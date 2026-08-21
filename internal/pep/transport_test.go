@@ -37,6 +37,13 @@ type switchableRouteConn struct {
 	failing atomic.Bool
 }
 
+func TestQUICUsesVersion2Only(t *testing.T) {
+	versions := quicConfig(flowWindows{}).Versions
+	if len(versions) != 1 || versions[0] != quic.Version2 {
+		t.Fatalf("QUIC versions = %v, want [%v]", versions, quic.Version2)
+	}
+}
+
 func (c *switchableRouteConn) WriteTo(payload []byte, addr net.Addr) (int, error) {
 	if c.failing.Load() {
 		return 0, injectedRouteError
