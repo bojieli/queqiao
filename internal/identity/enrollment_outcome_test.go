@@ -14,7 +14,7 @@ import (
 
 // attemptEnrollment runs one enrollment over an in-memory pipe and returns
 // what the gateway recorded alongside what the client was told.
-func attemptEnrollment(t *testing.T, provider *Provider, token string) (EnrollmentResult, error, enrollmentResponse) {
+func attemptEnrollment(t *testing.T, provider *Provider, token string) (EnrollmentResult, enrollmentResponse, error) {
 	t.Helper()
 	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -47,7 +47,7 @@ func attemptEnrollment(t *testing.T, provider *Provider, token string) (Enrollme
 		}
 	}
 	outcome := <-done
-	return outcome.result, outcome.err, response
+	return outcome.result, response, outcome.err
 }
 
 func mintInvitation(t *testing.T, provider *Provider) string {
@@ -74,7 +74,7 @@ func TestEnrollmentSeparatesStoreOutageFromRejection(t *testing.T) {
 	if err := os.Remove(filepath.Join(provider.Directory, authorizationFile)); err != nil {
 		t.Fatal(err)
 	}
-	result, err, response := attemptEnrollment(t, provider, token)
+	result, response, err := attemptEnrollment(t, provider, token)
 	if result.Outcome != EnrollmentUnavailable {
 		t.Fatalf("outcome is %q; want %q", result.Outcome, EnrollmentUnavailable)
 	}
@@ -99,7 +99,7 @@ func TestEnrollmentRejectionIsNotBlamedOnTheStore(t *testing.T) {
 	if _, err := rand.Read(bogus[:]); err != nil {
 		t.Fatal(err)
 	}
-	result, err, response := attemptEnrollment(t, provider, base64.RawURLEncoding.EncodeToString(bogus[:]))
+	result, response, err := attemptEnrollment(t, provider, base64.RawURLEncoding.EncodeToString(bogus[:]))
 	if result.Outcome != EnrollmentRejected {
 		t.Fatalf("outcome is %q; want %q", result.Outcome, EnrollmentRejected)
 	}
@@ -127,7 +127,7 @@ func TestEnrollmentMalformedTokenIsNotAnInvitationVerdict(t *testing.T) {
 func TestEnrollmentAcceptanceCarriesIdentifiers(t *testing.T) {
 	provider := testProvider(t, "127.0.0.1:443", time.Now())
 	token := mintInvitation(t, provider)
-	result, err, response := attemptEnrollment(t, provider, token)
+	result, response, err := attemptEnrollment(t, provider, token)
 	if err != nil {
 		t.Fatal(err)
 	}
