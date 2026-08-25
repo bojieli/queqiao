@@ -798,10 +798,13 @@ own path models, run in both orders:
 | order | one relay, 24 flows | three relays, 8 flows each |
 |---|---|---|
 | shared first | 1696.9ms, **34.6 Mbit/s** | 750/1176/1302ms, **57.5 Mbit/s** |
-| split first | 2540.6ms, **23.1 Mbit/s** | 396/1187/1382ms, **78.7 Mbit/s** |
+| split first | 1963.8ms, **29.8 Mbit/s** | 396/1187/1382ms, **78.7 Mbit/s** |
+| split first, repeated | 2540.6ms, **23.1 Mbit/s** | -- |
 
-**Three relays beat one by about two and a half times in aggregate, in both
-orders.** The batch also finishes sooner: 1.4 seconds against 2.6, because the
+The shared arm was run twice in the second position and both readings are
+given; its three figures are 34.6, 29.8 and 23.1 Mbit/s against the split arm's
+57.5 and 78.7. **Three relays beat one by roughly two and a half times in
+aggregate, in both orders.** The batch also finishes sooner: 1.4 seconds against 2.6, because the
 three groups run concurrently and the slowest of them still beats the shared
 relay's single figure.
 
