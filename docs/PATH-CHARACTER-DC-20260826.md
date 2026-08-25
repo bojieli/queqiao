@@ -1,0 +1,189 @@
+# What a China-US datacenter path actually is (2026-08-26)
+
+The path is between two datacenters rather than an access network: a Huawei
+Cloud instance in Guiyang and a colocated server in Tustin, California. It is
+the first path characterised for the datacenter profile, and it was chosen
+because it is the shape that profile targets -- a long-haul leg between two
+hosts the operator runs, carrying request/response traffic whose payloads are
+hundreds of kilobytes.
+
+Measurements were taken with `pathprobe` (open-loop UDP, download direction)
+and `pathmeasure` (TCP and upload-direction UDP, both new in this branch).
+
+## The path
+
+| Property | Value |
+|---|---|
+| Round trip | 199-207ms, min 185.9ms |
+| Jitter at 1 packet/s | mdev 0.58ms over 30 probes |
+| Path MTU | 1500, no blackholing; 1472-byte ICMP payload passes, 1480 does not |
+| Capacity knee, downstream | ~333 Mbit/s delivered |
+
+The jitter figure matters more than it looks. A round trip whose minimum and
+maximum differ by 3ms across thirty seconds is not queueing anywhere, so
+whatever the loss is, it is not congestion.
+
+## The two directions are different paths
+
+This is the finding that governs everything else, and it is the reason the
+first version of this measurement was wrong.
+
+| Direction | Protocol | Loss | Throughput |
+|---|---|---|---|
+| Upload, China to US | UDP, 50 Mbit/s | **0.0%** (0 of 41,663) | 49.99 Mbit/s |
+| Upload, China to US | TCP cubic | 0.36-2.90% retransmitted | 73-94 Mbit/s |
+| Download, US to China | UDP, 1-300 Mbit/s | **~14%** | knee at ~333 Mbit/s |
+| Download, US to China | TCP cubic | -- | **0.13-0.47 Mbit/s** |
+
+The upload direction erases nothing at all. The download direction erases a
+seventh of everything. They are the same two hosts, minutes apart.
+
+An earlier reading of this data concluded that UDP was being policed twenty to
+forty times harder than TCP. That conclusion was an artefact of comparing
+`pathprobe`, whose server is the sender and which therefore measures the
+download, against `pathmeasure`, whose client is the sender and which measures
+the upload. The protocols were never the variable; the direction was. The
+`udp` mode in `pathmeasure` exists because of this mistake, and it settles the
+question: UDP upstream loses nothing, so nothing on this path treats UDP
+worse than TCP.
+
+## The download erasure is memoryless and rate-independent
+
+Downstream, one connection, 1200-byte payloads:
+
+| offered Mbit/s | delivered | loss | P(loss \| prev ok) | P(ok \| prev lost) | burst factor | longest |
+|---|---|---|---|---|---|---|
+| 1 | 0.85 | 14.5% | 0.136 | 0.802 | 1.07 | 3 |
+| 2 | 1.80 | 9.8% | 0.096 | 0.878 | 1.03 | 3 |
+| 5 | 4.13 | 17.5% | 0.181 | 0.854 | 1.00 | 4 |
+| 10 | 8.51 | 14.9% | 0.124 | 0.710 | 1.20 | 6 |
+| 20 | 17.01 | 14.9% | 0.072 | 0.408 | 2.08 | 10 |
+| 40 | 34.38 | 14.0% | 0.062 | 0.380 | 2.26 | 11 |
+| 80 | 71.24 | 10.9% | 0.040 | 0.329 | 2.71 | 21 |
+| 150 | 129.19 | 13.9% | 0.136 | 0.843 | 1.02 | 26 |
+| 300 | 256.15 | 14.6% | 0.141 | 0.825 | 1.03 | 149 |
+| 600 | 333.49 | 44.4% | 0.490 | 0.613 | 1.00 | 795 |
+
+A memoryless channel with loss `p` has `P(loss | prev ok) = p` and
+`P(ok | prev lost) = 1 - p`. At 1 Mbit/s: 0.136 and 0.802 against a loss of
+0.145. At 150: 0.136 and 0.843 against 0.139. At 300: 0.141 and 0.825 against
+0.146. The erasure is independent, and it is independent at rates far below any
+queue.
+
+Delivered scales linearly with offered right up to 300 Mbit/s -- 0.85, 1.80,
+4.13, 8.51, 17.01, 34.38, 71.24, 129.19, 256.15 -- so there is no capacity
+constraint below it. At 600 the loss jumps to 44.4% and delivery saturates at
+333 Mbit/s with a longest run of 795. That is the knee, and it is the only
+place on this path where loss means congestion.
+
+The elevated burst factors at 20-80 Mbit/s are the sender's, not the path's:
+they appear where the probe's own release pattern is coarsest relative to the
+rate, and they disappear again at 150 and 300 where the sample counts are two
+orders of magnitude larger. This is the contamination `pathprobe`'s `-burst`
+flag exists to bound, and it is a reminder that a burst factor measured from a
+few hundred losses is not yet a measurement.
+
+## What TCP does with a memoryless erasure channel
+
+Mathis gives throughput as `MSS / (RTT * sqrt(p))`. With MSS 1448, RTT 0.2s and
+p = 0.14 that is 19.4 KB/s, or **0.155 Mbit/s**.
+
+Measured TCP download: **0.13-0.47 Mbit/s**.
+
+TCP is not malfunctioning. It is doing exactly what its design says to do with
+a loss signal, on a path where the loss signal means nothing. Meanwhile the
+open-loop probe pulls 256 Mbit/s across the same channel in the same window.
+The gap between 0.155 and 256 is not the path. It is the cost of interpreting
+erasure as congestion, and it is a factor of about 1,600.
+
+## Flow completion time is the metric, and it says something different
+
+Upload direction, cubic, payload sizes an inference call actually sends:
+
+| size | cold (incl. handshake) | warm-first | warm | floor |
+|---|---|---|---|---|
+| 100KB | 836-2009ms | 742ms | 186-763ms | ~200ms |
+| 300KB | 1172-1198ms | 1029ms | **209ms** | ~200ms |
+| 1MB | 1560-1721ms | 1687ms | **212ms** | ~200ms |
+
+Three things are visible here that no throughput number shows.
+
+**A warm connection is worth 5.7x on 300KB** -- 1198ms cold against 209ms warm.
+And 209ms on a 200ms path is one round trip: the floor, reached exactly.
+
+**The first flow on a warm connection is not warm.** 300KB warm-first takes
+1029ms against 209ms for the ones after it, and against 998ms for the transfer
+half of a cold flow. Reusing a connection saves the handshake immediately and
+saves the ramp only later.
+
+**Small flows have worse tails than larger ones.** 300KB warm was 209.0 and
+209.0ms on two runs; 100KB warm was 186 and 763ms. A 100KB payload is about 70
+packets, which is too few to reliably produce the three duplicate
+acknowledgements fast retransmit needs, so a loss falls through to a
+retransmission timeout. The smallest flows are the ones least able to recover
+cheaply, which is the opposite of the usual intuition and is precisely the
+regime forward error correction addresses.
+
+## A long-lived connection does not stay warm
+
+Six 300KB bursts on one connection, three seconds idle between them, upload
+direction. This is the shape of an interactive inference session.
+
+| burst | cubic, `ssai=1` | bbr, `ssai=1` | cubic, `ssai=0` |
+|---|---|---|---|
+| 0 | 941.9ms | 1082.6ms | 1028.5ms |
+| 1 | 941.0ms | 317.3ms | **209.1ms** |
+| 2 | 1515.7ms | 296.1ms | **209.1ms** |
+| 3 | 941.9ms | 288.5ms | **208.7ms** |
+| 4 | 1538.2ms | 286.1ms | **208.7ms** |
+| 5 | 941.0ms | 284.9ms | **209.0ms** |
+
+With Linux's default `tcp_slow_start_after_idle=1`, cubic pays full slow start
+on every single burst, forever. Its window returns to 223 packets each time and
+941ms is five round trips: the ramp, repeated, six times, on a connection that
+has been open the whole while.
+
+BBR does not reset, because `tcp_slow_start_after_idle_check()` returns early
+for any controller providing `cong_control`. It converges to 285ms instead --
+better, but still 36% above the floor, and the reason is visible in the
+`app_limited` column, which reads true from the second burst onward. BBR paces
+at a bottleneck estimate it derived from these bursts, and the bursts are all
+it has ever sent. 300KB in 285ms is 8.6 Mbit/s, which is what BBR believes the
+path can do. The open-loop probe says 256 Mbit/s.
+
+Setting `tcp_slow_start_after_idle=0` takes cubic to 209ms from the second
+burst on. **One sysctl, 941ms to 209ms, a factor of 4.5** -- and tuned cubic
+then beats BBR on the same path, because cubic does not pace and BBR's pacing
+is the remaining constraint.
+
+## Loopback, for comparison
+
+On the same server, to itself:
+
+| size | cold | warm |
+|---|---|---|
+| 300KB | 0.2-0.3ms | 0.1ms (28.9-31.5 Gbit/s) |
+| 1MB | 0.3-0.4ms | 0.2ms |
+
+A 300KB payload that takes 209ms across the path takes 0.1ms across loopback.
+Every constraint discussed above is a function of the round trip, and at a
+round trip of 0.05ms none of them binds. That is the entire argument for
+terminating close to the application and carrying only the long leg on a
+transport that knows about the path.
+
+## What this path implies
+
+- **The QUIC-based design is viable here.** UDP is not disadvantaged; upstream
+  it is perfect and downstream it matches what any protocol would see.
+- **Downstream is the direction that needs the transport.** It carries a
+  memoryless 14% erasure that TCP converts into a 1,600-fold throughput
+  penalty, and forward error correction is the right response to memoryless
+  loss on a 200ms round trip where a retransmission costs more than the
+  inference it carries.
+- **Upstream needs almost nothing.** Connection reuse and one sysctl reach the
+  round-trip floor. A transport that spent parity on this direction would be
+  spending it for nothing, which is an argument for measuring and controlling
+  the two directions separately rather than copying one model onto both.
+- **The measurement instruments have to name their direction.** The first
+  version of this document drew the wrong conclusion from correct numbers
+  because two tools disagreed about who was sending.

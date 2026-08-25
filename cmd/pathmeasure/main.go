@@ -1,0 +1,887 @@
+// Command pathmeasure asks what a stack achieves on a path, which is the
+// question pathprobe deliberately refuses to answer.
+//
+// pathprobe sends open-loop and counts what arrives, so it describes the path
+// and nothing else. That is the right instrument for finding an erasure floor
+// or a capacity knee, and the wrong one for the question this project's
+// datacenter work actually turns on: given a path that erases a seventh of
+// what crosses it, what does an ordinary TCP connection do, and how much of
+// the gap is the path's fault rather than the transport's?
+//
+// The two instruments together separate the two. Where pathprobe delivers 256
+// Mbit/s at 300 offered and TCP delivers a fraction of a megabit over the same
+// minutes, the difference is not the path. It is a congestion controller
+// reading rate-independent erasure as congestion and backing off from a link
+// that was never congested.
+//
+// Modes:
+//
+//	serve      sink TCP bytes and report what arrived
+//	tcp        send for a duration and sample the kernel's account of why
+//	rtt        round-trip distribution, idle and under load
+//
+// The tcp mode is the latency-attribution instrument. Goodput alone cannot
+// distinguish a small congestion window from a small receive window from an
+// application with nothing to send, and those need different fixes; TCP_INFO
+// names which one was binding in each interval.
+package main
+
+import (
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/bojieli/queqiao/internal/tcpinfo"
+)
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "pathmeasure: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	fs := flag.NewFlagSet("pathmeasure", flag.ContinueOnError)
+	mode := fs.String("mode", "", "serve, tcp, or rtt")
+	listen := fs.String("listen", ":12600", "serve: listen address")
+	remote := fs.String("remote", "", "client: server address")
+	seconds := fs.Float64("duration", 10, "client: seconds to run")
+	cc := fs.String("cc", "", "tcp: congestion control for this socket (empty keeps the system default)")
+	interval := fs.Float64("sample", 0.2, "tcp: seconds between TCP_INFO samples")
+	bytesToSend := fs.Int64("bytes", 0, "tcp: stop after this many bytes instead of after --duration; the flow-completion measurement")
+	jsonOut := fs.Bool("json", false, "emit samples as JSON lines rather than a table")
+	count := fs.Int("count", 50, "rtt: probes to send")
+	bursts := fs.Int("bursts", 5, "burst: number of bursts to send on one connection")
+	idle := fs.Float64("idle", 2, "burst: seconds to idle between bursts")
+	repeat := fs.Int("repeat", 1, "fct: repetitions per size")
+	sizes := fs.String("sizes", "100KB,300KB,1MB,5MB", "fct: comma-separated payload sizes")
+	rate := fs.Float64("rate", 10, "udp: offered rate in Mbit/s")
+	payload := fs.Int("payload", 1200, "udp: datagram payload bytes")
+	reverse := fs.Bool("reverse", false, "measure the download direction: the client connects, the server sends. The only way to measure the receive direction of a host that cannot accept inbound connections, which on real deployments is most of them")
+	localAddr := fs.String("local-address", "", "bind the socket to this local IP, so a host TUN route does not carry the measurement through a tunnel to the very server being measured")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	switch *mode {
+	case "serve":
+		return serve(*listen)
+	case "tcp":
+		if *remote == "" {
+			return errors.New("tcp needs --remote")
+		}
+		return tcpRun(*remote, time.Duration(*seconds*float64(time.Second)), *cc,
+			time.Duration(*interval*float64(time.Second)), *bytesToSend, *jsonOut, *localAddr)
+	case "fct":
+		if *remote == "" {
+			return errors.New("fct needs --remote")
+		}
+		return fctRun(*remote, *sizes, *repeat, *cc, *localAddr, *reverse)
+	case "burst":
+		if *remote == "" {
+			return errors.New("burst needs --remote")
+		}
+		return burstRun(*remote, *bursts, *bytesToSend,
+			time.Duration(*idle*float64(time.Second)), *cc, *localAddr)
+	case "udp":
+		if *remote == "" {
+			return errors.New("udp needs --remote")
+		}
+		return udpUpRun(*remote, *rate, time.Duration(*seconds*float64(time.Second)), *payload, *localAddr)
+	case "rtt":
+		if *remote == "" {
+			return errors.New("rtt needs --remote")
+		}
+		return rttRun(*remote, *count, *localAddr)
+	default:
+		return errors.New("--mode must be serve, tcp, fct, burst, udp, or rtt")
+	}
+}
+
+// The request header lets one connection express which direction is being
+// measured. A host behind NAT or a cloud security group cannot accept inbound
+// connections, and on real deployments that describes most clients -- so the
+// receive direction can only be measured by having the client dial out and ask
+// to be sent to. Since PR #52 found one live path erasing 3.8% in one
+// direction and 19.9% in the other, measuring only the easy direction is not a
+// simplification, it is half a measurement.
+const (
+	reqMagic    = 0x504d5351 // "PMSQ"
+	reqHeader   = 16
+	dirUpload   = 0 // client sends, server sinks
+	dirDownload = 1 // server sends, client sinks
+	// dirUDPUp asks the server to count a UDP blast the client is about to
+	// send. The count returns over this TCP connection rather than over the
+	// path being measured: a summary sent through a channel erasing a seventh
+	// of what crosses it is lost precisely when the measurement matters most,
+	// and a missing summary is then either an aborted run or, worse, replaced
+	// by an estimate that makes loss read as zero.
+	dirUDPUp = 2
+	// udpProbePort carries the blast. It is separate from the control port so
+	// that a firewall permitting one and not the other is visible as a failed
+	// probe rather than as a path that erases everything.
+	udpProbePort = "12601"
+)
+
+func serve(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("pathmeasure server on %s\n", ln.Addr())
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		go serveConn(c)
+	}
+}
+
+func serveConn(c net.Conn) {
+	defer c.Close()
+	hdr := make([]byte, reqHeader)
+	// A peer that sends no header is an upload from an older client or from a
+	// tool that just streams; treating a read failure as "sink it" keeps the
+	// server useful for both.
+	c.SetReadDeadline(time.Now().Add(20 * time.Second))
+	if _, err := io.ReadFull(c, hdr); err != nil {
+		c.SetReadDeadline(time.Time{})
+		sink(c)
+		return
+	}
+	c.SetReadDeadline(time.Time{})
+	if binary.LittleEndian.Uint32(hdr[0:4]) != reqMagic {
+		sink(c)
+		return
+	}
+	switch binary.LittleEndian.Uint32(hdr[4:8]) {
+	case dirUDPUp:
+		serveUDPCount(c, int64(binary.LittleEndian.Uint64(hdr[8:16])))
+	case dirDownload:
+		n := int64(binary.LittleEndian.Uint64(hdr[8:16]))
+		buf := make([]byte, 256*1024)
+		var sent int64
+		for sent < n {
+			w := buf
+			if n-sent < int64(len(buf)) {
+				w = buf[:n-sent]
+			}
+			k, err := c.Write(w)
+			sent += int64(k)
+			if err != nil {
+				break
+			}
+		}
+		fmt.Printf("pushed %d bytes to %s\n", sent, c.RemoteAddr())
+	default:
+		sink(c)
+	}
+}
+
+func sink(c net.Conn) {
+	start := time.Now()
+	n, _ := io.Copy(io.Discard, c)
+	el := time.Since(start).Seconds()
+	mbit := 0.0
+	if el > 0 {
+		mbit = float64(n) * 8 / el / 1e6
+	}
+	fmt.Printf("received %d bytes in %.2fs = %.3f Mbit/s from %s\n",
+		n, el, mbit, c.RemoteAddr())
+}
+
+func writeHeader(c net.Conn, dir uint32, n int64) error {
+	hdr := make([]byte, reqHeader)
+	binary.LittleEndian.PutUint32(hdr[0:4], reqMagic)
+	binary.LittleEndian.PutUint32(hdr[4:8], dir)
+	binary.LittleEndian.PutUint64(hdr[8:16], uint64(n))
+	_, err := c.Write(hdr)
+	return err
+}
+
+// sample is one observation of the kernel's state plus enough context to say
+// what changed since the previous one.
+type sample struct {
+	T             float64 `json:"t"`
+	Bytes         int64   `json:"bytes"`
+	GoodputMbit   float64 `json:"goodput_mbit"`
+	CwndPackets   uint32  `json:"cwnd_pkts"`
+	CwndBytes     uint64  `json:"cwnd_bytes"`
+	InFlightBytes uint64  `json:"inflight_bytes"`
+	SsthreshPkts  uint32  `json:"ssthresh_pkts"`
+	RTTms         float64 `json:"rtt_ms"`
+	MinRTTms      float64 `json:"min_rtt_ms"`
+	PacingMbit    float64 `json:"pacing_mbit"`
+	DeliveryMbit  float64 `json:"delivery_mbit"`
+	AppLimited    bool    `json:"app_limited"`
+	TotalRetrans  uint32  `json:"total_retrans"`
+	RetransRate   float64 `json:"retrans_rate"`
+	SndWndBytes   uint32  `json:"snd_wnd_bytes"`
+	NotsentBytes  uint32  `json:"notsent_bytes"`
+	CAState       uint8   `json:"ca_state"`
+	Limiter       string  `json:"limiter"`
+}
+
+// dialer builds a dialer bound to a chosen source address.
+//
+// This is not a convenience. A host running a TUN-mode proxy carries traffic
+// for the default route through a tunnel, and on the machines this project is
+// measured from that tunnel frequently terminates at the very server on the
+// other end of the measurement. The result is a number describing the proxy,
+// reported as though it described the path. Binding the source address to the
+// physical interface is the only way to be sure which path was measured.
+func dialer(localAddr string) (*net.Dialer, error) {
+	d := &net.Dialer{Timeout: 15 * time.Second}
+	if localAddr == "" {
+		return d, nil
+	}
+	ip := net.ParseIP(localAddr)
+	if ip == nil {
+		return nil, fmt.Errorf("bad --local-address %q", localAddr)
+	}
+	d.LocalAddr = &net.TCPAddr{IP: ip}
+	return d, nil
+}
+
+// tcpRun sends as fast as the stack allows and records why it was not faster.
+//
+// The payload is incompressible only in the sense that nothing in the path is
+// expected to compress it; what matters is that the sender never becomes the
+// constraint, so the write loop hands the kernel a large buffer repeatedly and
+// lets the socket apply the backpressure. If the application were the limit,
+// every sample would say so, which is precisely what the app_limited bit is
+// for.
+func tcpRun(remote string, dur time.Duration, cc string, every time.Duration, stopAfter int64, jsonOut bool, localAddr string) error {
+	d, err := dialer(localAddr)
+	if err != nil {
+		return err
+	}
+	c, err := d.Dial("tcp", remote)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		return errors.New("not a TCP connection")
+	}
+	if cc != "" {
+		raw, err := tc.SyscallConn()
+		if err != nil {
+			return err
+		}
+		if err := tcpinfo.SetCongestionControl(raw, cc); err != nil {
+			return fmt.Errorf("set congestion control %q: %w", cc, err)
+		}
+	}
+
+	buf := make([]byte, 256*1024)
+	for i := range buf {
+		buf[i] = byte(i)
+	}
+
+	start := time.Now()
+	var sent int64
+	var prev tcpinfo.Info
+	var samples []sample
+	noKernelInfo := false
+	// A write that fails ends the run early. Reporting the elapsed time
+	// without reporting why it ended would turn a broken connection into a
+	// throughput result, which is the failure mode this whole instrument
+	// exists to avoid.
+	var writeErr error
+	done := make(chan struct{})
+	deadline := start.Add(dur)
+
+	go func() {
+		defer close(done)
+		for {
+			if stopAfter > 0 && sent >= stopAfter {
+				return
+			}
+			if stopAfter == 0 && time.Now().After(deadline) {
+				return
+			}
+			w := buf
+			if stopAfter > 0 && stopAfter-sent < int64(len(buf)) {
+				w = buf[:stopAfter-sent]
+			}
+			n, err := tc.Write(w)
+			sent += int64(n)
+			if err != nil {
+				writeErr = err
+				return
+			}
+		}
+	}()
+
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+loop:
+	for {
+		select {
+		case <-done:
+			break loop
+		case <-tick.C:
+			// A kernel without TCP_INFO costs the attribution, not the
+			// measurement. Goodput, loss of the connection and wall time are
+			// still observable from userspace, and a tool that refused to
+			// report them because it could not also report the cause would be
+			// useless on exactly the client machines whose paths matter.
+			info, err := tcpinfo.Get(tc)
+			if err != nil {
+				if !errors.Is(err, errNoKernelInfo) && err.Error() != "tcpinfo: not supported on this platform" {
+					return err
+				}
+				noKernelInfo = true
+			}
+			el := time.Since(start).Seconds()
+			s := sample{
+				T:             el,
+				Bytes:         sent,
+				GoodputMbit:   float64(info.BytesAcked) * 8 / el / 1e6,
+				CwndPackets:   info.SndCwnd,
+				CwndBytes:     info.CwndBytes(),
+				InFlightBytes: info.BytesInFlight(),
+				SsthreshPkts:  info.SndSsthresh,
+				RTTms:         float64(info.RTT) / 1000,
+				MinRTTms:      float64(info.MinRTT) / 1000,
+				PacingMbit:    float64(info.PacingRate) * 8 / 1e6,
+				DeliveryMbit:  float64(info.DeliveryRate) * 8 / 1e6,
+				AppLimited:    info.AppLimited,
+				TotalRetrans:  info.TotalRetrans,
+				SndWndBytes:   info.SndWnd,
+				NotsentBytes:  info.NotsentBytes,
+				CAState:       info.CAState,
+				Limiter:       info.Limiter(prev),
+			}
+			if info.BytesSent > 0 {
+				s.RetransRate = float64(info.BytesRetrans) / float64(info.BytesSent)
+			}
+			samples = append(samples, s)
+			prev = info
+			if jsonOut {
+				b, _ := json.Marshal(s)
+				fmt.Println(string(b))
+			}
+		}
+	}
+	tc.CloseWrite()
+	elapsed := time.Since(start)
+	if writeErr != nil {
+		fmt.Printf("# RUN ENDED EARLY: write failed after %d bytes: %v\n", sent, writeErr)
+	}
+
+	final, ferr := tcpinfo.Get(tc)
+	if !jsonOut {
+		report(samples, sent, elapsed, cc, final, ferr, noKernelInfo)
+	}
+	return nil
+}
+
+// errNoKernelInfo marks the platforms that cannot answer the attribution
+// question, so the caller can tell "this kernel does not offer TCP_INFO" apart
+// from "this socket failed".
+var errNoKernelInfo = tcpinfo.ErrUnsupportedSentinel
+
+func report(samples []sample, sent int64, elapsed time.Duration, cc string, final tcpinfo.Info, ferr error, noKernelInfo bool) {
+	if cc == "" {
+		cc = "system default"
+	}
+	if noKernelInfo {
+		fmt.Printf("# kernel offers no TCP_INFO here: goodput is measured, attribution is not\n")
+	}
+	fmt.Printf("# congestion control: %s\n", cc)
+	fmt.Printf("# %d bytes offered in %.2fs = %.3f Mbit/s at the application\n",
+		sent, elapsed.Seconds(), float64(sent)*8/elapsed.Seconds()/1e6)
+	fmt.Printf("t\tgoodput\tcwnd_pkt\tcwnd_KB\tinflt_KB\trtt_ms\tpacing\tdelivery\tapplim\tretr%%\tlimiter\n")
+	for _, s := range samples {
+		fmt.Printf("%.1f\t%.3f\t%d\t%.1f\t%.1f\t%.1f\t%.2f\t%.2f\t%v\t%.2f\t%s\n",
+			s.T, s.GoodputMbit, s.CwndPackets, float64(s.CwndBytes)/1024,
+			float64(s.InFlightBytes)/1024, s.RTTms, s.PacingMbit, s.DeliveryMbit,
+			s.AppLimited, s.RetransRate*100, s.Limiter)
+	}
+	if ferr == nil && !noKernelInfo {
+		fmt.Printf("# final: acked=%d retrans_bytes=%d (%.2f%% of sent) total_retrans=%d min_rtt=%.1fms\n",
+			final.BytesAcked, final.BytesRetrans,
+			pct(final.BytesRetrans, final.BytesSent), final.TotalRetrans,
+			float64(final.MinRTT)/1000)
+		// The limiter histogram is the summary the phase gates in the
+		// datacenter plan actually need: not how fast it went, but what it was
+		// waiting on while it went that fast.
+		hist := map[string]int{}
+		for _, s := range samples {
+			hist[s.Limiter]++
+		}
+		keys := make([]string, 0, len(hist))
+		for k := range hist {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Printf("# binding constraint by sample:")
+		for _, k := range keys {
+			fmt.Printf("  %s=%d/%d", k, hist[k], len(samples))
+		}
+		fmt.Println()
+	}
+}
+
+func pct(a, b uint64) float64 {
+	if b == 0 {
+		return 0
+	}
+	return float64(a) / float64(b) * 100
+}
+
+// rttRun measures the round trip the way a request/response application
+// experiences it: a small write, a small read, and the wall time between.
+// This is deliberately not ICMP, which is separately rate-limited and
+// separately prioritised on most of the paths this project cares about.
+func rttRun(remote string, count int, localAddr string) error {
+	d, err := dialer(localAddr)
+	if err != nil {
+		return err
+	}
+	var ms []float64
+	for i := 0; i < count; i++ {
+		start := time.Now()
+		c, err := d.Dial("tcp", remote)
+		if err != nil {
+			continue
+		}
+		el := time.Since(start)
+		c.Close()
+		ms = append(ms, float64(el.Microseconds())/1000)
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(ms) == 0 {
+		return errors.New("no successful handshakes")
+	}
+	sort.Float64s(ms)
+	fmt.Printf("# TCP handshake round trip, %d/%d succeeded\n", len(ms), count)
+	fmt.Printf("p50=%.1fms p90=%.1fms p99=%.1fms min=%.1fms max=%.1fms\n",
+		q(ms, 0.50), q(ms, 0.90), q(ms, 0.99), ms[0], ms[len(ms)-1])
+	return nil
+}
+
+func q(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	i := int(p * float64(len(sorted)-1))
+	return sorted[i]
+}
+
+// parseSize accepts the units a payload is actually discussed in.
+func parseSize(s string) (int64, error) {
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(s, "KB"):
+		mult, s = 1024, strings.TrimSuffix(s, "KB")
+	case strings.HasSuffix(s, "MB"):
+		mult, s = 1024*1024, strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "B"):
+		s = strings.TrimSuffix(s, "B")
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0, fmt.Errorf("bad size %q", s)
+	}
+	return int64(v * float64(mult)), nil
+}
+
+// fctRun measures flow completion time, which is the metric this project's
+// datacenter work is actually about.
+//
+// Throughput is the wrong number for a 300KB request. A connection that
+// averages 90 Mbit/s over twenty seconds and one that delivers 300KB in 400ms
+// describe different experiences of the same path, and only the second is what
+// an inference call feels. Completion time also exposes the costs throughput
+// averages away: the handshakes, and the round trips slow start spends
+// climbing to a rate the flow never gets to use.
+//
+// Cold and warm are reported separately because the difference between them is
+// the entire argument for connection reuse, and because a benchmark that
+// silently reuses a connection reports a number no cold caller will ever see.
+func fctRun(remote, sizes string, repeat int, cc, localAddr string, reverse bool) error {
+	var list []int64
+	for _, f := range strings.Split(sizes, ",") {
+		n, err := parseSize(f)
+		if err != nil {
+			return err
+		}
+		list = append(list, n)
+	}
+	dirName := "upload (client -> server)"
+	if reverse {
+		dirName = "download (server -> client)"
+	}
+	fmt.Printf("# flow completion time to %s, %d repetition(s) per size, %s\n", remote, repeat, dirName)
+	fmt.Printf("# cold includes the TCP handshake; warm reuses an established connection\n")
+	fmt.Printf("size\tmode\tconnect_ms\ttransfer_ms\ttotal_ms\teff_Mbit\n")
+	for _, n := range list {
+		if reverse {
+			for r := 0; r < repeat; r++ {
+				cms, tms, err := oneDownload(remote, n, cc, localAddr)
+				if err != nil {
+					fmt.Printf("%s\tcold\tERROR: %v\n", human(n), err)
+					continue
+				}
+				total := cms + tms
+				fmt.Printf("%s\tcold\t%.1f\t%.1f\t%.1f\t%.2f\n",
+					human(n), cms, tms, total, float64(n)*8/(total/1000)/1e6)
+			}
+			continue
+		}
+		for r := 0; r < repeat; r++ {
+			cms, tms, err := oneFlow(remote, n, cc, localAddr, nil)
+			if err != nil {
+				fmt.Printf("%s\tcold\tERROR: %v\n", human(n), err)
+				continue
+			}
+			total := cms + tms
+			fmt.Printf("%s\tcold\t%.1f\t%.1f\t%.1f\t%.2f\n",
+				human(n), cms, tms, total, float64(n)*8/(total/1000)/1e6)
+		}
+		// Warm: one connection, the same payload sent repeatedly, so the
+		// handshake and whatever the window has learned are already paid for.
+		d, err := dialer(localAddr)
+		if err != nil {
+			return err
+		}
+		c, err := d.Dial("tcp", remote)
+		if err != nil {
+			fmt.Printf("%s\twarm\tERROR: %v\n", human(n), err)
+			continue
+		}
+		tc := c.(*net.TCPConn)
+		if cc != "" {
+			if raw, e := tc.SyscallConn(); e == nil {
+				_ = tcpinfo.SetCongestionControl(raw, cc)
+			}
+		}
+		for r := 0; r < repeat+1; r++ {
+			_, tms, err := oneFlow("", n, cc, localAddr, tc)
+			if err != nil {
+				break
+			}
+			// The first warm iteration still pays for slow start, so it is
+			// labelled rather than averaged in with the rest.
+			label := "warm"
+			if r == 0 {
+				label = "warm-first"
+			}
+			fmt.Printf("%s\t%s\t0.0\t%.1f\t%.1f\t%.2f\n",
+				human(n), label, tms, tms, float64(n)*8/(tms/1000)/1e6)
+		}
+		tc.Close()
+	}
+	return nil
+}
+
+// oneFlow sends exactly n bytes, either on a fresh connection whose handshake
+// it times, or on one handed to it.
+func oneFlow(remote string, n int64, cc, localAddr string, existing *net.TCPConn) (connectMS, transferMS float64, err error) {
+	tc := existing
+	if tc == nil {
+		d, derr := dialer(localAddr)
+		if derr != nil {
+			return 0, 0, derr
+		}
+		t0 := time.Now()
+		c, e := d.Dial("tcp", remote)
+		if e != nil {
+			return 0, 0, e
+		}
+		connectMS = float64(time.Since(t0).Microseconds()) / 1000
+		tc = c.(*net.TCPConn)
+		defer tc.Close()
+		if cc != "" {
+			if raw, e := tc.SyscallConn(); e == nil {
+				_ = tcpinfo.SetCongestionControl(raw, cc)
+			}
+		}
+	}
+	buf := make([]byte, 64*1024)
+	t1 := time.Now()
+	var sent int64
+	for sent < n {
+		w := buf
+		if n-sent < int64(len(buf)) {
+			w = buf[:n-sent]
+		}
+		k, e := tc.Write(w)
+		sent += int64(k)
+		if e != nil {
+			return connectMS, 0, e
+		}
+	}
+	// Completion is when the peer has the bytes, not when the socket accepted
+	// them. Without this the measurement reports the speed of memcpy into the
+	// send buffer, which for a 300KB payload is most of it.
+	if existing == nil {
+		tc.CloseWrite()
+		io.Copy(io.Discard, tc)
+	} else {
+		if info, e := tcpinfo.Get(tc); e == nil {
+			for info.Unacked > 0 {
+				time.Sleep(time.Millisecond)
+				if info, e = tcpinfo.Get(tc); e != nil {
+					break
+				}
+			}
+		}
+	}
+	transferMS = float64(time.Since(t1).Microseconds()) / 1000
+	return connectMS, transferMS, nil
+}
+
+func human(n int64) string {
+	switch {
+	case n >= 1024*1024:
+		return fmt.Sprintf("%dMB", n/(1024*1024))
+	case n >= 1024:
+		return fmt.Sprintf("%dKB", n/1024)
+	}
+	return fmt.Sprintf("%dB", n)
+}
+
+// burstRun is the demonstration that a long-lived connection does not stay
+// warm.
+//
+// It sends a burst, idles, and sends the same burst again on the same
+// connection, recording the congestion window and the app_limited bit at each
+// step. The belief this tests is the most widely held wrong belief about
+// keepalive: that a connection which has already carried traffic will carry
+// the next burst at the rate it previously achieved. What the kernel actually
+// does -- refuse to grow a window the application never filled, and on some
+// controllers reset it outright after an idle period -- is visible here and
+// nowhere in a throughput number.
+func burstRun(remote string, bursts int, burstBytes int64, idle time.Duration, cc, localAddr string) error {
+	if burstBytes <= 0 {
+		burstBytes = 300 * 1024
+	}
+	d, err := dialer(localAddr)
+	if err != nil {
+		return err
+	}
+	c, err := d.Dial("tcp", remote)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	tc := c.(*net.TCPConn)
+	if cc != "" {
+		if raw, e := tc.SyscallConn(); e == nil {
+			if e := tcpinfo.SetCongestionControl(raw, cc); e != nil {
+				return e
+			}
+		}
+	}
+	ssai := "unknown"
+	if b, e := os.ReadFile("/proc/sys/net/ipv4/tcp_slow_start_after_idle"); e == nil {
+		ssai = strings.TrimSpace(string(b))
+	}
+	fmt.Printf("# %d bursts of %s on ONE connection, %v idle between, cc=%s\n",
+		bursts, human(burstBytes), idle, cc)
+	fmt.Printf("# tcp_slow_start_after_idle=%s\n", ssai)
+	fmt.Printf("burst\telapsed_ms\tMbit\tcwnd_before\tcwnd_after\tssthresh\tapplim\tretrans\n")
+	buf := make([]byte, 64*1024)
+	for i := 0; i < bursts; i++ {
+		before, _ := tcpinfo.Get(tc)
+		t0 := time.Now()
+		var sent int64
+		for sent < burstBytes {
+			w := buf
+			if burstBytes-sent < int64(len(buf)) {
+				w = buf[:burstBytes-sent]
+			}
+			k, e := tc.Write(w)
+			sent += int64(k)
+			if e != nil {
+				return e
+			}
+		}
+		info, e := tcpinfo.Get(tc)
+		for e == nil && info.Unacked > 0 {
+			time.Sleep(time.Millisecond)
+			info, e = tcpinfo.Get(tc)
+		}
+		el := float64(time.Since(t0).Microseconds()) / 1000
+		fmt.Printf("%d\t%.1f\t%.2f\t%d\t%d\t%d\t%v\t%d\n",
+			i, el, float64(burstBytes)*8/(el/1000)/1e6,
+			before.SndCwnd, info.SndCwnd, info.SndSsthresh,
+			info.AppLimited, info.TotalRetrans)
+		if i < bursts-1 {
+			time.Sleep(idle)
+		}
+	}
+	return nil
+}
+
+// oneDownload measures the receive direction: dial out, ask for n bytes, and
+// time how long they take to arrive.
+func oneDownload(remote string, n int64, cc, localAddr string) (connectMS, transferMS float64, err error) {
+	d, derr := dialer(localAddr)
+	if derr != nil {
+		return 0, 0, derr
+	}
+	t0 := time.Now()
+	c, e := d.Dial("tcp", remote)
+	if e != nil {
+		return 0, 0, e
+	}
+	defer c.Close()
+	connectMS = float64(time.Since(t0).Microseconds()) / 1000
+	if cc != "" {
+		if tc, ok := c.(*net.TCPConn); ok {
+			if raw, e := tc.SyscallConn(); e == nil {
+				_ = tcpinfo.SetCongestionControl(raw, cc)
+			}
+		}
+	}
+	t1 := time.Now()
+	if err := writeHeader(c, dirDownload, n); err != nil {
+		return connectMS, 0, err
+	}
+	got, rerr := io.CopyN(io.Discard, c, n)
+	transferMS = float64(time.Since(t1).Microseconds()) / 1000
+	if rerr != nil && got < n {
+		return connectMS, transferMS, fmt.Errorf("received %d of %d: %w", got, n, rerr)
+	}
+	return connectMS, transferMS, nil
+}
+
+// The probe datagram carries a session and a sequence so the receiver can
+// attribute a gap to this run rather than to whatever else reaches the port.
+const (
+	udpMagic  = 0x504d5544 // "PMUD"
+	udpHdrLen = 16
+)
+
+// serveUDPCount receives one session's blast and reports what arrived back
+// over the TCP control connection.
+func serveUDPCount(c net.Conn, session int64) {
+	pc, err := net.ListenPacket("udp", ":"+udpProbePort)
+	if err != nil {
+		// The port is held by a concurrent run. Saying so is required: a zero
+		// count returned here is indistinguishable from a path that erased
+		// every datagram, and that is the more interesting result to fake.
+		fmt.Fprintf(c, "ERROR %v\n", err)
+		return
+	}
+	defer pc.Close()
+	buf := make([]byte, 2048)
+	var got, bytes, highest uint64
+	pc.SetReadDeadline(time.Now().Add(90 * time.Second))
+	for {
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			break
+		}
+		if n < udpHdrLen || binary.LittleEndian.Uint32(buf[0:4]) != udpMagic {
+			continue
+		}
+		if int64(binary.LittleEndian.Uint64(buf[4:12])) != session {
+			continue
+		}
+		if seq := uint64(binary.LittleEndian.Uint32(buf[12:16])); seq+1 > highest {
+			highest = seq + 1
+		}
+		got++
+		bytes += uint64(n)
+		// Once traffic is flowing, a short gap means the sender has stopped,
+		// so the report need not wait out the full timeout.
+		pc.SetReadDeadline(time.Now().Add(3 * time.Second))
+	}
+	fmt.Fprintf(c, "OK %d %d %d\n", got, bytes, highest)
+}
+
+// udpUpRun measures the send direction of a UDP path, which pathprobe cannot:
+// its server is the sender by design, so it characterises the download.
+//
+// That asymmetry is not academic here. This project has now measured a path
+// whose two directions differ by more than an order of magnitude, so
+// characterising one and assuming the other is not an approximation -- it
+// describes a different path.
+func udpUpRun(remote string, rateMbit float64, dur time.Duration, payload int, localAddr string) error {
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		return err
+	}
+	d, err := dialer(localAddr)
+	if err != nil {
+		return err
+	}
+	ctl, err := d.Dial("tcp", remote)
+	if err != nil {
+		return err
+	}
+	defer ctl.Close()
+	session := time.Now().UnixNano()
+	if err := writeHeader(ctl, dirUDPUp, session); err != nil {
+		return err
+	}
+	// Let the server bind its probe port before the blast starts, so early
+	// datagrams are not counted as path loss.
+	time.Sleep(300 * time.Millisecond)
+
+	uconn, err := net.Dial("udp", net.JoinHostPort(host, udpProbePort))
+	if err != nil {
+		return err
+	}
+	defer uconn.Close()
+
+	pkt := make([]byte, payload)
+	binary.LittleEndian.PutUint32(pkt[0:4], udpMagic)
+	binary.LittleEndian.PutUint64(pkt[4:12], uint64(session))
+
+	perPkt := time.Duration(float64(payload) * 8 / (rateMbit * 1e6) * float64(time.Second))
+	start := time.Now()
+	deadline := start.Add(dur)
+	var sent uint32
+	next := start
+	for time.Now().Before(deadline) {
+		binary.LittleEndian.PutUint32(pkt[12:16], sent)
+		if _, err := uconn.Write(pkt); err != nil {
+			break
+		}
+		sent++
+		next = next.Add(perPkt)
+		if w := time.Until(next); w > 0 {
+			time.Sleep(w)
+		}
+	}
+	elapsed := time.Since(start)
+	time.Sleep(500 * time.Millisecond) // let the tail arrive
+
+	ctl.SetReadDeadline(time.Now().Add(20 * time.Second))
+	reply := make([]byte, 128)
+	n, rerr := ctl.Read(reply)
+	if rerr != nil {
+		return fmt.Errorf("no count returned over the control connection: %w", rerr)
+	}
+	var got, bytes, highest uint64
+	if _, err := fmt.Sscanf(string(reply[:n]), "OK %d %d %d", &got, &bytes, &highest); err != nil {
+		return fmt.Errorf("bad reply %q", string(reply[:n]))
+	}
+	loss := 0.0
+	if sent > 0 {
+		loss = 100 * (1 - float64(got)/float64(sent))
+	}
+	fmt.Printf("# UDP upload (client -> server), %d-byte payloads, %.1fs\n", payload, elapsed.Seconds())
+	fmt.Printf("offered_Mbit\tsent_pkts\tdelivered_pkts\tdelivered_Mbit\tloss_pct\n")
+	fmt.Printf("%.1f\t%d\t%d\t%.2f\t%.1f\n",
+		rateMbit, sent, got, float64(bytes)*8/elapsed.Seconds()/1e6, loss)
+	return nil
+}
