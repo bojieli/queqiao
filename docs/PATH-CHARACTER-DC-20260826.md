@@ -474,3 +474,44 @@ rather than a tuned product, and a real TUIC deployment would be configured by
 someone who wanted it to work. And this is one emulated path: the same
 comparison on the live link, where these numbers came from, is the check that
 has not been run.
+
+## The other traffic shape, where the tail is a real problem
+
+A voice session sends a 20ms frame of audio fifty times a second and a gateway
+carries hundreds at once. Nothing about that resembles the burst above: the
+payloads are tens of bytes rather than hundreds of kilobytes, the flow never
+ends, and what matters is not when it completes but whether any single frame
+arrives late.
+
+Twenty-four sessions, a hundred 80-byte frames each, on the same emulated path:
+
+| | p50 | p90 | p99 | p99.9 |
+|---|---|---|---|---|
+| frame round trip | 203.3ms | 208.2ms | **766.6ms** | 909.4ms |
+
+The path's own round trip is 200ms, so the median frame is 3.3ms above the
+floor and the p90 is 8.2ms above it. Ninety-five percent of frames are as good
+as the path allows. **Then 4.96% of them arrive more than a frame interval
+late, and the p99 sits 567ms above the floor.**
+
+This is the reverse of the burst result, and the reason is the payload size
+rather than the concurrency. A 300KB request is two hundred packets: enough
+that a coding block is worth building and enough that three duplicate
+acknowledgements arrive to trigger a fast retransmit. An 80-byte frame is one
+packet, sent 20ms after the last one. There is no block to code and no
+subsequent traffic to produce duplicate acknowledgements, so a lost frame waits
+for a retransmission timeout -- and on a 200ms path that is most of the 567ms.
+
+So the two shapes of §2.3 give opposite answers on the same path with the same
+transport. Requests: p99 within 7% of the median at every concurrency tested.
+Frames: p99 at 3.8x the median, with a twentieth of them audibly late.
+
+The gap is not a scheduling failure and will not be fixed by a fairer queue.
+Everything that makes coding work for the burst -- a block to compute parity
+over, and traffic behind the loss to reveal it quickly -- is absent for a
+single small frame. Closing it means coding across frames from the same
+session, which spends parity on a stream that is mostly silence, or across
+sessions, which couples flows that have no other reason to be coupled. Both are
+real designs and neither is implemented. This is the open problem the
+datacenter profile has, and it is a narrower and more specific one than "the
+interactive tail", which is what the plan expected to find.

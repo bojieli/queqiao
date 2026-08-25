@@ -358,3 +358,123 @@ func baselineIdentity(t *testing.T) (tls.Certificate, *x509.CertPool) {
 	}
 	return baselineCert, baselinePool
 }
+
+// The other traffic shape. A voice session sends a 20ms frame of audio fifty
+// times a second, and a gateway carries hundreds of them at once. Nothing
+// about that resembles the burst measured above: the payloads are tens of
+// bytes rather than hundreds of kilobytes, the flow never ends, and what
+// matters is not when it completes but whether any single frame arrives late.
+//
+// The mechanisms it stresses are different too. A burst is a rate problem; a
+// frame stream is a scheduling and head-of-line problem, where one lost packet
+// can hold up a session that had nothing to do with it.
+const (
+	frameBytes    = 80
+	frameInterval = 20 * time.Millisecond
+	framesPerFlow = 100 // two seconds of speech
+	voiceSessions = 24
+	// pathRoundTrip is what pathsim.DCLongHaul emulates, and the floor no
+	// frame can beat.
+	pathRoundTrip = 200 * time.Millisecond
+)
+
+// TestFrameLatencyUnderConcurrentSessions measures the other half of §2.3.
+//
+// It reports the distribution of per-frame round trips rather than a
+// completion time, because a session that finishes on schedule while a tenth
+// of its frames arrived 400ms late is a session the listener heard break up.
+func TestFrameLatencyUnderConcurrentSessions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("brings up a transport across an emulated path")
+	}
+	path := pathsim.DCLongHaul()
+	socks, destination := codedPairWith(t, true, &path, echoFrames)
+
+	var mu sync.Mutex
+	var all latencies
+	var late int
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < voiceSessions; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			conn, err := trySocksDial(socks, destination, 120*time.Second)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			frame := make([]byte, frameBytes)
+			reply := make([]byte, frameBytes)
+			ticker := time.NewTicker(frameInterval)
+			defer ticker.Stop()
+			for f := 0; f < framesPerFlow; f++ {
+				<-ticker.C
+				sent := time.Now()
+				if _, err := conn.Write(frame); err != nil {
+					return
+				}
+				_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+				if _, err := io.ReadFull(conn, reply); err != nil {
+					return
+				}
+				rtt := time.Since(sent)
+				mu.Lock()
+				all = append(all, rtt)
+				// Lateness has to be measured against the path, not against
+				// the frame interval. Every frame on a 200ms path takes at
+				// least 200ms, so counting anything above one interval counts
+				// all of them and distinguishes nothing. What a jitter buffer
+				// actually has to absorb is the spread above the path's own
+				// minimum, and a frame more than one interval above it has
+				// displaced the frame behind it.
+				if rtt > pathRoundTrip+frameInterval {
+					late++
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(all) == 0 {
+		t.Fatal("no frame completed a round trip")
+	}
+	p50, p99 := all.quantile(0.50), all.quantile(0.99)
+	t.Logf("%d sessions x %d frames: %d delivered, p50=%.1fms p90=%.1fms p99=%.1fms p99.9=%.1fms",
+		voiceSessions, framesPerFlow, len(all),
+		float64(p50.Microseconds())/1000,
+		float64(all.quantile(0.90).Microseconds())/1000,
+		float64(p99.Microseconds())/1000,
+		float64(all.quantile(0.999).Microseconds())/1000)
+	t.Logf("frames more than one interval above the path's own round trip: %d of %d (%.2f%%)",
+		late, len(all), 100*float64(late)/float64(len(all)))
+	// The path's own round trip is 200ms, so a frame cannot beat that and the
+	// interesting quantity is how far above it the tail sits.
+	t.Logf("p99 above the path's round trip: %.1fms", float64((p99-200*time.Millisecond).Microseconds())/1000)
+}
+
+// echoFrames returns each frame as it arrives, which is what a decoder feeding
+// a response stream does.
+func echoFrames(ln net.Listener) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			buf := make([]byte, frameBytes)
+			for {
+				if _, err := io.ReadFull(c, buf); err != nil {
+					return
+				}
+				if _, err := c.Write(buf); err != nil {
+					return
+				}
+			}
+		}(c)
+	}
+}
