@@ -395,3 +395,75 @@ func TestProvidersShareTheUplinkAndNotEachOther(t *testing.T) {
 		t.Errorf("erasure %v: the new provider did not inherit the uplink's measured 0.08", got.Erasure)
 	}
 }
+
+// Merging is how the evidence a Correlator produces becomes a tree that
+// reflects the path rather than somebody's belief about it.
+func TestMergedGroupsShareANode(t *testing.T) {
+	ResetTree()
+	before := SharedChain(Key{Egress: "e", Group: "us-east-1", Dest: "a"})
+	other := SharedChain(Key{Egress: "e", Group: "us-east-2", Dest: "b"})
+	if before.nodes[1] == other.nodes[1] {
+		t.Fatal("distinct groups shared a node before any merge")
+	}
+	MergeGroups("us-east-1", "us-east-2")
+	afterA := SharedChain(Key{Egress: "e", Group: "us-east-1", Dest: "a"})
+	afterB := SharedChain(Key{Egress: "e", Group: "us-east-2", Dest: "b"})
+	if afterA.nodes[1] != afterB.nodes[1] {
+		t.Error("merged groups did not share a node")
+	}
+	// The peers stay distinct: merging says they share a segment, not that
+	// they are the same destination.
+	if afterA.Leaf() == afterB.Leaf() {
+		t.Error("merging groups also merged their destinations")
+	}
+}
+
+// A correlator reports pairs in whatever order it found them, so merging must
+// reach the same tree either way round, and must be transitive.
+func TestMergeIsOrderIndependentAndTransitive(t *testing.T) {
+	ResetTree()
+	MergeGroups("b", "a")
+	MergeGroups("c", "b")
+	if got := GroupOf("c"); got != "a" {
+		t.Errorf("GroupOf(c) = %q, want a after transitive merge", got)
+	}
+	if GroupOf("a") != GroupOf("b") || GroupOf("b") != GroupOf("c") {
+		t.Errorf("merged groups resolve differently: %q %q %q",
+			GroupOf("a"), GroupOf("b"), GroupOf("c"))
+	}
+	ResetTree()
+	MergeGroups("a", "b")
+	MergeGroups("b", "c")
+	if got := GroupOf("c"); got != "a" {
+		t.Errorf("reversed merge order gave GroupOf(c) = %q, want a", got)
+	}
+}
+
+func TestSplitUndoesAMerge(t *testing.T) {
+	ResetTree()
+	MergeGroups("x", "y")
+	if GroupOf("y") != "x" {
+		t.Fatalf("merge did not take: %q", GroupOf("y"))
+	}
+	SplitGroup("y")
+	if GroupOf("y") != "y" {
+		t.Errorf("after split, GroupOf(y) = %q", GroupOf("y"))
+	}
+}
+
+// A cycle in the alias map must not hang a flow. It should not be reachable
+// through MergeGroups, which is why the bound is a guard rather than a policy.
+func TestAliasResolutionIsBounded(t *testing.T) {
+	ResetTree()
+	treeMu.Lock()
+	groupAlias["p"] = "q"
+	groupAlias["q"] = "p"
+	treeMu.Unlock()
+	done := make(chan string, 1)
+	go func() { done <- GroupOf("p") }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("alias resolution did not terminate on a cycle")
+	}
+}

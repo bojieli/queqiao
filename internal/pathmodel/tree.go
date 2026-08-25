@@ -201,7 +201,74 @@ func combine(states []State) State {
 var (
 	treeMu sync.Mutex
 	tree   = make(map[string]*PathModel)
+	// groupAlias re-parents one group onto another, which is how the evidence
+	// a Correlator produces is acted on. It is separate from the node map so
+	// that merging two groups does not have to move the measurements already
+	// recorded under either: both names simply resolve to one node from the
+	// next chain onward.
+	groupAlias = make(map[string]string)
 )
+
+// MergeGroups declares that two destination groups sit behind one bottleneck,
+// so that flows to either pool what they learn about the segment they share.
+//
+// This is the action half of the discovery the plan describes; Correlator
+// produces the evidence. They are separate because the evidence is the hard
+// part and applying it is a map assignment, and because a topology change
+// re-parents every subsequent flow's budget -- which is a decision a caller
+// should make under a policy it can be held to, not a side effect of
+// measurement.
+//
+// Merging is transitive and idempotent: merging c into b when b is already
+// merged into a puts all three under a.
+func MergeGroups(a, b string) {
+	if a == "" || b == "" || a == b {
+		return
+	}
+	treeMu.Lock()
+	defer treeMu.Unlock()
+	rootA, rootB := resolveAliasLocked(a), resolveAliasLocked(b)
+	if rootA == rootB {
+		return
+	}
+	// The lexicographically smaller name is kept so that merging in either
+	// order reaches the same tree, which a correlator reporting pairs in an
+	// arbitrary order otherwise would not.
+	keep, drop := rootA, rootB
+	if drop < keep {
+		keep, drop = drop, keep
+	}
+	groupAlias[drop] = keep
+}
+
+// SplitGroup undoes a merge for one group, for when the correlation that
+// justified it decays.
+func SplitGroup(group string) {
+	treeMu.Lock()
+	defer treeMu.Unlock()
+	delete(groupAlias, group)
+}
+
+// resolveAliasLocked follows the alias chain to the group a name now belongs
+// to. It is bounded by the chain length rather than trusted to terminate,
+// because a cycle here would hang every flow rather than mis-size one.
+func resolveAliasLocked(group string) string {
+	for i := 0; i < 16; i++ {
+		next, ok := groupAlias[group]
+		if !ok || next == group {
+			return group
+		}
+		group = next
+	}
+	return group
+}
+
+// GroupOf reports which group a name resolves to after merges.
+func GroupOf(group string) string {
+	treeMu.Lock()
+	defer treeMu.Unlock()
+	return resolveAliasLocked(group)
+}
 
 // SharedChain returns the chain of models a flow to this key crosses.
 //
@@ -209,6 +276,9 @@ var (
 // which is the whole point: the second destination in a group inherits what
 // the first measured about the segment they share.
 func SharedChain(k Key) *Chain {
+	if k.Group != "" {
+		k.Group = GroupOf(k.Group)
+	}
 	keys := k.chainKeys()
 	if len(keys) == 0 {
 		return &Chain{}
@@ -301,6 +371,7 @@ func ResetTree() {
 	treeMu.Lock()
 	defer treeMu.Unlock()
 	tree = make(map[string]*PathModel)
+	groupAlias = make(map[string]string)
 }
 
 // Model is what a consumer needs from a path: what is known, and a way to
