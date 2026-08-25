@@ -92,3 +92,19 @@ func TestDatacenterProfileDoesNotCallOneRequestBulk(t *testing.T) {
 		t.Error("the veto leaked into the access-link default, changing published behaviour")
 	}
 }
+
+// The access-link profile must keep the flat model. Its published results were
+// measured on it, and on a deployment with one peer the tree adds a node that
+// measures nothing while changing the numbers.
+func TestOnlyTheDatacenterProfileUsesTheHierarchy(t *testing.T) {
+	if Default().HierarchicalPath {
+		t.Error("the default profile enabled the hierarchical path model")
+	}
+	dc, err := ByName("dc-long-haul")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dc.HierarchicalPath {
+		t.Error("the datacenter profile did not enable the hierarchical path model")
+	}
+}

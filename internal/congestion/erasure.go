@@ -107,7 +107,7 @@ type ErasureSender struct {
 	// path is shared with every other lane to the same endpoint pair, or nil
 	// for a lane that is on its own. share is this lane's allowance of the
 	// endpoint's bottleneck in bytes per second, zero while it is unknown.
-	path   *pathmodel.PathModel
+	path   pathmodel.Model
 	share  atomic.Uint64
 	member pathmodel.Member
 }
@@ -147,7 +147,7 @@ func NewErasureSender(initialPacketSize quiccongestion.ByteCount) *ErasureSender
 // measures the erasure floor from only its own packets, and each discovers the
 // bottleneck from only its own delivered rate, so the aggregate overshoots by
 // however many lanes there are and the path's loss stops being memoryless.
-func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path *pathmodel.PathModel) *ErasureSender {
+func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmodel.Model) *ErasureSender {
 	e := newErasureSender(initialPacketSize)
 	e.path = path
 	if path != nil {

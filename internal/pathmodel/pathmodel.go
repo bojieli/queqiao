@@ -191,6 +191,14 @@ func NewPathModel() *PathModel {
 // evidence; observedSamples records measurement progress even while the floor
 // is still unknown.
 func (m *PathModel) Report(member Member, o Observation) State {
+	// A nil model reports nothing rather than panicking. This matters because
+	// consumers now hold the Model interface: a nil *PathModel stored in an
+	// interface is not equal to nil, so the caller's own guard does not fire
+	// and what would have been an obvious nil-pointer dereference becomes a
+	// crash inside the transport instead.
+	if m == nil {
+		return State{}
+	}
 	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -291,6 +299,9 @@ func (m *PathModel) Report(member Member, o Observation) State {
 // path in the first place. A replacement lane, opened because its predecessor
 // died, would pay it every time.
 func (m *PathModel) Current() State {
+	if m == nil {
+		return State{}
+	}
 	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -356,6 +367,9 @@ func (m *PathModel) Current() State {
 
 // Members is how many contributors are currently reporting.
 func (m *PathModel) Members() int {
+	if m == nil {
+		return 0
+	}
 	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()

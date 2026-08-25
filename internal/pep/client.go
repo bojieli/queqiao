@@ -1336,7 +1336,8 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 		outer, err = dialTCP(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl)
 	case TransportQUIC:
 		ccfg := congestionConfig{
-			kind: c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
+			hierarchicalPath: c.cfg.Profile.HierarchicalPath,
+			kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 			adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
 		}
 		if pooled {
@@ -1713,7 +1714,8 @@ func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 	}
 	entry := &bulkConn{conn: conn, packet: packet}
 	entry.controller = configureQUICController(conn, congestionConfig{
-		kind: c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
+		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
+		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
 	})
 	c.cfg.Logger.Debug("bulk QUIC pool authenticated", "duration", time.Since(started))

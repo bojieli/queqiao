@@ -53,6 +53,15 @@ type Profile struct {
 	// whatever would starve an interactive flow, and on a datacenter leg
 	// carrying only requests there is no bulk to protect anything from.
 	Classifier classifier.Config
+	// HierarchicalPath models the path as a chain of segments -- the uplink,
+	// then the peer -- rather than as one endpoint pair, and lets a flow do
+	// only what the tighter segment permits.
+	//
+	// It is off for the access-link profile because that deployment has one
+	// peer, so the two models are identical by construction and the extra node
+	// would measure nothing while changing the numbers the published results
+	// were taken with.
+	HierarchicalPath bool
 }
 
 // wanSharedBottleneck is the deployment this project was built for and the one
@@ -101,7 +110,8 @@ func dcLongHaul() Profile {
 	// application's.
 	c.BulkIdleGapVeto = 1 * time.Second
 	return Profile{
-		Name: "dc-long-haul",
+		Name:             "dc-long-haul",
+		HierarchicalPath: true,
 		Precondition: "both endpoints are operated by the same party, the leg " +
 			"between them is long, and every flow on it is a latency-critical " +
 			"request rather than a transfer seeking throughput",

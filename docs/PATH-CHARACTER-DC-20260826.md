@@ -393,3 +393,35 @@ sequence. The two earlier claims in this document that did not survive checking
 -- that UDP was policed harder than TCP, and that classification cost a factor
 of two -- were both produced by a confound rather than by wrong numbers, which
 is the failure mode worth designing the instruments against.
+
+## The hierarchical path model, and what this path could not tell us about it
+
+The path is modelled as a chain of segments -- the uplink, then the peer --
+rather than as a single endpoint pair, with a flow permitted only what the
+tighter segment allows, and a node below a hundred observed samples permitted
+to constrain nothing.
+
+Enabled on the datacenter profile and measured against the flat model,
+order-alternated, 30 samples each, 300KB download:
+
+| model | median | p25 | p75 |
+|---|---|---|---|
+| flat, one model per endpoint pair | 607.8ms | 559.3 | 802.3 |
+| hierarchical | 585.5ms | 461.8 | 816.6 |
+
+Arm effect 22.3ms against an order effect of 11.5ms. The arm wins by a factor
+of 1.9, which is thin: **this is a no-regression result and not an
+improvement**, and 22ms on a 600ms base with this path's variance is not a
+number to build on.
+
+The more useful statement is what the measurement could not cover. This
+deployment has **one** provider, so the chain is the uplink node and the peer
+node carrying identical traffic -- the tree is degenerate here by construction,
+and what was actually measured is the confidence rule, not the hierarchy. The
+hierarchy earns its keep where flows go to different places over one uplink,
+which is what a multi-provider client or a node relay serving several regional
+gateways does, and neither exists on this path.
+
+So the gate the plan set -- no regression before any claim -- is met, and the
+claim it was gating remains unmade. The mechanism is in place, tested against
+its degenerate cases, and off by default.
