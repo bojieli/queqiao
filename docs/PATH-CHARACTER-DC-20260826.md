@@ -603,3 +603,44 @@ against each arm's own floor, so the arm with the 10ms lower median had 10ms
 more room beneath its own bar and reported fewer late frames for that reason
 alone. Counting against fixed thresholds -- 250ms, 400ms, a second -- removes
 it, and removes the finding with it. A listener does not have a relative bar.
+
+## What HTTP/2's flow-control window actually costs, and who actually pays it
+
+The datacenter plan claims that HTTP/2 flow control is usually the largest
+single component of a slow upload and the one no TCP tuning reaches. The
+mechanism is real, the magnitude is larger than claimed, and the word "usually"
+was wrong.
+
+The same 1MB upload to the same server on this 200ms path, differing only in
+the window it advertises:
+
+| receiver window | 300KB warm | 1MB warm |
+|---|---|---|
+| Go's `http2.Server` default | 187.5ms | 193.2ms |
+| 8MB, set explicitly | 191.3ms | 200.6ms |
+| **65535, the RFC's default** | **912.7ms** | **3903.0ms** |
+
+At the RFC value a megabyte takes **twenty times** as long, and the arithmetic
+is exactly the one the plan predicted: the window is credit per round trip, so
+1MB over 64KB is sixteen round trips, and sixteen times 200ms is 3.2 seconds
+against 3.9 measured. 300KB is 4.7 round trips, 940ms predicted against 912.7
+measured. The mechanism is confirmed to within the path's own noise.
+
+**But Go's server does not use 65535.** `x/net/http2` defaults both
+`MaxUploadBufferPerStream` and `MaxUploadBufferPerConnection` to 1MB, and gRPC-go
+goes further and tunes the window from a measured bandwidth-delay product. The
+64KB figure is what RFC 7540 specifies, not what a Go service running on a
+default configuration advertises -- and the first two rows above are
+indistinguishable because both were already far above the ceiling.
+
+So the claim that survives is narrower and more useful than the one that went
+in: **when the receiver's window is 64KB this dominates everything else by a
+factor of twenty, and whether it is 64KB is a property of the implementation
+rather than of HTTP/2.** Measure it before assuming it. The check is cheap and
+the two answers are five hundred milliseconds apart on a payload an inference
+call actually sends.
+
+The related trap is unchanged and worth keeping: RFC 7540 6.9.2 makes
+`SETTINGS_INITIAL_WINDOW_SIZE` govern stream windows only, so a stack that sets
+it and forgets the connection window is capped across every stream at once.
+Both are set together above for that reason.

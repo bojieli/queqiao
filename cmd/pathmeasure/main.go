@@ -21,6 +21,8 @@
 //	fct        flow completion time for request-sized payloads, cold and warm
 //	burst      repeated bursts on one connection, with the window at each step
 //	udp        open-loop UDP in the upload direction
+//	h2serve    an HTTP/2 sink whose flow-control windows are settable
+//	h2         upload over HTTP/2, to measure what those windows cost
 //	load       many concurrent request flows, reporting the tail
 //	frames     many concurrent frame streams, reporting per-message latency
 //	ab         order-alternated A/B of two arms, pooled
@@ -36,6 +38,9 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -49,6 +54,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"net/http"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
 	"github.com/bojieli/queqiao/internal/tcpinfo"
 )
@@ -79,6 +89,7 @@ func run(args []string) error {
 	bSpec := fs.String("b", "", "ab: second arm, same form as --a")
 	rounds := fs.Int("rounds", 3, "ab: round pairs; each pair runs A-first once and B-first once")
 	flows := fs.Int("flows", 16, "load/frames: concurrent flows or sessions")
+	h2Window := fs.Int("h2-window", 0, "h2serve: SETTINGS_INITIAL_WINDOW_SIZE and the connection window, in bytes. 0 leaves the library default, which is the 64KB the RFC specifies")
 	frames := fs.Int("frames", 100, "frames: messages per session")
 	frameBytes := fs.Int("frame-bytes", 80, "frames: message size")
 	frameEvery := fs.Float64("frame-interval", 0.02, "frames: seconds between messages")
@@ -111,6 +122,13 @@ func run(args []string) error {
 		}
 		return burstRun(*remote, *bursts, *bytesToSend,
 			time.Duration(*idle*float64(time.Second)), *cc, *localAddr)
+	case "h2serve":
+		return h2Serve(*listen, *h2Window)
+	case "h2":
+		if *remote == "" {
+			return errors.New("h2 needs --remote")
+		}
+		return h2Run(*remote, *sizes, *repeat, *localAddr)
 	case "load":
 		if *remote == "" {
 			return errors.New("load needs --remote")
@@ -138,7 +156,7 @@ func run(args []string) error {
 		}
 		return rttRun(*remote, *count, *localAddr)
 	default:
-		return errors.New("--mode must be serve, tcp, fct, burst, udp, ab, load, frames, or rtt")
+		return errors.New("--mode must be serve, tcp, fct, burst, udp, ab, load, frames, h2serve, h2, or rtt")
 	}
 }
 
@@ -1380,5 +1398,96 @@ func framesRun(remote string, sessions, count, size int, every time.Duration, lo
 	fmt.Printf("%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.1f\t%.2f%%\t%.2f%%\t%.2f%%\n",
 		len(got), p50, p90, p99, p999, p99/p50, floor,
 		over(250), over(400), over(1000))
+	return nil
+}
+
+// HTTP/2 flow control is usually the largest single component of a slow upload
+// and the one no TCP tuning reaches.
+//
+// SETTINGS_INITIAL_WINDOW_SIZE defaults to 65535 bytes, and the window is
+// credit per round trip, so it is a hard throughput ceiling: 64KB per RTT is
+// 936 KB/s at 70ms and 328 KB/s at 200ms, whatever the congestion window is
+// doing. Two properties make it worse than it looks. It is advertised by the
+// receiver, so for an upload the limit belongs to the server rather than to
+// the client that is slow. And it applies to each new stream, so a connection
+// that has been open for hours gives every fresh request the same 64KB.
+//
+// These two modes exist to put a number on that claim rather than asserting
+// it, by running the same upload against a server that has raised its windows
+// and one that has not.
+
+// h2Serve sinks HTTP/2 request bodies, with the flow-control windows settable
+// so the same binary provides both arms of the comparison.
+func h2Serve(addr string, window int) error {
+	h2s := &http2.Server{}
+	if window > 0 {
+		// Both windows, because they are separate. RFC 7540 6.9.2:
+		// SETTINGS_INITIAL_WINDOW_SIZE changes stream windows only, and the
+		// connection window is raised solely by WINDOW_UPDATE -- so a server
+		// that sets the first and forgets the second is capped at 64KB across
+		// every stream at once, which is the more common misconfiguration.
+		h2s.MaxUploadBufferPerStream = int32(window)
+		h2s.MaxUploadBufferPerConnection = int32(window)
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := io.Copy(io.Discard, r.Body)
+		fmt.Fprintf(w, "%d", n)
+	})
+	srv := &http.Server{Addr: addr, Handler: h2c.NewHandler(handler, h2s)}
+	fmt.Printf("pathmeasure h2 server on %s (window=%d, 0 means library default)\n", addr, window)
+	return srv.ListenAndServe()
+}
+
+// h2Run uploads a payload over HTTP/2 and times it, reusing one connection so
+// that the handshake is paid once and what is left is the windows.
+func h2Run(remote, sizes string, repeat int, localAddr string) error {
+	var list []int64
+	for _, f := range strings.Split(sizes, ",") {
+		n, err := parseSize(f)
+		if err != nil {
+			return err
+		}
+		list = append(list, n)
+	}
+	d, err := dialer(localAddr)
+	if err != nil {
+		return err
+	}
+	transport := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Minute}
+	if repeat < 1 {
+		repeat = 1
+	}
+	fmt.Printf("# HTTP/2 upload to %s, one connection reused\n", remote)
+	fmt.Printf("size\titeration\tms\teff_Mbit\n")
+	for _, n := range list {
+		body := make([]byte, n)
+		for i := 0; i < repeat; i++ {
+			start := time.Now()
+			req, err := http.NewRequest(http.MethodPost, "http://"+remote+"/", bytes.NewReader(body))
+			if err != nil {
+				return err
+			}
+			req.ContentLength = n
+			resp, err := client.Do(req)
+			if err != nil {
+				fmt.Printf("%s\t%d\tERROR: %v\n", human(n), i, err)
+				continue
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			ms := float64(time.Since(start).Microseconds()) / 1000
+			label := "warm"
+			if i == 0 {
+				label = "first"
+			}
+			fmt.Printf("%s\t%s\t%.1f\t%.2f\n", human(n), label, ms, float64(n)*8/(ms/1000)/1e6)
+		}
+	}
 	return nil
 }
