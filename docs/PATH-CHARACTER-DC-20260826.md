@@ -783,3 +783,51 @@ hardened implementation rather than parsing frames itself, and it is a
 measurement instrument rather than something to put in front of untrusted
 traffic. That is the reason to keep the L7 path narrowly scoped to the case
 that needs it, rather than making it the general shape.
+
+## One relay per node, or one per group? The path disagrees with the plan
+
+The datacenter plan argues for a node-level relay on the grounds that a sidecar
+per pod fragments the path model: each sidecar measures the shared segment
+alone, keeps its own connection pool, and probes on its own traffic, which is
+the failure `pathmodel` exists to prevent, reproduced one layer up.
+
+Twenty-four concurrent 300KB requests, either all through one client or split
+eight apiece across three independent clients with their own tunnels and their
+own path models, run in both orders:
+
+| order | one relay, 24 flows | three relays, 8 flows each |
+|---|---|---|
+| shared first | 1696.9ms, **34.6 Mbit/s** | 750/1176/1302ms, **57.5 Mbit/s** |
+| split first | 2540.6ms, **23.1 Mbit/s** | 396/1187/1382ms, **78.7 Mbit/s** |
+
+**Three relays beat one by about two and a half times in aggregate, in both
+orders.** The batch also finishes sooner: 1.4 seconds against 2.6, because the
+three groups run concurrently and the slowest of them still beats the shared
+relay's single figure.
+
+The mechanism is not subtle. Three tunnels are three QUIC connections with
+three independent congestion controllers, each with its own window, probing a
+333 Mbit/s path in parallel. One tunnel is one controller, and on a path with
+no shared bottleneck to contend for there is nothing for the coordination to
+buy.
+
+That last clause is the important one, because this project already settled
+this question the other way. The multipath design was measured and retired on
+the grounds that "the motivating bottleneck is shared by endpoint pair rather
+than independent 4-tuples" -- on the China access link, four lanes delivered
+about 8 Mbit/s where one delivered 11. **Both results are correct and they are
+about different paths.** Where the bottleneck is the client's own access link,
+splitting cannot multiply a share that does not exist and the coordination is
+what keeps the aggregate from overshooting the knee. Where the bottleneck is
+far away and the path is wide, splitting is simply parallelism and it works.
+
+So the plan's Phase 5 argument does not hold here as written, and the honest
+version of it is narrower. What the shared relay does buy, visibly, is
+**fairness**: every one of its 24 flows completed within 2ms of every other,
+p99/p50 of 1.00, while the split arm's three groups differed by up to 3.5x
+between them. A deployment that cares about the spread across tenants has a
+reason to share; one that cares about aggregate does not.
+
+Neither answer is the one the plan assumed, and the disagreement is the useful
+part: the node-relay argument was inherited from a regime where the bottleneck
+is at the sender, and this regime does not have one.
