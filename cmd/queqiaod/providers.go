@@ -197,6 +197,7 @@ func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtim
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
+		Profile:       opts.resolvedProfile,
 		Budget:        budget,
 		FallbackDelay: opts.fallbackDelay, FallbackGrace: opts.fallbackGrace,
 		UDPFailureThreshold: opts.udpFailureThreshold, UDPCooldown: opts.udpCooldown,

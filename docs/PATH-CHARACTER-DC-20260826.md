@@ -234,27 +234,68 @@ so an application flow costs half a millisecond locally plus one round trip,
 paying neither handshake nor ramp. A direct 1MB cold flow spends 2.2 seconds
 climbing to a rate it then stops needing.
 
-Warm flows are where the transport costs something. At 300KB it is 20ms of
-overhead. At 1MB it is a factor of two, and the shape of the regression names
-the cause: `warm-first` completes in 227ms and the flows *after* it take
-431-452ms, which is backwards unless something reclassified the flow in
-between. The counters confirm it -- `queqiao_class_transitions_2_total` reached
-1 and `queqiao_bulk_isolations_total` reached 2. A repeated 1MB payload crosses
-the classifier's 128KB bulk threshold, becomes bulk permanently, and is then
-isolated to protect interactive traffic that does not exist on this connection.
+Warm flows are where the transport costs something. At 300KB it is about 20ms.
+At 1MB the first reading showed a factor of two, and that reading did not
+survive being checked -- see the next section, which is the more important
+result.
 
 ### What the baseline actually says
 
 The datacenter plan predicted that today's transport would make this workload
-worse. That prediction is wrong in general and right in one corner:
+worse. It does not:
 
 - **Cold flows gain 5-10x** in both directions, from connection reuse alone.
 - **The erasure direction gains 17x** at 300KB, from coding.
-- **Warm flows above the bulk threshold lose 2x**, from a classifier whose
-  premise -- that bulk traffic exists and must be kept away from interactive
-  traffic -- does not hold when every flow is a latency-critical burst.
+- **Warm flows cost 20ms at 300KB**, and are otherwise unchanged.
 
-The classifier change the plan proposes is still needed. It is a correction to
-one regressing case rather than a rescue of a transport that was making things
-worse, and stating it the other way round would have been an easier sell and a
-false one.
+## An A/B that measured the experiment instead of the change
+
+The one apparent regression -- repeated 1MB requests taking 431-452ms against
+224ms direct -- was attributed to flow classification, because the counters
+showed a flow demoted to bulk and the classifier's 128KB threshold makes that
+inevitable for a megabyte request. A profile was built to prevent the demotion.
+
+It prevents it. `queqiao_class_transitions_2_total` reads 1 to 4 on the
+access-link profile and 0 on the datacenter profile, every run. The mechanism
+does exactly what it was written to do.
+
+It makes no difference to latency at all.
+
+Three interleaved rounds of eight warm 300KB flows per profile, then three more
+with the order reversed, 48 samples per profile:
+
+| | median | p25 | p75 |
+|---|---|---|---|
+| access-link profile, bulk allowed | 454.1ms | 295.6 | 508.6 |
+| datacenter profile, bulk prevented | 456.5ms | 295.9 | 662.7 |
+
+Two and a half milliseconds apart on a base of 455. Sorting the same 96 samples
+by position in the measurement sequence instead of by profile:
+
+| | median | p25 | p75 |
+|---|---|---|---|
+| whichever profile was measured **first** | 304.6ms | 292.3 | 535.4 |
+| whichever profile was measured **second** | 463.1ms | 297.4 | 627.3 |
+
+**Run order is worth 158ms and the change under test is worth 2.4ms.** The
+first three rounds measured the access-link profile first and appeared to show
+it winning by 53%; reversing the order reversed the finding. What was being
+measured was position in the sequence.
+
+Two conclusions, and the second is the one worth keeping.
+
+The classifier change is **principled but unproven**. A request that goes quiet
+between bursts is not a transfer seeking throughput, and calling it one is
+wrong regardless of what it costs -- but on this path it costs nothing
+measurable, and the plan's justification for the change, that it removes a
+regression, is not supported. It remains behind an experimental profile that no
+existing deployment selects, which is the right place for a change whose
+benefit has not been demonstrated.
+
+And **this path cannot support an A/B of anything smaller than about 30%
+without alternating order and pooling.** Identical warm 300KB flows ranged from
+250ms to 2906ms. Any comparison here that runs A then B, once, is measuring the
+sequence. The two earlier claims in this document that did not survive checking
+-- that UDP was policed harder than TCP, and that classification cost a factor
+of two -- were both produced by a confound rather than by wrong numbers, which
+is the failure mode worth designing the instruments against.

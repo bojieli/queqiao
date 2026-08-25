@@ -79,3 +79,97 @@ func TestBulkClassDoesNotFlap(t *testing.T) {
 		t.Fatalf("class = %s after idle gap, want bulk", got)
 	}
 }
+
+// The measured regression these settings exist for: a connection carrying
+// repeated megabyte requests accumulates enough bytes to cross the access-link
+// bulk threshold, is demoted permanently, and is then isolated to protect
+// interactive traffic that does not exist on it. On the China-US datacenter
+// path that cost a factor of two while every other case gained five to
+// seventeen times.
+//
+// The thresholds carry most of this: one request must not look like a
+// transfer. The veto carries the rest: many requests must not add up to one.
+func dcClassifier() *Classifier {
+	cfg := DefaultConfig()
+	cfg.BulkBytes = 32 << 20
+	cfg.BulkMinimumAge = 10 * time.Second
+	cfg.BulkIdleGapVeto = time.Second
+	return New(cfg)
+}
+
+func TestOneLargeRequestIsNotBulkOnADatacenterLeg(t *testing.T) {
+	c := dcClassifier()
+	busy := Observation{BytesUp: 5 << 20, Age: 2 * time.Second,
+		SinceLastPayload: 10 * time.Millisecond, UpRate: 20 << 20}
+	if got := c.Observe(busy); got == ClassBulk {
+		t.Fatalf("a single 5MB request classified %v", got)
+	}
+}
+
+func TestManyRequestsDoNotAddUpToBulk(t *testing.T) {
+	c := dcClassifier()
+	busy := Observation{BytesUp: 1 << 20, Age: 2 * time.Second,
+		SinceLastPayload: 10 * time.Millisecond, UpRate: 20 << 20}
+	c.Observe(busy)
+	// The caller waits for a response, which is what a request does.
+	idle := busy
+	idle.SinceLastPayload = 2 * time.Second
+	c.Observe(idle)
+	// Enough further requests to pass even the datacenter byte threshold.
+	for i := 0; i < 60; i++ {
+		busy.BytesUp += 1 << 20
+		busy.Age += 2 * time.Second
+		if got := c.Observe(busy); got == ClassBulk {
+			t.Fatalf("request %d classified bulk at %d bytes after an observed idle",
+				i, busy.BytesUp)
+		}
+	}
+}
+
+// The veto must not change the profile whose published results depend on the
+// old behaviour: there, a slow bulk transfer is slow because the path is bad,
+// and it still has to unlock lanes.
+func TestIdleGapVetoDisabledLeavesBulkReachable(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.BulkIdleGapVeto != 0 {
+		t.Fatalf("default profile enabled the veto: %v", cfg.BulkIdleGapVeto)
+	}
+	c := New(cfg)
+	o := Observation{BytesUp: 300 * 1024, Age: 2 * time.Second,
+		SinceLastPayload: 5 * time.Second}
+	if got := c.Observe(o); got != ClassBulk {
+		t.Fatalf("with the veto off, a long-idle large flow classified %v, want bulk", got)
+	}
+}
+
+// A genuine bulk transfer never stops asking, so it must still be demoted on
+// the datacenter profile. Otherwise that profile would have no bulk class at
+// all rather than a correctly narrow one.
+func TestSustainedTransferStillBecomesBulkOnADatacenterLeg(t *testing.T) {
+	c := dcClassifier()
+	o := Observation{Age: 11 * time.Second, SinceLastPayload: 5 * time.Millisecond,
+		UpRate: 100 << 20}
+	for i := 0; i < 60; i++ {
+		o.BytesUp += 4 << 20
+		o.Age += time.Second
+		if c.Observe(o) == ClassBulk {
+			return
+		}
+	}
+	t.Fatalf("a continuously busy multi-hundred-megabyte transfer never became bulk")
+}
+
+// The veto is sticky. A flow seen idle must not become bulk later merely
+// because a subsequent observation lands mid-burst -- which is the common case,
+// since the scheduler ticks during bursts too.
+func TestIdleVetoSurvivesLaterBusyObservations(t *testing.T) {
+	c := dcClassifier()
+	c.Observe(Observation{Age: 2 * time.Second, SinceLastPayload: 3 * time.Second})
+	busy := Observation{BytesUp: 500 << 20, Age: 300 * time.Second,
+		SinceLastPayload: time.Millisecond, UpRate: 100 << 20}
+	for i := 0; i < 10; i++ {
+		if got := c.Observe(busy); got == ClassBulk {
+			t.Fatalf("observation %d after an idle re-enabled bulk", i)
+		}
+	}
+}

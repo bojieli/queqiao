@@ -376,10 +376,16 @@ func newMultipathFlow(ctx context.Context, inner net.Conn, sessionID [16]byte, f
 	if len(loggers) > 0 {
 		logger = loggers[0]
 	}
-	return newMultipathFlowWithMemory(ctx, inner, sessionID, flowID, chunkSize, sendAckFlag, recvAckFlag, budget, registry, logger, defaultFlowMemoryLimits(), nil, nil)
+	return newMultipathFlowWithMemory(ctx, inner, sessionID, flowID, chunkSize, sendAckFlag, recvAckFlag, budget, registry, logger, defaultFlowMemoryLimits(), nil, nil, classifier.DefaultConfig())
 }
 
-func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [16]byte, flowID uint64, chunkSize int, sendAckFlag, recvAckFlag uint16, budget *limiter.Budget, registry *metrics.Registry, logger *slog.Logger, memoryLimits flowMemoryLimits, sendMemory, receiveMemory *memlimit.Budget) *multipathFlow {
+func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [16]byte, flowID uint64, chunkSize int, sendAckFlag, recvAckFlag uint16, budget *limiter.Budget, registry *metrics.Registry, logger *slog.Logger, memoryLimits flowMemoryLimits, sendMemory, receiveMemory *memlimit.Budget, classifierCfg classifier.Config) *multipathFlow {
+	// A zero config would classify nothing, which reads as "every flow is new"
+	// rather than as a misconfiguration. Falling back to the documented default
+	// keeps a caller that forgot the parameter on the supported policy.
+	if classifierCfg.NewBytes == 0 || classifierCfg.BulkBytes == 0 {
+		classifierCfg = classifier.DefaultConfig()
+	}
 	if chunkSize <= 0 {
 		chunkSize = defaultChunkSize
 	}
@@ -394,7 +400,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 		finalAck: make(chan struct{}, 1), sendDone: make(chan struct{}),
 		done: make(chan struct{}), localClosedCh: make(chan struct{}), remoteAbortCh: make(chan struct{}),
 		ackWake: make(chan struct{}, 1), ackErr: make(chan error, 1),
-		classifier: classifier.New(classifier.DefaultConfig()), started: time.Now(), completionGrace: flowCompletionGrace,
+		classifier: classifier.New(classifierCfg), started: time.Now(), completionGrace: flowCompletionGrace,
 	}
 	f.idleTimeout = defaultFlowIdleTimeout
 	f.maxLifetime = defaultFlowMaxLifetime

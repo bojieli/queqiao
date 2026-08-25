@@ -24,6 +24,7 @@ import (
 	"github.com/bojieli/queqiao/internal/netbind"
 	"github.com/bojieli/queqiao/internal/operlog"
 	"github.com/bojieli/queqiao/internal/pep"
+	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
@@ -489,24 +490,28 @@ func runEnroll(args []string) error {
 }
 
 type runtimeOptions struct {
-	listen, localAddress, transport, tcpCongestion                  string
+	listen, localAddress, transport, tcpCongestion, pathProfile     string
 	maxSessions, maxPendingOpens, tcpFallbackLanes                  int
 	chunkSize                                                       int
 	dialTimeout, handshakeTimeout, flowIdleTimeout, flowMaxLifetime time.Duration
 	quicPool, waitForOpenAck, udpOnStream                           bool
-	congestion                                                      string
-	brutalBytesPerSec, adaptiveMinBytesSec, adaptiveMaxBytesSec     uint64
-	aggregateBytesPerSec, interactiveReserveBytesPerSec             uint64
-	fallbackDelay, fallbackGrace, udpCooldown                       time.Duration
-	udpFailureThreshold                                             int
-	allowPrivate                                                    bool
-	logLevel, logFile, logFormat                                    string
-	jsonLogs                                                        bool
-	logStderr                                                       bool
-	logMaxSizeMiB                                                   int64
-	logMaxBackups                                                   int
-	telemetryLogInterval                                            time.Duration
-	metricsListen                                                   string
+	// resolvedProfile is the deployment policy, parsed once at flag time so
+	// that an unknown name fails before anything starts rather than being
+	// silently replaced by the default.
+	resolvedProfile                                             profile.Profile
+	congestion                                                  string
+	brutalBytesPerSec, adaptiveMinBytesSec, adaptiveMaxBytesSec uint64
+	aggregateBytesPerSec, interactiveReserveBytesPerSec         uint64
+	fallbackDelay, fallbackGrace, udpCooldown                   time.Duration
+	udpFailureThreshold                                         int
+	allowPrivate                                                bool
+	logLevel, logFile, logFormat                                string
+	jsonLogs                                                    bool
+	logStderr                                                   bool
+	logMaxSizeMiB                                               int64
+	logMaxBackups                                               int
+	telemetryLogInterval                                        time.Duration
+	metricsListen                                               string
 }
 
 func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
@@ -548,6 +553,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.StringVar(&opts.localAddress, "local-address", "auto", "outer source: auto, IP, or if:NAME")
 		fs.IntVar(&opts.maxPendingOpens, "max-pending-opens", 256, "concurrent remote flow opens")
 		fs.BoolVar(&opts.quicPool, "quic-pool", true, "reuse a persistent QUIC connection")
+		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this client runs in: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.BoolVar(&opts.waitForOpenAck, "wait-for-open-ack", false, "wait for destination confirmation before answering SOCKS")
 		fs.DurationVar(&opts.fallbackDelay, "fallback-delay", 300*time.Millisecond, "delay before preparing TCP fallback")
 		fs.DurationVar(&opts.fallbackGrace, "fallback-grace", 2*time.Second, "time a ready TCP fallback waits for QUIC")
@@ -555,8 +561,21 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.DurationVar(&opts.udpCooldown, "udp-cooldown", 30*time.Second, "UDP cooldown after repeated failure")
 	} else {
 		fs.StringVar(&opts.tcpCongestion, "tcp-congestion", "system", "server TCP congestion controller")
+		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this gateway serves: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.BoolVar(&opts.allowPrivate, "allow-private-destinations", false, "allow private and link-local destinations")
 	}
+}
+
+// resolveProfile parses the deployment profile once, so an unknown name is a
+// startup failure rather than a silent fallback to a policy the operator did
+// not ask for.
+func resolveProfile(opts *runtimeOptions) error {
+	p, err := profile.ByName(opts.pathProfile)
+	if err != nil {
+		return err
+	}
+	opts.resolvedProfile = p
+	return nil
 }
 
 func validateRuntime(opts runtimeOptions, client bool) error {
@@ -652,6 +671,9 @@ func runClient(args []string) (returnErr error) {
 	if err := requireNoArguments(fs); err != nil {
 		return err
 	}
+	if err := resolveProfile(&opts); err != nil {
+		return err
+	}
 	if *profilePath != "" && *providersPath != "" {
 		return errors.New("--profile and --providers are mutually exclusive")
 	}
@@ -736,6 +758,15 @@ func runServer(args []string) (returnErr error) {
 		return err
 	}
 	service := &identity.EnrollmentService{Provider: provider}
+	// An unknown profile name is refused rather than ignored. Starting on a
+	// different policy than the operator asked for is the failure the profile
+	// package exists to prevent, and it would be invisible in the logs.
+	serverProfile, err := profile.ByName(opts.pathProfile)
+	if err != nil {
+		return err
+	}
+	logger.Info("path profile selected", "profile", serverProfile.Name,
+		"level", string(serverProfile.Level), "evidence", serverProfile.Evidence)
 	server, err := pep.NewServer(pep.ServerConfig{
 		ListenAddr: opts.listen, Credentials: provider.ServerCredentials(), Enrollment: service,
 		ChunkSize:        opts.chunkSize,
@@ -748,7 +779,7 @@ func runServer(args []string) (returnErr error) {
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
-		Logger: logger, UDPOnStream: opts.udpOnStream,
+		Logger: logger, UDPOnStream: opts.udpOnStream, Profile: serverProfile,
 	})
 	if err != nil {
 		return err
@@ -877,6 +908,8 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 			slog.String("local_address", opts.localAddress),
 			slog.Int("max_pending_opens", opts.maxPendingOpens),
 			slog.Bool("quic_pool", opts.quicPool),
+			slog.String("path_profile", opts.resolvedProfile.Name),
+			slog.String("path_profile_level", string(opts.resolvedProfile.Level)),
 			slog.Bool("wait_for_open_ack", opts.waitForOpenAck),
 			slog.Duration("fallback_delay", opts.fallbackDelay),
 			slog.Duration("fallback_grace", opts.fallbackGrace),

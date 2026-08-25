@@ -41,6 +41,23 @@ type Config struct {
 	BulkMinimumAge      time.Duration
 	InteractiveMaxRate  float64
 	InteractiveIdleGap  time.Duration
+	// BulkIdleGapVeto disqualifies a flow from ever becoming bulk once it has
+	// been observed idle for this long. Zero disables the veto, which is the
+	// behaviour every deployment had before it existed.
+	//
+	// Cumulative bytes cannot separate a bulk transfer from a series of
+	// requests on one connection: three 300KB exchanges and a 900KB download
+	// weigh the same, and the classifier latches on the first to cross the
+	// threshold. Rate cannot separate them either, because a request burst is
+	// briefly faster than the bulk floor, not slower.
+	//
+	// Duty cycle does separate them. A flow seeking throughput does not stop
+	// asking for it; one that voluntarily goes quiet for a second and then
+	// resumes is a caller waiting on something, whatever its byte total. The
+	// veto is sticky for the same reason the bulk decision is sticky: the
+	// evidence is about what kind of flow this is, and it does not expire when
+	// the next burst starts.
+	BulkIdleGapVeto time.Duration
 }
 
 func DefaultConfig() Config {
@@ -83,9 +100,14 @@ type Observation struct {
 // word is exactly the size of value a race detector finds and a reader gets
 // half of.
 type Classifier struct {
-	cfg   Config
-	mu    sync.Mutex
-	class Class
+	// sawIdle records that this flow has been quiet long enough to disqualify
+	// it from bulk under BulkIdleGapVeto. It is the mirror of the sticky bulk
+	// decision below: both are conclusions about the flow's kind rather than
+	// about its present moment.
+	sawIdle bool
+	cfg     Config
+	mu      sync.Mutex
+	class   Class
 }
 
 func New(cfg Config) *Classifier {
@@ -110,6 +132,9 @@ func (c *Classifier) Observe(o Observation) Class {
 	if c.class == ClassBulk {
 		return c.class
 	}
+	if c.cfg.BulkIdleGapVeto > 0 && o.SinceLastPayload >= c.cfg.BulkIdleGapVeto {
+		c.sawIdle = true
+	}
 	if c.isBulk(o) {
 		c.class = ClassBulk
 		return c.class
@@ -123,6 +148,9 @@ func (c *Classifier) Observe(o Observation) Class {
 }
 
 func (c *Classifier) isBulk(o Observation) bool {
+	if c.sawIdle {
+		return false
+	}
 	return o.Age >= c.cfg.BulkMinimumAge &&
 		o.BytesUp+o.BytesDown >= c.cfg.BulkBytes &&
 		(!o.Bidirectional || !o.SmallBidirectionalBursts)

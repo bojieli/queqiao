@@ -20,6 +20,7 @@ import (
 	"github.com/bojieli/queqiao/internal/limiter"
 	"github.com/bojieli/queqiao/internal/memlimit"
 	"github.com/bojieli/queqiao/internal/metrics"
+	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
 	"github.com/bojieli/queqiao/internal/socks5"
@@ -74,8 +75,13 @@ type ClientConfig struct {
 	// desktop agent and the mobile packet tunnel, and set when the listener is
 	// reachable by other applications on the same host, as in Android export
 	// mode where loopback is shared across every installed app.
-	SOCKSAuth        *socks5.Credentials
-	Credentials      identity.ClientCredentials
+	SOCKSAuth   *socks5.Credentials
+	Credentials identity.ClientCredentials
+	// Profile names the deployment this client is running in, and carries the
+	// policy that differs between deployments. The zero value is the supported
+	// access-link profile, so a caller that does not choose gets the behaviour
+	// the published measurements describe.
+	Profile          profile.Profile
 	ChunkSize        int
 	DialTimeout      time.Duration
 	HandshakeTimeout time.Duration
@@ -776,7 +782,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 		return
 	}
 	c.cfg.Logger.Debug("local flow opened", "transport", flow.kind, "duration", time.Since(flowOpenStarted))
-	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory)
+	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
 	flowSession.ackRanges.Store(true)
 	flowSession.idleTimeout = c.cfg.FlowIdleTimeout
 	flowSession.maxLifetime = c.cfg.FlowMaxLifetime
@@ -2542,4 +2548,15 @@ func closeAuthenticatedLane(lane *authenticatedLane) {
 	if lane != nil && lane.fc != nil {
 		_ = lane.fc.Close()
 	}
+}
+
+// classifierConfig is the flow-classification policy this client's profile
+// asks for. It is read per flow rather than cached so that a profile chosen at
+// startup is visible in every flow the process creates, including ones opened
+// long afterwards.
+func (c *Client) classifierConfig() classifier.Config {
+	if c.cfg.Profile.Classifier.BulkBytes == 0 {
+		return profile.Default().Classifier
+	}
+	return c.cfg.Profile.Classifier
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/limiter"
 	"github.com/bojieli/queqiao/internal/metrics"
+	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
 )
@@ -28,6 +29,9 @@ import (
 const completedSessionLinger = 90 * time.Second
 
 type ServerConfig struct {
+	// Profile names the deployment this gateway serves; see internal/profile.
+	// The zero value is the supported access-link profile.
+	Profile           profile.Profile
 	ListenAddr        string
 	Credentials       identity.ServerCredentials
 	Enrollment        *identity.EnrollmentService
@@ -719,6 +723,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	s.cfg.Logger.Debug("remote flow opened", "transport", transportKindForConn(conn), "account", principal.AccountID, "device", principal.DeviceID, "open_duration", destinationDialStarted.Sub(sessionStarted), "destination_dial_duration", time.Since(destinationDialStarted), "total_duration", time.Since(sessionStarted))
 	defer destinationConn.Close()
 	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
+	flow.classifier = classifier.New(s.classifierConfig())
 	// Wire version 1 requires range acknowledgements on both endpoints.
 	flow.ackRanges.Store(true)
 	flow.idleTimeout = s.cfg.FlowIdleTimeout
@@ -1210,4 +1215,16 @@ func transportKindForConn(conn streamConn) TransportKind {
 		return TransportQUIC
 	}
 	return TransportTCP
+}
+
+// classifierConfig is the gateway's flow-classification policy. A gateway
+// serving a datacenter leg has the same reason as its client to stop calling a
+// large request a bulk transfer, and the two ends classify independently, so
+// setting it on only one of them would leave the other demoting flows the first
+// had decided to protect.
+func (s *Server) classifierConfig() classifier.Config {
+	if s.cfg.Profile.Classifier.BulkBytes == 0 {
+		return profile.Default().Classifier
+	}
+	return s.cfg.Profile.Classifier
 }
