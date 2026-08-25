@@ -698,3 +698,47 @@ first was fixed in #55 with the observation that a counter which cannot be
 produced reads as a confident measurement once it stops wobbling. The general
 lesson is the same: check what a metric is scoped to before believing what it
 says.
+
+## What to do about the frame tail, settled by measuring it
+
+The frame workload's tail was left as the datacenter profile's open problem,
+with three candidate designs and no way to choose between them from argument.
+Coding across a session's own frames needs a window, which means holding frames
+back and paying delay on every frame to repair the few that are lost. Coding
+across sessions couples flows that have no other reason to be coupled. Sending
+each frame more than once needs no window, no delay and no coupling, and for an
+eighty-byte payload the bandwidth is nearly free.
+
+Measured on the emulated path, frames over datagrams rather than a stream,
+400 frames at 50Hz per arm:
+
+| copies | delivered | p50 | p90 | p99 | never arrived |
+|---|---|---|---|---|---|
+| 1 | 329/400 | 204.4ms | 206.4ms | 208.7ms | **71 (17.8%)** |
+| 2 | 390/400 | 203.5ms | 205.4ms | 207.0ms | **10 (2.5%)** |
+| 3 | 400/400 | 203.0ms | 204.6ms | 207.7ms | **0** |
+
+Duplication removes seven eighths of the losses and a third copy removes the
+rest, and **the latency of delivered frames does not move**: p50 within 1.4ms
+and p99 within 1.7ms across all three arms. That is the property a windowed
+code cannot have, since holding frames back to compute parity shows up as
+median delay on every frame including the ones that were never at risk.
+
+The cost is two eighty-byte datagrams every 20ms instead of one: 8 KB/s per
+session against 4. A thousand concurrent sessions is 8 MB/s rather than 4 --
+which on a leg whose knee is 333 Mbit/s is not a consideration.
+
+There is a second finding underneath the first, and it may be the more
+important one. **Over datagrams the tail is not lateness, it is loss.** Every
+delivered frame in every arm arrived within 209ms, and none was more than one
+interval late; what the single-copy arm suffered was frames that never came at
+all. The 567ms tail measured earlier is what happens when frames are carried on
+an ordered stream, where a lost one delays everything behind it. Carrying them
+on datagrams converts that delay into a drop, which for audio is the outcome a
+jitter buffer is built for and the outcome a listener prefers.
+
+So the design is: **carry frame traffic on datagrams, duplicated, rather than
+on streams**. This transport already has the datagram path -- QUIC datagrams
+and UDP ASSOCIATE -- so the work is routing the traffic onto it and making the
+copy count a policy rather than adding a coding scheme. The two options that
+were harder to choose between are both rejected on evidence rather than taste.
