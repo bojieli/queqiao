@@ -742,3 +742,44 @@ on streams**. This transport already has the datagram path -- QUIC datagrams
 and UDP ASSOCIATE -- so the work is routing the traffic onto it and making the
 copy count a policy rather than adding a coding scheme. The two options that
 were harder to choose between are both rejected on evidence rather than taste.
+
+## An L7 ingress against a receiver you cannot change
+
+Raising the receiver's window fixes the problem above and requires owning the
+receiver. The case that remains is a third-party endpoint whose
+`SETTINGS_INITIAL_WINDOW_SIZE` is whatever it is.
+
+A window is credit per round trip, so its cost is proportional to the round
+trip it spans: 64KB over 200ms is 328 KB/s, and the same 64KB over 1ms is
+64 MB/s. An ingress placed next to the endpoint leaves the small window exactly
+where it is and makes it irrelevant.
+
+Measured against the same server advertising 65535, unmodified, with the
+ingress colocated with it and reached across the 200ms path:
+
+| payload | direct to the 64KB receiver | through the colocated ingress |
+|---|---|---|
+| 300KB warm | 998.0ms | **184.8ms** |
+| 1MB warm | 3394.9ms | **190.8ms** |
+
+**17.8x at a megabyte, with nothing changed on the far side.** And 190.8ms on a
+200ms path is one round trip, which is both the floor and a proof that the
+ingress streams rather than buffers: copying the body into memory before
+forwarding would have added the whole upload time to the total, and a megabyte
+at 2.47 Mbit/s is three seconds of it.
+
+Three properties make the translation worth its hop, and all three are
+structural rather than tuned. The body is streamed, so no transfer time is
+added. Backpressure propagates, because the copy between the two bodies reads
+only as fast as the write side accepts -- a proxy that read ahead would grow an
+unbounded queue and convert its own tail into a queueing problem. And
+cancellation propagates through the request context, so a caller that
+disappears stops the work behind it, which on an inference endpoint is a cost
+question before it is a latency one.
+
+The cost is that terminating HTTP/2 means inheriting its attack surface: HPACK
+decompression bombs, CONTINUATION floods, stream-reset storms. This uses a
+hardened implementation rather than parsing frames itself, and it is a
+measurement instrument rather than something to put in front of untrusted
+traffic. That is the reason to keep the L7 path narrowly scoped to the case
+that needs it, rather than making it the general shape.

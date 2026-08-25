@@ -22,6 +22,7 @@
 //	burst      repeated bursts on one connection, with the window at each step
 //	udp        open-loop UDP in the upload direction
 //	h2serve    an HTTP/2 sink whose flow-control windows are settable
+//	h2proxy    terminate HTTP/2 locally with generous windows and stream onward
 //	h2         upload over HTTP/2, to measure what those windows cost
 //	load       many concurrent request flows, reporting the tail
 //	frames     many concurrent frame streams, reporting per-message latency
@@ -122,6 +123,11 @@ func run(args []string) error {
 		}
 		return burstRun(*remote, *bursts, *bytesToSend,
 			time.Duration(*idle*float64(time.Second)), *cc, *localAddr)
+	case "h2proxy":
+		if *remote == "" {
+			return errors.New("h2proxy needs --remote")
+		}
+		return h2Proxy(*listen, *remote, *h2Window, *localAddr)
 	case "h2serve":
 		return h2Serve(*listen, *h2Window)
 	case "h2":
@@ -156,7 +162,7 @@ func run(args []string) error {
 		}
 		return rttRun(*remote, *count, *localAddr)
 	default:
-		return errors.New("--mode must be serve, tcp, fct, burst, udp, ab, load, frames, h2serve, h2, or rtt")
+		return errors.New("--mode must be serve, tcp, fct, burst, udp, ab, load, frames, h2serve, h2proxy, h2, or rtt")
 	}
 }
 
@@ -1490,4 +1496,82 @@ func h2Run(remote, sizes string, repeat int, localAddr string) error {
 		}
 	}
 	return nil
+}
+
+// h2Proxy is the L7 ingress: it terminates HTTP/2 locally with generous
+// windows and streams the body onward over its own connection.
+//
+// It exists for the case the receiver's window cannot be changed -- a
+// third-party endpoint whose SETTINGS_INITIAL_WINDOW_SIZE is whatever it is.
+// A window is credit per round trip, so its cost is proportional to the round
+// trip it spans: 64KB over 200ms is 328 KB/s and over 1ms is 64 MB/s. Placing
+// the ingress next to the endpoint leaves the small window in place and makes
+// it irrelevant, without changing anything on the far side.
+//
+// Three properties have to hold or the translation costs more than it saves.
+//
+// The body is streamed rather than buffered. Copying a request into memory
+// before forwarding it would add its whole transfer time to the latency, which
+// on a long path is most of the latency there is.
+//
+// Backpressure propagates, because io.Copy between the two bodies reads only
+// as fast as the write side accepts. A proxy that read ahead would grow an
+// unbounded queue and turn its tail into a queueing problem.
+//
+// Cancellation propagates, by deriving the upstream request from the inbound
+// request's context. When a caller disappears mid-request the work behind it
+// stops, which on an inference endpoint is a cost question as much as a
+// latency one.
+//
+// Terminating HTTP/2 inherits its attack surface -- HPACK decompression bombs,
+// CONTINUATION floods, stream-reset storms. This uses the hardened
+// implementation in x/net rather than parsing frames itself, and it is a
+// measurement instrument: do not put it in front of anything untrusted.
+func h2Proxy(listen, remote string, window int, localAddr string) error {
+	d, err := dialer(localAddr)
+	if err != nil {
+		return err
+	}
+	upstream := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	client := &http.Client{Transport: upstream}
+
+	h2s := &http2.Server{}
+	if window > 0 {
+		h2s.MaxUploadBufferPerStream = int32(window)
+		h2s.MaxUploadBufferPerConnection = int32(window)
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		out, err := http.NewRequestWithContext(r.Context(), r.Method,
+			"http://"+remote+r.URL.RequestURI(), r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		// ContentLength is carried across so the upstream can size its own
+		// framing; -1 where the caller did not declare one, which is what
+		// http.NewRequest already means by an unknown length.
+		out.ContentLength = r.ContentLength
+		for k, v := range r.Header {
+			out.Header[k] = v
+		}
+		resp, err := client.Do(out)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, v := range resp.Header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	})
+	srv := &http.Server{Addr: listen, Handler: h2c.NewHandler(handler, h2s)}
+	fmt.Printf("pathmeasure h2 ingress on %s -> %s (local window=%d)\n", listen, remote, window)
+	return srv.ListenAndServe()
 }
