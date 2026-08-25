@@ -1,3 +1,36 @@
+### What is left, and what it is not
+
+7.3x is not braked, it is less unbraked. The remaining overdrive is a bandwidth
+estimate that reads **2.0x the path in the full stack against 1.01x when the
+estimator is driven in isolation**, and the pacing gain applied on top of it.
+
+Three explanations for that gap have been measured and ruled out. They are
+recorded because each was plausible enough to have been implemented on
+reasoning alone.
+
+**It is not the metric folding across lanes.** The measurement is taken with
+one lane (`queqiao_quic_lanes` reads 1), so the reported figure is a single
+sender's own estimate and not a maximum over several.
+
+**It is not the startup gain.** The controller is in ProbeBW, not startup
+(`queqiao_quic_controller_mode` reads 3), so it is not pacing at the 2.77
+startup gain and has already decided delivery stopped growing.
+
+**It is not sender burstiness.** A paced sender emits flights, and a flight
+partly passing a token bucket leaves the survivors bunched -- a short window
+carrying many bytes, which is exactly the shape a maximum filter would
+overstate. Driven with flights from one packet to sixty-four, the estimate stays
+within two per cent of the path.
+`TestBurstinessDoesNotInflateTheEstimate` keeps that negative result.
+
+So the difference is something the harness does not model: QUIC's own
+acknowledgement timing, the coded datagram substrate, the emulator policing both
+directions, or reverse-path loss on the acknowledgements themselves. **The next
+step is the sample trace wired into the running stack rather than into a
+harness** -- the hook exists and is nil in production; what it lacks is a way to
+install it from an end-to-end test. A harness cannot answer this one, which is
+the fourth thing this exercise has established the hard way.
+
 # Control redesign: delay-bounded goodput
 
 > [!IMPORTANT]

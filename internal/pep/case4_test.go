@@ -59,6 +59,8 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 	}()
 
 	var peakPacing, peakBandwidth uint64
+	var lanes int64
+	var lastMode uint32
 	var maxQueue time.Duration
 	var maxBrake float64
 	var lastLoss float64
@@ -84,16 +86,18 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 		if s.QUICDelayBrake > maxBrake {
 			maxBrake = s.QUICDelayBrake
 		}
+		lanes = s.QUICLanes
+		lastMode = s.QUICControllerMode
 		if s.QUICPacketsSent > 0 {
 			lastLoss = 100 * float64(s.QUICLossObservedPackets) / float64(s.QUICPacketsSent)
 		}
 	}
 
 	t.Logf("policed at %d B/s: peak pacing %d (%.1fx), peak bandwidth estimate %d (%.1fx), "+
-		"worst queue %v, strongest brake %.4f, loss %.1f%%",
+		"worst queue %v, strongest brake %.4f, loss %.1f%%, lanes %d, controller mode %d",
 		shaped, peakPacing, float64(peakPacing)/shaped,
 		peakBandwidth, float64(peakBandwidth)/shaped,
-		maxQueue.Round(time.Millisecond), maxBrake, lastLoss)
+		maxQueue.Round(time.Millisecond), maxBrake, lastLoss, lanes, lastMode)
 
 	if peakPacing == 0 {
 		t.Skip("the flow never got going, so this run measured nothing")

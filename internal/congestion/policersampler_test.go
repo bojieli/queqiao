@@ -50,6 +50,13 @@ type samplerEvent struct {
 // timestamp order. Getting that ordering wrong is what made an earlier attempt
 // at this measurement report 4,000 B/s on a 250 KB/s path.
 func driveThroughPolicer(t *testing.T, offered, shaped float64, rtt time.Duration, seconds float64) (tuicBandwidthEstimator, []bandwidthSampleTrace) {
+	return driveThroughPolicerBursty(t, offered, shaped, rtt, seconds, 1)
+}
+
+// driveThroughPolicerBursty offers the same average rate in flights of burst
+// packets rather than evenly spaced, which is what a paced sender does and what
+// an evenly-spaced harness cannot reproduce.
+func driveThroughPolicerBursty(t *testing.T, offered, shaped float64, rtt time.Duration, seconds float64, burst int) (tuicBandwidthEstimator, []bandwidthSampleTrace) {
 	t.Helper()
 	const size = 1200
 	e := newTUICBandwidthEstimator()
@@ -59,14 +66,22 @@ func driveThroughPolicer(t *testing.T, offered, shaped float64, rtt time.Duratio
 	p := &policer{rate: shaped, refill: 8 * time.Millisecond}
 	p.bucket = shaped*p.refill.Seconds() + size
 
+	if burst < 1 {
+		burst = 1
+	}
 	sendGap := time.Duration(float64(time.Second) * size / offered)
+	flightGap := sendGap * time.Duration(burst)
 	var events []samplerEvent
 	pn := quiccongestion.PacketNumber(0)
-	for at := time.Duration(0); at < time.Duration(seconds*float64(time.Second)); at += sendGap {
-		admitted := p.admit(at, size)
-		events = append(events, samplerEvent{at: at, send: true, pn: pn})
-		events = append(events, samplerEvent{at: at + rtt, pn: pn, acked: admitted})
-		pn++
+	for at := time.Duration(0); at < time.Duration(seconds*float64(time.Second)); at += flightGap {
+		for i := 0; i < burst; i++ {
+			// A flight leaves back to back, then the sender waits.
+			sendAt := at + time.Duration(i)*time.Microsecond
+			admitted := p.admit(sendAt, size)
+			events = append(events, samplerEvent{at: sendAt, send: true, pn: pn})
+			events = append(events, samplerEvent{at: sendAt + rtt, pn: pn, acked: admitted})
+			pn++
+		}
 	}
 	sort.SliceStable(events, func(i, j int) bool { return events[i].at < events[j].at })
 
@@ -128,6 +143,7 @@ func TestWhatTheSamplerSeesOnAPolicedPath(t *testing.T) {
 		rtt     = 300 * time.Millisecond
 	)
 	e, traces := driveThroughPolicer(t, offered, shaped, rtt, 6)
+	_ = traces
 	if len(traces) == 0 {
 		t.Fatal("no samples were produced, so this measured nothing")
 	}
@@ -165,4 +181,40 @@ func TestWhatTheSamplerSeesOnAPolicedPath(t *testing.T) {
 	t.Logf("  worst sample: rate=%d ack=%d bytes over %v, send=%d bytes over %v, applimited=%v",
 		worst.Sample, worst.AckedDelta, worst.AckInterval.Round(time.Microsecond),
 		worst.SentDelta, worst.SendInterval.Round(time.Microsecond), worst.AppLimited)
+}
+
+// A negative result, kept because it was the most plausible remaining
+// explanation and it is wrong.
+//
+// A paced sender emits flights rather than evenly spaced packets, and a flight
+// arriving at a token bucket partly passes and partly drops, so the packets
+// that do pass leave together and are acknowledged together -- a short
+// measurement window carrying a lot of bytes, which is the shape a maximum
+// filter would report as the path. It does not happen. From flights of one to
+// flights of sixty-four the estimate stays within two per cent of the policer's
+// rate.
+//
+// So burstiness is not why the full stack reads twice the path while the
+// estimator driven directly reads 1.01 times it. Whatever the difference is, it
+// is not in the sampler's response to bursts.
+func TestBurstinessDoesNotInflateTheEstimate(t *testing.T) {
+	const (
+		shaped  = 250_000.0
+		offered = 9_000_000.0
+		rtt     = 300 * time.Millisecond
+	)
+	for _, burst := range []int{1, 4, 16, 64} {
+		e, traces := driveThroughPolicerBursty(t, offered, shaped, rtt, 6, burst)
+		if len(traces) == 0 {
+			t.Fatalf("burst %d produced no samples", burst)
+		}
+		estimate := float64(e.estimate())
+		t.Logf("flights of %2d packets: estimate %.0f (%.2fx the path), %d samples",
+			burst, estimate, estimate/shaped, len(traces))
+		if estimate > shaped*1.5 {
+			t.Errorf("flights of %d inflated the estimate to %.2fx; that would make burstiness "+
+				"an explanation for the full stack's reading, which this test records it is not",
+				burst, estimate/shaped)
+		}
+	}
 }
