@@ -425,3 +425,52 @@ gateways does, and neither exists on this path.
 So the gate the plan set -- no regression before any claim -- is met, and the
 claim it was gating remains unmade. The mechanism is in place, tested against
 its degenerate cases, and off by default.
+
+## The tail under concurrent requests
+
+The datacenter workload is not one flow. It is many concurrent requests, every
+one of them latency-critical, and `docs/COMPARISON.md` records that the tail
+under load is this transport's weakest published number: SSH p99 at 940ms
+against TUIC's 662ms. On an access link that is a caveat, because the bulk
+transfer it competes with is also the thing being won. Here there is no bulk
+transfer, so the tail is not a caveat -- it is the result.
+
+Measured on the emulated path (`pathsim.DCLongHaul`, the figures above), 300KB
+requests started together, against the TUIC-shaped reference on the same QUIC
+fork in the same process:
+
+| concurrency | queqiao | reference |
+|---|---|---|
+| 1 | 1/1, p50 2395ms, p99/p50 **1.00** | 1/1, p50 5054ms |
+| 4 | 4/4, p50 2302ms, p99/p50 **1.07** | 4/4, p50 **35637ms** |
+| 16 | 16/16, p50 3269ms, p99/p50 **1.06** | **0/16 completed** |
+| 48 | 48/48, p50 6445ms, p99/p50 **1.05** | **0/48 completed** |
+
+Two things, and the second is the one that was not expected.
+
+**Every flow completes, and the tail stays within 7% of the median at every
+load.** Forty-eight times the offered load costs 2.7x the latency, which is
+sublinear, and the p99/p50 ratio moves from 1.00 to 1.05 rather than diverging.
+Whatever the scheduler is doing, it is not starving anyone.
+
+**The reference does not degrade, it falls over.** Four concurrent flows already
+cost it 35.6 seconds -- fifteen times its own single-flow figure -- and at
+sixteen it completes nothing inside a two-minute deadline. The mechanism is
+visible in the shape: one QUIC connection carrying one stream per request,
+where a lost packet stalls its stream until a retransmission crosses a 200ms
+round trip, and 14% of packets are lost. Queqiao repairs the gap inside the
+round trip that carried it, so no stream ever waits.
+
+The datacenter plan expected the interactive tail to be this profile's problem,
+on the grounds that the published loss was a tail number and the workload is
+nothing but tails. On this path it is the opposite: the tail is the strongest
+result in this document.
+
+Three limits on the claim. The absolute figures are bounded by the emulator and
+the host it runs on -- 48 requests of 300KB is 14.4MB, which the modelled
+333 Mbit/s would carry in about a third of a second, so 6.4s is not the path's
+doing and only the comparison transfers. The reference is a measurement control
+rather than a tuned product, and a real TUIC deployment would be configured by
+someone who wanted it to work. And this is one emulated path: the same
+comparison on the live link, where these numbers came from, is the check that
+has not been run.

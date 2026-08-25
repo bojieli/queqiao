@@ -48,6 +48,18 @@ type Config struct {
 	// heavy reverse loss collapses, and the forward flow stalls even though its
 	// own direction is healthy.
 	UpstreamLossRate float64
+	// UpstreamClean states that the client-to-server direction erases nothing,
+	// which UpstreamLossRate cannot express because its zero means "inherit
+	// LossRate".
+	//
+	// The distinction is not hypothetical. The China-US datacenter path
+	// measured in docs/PATH-CHARACTER-DC-20260826.md erases 14% downstream and
+	// 0.0% upstream -- zero of 41,663 datagrams at 50 Mbit/s -- and that
+	// asymmetry is its defining feature. An emulator that can only say
+	// "different and non-zero" cannot reproduce the case where a transport's
+	// acknowledgements cross a clean channel while its data does not, which is
+	// exactly when a coding decision is easiest to get wrong.
+	UpstreamClean bool
 	// LossBurstPackets is the mean length, in packets, of a loss burst. One
 	// (or zero) gives independent Bernoulli loss. Larger values switch to a
 	// Gilbert model: the path alternates between a lossless good state and a
@@ -454,7 +466,9 @@ func NewBottleneck(cfg Config) *Bottleneck {
 	b.up.rng = rand.New(rand.NewSource(cfg.Seed))
 	b.down.rng = rand.New(rand.NewSource(cfg.Seed + 1))
 	b.up.lossRate = cfg.LossRate
-	if cfg.UpstreamLossRate > 0 {
+	if cfg.UpstreamClean {
+		b.up.lossRate = 0
+	} else if cfg.UpstreamLossRate > 0 {
 		b.up.lossRate = cfg.UpstreamLossRate
 	}
 	b.down.lossRate = cfg.LossRate
@@ -515,7 +529,9 @@ func newRelay(listen, target string, cfg Config, shared *Bottleneck) (*Relay, er
 		r.upstream.rng = rand.New(rand.NewSource(cfg.Seed))
 		r.downstream.rng = rand.New(rand.NewSource(cfg.Seed + 1))
 		r.upstream.lossRate = cfg.LossRate
-		if cfg.UpstreamLossRate > 0 {
+		if cfg.UpstreamClean {
+			r.upstream.lossRate = 0
+		} else if cfg.UpstreamLossRate > 0 {
 			r.upstream.lossRate = cfg.UpstreamLossRate
 		}
 		r.downstream.lossRate = cfg.LossRate
