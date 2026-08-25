@@ -21,6 +21,8 @@
 //	fct        flow completion time for request-sized payloads, cold and warm
 //	burst      repeated bursts on one connection, with the window at each step
 //	udp        open-loop UDP in the upload direction
+//	load       many concurrent request flows, reporting the tail
+//	frames     many concurrent frame streams, reporting per-message latency
 //	ab         order-alternated A/B of two arms, pooled
 //	rtt        round-trip distribution
 //
@@ -45,6 +47,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bojieli/queqiao/internal/tcpinfo"
@@ -75,6 +78,10 @@ func run(args []string) error {
 	aSpec := fs.String("a", "", "ab: first arm, either \"direct\" or \"socks5=host:port\"")
 	bSpec := fs.String("b", "", "ab: second arm, same form as --a")
 	rounds := fs.Int("rounds", 3, "ab: round pairs; each pair runs A-first once and B-first once")
+	flows := fs.Int("flows", 16, "load/frames: concurrent flows or sessions")
+	frames := fs.Int("frames", 100, "frames: messages per session")
+	frameBytes := fs.Int("frame-bytes", 80, "frames: message size")
+	frameEvery := fs.Float64("frame-interval", 0.02, "frames: seconds between messages")
 	socks := fs.String("socks5", "", "reach the server through this SOCKS5 proxy, so the same instrument measures a tunnel and the path beneath it")
 	rate := fs.Float64("rate", 10, "udp: offered rate in Mbit/s")
 	payload := fs.Int("payload", 1200, "udp: datagram payload bytes")
@@ -104,6 +111,17 @@ func run(args []string) error {
 		}
 		return burstRun(*remote, *bursts, *bytesToSend,
 			time.Duration(*idle*float64(time.Second)), *cc, *localAddr)
+	case "load":
+		if *remote == "" {
+			return errors.New("load needs --remote")
+		}
+		return loadRun(*remote, *sizes, *flows, *localAddr)
+	case "frames":
+		if *remote == "" {
+			return errors.New("frames needs --remote")
+		}
+		return framesRun(*remote, *flows, *frames, *frameBytes,
+			time.Duration(*frameEvery*float64(time.Second)), *localAddr)
 	case "ab":
 		if *remote == "" || *aSpec == "" || *bSpec == "" {
 			return errors.New("ab needs --remote, --a and --b")
@@ -120,7 +138,7 @@ func run(args []string) error {
 		}
 		return rttRun(*remote, *count, *localAddr)
 	default:
-		return errors.New("--mode must be serve, tcp, fct, burst, udp, ab, or rtt")
+		return errors.New("--mode must be serve, tcp, fct, burst, udp, ab, load, frames, or rtt")
 	}
 }
 
@@ -143,6 +161,9 @@ const (
 	// and a missing summary is then either an aborted run or, worse, replaced
 	// by an estimate that makes loss read as zero.
 	dirUDPUp = 2
+	// dirEcho asks the server to return every message of a fixed size, which
+	// is the streaming shape rather than the request one.
+	dirEcho = 3
 	// udpProbePort carries the blast. It is separate from the control port so
 	// that a firewall permitting one and not the other is visible as a failed
 	// probe rather than as a path that erases everything.
@@ -219,6 +240,20 @@ func serveConn(c net.Conn) {
 				return
 			}
 			if _, err := c.Write([]byte{1}); err != nil {
+				return
+			}
+		}
+	case dirEcho:
+		size := int(binary.LittleEndian.Uint64(hdr[8:16]))
+		if size <= 0 || size > 1<<20 {
+			return
+		}
+		buf := make([]byte, size)
+		for {
+			if _, err := io.ReadFull(c, buf); err != nil {
+				return
+			}
+			if _, err := c.Write(buf); err != nil {
 				return
 			}
 		}
@@ -1203,4 +1238,147 @@ func absDiff(a, b float64) float64 {
 		return a - b
 	}
 	return b - a
+}
+
+// quantiles reduces a sample set to the figures a tail is read from.
+func quantiles(ms []float64) (p50, p90, p99, p999 float64) {
+	if len(ms) == 0 {
+		return 0, 0, 0, 0
+	}
+	s := append([]float64(nil), ms...)
+	sort.Float64s(s)
+	return q(s, 0.50), q(s, 0.90), q(s, 0.99), q(s, 0.999)
+}
+
+// loadRun starts every flow at once and reports how long each took.
+//
+// They start together on purpose. Staggering them measures a queue that never
+// forms, and the case a gateway has to survive is sessions that all speak at
+// once because their users did.
+func loadRun(remote, sizes string, flows int, localAddr string) error {
+	size, err := parseSize(strings.Split(sizes, ",")[0])
+	if err != nil {
+		return err
+	}
+	var mu sync.Mutex
+	var got []float64
+	var failed int
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	begun := time.Now()
+	for i := 0; i < flows; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, tms, err := oneFlow(remote, size, "", localAddr, nil)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failed++
+				return
+			}
+			got = append(got, tms)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	wall := time.Since(begun).Seconds()
+
+	p50, p90, p99, _ := quantiles(got)
+	fmt.Printf("# %d concurrent %s flows, started together\n", flows, human(size))
+	fmt.Printf("completed\tfailed\tp50_ms\tp90_ms\tp99_ms\tp99/p50\twall_s\taggregate_Mbit\n")
+	ratio := 0.0
+	if p50 > 0 {
+		ratio = p99 / p50
+	}
+	fmt.Printf("%d/%d\t%d\t%.1f\t%.1f\t%.1f\t%.2f\t%.1f\t%.2f\n",
+		len(got), flows, failed, p50, p90, p99, ratio, wall,
+		float64(len(got))*float64(size)*8/wall/1e6)
+	return nil
+}
+
+// framesRun is the streaming shape: many sessions each sending a small message
+// on a fixed cadence, measuring how long each message takes to come back.
+//
+// The number that matters is not the median, which the path floor dictates,
+// but how far above that floor the tail sits -- because that is what a jitter
+// buffer has to absorb, and a message past it has displaced the one behind it.
+func framesRun(remote string, sessions, count, size int, every time.Duration, localAddr string) error {
+	var mu sync.Mutex
+	var got []float64
+	var dropped int
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < sessions; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			c, err := dialVia(remote, localAddr)
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			if err := writeHeader(c, dirEcho, int64(size)); err != nil {
+				return
+			}
+			frame := make([]byte, size)
+			reply := make([]byte, size)
+			tick := time.NewTicker(every)
+			defer tick.Stop()
+			for f := 0; f < count; f++ {
+				<-tick.C
+				sent := time.Now()
+				if _, err := c.Write(frame); err != nil {
+					return
+				}
+				_ = c.SetReadDeadline(time.Now().Add(15 * time.Second))
+				if _, err := io.ReadFull(c, reply); err != nil {
+					mu.Lock()
+					dropped++
+					mu.Unlock()
+					return
+				}
+				ms := float64(time.Since(sent).Microseconds()) / 1000
+				mu.Lock()
+				got = append(got, ms)
+				mu.Unlock()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(got) == 0 {
+		return errors.New("no message completed a round trip")
+	}
+	p50, p90, p99, p999 := quantiles(got)
+	s := append([]float64(nil), got...)
+	sort.Float64s(s)
+	floor := s[0]
+
+	// Lateness is counted against fixed thresholds rather than against each
+	// arm's own floor.
+	//
+	// A relative bar sounds fairer and is not. Two arms whose medians differ
+	// by 10ms get bars 10ms apart, so the arm with the lower median has more
+	// room beneath its own bar and reports fewer late messages for that reason
+	// alone -- which on a steep distribution can be most of the difference. A
+	// listener does not have a relative bar; a frame is late when it is late.
+	over := func(bar float64) float64 {
+		n := 0
+		for _, v := range got {
+			if v > bar {
+				n++
+			}
+		}
+		return 100 * float64(n) / float64(len(got))
+	}
+	fmt.Printf("# %d sessions x %d messages of %dB every %v\n", sessions, count, size, every)
+	fmt.Printf("delivered\tp50_ms\tp90_ms\tp99_ms\tp999_ms\tp99/p50\tfloor_ms\t>250ms\t>400ms\t>1s\n")
+	fmt.Printf("%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.1f\t%.2f%%\t%.2f%%\t%.2f%%\n",
+		len(got), p50, p90, p99, p999, p99/p50, floor,
+		over(250), over(400), over(1000))
+	return nil
 }

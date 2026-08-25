@@ -70,6 +70,19 @@ pathmeasure -mode ab -reverse -remote HOST:12600 \
   -a socks5=127.0.0.1:12081 -b socks5=127.0.0.1:12080 -sizes 300KB -repeat 3 -rounds 2
 ```
 
+## Always measure the loss in the same minutes
+
+This path's erasure moves between roughly zero and seventeen percent within
+minutes. A comparison quoted without a contemporaneous loss figure cannot be
+placed against any other, because the transport repairs erasure and its
+advantage is a function of how much there is: the same download comparison gave
+13.5x at 14% loss and 6.5x at single-digit loss, hours apart.
+
+```sh
+# before and after every comparison, not once at the start of the session
+pathprobe -mode client -remote HOST:12599 -rate 20 -duration 6
+```
+
 ## Two traps that cost real time here
 
 **A host running a TUN-mode proxy cannot measure its own paths.** Capture below
@@ -77,6 +90,12 @@ the socket layer is not escaped by binding a source address or an interface;
 `curl --interface en0` still left through the tunnel. Where the tunnel
 terminates at the very server being measured, the result describes the proxy.
 `-local-address` helps only when the redirect is routing-based.
+
+**A relative threshold is not a fair threshold.** Counting late messages
+against each arm's own floor gives the arm with the lower median more room
+beneath its own bar, and it reports fewer late messages for that reason alone.
+The first frame comparison here showed 30% against 2% that way and no
+difference at all against fixed thresholds.
 
 **Completion must be acknowledged by the peer.** Timing an upload by watching
 the local socket drain measures how long bytes took to reach a proxy's buffer on

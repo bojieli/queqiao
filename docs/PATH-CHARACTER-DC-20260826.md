@@ -515,3 +515,91 @@ sessions, which couples flows that have no other reason to be coupled. Both are
 real designs and neither is implemented. This is the open problem the
 datacenter profile has, and it is a narrower and more specific one than "the
 interactive tail", which is what the plan expected to find.
+
+## The live link, and why one number for it is the wrong shape of answer
+
+Everything above was measured across one evening. Re-running the same
+comparisons a few hours later produced a different path.
+
+Downstream loss, three measurements within about ten minutes of each other:
+
+| when | offered | loss |
+|---|---|---|
+| t+0 | 2 Mbit/s | **0.0%** |
+| t+0 | 20 Mbit/s | **2.4%** |
+| t+9min | 20 Mbit/s | **9.1%** |
+
+Earlier the same evening it read 9.8-17.5% across a decade of offered rates.
+**This path's erasure moves between roughly zero and seventeen percent on a
+timescale of minutes**, and every figure in this document is a snapshot of
+whatever it was doing at the time.
+
+That is not a caveat to append; it changes what a result means. The download
+comparison run when the path was erasing 14% gave 13.5x. The same comparison,
+same command, run when it was erasing somewhere between 2.4% and 9.1%:
+
+| arm | median | p25 | p75 | min | max |
+|---|---|---|---|---|---|
+| direct | 1820.1ms | 1123.8 | 2874.5 | 938.7 | 19275.1 |
+| through Queqiao | **281.2ms** | 273.6 | 365.5 | 268.7 | 623.3 |
+
+Arm effect 1538.9ms against an order effect of **0.7ms** -- the cleanest
+comparison in this document -- and a gain of **6.5x** rather than 13.5x.
+
+Both numbers are correct. The transport repairs erasure, so its advantage is a
+function of how much erasure there is, and on this path that is a variable
+rather than a constant. The honest statement is the relationship: **6.5x at
+single-digit loss, 13.5x in the teens, and by extension very little at zero**,
+which is what the clean upload direction already showed, where the tunnel costs
+50-75ms and buys nothing.
+
+Two consequences for how this path is used as evidence.
+
+**Every comparison needs a contemporaneous loss measurement**, taken in the same
+minutes and reported beside it. A result quoted without one cannot be placed on
+the curve above, and two results quoted without one cannot be compared to each
+other at all.
+
+**The order alternation is not optional here.** It was already justified by a
+158ms position effect; on a path that changes this much between runs, an
+unalternated A/B is measuring the weather.
+
+## The concurrent workloads on the live link
+
+Both shapes of §2.3, run on the live path rather than the emulator.
+
+**Requests, upload direction, started together:**
+
+| flows | direct p50/p99 | queqiao p50/p99 | direct aggregate | queqiao aggregate |
+|---|---|---|---|---|
+| 4 | 937/937ms | 991/992ms | 8.7 Mbit/s | 8.4 Mbit/s |
+| 16 | 938/997ms | 837/840ms | 18.4 Mbit/s | **46.4 Mbit/s** |
+| 32 | 927/1017ms | 723/904ms | 35.4 Mbit/s | **86.1 Mbit/s** |
+
+Both complete every flow at every level and both keep a tight tail, which
+confirms the emulated result on the real path. The aggregate is the new part:
+at sixteen and thirty-two concurrent flows the tunnel moves two and a half
+times the traffic and finishes the batch in 0.8-0.9s against 2.1-2.2s. This is
+the clean direction, so it is connection reuse and aggregation rather than
+coding.
+
+**Frames, 80 bytes every 20ms, bidirectional:**
+
+| sessions | arm | p50 | p90 | p99 | >250ms | >400ms |
+|---|---|---|---|---|---|---|
+| 16 | direct | 195.3ms | 207.1ms | 606.6ms | 3.25% | 3.25% |
+| 16 | queqiao | 185.6ms | 192.0ms | **658.8ms** | 2.88% | 2.31% |
+
+Slightly better median and p90, slightly worse p99, and no meaningful
+difference in how many frames arrive late. This ran while the path was in its
+clean phase, which is the reason: there was almost nothing to repair. It is
+consistent with the emulated finding rather than contradicting it -- the
+emulator held loss at 14%, where the frame tail was a real problem, and the
+live path during this run was not doing that.
+
+The first version of this table reported direct losing 30% of frames to
+lateness against Queqiao's 2%, which was an artefact. Lateness was being counted
+against each arm's own floor, so the arm with the 10ms lower median had 10ms
+more room beneath its own bar and reported fewer late frames for that reason
+alone. Counting against fixed thresholds -- 250ms, 400ms, a second -- removes
+it, and removes the finding with it. A listener does not have a relative bar.
