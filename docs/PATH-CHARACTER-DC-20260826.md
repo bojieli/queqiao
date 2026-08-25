@@ -280,6 +280,49 @@ the honest price of the framing, the extra local hop and the gateway's
 processing, and it is the number to quote against the gains above rather than
 the gains alone.
 
+## How much of the win is this project, and how much is not TCP
+
+`internal/baseline` exists to answer exactly this: a TUIC-shaped proxy on the
+same QUIC fork, the same congestion controllers, and the same process, so a gap
+between it and Queqiao is the design rather than the library. Run as a third
+arm, order-alternated:
+
+**Download, 300KB, the direction that erases 14%:**
+
+| transport | median | vs direct TCP |
+|---|---|---|
+| direct TCP, cubic | 5449.7ms | 1.0x |
+| TUIC-shaped QUIC, bbr-tuic | **791.7ms** | **6.9x** |
+| Queqiao | **399.1ms** | **13.7x** |
+
+Arm effect 392.7ms against an order effect of 13.7ms, so the comparison
+resolves by a factor of twenty-nine.
+
+The decomposition is the useful part, and it is not the flattering one.
+**Moving off TCP is worth 6.9x of the 13.7x.** Most of the opportunity on this
+path is available to anything that stops treating rate-independent erasure as
+congestion, and QUIC with a modern controller does that without any of this
+project. What erasure-aware coding adds on top of good QUIC is a further **2.0x**
+-- real, worth having, and the smaller half.
+
+Stated the other way round, which is how it should be stated: Queqiao's claim
+on this path is that it is twice as fast as a well-configured QUIC tunnel, not
+that it is fourteen times faster than TCP. The second number is true and mostly
+belongs to QUIC.
+
+**Upload, 300KB warm, the direction that erases nothing:**
+
+| transport | median |
+|---|---|
+| direct TCP | 209.8ms |
+| Queqiao | **262.2ms** |
+| TUIC-shaped QUIC | 284.0ms |
+
+Arm effect 21.8ms against an order effect of 0.1ms. Both tunnels cost 50-75ms
+over direct TCP on a clean path with a warm connection -- that is the price of a
+userspace proxy and an extra local hop, not of anything either design does --
+and Queqiao is the cheaper of the two by 21.8ms.
+
 ## An A/B that measured the experiment instead of the change
 
 The one apparent regression -- repeated 1MB requests taking 431-452ms against
