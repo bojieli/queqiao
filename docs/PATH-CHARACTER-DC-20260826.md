@@ -644,3 +644,57 @@ The related trap is unchanged and worth keeping: RFC 7540 6.9.2 makes
 `SETTINGS_INITIAL_WINDOW_SIZE` govern stream windows only, so a stack that sets
 it and forgets the connection window is capped across every stream at once.
 Both are set together above for that reason.
+
+## An attempt to measure whether aggregation replaces probing, and why it failed
+
+The datacenter plan argues that a node-level relay removes the need for a
+synthetic bandwidth probe: an aggregate fed by every flow on the node is
+continuously busy, so the sustained rate falls out of production traffic. That
+is the strongest argument for the node-level deployment shape, so it is worth
+testing.
+
+The obvious test is to watch the controller's own view as concurrency rises.
+Running 1, 4, 16 and 32 concurrent 300KB requests through the tunnel and
+reading the client's counters afterwards:
+
+| flows | aggregate delivered | app-limited samples | non-app-limited | max bandwidth |
+|---|---|---|---|---|
+| 1 | 11.7 Mbit/s | 21,860 | 79 | 0 |
+| 4 | 23.8 Mbit/s | 23,256 | 79 | 0 |
+| 16 | 87.1 Mbit/s | 27,531 | 79 | 0 |
+| 32 | 163.8 Mbit/s | 36,040 | 79 | 0 |
+
+The non-app-limited count never moves, and a sustained single 30MB transfer at
+285.8 Mbit/s -- which cannot be application-limited under any definition --
+produced 57,743 app-limited samples against the same frozen 79, with the
+bandwidth estimate still reading zero.
+
+**That looks like a serious bug and is not one.** The controller documents both
+halves of it. Marking app-limited on any unused congestion window is deliberate
+and liberal, because a paced sender is almost always under its window; the rule
+has been tightened twice and reverted twice, since requiring a burst of unused
+window measures better on the emulator and costs more than half the throughput
+on this very path. A near-100% app-limited count is expected rather than a
+symptom. And the metrics endpoint reports one lane, which with connection
+pooling is the control connection -- genuinely idle -- so its bandwidth estimate
+says nothing about the lane carrying data.
+
+So this measurement cannot answer the question it was built for, and the
+conclusion is that **§11.5 is untested rather than refuted**. Answering it needs
+per-lane evidence from the lane trace rather than the aggregate metrics
+endpoint.
+
+What the same runs do support, at the level of outcomes rather than estimates,
+is the shape of the claim. Aggregate delivered rate through the tunnel rose
+from 11.7 Mbit/s at one flow to 163.8 at thirty-two, and the completion tail
+stayed tight throughout (p99/p50 between 1.00 and 1.09). Whatever the estimator
+believes, more concurrent flows are getting more out of the path rather than
+contending for a fixed share of it -- which is the behaviour the node-relay
+argument predicts, arrived at from the other end.
+
+This is the second time in this document that a counter reading exactly zero
+turned out to describe something other than what was being asked about, and the
+first was fixed in #55 with the observation that a counter which cannot be
+produced reads as a confident measurement once it stops wobbling. The general
+lesson is the same: check what a metric is scoped to before believing what it
+says.
