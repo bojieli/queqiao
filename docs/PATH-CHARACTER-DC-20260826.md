@@ -287,16 +287,35 @@ same QUIC fork, the same congestion controllers, and the same process, so a gap
 between it and Queqiao is the design rather than the library. Run as a third
 arm, order-alternated:
 
-**Download, 300KB, the direction that erases 14%:**
+**Download, the direction that erases 14%, order-alternated:**
 
-| transport | median | vs direct TCP |
-|---|---|---|
-| direct TCP, cubic | 5449.7ms | 1.0x |
-| TUIC-shaped QUIC, bbr-tuic | **791.7ms** | **6.9x** |
-| Queqiao | **399.1ms** | **13.7x** |
+| payload | direct TCP | TUIC-shaped QUIC | Queqiao | QUIC's share | coding adds |
+|---|---|---|---|---|---|
+| 100KB | 1918.4ms | 401.0ms | **218.5ms** | 4.8x | 1.84x |
+| 300KB | 5449.7ms | 791.7ms | **399.1ms** | 6.9x | 2.0x |
 
-Arm effect 392.7ms against an order effect of 13.7ms, so the comparison
-resolves by a factor of twenty-nine.
+Arm effects of 392.7ms and 182.5ms against order effects of 13.7ms and 84.4ms,
+so both comparisons resolve.
+
+The medians are not the most interesting column. The spread is:
+
+| payload | direct TCP | TUIC-shaped QUIC | Queqiao |
+|---|---|---|---|
+| 100KB | 806-4722ms | 214-801ms | **204-220ms** |
+| 300KB | 1341-17117ms | -- | **192-820ms** |
+
+Sixteen consecutive 100KB downloads through Queqiao spanned sixteen
+milliseconds, on a channel erasing a seventh of everything, at 200ms round
+trip. That is one round trip, every time: the code repaired every gap in the
+round trip that carried it, so no loss ever cost a retransmission. The same
+sixteen downloads over TCP spanned four seconds.
+
+Small flows gain the least in the median and the most in the tail, which is the
+opposite of the usual expectation and follows from a mechanism worth naming. A
+100KB payload is about seventy packets, too few to reliably produce the three
+duplicate acknowledgements fast retransmit needs, so a loss falls through to a
+retransmission timeout. The smallest flows are the ones least able to recover
+cheaply, and they are also the ones an inference call is made of.
 
 The decomposition is the useful part, and it is not the flattering one.
 **Moving off TCP is worth 6.9x of the 13.7x.** Most of the opportunity on this
