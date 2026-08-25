@@ -16,9 +16,15 @@
 //
 // Modes:
 //
-//	serve      sink TCP bytes and report what arrived
+//	serve      sink TCP bytes, push them, or count a UDP blast
 //	tcp        send for a duration and sample the kernel's account of why
-//	rtt        round-trip distribution, idle and under load
+//	fct        flow completion time for request-sized payloads, cold and warm
+//	burst      repeated bursts on one connection, with the window at each step
+//	udp        open-loop UDP in the upload direction
+//	rtt        round-trip distribution
+//
+// Every mode can be pointed through a SOCKS5 proxy, so a tunnel and the path
+// beneath it are measured by the same instrument rather than by two.
 //
 // The tcp mode is the latency-attribution instrument. Goodput alone cannot
 // distinguish a small congestion window from a small receive window from an
@@ -52,7 +58,7 @@ func main() {
 
 func run(args []string) error {
 	fs := flag.NewFlagSet("pathmeasure", flag.ContinueOnError)
-	mode := fs.String("mode", "", "serve, tcp, or rtt")
+	mode := fs.String("mode", "", "serve, tcp, fct, burst, udp, or rtt")
 	listen := fs.String("listen", ":12600", "serve: listen address")
 	remote := fs.String("remote", "", "client: server address")
 	seconds := fs.Float64("duration", 10, "client: seconds to run")
@@ -65,6 +71,7 @@ func run(args []string) error {
 	idle := fs.Float64("idle", 2, "burst: seconds to idle between bursts")
 	repeat := fs.Int("repeat", 1, "fct: repetitions per size")
 	sizes := fs.String("sizes", "100KB,300KB,1MB,5MB", "fct: comma-separated payload sizes")
+	socks := fs.String("socks5", "", "reach the server through this SOCKS5 proxy, so the same instrument measures a tunnel and the path beneath it")
 	rate := fs.Float64("rate", 10, "udp: offered rate in Mbit/s")
 	payload := fs.Int("payload", 1200, "udp: datagram payload bytes")
 	reverse := fs.Bool("reverse", false, "measure the download direction: the client connects, the server sends. The only way to measure the receive direction of a host that cannot accept inbound connections, which on real deployments is most of them")
@@ -72,6 +79,7 @@ func run(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	proxyAddr = *socks
 	switch *mode {
 	case "serve":
 		return serve(*listen)
@@ -165,6 +173,46 @@ func serveConn(c net.Conn) {
 		return
 	}
 	switch binary.LittleEndian.Uint32(hdr[4:8]) {
+	case dirUpload:
+		// A declared length lets the server acknowledge completion. Without an
+		// acknowledgement from the peer, a client measuring an upload through
+		// a proxy is timing how long its bytes took to reach the proxy's
+		// buffer on loopback -- which is microseconds, and which makes any
+		// tunnel look arbitrarily fast. The ack is the only definition of
+		// "delivered" that survives an intermediary.
+		n := int64(binary.LittleEndian.Uint64(hdr[8:16]))
+		if n <= 0 {
+			sink(c)
+			return
+		}
+		got, err := io.CopyN(io.Discard, c, n)
+		if err != nil {
+			fmt.Printf("upload short: %d of %d from %s: %v\n", got, n, c.RemoteAddr(), err)
+			return
+		}
+		if _, err := c.Write([]byte{1}); err != nil {
+			return
+		}
+		// Stay open: the client may send further payloads on this connection,
+		// which is what makes the warm measurement warm.
+		for {
+			if _, err := io.ReadFull(c, hdr); err != nil {
+				return
+			}
+			if binary.LittleEndian.Uint32(hdr[0:4]) != reqMagic {
+				return
+			}
+			n = int64(binary.LittleEndian.Uint64(hdr[8:16]))
+			if n <= 0 {
+				return
+			}
+			if _, err := io.CopyN(io.Discard, c, n); err != nil {
+				return
+			}
+			if _, err := c.Write([]byte{1}); err != nil {
+				return
+			}
+		}
 	case dirUDPUp:
 		serveUDPCount(c, int64(binary.LittleEndian.Uint64(hdr[8:16])))
 	case dirDownload:
@@ -232,6 +280,105 @@ type sample struct {
 	Limiter       string  `json:"limiter"`
 }
 
+// proxyAddr is the SOCKS5 endpoint to reach the server through, empty for a
+// direct connection. It is process-wide because every mode dials the same way
+// and threading it through each signature would say nothing extra.
+var proxyAddr string
+
+// dialVia opens a connection to remote, through the SOCKS5 proxy if one is
+// configured.
+//
+// Measuring a tunnel with the same instrument that measured the path beneath
+// it is the only way the comparison means anything: a benchmark that uses one
+// tool for the baseline and another for the tunnel is comparing two tools.
+func dialVia(remote, localAddr string) (net.Conn, error) {
+	d, err := dialer(localAddr)
+	if err != nil {
+		return nil, err
+	}
+	if proxyAddr == "" {
+		return d.Dial("tcp", remote)
+	}
+	c, err := d.Dial("tcp", proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("dial proxy %s: %w", proxyAddr, err)
+	}
+	if err := socks5Connect(c, remote); err != nil {
+		c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// socks5Connect performs an unauthenticated CONNECT, which is what this
+// project's client listener speaks.
+func socks5Connect(c net.Conn, remote string) error {
+	host, portStr, err := net.SplitHostPort(remote)
+	if err != nil {
+		return err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return err
+	}
+	c.SetDeadline(time.Now().Add(20 * time.Second))
+	defer c.SetDeadline(time.Time{})
+	if _, err := c.Write([]byte{5, 1, 0}); err != nil {
+		return err
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(c, resp); err != nil {
+		return err
+	}
+	if resp[0] != 5 || resp[1] != 0 {
+		return fmt.Errorf("socks5: server chose method %d", resp[1])
+	}
+	req := []byte{5, 1, 0}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+		req = append(req, 1)
+		req = append(req, ip.To4()...)
+	} else if ip != nil {
+		req = append(req, 4)
+		req = append(req, ip.To16()...)
+	} else {
+		if len(host) > 255 {
+			return fmt.Errorf("socks5: host too long")
+		}
+		req = append(req, 3, byte(len(host)))
+		req = append(req, host...)
+	}
+	req = append(req, byte(port>>8), byte(port))
+	if _, err := c.Write(req); err != nil {
+		return err
+	}
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(c, head); err != nil {
+		return err
+	}
+	if head[1] != 0 {
+		return fmt.Errorf("socks5: CONNECT refused, reply %d", head[1])
+	}
+	var skip int
+	switch head[3] {
+	case 1:
+		skip = 4
+	case 4:
+		skip = 16
+	case 3:
+		l := make([]byte, 1)
+		if _, err := io.ReadFull(c, l); err != nil {
+			return err
+		}
+		skip = int(l[0])
+	default:
+		return fmt.Errorf("socks5: unknown address type %d", head[3])
+	}
+	if _, err := io.ReadFull(c, make([]byte, skip+2)); err != nil {
+		return err
+	}
+	return nil
+}
+
 // dialer builds a dialer bound to a chosen source address.
 //
 // This is not a convenience. A host running a TUN-mode proxy carries traffic
@@ -262,11 +409,10 @@ func dialer(localAddr string) (*net.Dialer, error) {
 // every sample would say so, which is precisely what the app_limited bit is
 // for.
 func tcpRun(remote string, dur time.Duration, cc string, every time.Duration, stopAfter int64, jsonOut bool, localAddr string) error {
-	d, err := dialer(localAddr)
-	if err != nil {
+	if _, err := dialer(localAddr); err != nil {
 		return err
 	}
-	c, err := d.Dial("tcp", remote)
+	c, err := dialVia(remote, localAddr)
 	if err != nil {
 		return err
 	}
@@ -448,14 +594,13 @@ func pct(a, b uint64) float64 {
 // This is deliberately not ICMP, which is separately rate-limited and
 // separately prioritised on most of the paths this project cares about.
 func rttRun(remote string, count int, localAddr string) error {
-	d, err := dialer(localAddr)
-	if err != nil {
+	if _, err := dialer(localAddr); err != nil {
 		return err
 	}
 	var ms []float64
 	for i := 0; i < count; i++ {
 		start := time.Now()
-		c, err := d.Dial("tcp", remote)
+		c, err := dialVia(remote, localAddr)
 		if err != nil {
 			continue
 		}
@@ -555,19 +700,20 @@ func fctRun(remote, sizes string, repeat int, cc, localAddr string, reverse bool
 		}
 		// Warm: one connection, the same payload sent repeatedly, so the
 		// handshake and whatever the window has learned are already paid for.
-		d, err := dialer(localAddr)
-		if err != nil {
+		if _, err := dialer(localAddr); err != nil {
 			return err
 		}
-		c, err := d.Dial("tcp", remote)
+		c, err := dialVia(remote, localAddr)
 		if err != nil {
 			fmt.Printf("%s\twarm\tERROR: %v\n", human(n), err)
 			continue
 		}
-		tc := c.(*net.TCPConn)
+		tc := c
 		if cc != "" {
-			if raw, e := tc.SyscallConn(); e == nil {
-				_ = tcpinfo.SetCongestionControl(raw, cc)
+			if t, ok := c.(*net.TCPConn); ok {
+				if raw, e := t.SyscallConn(); e == nil {
+					_ = tcpinfo.SetCongestionControl(raw, cc)
+				}
 			}
 		}
 		for r := 0; r < repeat+1; r++ {
@@ -591,29 +737,34 @@ func fctRun(remote, sizes string, repeat int, cc, localAddr string, reverse bool
 
 // oneFlow sends exactly n bytes, either on a fresh connection whose handshake
 // it times, or on one handed to it.
-func oneFlow(remote string, n int64, cc, localAddr string, existing *net.TCPConn) (connectMS, transferMS float64, err error) {
+func oneFlow(remote string, n int64, cc, localAddr string, existing net.Conn) (connectMS, transferMS float64, err error) {
 	tc := existing
 	if tc == nil {
-		d, derr := dialer(localAddr)
-		if derr != nil {
+		if _, derr := dialer(localAddr); derr != nil {
 			return 0, 0, derr
 		}
 		t0 := time.Now()
-		c, e := d.Dial("tcp", remote)
+		c, e := dialVia(remote, localAddr)
 		if e != nil {
 			return 0, 0, e
 		}
 		connectMS = float64(time.Since(t0).Microseconds()) / 1000
-		tc = c.(*net.TCPConn)
+		tc = c
 		defer tc.Close()
 		if cc != "" {
-			if raw, e := tc.SyscallConn(); e == nil {
-				_ = tcpinfo.SetCongestionControl(raw, cc)
+			if t, ok := c.(*net.TCPConn); ok {
+				if raw, e := t.SyscallConn(); e == nil {
+					_ = tcpinfo.SetCongestionControl(raw, cc)
+				}
 			}
 		}
 	}
 	buf := make([]byte, 64*1024)
 	t1 := time.Now()
+	// The length is declared first so the peer knows when to acknowledge.
+	if e := writeHeader(tc, dirUpload, n); e != nil {
+		return connectMS, 0, e
+	}
 	var sent int64
 	for sent < n {
 		w := buf
@@ -626,22 +777,15 @@ func oneFlow(remote string, n int64, cc, localAddr string, existing *net.TCPConn
 			return connectMS, 0, e
 		}
 	}
-	// Completion is when the peer has the bytes, not when the socket accepted
-	// them. Without this the measurement reports the speed of memcpy into the
-	// send buffer, which for a 300KB payload is most of it.
-	if existing == nil {
-		tc.CloseWrite()
-		io.Copy(io.Discard, tc)
-	} else {
-		if info, e := tcpinfo.Get(tc); e == nil {
-			for info.Unacked > 0 {
-				time.Sleep(time.Millisecond)
-				if info, e = tcpinfo.Get(tc); e != nil {
-					break
-				}
-			}
-		}
+	// Completion is when the peer says it has the bytes. Reading the local
+	// socket's own accounting instead would time the send buffer, and through
+	// a proxy would time loopback.
+	ack := make([]byte, 1)
+	tc.SetReadDeadline(time.Now().Add(120 * time.Second))
+	if _, e := io.ReadFull(tc, ack); e != nil {
+		return connectMS, 0, fmt.Errorf("no completion ack: %w", e)
 	}
+	tc.SetReadDeadline(time.Time{})
 	transferMS = float64(time.Since(t1).Microseconds()) / 1000
 	return connectMS, transferMS, nil
 }
@@ -671,11 +815,10 @@ func burstRun(remote string, bursts int, burstBytes int64, idle time.Duration, c
 	if burstBytes <= 0 {
 		burstBytes = 300 * 1024
 	}
-	d, err := dialer(localAddr)
-	if err != nil {
+	if _, err := dialer(localAddr); err != nil {
 		return err
 	}
-	c, err := d.Dial("tcp", remote)
+	c, err := dialVia(remote, localAddr)
 	if err != nil {
 		return err
 	}
@@ -736,8 +879,9 @@ func oneDownload(remote string, n int64, cc, localAddr string) (connectMS, trans
 	if derr != nil {
 		return 0, 0, derr
 	}
+	_ = d
 	t0 := time.Now()
-	c, e := d.Dial("tcp", remote)
+	c, e := dialVia(remote, localAddr)
 	if e != nil {
 		return 0, 0, e
 	}
@@ -823,7 +967,8 @@ func udpUpRun(remote string, rateMbit float64, dur time.Duration, payload int, l
 	if err != nil {
 		return err
 	}
-	ctl, err := d.Dial("tcp", remote)
+	_ = d
+	ctl, err := dialVia(remote, localAddr)
 	if err != nil {
 		return err
 	}

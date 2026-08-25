@@ -187,3 +187,74 @@ transport that knows about the path.
 - **The measurement instruments have to name their direction.** The first
   version of this document drew the wrong conclusion from correct numbers
   because two tools disagreed about who was sending.
+
+## What this project's own transport does with the path
+
+A gateway was run on the US host and a client on the Guiyang host, isolated from
+the production deployment on the same server, and the same instrument measured
+the same payloads directly and through the SOCKS5 listener. Completion is an
+end-to-end acknowledgement from the far side in both cases: a client measuring
+an upload through a proxy by watching its own socket is timing loopback, and
+that makes any tunnel look arbitrarily fast.
+
+### Download, the direction that erases 14%
+
+| size | direct, median (range) | through Queqiao, median (range) | gain |
+|---|---|---|---|
+| 100KB | 1732ms (945-12307) | **396ms** (262-705) | 4.4x |
+| 300KB | 11257ms (6377-17147) | **649ms** (288-664) | **17.3x** |
+
+A 300KB response takes between six and seventeen seconds directly, and between
+0.3 and 0.7 of a second through the transport. The spread collapses with the
+median: direct varies by 2.7x across three runs, the tunnel by 2.3x on a much
+smaller base.
+
+The client's own counters say why. `queqiao_erasure_ratio_receive` measured
+0.035-0.25 on the receive direction, `queqiao_coded_symbols_recovered_total`
+reached 53, and `queqiao_erasure_residual_ratio_receive` stayed **0**. The code
+was sized for the erasure the path was doing and repaired all of it, so no gap
+ever cost a round trip. That is the mechanism the whole design exists for,
+working on a live path, and it is worth noting that it is the fix landed in #52
+that makes it work -- an earlier build sized the code from the controller's
+deliberately low floor and would have carried almost no parity here.
+
+### Upload, the direction that erases nothing
+
+| size | mode | direct | through Queqiao | gain |
+|---|---|---|---|---|
+| 100KB | cold | 977-1092ms | **200-208ms** | 5.0x |
+| 300KB | cold | 1157-1204ms | **216ms** | 5.4x |
+| 1MB | cold | 2240-2381ms | **227-232ms** | **10.3x** |
+| 300KB | warm | 193ms | 213ms | 0.91x |
+| 1MB | warm | 224ms | 431-452ms | **0.50x** |
+
+Cold flows gain five to ten times, and the reason is not erasure -- this
+direction has none. It is that the client holds a pre-warmed pooled connection,
+so an application flow costs half a millisecond locally plus one round trip,
+paying neither handshake nor ramp. A direct 1MB cold flow spends 2.2 seconds
+climbing to a rate it then stops needing.
+
+Warm flows are where the transport costs something. At 300KB it is 20ms of
+overhead. At 1MB it is a factor of two, and the shape of the regression names
+the cause: `warm-first` completes in 227ms and the flows *after* it take
+431-452ms, which is backwards unless something reclassified the flow in
+between. The counters confirm it -- `queqiao_class_transitions_2_total` reached
+1 and `queqiao_bulk_isolations_total` reached 2. A repeated 1MB payload crosses
+the classifier's 128KB bulk threshold, becomes bulk permanently, and is then
+isolated to protect interactive traffic that does not exist on this connection.
+
+### What the baseline actually says
+
+The datacenter plan predicted that today's transport would make this workload
+worse. That prediction is wrong in general and right in one corner:
+
+- **Cold flows gain 5-10x** in both directions, from connection reuse alone.
+- **The erasure direction gains 17x** at 300KB, from coding.
+- **Warm flows above the bulk threshold lose 2x**, from a classifier whose
+  premise -- that bulk traffic exists and must be kept away from interactive
+  traffic -- does not hold when every flow is a latency-critical burst.
+
+The classifier change the plan proposes is still needed. It is a correction to
+one regressing case rather than a rescue of a transport that was making things
+worse, and stating it the other way round would have been an easier sell and a
+false one.
