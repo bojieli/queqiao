@@ -248,6 +248,38 @@ worse. It does not:
 - **The erasure direction gains 17x** at 300KB, from coding.
 - **Warm flows cost 20ms at 300KB**, and are otherwise unchanged.
 
+## The comparison, measured the way the previous section requires
+
+Re-run with order alternation and pooling, which is now what `pathmeasure -mode
+ab` does by construction. Each round pair runs A first and then B first, and the
+report prints the order effect beside the arm effect so a comparison that has
+not resolved its change says so.
+
+**Download, 300KB, cold, 12 samples per arm:**
+
+| arm | median | p25 | p75 | min | max |
+|---|---|---|---|---|---|
+| direct | **5449.7ms** | 2654.1 | 9052.9 | 1340.9 | 17116.5 |
+| through Queqiao | **405.1ms** | 216.8 | 591.1 | 192.3 | 819.7 |
+
+Arm effect 5044.6ms against an order effect of 548.4ms: the change is worth
+nine times the confound, so this comparison resolves. **13.5x on the direction
+that erases 14%**, and the tail improves more than the median -- the worst
+direct sample is 17.1 seconds and the worst tunnelled one is 0.82.
+
+**Upload, 300KB, warm, 30 samples per arm:**
+
+| arm | median | p25 | p75 | min | max |
+|---|---|---|---|---|---|
+| direct | **209.8ms** | 198.7 | 215.1 | 192.2 | 765.3 |
+| through Queqiao | **276.1ms** | 272.1 | 431.8 | 261.3 | 677.3 |
+
+Arm effect 66.3ms against an order effect of 3.9ms. On a clean path with a warm
+connection the tunnel costs **66ms**, about a third of a round trip. That is
+the honest price of the framing, the extra local hop and the gateway's
+processing, and it is the number to quote against the gains above rather than
+the gains alone.
+
 ## An A/B that measured the experiment instead of the change
 
 The one apparent regression -- repeated 1MB requests taking 431-452ms against

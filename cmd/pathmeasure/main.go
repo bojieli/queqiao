@@ -21,6 +21,7 @@
 //	fct        flow completion time for request-sized payloads, cold and warm
 //	burst      repeated bursts on one connection, with the window at each step
 //	udp        open-loop UDP in the upload direction
+//	ab         order-alternated A/B of two arms, pooled
 //	rtt        round-trip distribution
 //
 // Every mode can be pointed through a SOCKS5 proxy, so a tunnel and the path
@@ -71,6 +72,9 @@ func run(args []string) error {
 	idle := fs.Float64("idle", 2, "burst: seconds to idle between bursts")
 	repeat := fs.Int("repeat", 1, "fct: repetitions per size")
 	sizes := fs.String("sizes", "100KB,300KB,1MB,5MB", "fct: comma-separated payload sizes")
+	aSpec := fs.String("a", "", "ab: first arm, either \"direct\" or \"socks5=host:port\"")
+	bSpec := fs.String("b", "", "ab: second arm, same form as --a")
+	rounds := fs.Int("rounds", 3, "ab: round pairs; each pair runs A-first once and B-first once")
 	socks := fs.String("socks5", "", "reach the server through this SOCKS5 proxy, so the same instrument measures a tunnel and the path beneath it")
 	rate := fs.Float64("rate", 10, "udp: offered rate in Mbit/s")
 	payload := fs.Int("payload", 1200, "udp: datagram payload bytes")
@@ -100,6 +104,11 @@ func run(args []string) error {
 		}
 		return burstRun(*remote, *bursts, *bytesToSend,
 			time.Duration(*idle*float64(time.Second)), *cc, *localAddr)
+	case "ab":
+		if *remote == "" || *aSpec == "" || *bSpec == "" {
+			return errors.New("ab needs --remote, --a and --b")
+		}
+		return abRun(*remote, *aSpec, *bSpec, *rounds, *repeat, *sizes, *cc, *localAddr, *reverse)
 	case "udp":
 		if *remote == "" {
 			return errors.New("udp needs --remote")
@@ -111,7 +120,7 @@ func run(args []string) error {
 		}
 		return rttRun(*remote, *count, *localAddr)
 	default:
-		return errors.New("--mode must be serve, tcp, fct, burst, udp, or rtt")
+		return errors.New("--mode must be serve, tcp, fct, burst, udp, ab, or rtt")
 	}
 }
 
@@ -1029,4 +1038,169 @@ func udpUpRun(remote string, rateMbit float64, dur time.Duration, payload int, l
 	fmt.Printf("%.1f\t%d\t%d\t%.2f\t%.1f\n",
 		rateMbit, sent, got, float64(bytes)*8/elapsed.Seconds()/1e6, loss)
 	return nil
+}
+
+// abRun compares two arms in the only way this project's paths support.
+//
+// A live long-haul path drifts on the scale of the measurement. Identical warm
+// 300KB flows on the China-US path ranged from 250ms to 2906ms, and a
+// comparison that runs the baseline and then the change, once, resolves the
+// drift and reports it as the change: measured there, position in the sequence
+// was worth 158ms and the policy under test was worth 2.4ms. Sorting by
+// profile gave a 53% win that reversed when the order reversed.
+//
+// So every round pair runs A first and then B first, and the pooled medians are
+// reported beside the order effect. If the order effect is the larger of the
+// two, the comparison has not measured the change and the report says so
+// rather than leaving the reader to notice.
+func abRun(remote, aSpec, bSpec string, rounds, repeat int, sizes, cc, localAddr string, reverse bool) error {
+	aProxy, err := parseArm(aSpec)
+	if err != nil {
+		return fmt.Errorf("--a: %w", err)
+	}
+	bProxy, err := parseArm(bSpec)
+	if err != nil {
+		return fmt.Errorf("--b: %w", err)
+	}
+	size, err := parseSize(strings.Split(sizes, ",")[0])
+	if err != nil {
+		return err
+	}
+	if repeat < 1 {
+		repeat = 1
+	}
+	var aAll, bAll, firstAll, secondAll []float64
+	dir := "upload, warm"
+	if reverse {
+		dir = "download, cold"
+	}
+	fmt.Printf("# A=%s  B=%s  %s x %d per arm per round, %d round pairs, %s\n",
+		aSpec, bSpec, human(size), repeat, rounds, dir)
+	for r := 0; r < rounds; r++ {
+		for _, aFirst := range []bool{true, false} {
+			first, second := aProxy, bProxy
+			if !aFirst {
+				first, second = bProxy, aProxy
+			}
+			fs := armSamples(remote, first, size, repeat, cc, localAddr, reverse)
+			ss := armSamples(remote, second, size, repeat, cc, localAddr, reverse)
+			firstAll = append(firstAll, fs...)
+			secondAll = append(secondAll, ss...)
+			if aFirst {
+				aAll, bAll = append(aAll, fs...), append(bAll, ss...)
+			} else {
+				bAll, aAll = append(bAll, fs...), append(aAll, ss...)
+			}
+		}
+	}
+	fmt.Printf("\n# pooled across both orders\n")
+	fmt.Printf("arm\tn\tmedian_ms\tp25\tp75\tmin\tmax\n")
+	reportArm("A", aAll)
+	reportArm("B", bAll)
+	fmt.Printf("\n# the same samples sorted by position rather than by arm\n")
+	reportArm("first", firstAll)
+	reportArm("second", secondAll)
+	effect := absDiff(median(aAll), median(bAll))
+	order := absDiff(median(firstAll), median(secondAll))
+	fmt.Printf("\n# arm effect %.1fms, order effect %.1fms\n", effect, order)
+	if order >= effect {
+		fmt.Printf("# ORDER DOMINATES: this comparison has not resolved the change.\n")
+		fmt.Printf("# Either the arms do not differ, or the path drifted more than they do.\n")
+	}
+	return nil
+}
+
+// parseArm turns an arm spec into the proxy it dials through, empty for direct.
+func parseArm(spec string) (string, error) {
+	if spec == "direct" {
+		return "", nil
+	}
+	if rest, ok := strings.CutPrefix(spec, "socks5="); ok && rest != "" {
+		return rest, nil
+	}
+	return "", fmt.Errorf("want \"direct\" or \"socks5=host:port\", got %q", spec)
+}
+
+// armSamples runs one arm once: a fresh connection, then repeat warm flows on
+// it. The connection is fresh each time so that neither arm inherits the
+// other's warmth.
+func armSamples(remote, proxy string, size int64, repeat int, cc, localAddr string, reverse bool) []float64 {
+	saved := proxyAddr
+	proxyAddr = proxy
+	defer func() { proxyAddr = saved }()
+
+	// The download arm dials per flow, because the receive direction is
+	// measured by asking to be sent to and there is no warm equivalent that
+	// both arms could share fairly.
+	if reverse {
+		out := make([]float64, 0, repeat)
+		for i := 0; i < repeat; i++ {
+			_, ms, err := oneDownload(remote, size, cc, localAddr)
+			if err != nil {
+				fmt.Printf("# download sample failed: %v\n", err)
+				continue
+			}
+			out = append(out, ms)
+		}
+		return out
+	}
+
+	c, err := dialVia(remote, localAddr)
+	if err != nil {
+		fmt.Printf("# arm dial failed: %v\n", err)
+		return nil
+	}
+	defer c.Close()
+	if cc != "" {
+		if t, ok := c.(*net.TCPConn); ok {
+			if raw, e := t.SyscallConn(); e == nil {
+				_ = tcpinfo.SetCongestionControl(raw, cc)
+			}
+		}
+	}
+	out := make([]float64, 0, repeat)
+	for i := 0; i < repeat+1; i++ {
+		_, ms, err := oneFlow("", size, cc, localAddr, c)
+		if err != nil {
+			break
+		}
+		// The first flow on a fresh connection still pays for the ramp, and
+		// including it would measure the handshake in both arms rather than
+		// the difference between them.
+		if i > 0 {
+			out = append(out, ms)
+		}
+	}
+	return out
+}
+
+func reportArm(name string, v []float64) {
+	if len(v) == 0 {
+		fmt.Printf("%s\t0\t--\n", name)
+		return
+	}
+	s := append([]float64(nil), v...)
+	sort.Float64s(s)
+	fmt.Printf("%s\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
+		name, len(s), median(s), q(s, 0.25), q(s, 0.75), s[0], s[len(s)-1])
+}
+
+func median(v []float64) float64 {
+	if len(v) == 0 {
+		return 0
+	}
+	s := append([]float64(nil), v...)
+	sort.Float64s(s)
+	n := len(s)
+	if n%2 == 1 {
+		return s[n/2]
+	}
+	return (s[n/2-1] + s[n/2]) / 2
+}
+
+func absDiff(a, b float64) float64 {
+	if a > b {
+		return a - b
+	}
+	return b - a
 }
