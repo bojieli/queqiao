@@ -509,9 +509,17 @@ func (e *ErasureSender) Telemetry() ControllerTelemetry {
 	// two independently derived, which is what lets a test assert they agree.
 	t.PacketsLostObserved = e.passed.Load()
 	t.Erasure = float64(e.erasure.Load()) / partsPerMillion
-	// Recomputed rather than read from the cached value, so a trace taken while
-	// nothing is sending still reflects the path rather than the last send.
-	e.delayBounded(1)
+	// Read, never recomputed. This method runs on the flow telemetry goroutine
+	// while quic-go invokes the controller on its packet goroutine, which is
+	// why everything else here comes from an atomic. Recomputing the brake
+	// reached through to the inner sender's minimum round trip, which the
+	// packet goroutine writes: a data race, and one that surfaced on a single
+	// CI architecture and on none of eight local runs.
+	//
+	// The cost is that a trace taken while nothing is sending reports the last
+	// brake rather than a fresh one. That is the right trade -- a stale
+	// diagnostic is a smaller problem than an unsynchronised read of the
+	// controller's state.
 	t.DelayBrake = float64(e.delayBrake.Load()) / partsPerMillion
 	arrival := e.arrivalRate()
 	t.PacingRate = uint64(float64(t.PacingRate) / arrival)

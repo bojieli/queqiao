@@ -143,3 +143,43 @@ func TestTheDelayBoundAppliesToWhatIsSentNotWhatArrives(t *testing.T) {
 			"compensation is escaping the delay bound", ratio)
 	}
 }
+
+// Telemetry runs on the flow telemetry goroutine while quic-go invokes the
+// controller on its packet goroutine. Everything it reports must therefore come
+// from an atomic, and this is the test that says so.
+//
+// It exists because that invariant was broken by a one-line convenience: the
+// delay brake was recomputed inside Telemetry so a trace taken while nothing
+// was sending would still be fresh, and recomputing it reached through to the
+// inner sender's minimum round trip, which refreshRTTSample writes. The race
+// detector found it on one CI architecture and on none of eight local runs.
+//
+// The sender is driven with real sent packets and shrinking round trips, which
+// is what makes refreshRTTSample write rather than return early. Without that
+// the test passes against the defect it was written for.
+func TestTelemetryIsSafeBesideTheControllerGoroutine(t *testing.T) {
+	e := NewErasureSender(1200)
+	e.SetRTTStatsProvider(&fixedRTT{min: time.Second, smoothed: time.Second})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		base := monotime.Now()
+		number := quiccongestion.PacketNumber(0)
+		for i := 0; i < 3000; i++ {
+			// A round trip that keeps shrinking, so every event takes the
+			// branch in refreshRTTSample that stores a new minimum.
+			rtt := time.Duration(400-(i%350)) * time.Millisecond
+			sent := base.Add(time.Duration(i) * time.Millisecond)
+			e.OnPacketSent(sent, 2400, number, 1200, true)
+			e.OnCongestionEventEx(2400, sent.Add(rtt), []quiccongestion.AckedPacketInfo{
+				{PacketNumber: number, BytesAcked: 1200, ReceivedTime: sent.Add(rtt)},
+			}, nil)
+			number++
+		}
+	}()
+	for i := 0; i < 3000; i++ {
+		_ = e.Telemetry()
+	}
+	<-done
+}
