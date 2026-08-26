@@ -169,6 +169,30 @@ pathmeasure -mode workload -rounds 20 \
   -post-file sample.wav -form-field file
 ```
 
+## The five shapes, and what to check for each
+
+This profile carries more than requests, and the thresholds were all chosen
+from the request case. Each shape has a different thing worth watching.
+
+| Shape | Watch | Wrong looks like |
+|---|---|---|
+| Short request | `queqiao_class_transitions_total{class="2"}` | anything above zero: a request was demoted to bulk |
+| Long-lived, intermittent | the same counter | the same. A session of exchanges must never add up to a transfer |
+| Token stream | `queqiao_erasure_residual_ratio{direction="receive"}` | above a fraction of a percent. Each unrepaired symbol is a reader watching a sentence stop |
+| Bulk transfer | `queqiao_class_transitions_total{class="2"}` | staying zero during a large sustained pull. That transfer is being coded and holding one lane |
+| Bulk beside interactive | `queqiao_bulk_isolations_total` | staying zero while both are running |
+
+The fourth row is the one that reads backwards from the first two, and that is
+the point: the same counter means the profile is working in one case and broken
+in another, so the counter alone is not the check. What the check is, is whether
+the class matches the shape you know you are running.
+
+To measure a token stream rather than infer it, `pathmeasure -mode stream`
+reports how far behind the generator's own schedule each token arrived. Give it
+`-stream-expect` with your generator's token interval, because the gaps between
+arrivals cannot show a stall: a stall and its catch-up burst produce one long
+gap and a run of zero-length ones, whose median looks healthy.
+
 ## Rolling back
 
 `--path-profile` defaults to `wan-shared-bottleneck`, which behaves exactly as
