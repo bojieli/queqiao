@@ -114,6 +114,16 @@ is 1.7% of samples, hardware-accelerated. Neither is the coding: the `fec` and
 `coded` packages do not appear in the top twenty. What dominates is the syscall
 per batch of packets, which is what userspace UDP is.
 
+That cost is already half-optimised and the half that is missing is upstream.
+The QUIC stack sets `UDP_SEGMENT`, so a send hands the kernel up to 64KB and it
+splits that into datagrams: one syscall for roughly forty packets. Receives get
+`recvmmsg` batching instead, which is one syscall for a batch of separate
+messages rather than one coalesced read. Checked against upstream quic-go
+v0.61.0 as well as the fork this project uses, `UDP_GRO` appears in neither, and
+the receive path's control-message parser handles only TOS and packet
+information. So the asymmetry is real and it is not something this repository
+can close.
+
 ## Flow completion time
 
 Upload direction, cubic, at the payload sizes an inference call actually sends:
