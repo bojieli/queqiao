@@ -77,11 +77,19 @@ Use it when all three hold:
 
 1. You operate both ends.
 2. The hop between them is long.
-3. Every flow on it is a latency-sensitive request, not a bulk transfer.
+3. Latency-critical requests are what the link is for, even if transfers also
+   cross it.
 
-If the third one is false, use the access-link profile instead. Its classifier
-is built around separating bulk traffic from interactive traffic, and that
-distinction doesn't mean anything here.
+The third one used to read "every flow is a request, not a bulk transfer,"
+which contradicted the profile's own classifier: this profile does separate
+bulk from interactive, at a 32MB floor rather than the access link's 128KB,
+because on a datacenter leg 128KB is one ordinary request. A checkpoint pull
+beside inference traffic is a shape this carries, and it is measured below.
+
+What sends you to the access-link profile instead is not the presence of
+transfers but the position of the bottleneck: if the near end of the path is
+what everything is contending for, coordinating across flows is what keeps the
+aggregate inside it, and that is what the other profile is built to do.
 
 **The split is not "datacenter versus internet."** The path we characterized is
 both: a cloud instance in Guiyang and a colocated server in Irvine, talking
