@@ -1,6 +1,6 @@
 # What a China-US datacenter path actually is (2026-08-26)
 
-A Huawei Cloud instance in Guiyang and a colocated server in Tustin,
+A Huawei Cloud instance in Guiyang and a colocated server in Irvine,
 California. The first path characterised for the datacenter profile, chosen
 because it is that profile's shape: a long leg between two hosts one operator
 runs, carrying request/response traffic of a few hundred kilobytes.
