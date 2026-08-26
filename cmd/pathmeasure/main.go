@@ -48,6 +48,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"sort"
@@ -59,7 +60,6 @@ import (
 	"net/http"
 
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 
 	"github.com/bojieli/queqiao/internal/tcpinfo"
 )
@@ -215,13 +215,13 @@ func serveConn(c net.Conn) {
 	// A peer that sends no header is an upload from an older client or from a
 	// tool that just streams; treating a read failure as "sink it" keeps the
 	// server useful for both.
-	c.SetReadDeadline(time.Now().Add(20 * time.Second))
+	_ = c.SetReadDeadline(time.Now().Add(20 * time.Second))
 	if _, err := io.ReadFull(c, hdr); err != nil {
-		c.SetReadDeadline(time.Time{})
+		_ = c.SetReadDeadline(time.Time{})
 		sink(c)
 		return
 	}
-	c.SetReadDeadline(time.Time{})
+	_ = c.SetReadDeadline(time.Time{})
 	if binary.LittleEndian.Uint32(hdr[0:4]) != reqMagic {
 		sink(c)
 		return
@@ -234,8 +234,8 @@ func serveConn(c net.Conn) {
 		// buffer on loopback -- which is microseconds, and which makes any
 		// tunnel look arbitrarily fast. The ack is the only definition of
 		// "delivered" that survives an intermediary.
-		n := int64(binary.LittleEndian.Uint64(hdr[8:16]))
-		if n <= 0 {
+		n, ok := boundedLength(binary.LittleEndian.Uint64(hdr[8:16]))
+		if !ok {
 			sink(c)
 			return
 		}
@@ -256,8 +256,8 @@ func serveConn(c net.Conn) {
 			if binary.LittleEndian.Uint32(hdr[0:4]) != reqMagic {
 				return
 			}
-			n = int64(binary.LittleEndian.Uint64(hdr[8:16]))
-			if n <= 0 {
+			var ok bool
+			if n, ok = boundedLength(binary.LittleEndian.Uint64(hdr[8:16])); !ok {
 				return
 			}
 			if _, err := io.CopyN(io.Discard, c, n); err != nil {
@@ -268,10 +268,11 @@ func serveConn(c net.Conn) {
 			}
 		}
 	case dirEcho:
-		size := int(binary.LittleEndian.Uint64(hdr[8:16]))
-		if size <= 0 || size > 1<<20 {
+		n, ok := boundedLength(binary.LittleEndian.Uint64(hdr[8:16]))
+		if !ok || n > 1<<20 {
 			return
 		}
+		size := int(n)
 		buf := make([]byte, size)
 		for {
 			if _, err := io.ReadFull(c, buf); err != nil {
@@ -282,9 +283,14 @@ func serveConn(c net.Conn) {
 			}
 		}
 	case dirUDPUp:
-		serveUDPCount(c, int64(binary.LittleEndian.Uint64(hdr[8:16])))
+		// The session id is an opaque tag rather than a length, so it is
+		// compared as the unsigned value it was written as.
+		serveUDPCount(c, binary.LittleEndian.Uint64(hdr[8:16]))
 	case dirDownload:
-		n := int64(binary.LittleEndian.Uint64(hdr[8:16]))
+		n, ok := boundedLength(binary.LittleEndian.Uint64(hdr[8:16]))
+		if !ok {
+			return
+		}
 		buf := make([]byte, 256*1024)
 		var sent int64
 		for sent < n {
@@ -316,11 +322,11 @@ func sink(c net.Conn) {
 		n, el, mbit, c.RemoteAddr())
 }
 
-func writeHeader(c net.Conn, dir uint32, n int64) error {
+func writeHeader(c net.Conn, dir uint32, n uint64) error {
 	hdr := make([]byte, reqHeader)
 	binary.LittleEndian.PutUint32(hdr[0:4], reqMagic)
 	binary.LittleEndian.PutUint32(hdr[4:8], dir)
-	binary.LittleEndian.PutUint64(hdr[8:16], uint64(n))
+	binary.LittleEndian.PutUint64(hdr[8:16], n)
 	_, err := c.Write(hdr)
 	return err
 }
@@ -372,7 +378,7 @@ func dialVia(remote, localAddr string) (net.Conn, error) {
 		return nil, fmt.Errorf("dial proxy %s: %w", proxyAddr, err)
 	}
 	if err := socks5Connect(c, remote); err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, err
 	}
 	return c, nil
@@ -386,11 +392,11 @@ func socks5Connect(c net.Conn, remote string) error {
 		return err
 	}
 	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return err
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("socks5: bad destination port %q", portStr)
 	}
-	c.SetDeadline(time.Now().Add(20 * time.Second))
-	defer c.SetDeadline(time.Time{})
+	_ = c.SetDeadline(time.Now().Add(20 * time.Second))
+	defer func() { _ = c.SetDeadline(time.Time{}) }()
 	if _, err := c.Write([]byte{5, 1, 0}); err != nil {
 		return err
 	}
@@ -590,7 +596,7 @@ loop:
 			}
 		}
 	}
-	tc.CloseWrite()
+	_ = tc.CloseWrite()
 	elapsed := time.Since(start)
 	if writeErr != nil {
 		fmt.Printf("# RUN ENDED EARLY: write failed after %d bytes: %v\n", sent, writeErr)
@@ -673,7 +679,7 @@ func rttRun(remote string, count int, localAddr string) error {
 			continue
 		}
 		el := time.Since(start)
-		c.Close()
+		_ = c.Close()
 		ms = append(ms, float64(el.Microseconds())/1000)
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -798,7 +804,7 @@ func fctRun(remote, sizes string, repeat int, cc, localAddr string, reverse bool
 			fmt.Printf("%s\t%s\t0.0\t%.1f\t%.1f\t%.2f\n",
 				human(n), label, tms, tms, float64(n)*8/(tms/1000)/1e6)
 		}
-		tc.Close()
+		_ = tc.Close()
 	}
 	return nil
 }
@@ -830,7 +836,7 @@ func oneFlow(remote string, n int64, cc, localAddr string, existing net.Conn) (c
 	buf := make([]byte, 64*1024)
 	t1 := time.Now()
 	// The length is declared first so the peer knows when to acknowledge.
-	if e := writeHeader(tc, dirUpload, n); e != nil {
+	if e := writeHeader(tc, dirUpload, uint64(n)); e != nil {
 		return connectMS, 0, e
 	}
 	var sent int64
@@ -849,11 +855,11 @@ func oneFlow(remote string, n int64, cc, localAddr string, existing net.Conn) (c
 	// socket's own accounting instead would time the send buffer, and through
 	// a proxy would time loopback.
 	ack := make([]byte, 1)
-	tc.SetReadDeadline(time.Now().Add(120 * time.Second))
+	_ = tc.SetReadDeadline(time.Now().Add(120 * time.Second))
 	if _, e := io.ReadFull(tc, ack); e != nil {
 		return connectMS, 0, fmt.Errorf("no completion ack: %w", e)
 	}
-	tc.SetReadDeadline(time.Time{})
+	_ = tc.SetReadDeadline(time.Time{})
 	transferMS = float64(time.Since(t1).Microseconds()) / 1000
 	return connectMS, transferMS, nil
 }
@@ -963,7 +969,7 @@ func oneDownload(remote string, n int64, cc, localAddr string) (connectMS, trans
 		}
 	}
 	t1 := time.Now()
-	if err := writeHeader(c, dirDownload, n); err != nil {
+	if err := writeHeader(c, dirDownload, uint64(n)); err != nil {
 		return connectMS, 0, err
 	}
 	got, rerr := io.CopyN(io.Discard, c, n)
@@ -983,7 +989,7 @@ const (
 
 // serveUDPCount receives one session's blast and reports what arrived back
 // over the TCP control connection.
-func serveUDPCount(c net.Conn, session int64) {
+func serveUDPCount(c net.Conn, session uint64) {
 	pc, err := net.ListenPacket("udp", ":"+udpProbePort)
 	if err != nil {
 		// The port is held by a concurrent run. Saying so is required: a zero
@@ -995,7 +1001,7 @@ func serveUDPCount(c net.Conn, session int64) {
 	defer pc.Close()
 	buf := make([]byte, 2048)
 	var got, bytes, highest uint64
-	pc.SetReadDeadline(time.Now().Add(90 * time.Second))
+	_ = pc.SetReadDeadline(time.Now().Add(90 * time.Second))
 	for {
 		n, _, err := pc.ReadFrom(buf)
 		if err != nil {
@@ -1004,7 +1010,7 @@ func serveUDPCount(c net.Conn, session int64) {
 		if n < udpHdrLen || binary.LittleEndian.Uint32(buf[0:4]) != udpMagic {
 			continue
 		}
-		if int64(binary.LittleEndian.Uint64(buf[4:12])) != session {
+		if binary.LittleEndian.Uint64(buf[4:12]) != session {
 			continue
 		}
 		if seq := uint64(binary.LittleEndian.Uint32(buf[12:16])); seq+1 > highest {
@@ -1014,7 +1020,7 @@ func serveUDPCount(c net.Conn, session int64) {
 		bytes += uint64(n)
 		// Once traffic is flowing, a short gap means the sender has stopped,
 		// so the report need not wait out the full timeout.
-		pc.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_ = pc.SetReadDeadline(time.Now().Add(3 * time.Second))
 	}
 	fmt.Fprintf(c, "OK %d %d %d\n", got, bytes, highest)
 }
@@ -1041,7 +1047,7 @@ func udpUpRun(remote string, rateMbit float64, dur time.Duration, payload int, l
 		return err
 	}
 	defer ctl.Close()
-	session := time.Now().UnixNano()
+	session := uint64(time.Now().UnixNano())
 	if err := writeHeader(ctl, dirUDPUp, session); err != nil {
 		return err
 	}
@@ -1057,7 +1063,7 @@ func udpUpRun(remote string, rateMbit float64, dur time.Duration, payload int, l
 
 	pkt := make([]byte, payload)
 	binary.LittleEndian.PutUint32(pkt[0:4], udpMagic)
-	binary.LittleEndian.PutUint64(pkt[4:12], uint64(session))
+	binary.LittleEndian.PutUint64(pkt[4:12], session)
 
 	perPkt := time.Duration(float64(payload) * 8 / (rateMbit * 1e6) * float64(time.Second))
 	start := time.Now()
@@ -1078,7 +1084,7 @@ func udpUpRun(remote string, rateMbit float64, dur time.Duration, payload int, l
 	elapsed := time.Since(start)
 	time.Sleep(500 * time.Millisecond) // let the tail arrive
 
-	ctl.SetReadDeadline(time.Now().Add(20 * time.Second))
+	_ = ctl.SetReadDeadline(time.Now().Add(20 * time.Second))
 	reply := make([]byte, 128)
 	n, rerr := ctl.Read(reply)
 	if rerr != nil {
@@ -1344,7 +1350,7 @@ func framesRun(remote string, sessions, count, size int, every time.Duration, lo
 				return
 			}
 			defer c.Close()
-			if err := writeHeader(c, dirEcho, int64(size)); err != nil {
+			if err := writeHeader(c, dirEcho, uint64(size)); err != nil {
 				return
 			}
 			frame := make([]byte, size)
@@ -1426,22 +1432,44 @@ func framesRun(remote string, sessions, count, size int, every time.Duration, lo
 // so the same binary provides both arms of the comparison.
 func h2Serve(addr string, window int) error {
 	h2s := &http2.Server{}
-	if window > 0 {
+	if w, ok := windowSetting(window); ok {
 		// Both windows, because they are separate. RFC 7540 6.9.2:
 		// SETTINGS_INITIAL_WINDOW_SIZE changes stream windows only, and the
 		// connection window is raised solely by WINDOW_UPDATE -- so a server
 		// that sets the first and forgets the second is capped at 64KB across
 		// every stream at once, which is the more common misconfiguration.
-		h2s.MaxUploadBufferPerStream = int32(window)
-		h2s.MaxUploadBufferPerConnection = int32(window)
+		h2s.MaxUploadBufferPerStream = w
+		h2s.MaxUploadBufferPerConnection = w
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n, _ := io.Copy(io.Discard, r.Body)
 		fmt.Fprintf(w, "%d", n)
 	})
-	srv := &http.Server{Addr: addr, Handler: h2c.NewHandler(handler, h2s)}
 	fmt.Printf("pathmeasure h2 server on %s (window=%d, 0 means library default)\n", addr, window)
-	return srv.ListenAndServe()
+	return serveClearTextH2(addr, h2s, handler)
+}
+
+// serveClearTextH2 speaks HTTP/2 on a plain TCP listener.
+//
+// Both ends here use prior knowledge: the client dials TCP and sends the HTTP/2
+// preface without asking. That is what h2c.NewHandler exists to detect and
+// upgrade, so with prior knowledge on both sides we can hand each accepted
+// connection straight to the HTTP/2 server. Doing it this way keeps the upload
+// buffer sizes configurable, which is the whole point of these modes, without
+// depending on a package that has been deprecated.
+func serveClearTextH2(addr string, h2s *http2.Server, handler http.Handler) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		go h2s.ServeConn(conn, &http2.ServeConnOpts{Handler: handler})
+	}
 }
 
 // h2Run uploads a payload over HTTP/2 and times it, reusing one connection so
@@ -1485,8 +1513,8 @@ func h2Run(remote, sizes string, repeat int, localAddr string) error {
 				fmt.Printf("%s\t%d\tERROR: %v\n", human(n), i, err)
 				continue
 			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 			ms := float64(time.Since(start).Microseconds()) / 1000
 			label := "warm"
 			if i == 0 {
@@ -1541,9 +1569,9 @@ func h2Proxy(listen, remote string, window int, localAddr string) error {
 	client := &http.Client{Transport: upstream}
 
 	h2s := &http2.Server{}
-	if window > 0 {
-		h2s.MaxUploadBufferPerStream = int32(window)
-		h2s.MaxUploadBufferPerConnection = int32(window)
+	if w, ok := windowSetting(window); ok {
+		h2s.MaxUploadBufferPerStream = w
+		h2s.MaxUploadBufferPerConnection = w
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		out, err := http.NewRequestWithContext(r.Context(), r.Method,
@@ -1571,7 +1599,36 @@ func h2Proxy(listen, remote string, window int, localAddr string) error {
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 	})
-	srv := &http.Server{Addr: listen, Handler: h2c.NewHandler(handler, h2s)}
 	fmt.Printf("pathmeasure h2 ingress on %s -> %s (local window=%d)\n", listen, remote, window)
-	return srv.ListenAndServe()
+	return serveClearTextH2(listen, h2s, handler)
+}
+
+// boundedLength reads a length from a wire header and refuses anything that
+// could not be a real payload.
+//
+// The value is attacker-controlled in the sense that anything can connect to
+// this port and send sixteen bytes. Converting it straight to a signed length
+// and handing it to io.CopyN would let a peer ask the server to read for as
+// long as it likes. maxPayload is far above any measurement this tool takes
+// and far below a length that could wrap.
+func boundedLength(v uint64) (int64, bool) {
+	if v == 0 || v > maxPayload {
+		return 0, false
+	}
+	return int64(v), true
+}
+
+// maxPayload caps a single measured transfer at a gigabyte.
+const maxPayload = 1 << 30
+
+// windowSetting converts the flag to the int32 the HTTP/2 server takes.
+//
+// The flag is an int, so on a 64-bit host it can hold values the field cannot.
+// A window larger than int32 is a typo rather than an intention, and silently
+// truncating it would advertise a window nobody asked for.
+func windowSetting(window int) (int32, bool) {
+	if window <= 0 || window > math.MaxInt32 {
+		return 0, false
+	}
+	return int32(window), true
 }

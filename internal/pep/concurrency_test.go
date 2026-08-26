@@ -5,7 +5,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	crand "crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -323,7 +322,7 @@ func baselineIdentity(t *testing.T) (tls.Certificate, *x509.CertPool) {
 			baselineErr = err
 			return
 		}
-		serial, err := crand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+		serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 		if err != nil {
 			baselineErr = err
 			return

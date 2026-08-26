@@ -363,11 +363,6 @@ func TestNilModelsAreInertRatherThanFatal(t *testing.T) {
 	if node.Members() != 0 {
 		t.Error("a nil node reported members")
 	}
-	// The trap itself: this is true, which is why the guards above exist.
-	var typed Model = node
-	if typed == nil {
-		t.Skip("this Go version compares typed nils as nil; the guard is then redundant")
-	}
 }
 
 // The deployment the tree is for: one client reaching several providers over
