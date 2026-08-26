@@ -42,8 +42,8 @@ type Config struct {
 	InteractiveMaxRate  float64
 	InteractiveIdleGap  time.Duration
 	// BulkIdleGapVeto disqualifies a flow from ever becoming bulk once it has
-	// been observed idle for this long. Zero disables the veto, which is the
-	// behaviour every deployment had before it existed.
+	// been observed idle for this long, that many times. Zero disables the
+	// veto, which is the behaviour every deployment had before it existed.
 	//
 	// Cumulative bytes cannot separate a bulk transfer from a series of
 	// requests on one connection: three 300KB exchanges and a 900KB download
@@ -58,6 +58,25 @@ type Config struct {
 	// evidence is about what kind of flow this is, and it does not expire when
 	// the next burst starts.
 	BulkIdleGapVeto time.Duration
+	// BulkIdleGapVetoEpisodes is how many separate idle gaps it takes. Zero
+	// means one, which is what the veto did when it was first written.
+	//
+	// One is too few, and the measurement that says so is that a transfer
+	// stalling once anywhere in its first BulkBytes is vetoed for the rest of
+	// its life. That window is the beginning of every transfer, which is where
+	// a stall is most likely: a cold source, an authorization round trip, a
+	// cache miss. On the datacenter profile a 240MB pull that paused for a
+	// second-and-a-half at 12MB spent the remaining 228MB classified
+	// interactive, which means coded and holding one lane.
+	//
+	// What separates the two cases is not whether a flow went quiet but
+	// whether going quiet is what it does. Two separate episodes is the
+	// smallest evidence that idling is a pattern rather than an event. It
+	// still protects the case the veto exists for by a wide margin: a session
+	// of a few hundred kilobytes per exchange needs roughly ninety exchanges
+	// to reach this profile's byte floor, and it produces an episode on the
+	// second one.
+	BulkIdleGapVetoEpisodes int
 }
 
 func DefaultConfig() Config {
@@ -100,14 +119,20 @@ type Observation struct {
 // word is exactly the size of value a race detector finds and a reader gets
 // half of.
 type Classifier struct {
-	// sawIdle records that this flow has been quiet long enough to disqualify
-	// it from bulk under BulkIdleGapVeto. It is the mirror of the sticky bulk
-	// decision below: both are conclusions about the flow's kind rather than
-	// about its present moment.
-	sawIdle bool
-	cfg     Config
-	mu      sync.Mutex
-	class   Class
+	// idleEpisodes counts the times this flow has gone quiet long enough to
+	// count under BulkIdleGapVeto, and inIdle debounces a single gap that
+	// several consecutive observations land inside. Counting observations
+	// rather than episodes would make the veto a function of how often the
+	// scheduler happened to tick during one pause.
+	//
+	// Once the count reaches the threshold the conclusion is sticky, in the
+	// same way the bulk decision is: both are about what kind of flow this is
+	// rather than about its present moment.
+	idleEpisodes int
+	inIdle       bool
+	cfg          Config
+	mu           sync.Mutex
+	class        Class
 }
 
 // Declare sets the class a flow starts in, from something known before it
@@ -156,8 +181,15 @@ func (c *Classifier) Observe(o Observation) Class {
 	if c.class == ClassBulk {
 		return c.class
 	}
-	if c.cfg.BulkIdleGapVeto > 0 && o.SinceLastPayload >= c.cfg.BulkIdleGapVeto {
-		c.sawIdle = true
+	if c.cfg.BulkIdleGapVeto > 0 {
+		if o.SinceLastPayload >= c.cfg.BulkIdleGapVeto {
+			if !c.inIdle {
+				c.idleEpisodes++
+				c.inIdle = true
+			}
+		} else {
+			c.inIdle = false
+		}
 	}
 	if c.isBulk(o) {
 		c.class = ClassBulk
@@ -172,12 +204,30 @@ func (c *Classifier) Observe(o Observation) Class {
 }
 
 func (c *Classifier) isBulk(o Observation) bool {
-	if c.sawIdle {
+	if c.vetoed() {
 		return false
 	}
 	return o.Age >= c.cfg.BulkMinimumAge &&
 		o.BytesUp+o.BytesDown >= c.cfg.BulkBytes &&
 		(!o.Bidirectional || !o.SmallBidirectionalBursts)
+}
+
+// vetoed reports whether this flow has gone quiet often enough to be
+// disqualified from bulk.
+func (c *Classifier) vetoed() bool {
+	if c.cfg.BulkIdleGapVeto <= 0 {
+		return false
+	}
+	return c.idleEpisodes >= c.vetoEpisodes()
+}
+
+// vetoEpisodes is the configured episode count, treating zero as one so that a
+// deployment that set only the duration keeps the behaviour it had.
+func (c *Classifier) vetoEpisodes() int {
+	if c.cfg.BulkIdleGapVetoEpisodes <= 0 {
+		return 1
+	}
+	return c.cfg.BulkIdleGapVetoEpisodes
 }
 
 func (c *Classifier) isInteractive(o Observation) bool {

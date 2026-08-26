@@ -89,13 +89,7 @@ func TestBulkClassDoesNotFlap(t *testing.T) {
 //
 // The thresholds carry most of this: one request must not look like a
 // transfer. The veto carries the rest: many requests must not add up to one.
-func dcClassifier() *Classifier {
-	cfg := DefaultConfig()
-	cfg.BulkBytes = 32 << 20
-	cfg.BulkMinimumAge = 10 * time.Second
-	cfg.BulkIdleGapVeto = time.Second
-	return New(cfg)
-}
+func dcClassifier() *Classifier { return New(dcClassifierConfig()) }
 
 func TestOneLargeRequestIsNotBulkOnADatacenterLeg(t *testing.T) {
 	c := dcClassifier()
@@ -110,18 +104,19 @@ func TestManyRequestsDoNotAddUpToBulk(t *testing.T) {
 	c := dcClassifier()
 	busy := Observation{BytesUp: 1 << 20, Age: 2 * time.Second,
 		SinceLastPayload: 10 * time.Millisecond, UpRate: 20 << 20}
-	c.Observe(busy)
-	// The caller waits for a response, which is what a request does.
-	idle := busy
-	idle.SinceLastPayload = 2 * time.Second
-	c.Observe(idle)
-	// Enough further requests to pass even the datacenter byte threshold.
-	for i := 0; i < 60; i++ {
+	// Enough requests to pass even the datacenter byte threshold several times
+	// over. Each one is a burst and then a wait, because that is what a request
+	// is: the wait is not incidental to the shape, it is the shape.
+	for i := range 60 {
 		busy.BytesUp += 1 << 20
 		busy.Age += 2 * time.Second
 		if got := c.Observe(busy); got == ClassBulk {
-			t.Fatalf("request %d classified bulk at %d bytes after an observed idle",
-				i, busy.BytesUp)
+			t.Fatalf("request %d classified bulk at %d bytes", i, busy.BytesUp)
+		}
+		idle := busy
+		idle.SinceLastPayload = 2 * time.Second
+		if got := c.Observe(idle); got == ClassBulk {
+			t.Fatalf("request %d classified bulk while the caller waited", i)
 		}
 	}
 }
@@ -164,7 +159,12 @@ func TestSustainedTransferStillBecomesBulkOnADatacenterLeg(t *testing.T) {
 // since the scheduler ticks during bursts too.
 func TestIdleVetoSurvivesLaterBusyObservations(t *testing.T) {
 	c := dcClassifier()
+	// Two separate gaps, which is what it takes for going quiet to count as
+	// something this flow does rather than something that happened to it. The
+	// busy observation between them is what makes them separate.
 	c.Observe(Observation{Age: 2 * time.Second, SinceLastPayload: 3 * time.Second})
+	c.Observe(Observation{Age: 3 * time.Second, SinceLastPayload: time.Millisecond})
+	c.Observe(Observation{Age: 4 * time.Second, SinceLastPayload: 3 * time.Second})
 	busy := Observation{BytesUp: 500 << 20, Age: 300 * time.Second,
 		SinceLastPayload: time.Millisecond, UpRate: 100 << 20}
 	for i := 0; i < 10; i++ {
@@ -225,11 +225,16 @@ func TestTheDatacenterClassifierChangesStillChangeSomething(t *testing.T) {
 	}
 }
 
+// dcClassifierConfig mirrors what internal/profile ships for dc-long-haul.
+// The profile package imports this one, so these tests cannot import it back;
+// TestDatacenterProfileMatchesWhatItsTestsAssume over there fails if the two
+// ever drift, which is how this copy stayed wrong through one change already.
 func dcClassifierConfig() Config {
 	c := DefaultConfig()
 	c.BulkBytes = 32 << 20
 	c.BulkMinimumAge = 10 * time.Second
 	c.BulkIdleGapVeto = time.Second
+	c.BulkIdleGapVetoEpisodes = 2
 	return c
 }
 
@@ -285,5 +290,108 @@ func TestDeclaringNonsenseChangesNothing(t *testing.T) {
 	c.Declare(Class(99))
 	if c.Class() != ClassNew {
 		t.Errorf("an unknown class was applied: %v", c.Class())
+	}
+}
+
+// The datacenter profile carries five workload shapes, not one, and each of
+// them has to land somewhere defensible. This table is the record of where.
+//
+// It exists because every threshold in the datacenter config was chosen from
+// the request case, and a threshold chosen from one shape is a threshold
+// untested against the other four. A change that improves the request case and
+// silently reclassifies token streams should fail here rather than in a
+// deployment.
+func TestEveryDatacenterWorkloadShapeLandsSomewhere(t *testing.T) {
+	// tick is one scheduler observation.
+	type tick struct {
+		up, down uint64
+		since    time.Duration
+		upRate   float64
+		downRate float64
+	}
+	// A conversation's recent-rate test is what SmallBidirectionalBursts
+	// reports; the observer computes it from a one-second window, so these
+	// cases state it directly.
+	for _, tc := range []struct {
+		name    string
+		small   bool
+		bidi    bool
+		ticks   []tick
+		wantNot Class
+		wantIs  Class
+		note    string
+	}{
+		{
+			name: "one recognition request, cold",
+			bidi: true, small: false,
+			ticks:   []tick{{up: 355 << 10, since: 5 * time.Millisecond, upRate: 1 << 20}},
+			wantNot: ClassBulk,
+			note:    "300ms of upload never reaches the ten-second minimum age",
+		},
+		{
+			name: "recognition on a held-open connection",
+			bidi: true, small: false,
+			ticks: []tick{
+				{up: 355 << 10, since: 5 * time.Millisecond, upRate: 1 << 20},
+				{up: 355 << 10, since: 1700 * time.Millisecond},
+				{up: 710 << 10, since: 5 * time.Millisecond, upRate: 1 << 20},
+				{up: 710 << 10, since: 1700 * time.Millisecond},
+			},
+			wantNot: ClassBulk,
+			wantIs:  ClassInteractive,
+			note:    "the caller waits between utterances, whatever the running total",
+		},
+		{
+			name: "a language model streaming tokens",
+			bidi: true, small: true,
+			ticks: []tick{
+				{up: 1 << 10, down: 800, since: 30 * time.Millisecond, downRate: 800},
+				{up: 1 << 10, down: 24000, since: 30 * time.Millisecond, downRate: 800},
+				{up: 1 << 10, down: 48000, since: 30 * time.Millisecond, downRate: 800},
+			},
+			wantNot: ClassBulk,
+			wantIs:  ClassInteractive,
+			note: "tokens arrive too close together to look idle, so the small " +
+				"recent rate is the only thing that separates this from a transfer",
+		},
+		{
+			name: "a checkpoint pull",
+			bidi: false, small: false,
+			ticks: func() []tick {
+				var out []tick
+				var got uint64
+				for i := range 40 {
+					got += 4 << 20
+					out = append(out, tick{down: got, since: 5 * time.Millisecond,
+						downRate: 100 << 20})
+					_ = i
+				}
+				return out
+			}(),
+			wantIs: ClassBulk,
+			note:   "never stops asking, and passes both the byte and age floors",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := dcClassifier()
+			age := 11 * time.Second
+			var got Class
+			for _, tk := range tc.ticks {
+				age += time.Second
+				got = c.Observe(Observation{
+					BytesUp: tk.up, BytesDown: tk.down,
+					UpRate: tk.upRate, DownRate: tk.downRate,
+					Age: age, SinceLastPayload: tk.since,
+					Bidirectional:            tc.bidi,
+					SmallBidirectionalBursts: tc.small,
+				})
+			}
+			if tc.wantIs != ClassNew && got != tc.wantIs {
+				t.Fatalf("%s classified %v, want %v (%s)", tc.name, got, tc.wantIs, tc.note)
+			}
+			if tc.wantNot != ClassNew && got == tc.wantNot {
+				t.Fatalf("%s classified %v, which it must not (%s)", tc.name, got, tc.note)
+			}
+		})
 	}
 }

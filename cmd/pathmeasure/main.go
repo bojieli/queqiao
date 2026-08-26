@@ -28,6 +28,8 @@
 //	frames     many concurrent frame streams, reporting per-message latency
 //	ab         order-alternated A/B of two arms, pooled
 //	workload   order-alternated A/B of a real HTTP request against both arms
+//	stream     order-alternated A/B of a token stream, reporting the gaps
+//	streamserve emit tokens at a fixed cadence, so the generator is not a variable
 //	rtt        round-trip distribution
 //
 // Every mode can be pointed through a SOCKS5 proxy, so a tunnel and the path
@@ -112,6 +114,10 @@ func run(args []string) error {
 	fs.Var(&formValues, "form-value", "workload: an extra multipart field as key=value; repeatable")
 	var headers repeatedValue
 	fs.Var(&headers, "header", "workload: an extra request header as Name: value; repeatable")
+	streamTokens := fs.Int("stream-tokens", 200, "streamserve: tokens to emit per response")
+	streamInterval := fs.Float64("stream-interval", 0.03, "streamserve: seconds between tokens")
+	streamTokenBytes := fs.Int("stream-token-bytes", 24, "streamserve: payload bytes per token")
+	streamExpect := fs.Float64("stream-expect", 0, "stream: the generator's token interval in seconds. Given, the mode reports how far behind that schedule each token arrived, which is what a reader notices; a stall and its catch-up burst are invisible in the gap median")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -184,6 +190,21 @@ func run(args []string) error {
 		w.headers = headers
 		return workloadMode(*url, *aSpec, *bSpec, *rounds, *reuse, *localAddr, w,
 			time.Duration(*spacing*float64(time.Second)))
+	case "stream":
+		if *url == "" {
+			return fmt.Errorf("stream: --url is required")
+		}
+		w, err := buildBody(*postFile, *formField, *contentType, formValues)
+		if err != nil {
+			return fmt.Errorf("stream: %w", err)
+		}
+		w.headers = headers
+		return streamMode(*url, *aSpec, *bSpec, *rounds, *reuse, *localAddr, w,
+			time.Duration(*spacing*float64(time.Second)),
+			time.Duration(*streamExpect*float64(time.Second)))
+	case "streamserve":
+		return streamServe(*listen, *streamTokens,
+			time.Duration(*streamInterval*float64(time.Second)), *streamTokenBytes)
 	case "rtt":
 		if *remote == "" {
 			return errors.New("rtt needs --remote")

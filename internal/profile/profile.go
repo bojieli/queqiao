@@ -183,6 +183,15 @@ func dcLongHaul() Profile {
 	// unlock lanes, and its slowness is the path's doing rather than the
 	// application's.
 	c.BulkIdleGapVeto = 1 * time.Second
+	// Two episodes rather than one. A single stall is an event; two is a
+	// pattern, and only the pattern says this flow is a caller rather than a
+	// transfer. With one, a checkpoint pull that paused once inside its first
+	// 32MB spent the rest of its life classified interactive: coded, and
+	// holding a single lane. The margin protecting the case this veto exists
+	// for is unaffected, because a session of request-sized exchanges reaches
+	// the byte floor after roughly ninety of them and produces its second
+	// episode on the second one.
+	c.BulkIdleGapVetoEpisodes = 2
 	return Profile{
 		Name:             "dc-long-haul",
 		HierarchicalPath: true,

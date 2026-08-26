@@ -127,6 +127,32 @@ func buildBody(postFile, formField, contentType string, formValues []string) (*w
 	return w, nil
 }
 
+// newWorkloadHTTPRequest builds the request this workload repeats. The body is
+// assembled once and re-read from memory each round, so per-round timing never
+// includes reading a file off disk.
+func newWorkloadHTTPRequest(w *workloadRequest) (*http.Request, error) {
+	method := http.MethodPost
+	if len(w.body) == 0 {
+		method = http.MethodGet
+	}
+	req, err := http.NewRequest(method, w.url, bytes.NewReader(w.body))
+	if err != nil {
+		return nil, err
+	}
+	if w.contentType != "" {
+		req.Header.Set("Content-Type", w.contentType)
+	}
+	for _, h := range w.headers {
+		k, v, ok := strings.Cut(h, ":")
+		if !ok {
+			continue
+		}
+		req.Header.Set(strings.TrimSpace(k), strings.TrimSpace(v))
+	}
+	req.ContentLength = int64(len(w.body))
+	return req, nil
+}
+
 // newWorkloadClient builds a client that dials through this arm's proxy using
 // the same dialer every other mode uses, so a tunnel and the path beneath it
 // are measured by one instrument.
@@ -158,26 +184,11 @@ func timeOne(cl *http.Client, w *workloadRequest) legs {
 	var l legs
 	l.out = int64(len(w.body))
 
-	method := http.MethodPost
-	if len(w.body) == 0 {
-		method = http.MethodGet
-	}
-	req, err := http.NewRequest(method, w.url, bytes.NewReader(w.body))
+	req, err := newWorkloadHTTPRequest(w)
 	if err != nil {
 		l.err = err
 		return l
 	}
-	if w.contentType != "" {
-		req.Header.Set("Content-Type", w.contentType)
-	}
-	for _, h := range w.headers {
-		k, v, ok := strings.Cut(h, ":")
-		if !ok {
-			continue
-		}
-		req.Header.Set(strings.TrimSpace(k), strings.TrimSpace(v))
-	}
-	req.ContentLength = int64(len(w.body))
 
 	var start, conn, first time.Time
 	start = time.Now()
