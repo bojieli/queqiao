@@ -30,6 +30,39 @@ If the third one is false, use the access-link profile instead. Its classifier
 is built around separating bulk traffic from interactive traffic, and that
 distinction doesn't mean anything here.
 
+**The split is not "datacenter versus internet."** The path we characterized is
+both: a cloud instance in Guiyang and a colocated server in Irvine, talking
+over the public internet. It erases up to 17% and has no capacity constraint
+until 333 Mbit/s, which makes it look nothing like a datacenter in the
+low-latency-fabric sense and exactly like one in the sense that matters here,
+which is that nothing near either endpoint is the bottleneck.
+
+What actually separates the two profiles is **where the bottleneck is**. On an
+access link it's the client's own uplink, shared by everything, and
+coordinating across flows is what keeps the aggregate inside it. On this hop
+there is no such constraint, so coordination buys fairness rather than
+throughput, and a few hundred kilobytes is one ordinary request rather than a
+transfer worth demoting.
+
+That's a property to measure, not to infer from where the machines are. A
+datacenter hop behind a saturated egress behaves like an access link, and a
+residential connection to a nearby CDN behaves like this one. The hierarchical
+path model exists so the answer can be discovered rather than assumed, and
+`cmd/pathprobe` tells you which case you have before you choose.
+
+Two consequences worth stating, because both were mistakes we made:
+
+**Most fixes belong in neither profile.** The largest defect found while
+building this, a long conversation losing its coding after about a minute,
+affected both and was fixed globally. When a change only makes sense in one
+regime, that's evidence it's a profile field; when it makes sense in both, a
+profile field is the wrong place to put it.
+
+**Carrier matters more than regime.** Voice frames over TCP have a p99 three
+and a half times the median on this path, and over UDP they don't. That was
+true regardless of which profile was selected, and no amount of profile tuning
+would have addressed it.
+
 ## What we got wrong
 
 We designed this profile from first principles and then went and measured it.
