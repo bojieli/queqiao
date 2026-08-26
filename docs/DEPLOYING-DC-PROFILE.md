@@ -22,6 +22,17 @@ Two figures decide it:
   path's capacity, the bottleneck is the path and the access-link profile's
   coordination is what you want.
 
+`queqiaod doctor` checks the part of this a machine can check:
+
+```sh
+queqiaod doctor --path-profile dc-long-haul --profile ~/.config/queqiao/*.json
+```
+
+It reports the profile's qualification level and precondition, the kernel
+settings the measurements assumed, and whether the gateway answers. It does not
+tell you what the path does, because no local check can: that is what
+`pathprobe` is for, and the two figures below are the ones to get from it.
+
 Then do the free things first, because they're worth more than anything below
 and they cost a config line: reuse connections, set the receiver's HTTP/2
 windows, and set `net.ipv4.tcp_slow_start_after_idle=0`. On the path we
