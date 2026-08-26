@@ -71,6 +71,10 @@ BASELINE = {
     ("G301", "cmd/queqiaopack/main.go"): 3,
     ("G301", "mobile/tools/notices/main.go"): 1,
     ("G302", "cmd/queqiaopack/main.go"): 2,
+    # The workload mode sends a file the operator names on the command line:
+    # the audio to transcribe, or the request body to post. There is no
+    # untrusted input here and nothing is served; the path is the argument.
+    ("G304", "cmd/pathmeasure/workload.go"): 1,
     ("G304", "cmd/queqiaod/main.go"): 2,
     # The multi-provider manifest is opened from the operator's own --providers
     # path, on the same footing as the reviewed --profile reads above it.
