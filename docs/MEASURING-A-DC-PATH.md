@@ -210,3 +210,40 @@ queqiaod provider invite -state /tmp/qqstate -user bench      # then on the clie
 queqiaod enroll 'queqiao://enroll/...' --local-address if:eth0
 queqiaod client --profile ~/.config/queqiao/*.json --path-profile dc-long-haul &
 ```
+
+## Qualifying a second path
+
+The `dc-long-haul` profile is experimental because everything known about it
+comes from one link. A second path either confirms the constants or shows they
+were that link's constants, and there is no way to tell which from here.
+
+What a second path has to answer, in order. Each step decides whether the next
+one is worth running:
+
+1. **Is the loss rate-independent?** Sweep `pathprobe` from 1 Mbit/s to past the
+   knee and look at loss against offered rate. Flat means erasure, which is
+   what this transport repairs. Loss that appears only near the knee is
+   congestion, and this profile is the wrong answer to it. Run both directions
+   separately: on our path one direction lost nothing and the other lost 14%,
+   and a single-direction reading would have described neither.
+2. **Is it memoryless?** Compare `P(loss|prev ok)` against the overall rate, and
+   `P(ok|prev lost)` against its complement. If they match, a code sized for the
+   rate repairs it. If loss arrives in long runs, it needs a different size and
+   possibly a different mechanism.
+3. **Where is the knee, relative to what you'll offer?** The profile assumes
+   your traffic is nowhere near capacity. If it isn't, use the access-link
+   profile.
+4. **What do the free client-side fixes recover?** Run `-mode workload` with and
+   without `-reuse`, and with `tcp_slow_start_after_idle` at 1 and at 0. On our
+   path this recovered the entire median on the clean direction and almost none
+   of the erasing one. Whichever it does on yours is the thing to know before
+   deploying anything.
+5. **Then the transport comparison**, with the QUIC arm included, order
+   alternated, and a loss reading in the same minutes.
+
+The constants worth checking against ours are the erasure rate and its
+directional asymmetry, the burst factor, the knee, and the ratio between what
+step 4 recovers and what step 5 does. If the second path agrees, the profile
+stops being experimental. If it disagrees, the profile needs a discovered
+constant where it currently has a fixed one, and knowing which constant is the
+useful outcome.
