@@ -495,6 +495,12 @@ digits. So:
   confirmed the fix: erasure fell from 14% to 4.3% and the burst factor rose to
   2.0, so loss stopped arriving independently. A channel that holds still for
   the length of a comparison is what settles it, and this path does not.
+- The unmetered burst rests on a threshold, which is the thing this design
+  otherwise avoids. It is defensible only because the two paths measured sit far
+  apart on either side of it, and a third path landing in between would make it
+  a guess. What would replace it is a congestion signal a policer cannot hide
+  from, which is the open problem in
+  [CONTROL-REDESIGN.md](CONTROL-REDESIGN.md) and not a new one.
 - Coding is sized per block and the class is fixed per lane, which is why the
   fix keys on how a block sealed rather than on what kind of flow produced it.
   A lane carries every class at once, so `fec.ClassInteractive` is not reachable
