@@ -768,24 +768,26 @@ what was described as a 355KB upload, and 355KB cannot be done in 225.8ms on
 this path. One round trip is about 200ms and the model is about 30ms, so the
 floor is roughly 230ms whatever the transport does.
 
-Re-run with one fixed file, `dashboard.wav` at 354,640 bytes, contemporaneous
-round trip 207ms, after the pacing fix:
+Re-run with one fixed file, `dashboard.wav` at 354,640 bytes, arms alternating
+within the run, contemporaneous round trip 197 to 205ms, after the pacing fix:
 
 | 355KB ASR upload | direct | queqiao |
 |---|---|---|
-| new connection, p50 | 1375.8ms | **281.7ms** |
-| held open and tuned, p50 | **229.5ms** | 248.1ms |
-| held open and tuned, p90 | 834.3ms | **274.6ms** |
-| held open and tuned, p99 | 916.7ms | **289.6ms** |
+| new connection, p50 | 1185.3ms | **301.6ms** |
+| held open and tuned, p50 | 240.9ms | **236.5ms** |
+| held open and tuned, p99 | 251.7ms | **246.4ms** |
 
-Paired per-round ratio on new connections: median 4.45x.
+Paired per-round ratio: 3.96x on new connections, 1.03x warm.
 
-229.5ms against a 207ms round trip and a 30ms model is the floor, reached. The
-transport is 18.6ms above it, which is a userspace proxy and an extra local
-hop. Before the pacing fix that gap was 67ms, and all of the difference was the
-pacer metering a flow that had produced no evidence of congestion.
+The warm row is the one that took the work. A 197ms round trip and a 30ms model
+put the floor around 227ms, and both arms are within ten milliseconds of it.
+Before the pacing fix the transport sat 67ms above, all of it the pacer metering
+a flow that had produced no evidence of congestion.
 
-The tail is the other half and it moves the other way: 834.3ms against 274.6ms
-at p90. A restored congestion window does nothing about a packet that was
-dropped, and this path drops packets for reasons that have nothing to do with
-how fast anyone is sending.
+Two cautions about the tail figures. An earlier run of the same comparison, on a
+minute when the path was dropping about 20% of pings, put direct at 834.3ms and
+916.7ms at p90 and p99 against 274.6ms and 289.6ms; this run, with the path
+clean, put both arms inside 252ms. The tail advantage is real and it is a
+property of the path's condition rather than of the workload, so neither run
+should be quoted as the tail behaviour. And the cold figures move by 200ms
+between runs an hour apart, which is this link, not this transport.

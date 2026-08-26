@@ -43,19 +43,22 @@ characterized that last one alone took a 300KB burst on an idle connection from
 941ms to 209ms.
 
 We mean this literally, and there's a measurement behind it. Running real ASR
-from Guiyang against a model in Irvine, a 355KB upload takes 1263ms on a new
-connection and this profile takes it to 282ms. Reuse the connection and set that
-sysctl on the client, and direct TCP reaches 229.5ms at the median, which is
-where the transport gets to as well: 248.1ms, the difference being a userspace
-proxy and an extra local hop.
+from Guiyang against a model in Irvine, a 355KB upload takes 1185ms on a new
+connection and this profile takes it to 302ms. Reuse the connection and set that
+sysctl, and direct TCP reaches 240.9ms at the median; the transport reaches
+236.5ms in the same minutes. Both are within ten milliseconds of the floor that
+a 197ms round trip and a 30ms model impose, so on a warm connection over a clean
+direction the two are the same answer and the config line is the cheaper way to
+get it.
 
-What the sysctl does not reach is the tail. On the same runs direct TCP was
-834.3ms at p90 and 916.7ms at p99, against 274.6ms and 289.6ms through the
-transport, because a connection window restored after an idle gap does nothing
-about a path that drops packets for reasons unrelated to congestion.
+What the sysctl does not reach is a connection that is genuinely cold, a
+direction that erases, or a caller you cannot reconfigure. On a minute when the
+path was dropping about 20% of pings, the same comparison put direct at 916.7ms
+at p99 against 246.4ms; a congestion window restored after an idle gap does
+nothing about a packet that was dropped.
 
 <p align="center">
-  <img src="../assets/fix-the-client-first.svg" alt="Two grouped bar charts. On the speech recognition upload, which runs on the clean direction, a tuned direct client reaches 230 milliseconds at the median against Queqiao's 248, but its 99th percentile is 917 against Queqiao's 290. On the speech synthesis download, which erases 14 percent, tuning the client moves 916 milliseconds only to 629, while Queqiao is 71." width="880">
+  <img src="../assets/fix-the-client-first.svg" alt="Two bar charts. On the speech recognition upload, which runs on the direction that loses nothing, a tuned direct client reaches 241 milliseconds on a reused connection and Queqiao reaches 237, so the two are the same answer. On a new connection direct TCP takes 1185 milliseconds and Queqiao 302. On the speech synthesis download, which erases about 14 percent, tuning the client moves 916 milliseconds only to 629, while Queqiao is 71." width="880">
 </p>
 
 So the question to ask before deploying anything is which of those you have.

@@ -1,67 +1,56 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 600" width="1240" height="600" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="Two grouped bar charts comparing three arms. On the speech recognition upload, which runs on the clean direction, a tuned direct client reaches 230 milliseconds at the median against Queqiao's 248, but its 99th percentile is 917 against Queqiao's 290. On the speech synthesis download, which runs on the direction that erases 14 percent of packets, tuning the client moves 916 milliseconds only to 629, while Queqiao is 71.">
-  <rect x="0" y="0" width="1240" height="600" fill="#FBFCFE"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 580" width="1240" height="580" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="Two bar charts. On the speech recognition upload, which runs on the direction that loses nothing, a tuned direct client reaches 241 milliseconds on a reused connection and Queqiao reaches 237, so the two are the same answer. On a new connection direct TCP takes 1185 milliseconds and Queqiao 302. On the speech synthesis download, which runs on the direction that erases about 14 percent, tuning the client moves 916 milliseconds only to 629, while Queqiao is 71.">
+  <rect x="0" y="0" width="1240" height="580" fill="#FBFCFE"/>
 
-  <text x="620" y="46" text-anchor="middle" font-size="27" font-weight="700" fill="#0F172A">Fix the client first, then deploy this for what is left</text>
-  <text x="620" y="76" text-anchor="middle" font-size="17" fill="#64748B">Reusing the connection and setting one sysctl is free, and it buys the median. It does not buy the tail.</text>
+  <text x="620" y="44" text-anchor="middle" font-size="25" font-weight="700" fill="#0F172A">The free client fix reaches the median. It does not reach the rest.</text>
+  <text x="620" y="72" text-anchor="middle" font-size="16" fill="#64748B">Reusing the connection and setting one sysctl costs a config line. Do it first.</text>
 
-  <!-- legend -->
-  <rect x="380" y="98" width="14" height="14" rx="2" fill="#C2410C"/>
-  <text x="402" y="110" font-size="13.5" fill="#334155">direct, new connection</text>
-  <rect x="580" y="98" width="14" height="14" rx="2" fill="#94A3B8"/>
-  <text x="602" y="110" font-size="13.5" fill="#334155">direct, tuned client</text>
-  <rect x="760" y="98" width="14" height="14" rx="2" fill="#2563EB"/>
-  <text x="782" y="110" font-size="13.5" fill="#334155">through Queqiao</text>
+  <rect x="330" y="94" width="14" height="14" rx="2" fill="#C2410C"/>
+  <text x="352" y="106" font-size="13.5" fill="#334155">direct TCP, untuned</text>
+  <rect x="510" y="94" width="14" height="14" rx="2" fill="#94A3B8"/>
+  <text x="532" y="106" font-size="13.5" fill="#334155">direct TCP, tuned client</text>
+  <rect x="720" y="94" width="14" height="14" rx="2" fill="#2563EB"/>
+  <text x="742" y="106" font-size="13.5" fill="#334155">through Queqiao</text>
 
-  <!-- ============ LEFT: ASR upload, clean direction ============ -->
-  <text x="70" y="158" font-size="18" font-weight="700" fill="#0F172A">ASR upload, 355KB</text>
-  <text x="70" y="180" font-size="14" fill="#15803D">upstream, which loses nothing</text>
+  <!-- LEFT: ASR upload, clean direction -->
+  <text x="60" y="152" font-size="18" font-weight="700" fill="#0F172A">ASR upload, 355KB</text>
+  <text x="60" y="174" font-size="14" fill="#15803D">upstream, which loses nothing: 0 of 41,663</text>
 
-  <line x1="70" y1="440" x2="590" y2="440" stroke="#CBD5E1" stroke-width="1.5"/>
+  <line x1="60" y1="430" x2="600" y2="430" stroke="#CBD5E1" stroke-width="1.5"/>
 
-  <!-- p50 group -->
-  <text x="180" y="464" text-anchor="middle" font-size="14" font-weight="600" fill="#475569">median</text>
-  <rect x="98" y="212" width="46" height="228" rx="3" fill="#C2410C"/>
-  <text x="121" y="204" text-anchor="middle" font-size="13" font-weight="600" fill="#9A3412">1134</text>
-  <rect x="157" y="393.8" width="46" height="46.2" rx="3" fill="#94A3B8"/>
-  <text x="180" y="385.8" text-anchor="middle" font-size="13" font-weight="700" fill="#15803D">230</text>
-  <rect x="216" y="390.2" width="46" height="49.8" rx="3" fill="#2563EB"/>
-  <text x="239" y="382.2" text-anchor="middle" font-size="13" font-weight="600" fill="#1D4ED8">248</text>
+  <text x="190" y="454" text-anchor="middle" font-size="14" font-weight="600" fill="#475569">connection reused</text>
+  <rect x="140" y="382" width="50" height="48" rx="3" fill="#94A3B8"/>
+  <text x="165" y="374" text-anchor="middle" font-size="13" font-weight="600" fill="#475569">241</text>
+  <rect x="200" y="383" width="50" height="47" rx="3" fill="#2563EB"/>
+  <text x="225" y="375" text-anchor="middle" font-size="13" font-weight="700" fill="#1D4ED8">237</text>
 
-  <!-- p99 group -->
-  <text x="450" y="464" text-anchor="middle" font-size="14" font-weight="600" fill="#475569">99th percentile</text>
-  <rect x="368" y="170" width="46" height="270" rx="3" fill="#C2410C"/>
-  <text x="391" y="162" text-anchor="middle" font-size="13" font-weight="600" fill="#9A3412">1344</text>
-  <rect x="427" y="255.7" width="46" height="184.3" rx="3" fill="#94A3B8"/>
-  <text x="450" y="247.7" text-anchor="middle" font-size="13" font-weight="600" fill="#475569">917</text>
-  <rect x="486" y="381.7" width="46" height="58.3" rx="3" fill="#2563EB"/>
-  <text x="509" y="373.7" text-anchor="middle" font-size="13" font-weight="700" fill="#1D4ED8">290</text>
+  <text x="440" y="454" text-anchor="middle" font-size="14" font-weight="600" fill="#475569">new connection</text>
+  <rect x="390" y="193" width="50" height="237" rx="3" fill="#C2410C"/>
+  <text x="415" y="185" text-anchor="middle" font-size="13" font-weight="600" fill="#9A3412">1185</text>
+  <rect x="450" y="370" width="50" height="60" rx="3" fill="#2563EB"/>
+  <text x="475" y="362" text-anchor="middle" font-size="13" font-weight="700" fill="#1D4ED8">302</text>
 
-  <!-- divider -->
-  <line x1="640" y1="150" x2="640" y2="470" stroke="#E2E8F0" stroke-width="2"/>
+  <text x="330" y="486" text-anchor="middle" font-size="14" fill="#15803D">Tuned and warm, the two are the same answer, and both are</text>
+  <text x="330" y="506" text-anchor="middle" font-size="14" fill="#15803D">within 10ms of what a 200ms round trip and a 30ms model allow.</text>
 
-  <!-- ============ RIGHT: TTS download, erasing direction ============ -->
-  <text x="700" y="158" font-size="18" font-weight="700" fill="#0F172A">TTS download, 100KB</text>
-  <text x="700" y="180" font-size="14" fill="#B91C1C">downstream, which erases about 14%</text>
+  <line x1="640" y1="140" x2="640" y2="460" stroke="#E2E8F0" stroke-width="2"/>
 
-  <line x1="700" y1="440" x2="1180" y2="440" stroke="#CBD5E1" stroke-width="1.5"/>
-  <text x="900" y="464" text-anchor="middle" font-size="14" font-weight="600" fill="#475569">time to move the audio back</text>
+  <!-- RIGHT: TTS download, erasing direction -->
+  <text x="690" y="152" font-size="18" font-weight="700" fill="#0F172A">TTS download, 100KB</text>
+  <text x="690" y="174" font-size="14" fill="#B91C1C">downstream, which erases about 14%</text>
 
-  <rect x="760" y="255.9" width="60" height="184.1" rx="3" fill="#C2410C"/>
-  <text x="790" y="247.9" text-anchor="middle" font-size="13" font-weight="600" fill="#9A3412">916</text>
+  <line x1="690" y1="430" x2="1180" y2="430" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="905" y="454" text-anchor="middle" font-size="14" font-weight="600" fill="#475569">time to move the audio back</text>
 
-  <rect x="860" y="313.6" width="60" height="126.4" rx="3" fill="#94A3B8"/>
-  <text x="890" y="305.6" text-anchor="middle" font-size="13" font-weight="600" fill="#475569">629</text>
+  <rect x="760" y="247" width="60" height="183" rx="3" fill="#C2410C"/>
+  <text x="790" y="239" text-anchor="middle" font-size="13" font-weight="600" fill="#9A3412">916</text>
+  <rect x="860" y="304" width="60" height="126" rx="3" fill="#94A3B8"/>
+  <text x="890" y="296" text-anchor="middle" font-size="13" font-weight="600" fill="#475569">629</text>
+  <rect x="960" y="416" width="60" height="14" rx="3" fill="#2563EB"/>
+  <text x="990" y="408" text-anchor="middle" font-size="13" font-weight="700" fill="#1D4ED8">71</text>
 
-  <rect x="960" y="425.7" width="60" height="14.3" rx="3" fill="#2563EB"/>
-  <text x="990" y="417.7" text-anchor="middle" font-size="13" font-weight="700" fill="#1D4ED8">71</text>
+  <text x="935" y="486" text-anchor="middle" font-size="14" fill="#7F1D1D">The sysctl restores a window after an idle gap. It does</text>
+  <text x="935" y="506" text-anchor="middle" font-size="14" fill="#7F1D1D">nothing about a packet that was dropped.</text>
 
-  <text x="1060" y="300" font-size="14" font-weight="600" fill="#7F1D1D">The sysctl fixes what</text>
-  <text x="1060" y="320" font-size="14" font-weight="600" fill="#7F1D1D">happens after an idle</text>
-  <text x="1060" y="340" font-size="14" font-weight="600" fill="#7F1D1D">gap. It does nothing</text>
-  <text x="1060" y="360" font-size="14" font-weight="600" fill="#7F1D1D">about a lost packet.</text>
-
-  <rect x="70" y="504" width="1100" height="72" rx="10" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
-  <text x="620" y="530" text-anchor="middle" font-size="15" fill="#1E40AF">On a clean direction a tuned client reaches the same median this transport does, and the 19ms between them</text>
-  <text x="620" y="552" text-anchor="middle" font-size="15" fill="#1E40AF">is a userspace proxy and an extra local hop. What it does not reach is a tail, a direction that erases,</text>
-  <text x="620" y="570" text-anchor="middle" font-size="15" fill="#1E40AF">a connection that is genuinely cold, or a caller you cannot reconfigure.</text>
+  <rect x="120" y="528" width="1000" height="40" rx="10" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
+  <text x="620" y="553" text-anchor="middle" font-size="15" fill="#1E40AF">Deploy this for what the config line cannot reach: a cold connection, a direction that erases, or a caller you cannot reconfigure.</text>
 </svg>

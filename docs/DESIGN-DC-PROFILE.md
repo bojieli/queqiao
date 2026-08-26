@@ -21,22 +21,22 @@ design away.
 
 ## Where the time actually goes
 
-A 355KB speech request from Guiyang to a model in Irvine takes about 1.26
+A 355KB speech request from Guiyang to a model in Irvine takes about 1.17
 seconds on a new connection. The model spends about 30ms of it.
 
 <p align="center">
-  <img src="../assets/where-the-time-goes.svg" alt="A bar chart of where 1.26 seconds goes on a 355KB speech recognition request. The path could carry the bytes in about 9 milliseconds. Direct TCP on a new connection takes 1263: 216 for the handshake, 1047 sending the audio and waiting for the answer, of which the model is about 30. A tuned direct client takes 230. Queqiao takes 282." width="880">
+  <img src="../assets/where-the-time-goes.svg" alt="A bar chart of where 1.17 seconds goes on a 355KB speech recognition request. The path could carry the bytes in about 9 milliseconds. Direct TCP on a new connection takes 1169: 199 for the handshake, 970 sending the audio and waiting for the answer, of which the model is about 30. A tuned direct client takes 241. Queqiao on a cold connection takes 302." width="880">
 </p>
 
 Nothing about the path explains the rest. Its round trip is around 200ms and
 its capacity knee is 333 Mbit/s, so 355KB is about 9ms of wire time. One round
 trip carries the request and the answer, and with the model that is about
-235ms, which is what a tuned client actually achieves.
+230ms, which is what both a tuned client and this transport actually reach.
 
 The rest is a stack of defaults, each of which was chosen for a link that is
 not this one:
 
-- **The handshake buys nothing and costs a round trip.** 216ms of that 1263ms is
+- **The handshake buys nothing and costs a round trip.** 199ms of that 1169ms is
   a connection being opened for a single request.
 - **The transfer starts at ten segments.** Linux opens with an initial window
   of 10 MSS, about 14.5KB, and doubles once per round trip. Reaching 355KB
@@ -62,10 +62,10 @@ trying to stop a request from spending five round trips discovering capacity
 that was there the whole time.
 
 It is also why the first thing the deployment guide says is to fix the client.
-Three of those five are one config line each and they cost nothing. Where you
-can apply them, they take the median to the same place this transport does; what
-they do not reach is the tail, a direction that erases, a connection that is
-genuinely cold, or a caller you cannot reconfigure.
+Three of those five are one config line each and they cost nothing, and where
+you can apply them they reach the same median this transport does. What they do
+not reach is a connection that is genuinely cold, a direction that erases, or a
+caller you cannot reconfigure.
 
 ## When this profile applies
 
@@ -150,9 +150,10 @@ Mbit/s where sixteen estimated 88 on the same path in the same minutes.
 So every request received a congestion response having produced no congestion
 evidence, on a path whose own delay signal said there was no queue. The pacer
 now meters only when the delay bound is reached or loss starts tracking rate.
-That took the median from 299.0ms to 248.1ms against a tuned client's 229.5ms,
-and it is profile-independent: a path that is congested produces the evidence
-and gets paced whichever profile it runs.
+That took the median from 299.0ms to 236.5ms, against 240.9ms for a fully tuned
+direct client measured in the same minutes, and it is profile-independent: a
+path that is congested produces the evidence and gets paced whichever profile
+it runs.
 
 Which is where the first version of the fix was wrong, and the way it was wrong
 is worth keeping. A policer is the path where bursting is worst, and it is

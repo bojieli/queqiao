@@ -39,11 +39,10 @@ qualification items are still open.
 - On a path direction that does not erase, a fully tuned client reaches the same
   median as this transport. Reusing a connection and setting
   `net.ipv4.tcp_slow_start_after_idle=0` took a real 355KB inference upload to
-  229.5ms against 248.1ms through the tunnel, a difference that is the cost of
-  a userspace proxy and an extra local hop. What the client fix does not reach
-  is the tail (834.3ms against 274.6ms at p90), a direction that erases, a
-  connection that is genuinely cold, or a caller you cannot reconfigure. Apply
-  the free fixes first and deploy this for what is left; see
+  240.9ms, against 236.5ms through the tunnel in the same minutes. Do the free
+  fixes: they cost a config line and they get you there. What they do not reach
+  is a connection that is genuinely cold, a direction that erases, or a caller
+  you cannot reconfigure. See
   [DEPLOYING-DC-PROFILE.md](DEPLOYING-DC-PROFILE.md).
 - Queqiao is a WAN optimization data plane, not an anonymity network. The
   desktop ingress is SOCKS5, the released Android app exports an authenticated
