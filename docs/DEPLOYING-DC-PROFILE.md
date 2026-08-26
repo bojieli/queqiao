@@ -3,8 +3,11 @@
 > [!NOTE]
 > **Status:** Experimental. Qualified on one path.
 >
-> Read [DESIGN-DC-PROFILE.md](DESIGN-DC-PROFILE.md) for what it does and when
-> it applies. This is how to run it.
+> [DESIGN-DC-PROFILE.md](DESIGN-DC-PROFILE.md) is why this profile exists, what
+> separates it from the default one, the five workload shapes it carries, and
+> the assumptions measurement overturned.
+> [PATH-CHARACTER-DC-20260826.md](PATH-CHARACTER-DC-20260826.md) is the evidence
+> behind every number here. This document is how to run it.
 
 ## Before you turn anything on
 

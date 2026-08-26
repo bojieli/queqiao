@@ -32,20 +32,22 @@ client-to-gateway deployments. It carries TCP and UDP through a local proxy over
 an authenticated transport, and keeps evolving as we measure more paths,
 improve the transport, and learn from users.
 
-### The second reason this exists
+### Not only client to gateway, but also inter-datacenter
 
 The same problem turned up between two machines we own. GPU capacity
 concentrates in a few regions while turn-taking has to answer in about 20ms, so
 every speech request crosses a long hop twice.
 
-Real speech recognition, Guiyang to a model in Irvine: a 355KB upload takes
-**1133ms**, of which the model spends 38ms. Through Queqiao, **290ms**.
+Speech loads the two directions differently. Recognition sends a few hundred
+kilobytes of audio up and gets a sentence back. Synthesis sends a sentence up
+and gets a few hundred kilobytes back, in one burst once the model finishes.
+Each is a single transfer that has to complete before anything else happens,
+which is the shape a long path is worst at.
 
-Worth knowing before you deploy it: on a path direction that does not lose
-packets, reusing the connection and setting one sysctl reaches 226ms with no
-tunnel at all. Queqiao is for what that leaves, which is the tail, an erasing
-direction, cold connections, and callers you cannot reconfigure. See the
-[datacenter profile](docs/DEPLOYING-DC-PROFILE.md).
+Guiyang to a model in Irvine: a 355KB recognition upload takes **1133ms**, of
+which the model spends 38ms. The synthesis burst takes **916ms** to move.
+Through Queqiao, **290ms** and **75ms**. See the [datacenter
+profile](docs/DEPLOYING-DC-PROFILE.md).
 
 ## Why Queqiao?
 
