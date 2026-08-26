@@ -230,3 +230,27 @@ func Names() []string {
 	sort.Strings(out)
 	return out
 }
+
+// ParseClassHints reads hints from the repeatable command-line form,
+// "<match>=<class>", where class is interactive or bulk.
+//
+// The separator is the last "=" rather than the first, because the match is
+// usually an identity fragment that contains one: "path=/app/voice" is the
+// common case and splitting on the first would leave a match of "path" and a
+// class of "/app/voice=interactive".
+func ParseClassHints(specs []string) ([]ClassHint, error) {
+	out := make([]ClassHint, 0, len(specs))
+	for _, spec := range specs {
+		i := strings.LastIndex(spec, "=")
+		if i <= 0 || i == len(spec)-1 {
+			return nil, fmt.Errorf("class hint %q: want <match>=<interactive|bulk>", spec)
+		}
+		h := ClassHint{Match: strings.TrimSpace(spec[:i]), Class: strings.TrimSpace(spec[i+1:])}
+		out = append(out, h)
+	}
+	p := Profile{ClassHints: out}
+	if err := p.ValidateHints(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}

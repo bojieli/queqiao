@@ -126,3 +126,43 @@ func TestGroupingDiscoveryRequiresAHierarchy(t *testing.T) {
 		t.Error("the default profile rearranges its own tree")
 	}
 }
+
+// The command-line form has to survive the match containing an "=", which the
+// common case does: "path=/app/voice" is an identity fragment, not a
+// key-value pair this parser should split on.
+func TestParseClassHintsSplitsOnTheLastSeparator(t *testing.T) {
+	got, err := ParseClassHints([]string{
+		"path=/app/checkpoint-sync=bulk",
+		"path=/app/=interactive",
+		"unit=voice.service=interactive",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ClassHint{
+		{Match: "path=/app/checkpoint-sync", Class: "bulk"},
+		{Match: "path=/app/", Class: "interactive"},
+		{Match: "unit=voice.service", Class: "interactive"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parsed %d hints, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("hint %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	// Order is preserved, because first match wins and the operator ordered them.
+	p := Profile{ClassHints: got}
+	if c, ok := p.HintedClass("path=/app/checkpoint-sync pod=x"); !ok || c.String() != "bulk" {
+		t.Errorf("the specific rule did not win: %v %v", c, ok)
+	}
+}
+
+func TestParseClassHintsRejectsNonsense(t *testing.T) {
+	for _, bad := range []string{"", "=bulk", "path=/app/=", "path=/app/=nonsense", "noseparator"} {
+		if _, err := ParseClassHints([]string{bad}); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}

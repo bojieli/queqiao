@@ -197,18 +197,22 @@ queqiaod client --profile ... --path-profile dc-long-haul \
   --flow-metadata-socket /run/tunless/metadata.sock
 ```
 
-The profile maps what the agent reports to a class:
+The mapping from what the agent reports to a class is repeatable on the
+command line:
 
-```go
-ClassHints: []profile.ClassHint{
-    {Match: "path=/app/checkpoint-sync", Class: "bulk"},
-    {Match: "path=/app/", Class: "interactive"},
-}
+```sh
+queqiaod client --profile ... --path-profile dc-long-haul \
+  --flow-metadata-socket /run/tunless/metadata.sock \
+  --class-hint 'path=/app/checkpoint-sync=bulk' \
+  --class-hint 'path=/app/=interactive'
 ```
 
-First match wins, so put specific rules before general ones. A misspelled class
-name fails at startup rather than matching nothing at runtime, where it would
-look identical to a rule whose workload never appeared.
+First match wins, so put specific rules before general ones. The separator is
+the last `=`, because the match itself usually contains one.
+
+Two things fail at startup rather than at runtime: a misspelled class name,
+which would otherwise look identical to a rule whose workload never appeared,
+and a hint given without a socket, since nothing would be there to ask.
 
 Three things are deliberate here.
 

@@ -496,6 +496,7 @@ type runtimeOptions struct {
 	dialTimeout, handshakeTimeout, flowIdleTimeout, flowMaxLifetime time.Duration
 	quicPool, waitForOpenAck, udpOnStream                           bool
 	flowMetadataSocket                                              string
+	classHints                                                      repeatedFlag
 	// resolvedProfile is the deployment policy, parsed once at flag time so
 	// that an unknown name fails before anything starts rather than being
 	// silently replaced by the default.
@@ -556,6 +557,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.BoolVar(&opts.quicPool, "quic-pool", true, "reuse a persistent QUIC connection")
 		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this client runs in: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.StringVar(&opts.flowMetadataSocket, "flow-metadata-socket", "", "local capture agent socket to ask what produced each flow, so its class is known before it carries anything; empty disables the lookup")
+		fs.Var(&opts.classHints, "class-hint", "declare the class a flow starts in from what produced it, as <match>=<interactive|bulk>; repeatable, first match wins, and it does nothing without --flow-metadata-socket")
 		fs.BoolVar(&opts.waitForOpenAck, "wait-for-open-ack", false, "wait for destination confirmation before answering SOCKS")
 		fs.DurationVar(&opts.fallbackDelay, "fallback-delay", 300*time.Millisecond, "delay before preparing TCP fallback")
 		fs.DurationVar(&opts.fallbackGrace, "fallback-grace", 2*time.Second, "time a ready TCP fallback waits for QUIC")
@@ -675,6 +677,14 @@ func runClient(args []string) (returnErr error) {
 	}
 	if err := resolveProfile(&opts); err != nil {
 		return err
+	}
+	hints, err := profile.ParseClassHints(opts.classHints)
+	if err != nil {
+		return err
+	}
+	opts.resolvedProfile.ClassHints = hints
+	if len(hints) > 0 && opts.flowMetadataSocket == "" {
+		return errors.New("--class-hint needs --flow-metadata-socket: without an agent to ask, nothing declares a class")
 	}
 	if *profilePath != "" && *providersPath != "" {
 		return errors.New("--profile and --providers are mutually exclusive")
@@ -1124,4 +1134,15 @@ func serveMetrics(addr string, handler http.Handler, logger *slog.Logger) (func(
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	}, nil
+}
+
+// repeatedFlag collects a flag given more than once, in the order it was
+// given, because for class hints that order is the policy: first match wins.
+type repeatedFlag []string
+
+func (r *repeatedFlag) String() string { return strings.Join(*r, ",") }
+
+func (r *repeatedFlag) Set(v string) error {
+	*r = append(*r, v)
+	return nil
 }
