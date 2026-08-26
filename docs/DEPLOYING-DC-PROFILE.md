@@ -67,6 +67,18 @@ queqiaod client --profile ~/.config/queqiao/*.json \
 
 Applications reach it at `127.0.0.1:12080` over SOCKS5.
 
+That is the foreground form. To install it as a service, pass the same profile
+to the installer, which threads it into the LaunchAgent or systemd user unit:
+
+```sh
+deploy/install-client.sh --path-profile dc-long-haul --local-address if:eth0
+```
+
+An unknown name fails the install. It is not defaulted, because a service that
+came up carrying policy the operator did not ask for is the failure the profile
+package exists to prevent, and finding out at first start means the installer
+has already reported success.
+
 ## Point voice at UDP, not TCP
 
 This matters more than any tuning below it. On the path we measured, frames
