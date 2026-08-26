@@ -34,24 +34,21 @@ improve the transport, and learn from users.
 
 ### Not only client to gateway, but also inter-datacenter
 
-The same problem turned up between two machines we own. This has been our own
-pain point since 2023: the models run in the US and the clients are everywhere,
-so every speech request crosses that gap twice.
-
-Recognition sends a few hundred kilobytes of audio up and gets a sentence back.
-Synthesis sends a sentence up and gets a few hundred kilobytes back, in one
+The same problem turned up between two datacenter servers. This has been our own
+pain point since 2023: the models run in the US and the clients are everywhere.
+ASR sends a few hundred kilobytes of audio up and gets a sentence back.
+TTS sends a sentence up and gets a few hundred kilobytes back, in one
 burst once the model finishes. Each is a single transfer that has to finish
 before anything else happens, which is the shape a long path is worst at.
 
-Guiyang to a model in Irvine: a 355KB recognition upload takes **1133ms**, of
-which the model spends 38ms; the synthesis burst back takes **916ms**. Through
-Queqiao, **290ms** and **75ms**.
-
-Almost none of that is the network. The path could carry 355KB in about 9ms.
+Guiyang, China to a model in Irvine, US: a 355KB audio upload takes **1133ms**, of
+which the ASR model only spends 38ms.
+In theory, the path's bandwidth could carry 355KB in about 9ms.
 The rest is a handshake, a transfer starting at ten segments, and a window
-thrown away between requests. [Why this profile
-exists](docs/DESIGN-DC-PROFILE.md) walks through each; [the
-runbook](docs/DEPLOYING-DC-PROFILE.md) is how to run it.
+thrown away between requests.
+Queqiao approaches the limits of this 210ms RTT link, achieving **290ms** end-to-end.
+[Why this profile exists](docs/DESIGN-DC-PROFILE.md) walks through each request; [the
+runbook](docs/DEPLOYING-DC-PROFILE.md) is how to deploy it.
 
 ## Why Queqiao?
 
