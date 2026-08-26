@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -174,5 +176,51 @@ func TestServiceResolveRejectsUnsafeNames(t *testing.T) {
 		if err := config.resolve(); err == nil {
 			t.Fatalf("service name %q became a file name without complaint", name)
 		}
+	}
+}
+
+// The datacenter profile had no supported way to reach an installed service.
+// The flag existed on `queqiaod client` and nothing between the installer and
+// the unit file carried it, so running it meant hand-editing a definition that
+// the installer rewrites on every upgrade.
+func TestServiceCarriesThePathProfile(t *testing.T) {
+	config := testServiceConfig()
+	if got := strings.Join(config.arguments(), " "); strings.Contains(got, "--path-profile") {
+		t.Fatalf("an unset profile still reached the service: %s", got)
+	}
+	config.pathProfile = "dc-long-haul"
+	got := strings.Join(config.arguments(), " ")
+	if !strings.Contains(got, "--path-profile dc-long-haul") {
+		t.Fatalf("the profile did not reach the service: %s", got)
+	}
+}
+
+// A misspelled profile has to fail the install. The client refuses an unknown
+// name rather than falling back to the default, so without this the failure
+// lands at first start, on a service the installer has already reported as
+// successfully installed.
+func TestServiceResolveRejectsAnUnknownPathProfile(t *testing.T) {
+	config := testServiceConfig()
+	config.pathProfile = "dc-long-hual"
+	err := config.resolve()
+	if err == nil {
+		t.Fatal("a misspelled profile installed cleanly")
+	}
+	if !strings.Contains(err.Error(), "dc-long-haul") {
+		t.Fatalf("the error does not name the alternatives: %v", err)
+	}
+}
+
+func TestServiceResolveAcceptsAKnownPathProfile(t *testing.T) {
+	manifest := filepath.Join(t.TempDir(), "providers.json")
+	if err := os.WriteFile(manifest, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := testServiceConfig()
+	config.providers = manifest
+	config.binary = os.Args[0]
+	config.pathProfile = "dc-long-haul"
+	if err := config.resolve(); err != nil {
+		t.Fatalf("a known profile was rejected: %v", err)
 	}
 }

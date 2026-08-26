@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/bojieli/queqiao/internal/profile"
 )
 
 // A supervised client is not optional equipment. The process exits when any
@@ -38,6 +40,7 @@ type serviceConfig struct {
 	localAddress  string
 	metricsListen string
 	logLevel      string
+	pathProfile   string
 }
 
 // arguments returns everything after the binary. The supervisor-specific tail
@@ -52,6 +55,9 @@ func (c serviceConfig) arguments() []string {
 		args = append(args, "--profile", c.profile, "--listen", c.listen)
 	}
 	args = append(args, "--local-address", c.localAddress)
+	if c.pathProfile != "" {
+		args = append(args, "--path-profile", c.pathProfile)
+	}
 	if c.metricsListen != "" {
 		args = append(args, "--metrics-listen", c.metricsListen)
 	}
@@ -191,6 +197,7 @@ func bindServiceFlags(fs *flag.FlagSet, c *serviceConfig) {
 	fs.StringVar(&c.localAddress, "local-address", "auto", "outer source: auto, IP, or if:NAME")
 	fs.StringVar(&c.metricsListen, "metrics-listen", "127.0.0.1:12090", "loopback metrics address, empty to disable")
 	fs.StringVar(&c.logLevel, "log-level", "info", "debug, info, warn, or error")
+	fs.StringVar(&c.pathProfile, "path-profile", "", "path profile the service runs, empty for the default. See docs/DEPLOYING-DC-PROFILE.md before choosing dc-long-haul")
 	fs.StringVar(&c.label, "label", defaultServiceLabel, "macOS LaunchAgent label")
 	fs.StringVar(&c.unit, "service-name", defaultServiceUnit, "Linux systemd --user unit name")
 	fs.StringVar(&c.binary, "binary", "", "queqiaod path to run (default: this executable)")
@@ -202,6 +209,14 @@ func (c *serviceConfig) resolve() error {
 	}
 	if !serviceNamePattern.MatchString(c.unit) {
 		return fmt.Errorf("invalid --service-name %q; use letters, digits, dot, underscore, and dash", c.unit)
+	}
+	// Resolved here rather than at first start, so a misspelled profile is a
+	// failed install instead of a service that comes up carrying policy the
+	// operator did not ask for.
+	if c.pathProfile != "" {
+		if _, err := profile.ByName(c.pathProfile); err != nil {
+			return err
+		}
 	}
 	if c.profile == "" && c.providers == "" {
 		return errors.New("--profile or --providers is required; run queqiaod enroll first to create one")

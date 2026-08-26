@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -150,16 +149,7 @@ func TestUDPAssociationRescuesToTCP(t *testing.T) {
 
 	tlsCert, roots := testCertificate(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tcpListener.Close()
-	tcpPort := tcpListener.Addr().(*net.TCPAddr).Port
-	quicPacketConn, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(tcpPort)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	tcpListener, quicPacketConn := listenTCPAndUDPOnOnePort(t)
 	serverAddr := tcpListener.Addr().String()
 	server, err := NewServer(ServerConfig{
 		ListenAddr: serverAddr, Credentials: tlsCert,
@@ -258,7 +248,6 @@ func TestUDPAssociationRescuesToTCP(t *testing.T) {
 // sequence without relying on a host firewall or wall-clock minutes.
 func TestIntermittentUDPBlockingReturnsToQUIC(t *testing.T) {
 	tcpListener, quicPacketConn := listenTCPAndUDPOnOnePort(t)
-	defer tcpListener.Close()
 	tlsCert, roots := testCertificate(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server, err := NewServer(ServerConfig{

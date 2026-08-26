@@ -117,7 +117,7 @@ type Config struct {
 	// whose own acknowledgements reveal the erasure rate of exactly this
 	// direction. Without it a path starts out believing it is clean and sends
 	// its first symbols unprotected.
-	Path *pathmodel.PathModel
+	Path pathmodel.Model
 	// Pending bounds the frames queued for sending before Send blocks.
 	Pending int
 }

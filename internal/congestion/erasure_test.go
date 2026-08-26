@@ -406,3 +406,96 @@ func TestTheSenderPublishesTheMeasurementItsCodeIsSizedFrom(t *testing.T) {
 	}
 
 }
+
+// The pacer used to meter every send at a bandwidth estimate that a
+// request-shaped flow cannot raise, because such a flow is application-limited
+// by construction. On the measured datacenter path that cost 67ms of a 355KB
+// request, which was the whole of this transport's deficit against a tuned TCP
+// client on the same link.
+//
+// The controller already knew there was nothing to protect: no queue beyond the
+// path's own minimum, and no loss the estimator attributed to rate. These pin
+// that the burst follows that evidence rather than a constant.
+func TestNoCongestionEvidenceMeansNoMetering(t *testing.T) {
+	e := senderAtRTT(t, 200*time.Millisecond, 202*time.Millisecond)
+	got := e.unmeteredBurst()
+	if got <= 0 {
+		t.Fatal("a path holding almost no queue, with no loss attributed to rate, is " +
+			"still being metered; the pacer is protecting a queue that is not forming")
+	}
+	if want := e.GetCongestionWindow(); got != want {
+		t.Fatalf("unmetered burst is %d, want the congestion window %d: below the delay "+
+			"bound, the window and the acknowledgement clock are what bound the send",
+			got, want)
+	}
+}
+
+// The delay bound permits a queue of one round trip. At it, the sender is doing
+// the thing pacing exists to prevent, so metering has to come back.
+func TestAQueueAtTheBoundRestoresMetering(t *testing.T) {
+	e := senderAtRTT(t, 200*time.Millisecond, 400*time.Millisecond)
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Fatalf("a path holding a full round trip of queue reported an unmetered burst "+
+			"of %d; that is the bound this controller says must not be exceeded", got)
+	}
+}
+
+// Loss that only appears when you push is the other half of the evidence, and
+// separating it from the channel's own erasure is what this project is for.
+// Erasure alone must not restore metering; congestive loss must.
+func TestOnlyCongestiveLossRestoresMetering(t *testing.T) {
+	e := senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond)
+	if e.unmeteredBurst() <= 0 {
+		t.Fatal("precondition: a quiet path should not be metered")
+	}
+	e.congestive.Store(uint64(0.02 * partsPerMillion))
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Fatalf("with 2%% of loss attributed to rate the burst is still %d; that is the "+
+			"one signal a sender can act on by slowing down", got)
+	}
+	e.congestive.Store(0)
+	if e.unmeteredBurst() <= 0 {
+		t.Fatal("metering did not lift once the rate-dependent loss went away")
+	}
+}
+
+// Without round-trip measurements there is no delay signal, so there is no
+// evidence of absence either and the constant has to stand.
+func TestNoRoundTripMeasurementKeepsTheConstant(t *testing.T) {
+	e := NewErasureSender(1200)
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Fatalf("a sender with no round-trip measurement reported %d; it cannot know "+
+			"whether a queue is forming, so it must not stop metering", got)
+	}
+}
+
+// A policer is the path where bursting is worst and where both of the signals
+// above read clean: it holds no queue, and its loss is sustained enough that
+// the estimator's floor rises to meet it and reports nothing congestive.
+// Gating on those two alone took an emulated policer from 3.0x overdrive to
+// 4.0x and from 32.9% loss to 54.9%, because metering was the last thing
+// holding the rate down. See internal/pep/case4_test.go.
+func TestALossyDirectionIsStillMetered(t *testing.T) {
+	e := senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond)
+	if e.unmeteredBurst() <= 0 {
+		t.Fatal("precondition: a clean quiet path should not be metered")
+	}
+	e.erasure.Store(uint64(0.33 * partsPerMillion))
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Fatalf("a direction losing a third of what it sends reported an unmetered "+
+			"burst of %d; on a policed path neither the delay bound nor the congestive "+
+			"component can see the overload, so this is the only thing left", got)
+	}
+}
+
+// The datacenter path's upload direction lost nothing at all, which is the case
+// the burst exists for. A trace of loss must not close the gate, or the rule
+// would never fire on a real link.
+func TestAnAlmostCleanDirectionStillBursts(t *testing.T) {
+	e := senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond)
+	e.erasure.Store(uint64(0.001 * partsPerMillion))
+	if e.unmeteredBurst() <= 0 {
+		t.Fatal("a direction losing one packet in a thousand is being metered; the " +
+			"measured datacenter upload lost 0 of 41,663 and this rule has to fire there")
+	}
+}

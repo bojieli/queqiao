@@ -74,6 +74,19 @@ type congestionConfig struct {
 	brutalBytesPerSecond   uint64
 	adaptiveMinBytesPerSec uint64
 	adaptiveMaxBytesPerSec uint64
+	// hierarchicalPath models the path as a chain of segments rather than a
+	// single endpoint pair, so that flows to different peers pool what they
+	// share -- the uplink -- while keeping separate what they do not.
+	//
+	// It is off by default because the deployment this project's published
+	// results describe has one peer, where the two models are identical by
+	// construction and the extra node measures nothing. It earns its keep when
+	// one client serves several providers, which share the client's uplink and
+	// nothing else.
+	hierarchicalPath bool
+	// discoverGrouping lets the tree's shape follow the evidence rather than
+	// the static hierarchy. It does nothing without hierarchicalPath.
+	discoverGrouping bool
 }
 
 type udpHealth struct {
@@ -778,7 +791,7 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 		// overshot by however many lanes there were. Live, four lanes
 		// delivered about 8 Mbit/s where one delivered 11.
 		controller := wancongestion.NewErasureSenderOn(
-			conn.InitialPacketSize(), pathmodel.Shared(peerKey(conn)))
+			conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
 		conn.SetCongestionControl(controller)
 		return controller
 	case CongestionBrutal:
@@ -810,6 +823,36 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 // downstream is sized from it. The local address is what distinguishes them:
 // changing uplink changes it, so the model for the new path starts empty
 // rather than inheriting the old one's conclusions.
+// pathModelFor returns the model this connection contributes to and reads.
+//
+// Flat, that is one model per endpoint pair, which is what every deployment
+// had before the tree existed and what the WAN results were measured on.
+// Hierarchical, it is the uplink's model and the peer's, and a flow may do
+// only what the tighter of the two permits -- so a second provider reached
+// over the same uplink starts from what the first measured about it, and a
+// congested peer does not throttle traffic to a healthy one.
+func pathModelFor(conn *quic.Conn, hierarchical, discover bool) pathmodel.Model {
+	key := peerKey(conn)
+	if !hierarchical {
+		return pathmodel.Shared(key)
+	}
+	k := pathmodel.Key{Egress: egressOf(conn), Dest: key}
+	if discover {
+		return pathmodel.SharedChainRegrouping(k)
+	}
+	return pathmodel.SharedChain(k)
+}
+
+// egressOf names the local side of the connection, which is the segment every
+// flow from this host shares regardless of where it is going.
+func egressOf(conn *quic.Conn) string {
+	source := addressHost(conn.LocalAddr())
+	if isUnspecifiedHost(source) {
+		source = routeSource(conn.RemoteAddr())
+	}
+	return source
+}
+
 func peerKey(conn *quic.Conn) string {
 	return pathKey(conn.LocalAddr(), conn.RemoteAddr())
 }

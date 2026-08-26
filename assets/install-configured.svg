@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 440" width="1240" height="440" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="Architecture when the application is configured to use the proxy. The application dials a SOCKS5 endpoint on loopback at 127.0.0.1 port 12080. The Queqiao client carries the flow across the long hop, which has a 199 millisecond round trip and erases about 14 percent downstream. The Queqiao gateway hands it to the inference endpoint over loopback. Both ends are loopback at about 0.05 milliseconds, so the round-trip problem is confined to the middle where the protocol is under our control.">
+  <defs>
+    <marker id="c-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#2563EB"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1240" height="440" fill="#FBFCFE"/>
+
+  <text x="620" y="44" text-anchor="middle" font-size="25" font-weight="700" fill="#0F172A">Installation A: the application points at the proxy</text>
+  <text x="620" y="72" text-anchor="middle" font-size="16" fill="#64748B">One config line in the application. Nothing else on the host changes.</text>
+
+  <!-- application -->
+  <rect x="50" y="150" width="200" height="86" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="2"/>
+  <text x="150" y="182" text-anchor="middle" font-size="17" font-weight="600" fill="#0F172A">The application</text>
+  <text x="150" y="206" text-anchor="middle" font-size="13.5" fill="#64748B">configured to use</text>
+  <text x="150" y="224" text-anchor="middle" font-size="13.5" font-weight="600" fill="#2563EB">127.0.0.1:12080</text>
+
+  <line x1="250" y1="193" x2="302" y2="193" stroke="#2563EB" stroke-width="2.5" marker-end="url(#c-blue)"/>
+
+  <!-- queqiao client -->
+  <rect x="310" y="150" width="200" height="86" rx="12" fill="#EFF6FF" stroke="#2563EB" stroke-width="2.5"/>
+  <text x="410" y="184" text-anchor="middle" font-size="17" font-weight="700" fill="#1D4ED8">Queqiao client</text>
+  <text x="410" y="208" text-anchor="middle" font-size="13.5" fill="#1E40AF">SOCKS5 in, pooled</text>
+  <text x="410" y="226" text-anchor="middle" font-size="13.5" fill="#1E40AF">tunnel out</text>
+
+  <!-- the long hop -->
+  <rect x="512" y="150" width="216" height="86" rx="12" fill="#FEF2F2" stroke="#FCA5A5" stroke-width="2" stroke-dasharray="7 5"/>
+  <text x="620" y="180" text-anchor="middle" font-size="16" font-weight="700" fill="#B91C1C">the long hop</text>
+  <text x="620" y="202" text-anchor="middle" font-size="13" fill="#7F1D1D">199ms round trip</text>
+  <text x="620" y="220" text-anchor="middle" font-size="13" fill="#7F1D1D">~14% erased downstream</text>
+
+  <!-- gateway -->
+  <rect x="730" y="150" width="200" height="86" rx="12" fill="#EFF6FF" stroke="#2563EB" stroke-width="2.5"/>
+  <text x="830" y="190" text-anchor="middle" font-size="17" font-weight="700" fill="#1D4ED8">Queqiao gateway</text>
+  <text x="830" y="214" text-anchor="middle" font-size="13.5" fill="#1E40AF">in the model's region</text>
+
+  <line x1="930" y1="193" x2="982" y2="193" stroke="#2563EB" stroke-width="2.5" marker-end="url(#c-blue)"/>
+
+  <!-- endpoint -->
+  <rect x="990" y="150" width="200" height="86" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="2"/>
+  <text x="1090" y="184" text-anchor="middle" font-size="17" font-weight="600" fill="#0F172A">ASR, TTS, LLM</text>
+  <text x="1090" y="208" text-anchor="middle" font-size="13.5" fill="#64748B">unchanged, listening</text>
+  <text x="1090" y="226" text-anchor="middle" font-size="13.5" fill="#64748B">on loopback</text>
+
+  <!-- loopback brackets -->
+  <path d="M 60 258 L 60 274 L 500 274 L 500 258" fill="none" stroke="#15803D" stroke-width="1.8"/>
+  <text x="280" y="294" text-anchor="middle" font-size="14" font-weight="600" fill="#15803D">loopback, about 0.05ms</text>
+  <path d="M 740 258 L 740 274 L 1180 274 L 1180 258" fill="none" stroke="#15803D" stroke-width="1.8"/>
+  <text x="960" y="294" text-anchor="middle" font-size="14" font-weight="600" fill="#15803D">loopback, about 0.05ms</text>
+
+  <rect x="140" y="332" width="960" height="76" rx="10" fill="#F1F5F9" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="620" y="358" text-anchor="middle" font-size="15" fill="#334155">Everything the profile is about is credit per round trip, so a zero-RTT segment at each end confines the</text>
+  <text x="620" y="380" text-anchor="middle" font-size="15" fill="#334155">problem to the middle, where we control the protocol. The application's connection is never the one that</text>
+  <text x="620" y="400" text-anchor="middle" font-size="15" fill="#334155">crosses the ocean, so a short-lived connection stops being expensive without the application knowing.</text>
+</svg>

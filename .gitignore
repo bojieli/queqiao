@@ -8,6 +8,14 @@
 /fallback-soak/
 # `go build ./tools/notices` from mobile/ drops the compiled tool here.
 /mobile/notices
+# `go build ./cmd/X` from the repository root drops the binary beside the
+# source. One of these reached a commit as a 9MB blob, so name them all.
+/pathmeasure
+/pathprobe
+/queqiaobench
+/queqiaod
+/queqiaopack
+/queqiaoref
 __pycache__/
 *.py[cod]
 

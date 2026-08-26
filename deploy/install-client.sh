@@ -25,6 +25,7 @@ config_dir=
 base_port=12080
 metrics_listen=127.0.0.1:12090
 local_address=auto
+path_profile=
 device_name=
 log_level=info
 label=me.01.queqiao.client
@@ -59,6 +60,12 @@ Options:
   --local-address VALUE    outer source for enrollment and traffic: auto, an IP,
                            or if:NAME (default auto). Use if:en0 when Clash TUN
                            owns the default route or two uplinks are active.
+  --path-profile NAME      path policy: wan-shared-bottleneck (default) or
+                           dc-long-haul. The second is experimental and is for a
+                           long hop between two regions you operate; measure the
+                           path first, per docs/DEPLOYING-DC-PROFILE.md. An
+                           unknown name fails the install rather than falling
+                           back to the default.
   --device-name NAME       device label shown to the provider (default hostname)
   --metrics-listen ADDR    loopback metrics address (default 127.0.0.1:12090)
   --log-level LEVEL        debug, info, warn, or error (default info)
@@ -151,6 +158,11 @@ while [ "$#" -gt 0 ]; do
 		next_value "$#" "$1"
 		base_port=$2
 		shift
+		;;
+	--path-profile)
+		[ $# -ge 2 ] || die "--path-profile needs a value."
+		path_profile=$2
+		shift 2
 		;;
 	--local-address)
 		next_value "$#" "$1"
@@ -456,6 +468,9 @@ if [ "$dry_run" = true ]; then
 	echo "Would install $binary_path and write $manifest."
 	echo "Would enroll $(wc -l <"$pending" | tr -d ' ') invitation(s) with --local-address $local_address as device \"$device_name\"."
 	echo "Would allocate loopback SOCKS5 ports from $base_port upward."
+	if [ -n "$path_profile" ]; then
+		echo "Would run the service with --path-profile $path_profile."
+	fi
 	if [ "$platform" = macos ]; then
 		echo "Would install the LaunchAgent $service_path."
 	else
@@ -608,6 +623,9 @@ set -- service install \
 	--metrics-listen "$metrics_listen" \
 	--label "$label" \
 	--service-name "$service_name"
+if [ -n "$path_profile" ]; then
+	set -- "$@" --path-profile "$path_profile"
+fi
 if [ "$start_service" = false ]; then
 	set -- "$@" --no-start
 fi

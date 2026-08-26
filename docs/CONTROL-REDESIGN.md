@@ -68,6 +68,37 @@ filter's ten-second ceiling costs the same 15% and leaves the policed path at
 delay reaches the controller on a policer; what has changed is that the
 controller is no longer being handed a number nothing measured.
 
+### The pacer was never wired to any of this
+
+Everything above is about what the controller believes and what brakes it. The
+pacer, which decides when a packet may actually leave, consulted none of it. It
+metered every send at the bandwidth estimate, and for a request-shaped flow that
+estimate is low precisely because such a flow is application-limited: measured
+on the datacenter path, one flow estimated 42 Mbit/s where sixteen estimated 88
+in the same minutes. So a flow that had produced no congestion evidence was
+given a congestion response, and on that path it cost 67ms of a 299ms request,
+which was the whole of this transport's deficit against a tuned TCP client.
+
+It now meters only when the delay bound is reached or the estimator attributes
+loss to rate. Below that, the congestion window and the acknowledgement clock
+bound the send, which is what an unpaced TCP does.
+
+**And a policer defeats it, for the same reason a policer defeats everything
+else here.** It holds no queue, so the delay bound sees nothing, and its loss is
+sustained enough that the floor rises to meet it and the congestive component
+reads zero. Gating on those two signals alone took the emulated policer from
+3.0x overdrive to 4.0x and its loss from 32.9% to 54.9%, because metering had
+been the last thing holding the rate down. The burst therefore also requires the
+sending direction to be delivering essentially everything, which is a refusal to
+act on the absence of the first two rather than a third signal.
+
+That guard is a loss threshold, and this design otherwise refuses thresholds:
+the delay bound is a ratio precisely so that no duration has to be chosen. It is
+defensible only because the two paths measured sit far apart on either side of
+it, the datacenter upload having lost 0 of 41,663 datagrams and the policer a
+third of everything. A path in between would make it a guess, and what would
+replace it is the same thing the rest of this document is missing.
+
 ### Two attempts on the wrong component
 
 **Bounding the filter's memory in wall time.** The filter kept a sample for ten
@@ -178,3 +209,7 @@ conservative floor, the code reads the measurement.
   specified.
 - **Mixed-fleet behaviour during step 6.** Until both ends report, half the
   paths run open-loop. Acceptable, or gated behind a capability exchange?
+- **A congestion signal a policer cannot hide from.** This is the same gap as
+  "2.4x is not braked" above, and it now has a second dependant: the unmetered
+  burst is guarded by a loss threshold only because nothing else can see a
+  policer. Whatever answers one answers both.

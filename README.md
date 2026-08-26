@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Make difficult long-haul links feel local.</strong><br>
-  An open-source, self-hosted transport for TCP and UDP across a known WAN bottleneck.
+  An open-source, self-hosted transport for TCP and UDP across a long link you control both ends of.
 </p>
 
 <p align="center">
@@ -31,6 +31,27 @@ Today, Queqiao is a ready-to-use, self-hosted protocol for supported
 client-to-gateway deployments. It carries TCP and UDP through a local proxy over
 an authenticated transport, and keeps evolving as we measure more paths,
 improve the transport, and learn from users.
+
+### Not only client to gateway, but also inter-datacenter
+
+The same problem turned up between two datacenter servers. This has been our own
+pain point since 2023: the models run in the US and the clients are everywhere.
+ASR sends a few hundred kilobytes of audio up and gets a sentence back.
+TTS sends a sentence up and gets a few hundred kilobytes back, in one
+burst once the model finishes. Each is a single transfer that has to finish
+before anything else happens, which is the shape a long path is worst at.
+
+Guiyang, China to a model in Irvine, US: a 355KB audio upload takes **1185ms**, of
+which the ASR model only spends about 30ms.
+In theory, the path's bandwidth could carry 355KB in about 9ms.
+The rest is a handshake, a transfer starting at ten segments, and a window
+thrown away between requests.
+Queqiao approaches the limits of this 200ms RTT link, achieving **302ms** end-to-end
+on a cold connection and **237ms** once warm, which is the floor. On a sustained
+transfer it reaches **310 Mbit/s**, 93% of what the path itself carries, against
+3.6 to 106 Mbit/s for direct TCP.
+[Why this profile exists](docs/DESIGN-DC-PROFILE.md) walks through each request; [the
+runbook](docs/DEPLOYING-DC-PROFILE.md) is how to deploy it.
 
 ## Why Queqiao?
 
@@ -220,9 +241,17 @@ gateway. Typical deployments include:
 | Remote corporate access | employee or remote site to the corporate VPN gateway |
 | Weak access network | hotel, residential, mobile, or rural link to a stable relay |
 | Overlay network | one long-haul leg between two overlay endpoints |
+| Cross-region inference | an application in one region calling ASR, TTS, or an LLM served in another |
 
 The repository provides this paired data plane. Discovery, global routing, and
 a full mesh control plane belong to a larger overlay product built around it.
+
+The last row is served by a second, experimental profile. A hop between two
+regions one operator runs differs from an access link in where its bottleneck
+is, so it gets its own profile rather than the default one: see [the datacenter
+profile](docs/DEPLOYING-DC-PROFILE.md), and read its measured limits before
+deploying it, because on a clean path direction a one-line client-side fix
+beats it on the median request.
 
 ## Project status
 

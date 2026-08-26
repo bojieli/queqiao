@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Status:** Current limitations for public protocol 1
-> **Last reviewed:** 2026-08-20
+> **Last reviewed:** 2026-08-26
 
 These are the boundaries of the ready-to-use public-preview deployment. Read
 them before treating a successful local test as evidence that a different
@@ -31,7 +31,25 @@ qualification items are still open.
 
   `internal/pep/case4_test.go` asserts this behaviour rather than the fix, so
   it cannot change silently in either direction, and the redesign document
-  records what was tried, in what order, and which of it was wrong.
+  records what was tried, in what order, and which of it was wrong. It has since
+  earned that design twice: a change letting a sender release a burst when
+  neither brake reported anything took the same emulated policer from 3.0x to
+  4.0x and its loss from 32.9% to 54.9%, because on a policer neither brake
+  reports anything by construction. The burst is now also gated on the sending
+  direction being close to lossless, which is a guard against the blind spot
+  rather than a fix for it.
+- The `dc-long-haul` profile is qualified on exactly one path. Everything known
+  about it comes from a Guiyang-to-Irvine link, so its constants are that
+  link's constants until a second path either confirms them or doesn't. It is
+  marked experimental for that reason and the marking is not a formality.
+- On a path direction that does not erase, a fully tuned client reaches the same
+  median as this transport. Reusing a connection and setting
+  `net.ipv4.tcp_slow_start_after_idle=0` took a real 355KB inference upload to
+  240.9ms, against 236.5ms through the tunnel in the same minutes. Do the free
+  fixes: they cost a config line and they get you there. What they do not reach
+  is a connection that is genuinely cold, a direction that erases, or a caller
+  you cannot reconfigure. See
+  [DEPLOYING-DC-PROFILE.md](DEPLOYING-DC-PROFILE.md).
 - Queqiao is a WAN optimization data plane, not an anonymity network. The
   desktop ingress is SOCKS5, the released Android app exports an authenticated
   SOCKS5 endpoint to a separate routing client, and the iOS app is a

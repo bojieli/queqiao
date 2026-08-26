@@ -36,19 +36,50 @@ BASELINE = {
     ("G115", "internal/metrics/metrics.go"): 3,
     ("G115", "internal/multipath/reassembly.go"): 1,
     ("G115", "internal/pep/client.go"): 2,
-    ("G115", "internal/pep/mpflow.go"): 10,
+    # Two more from the exchange window: a byte count added to a uint64
+    # counter, guarded above against the negative that would wrap it.
+    ("G115", "internal/pep/mpflow.go"): 12,
     ("G115", "internal/pep/server.go"): 1,
     ("G115", "internal/pep/stripedsend.go"): 5,
     ("G115", "internal/protocol/frame.go"): 1,
     ("G115", "internal/session/packet.go"): 1,
     ("G115", "internal/socks5/socks5.go"): 1,
     ("G115", "internal/stripe/stripe.go"): 1,
+    # pathmeasure is a measurement instrument, not a served endpoint. The five
+    # conversions are a declared payload size that boundedLength has already
+    # rejected above a gigabyte, a host length the SOCKS5 encoder checks
+    # against 255 before writing it, and a destination port validated to
+    # 1-65535. Lengths read off the wire all pass through boundedLength; these
+    # are the reverse direction, where the value is the tool's own. The two
+    # added for UDP ASSOCIATE split a port that netip already types as uint16.
+    ("G115", "cmd/pathmeasure/main.go"): 7,
+    # The h2 ingress forwards to the --remote given on the command line and
+    # takes only the request path from the caller, which is what a proxy is.
+    # Its documentation says not to put it in front of untrusted traffic, and
+    # it exists to measure what an HTTP/2 receive window costs.
+    ("G704", "cmd/pathmeasure/main.go"): 2,
+    # TCP_INFO has no typed accessor that survives the struct growing, and
+    # x/sys/unix offers no helper for reading an arbitrary option into bytes:
+    # the string helper stops at the first zero, which in this struct returns
+    # almost nothing and returns it without error. The two unsafe.Pointer uses
+    # are the buffer and the length word handed to one getsockopt, both stack
+    # locals whose lifetime spans the call.
+    ("G103", "internal/tcpinfo/sample_linux.go"): 2,
     ("G204", "cmd/queqiaopack/main.go"): 1,
     ("G204", "internal/extproxy/process.go"): 1,
     ("G204", "mobile/tools/notices/main.go"): 1,
     ("G301", "cmd/queqiaopack/main.go"): 3,
     ("G301", "mobile/tools/notices/main.go"): 1,
     ("G302", "cmd/queqiaopack/main.go"): 2,
+    # The workload mode sends a file the operator names on the command line:
+    # the audio to transcribe, or the request body to post. There is no
+    # untrusted input here and nothing is served; the path is the argument.
+    ("G304", "cmd/pathmeasure/workload.go"): 1,
+    # doctor reads a sysctl from /proc/sys, with the name supplied by this
+    # package rather than by an operator. It is a file read because a shell out
+    # would behave differently under a service manager that gives the process
+    # no PATH.
+    ("G304", "cmd/queqiaod/doctor.go"): 1,
     ("G304", "cmd/queqiaod/main.go"): 2,
     # The multi-provider manifest is opened from the operator's own --providers
     # path, on the same footing as the reviewed --profile reads above it.

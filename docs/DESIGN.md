@@ -19,6 +19,13 @@ The archived [multipath](archive/2026-08-development/DESIGN-MULTIPATH.md) and
 the current design was reached. When they disagree with this document, this
 document is current.
 
+We're currently measuring a second deployment: a long hop between two machines
+one operator runs, carrying inference requests. The
+[datacenter profile design](DESIGN-DC-PROFILE.md) covers when it applies, what
+differs, and which of our assumptions the measurements overturned. It's
+experimental and you select it explicitly with `--path-profile`. Nothing here
+changes for a deployment that doesn't ask for it.
+
 ## The topology changes the control problem
 
 A general Internet congestion controller cannot assume two connections share a

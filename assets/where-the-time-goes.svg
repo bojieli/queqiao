@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 630" width="1240" height="630" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="A bar chart of where 1.17 seconds goes on a 355KB speech recognition request from Guiyang to Irvine. The path itself could carry the bytes in about 9 milliseconds. Direct TCP on a new connection takes 1169 milliseconds: 199 for the handshake, then 970 spent sending the audio and waiting for the answer, of which the recognition model is only about 30. Reusing the connection and disabling slow start after idle takes it to 241 milliseconds. Through Queqiao it is 302 milliseconds cold and 237 once the connection is reused.">
+  <rect x="0" y="0" width="1240" height="630" fill="#FBFCFE"/>
+
+  <text x="620" y="46" text-anchor="middle" font-size="27" font-weight="700" fill="#0F172A">Where 1.17 seconds goes</text>
+  <text x="620" y="76" text-anchor="middle" font-size="17" fill="#64748B">A 355KB speech recognition request, Guiyang to Irvine. The model is about 30ms of it.</text>
+
+  <!-- axis -->
+  <line x1="300" y1="140" x2="1180" y2="140" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="300" y="128" text-anchor="middle" font-size="13" fill="#94A3B8">0</text>
+  <text x="520" y="128" text-anchor="middle" font-size="13" fill="#94A3B8">300ms</text>
+  <text x="740" y="128" text-anchor="middle" font-size="13" fill="#94A3B8">600ms</text>
+  <text x="960" y="128" text-anchor="middle" font-size="13" fill="#94A3B8">900ms</text>
+  <text x="1180" y="128" text-anchor="middle" font-size="13" fill="#94A3B8">1200ms</text>
+  <line x1="520" y1="140" x2="520" y2="540" stroke="#E2E8F0" stroke-width="1"/>
+  <line x1="740" y1="140" x2="740" y2="540" stroke="#E2E8F0" stroke-width="1"/>
+  <line x1="960" y1="140" x2="960" y2="540" stroke="#E2E8F0" stroke-width="1"/>
+  <line x1="1180" y1="140" x2="1180" y2="540" stroke="#E2E8F0" stroke-width="1"/>
+
+  <!-- row 1: the link's own floor -->
+  <text x="288" y="184" text-anchor="end" font-size="15" font-weight="600" fill="#0F172A">What the link could do</text>
+  <text x="288" y="204" text-anchor="end" font-size="13" fill="#94A3B8">355KB at the 333 Mbit/s knee</text>
+  <rect x="300" y="166" width="7" height="40" rx="2" fill="#15803D"/>
+  <text x="320" y="192" font-size="15" font-weight="600" fill="#15803D">9ms</text>
+
+  <!-- row 2: direct, cold -->
+  <text x="288" y="254" text-anchor="end" font-size="15" font-weight="600" fill="#0F172A">Direct TCP, new connection</text>
+  <text x="288" y="274" text-anchor="end" font-size="13" fill="#94A3B8">what an unmodified client does</text>
+  <rect x="300" y="236" width="146" height="40" rx="2" fill="#C2410C"/>
+  <rect x="446" y="236" width="686" height="40" fill="#EA8A5A"/>
+  <rect x="1110" y="236" width="22" height="40" fill="#15803D"/>
+  <rect x="300" y="236" width="832" height="40" rx="2" fill="none" stroke="#9A3412" stroke-width="1.5"/>
+  <text x="1132" y="228" text-anchor="end" font-size="16" font-weight="700" fill="#9A3412">1169ms</text>
+
+  <!-- row 3: direct, tuned -->
+  <text x="288" y="324" text-anchor="end" font-size="15" font-weight="600" fill="#0F172A">Direct TCP, tuned client</text>
+  <text x="288" y="344" text-anchor="end" font-size="13" fill="#94A3B8">connection reused, slow-start-after-idle off</text>
+  <rect x="300" y="306" width="177" height="40" rx="2" fill="#94A3B8"/>
+  <text x="493" y="332" font-size="16" font-weight="700" fill="#475569">241ms</text>
+
+  <!-- row 4: queqiao -->
+  <text x="288" y="394" text-anchor="end" font-size="15" font-weight="600" fill="#0F172A">Through Queqiao</text>
+  <text x="288" y="414" text-anchor="end" font-size="13" fill="#94A3B8">unmodified client, new connection</text>
+  <rect x="300" y="376" width="221" height="40" rx="2" fill="#2563EB"/>
+  <text x="537" y="402" font-size="16" font-weight="700" fill="#1D4ED8">302ms</text>
+
+  <!-- row 5: queqiao warm -->
+  <text x="288" y="464" text-anchor="end" font-size="15" font-weight="600" fill="#0F172A">Through Queqiao, reused</text>
+  <text x="288" y="484" text-anchor="end" font-size="13" fill="#94A3B8">the same connection, held open</text>
+  <rect x="300" y="446" width="174" height="40" rx="2" fill="#2563EB"/>
+  <text x="490" y="472" font-size="16" font-weight="700" fill="#1D4ED8">237ms</text>
+
+  <!-- legend for the stacked bar -->
+  <rect x="300" y="522" width="14" height="14" rx="2" fill="#C2410C"/>
+  <text x="322" y="534" font-size="13.5" fill="#334155">handshake, 199ms</text>
+  <rect x="470" y="522" width="14" height="14" rx="2" fill="#EA8A5A"/>
+  <text x="492" y="534" font-size="13.5" fill="#334155">sending 355KB and waiting for the answer, 970ms</text>
+  <rect x="852" y="522" width="14" height="14" rx="2" fill="#15803D"/>
+  <text x="874" y="534" font-size="13.5" fill="#334155">the recognition model, about 30ms</text>
+
+  <text x="620" y="582" text-anchor="middle" font-size="15" fill="#475569">Nothing here is the network being slow. It is a handshake for one request, a transfer starting at ten segments,</text>
+  <text x="620" y="604" text-anchor="middle" font-size="15" fill="#475569">and a window thrown away between requests. Each is credit per round trip, and the round trip is 200ms.</text>
+</svg>

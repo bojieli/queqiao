@@ -16,10 +16,12 @@ import (
 	"github.com/apernet/quic-go"
 	"github.com/bojieli/queqiao/internal/classifier"
 	wancongestion "github.com/bojieli/queqiao/internal/congestion"
+	"github.com/bojieli/queqiao/internal/flowmeta"
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/limiter"
 	"github.com/bojieli/queqiao/internal/memlimit"
 	"github.com/bojieli/queqiao/internal/metrics"
+	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
 	"github.com/bojieli/queqiao/internal/socks5"
@@ -74,14 +76,27 @@ type ClientConfig struct {
 	// desktop agent and the mobile packet tunnel, and set when the listener is
 	// reachable by other applications on the same host, as in Android export
 	// mode where loopback is shared across every installed app.
-	SOCKSAuth        *socks5.Credentials
-	Credentials      identity.ClientCredentials
-	ChunkSize        int
-	DialTimeout      time.Duration
-	HandshakeTimeout time.Duration
-	FlowIdleTimeout  time.Duration
-	FlowMaxLifetime  time.Duration
-	MaxSessions      int
+	SOCKSAuth   *socks5.Credentials
+	Credentials identity.ClientCredentials
+	// Profile names the deployment this client is running in, and carries the
+	// policy that differs between deployments. The zero value is the supported
+	// access-link profile, so a caller that does not choose gets the behaviour
+	// the published measurements describe.
+	Profile profile.Profile
+	// FlowMetadataSocket is a local capture agent's lookup socket. Empty
+	// disables the lookup and is the default: a deployment without an agent
+	// behaves exactly as it did before this existed.
+	FlowMetadataSocket string
+	// FlowMetadataTimeout bounds one lookup. It runs on the accept path, so an
+	// agent that has wedged costs a flow a millisecond rather than its
+	// handshake.
+	FlowMetadataTimeout time.Duration
+	ChunkSize           int
+	DialTimeout         time.Duration
+	HandshakeTimeout    time.Duration
+	FlowIdleTimeout     time.Duration
+	FlowMaxLifetime     time.Duration
+	MaxSessions         int
 	// SessionLimit optionally shares admission across several clients in one
 	// process. Nil gives this client its own MaxSessions-sized limit.
 	SessionLimit *SessionLimit
@@ -173,6 +188,9 @@ type ClientConfig struct {
 }
 
 type Client struct {
+	// flowMeta asks a local capture agent what produced a flow. Nil when no
+	// agent is configured, which is the default.
+	flowMeta      *flowmeta.Lookup
 	cfg           ClientConfig
 	udpHealth     *udpHealth
 	budget        *limiter.Budget
@@ -523,8 +541,15 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A misspelled class name fails here rather than matching nothing at
+	// runtime, where it would be indistinguishable from a rule whose workload
+	// never appeared.
+	if err := cfg.Profile.ValidateHints(); err != nil {
+		return nil, fmt.Errorf("client profile: %w", err)
+	}
 	return &Client{
-		cfg: cfg, udpHealth: newUDPHealth(cfg.UDPFailureThreshold, cfg.UDPCooldown),
+		flowMeta: flowmeta.New(cfg.FlowMetadataSocket, cfg.FlowMetadataTimeout),
+		cfg:      cfg, udpHealth: newUDPHealth(cfg.UDPFailureThreshold, cfg.UDPCooldown),
 		credentials: cfg.Credentials, budget: budget,
 		metrics: cfg.Metrics, sessionLimit: cfg.SessionLimit, pendingOpens: make(chan struct{}, cfg.MaxPendingOpens),
 		sendMemory: sendMemory, receiveMemory: receiveMemory, memoryLimits: memoryLimits,
@@ -776,7 +801,8 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 		return
 	}
 	c.cfg.Logger.Debug("local flow opened", "transport", flow.kind, "duration", time.Since(flowOpenStarted))
-	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory)
+	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
+	c.declareClass(ctx, inner, flowSession)
 	flowSession.ackRanges.Store(true)
 	flowSession.idleTimeout = c.cfg.FlowIdleTimeout
 	flowSession.maxLifetime = c.cfg.FlowMaxLifetime
@@ -1330,7 +1356,9 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 		outer, err = dialTCP(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl)
 	case TransportQUIC:
 		ccfg := congestionConfig{
-			kind: c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
+			hierarchicalPath: c.cfg.Profile.HierarchicalPath,
+			discoverGrouping: c.cfg.Profile.DiscoverGrouping,
+			kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 			adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
 		}
 		if pooled {
@@ -1712,7 +1740,8 @@ func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 	}
 	entry := &bulkConn{conn: conn, packet: packet}
 	entry.controller = configureQUICController(conn, congestionConfig{
-		kind: c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
+		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
+		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
 	})
 	c.cfg.Logger.Debug("bulk QUIC pool authenticated", "duration", time.Since(started))
@@ -2563,4 +2592,62 @@ func closeAuthenticatedLane(lane *authenticatedLane) {
 	if lane != nil && lane.fc != nil {
 		_ = lane.fc.Close()
 	}
+}
+
+// classifierConfig is the flow-classification policy this client's profile
+// asks for. It is read per flow rather than cached so that a profile chosen at
+// startup is visible in every flow the process creates, including ones opened
+// long afterwards.
+func (c *Client) classifierConfig() classifier.Config {
+	if c.cfg.Profile.Classifier.BulkBytes == 0 {
+		return profile.Default().Classifier
+	}
+	return c.cfg.Profile.Classifier
+}
+
+// declareClass asks the local capture agent what opened this connection, and
+// applies whatever class the profile declares for it.
+//
+// It runs on the accept path, so everything about it is bounded and optional:
+// no agent, an agent that has forgotten the flow, a process that exited, or a
+// profile with no matching hint all leave the flow exactly as it would have
+// been. What it buys is the first second, which is the window the classifier
+// cannot cover and which a request shorter than it spends entirely inside.
+func (c *Client) declareClass(ctx context.Context, inner net.Conn, flow *multipathFlow) {
+	if !c.flowMeta.Enabled() || len(c.cfg.Profile.ClassHints) == 0 {
+		return
+	}
+	port, ok := flowmeta.SourcePortOf(inner.RemoteAddr())
+	if !ok {
+		return
+	}
+	proc, err := c.flowMeta.BySourcePort(ctx, port)
+	if err != nil {
+		// A lookup failure is not a flow failure. It is logged at debug
+		// because on a host with no agent it would otherwise be logged for
+		// every connection.
+		c.cfg.Logger.Debug("flow attribution unavailable", "error", err, "source_port", port)
+		return
+	}
+	identity := proc.Identity()
+	if identity == "" {
+		return
+	}
+	class, ok := c.cfg.Profile.HintedClass(identity)
+	if !ok {
+		c.cfg.Logger.Debug("flow attributed with no matching hint", "identity", identity)
+		return
+	}
+	flow.classifier.Declare(class)
+	flow.class.Store(uint32(protocol.Class(class)))
+	// Counted like any other transition. A declared class never passes through
+	// Observe, so without this the whole mechanism is invisible in telemetry:
+	// an operator reading class_transitions would see zero and conclude the
+	// hints never fired, which is indistinguishable from them not being
+	// configured.
+	if c.metrics != nil {
+		c.metrics.ClassTransition(int(class))
+	}
+	c.cfg.Logger.Debug("flow class declared from attribution",
+		"identity", identity, "class", class)
 }
