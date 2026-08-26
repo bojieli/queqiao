@@ -75,6 +75,11 @@ BASELINE = {
     # the audio to transcribe, or the request body to post. There is no
     # untrusted input here and nothing is served; the path is the argument.
     ("G304", "cmd/pathmeasure/workload.go"): 1,
+    # doctor reads a sysctl from /proc/sys, with the name supplied by this
+    # package rather than by an operator. It is a file read because a shell out
+    # would behave differently under a service manager that gives the process
+    # no PATH.
+    ("G304", "cmd/queqiaod/doctor.go"): 1,
     ("G304", "cmd/queqiaod/main.go"): 2,
     # The multi-provider manifest is opened from the operator's own --providers
     # path, on the same footing as the reviewed --profile reads above it.
