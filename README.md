@@ -6,7 +6,9 @@
 
 <p align="center">
   <strong>Make difficult long-haul links feel local.</strong><br>
-  An open-source, self-hosted transport for TCP and UDP across a known WAN bottleneck.
+  An open-source, self-hosted transport for TCP and UDP across a long link you
+  control both ends of: a client to its gateway, or one region's applications to
+  another region's GPUs.
 </p>
 
 <p align="center">
@@ -31,6 +33,37 @@ Today, Queqiao is a ready-to-use, self-hosted protocol for supported
 client-to-gateway deployments. It carries TCP and UDP through a local proxy over
 an authenticated transport, and keeps evolving as we measure more paths,
 improve the transport, and learn from users.
+
+### The second reason this exists
+
+The same problem turned up somewhere I did not expect it: between two machines
+we own.
+
+GPU serving wants big batches and warm caches, so inference capacity ends up
+concentrated in one or two regions. Voice activity detection and turn-taking
+have to answer within about 20ms, so those run close to the user. That leaves a
+long hop in the middle that nobody can design away, and every speech request
+crosses it twice.
+
+Running real speech recognition from Guiyang against a model in Irvine, a 355KB
+audio upload takes **1133ms**. The model spends 38ms of that. The other 1095ms
+is a handshake that buys nothing and a few hundred kilobytes climbing out of a
+ten-segment initial window on a 199ms path. Synthesis is the same story in
+reverse: the answer comes back as one 100KB burst, and moving it takes 916ms.
+
+Through Queqiao those become **290ms** and **75ms**. But the honest version of
+this story has a second half, and it is in the README because it changes what
+you should do first: on a path direction that does not lose packets, a client
+that reuses its connection and sets one sysctl reaches 226ms on its own, and
+beats the tunnel. What it does not reach is the tail, a direction that erases,
+a connection that is genuinely cold, or a caller you cannot reconfigure.
+
+So there are two profiles, and they are chosen from where the bottleneck is
+rather than from where the machines are. `wan-shared-bottleneck` is the default
+and the one above. `dc-long-haul` is experimental, for a long hop between two
+regions one operator runs. Start with [the datacenter
+profile](docs/DEPLOYING-DC-PROFILE.md) if that is your case, and read its
+measured limits before deploying it.
 
 ## Why Queqiao?
 
