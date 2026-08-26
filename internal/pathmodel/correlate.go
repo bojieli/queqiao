@@ -270,3 +270,12 @@ func (c *Correlator) Forget(group string) {
 	defer c.mu.Unlock()
 	delete(c.groups, group)
 }
+
+// ResetCorrelator drops every group, for tests, for the same reason ResetTree
+// exists: the correlator is process-wide and two tests that could not affect
+// each other on a real network share it here.
+func ResetCorrelator() {
+	sharedCorrelator.mu.Lock()
+	defer sharedCorrelator.mu.Unlock()
+	sharedCorrelator.groups = make(map[string]*series)
+}

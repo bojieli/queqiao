@@ -462,3 +462,83 @@ func TestAliasResolutionIsBounded(t *testing.T) {
 		t.Fatal("alias resolution did not terminate on a cycle")
 	}
 }
+
+// The correlator has to be fed by ordinary reporting, or the evidence it
+// gathers is only ever what a test put there.
+func TestReportingFeedsTheCorrelator(t *testing.T) {
+	ResetTree()
+	ResetCorrelator()
+	c := SharedChain(Key{Egress: "e", Group: "us-east", Dest: "svc"})
+	feed(c, 800, 1<<20, 0.12, 1000, 40*time.Millisecond)
+	if got := SharedCorrelator().Groups(); len(got) != 1 || got[0] != "us-east" {
+		t.Errorf("correlator groups = %v, want [us-east]", got)
+	}
+}
+
+// A chain that names no group records nothing, because the question the
+// correlator answers is about groups.
+func TestAGrouplessChainRecordsNothing(t *testing.T) {
+	ResetTree()
+	ResetCorrelator()
+	c := SharedChain(Key{Dest: "peer"})
+	feed(c, 900, 1<<20, 0.12, 1000, 40*time.Millisecond)
+	if got := SharedCorrelator().Groups(); len(got) != 0 {
+		t.Errorf("correlator groups = %v, want none", got)
+	}
+}
+
+// Acting on the evidence is opt-in. A deployment that did not ask keeps the
+// static hierarchy it was given, however strongly two groups correlate.
+func TestRegroupingIsOptIn(t *testing.T) {
+	ResetTree()
+	ResetCorrelator()
+	lastRegroup.Store(0)
+	// Two groups whose congestion moves together, reported through ordinary
+	// chains that did not ask to regroup.
+	a := SharedChain(Key{Egress: "e", Group: "alpha", Dest: "a"})
+	b := SharedChain(Key{Egress: "e", Group: "beta", Dest: "b"})
+	for i := 0; i < 40; i++ {
+		spike := 0.0
+		if i%5 == 0 {
+			spike = 0.3
+		}
+		now := base.Add(time.Duration(i) * bucketWidth)
+		SharedCorrelator().Observe("alpha", now, Signal{LossRate: spike})
+		SharedCorrelator().Observe("beta", now, Signal{LossRate: spike})
+	}
+	feed(a, 1000, 1<<20, 0.1, 500, time.Millisecond)
+	feed(b, 1100, 1<<20, 0.1, 500, time.Millisecond)
+	if GroupOf("beta") != "beta" {
+		t.Error("a chain that did not opt in regrouped anyway")
+	}
+
+	// The same evidence, through a chain that did ask.
+	lastRegroup.Store(0)
+	c := SharedChainRegrouping(Key{Egress: "e", Group: "alpha", Dest: "a"})
+	feed(c, 1200, 1<<20, 0.1, 500, time.Millisecond)
+	if GroupOf("beta") == "beta" {
+		t.Error("a regrouping chain did not act on strongly correlated groups")
+	}
+}
+
+// Merging is rate limited, because the evidence is gathered over ten seconds
+// and re-deciding faster than that reads the same buckets twice.
+func TestRegroupingIsRateLimited(t *testing.T) {
+	ResetTree()
+	ResetCorrelator()
+	lastRegroup.Store(time.Now().UnixNano())
+	for i := 0; i < 40; i++ {
+		now := base.Add(time.Duration(i) * bucketWidth)
+		spike := 0.0
+		if i%5 == 0 {
+			spike = 0.3
+		}
+		SharedCorrelator().Observe("x", now, Signal{LossRate: spike})
+		SharedCorrelator().Observe("y", now, Signal{LossRate: spike})
+	}
+	c := SharedChainRegrouping(Key{Egress: "e", Group: "x", Dest: "d"})
+	feed(c, 1300, 1<<20, 0.1, 500, time.Millisecond)
+	if GroupOf("y") != "y" {
+		t.Error("a merge happened inside the rate limit")
+	}
+}

@@ -62,6 +62,16 @@ type Profile struct {
 	// would measure nothing while changing the numbers the published results
 	// were taken with.
 	HierarchicalPath bool
+	// DiscoverGrouping lets the tree's shape follow measured evidence instead
+	// of the static hierarchy it starts from: groups whose congestion arrives
+	// and leaves together are merged into one segment.
+	//
+	// It requires HierarchicalPath, and it is off by default even there.
+	// Merging re-parents the budget of every flow that follows, and it is
+	// close to irreversible in practice, because the evidence that would
+	// justify splitting again is gathered under the shared budget that hides
+	// the difference.
+	DiscoverGrouping bool
 }
 
 // wanSharedBottleneck is the deployment this project was built for and the one
@@ -112,6 +122,7 @@ func dcLongHaul() Profile {
 	return Profile{
 		Name:             "dc-long-haul",
 		HierarchicalPath: true,
+		DiscoverGrouping: true,
 		Precondition: "both endpoints are operated by the same party, the leg " +
 			"between them is long, and every flow on it is a latency-critical " +
 			"request rather than a transfer seeking throughput",

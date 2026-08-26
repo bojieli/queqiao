@@ -98,9 +98,17 @@ levels instead, you find that every pair of paths gets worse in the evening,
 and the tree collapses to a single root for a reason that has nothing to do
 with a shared queue. Differencing cancels the common trend.
 
-`SuggestMerges` reports what correlates. `MergeGroups` acts on it. We kept
-those separate because merging re-parents the budget for every flow that
-follows, and that should be a deliberate call.
+`SuggestMerges` reports what correlates and `MergeGroups` acts on it. Ordinary
+reporting feeds the correlator, and the datacenter profile applies suggestions
+at a bounded cadence; the access-link profile gathers nothing and rearranges
+nothing.
+
+We merge but don't automatically split. That sounds asymmetric and isn't: once
+two groups share a node they share a budget, and the shared budget is exactly
+what smooths away the congestion signal that would tell them apart again.
+Undoing a merge is `SplitGroup` and an operator with a reason. The threshold is
+0.8 on differenced short-window signals, which is deliberately higher than the
+bar for leaving them apart.
 
 ### Flow classification
 
@@ -219,7 +227,5 @@ digits. So:
 - We don't know whether aggregating flows removes the need for a synthetic
   bandwidth probe. The aggregate metrics endpoint reports the idle control
   connection, so answering this needs per-lane trace data.
-- Correlation-based regrouping produces evidence and can apply a merge on
-  request, but nothing feeds it in production and splitting a group back apart
-  is manual.
+- Splitting a merged group back apart is manual, for the reason above.
 - One path. This profile stays experimental until we've run it on more.

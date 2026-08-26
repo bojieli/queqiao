@@ -1337,6 +1337,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 	case TransportQUIC:
 		ccfg := congestionConfig{
 			hierarchicalPath: c.cfg.Profile.HierarchicalPath,
+			discoverGrouping: c.cfg.Profile.DiscoverGrouping,
 			kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 			adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
 		}

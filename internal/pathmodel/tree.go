@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // A path is a chain of segments, and only one of them is the bottleneck.
@@ -82,6 +84,15 @@ const confidentSamples = 100
 type Chain struct {
 	nodes []*PathModel
 	keys  []string
+	// group is the destination grouping this chain belongs to, empty when the
+	// caller named no group. It is what the correlator records against, since
+	// the question it answers is which groups share a bottleneck.
+	group string
+	// regroup says whether this chain may act on the correlator's evidence.
+	// It is off unless a deployment asks for it, because merging two groups
+	// re-parents the budget of every flow that follows and that should be a
+	// policy rather than a side effect of measurement.
+	regroup bool
 }
 
 // Nodes is how many segments this chain distinguishes. A chain of one is the
@@ -117,7 +128,39 @@ func (c *Chain) Report(member Member, o Observation) State {
 	for i, n := range c.nodes {
 		states[i] = n.Report(member, o)
 	}
-	return combine(states)
+	out := combine(states)
+	c.recordCongestion(out)
+	return out
+}
+
+// recordCongestion feeds this chain's group to the correlator, and acts on
+// what it has gathered when the deployment allows it.
+//
+// The signal is the leaf's view rather than an ancestor's: what a flow to this
+// destination actually experienced. RTT inflation is measured against this
+// group's own minimum, because two groups of different lengths are being
+// compared for whether they move together rather than for which is longer.
+func (c *Chain) recordCongestion(s State) {
+	// The group check is a fast path rather than a correctness one: Observe
+	// rejects an empty group itself, and this avoids taking the leaf's lock on
+	// every report from the single-node chains that are the common case.
+	if c.group == "" || len(c.nodes) == 0 {
+		return
+	}
+	leaf := c.nodes[len(c.nodes)-1]
+	leaf.mu.Lock()
+	floor := leaf.knowledge.roundTrip
+	leaf.mu.Unlock()
+	inflation := 0.0
+	if floor > 0 && s.RoundTrip > floor {
+		inflation = (s.RoundTrip - floor).Seconds()
+	}
+	sharedCorrelator.Observe(c.group, time.Now(), Signal{
+		LossRate: s.Erasure, RTTInflation: inflation,
+	})
+	if c.regroup {
+		maybeRegroup()
+	}
 }
 
 // Current is what the chain already knows, without contributing to it.
@@ -276,6 +319,18 @@ func GroupOf(group string) string {
 // which is the whole point: the second destination in a group inherits what
 // the first measured about the segment they share.
 func SharedChain(k Key) *Chain {
+	return sharedChain(k, false)
+}
+
+// SharedChainRegrouping is SharedChain for a deployment that has asked for the
+// tree's shape to follow the evidence rather than the static hierarchy it was
+// bootstrapped from.
+func SharedChainRegrouping(k Key) *Chain {
+	return sharedChain(k, true)
+}
+
+func sharedChain(k Key, regroup bool) *Chain {
+	group := k.Group
 	if k.Group != "" {
 		k.Group = GroupOf(k.Group)
 	}
@@ -283,7 +338,8 @@ func SharedChain(k Key) *Chain {
 	if len(keys) == 0 {
 		return &Chain{}
 	}
-	c := &Chain{nodes: make([]*PathModel, 0, len(keys)), keys: keys}
+	c := &Chain{nodes: make([]*PathModel, 0, len(keys)), keys: keys,
+		group: group, regroup: regroup}
 	treeMu.Lock()
 	defer treeMu.Unlock()
 	for _, key := range keys {
@@ -391,3 +447,51 @@ var (
 	_ Model = (*PathModel)(nil)
 	_ Model = (*Chain)(nil)
 )
+
+// sharedCorrelator gathers the evidence for which groups share a bottleneck.
+// It is process-wide for the same reason the node map is: the question is
+// about paths, not about whichever flow happened to ask.
+var sharedCorrelator = NewCorrelator()
+
+// Correlation is the coefficient above which two groups are treated as one
+// segment.
+//
+// It is high on purpose. Merging is close to irreversible in practice -- the
+// evidence that would justify splitting again is gathered under the merged
+// budget, which is the budget that hides the difference -- so the bar to merge
+// has to be higher than the bar to have left them apart. At 0.8 on differenced
+// short-window signals, two groups have to get worse and better together
+// within a fifth of a second, repeatedly.
+const mergeCorrelation = 0.8
+
+// regroupInterval bounds how often the evidence is acted on. Correlation is
+// computed over ten seconds of buckets, so re-deciding faster than that reads
+// the same data twice and pays for it.
+const regroupInterval = 30 * time.Second
+
+var lastRegroup atomic.Int64
+
+// maybeRegroup applies the correlator's suggestions at a bounded cadence.
+//
+// It merges and does not split. Splitting on decayed correlation sounds
+// symmetric and is not: once two groups share a node they share a budget, so
+// the congestion signal that would distinguish them is exactly what the shared
+// budget smooths away. Undoing a merge is left to SplitGroup and to an
+// operator who has a reason.
+func maybeRegroup() {
+	now := time.Now().UnixNano()
+	last := lastRegroup.Load()
+	if time.Duration(now-last) < regroupInterval {
+		return
+	}
+	if !lastRegroup.CompareAndSwap(last, now) {
+		return
+	}
+	for _, m := range sharedCorrelator.SuggestMerges(mergeCorrelation) {
+		MergeGroups(m.A, m.B)
+	}
+}
+
+// SharedCorrelator exposes the gathered evidence, for an operator asking why
+// two groups were joined.
+func SharedCorrelator() *Correlator { return sharedCorrelator }

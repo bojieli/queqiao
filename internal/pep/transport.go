@@ -84,6 +84,9 @@ type congestionConfig struct {
 	// one client serves several providers, which share the client's uplink and
 	// nothing else.
 	hierarchicalPath bool
+	// discoverGrouping lets the tree's shape follow the evidence rather than
+	// the static hierarchy. It does nothing without hierarchicalPath.
+	discoverGrouping bool
 }
 
 type udpHealth struct {
@@ -788,7 +791,7 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 		// overshot by however many lanes there were. Live, four lanes
 		// delivered about 8 Mbit/s where one delivered 11.
 		controller := wancongestion.NewErasureSenderOn(
-			conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath))
+			conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
 		conn.SetCongestionControl(controller)
 		return controller
 	case CongestionBrutal:
@@ -828,15 +831,16 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 // only what the tighter of the two permits -- so a second provider reached
 // over the same uplink starts from what the first measured about it, and a
 // congested peer does not throttle traffic to a healthy one.
-func pathModelFor(conn *quic.Conn, hierarchical bool) pathmodel.Model {
+func pathModelFor(conn *quic.Conn, hierarchical, discover bool) pathmodel.Model {
 	key := peerKey(conn)
 	if !hierarchical {
 		return pathmodel.Shared(key)
 	}
-	return pathmodel.SharedChain(pathmodel.Key{
-		Egress: egressOf(conn),
-		Dest:   key,
-	})
+	k := pathmodel.Key{Egress: egressOf(conn), Dest: key}
+	if discover {
+		return pathmodel.SharedChainRegrouping(k)
+	}
+	return pathmodel.SharedChain(k)
 }
 
 // egressOf names the local side of the connection, which is the segment every

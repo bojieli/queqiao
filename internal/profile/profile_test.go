@@ -108,3 +108,21 @@ func TestOnlyTheDatacenterProfileUsesTheHierarchy(t *testing.T) {
 		t.Error("the datacenter profile did not enable the hierarchical path model")
 	}
 }
+
+// Discovering the grouping needs a hierarchy to rearrange, so a profile that
+// asks for one without the other is a configuration that cannot do what it
+// says.
+func TestGroupingDiscoveryRequiresAHierarchy(t *testing.T) {
+	for _, name := range Names() {
+		p, err := ByName(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.DiscoverGrouping && !p.HierarchicalPath {
+			t.Errorf("%s discovers grouping without a hierarchy to apply it to", name)
+		}
+	}
+	if Default().DiscoverGrouping {
+		t.Error("the default profile rearranges its own tree")
+	}
+}
