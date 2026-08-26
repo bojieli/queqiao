@@ -1,14 +1,12 @@
 # What a China-US datacenter path actually is (2026-08-26)
 
-The path is between two datacenters rather than an access network: a Huawei
-Cloud instance in Guiyang and a colocated server in Tustin, California. It is
-the first path characterised for the datacenter profile, and it was chosen
-because it is the shape that profile targets -- a long-haul leg between two
-hosts the operator runs, carrying request/response traffic whose payloads are
-hundreds of kilobytes.
+A Huawei Cloud instance in Guiyang and a colocated server in Tustin,
+California. The first path characterised for the datacenter profile, chosen
+because it is that profile's shape: a long leg between two hosts one operator
+runs, carrying request/response traffic of a few hundred kilobytes.
 
-Measurements were taken with `pathprobe` (open-loop UDP, download direction)
-and `pathmeasure` (TCP and upload-direction UDP, both new in this branch).
+Measured with `pathprobe` (open-loop UDP) and `pathmeasure` (new in this
+branch). Reproduce with [MEASURING-A-DC-PATH.md](MEASURING-A-DC-PATH.md).
 
 ## The path
 
@@ -16,512 +14,202 @@ and `pathmeasure` (TCP and upload-direction UDP, both new in this branch).
 |---|---|
 | Round trip | 199-207ms, min 185.9ms |
 | Jitter at 1 packet/s | mdev 0.58ms over 30 probes |
-| Path MTU | 1500, no blackholing; 1472-byte ICMP payload passes, 1480 does not |
-| Capacity knee, downstream | ~333 Mbit/s delivered |
+| Path MTU | 1500, no blackholing |
+| Capacity knee, downstream | ~333 Mbit/s |
 
-The jitter figure matters more than it looks. A round trip whose minimum and
-maximum differ by 3ms across thirty seconds is not queueing anywhere, so
-whatever the loss is, it is not congestion.
+A round trip whose min and max differ by 3ms is not queueing, so whatever the
+loss is, it is not congestion.
 
 ## The two directions are different paths
 
-This is the finding that governs everything else, and it is the reason the
-first version of this measurement was wrong.
-
 | Direction | Protocol | Loss | Throughput |
 |---|---|---|---|
-| Upload, China to US | UDP, 50 Mbit/s | **0.0%** (0 of 41,663) | 49.99 Mbit/s |
-| Upload, China to US | TCP cubic | 0.36-2.90% retransmitted | 73-94 Mbit/s |
-| Download, US to China | UDP, 1-300 Mbit/s | **~14%** | knee at ~333 Mbit/s |
-| Download, US to China | TCP cubic | -- | **0.13-0.47 Mbit/s** |
+| Upload, CN→US | UDP 50 Mbit/s | **0.0%** (0 of 41,663) | 49.99 Mbit/s |
+| Upload, CN→US | TCP cubic | 0.36-2.90% retransmitted | 73-94 Mbit/s |
+| Download, US→CN | UDP 1-300 Mbit/s | **~14%** | knee ~333 Mbit/s |
+| Download, US→CN | TCP cubic | -- | **0.13-0.47 Mbit/s** |
 
-The upload direction erases nothing at all. The download direction erases a
-seventh of everything. They are the same two hosts, minutes apart.
-
-An earlier reading of this data concluded that UDP was being policed twenty to
-forty times harder than TCP. That conclusion was an artefact of comparing
-`pathprobe`, whose server is the sender and which therefore measures the
-download, against `pathmeasure`, whose client is the sender and which measures
-the upload. The protocols were never the variable; the direction was. The
-`udp` mode in `pathmeasure` exists because of this mistake, and it settles the
-question: UDP upstream loses nothing, so nothing on this path treats UDP
-worse than TCP.
+An earlier reading concluded UDP was policed 20-40x harder than TCP. That was
+an artefact: `pathprobe`'s server is the sender, so it measures the download,
+while `pathmeasure`'s client is the sender. The direction was the variable, not
+the protocol. `pathmeasure -mode udp` exists because of that mistake.
 
 ## The download erasure is memoryless and rate-independent
 
-Downstream, one connection, 1200-byte payloads:
+| offered Mbit/s | delivered | loss | P(loss\|prev ok) | P(ok\|prev lost) | burst factor |
+|---|---|---|---|---|---|
+| 1 | 0.85 | 14.5% | 0.136 | 0.802 | 1.07 |
+| 5 | 4.13 | 17.5% | 0.181 | 0.854 | 1.00 |
+| 20 | 17.01 | 14.9% | 0.072 | 0.408 | 2.08 |
+| 150 | 129.19 | 13.9% | 0.136 | 0.843 | 1.02 |
+| 300 | 256.15 | 14.6% | 0.141 | 0.825 | 1.03 |
+| 600 | 333.49 | **44.4%** | 0.490 | 0.613 | 1.00 |
 
-| offered Mbit/s | delivered | loss | P(loss \| prev ok) | P(ok \| prev lost) | burst factor | longest |
-|---|---|---|---|---|---|---|
-| 1 | 0.85 | 14.5% | 0.136 | 0.802 | 1.07 | 3 |
-| 2 | 1.80 | 9.8% | 0.096 | 0.878 | 1.03 | 3 |
-| 5 | 4.13 | 17.5% | 0.181 | 0.854 | 1.00 | 4 |
-| 10 | 8.51 | 14.9% | 0.124 | 0.710 | 1.20 | 6 |
-| 20 | 17.01 | 14.9% | 0.072 | 0.408 | 2.08 | 10 |
-| 40 | 34.38 | 14.0% | 0.062 | 0.380 | 2.26 | 11 |
-| 80 | 71.24 | 10.9% | 0.040 | 0.329 | 2.71 | 21 |
-| 150 | 129.19 | 13.9% | 0.136 | 0.843 | 1.02 | 26 |
-| 300 | 256.15 | 14.6% | 0.141 | 0.825 | 1.03 | 149 |
-| 600 | 333.49 | 44.4% | 0.490 | 0.613 | 1.00 | 795 |
+A memoryless channel with loss `p` has `P(loss|prev ok) = p` and
+`P(ok|prev lost) = 1-p`; at 1, 150 and 300 Mbit/s the measured pairs match to
+within sampling noise. Delivery scales linearly to 300 Mbit/s, so nothing is
+congested below it; at 600 loss jumps to 44.4% with a longest run of 795. That
+is the knee, and the only place on this path where loss means congestion. The
+elevated burst factors at 20-80 Mbit/s are the probe's own release pattern, not
+the path's — they vanish at 150 and 300 where sample counts are two orders of
+magnitude larger.
 
-A memoryless channel with loss `p` has `P(loss | prev ok) = p` and
-`P(ok | prev lost) = 1 - p`. At 1 Mbit/s: 0.136 and 0.802 against a loss of
-0.145. At 150: 0.136 and 0.843 against 0.139. At 300: 0.141 and 0.825 against
-0.146. The erasure is independent, and it is independent at rates far below any
-queue.
+**What TCP does with it.** Mathis gives `MSS/(RTT·√p)` = 1448/(0.2·√0.14) =
+**0.155 Mbit/s**. Measured: 0.13-0.47. TCP is not malfunctioning; it is obeying
+a loss signal that means nothing here, while the open-loop probe pulls 256
+Mbit/s across the same channel.
 
-Delivered scales linearly with offered right up to 300 Mbit/s -- 0.85, 1.80,
-4.13, 8.51, 17.01, 34.38, 71.24, 129.19, 256.15 -- so there is no capacity
-constraint below it. At 600 the loss jumps to 44.4% and delivery saturates at
-333 Mbit/s with a longest run of 795. That is the knee, and it is the only
-place on this path where loss means congestion.
+## Flow completion time
 
-The elevated burst factors at 20-80 Mbit/s are the sender's, not the path's:
-they appear where the probe's own release pattern is coarsest relative to the
-rate, and they disappear again at 150 and 300 where the sample counts are two
-orders of magnitude larger. This is the contamination `pathprobe`'s `-burst`
-flag exists to bound, and it is a reminder that a burst factor measured from a
-few hundred losses is not yet a measurement.
+Upload, cubic, payload sizes an inference call sends:
 
-## What TCP does with a memoryless erasure channel
-
-Mathis gives throughput as `MSS / (RTT * sqrt(p))`. With MSS 1448, RTT 0.2s and
-p = 0.14 that is 19.4 KB/s, or **0.155 Mbit/s**.
-
-Measured TCP download: **0.13-0.47 Mbit/s**.
-
-TCP is not malfunctioning. It is doing exactly what its design says to do with
-a loss signal, on a path where the loss signal means nothing. Meanwhile the
-open-loop probe pulls 256 Mbit/s across the same channel in the same window.
-The gap between 0.155 and 256 is not the path. It is the cost of interpreting
-erasure as congestion, and it is a factor of about 1,600.
-
-## Flow completion time is the metric, and it says something different
-
-Upload direction, cubic, payload sizes an inference call actually sends:
-
-| size | cold (incl. handshake) | warm-first | warm | floor |
+| size | cold | warm-first | warm | floor |
 |---|---|---|---|---|
 | 100KB | 836-2009ms | 742ms | 186-763ms | ~200ms |
 | 300KB | 1172-1198ms | 1029ms | **209ms** | ~200ms |
 | 1MB | 1560-1721ms | 1687ms | **212ms** | ~200ms |
 
-Three things are visible here that no throughput number shows.
-
-**A warm connection is worth 5.7x on 300KB** -- 1198ms cold against 209ms warm.
-And 209ms on a 200ms path is one round trip: the floor, reached exactly.
-
-**The first flow on a warm connection is not warm.** 300KB warm-first takes
-1029ms against 209ms for the ones after it, and against 998ms for the transfer
-half of a cold flow. Reusing a connection saves the handshake immediately and
-saves the ramp only later.
-
-**Small flows have worse tails than larger ones.** 300KB warm was 209.0 and
-209.0ms on two runs; 100KB warm was 186 and 763ms. A 100KB payload is about 70
-packets, which is too few to reliably produce the three duplicate
-acknowledgements fast retransmit needs, so a loss falls through to a
-retransmission timeout. The smallest flows are the ones least able to recover
-cheaply, which is the opposite of the usual intuition and is precisely the
-regime forward error correction addresses.
+A warm connection is worth 5.7x at 300KB, and 209ms on a 200ms path is one
+round trip — the floor, reached exactly. The first flow on a warm connection is
+not warm: 1029ms against 209ms for the ones after it. And small flows have
+worse tails than larger ones, because 100KB is ~70 packets, too few to
+reliably produce the three duplicate acknowledgements fast retransmit needs.
 
 ## A long-lived connection does not stay warm
 
-Six 300KB bursts on one connection, three seconds idle between them, upload
-direction. This is the shape of an interactive inference session.
+Six 300KB bursts on one connection, 3s idle between — the shape of an
+interactive session:
 
 | burst | cubic, `ssai=1` | bbr, `ssai=1` | cubic, `ssai=0` |
 |---|---|---|---|
 | 0 | 941.9ms | 1082.6ms | 1028.5ms |
 | 1 | 941.0ms | 317.3ms | **209.1ms** |
-| 2 | 1515.7ms | 296.1ms | **209.1ms** |
 | 3 | 941.9ms | 288.5ms | **208.7ms** |
-| 4 | 1538.2ms | 286.1ms | **208.7ms** |
 | 5 | 941.0ms | 284.9ms | **209.0ms** |
 
-With Linux's default `tcp_slow_start_after_idle=1`, cubic pays full slow start
-on every single burst, forever. Its window returns to 223 packets each time and
-941ms is five round trips: the ramp, repeated, six times, on a connection that
-has been open the whole while.
+With Linux's default, cubic pays full slow start on every burst forever: 941ms
+is five round trips, repeated, on a connection open the whole time. BBR does
+not reset (`tcp_slow_start_after_idle_check` returns early for any controller
+providing `cong_control`) but converges to 285ms, because it paces at a
+bottleneck estimate derived from its own bursts — `app_limited` reads true from
+burst 1. **One sysctl takes cubic to 209ms: a factor of 4.5**, and tuned cubic
+then beats BBR, whose pacing is the remaining constraint.
 
-BBR does not reset, because `tcp_slow_start_after_idle_check()` returns early
-for any controller providing `cong_control`. It converges to 285ms instead --
-better, but still 36% above the floor, and the reason is visible in the
-`app_limited` column, which reads true from the second burst onward. BBR paces
-at a bottleneck estimate it derived from these bursts, and the bursts are all
-it has ever sent. 300KB in 285ms is 8.6 Mbit/s, which is what BBR believes the
-path can do. The open-loop probe says 256 Mbit/s.
+**Loopback, for scale.** 300KB takes 0.1ms (28.9-31.5 Gbit/s) on the same
+server to itself, against 209ms across the path. Every constraint above is a
+function of the round trip.
 
-Setting `tcp_slow_start_after_idle=0` takes cubic to 209ms from the second
-burst on. **One sysctl, 941ms to 209ms, a factor of 4.5** -- and tuned cubic
-then beats BBR on the same path, because cubic does not pace and BBR's pacing
-is the remaining constraint.
+## What this transport does, and how much of it is QUIC
 
-## Loopback, for comparison
-
-On the same server, to itself:
-
-| size | cold | warm |
-|---|---|---|
-| 300KB | 0.2-0.3ms | 0.1ms (28.9-31.5 Gbit/s) |
-| 1MB | 0.3-0.4ms | 0.2ms |
-
-A 300KB payload that takes 209ms across the path takes 0.1ms across loopback.
-Every constraint discussed above is a function of the round trip, and at a
-round trip of 0.05ms none of them binds. That is the entire argument for
-terminating close to the application and carrying only the long leg on a
-transport that knows about the path.
-
-## What this path implies
-
-- **The QUIC-based design is viable here.** UDP is not disadvantaged; upstream
-  it is perfect and downstream it matches what any protocol would see.
-- **Downstream is the direction that needs the transport.** It carries a
-  memoryless 14% erasure that TCP converts into a 1,600-fold throughput
-  penalty, and forward error correction is the right response to memoryless
-  loss on a 200ms round trip where a retransmission costs more than the
-  inference it carries.
-- **Upstream needs almost nothing.** Connection reuse and one sysctl reach the
-  round-trip floor. A transport that spent parity on this direction would be
-  spending it for nothing, which is an argument for measuring and controlling
-  the two directions separately rather than copying one model onto both.
-- **The measurement instruments have to name their direction.** The first
-  version of this document drew the wrong conclusion from correct numbers
-  because two tools disagreed about who was sending.
-
-## What this project's own transport does with the path
-
-A gateway was run on the US host and a client on the Guiyang host, isolated from
-the production deployment on the same server, and the same instrument measured
-the same payloads directly and through the SOCKS5 listener. Completion is an
-end-to-end acknowledgement from the far side in both cases: a client measuring
-an upload through a proxy by watching its own socket is timing loopback, and
-that makes any tunnel look arbitrarily fast.
-
-### Download, the direction that erases 14%
-
-| size | direct, median (range) | through Queqiao, median (range) | gain |
-|---|---|---|---|
-| 100KB | 1732ms (945-12307) | **396ms** (262-705) | 4.4x |
-| 300KB | 11257ms (6377-17147) | **649ms** (288-664) | **17.3x** |
-
-A 300KB response takes between six and seventeen seconds directly, and between
-0.3 and 0.7 of a second through the transport. The spread collapses with the
-median: direct varies by 2.7x across three runs, the tunnel by 2.3x on a much
-smaller base.
-
-The client's own counters say why. `queqiao_erasure_ratio_receive` measured
-0.035-0.25 on the receive direction, `queqiao_coded_symbols_recovered_total`
-reached 53, and `queqiao_erasure_residual_ratio_receive` stayed **0**. The code
-was sized for the erasure the path was doing and repaired all of it, so no gap
-ever cost a round trip. That is the mechanism the whole design exists for,
-working on a live path, and it is worth noting that it is the fix landed in #52
-that makes it work -- an earlier build sized the code from the controller's
-deliberately low floor and would have carried almost no parity here.
-
-### Upload, the direction that erases nothing
-
-| size | mode | direct | through Queqiao | gain |
-|---|---|---|---|---|
-| 100KB | cold | 977-1092ms | **200-208ms** | 5.0x |
-| 300KB | cold | 1157-1204ms | **216ms** | 5.4x |
-| 1MB | cold | 2240-2381ms | **227-232ms** | **10.3x** |
-| 300KB | warm | 193ms | 213ms | 0.91x |
-| 1MB | warm | 224ms | 431-452ms | **0.50x** |
-
-Cold flows gain five to ten times, and the reason is not erasure -- this
-direction has none. It is that the client holds a pre-warmed pooled connection,
-so an application flow costs half a millisecond locally plus one round trip,
-paying neither handshake nor ramp. A direct 1MB cold flow spends 2.2 seconds
-climbing to a rate it then stops needing.
-
-Warm flows are where the transport costs something. At 300KB it is about 20ms.
-At 1MB the first reading showed a factor of two, and that reading did not
-survive being checked -- see the next section, which is the more important
-result.
-
-### What the baseline actually says
-
-The datacenter plan predicted that today's transport would make this workload
-worse. It does not:
-
-- **Cold flows gain 5-10x** in both directions, from connection reuse alone.
-- **The erasure direction gains 17x** at 300KB, from coding.
-- **Warm flows cost 20ms at 300KB**, and are otherwise unchanged.
-
-## The comparison, measured the way the previous section requires
-
-Re-run with order alternation and pooling, which is now what `pathmeasure -mode
-ab` does by construction. Each round pair runs A first and then B first, and the
-report prints the order effect beside the arm effect so a comparison that has
-not resolved its change says so.
-
-**Download, 300KB, cold, 12 samples per arm:**
-
-| arm | median | p25 | p75 | min | max |
-|---|---|---|---|---|---|
-| direct | **5449.7ms** | 2654.1 | 9052.9 | 1340.9 | 17116.5 |
-| through Queqiao | **405.1ms** | 216.8 | 591.1 | 192.3 | 819.7 |
-
-Arm effect 5044.6ms against an order effect of 548.4ms: the change is worth
-nine times the confound, so this comparison resolves. **13.5x on the direction
-that erases 14%**, and the tail improves more than the median -- the worst
-direct sample is 17.1 seconds and the worst tunnelled one is 0.82.
-
-**Upload, 300KB, warm, 30 samples per arm:**
-
-| arm | median | p25 | p75 | min | max |
-|---|---|---|---|---|---|
-| direct | **209.8ms** | 198.7 | 215.1 | 192.2 | 765.3 |
-| through Queqiao | **276.1ms** | 272.1 | 431.8 | 261.3 | 677.3 |
-
-Arm effect 66.3ms against an order effect of 3.9ms. On a clean path with a warm
-connection the tunnel costs **66ms**, about a third of a round trip. That is
-the honest price of the framing, the extra local hop and the gateway's
-processing, and it is the number to quote against the gains above rather than
-the gains alone.
-
-## How much of the win is this project, and how much is not TCP
-
-`internal/baseline` exists to answer exactly this: a TUIC-shaped proxy on the
-same QUIC fork, the same congestion controllers, and the same process, so a gap
-between it and Queqiao is the design rather than the library. Run as a third
-arm, order-alternated:
-
-**Download, the direction that erases 14%, order-alternated:**
+`internal/baseline` is TUIC's data-path shape on the same QUIC fork in the same
+process, so a gap is the design rather than the library. Order-alternated,
+download direction:
 
 | payload | direct TCP | TUIC-shaped QUIC | Queqiao | QUIC's share | coding adds |
 |---|---|---|---|---|---|
 | 100KB | 1918.4ms | 401.0ms | **218.5ms** | 4.8x | 1.84x |
 | 300KB | 5449.7ms | 791.7ms | **399.1ms** | 6.9x | 2.0x |
 
-Arm effects of 392.7ms and 182.5ms against order effects of 13.7ms and 84.4ms,
-so both comparisons resolve.
+**Moving off TCP is worth most of it.** The honest claim is that Queqiao is
+twice a well-configured QUIC tunnel here, not fourteen times TCP — a benchmark
+table without the QUIC arm overstates this project's contribution sevenfold.
 
-The medians are not the most interesting column. The spread is:
+The spread matters more than the median: sixteen consecutive 100KB downloads
+through Queqiao spanned **16ms** (204-220), on a channel erasing a seventh of
+everything. The same sixteen over TCP spanned four seconds.
 
-| payload | direct TCP | TUIC-shaped QUIC | Queqiao |
-|---|---|---|---|
-| 100KB | 806-4722ms | 214-801ms | **204-220ms** |
-| 300KB | 1341-17117ms | -- | **192-820ms** |
+On the clean upload direction with a warm connection the tunnel **costs**
+50-75ms — the price of a userspace proxy and an extra local hop — and Queqiao
+is the cheaper of the two tunnels by 21.8ms.
 
-Sixteen consecutive 100KB downloads through Queqiao spanned sixteen
-milliseconds, on a channel erasing a seventh of everything, at 200ms round
-trip. That is one round trip, every time: the code repaired every gap in the
-round trip that carried it, so no loss ever cost a retransmission. The same
-sixteen downloads over TCP spanned four seconds.
+## Concurrency: the two workload shapes disagree
 
-Small flows gain the least in the median and the most in the tail, which is the
-opposite of the usual expectation and follows from a mechanism worth naming. A
-100KB payload is about seventy packets, too few to reliably produce the three
-duplicate acknowledgements fast retransmit needs, so a loss falls through to a
-retransmission timeout. The smallest flows are the ones least able to recover
-cheaply, and they are also the ones an inference call is made of.
-
-The decomposition is the useful part, and it is not the flattering one.
-**Moving off TCP is worth 6.9x of the 13.7x.** Most of the opportunity on this
-path is available to anything that stops treating rate-independent erasure as
-congestion, and QUIC with a modern controller does that without any of this
-project. What erasure-aware coding adds on top of good QUIC is a further **2.0x**
--- real, worth having, and the smaller half.
-
-Stated the other way round, which is how it should be stated: Queqiao's claim
-on this path is that it is twice as fast as a well-configured QUIC tunnel, not
-that it is fourteen times faster than TCP. The second number is true and mostly
-belongs to QUIC.
-
-**Upload, 300KB warm, the direction that erases nothing:**
-
-| transport | median |
-|---|---|
-| direct TCP | 209.8ms |
-| Queqiao | **262.2ms** |
-| TUIC-shaped QUIC | 284.0ms |
-
-Arm effect 21.8ms against an order effect of 0.1ms. Both tunnels cost 50-75ms
-over direct TCP on a clean path with a warm connection -- that is the price of a
-userspace proxy and an extra local hop, not of anything either design does --
-and Queqiao is the cheaper of the two by 21.8ms.
-
-## An A/B that measured the experiment instead of the change
-
-The one apparent regression -- repeated 1MB requests taking 431-452ms against
-224ms direct -- was attributed to flow classification, because the counters
-showed a flow demoted to bulk and the classifier's 128KB threshold makes that
-inevitable for a megabyte request. A profile was built to prevent the demotion.
-
-It prevents it. `queqiao_class_transitions_2_total` reads 1 to 4 on the
-access-link profile and 0 on the datacenter profile, every run. The mechanism
-does exactly what it was written to do.
-
-It makes no difference to latency at all.
-
-Three interleaved rounds of eight warm 300KB flows per profile, then three more
-with the order reversed, 48 samples per profile:
-
-| | median | p25 | p75 |
-|---|---|---|---|
-| access-link profile, bulk allowed | 454.1ms | 295.6 | 508.6 |
-| datacenter profile, bulk prevented | 456.5ms | 295.9 | 662.7 |
-
-Two and a half milliseconds apart on a base of 455. Sorting the same 96 samples
-by position in the measurement sequence instead of by profile:
-
-| | median | p25 | p75 |
-|---|---|---|---|
-| whichever profile was measured **first** | 304.6ms | 292.3 | 535.4 |
-| whichever profile was measured **second** | 463.1ms | 297.4 | 627.3 |
-
-**Run order is worth 158ms and the change under test is worth 2.4ms.** The
-first three rounds measured the access-link profile first and appeared to show
-it winning by 53%; reversing the order reversed the finding. What was being
-measured was position in the sequence.
-
-Two conclusions, and the second is the one worth keeping.
-
-The classifier change is **principled but unproven**. A request that goes quiet
-between bursts is not a transfer seeking throughput, and calling it one is
-wrong regardless of what it costs -- but on this path it costs nothing
-measurable, and the plan's justification for the change, that it removes a
-regression, is not supported. It remains behind an experimental profile that no
-existing deployment selects, which is the right place for a change whose
-benefit has not been demonstrated.
-
-And **this path cannot support an A/B of anything smaller than about 30%
-without alternating order and pooling.** Identical warm 300KB flows ranged from
-250ms to 2906ms. Any comparison here that runs A then B, once, is measuring the
-sequence. The two earlier claims in this document that did not survive checking
--- that UDP was policed harder than TCP, and that classification cost a factor
-of two -- were both produced by a confound rather than by wrong numbers, which
-is the failure mode worth designing the instruments against.
-
-## The hierarchical path model, and what this path could not tell us about it
-
-The path is modelled as a chain of segments -- the uplink, then the peer --
-rather than as a single endpoint pair, with a flow permitted only what the
-tighter segment allows, and a node below a hundred observed samples permitted
-to constrain nothing.
-
-Enabled on the datacenter profile and measured against the flat model,
-order-alternated, 30 samples each, 300KB download:
-
-| model | median | p25 | p75 |
-|---|---|---|---|
-| flat, one model per endpoint pair | 607.8ms | 559.3 | 802.3 |
-| hierarchical | 585.5ms | 461.8 | 816.6 |
-
-Arm effect 22.3ms against an order effect of 11.5ms. The arm wins by a factor
-of 1.9, which is thin: **this is a no-regression result and not an
-improvement**, and 22ms on a 600ms base with this path's variance is not a
-number to build on.
-
-The more useful statement is what the measurement could not cover. This
-deployment has **one** provider, so the chain is the uplink node and the peer
-node carrying identical traffic -- the tree is degenerate here by construction,
-and what was actually measured is the confidence rule, not the hierarchy. The
-hierarchy earns its keep where flows go to different places over one uplink,
-which is what a multi-provider client or a node relay serving several regional
-gateways does, and neither exists on this path.
-
-So the gate the plan set -- no regression before any claim -- is met, and the
-claim it was gating remains unmade. The mechanism is in place, tested against
-its degenerate cases, and off by default.
-
-## The tail under concurrent requests
-
-The datacenter workload is not one flow. It is many concurrent requests, every
-one of them latency-critical, and `docs/COMPARISON.md` records that the tail
-under load is this transport's weakest published number: SSH p99 at 940ms
-against TUIC's 662ms. On an access link that is a caveat, because the bulk
-transfer it competes with is also the thing being won. Here there is no bulk
-transfer, so the tail is not a caveat -- it is the result.
-
-Measured on the emulated path (`pathsim.DCLongHaul`, the figures above), 300KB
-requests started together, against the TUIC-shaped reference on the same QUIC
-fork in the same process:
+**Requests**, 300KB started together, against the reference (emulated path):
 
 | concurrency | queqiao | reference |
 |---|---|---|
-| 1 | 1/1, p50 2395ms, p99/p50 **1.00** | 1/1, p50 5054ms |
-| 4 | 4/4, p50 2302ms, p99/p50 **1.07** | 4/4, p50 **35637ms** |
-| 16 | 16/16, p50 3269ms, p99/p50 **1.06** | **0/16 completed** |
-| 48 | 48/48, p50 6445ms, p99/p50 **1.05** | **0/48 completed** |
+| 4 | 4/4, p99/p50 **1.07** | 4/4, p50 **35637ms** |
+| 16 | 16/16, p99/p50 **1.06** | **0/16 completed** |
+| 48 | 48/48, p99/p50 **1.05** | **0/48 completed** |
 
-Two things, and the second is the one that was not expected.
+Every flow completes and the tail stays within 7% of the median; 48x the load
+costs 2.7x the latency. The reference falls over at sixteen. On the live link
+the same shape holds, and the tunnel moves 2.5x the aggregate at 16 and 32
+flows (86.1 against 35.4 Mbit/s).
 
-**Every flow completes, and the tail stays within 7% of the median at every
-load.** Forty-eight times the offered load costs 2.7x the latency, which is
-sublinear, and the p99/p50 ratio moves from 1.00 to 1.05 rather than diverging.
-Whatever the scheduler is doing, it is not starving anyone.
+**Frames**, 80 bytes every 20ms, 24 sessions (emulated): p50 203.3ms against a
+200ms floor, p90 208.2ms — then **p99 766.6ms**, with 4.96% arriving more than
+a frame interval late. The reverse of the request result, and the cause is
+payload size: an 80-byte frame is one packet with no block to code over and no
+following traffic to reveal a loss, so it waits out a timeout.
 
-**The reference does not degrade, it falls over.** Four concurrent flows already
-cost it 35.6 seconds -- fifteen times its own single-flow figure -- and at
-sixteen it completes nothing inside a two-minute deadline. The mechanism is
-visible in the shape: one QUIC connection carrying one stream per request,
-where a lost packet stalls its stream until a retransmission crosses a 200ms
-round trip, and 14% of packets are lost. Queqiao repairs the gap inside the
-round trip that carried it, so no stream ever waits.
+## What fixes the frame tail
 
-The datacenter plan expected the interactive tail to be this profile's problem,
-on the grounds that the published loss was a tail number and the workload is
-nothing but tails. On this path it is the opposite: the tail is the strongest
-result in this document.
+Frames over **datagrams** rather than a stream, 400 per arm, emulated 14% path:
 
-Three limits on the claim. The absolute figures are bounded by the emulator and
-the host it runs on -- 48 requests of 300KB is 14.4MB, which the modelled
-333 Mbit/s would carry in about a third of a second, so 6.4s is not the path's
-doing and only the comparison transfers. The reference is a measurement control
-rather than a tuned product, and a real TUIC deployment would be configured by
-someone who wanted it to work. And this is one emulated path: the same
-comparison on the live link, where these numbers came from, is the check that
-has not been run.
-
-## The other traffic shape, where the tail is a real problem
-
-A voice session sends a 20ms frame of audio fifty times a second and a gateway
-carries hundreds at once. Nothing about that resembles the burst above: the
-payloads are tens of bytes rather than hundreds of kilobytes, the flow never
-ends, and what matters is not when it completes but whether any single frame
-arrives late.
-
-Twenty-four sessions, a hundred 80-byte frames each, on the same emulated path:
-
-| | p50 | p90 | p99 | p99.9 |
+| copies | delivered | p50 | p99 | never arrived |
 |---|---|---|---|---|
-| frame round trip | 203.3ms | 208.2ms | **766.6ms** | 909.4ms |
+| 1 | 329/400 | 204.4ms | 208.7ms | **71** |
+| 2 | 390/400 | 203.5ms | 207.0ms | **10** |
+| 3 | 400/400 | 203.0ms | 207.7ms | **0** |
 
-The path's own round trip is 200ms, so the median frame is 3.3ms above the
-floor and the p90 is 8.2ms above it. Ninety-five percent of frames are as good
-as the path allows. **Then 4.96% of them arrive more than a frame interval
-late, and the p99 sits 567ms above the floor.**
+Duplication removes seven eighths of the losses and **latency does not move**:
+p50 within 1.4ms across all arms. A windowed code cannot have that property.
+Cost is 8 KB/s per session against 4.
 
-This is the reverse of the burst result, and the reason is the payload size
-rather than the concurrency. A 300KB request is two hundred packets: enough
-that a coding block is worth building and enough that three duplicate
-acknowledgements arrive to trigger a fast retransmit. An 80-byte frame is one
-packet, sent 20ms after the last one. There is no block to code and no
-subsequent traffic to produce duplicate acknowledgements, so a lost frame waits
-for a retransmission timeout -- and on a 200ms path that is most of the 567ms.
+Underneath it: **over datagrams the tail is loss, not lateness.** Every
+delivered frame arrived within 209ms. The 567ms tail is what an ordered stream
+does when one frame is lost.
 
-So the two shapes of §2.3 give opposite answers on the same path with the same
-transport. Requests: p99 within 7% of the median at every concurrency tested.
-Frames: p99 at 3.8x the median, with a twentieth of them audibly late.
+## HTTP/2 flow control, and an ingress for receivers you cannot change
 
-The gap is not a scheduling failure and will not be fixed by a fairer queue.
-Everything that makes coding work for the burst -- a block to compute parity
-over, and traffic behind the loss to reveal it quickly -- is absent for a
-single small frame. Closing it means coding across frames from the same
-session, which spends parity on a stream that is mostly silence, or across
-sessions, which couples flows that have no other reason to be coupled. Both are
-real designs and neither is implemented. This is the open problem the
-datacenter profile has, and it is a narrower and more specific one than "the
-interactive tail", which is what the plan expected to find.
+Same 1MB upload, same server, differing only in the window advertised:
 
-## The live link, and why one number for it is the wrong shape of answer
+| receiver window | 300KB warm | 1MB warm |
+|---|---|---|
+| Go `http2.Server` default | 187.5ms | 193.2ms |
+| 8MB explicit | 191.3ms | 200.6ms |
+| **65535, the RFC default** | **912.7ms** | **3903.0ms** |
 
-Everything above was measured across one evening. Re-running the same
-comparisons a few hours later produced a different path.
+Twenty times, matching credit-per-round-trip arithmetic: 1MB over 64KB is
+sixteen round trips, 3.2s predicted against 3.9 measured. **But `x/net/http2`
+defaults both upload buffers to 1MB** and gRPC-go tunes from a measured BDP, so
+64KB is what RFC 7540 specifies rather than what a default Go service
+advertises. The claim that survives: when the window *is* 64KB it dominates by
+20x, and whether it is 64KB is a property of the implementation.
 
-Downstream loss, three measurements within about ten minutes of each other:
+An L7 ingress colocated with an **unmodified** 65535 server, reached across the
+200ms path: 300KB warm 998.0ms → **184.8ms**, 1MB warm 3394.9ms → **190.8ms**
+(**17.8x**). A window is credit per round trip, so shortening the trip it spans
+makes it irrelevant. 190.8ms is one round trip, which also proves the ingress
+streams rather than buffers.
+
+## One relay, or several
+
+24 concurrent 300KB requests, all through one client or split eight apiece
+across three independent clients, both orders:
+
+| order | one relay | three relays |
+|---|---|---|
+| shared first | 1696.9ms, **34.6 Mbit/s** | 750/1176/1302ms, **57.5 Mbit/s** |
+| split first | 1963.8ms, **29.8 Mbit/s** | 396/1187/1382ms, **78.7 Mbit/s** |
+| split first, repeat | 2540.6ms, **23.1 Mbit/s** | -- |
+
+Three relays beat one by ~2.5x in aggregate, in both orders. Three tunnels are
+three congestion controllers probing a 333 Mbit/s path in parallel; one is one,
+and there is no shared bottleneck here for coordination to buy anything at.
+
+This project retired multipath on the opposite evidence — four lanes delivering
+8 Mbit/s where one delivered 11 — and **both results are correct about
+different paths.** Where the bottleneck is the client's own access link,
+splitting cannot multiply a share that does not exist.
+
+What sharing buys is **fairness**: all 24 flows within 2ms of each other
+(p99/p50 1.00) against a 3.5x spread between the split arm's groups.
+
+## The path is not stationary, and that shapes every number above
+
+Downstream loss, three readings within about ten minutes:
 
 | when | offered | loss |
 |---|---|---|
@@ -529,308 +217,34 @@ Downstream loss, three measurements within about ten minutes of each other:
 | t+0 | 20 Mbit/s | **2.4%** |
 | t+9min | 20 Mbit/s | **9.1%** |
 
-Earlier the same evening it read 9.8-17.5% across a decade of offered rates.
-**This path's erasure moves between roughly zero and seventeen percent on a
-timescale of minutes**, and every figure in this document is a snapshot of
-whatever it was doing at the time.
-
-That is not a caveat to append; it changes what a result means. The download
-comparison run when the path was erasing 14% gave 13.5x. The same comparison,
-same command, run when it was erasing somewhere between 2.4% and 9.1%:
-
-| arm | median | p25 | p75 | min | max |
-|---|---|---|---|---|---|
-| direct | 1820.1ms | 1123.8 | 2874.5 | 938.7 | 19275.1 |
-| through Queqiao | **281.2ms** | 273.6 | 365.5 | 268.7 | 623.3 |
-
-Arm effect 1538.9ms against an order effect of **0.7ms** -- the cleanest
-comparison in this document -- and a gain of **6.5x** rather than 13.5x.
-
-Both numbers are correct. The transport repairs erasure, so its advantage is a
-function of how much erasure there is, and on this path that is a variable
-rather than a constant. The honest statement is the relationship: **6.5x at
-single-digit loss, 13.5x in the teens, and by extension very little at zero**,
-which is what the clean upload direction already showed, where the tunnel costs
-50-75ms and buys nothing.
-
-Two consequences for how this path is used as evidence.
-
-**Every comparison needs a contemporaneous loss measurement**, taken in the same
-minutes and reported beside it. A result quoted without one cannot be placed on
-the curve above, and two results quoted without one cannot be compared to each
-other at all.
-
-**The order alternation is not optional here.** It was already justified by a
-158ms position effect; on a path that changes this much between runs, an
-unalternated A/B is measuring the weather.
-
-## The concurrent workloads on the live link
-
-Both shapes of §2.3, run on the live path rather than the emulator.
-
-**Requests, upload direction, started together:**
-
-| flows | direct p50/p99 | queqiao p50/p99 | direct aggregate | queqiao aggregate |
-|---|---|---|---|---|
-| 4 | 937/937ms | 991/992ms | 8.7 Mbit/s | 8.4 Mbit/s |
-| 16 | 938/997ms | 837/840ms | 18.4 Mbit/s | **46.4 Mbit/s** |
-| 32 | 927/1017ms | 723/904ms | 35.4 Mbit/s | **86.1 Mbit/s** |
-
-Both complete every flow at every level and both keep a tight tail, which
-confirms the emulated result on the real path. The aggregate is the new part:
-at sixteen and thirty-two concurrent flows the tunnel moves two and a half
-times the traffic and finishes the batch in 0.8-0.9s against 2.1-2.2s. This is
-the clean direction, so it is connection reuse and aggregation rather than
-coding.
-
-**Frames, 80 bytes every 20ms, bidirectional:**
-
-| sessions | arm | p50 | p90 | p99 | >250ms | >400ms |
-|---|---|---|---|---|---|---|
-| 16 | direct | 195.3ms | 207.1ms | 606.6ms | 3.25% | 3.25% |
-| 16 | queqiao | 185.6ms | 192.0ms | **658.8ms** | 2.88% | 2.31% |
-
-Slightly better median and p90, slightly worse p99, and no meaningful
-difference in how many frames arrive late. This ran while the path was in its
-clean phase, which is the reason: there was almost nothing to repair. It is
-consistent with the emulated finding rather than contradicting it -- the
-emulator held loss at 14%, where the frame tail was a real problem, and the
-live path during this run was not doing that.
-
-The first version of this table reported direct losing 30% of frames to
-lateness against Queqiao's 2%, which was an artefact. Lateness was being counted
-against each arm's own floor, so the arm with the 10ms lower median had 10ms
-more room beneath its own bar and reported fewer late frames for that reason
-alone. Counting against fixed thresholds -- 250ms, 400ms, a second -- removes
-it, and removes the finding with it. A listener does not have a relative bar.
-
-## What HTTP/2's flow-control window actually costs, and who actually pays it
-
-The datacenter plan claims that HTTP/2 flow control is usually the largest
-single component of a slow upload and the one no TCP tuning reaches. The
-mechanism is real, the magnitude is larger than claimed, and the word "usually"
-was wrong.
-
-The same 1MB upload to the same server on this 200ms path, differing only in
-the window it advertises:
-
-| receiver window | 300KB warm | 1MB warm |
-|---|---|---|
-| Go's `http2.Server` default | 187.5ms | 193.2ms |
-| 8MB, set explicitly | 191.3ms | 200.6ms |
-| **65535, the RFC's default** | **912.7ms** | **3903.0ms** |
-
-At the RFC value a megabyte takes **twenty times** as long, and the arithmetic
-is exactly the one the plan predicted: the window is credit per round trip, so
-1MB over 64KB is sixteen round trips, and sixteen times 200ms is 3.2 seconds
-against 3.9 measured. 300KB is 4.7 round trips, 940ms predicted against 912.7
-measured. The mechanism is confirmed to within the path's own noise.
-
-**But Go's server does not use 65535.** `x/net/http2` defaults both
-`MaxUploadBufferPerStream` and `MaxUploadBufferPerConnection` to 1MB, and gRPC-go
-goes further and tunes the window from a measured bandwidth-delay product. The
-64KB figure is what RFC 7540 specifies, not what a Go service running on a
-default configuration advertises -- and the first two rows above are
-indistinguishable because both were already far above the ceiling.
-
-So the claim that survives is narrower and more useful than the one that went
-in: **when the receiver's window is 64KB this dominates everything else by a
-factor of twenty, and whether it is 64KB is a property of the implementation
-rather than of HTTP/2.** Measure it before assuming it. The check is cheap and
-the two answers are five hundred milliseconds apart on a payload an inference
-call actually sends.
-
-The related trap is unchanged and worth keeping: RFC 7540 6.9.2 makes
-`SETTINGS_INITIAL_WINDOW_SIZE` govern stream windows only, so a stack that sets
-it and forgets the connection window is capped across every stream at once.
-Both are set together above for that reason.
-
-## An attempt to measure whether aggregation replaces probing, and why it failed
-
-The datacenter plan argues that a node-level relay removes the need for a
-synthetic bandwidth probe: an aggregate fed by every flow on the node is
-continuously busy, so the sustained rate falls out of production traffic. That
-is the strongest argument for the node-level deployment shape, so it is worth
-testing.
-
-The obvious test is to watch the controller's own view as concurrency rises.
-Running 1, 4, 16 and 32 concurrent 300KB requests through the tunnel and
-reading the client's counters afterwards:
-
-| flows | aggregate delivered | app-limited samples | non-app-limited | max bandwidth |
-|---|---|---|---|---|
-| 1 | 11.7 Mbit/s | 21,860 | 79 | 0 |
-| 4 | 23.8 Mbit/s | 23,256 | 79 | 0 |
-| 16 | 87.1 Mbit/s | 27,531 | 79 | 0 |
-| 32 | 163.8 Mbit/s | 36,040 | 79 | 0 |
-
-The non-app-limited count never moves, and a sustained single 30MB transfer at
-285.8 Mbit/s -- which cannot be application-limited under any definition --
-produced 57,743 app-limited samples against the same frozen 79, with the
-bandwidth estimate still reading zero.
-
-**That looks like a serious bug and is not one.** The controller documents both
-halves of it. Marking app-limited on any unused congestion window is deliberate
-and liberal, because a paced sender is almost always under its window; the rule
-has been tightened twice and reverted twice, since requiring a burst of unused
-window measures better on the emulator and costs more than half the throughput
-on this very path. A near-100% app-limited count is expected rather than a
-symptom. And the metrics endpoint reports one lane, which with connection
-pooling is the control connection -- genuinely idle -- so its bandwidth estimate
-says nothing about the lane carrying data.
-
-So this measurement cannot answer the question it was built for, and the
-conclusion is that **§11.5 is untested rather than refuted**. Answering it needs
-per-lane evidence from the lane trace rather than the aggregate metrics
+Earlier the same evening it read 9.8-17.5%. The same download comparison gave
+**13.5x** when the path erased 14% and **6.5x** when it erased single digits.
+Both are correct: the transport repairs erasure, so its advantage is a function
+of how much there is. The honest statement is the relationship, not either
 endpoint.
 
-What the same runs do support, at the level of outcomes rather than estimates,
-is the shape of the claim. Aggregate delivered rate through the tunnel rose
-from 11.7 Mbit/s at one flow to 163.8 at thirty-two, and the completion tail
-stayed tight throughout (p99/p50 between 1.00 and 1.09). Whatever the estimator
-believes, more concurrent flows are getting more out of the path rather than
-contending for a fixed share of it -- which is the behaviour the node-relay
-argument predicts, arrived at from the other end.
+Two consequences. **Every comparison needs a contemporaneous loss measurement**
+reported beside it. And **order alternation is not optional**: position in the
+measurement sequence was worth 158ms on this path while one policy under test
+was worth 2.4ms, and running the baseline first produced a 53% win that
+reversed when the order reversed. `pathmeasure -mode ab` alternates and pools
+by construction, and says so when the order effect dominates.
 
-This is the second time in this document that a counter reading exactly zero
-turned out to describe something other than what was being asked about, and the
-first was fixed in #55 with the observation that a counter which cannot be
-produced reads as a confident measurement once it stops wobbling. The general
-lesson is the same: check what a metric is scoped to before believing what it
-says.
+## Two measurements that could not answer their question
 
-## What to do about the frame tail, settled by measuring it
+**Whether aggregation replaces probing.** Watching the controller's counters
+across 1/4/16/32 concurrent flows showed the non-app-limited count frozen at 79
+and the bandwidth estimate at zero, even during a sustained 30MB transfer at
+285.8 Mbit/s. That looks like a bug and is not: `bbr_tuic.go` documents that
+marking app-limited on any unused congestion window is deliberate (tightened
+twice, reverted twice), and that the metrics endpoint reports the pooled
+control connection, which is genuinely idle. Answering this needs per-lane
+trace evidence. At the level of outcomes the claim's shape holds: aggregate
+rose 11.7 → 163.8 Mbit/s from one flow to thirty-two with the tail staying
+tight.
 
-The frame workload's tail was left as the datacenter profile's open problem,
-with three candidate designs and no way to choose between them from argument.
-Coding across a session's own frames needs a window, which means holding frames
-back and paying delay on every frame to repair the few that are lost. Coding
-across sessions couples flows that have no other reason to be coupled. Sending
-each frame more than once needs no window, no delay and no coupling, and for an
-eighty-byte payload the bandwidth is nearly free.
-
-Measured on the emulated path, frames over datagrams rather than a stream,
-400 frames at 50Hz per arm:
-
-| copies | delivered | p50 | p90 | p99 | never arrived |
-|---|---|---|---|---|---|
-| 1 | 329/400 | 204.4ms | 206.4ms | 208.7ms | **71 (17.8%)** |
-| 2 | 390/400 | 203.5ms | 205.4ms | 207.0ms | **10 (2.5%)** |
-| 3 | 400/400 | 203.0ms | 204.6ms | 207.7ms | **0** |
-
-Duplication removes seven eighths of the losses and a third copy removes the
-rest, and **the latency of delivered frames does not move**: p50 within 1.4ms
-and p99 within 1.7ms across all three arms. That is the property a windowed
-code cannot have, since holding frames back to compute parity shows up as
-median delay on every frame including the ones that were never at risk.
-
-The cost is two eighty-byte datagrams every 20ms instead of one: 8 KB/s per
-session against 4. A thousand concurrent sessions is 8 MB/s rather than 4 --
-which on a leg whose knee is 333 Mbit/s is not a consideration.
-
-There is a second finding underneath the first, and it may be the more
-important one. **Over datagrams the tail is not lateness, it is loss.** Every
-delivered frame in every arm arrived within 209ms, and none was more than one
-interval late; what the single-copy arm suffered was frames that never came at
-all. The 567ms tail measured earlier is what happens when frames are carried on
-an ordered stream, where a lost one delays everything behind it. Carrying them
-on datagrams converts that delay into a drop, which for audio is the outcome a
-jitter buffer is built for and the outcome a listener prefers.
-
-So the design is: **carry frame traffic on datagrams, duplicated, rather than
-on streams**. This transport already has the datagram path -- QUIC datagrams
-and UDP ASSOCIATE -- so the work is routing the traffic onto it and making the
-copy count a policy rather than adding a coding scheme. The two options that
-were harder to choose between are both rejected on evidence rather than taste.
-
-## An L7 ingress against a receiver you cannot change
-
-Raising the receiver's window fixes the problem above and requires owning the
-receiver. The case that remains is a third-party endpoint whose
-`SETTINGS_INITIAL_WINDOW_SIZE` is whatever it is.
-
-A window is credit per round trip, so its cost is proportional to the round
-trip it spans: 64KB over 200ms is 328 KB/s, and the same 64KB over 1ms is
-64 MB/s. An ingress placed next to the endpoint leaves the small window exactly
-where it is and makes it irrelevant.
-
-Measured against the same server advertising 65535, unmodified, with the
-ingress colocated with it and reached across the 200ms path:
-
-| payload | direct to the 64KB receiver | through the colocated ingress |
-|---|---|---|
-| 300KB warm | 998.0ms | **184.8ms** |
-| 1MB warm | 3394.9ms | **190.8ms** |
-
-**17.8x at a megabyte, with nothing changed on the far side.** And 190.8ms on a
-200ms path is one round trip, which is both the floor and a proof that the
-ingress streams rather than buffers: copying the body into memory before
-forwarding would have added the whole upload time to the total, and a megabyte
-at 2.47 Mbit/s is three seconds of it.
-
-Three properties make the translation worth its hop, and all three are
-structural rather than tuned. The body is streamed, so no transfer time is
-added. Backpressure propagates, because the copy between the two bodies reads
-only as fast as the write side accepts -- a proxy that read ahead would grow an
-unbounded queue and convert its own tail into a queueing problem. And
-cancellation propagates through the request context, so a caller that
-disappears stops the work behind it, which on an inference endpoint is a cost
-question before it is a latency one.
-
-The cost is that terminating HTTP/2 means inheriting its attack surface: HPACK
-decompression bombs, CONTINUATION floods, stream-reset storms. This uses a
-hardened implementation rather than parsing frames itself, and it is a
-measurement instrument rather than something to put in front of untrusted
-traffic. That is the reason to keep the L7 path narrowly scoped to the case
-that needs it, rather than making it the general shape.
-
-## One relay per node, or one per group? The path disagrees with the plan
-
-The datacenter plan argues for a node-level relay on the grounds that a sidecar
-per pod fragments the path model: each sidecar measures the shared segment
-alone, keeps its own connection pool, and probes on its own traffic, which is
-the failure `pathmodel` exists to prevent, reproduced one layer up.
-
-Twenty-four concurrent 300KB requests, either all through one client or split
-eight apiece across three independent clients with their own tunnels and their
-own path models, run in both orders:
-
-| order | one relay, 24 flows | three relays, 8 flows each |
-|---|---|---|
-| shared first | 1696.9ms, **34.6 Mbit/s** | 750/1176/1302ms, **57.5 Mbit/s** |
-| split first | 1963.8ms, **29.8 Mbit/s** | 396/1187/1382ms, **78.7 Mbit/s** |
-| split first, repeated | 2540.6ms, **23.1 Mbit/s** | -- |
-
-The shared arm was run twice in the second position and both readings are
-given; its three figures are 34.6, 29.8 and 23.1 Mbit/s against the split arm's
-57.5 and 78.7. **Three relays beat one by roughly two and a half times in
-aggregate, in both orders.** The batch also finishes sooner: 1.4 seconds against 2.6, because the
-three groups run concurrently and the slowest of them still beats the shared
-relay's single figure.
-
-The mechanism is not subtle. Three tunnels are three QUIC connections with
-three independent congestion controllers, each with its own window, probing a
-333 Mbit/s path in parallel. One tunnel is one controller, and on a path with
-no shared bottleneck to contend for there is nothing for the coordination to
-buy.
-
-That last clause is the important one, because this project already settled
-this question the other way. The multipath design was measured and retired on
-the grounds that "the motivating bottleneck is shared by endpoint pair rather
-than independent 4-tuples" -- on the China access link, four lanes delivered
-about 8 Mbit/s where one delivered 11. **Both results are correct and they are
-about different paths.** Where the bottleneck is the client's own access link,
-splitting cannot multiply a share that does not exist and the coordination is
-what keeps the aggregate from overshooting the knee. Where the bottleneck is
-far away and the path is wide, splitting is simply parallelism and it works.
-
-So the plan's Phase 5 argument does not hold here as written, and the honest
-version of it is narrower. What the shared relay does buy, visibly, is
-**fairness**: every one of its 24 flows completed within 2ms of every other,
-p99/p50 of 1.00, while the split arm's three groups differed by up to 3.5x
-between them. A deployment that cares about the spread across tenants has a
-reason to share; one that cares about aggregate does not.
-
-Neither answer is the one the plan assumed, and the disagreement is the useful
-part: the node-relay argument was inherited from a regime where the bottleneck
-is at the sender, and this regime does not have one.
+**Whether frames are late more often direct than tunnelled.** The first live
+frame comparison showed 30% against 2%. It counted lateness against each arm's
+own floor, so the arm with the 10ms lower median had 10ms more room under its
+own bar. Against fixed thresholds the difference disappears. A listener does
+not have a relative bar.

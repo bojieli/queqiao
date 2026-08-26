@@ -19,6 +19,13 @@ The archived [multipath](archive/2026-08-development/DESIGN-MULTIPATH.md) and
 the current design was reached. When they disagree with this document, this
 document is current.
 
+A second deployment is under measurement: a long leg between two hosts one
+operator runs, carrying inference requests. Its precondition, the mechanisms
+that differ, and what measurement changed about them are in the
+[datacenter profile design](DESIGN-DC-PROFILE.md). It is experimental and
+selected explicitly with `--path-profile`; nothing here changes for a
+deployment that does not ask for it.
+
 ## The topology changes the control problem
 
 A general Internet congestion controller cannot assume two connections share a
