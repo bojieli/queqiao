@@ -16,6 +16,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -613,4 +614,180 @@ func TestASessionKeepsItsRepairPastTheByteCutoff(t *testing.T) {
 		}
 	}
 	t.Logf("p99 before the cutoff %v, after %v", before.quantile(0.99), after.quantile(0.99))
+}
+
+// tokenStreamBytes is what one generated token weighs on the wire once it is
+// wrapped in the event framing a model server uses.
+const (
+	tokenStreamBytes    = 48
+	tokenStreamInterval = 30 * time.Millisecond
+	tokensPerStream     = 200
+)
+
+// serveTokensAndSink answers two kinds of connection on one listener. A client
+// that writes a byte gets a token stream; a client that writes nothing gets its
+// bytes swallowed as fast as they arrive.
+//
+// One listener rather than two because the point is contention: both flows have
+// to cross the same emulated path, through the same transport, at the same
+// time.
+func serveTokensAndSink(ln net.Listener) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			kind := make([]byte, 1)
+			if _, err := io.ReadFull(c, kind); err != nil {
+				return
+			}
+			if kind[0] != 's' {
+				_, _ = io.Copy(io.Discard, c)
+				return
+			}
+			token := make([]byte, tokenStreamBytes)
+			ticker := time.NewTicker(tokenStreamInterval)
+			defer ticker.Stop()
+			for range tokensPerStream {
+				<-ticker.C
+				if _, err := c.Write(token); err != nil {
+					return
+				}
+			}
+		}(c)
+	}
+}
+
+// readTokenLateness consumes a stream and reports how far behind the
+// generator's own cadence each token arrived, measured from the first one so
+// that the path's fixed delay cancels.
+func readTokenLateness(t *testing.T, socks string, destination net.Listener) []time.Duration {
+	t.Helper()
+	conn, err := trySocksDial(socks, destination, 120*time.Second)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte{'s'}); err != nil {
+		return nil
+	}
+	buf := make([]byte, tokenStreamBytes)
+	var first time.Time
+	var out []time.Duration
+	for i := range tokensPerStream {
+		_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			break
+		}
+		now := time.Now()
+		if i == 0 {
+			first = now
+			continue
+		}
+		out = append(out, now.Sub(first)-time.Duration(i)*tokenStreamInterval)
+	}
+	return out
+}
+
+// A checkpoint pull beside a model answering.
+//
+// This question could not be measured on the live path. The stream got worse
+// throughout the experiment whether or not a transfer was running, so the run
+// with the transfer was not evidence that the transfer cost anything: the arm
+// measured last was the worst one, and it was the arm with no transfer in it.
+// A drift that runs one way for the length of the experiment is not something
+// order alternation can remove.
+//
+// Here the channel holds still, so the difference between the arms is the
+// transfer.
+func TestATransferBesideATokenStream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("brings up a transport across an emulated path")
+	}
+	// The measured path's knee is 333 Mbit/s, which a userspace transport on
+	// loopback cannot fill, so at that rate the transfer and the stream would
+	// never actually compete and this test would pass without asking anything.
+	// Narrowing the bottleneck is what makes the question real.
+	path := pathsim.DCLongHaul()
+	path.RateBytesPerSec = 20 * 1000 * 1000 / 8
+	socks, destination := codedPairWith(t, true, &path, serveTokensAndSink)
+
+	alone := readTokenLateness(t, socks, destination)
+	if len(alone) < tokensPerStream/2 {
+		t.Skipf("only %d tokens arrived without a transfer; the harness is not "+
+			"healthy enough to measure contention", len(alone))
+	}
+
+	stop := make(chan struct{})
+	var moved atomic.Uint64
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		conn, err := trySocksDial(socks, destination, 120*time.Second)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := conn.Write([]byte{'b'}); err != nil {
+			return
+		}
+		block := make([]byte, 64<<10)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			n, err := conn.Write(block)
+			moved.Add(uint64(n))
+			if err != nil {
+				return
+			}
+		}
+	}()
+	// Long enough that the transfer is established and moving before the
+	// stream starts, rather than ramping through the measurement.
+	time.Sleep(2 * time.Second)
+	before := moved.Load()
+	start := time.Now()
+	beside := readTokenLateness(t, socks, destination)
+	elapsed := time.Since(start)
+	close(stop)
+	wg.Wait()
+
+	// A transfer that was not using the path did not contend for it, and a
+	// stream that stayed fast beside it has not been shown anything.
+	offered := float64(moved.Load()-before) * 8 / elapsed.Seconds() / 1e6
+	t.Logf("transfer offered %.1f Mbit/s against a %.0f Mbit/s bottleneck",
+		offered, float64(path.RateBytesPerSec)*8/1e6)
+	if offered < float64(path.RateBytesPerSec)*8/1e6/4 {
+		t.Skipf("the transfer only reached %.1f Mbit/s, so it never competed for the "+
+			"bottleneck and this run says nothing about contention", offered)
+	}
+
+	if len(beside) < tokensPerStream/2 {
+		t.Fatalf("only %d of %d tokens arrived while a transfer ran; the transfer is "+
+			"not sharing the path, it is taking it", len(beside), tokensPerStream)
+	}
+
+	sort.Slice(alone, func(i, j int) bool { return alone[i] < alone[j] })
+	sort.Slice(beside, func(i, j int) bool { return beside[i] < beside[j] })
+	q := func(v []time.Duration, p float64) time.Duration {
+		return v[int(p*float64(len(v)-1))]
+	}
+	t.Logf("alone:  p50=%v p90=%v p99=%v (n=%d)", q(alone, 0.5), q(alone, 0.9), q(alone, 0.99), len(alone))
+	t.Logf("beside: p50=%v p90=%v p99=%v (n=%d)", q(beside, 0.5), q(beside, 0.9), q(beside, 0.99), len(beside))
+
+	// The bar is the tail, because a reader notices a stall and does not notice
+	// a millisecond. Held loosely: what must not happen is a transfer turning a
+	// stream into something that stutters, and a factor of four on the p99 of a
+	// 30ms cadence is that.
+	if got, want := q(beside, 0.99), 4*q(alone, 0.99)+time.Second; got > want {
+		t.Fatalf("a transfer beside the stream took its p99 lateness from %v to %v; "+
+			"the transfer is not being kept out of the stream's way",
+			q(alone, 0.99), got)
+	}
 }

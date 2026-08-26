@@ -679,3 +679,67 @@ same window after it, against direct TCP:
 queqiao now leads at every threshold, where before the change it lost the 500ms
 bar. That is consistent with the fix and is not proof of it. A second path,
 measured while this one is not moving, is what would settle it.
+
+
+## A transfer beside a stream, and a measurement that failed
+
+The fifth shape is a checkpoint pull happening while inference traffic runs, and
+the question is whether the transfer costs the reader anything.
+
+One part of it answered cleanly. A 90-second transfer that moved 1.35GB reached
+the bulk class on this profile: `queqiao_class_transitions_total{class="2"}`
+went from zero to one, and `queqiao_bulk_isolations_total` reached three. That
+is the idle-veto change working end to end. A transfer offered in one burst does
+not reach it, because 300MB went into the local buffer in 8.57s and this
+profile's minimum age is ten seconds, which is deliberate: the age floor is what
+stops a five-megabyte request being read as a transfer.
+
+The other part did not answer. Ordered alone, then with the transfer, then alone
+again:
+
+| | tokens over 200ms late | over 500ms |
+|---|---|---|
+| alone | 8.47%, 16.28% | 1.78%, 2.12% |
+| with a 1.35GB transfer underneath | 26.76%, 26.53% | 9.20%, 4.68% |
+| alone again | **53.40%, 40.25%** | **14.60%, 8.92%** |
+
+The last row is worse than the middle one. The stream got worse throughout,
+whether or not a transfer was running, so the middle row is not evidence that
+the transfer cost anything. An earlier attempt at the same comparison showed the
+same pattern in the same direction.
+
+We are recording it because the conclusion is about the instrument rather than
+the transport: **on this path the drift over a few minutes is larger than the
+effect being measured**, so this question cannot be answered here at all. Order
+alternation handles a trend that reverses; it does not handle one that runs one
+way for the length of the experiment.
+
+Two things follow. Any mixed-workload result on this path needs the arms
+interleaved at a much finer grain than one run each, or it needs a path that
+holds still. And the emulator, not this link, is where a contention question
+gets settled, for the same reason the benchmarking guide already gives: a
+result is reproducible where the channel is controlled.
+
+### The same question, where the channel holds still
+
+`TestATransferBesideATokenStream` puts both flows through the real transport
+across the emulated version of this path. The bottleneck is narrowed to 20
+Mbit/s, because the measured knee of 333 Mbit/s is more than a userspace
+transport on loopback can fill, and a transfer that never reaches the
+bottleneck never competes for it. The test reports what the transfer actually
+offered and skips itself if that was too little to matter.
+
+| | p50 lateness | p90 | p99 | tokens |
+|---|---|---|---|---|
+| stream alone | -3.5ms | -1.6ms | 2.2ms | 199/199 |
+| stream beside a transfer at 15.5 Mbit/s | -6.3ms | -1.3ms | 2.2ms | 199/199 |
+
+A transfer taking 78% of the bottleneck cost the stream nothing measurable.
+Every token arrived in both arms and the p99 moved by 54 microseconds on a
+30ms cadence.
+
+That is the answer the live path could not give, and it is worth being precise
+about what it covers: the emulator reproduces this path's delay, erasure, burst
+structure and knee, and it does not reproduce whatever was making the live link
+drift for ten minutes at a time. A contention result is a statement about the
+transport's scheduling, and the emulator is where that is a fair question.
