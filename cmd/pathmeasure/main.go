@@ -27,6 +27,7 @@
 //	load       many concurrent request flows, reporting the tail
 //	frames     many concurrent frame streams, reporting per-message latency
 //	ab         order-alternated A/B of two arms, pooled
+//	workload   order-alternated A/B of a real HTTP request against both arms
 //	rtt        round-trip distribution
 //
 // Every mode can be pointed through a SOCKS5 proxy, so a tunnel and the path
@@ -74,7 +75,7 @@ func main() {
 
 func run(args []string) error {
 	fs := flag.NewFlagSet("pathmeasure", flag.ContinueOnError)
-	mode := fs.String("mode", "", "serve, tcp, fct, burst, udp, or rtt")
+	mode := fs.String("mode", "", "serve, tcp, fct, burst, udp, workload, or rtt")
 	listen := fs.String("listen", ":12600", "serve: listen address")
 	remote := fs.String("remote", "", "client: server address")
 	seconds := fs.Float64("duration", 10, "client: seconds to run")
@@ -101,6 +102,16 @@ func run(args []string) error {
 	udpFrames := fs.Bool("udp-frames", false, "frames: carry messages over UDP rather than a stream, which is how voice actually travels and removes the head-of-line blocking a stream imposes on the frames behind a lost one")
 	reverse := fs.Bool("reverse", false, "measure the download direction: the client connects, the server sends. The only way to measure the receive direction of a host that cannot accept inbound connections, which on real deployments is most of them")
 	localAddr := fs.String("local-address", "", "bind the socket to this local IP, so a host TUN route does not carry the measurement through a tunnel to the very server being measured")
+	url := fs.String("url", "", "workload: the endpoint to request")
+	postFile := fs.String("post-file", "", "workload: file to send as the request body")
+	formField := fs.String("form-field", "", "workload: send --post-file as a multipart field of this name rather than as a raw body")
+	contentType := fs.String("content-type", "", "workload: Content-Type for a raw body; ignored when --form-field is set")
+	reuse := fs.Bool("reuse", false, "workload: hold connections open between rounds, which is the long-lived bursty session rather than a cold one")
+	spacing := fs.Float64("spacing", 0.8, "workload: seconds to wait between arms, so neither inherits the other's queue")
+	var formValues repeatedValue
+	fs.Var(&formValues, "form-value", "workload: an extra multipart field as key=value; repeatable")
+	var headers repeatedValue
+	fs.Var(&headers, "header", "workload: an extra request header as Name: value; repeatable")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -162,6 +173,17 @@ func run(args []string) error {
 			return errors.New("udp needs --remote")
 		}
 		return udpUpRun(*remote, *rate, time.Duration(*seconds*float64(time.Second)), *payload, *localAddr)
+	case "workload":
+		if *url == "" {
+			return fmt.Errorf("workload: --url is required")
+		}
+		w, err := buildBody(*postFile, *formField, *contentType, formValues)
+		if err != nil {
+			return fmt.Errorf("workload: %w", err)
+		}
+		w.headers = headers
+		return workloadMode(*url, *aSpec, *bSpec, *rounds, *reuse, *localAddr, w,
+			time.Duration(*spacing*float64(time.Second)))
 	case "rtt":
 		if *remote == "" {
 			return errors.New("rtt needs --remote")

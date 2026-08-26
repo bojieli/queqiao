@@ -110,16 +110,27 @@ itself, put both arms behind the same reverse proxy on the inference host so
 that hop cancels, and drive the real API:
 
 ```sh
-# ASR: multipart upload, tiny response. Upload-dominated.
-POST /v1/audio/transcriptions   # 150-400KB WAV in, ~150 bytes of transcript out
+# Upload-dominated, the shape of a speech recognition call: a few hundred
+# kilobytes of audio up, a sentence back.
+pathmeasure -mode workload -rounds 20 \
+  -url http://HOST:PORT/v1/audio/transcriptions \
+  -a direct -b socks5=127.0.0.1:12080 \
+  -post-file speech.wav -form-field file -form-value model=sensevoice
 
-# TTS: tiny request, one burst back. Download-dominated.
-POST /v1/audio/speech           # ~270 bytes in, ~100KB of MP3 out
+# Download-dominated, the shape of a synthesis call: a sentence up, a few
+# hundred kilobytes of audio back.
+pathmeasure -mode workload -rounds 20 \
+  -url http://HOST:PORT/v1/audio/speech \
+  -a direct -b socks5=127.0.0.1:12080 \
+  -post-file request.json -content-type application/json
+
+# The long-lived bursty session, rather than a cold one. Worth running as its
+# own arm: it is what the client-side fix actually changes.
+pathmeasure -mode workload -reuse ...
 ```
 
-Break each request down with `httptrace`: `GotConn`, `WroteRequest`,
-`GotFirstResponseByte`, and last byte. Then alternate the arms every round and
-compare each round against itself.
+The mode alternates arms every round, pairs each round against itself, and
+splits each request into connect, request-to-first-byte, and download.
 
 Two things to get right, both of which will otherwise produce a wrong number:
 
@@ -127,14 +138,17 @@ Two things to get right, both of which will otherwise produce a wrong number:
 writes into a loopback socket that accepts the whole body into a buffer
 immediately, so `WroteRequest` fires in under a millisecond while the bytes have
 gone nowhere. We measured 0.4ms of "upload" for a 355KB file. The real send time
-reappears as server time. Compare `WroteRequest`-to-first-byte as one figure and
-never quote the two separately across arms.
+reappears as server time. That is why the mode reports connect,
+request-to-first-byte, and download rather than a separate upload figure: there
+is no honest one to report.
 
-**Check that the model leg matches.** Request-to-first-byte on a TTS call is one
-round trip plus synthesis, and synthesis is the same model on the same GPU in
-both arms. If those two numbers don't agree to within a few percent, something
-other than the transport differs between the arms and the comparison is invalid.
-Ours came out 4479.3ms against 4457.7ms, which is the check passing.
+**Check that the model leg matches.** Request-to-first-byte on a synthesis call
+is one round trip plus the model, and the model is the same model on the same
+GPU in both arms. If those two numbers don't agree, something other than the
+transport differs and the comparison is invalid. Ours came out 4479.3ms against
+4457.7ms, which is the check passing. The mode runs this automatically and says
+which way it went, and it skips the check on an upload-shaped request, where
+the send is most of that leg and the arms are supposed to differ.
 
 The corollary is that a total-latency ratio on a workload with heavy compute
 understates the transport by however much compute dominates. TTS came out at
