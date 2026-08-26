@@ -351,3 +351,47 @@ lower median and a wider spread; the tunnel finishes nearly every flow together
 wall time. That is the same fairness the relay comparison found, seen from the
 other side, and it is a choice rather than a defect.
 
+
+## Re-validated after the classification and carrier changes
+
+The same run again, with the fixes in place and grouping discovery enabled
+(loss 1.5% rising to 4.7% during it):
+
+| workload | arm | result |
+|---|---|---|
+| 16 concurrent 300KB requests | direct | p50 991.2ms, p99 1062.7ms, 17.8 Mbit/s |
+| 16 concurrent 300KB requests | tunnel | p50 1732.6ms, p99 1736.2ms, 22.6 Mbit/s |
+| 8 UDP frame sessions | direct | 52 of 1200 lost, p99 212.4ms |
+| 8 UDP frame sessions | tunnel | **15 of 1200 lost**, p99 209.8ms |
+| 8 TCP frame sessions | tunnel | 0 lost, p99 737.1ms, 2.58% over 250ms |
+
+class transitions: interactive 8, **bulk 0**
+
+Every request flow completes, no session is demoted, frames over UDP lose a
+third of what they lose direct while the tail stays flat, and frames over TCP
+show the same tail they always do. Letting the tree rearrange itself from
+measured correlation changed nothing here, which is what a path with one
+destination group should show.
+
+## Does aggregation give the estimator real evidence?
+
+A bandwidth estimate only improves from samples that were not
+application-limited. An earlier attempt to answer this read the aggregate
+metrics endpoint and saw a frozen sample count and a zero estimate, which is
+what that endpoint reports: one lane, and under pooling that is the idle
+control connection.
+
+Read from the per-lane trace instead, on the lane carrying data:
+
+| concurrent flows | non-app-limited samples | bandwidth estimate |
+|---|---|---|
+| 1 | 12 | 6.8 Mbit/s |
+| 4 | 30 | 24.6 Mbit/s |
+| 16 | 31 | **87.6 Mbit/s** |
+
+The estimate rises thirteenfold with concurrency and the non-app-limited count
+accumulates rather than staying at whatever the handshake produced. An
+aggregate fed by many flows does give the estimator evidence a single bursty
+flow cannot, which is the argument the node-relay shape rests on. The sample
+count plateaus while the estimate keeps climbing, which is the max filter
+keeping its best sample and is what it is for.

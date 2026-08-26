@@ -101,6 +101,26 @@ An unrecognized profile name is an error. We don't fall back to the default,
 because then a process would be running policy the operator didn't ask for with
 nothing in the logs to show it.
 
+### Aggregation instead of probing
+
+A bandwidth estimate only improves from samples that were not
+application-limited, and a single bursty flow rarely produces one. The
+node-relay shape rests on the claim that an aggregate fed by many flows does.
+
+Measured on the lane carrying data, read from the per-lane trace rather than
+from the aggregate metrics endpoint, which reports the idle pooled control
+connection:
+
+| concurrent flows | non-app-limited samples | bandwidth estimate |
+|---|---|---|
+| 1 | 12 | 6.8 Mbit/s |
+| 4 | 30 | 24.6 Mbit/s |
+| 16 | 31 | 87.6 Mbit/s |
+
+Thirteen times the estimate for sixteen times the flows. So we don't need a
+synthetic probe, which on a policed path would drain a token bucket and report
+the drain rate as the path's capacity. That failure mode is what made us ask.
+
 ### Modeling the path as a chain
 
 `PathModel` describes one endpoint pair. That's the right model when every flow
@@ -257,8 +277,5 @@ digits. So:
 
 ## Not done yet
 
-- We don't know whether aggregating flows removes the need for a synthetic
-  bandwidth probe. The aggregate metrics endpoint reports the idle control
-  connection, so answering this needs per-lane trace data.
 - Splitting a merged group back apart is manual, for the reason above.
 - One path. This profile stays experimental until we've run it on more.
