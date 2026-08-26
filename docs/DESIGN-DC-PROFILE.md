@@ -345,3 +345,15 @@ digits. So:
 - Sockmap splicing would cut the relay's per-byte cost. We haven't built it
   because no relay we've measured is CPU-bound yet, and it would be the wrong
   thing to optimize first.
+- The short-block sizing fix is proven where it can be and not where it
+  matters most. At the sizing level it is deterministic and the tests fail with
+  the rule disabled. End to end it is unproven, because the path changed
+  character between the run that found the problem and the run that would have
+  confirmed the fix: erasure fell from 14% to 4.3% and the burst factor rose to
+  2.0, so loss stopped arriving independently. A channel that holds still for
+  the length of a comparison is what settles it, and this path does not.
+- Coding is sized per block and the class is fixed per lane, which is why the
+  fix keys on how a block sealed rather than on what kind of flow produced it.
+  A lane carries every class at once, so `fec.ClassInteractive` is not reachable
+  at runtime; block length is the signal that survives that. It is the right
+  signal for this case and it is not obviously the right one for every case.
