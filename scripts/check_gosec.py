@@ -55,6 +55,13 @@ BASELINE = {
     # Its documentation says not to put it in front of untrusted traffic, and
     # it exists to measure what an HTTP/2 receive window costs.
     ("G704", "cmd/pathmeasure/main.go"): 2,
+    # TCP_INFO has no typed accessor that survives the struct growing, and
+    # x/sys/unix offers no helper for reading an arbitrary option into bytes:
+    # the string helper stops at the first zero, which in this struct returns
+    # almost nothing and returns it without error. The two unsafe.Pointer uses
+    # are the buffer and the length word handed to one getsockopt, both stack
+    # locals whose lifetime spans the call.
+    ("G103", "internal/tcpinfo/sample_linux.go"): 2,
     ("G204", "cmd/queqiaopack/main.go"): 1,
     ("G204", "internal/extproxy/process.go"): 1,
     ("G204", "mobile/tools/notices/main.go"): 1,
