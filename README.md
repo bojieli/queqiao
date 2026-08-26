@@ -151,21 +151,21 @@ All of it ships as a prebuilt binary. Download it below, or from the
 ## Platform availability
 
 Every release publishes reproducible, signed binaries for six native targets.
-The links below are v0.3.1, the current release; the
+The links below are v0.4.0, the current release; the
 [releases page](https://github.com/bojieli/queqiao/releases/latest) always has the newest.
 
 | Platform | Status | Download |
 | --- | --- | --- |
-| macOS, Apple silicon | Desktop and gateway, ready to use | [`darwin_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.3.1/queqiaod_v0.3.1_darwin_arm64_signed.zip), notarized |
-| macOS, Intel | Desktop and gateway, ready to use | [`darwin_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.3.1/queqiaod_v0.3.1_darwin_amd64_signed.zip), notarized |
-| Linux, x86-64 | Desktop and gateway, ready to use | [`linux_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.3.1/queqiaod_v0.3.1_linux_amd64.tar.gz) |
-| Linux, arm64 | Desktop and gateway, ready to use | [`linux_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.3.1/queqiaod_v0.3.1_linux_arm64.tar.gz) |
-| Windows, x86-64 | Native target built; under testing, not production-ready | [`windows_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.3.1/queqiaod_v0.3.1_windows_amd64.zip) |
-| Windows, arm64 | Native target built; under testing, not production-ready | [`windows_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.3.1/queqiaod_v0.3.1_windows_arm64.zip) |
+| macOS, Apple silicon | Desktop and gateway, ready to use | [`darwin_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.4.0/queqiaod_v0.4.0_darwin_arm64_signed.zip), notarized |
+| macOS, Intel | Desktop and gateway, ready to use | [`darwin_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.4.0/queqiaod_v0.4.0_darwin_amd64_signed.zip), notarized |
+| Linux, x86-64 | Desktop and gateway, ready to use | [`linux_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.4.0/queqiaod_v0.4.0_linux_amd64.tar.gz) |
+| Linux, arm64 | Desktop and gateway, ready to use | [`linux_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.4.0/queqiaod_v0.4.0_linux_arm64.tar.gz) |
+| Windows, x86-64 | Native target built; under testing, not production-ready | [`windows_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.4.0/queqiaod_v0.4.0_windows_amd64.zip) |
+| Windows, arm64 | Native target built; under testing, not production-ready | [`windows_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.4.0/queqiaod_v0.4.0_windows_arm64.zip) |
 | Android and iOS | Same protocol-1 core, under testing; not yet production-ready mobile apps | -- |
 
 Check a download against its release's
-[`SHA256SUMS`](https://github.com/bojieli/queqiao/releases/download/v0.3.1/SHA256SUMS)
+[`SHA256SUMS`](https://github.com/bojieli/queqiao/releases/download/v0.4.0/SHA256SUMS)
 before running it. Each archive carries its own CycloneDX SBOM and the complete
 license text for every module linked into the binary.
 
