@@ -275,3 +275,62 @@ func TestNoPlanIsSizedForAFractionOfTheMeasuredErasure(t *testing.T) {
 		}
 	}
 }
+
+// A block that sealed short did so because the producer stopped, and the
+// throughput objective prices a retransmission in symbols the producer was not
+// going to send. Left to itself it declines the parity and takes the round
+// trip, which on a token stream is a reader watching a sentence stop.
+func TestAShortBlockIsSizedForDeliveryRatherThanThroughput(t *testing.T) {
+	snap := lossmodel.Snapshot{Loss: 0.14, BurstFactor: 1.03, ArrivalAfterLoss: 0.86}
+	// The rate estimate an application-limited flow produces. It is low
+	// because the flow is not sending, which is exactly when this must not be
+	// read as "a retransmission is cheap".
+	p := Params{ShardBytes: 120, RateBytesPerSec: 2000, RoundTrip: 200 * time.Millisecond}
+	n, ok := ShardsFor(1, snap, p)
+	if !ok {
+		t.Fatal("a single symbol on a 14% channel got no code at all")
+	}
+	if n-1 < 3 {
+		t.Fatalf("one symbol got %d repairs; at 14%% erasure that leaves a residual of "+
+			"%.2f%%, and every one of those is a round trip the reader waits through",
+			n-1, 100*math.Pow(0.14, float64(n)))
+	}
+}
+
+// The same sizing must not depend on how fast the flow happens to be going,
+// because that is the input that was wrong.
+func TestShortBlockSizingDoesNotFollowTheRateEstimate(t *testing.T) {
+	snap := lossmodel.Snapshot{Loss: 0.14, BurstFactor: 1.03, ArrivalAfterLoss: 0.86}
+	var first int
+	for i, rate := range []float64{2000, 20000, 200000} {
+		n, _ := ShardsFor(1, snap, Params{
+			ShardBytes: 120, RateBytesPerSec: rate, RoundTrip: 200 * time.Millisecond,
+		})
+		if i == 0 {
+			first = n
+			continue
+		}
+		if n < first {
+			t.Fatalf("at %.0f B/s a single symbol got %d shards, fewer than the %d it got "+
+				"at 2000 B/s: the estimate is still deciding the protection", rate, n, first)
+		}
+	}
+}
+
+// Long blocks keep the throughput answer. A transfer is measured in bytes per
+// second, and there the parity genuinely costs what the objective says.
+func TestALongBlockKeepsTheThroughputAnswer(t *testing.T) {
+	snap := lossmodel.Snapshot{Loss: 0.14, BurstFactor: 1.03, ArrivalAfterLoss: 0.86}
+	p := Params{ShardBytes: 1200, RateBytesPerSec: 850000, RoundTrip: 200 * time.Millisecond}
+	n, ok := ShardsFor(64, snap, p)
+	if !ok {
+		t.Fatal("a 64-symbol block got no code")
+	}
+	// Held to a rate rather than an exact count, so that retuning the objective
+	// does not fail this for the wrong reason. What must not happen is a long
+	// block acquiring a short block's redundancy.
+	if rate := float64(64) / float64(n); rate < 0.5 {
+		t.Fatalf("a 64-symbol block was coded at rate %.2f; the short-block rule has "+
+			"leaked into blocks that are paying for their parity in throughput", rate)
+	}
+}

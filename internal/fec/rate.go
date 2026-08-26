@@ -79,6 +79,31 @@ const (
 	// eight times the wire per byte delivered. Past that the channel is not
 	// one this transport can use, and saying so is more useful than pretending.
 	minRate = 0.125
+	// shortBlockSymbols is the largest block that sealed because the producer
+	// stopped rather than because the block filled, and below which the
+	// throughput objective above is answering the wrong question.
+	//
+	// That objective trades parity bytes against the cost of a retransmission,
+	// and it prices the retransmission in symbols this flow could have sent
+	// instead. For a block that sealed short, the flow was not going to send
+	// them: it stopped, which is why the block is short. The spare capacity is
+	// free and the objective values it as if it were scarce, so it declines
+	// the parity and takes the round trip.
+	//
+	// Measured on the China-US path, a language model's token stream carried
+	// 2078 symbols, of which the code recovered 322 and failed on 29 -- a 1.38%
+	// residual on a workload where every unrepaired symbol is a reader watching
+	// a sentence stop for a round trip. The same run put 2.6% to 4.4% of tokens
+	// more than half a second behind the generator's own schedule. Sizing these
+	// blocks to a residual instead costs about a hundred bytes per token, on a
+	// path whose capacity knee is 333 Mbit/s.
+	shortBlockSymbols = 4
+	// shortBlockResidual is how often such a block may fail to decode and fall
+	// back to a round trip. At this path's 14% erasure it buys three repairs
+	// for a single symbol, which is where an emulated frame experiment already
+	// found the knee: one copy lost 71 frames of 400, two lost 10, three lost
+	// none, and the median moved by 1.4ms.
+	shortBlockResidual = 1e-3
 	// codeStillRepairs is where a code stops being one. A block that fails
 	// more often than it succeeds is not repaired by its parity, it is a
 	// lottery ticket bought with bandwidth, and the objective cannot tell the
@@ -298,6 +323,11 @@ func ShardsFor(k int, s lossmodel.Snapshot, p Params) (int, bool) {
 		}
 		if delivered := deliveredPerSymbolTime(k, n, residual, reissue); delivered > bestDelivered {
 			bestN, bestDelivered = n, delivered
+		}
+		if k <= shortBlockSymbols && residual <= shortBlockResidual && n > bestN {
+			// See shortBlockSymbols. Take whichever answer asks for more.
+			bestN, bestDelivered = n, math.Inf(1)
+			break
 		}
 	}
 	if bestN > k {
