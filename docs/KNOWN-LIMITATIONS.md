@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Status:** Current limitations for public protocol 1
-> **Last reviewed:** 2026-08-20
+> **Last reviewed:** 2026-08-26
 
 These are the boundaries of the ready-to-use public-preview deployment. Read
 them before treating a successful local test as evidence that a different

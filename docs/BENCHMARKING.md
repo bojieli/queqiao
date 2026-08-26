@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Status:** Current benchmark methodology for public protocol 1
-> **Last reviewed:** 2026-08-20
+> **Last reviewed:** 2026-08-26
 
 This is the reproducibility guide for the measurement rig. It exists because the motivating
 link moved between roughly 0% and 50% packet loss within minutes, so

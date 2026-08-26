@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 560" width="1240" height="560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="A bar chart of sustained single-flow throughput on the China to US path. An open-loop UDP probe with no congestion control measures the path's capacity knee at 333 Mbit/s. Direct TCP cubic ranges from 3.6 to 105.8 Mbit/s across five runs on the upload and 68 to 84 on the download. Queqiao reaches 310 Mbit/s, which is 93 percent of the knee. A CPU profile of the transfer attributes under 2 percent to encryption and less than the top twenty to the coding, with the syscall per batch of packets dominating.">
+  <rect x="0" y="0" width="1240" height="560" fill="#FBFCFE"/>
+
+  <text x="620" y="46" text-anchor="middle" font-size="26" font-weight="700" fill="#0F172A">One flow, running long enough to reach a steady state</text>
+  <text x="620" y="76" text-anchor="middle" font-size="16" fill="#64748B">The characterization measured request latency everywhere and this nowhere. Bars span the range across runs.</text>
+
+  <!-- axis -->
+  <line x1="300" y1="126" x2="1160" y2="126" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="300" y="114" text-anchor="middle" font-size="13" fill="#94A3B8">0</text>
+  <text x="516" y="114" text-anchor="middle" font-size="13" fill="#94A3B8">100</text>
+  <text x="731" y="114" text-anchor="middle" font-size="13" fill="#94A3B8">200</text>
+  <text x="947" y="114" text-anchor="middle" font-size="13" fill="#94A3B8">300 Mbit/s</text>
+  <line x1="516" y1="126" x2="516" y2="420" stroke="#E2E8F0" stroke-width="1"/>
+  <line x1="731" y1="126" x2="731" y2="420" stroke="#E2E8F0" stroke-width="1"/>
+  <line x1="947" y1="126" x2="947" y2="420" stroke="#E2E8F0" stroke-width="1"/>
+
+  <!-- the knee -->
+  <line x1="1018" y1="126" x2="1018" y2="420" stroke="#15803D" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="1030" y="150" font-size="14" font-weight="700" fill="#15803D">333 Mbit/s</text>
+  <text x="1030" y="169" font-size="13" fill="#15803D">the path's own knee,</text>
+  <text x="1030" y="186" font-size="13" fill="#15803D">measured open-loop</text>
+  <text x="1030" y="203" font-size="13" fill="#15803D">with no congestion</text>
+  <text x="1030" y="220" font-size="13" fill="#15803D">control at all</text>
+
+  <!-- upload -->
+  <text x="288" y="196" text-anchor="end" font-size="15" font-weight="700" fill="#0F172A">Upload</text>
+  <text x="288" y="216" text-anchor="end" font-size="13" fill="#15803D">loses nothing</text>
+
+  <text x="288" y="252" text-anchor="end" font-size="14" fill="#334155">direct TCP cubic</text>
+  <rect x="308" y="234" width="220" height="26" rx="3" fill="#E8A87C" stroke="#C2410C" stroke-width="1.5"/>
+  <text x="540" y="252" font-size="13" fill="#9A3412">3.6 to 105.8 across five runs</text>
+
+  <text x="288" y="292" text-anchor="end" font-size="14" fill="#334155">queqiao</text>
+  <rect x="300" y="274" width="667" height="26" rx="3" fill="#2563EB"/>
+  <text x="979" y="292" font-size="14" font-weight="700" fill="#1D4ED8">310</text>
+
+  <!-- download -->
+  <text x="288" y="346" text-anchor="end" font-size="15" font-weight="700" fill="#0F172A">Download</text>
+  <text x="288" y="366" text-anchor="end" font-size="13" fill="#B91C1C">erases about 14%</text>
+
+    <rect x="447" y="324" width="35" height="26" rx="3" fill="#E8A87C" stroke="#C2410C" stroke-width="1.5"/>
+  <text x="494" y="342" font-size="13" fill="#9A3412">direct TCP cubic, 68 to 84</text>
+
+  <rect x="300" y="364" width="577" height="26" rx="3" fill="#2563EB"/>
+  <text x="889" y="382" font-size="14" font-weight="700" fill="#1D4ED8">queqiao, 268</text>
+
+  <rect x="300" y="440" width="860" height="94" rx="10" fill="#F1F5F9" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="730" y="466" text-anchor="middle" font-size="15" fill="#334155">A CPU profile of a 300 Mbit/s transfer puts encryption at under 2% and the erasure coding below the top</text>
+  <text x="730" y="488" text-anchor="middle" font-size="15" fill="#334155">twenty. The expensive part is not the clever part: what dominates is the syscall per batch of packets,</text>
+  <text x="730" y="510" text-anchor="middle" font-size="15" fill="#334155">which is what userspace UDP is. Sends already batch about forty packets each; receives do not coalesce,</text>
+  <text x="730" y="528" text-anchor="middle" font-size="15" fill="#334155">and that is upstream rather than here.</text>
+</svg>

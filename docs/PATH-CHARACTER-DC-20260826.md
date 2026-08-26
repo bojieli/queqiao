@@ -74,6 +74,10 @@ Everything else here measures how long a request takes. That is the workload,
 and it left a gap: the profile also carries transfers, and nobody had asked what
 either transport does when a flow runs long enough to reach a steady state.
 
+<p align="center">
+  <img src="../assets/sustained-throughput.svg" alt="A bar chart of sustained single-flow throughput. An open-loop UDP probe measures the path's capacity knee at 333 Mbit/s with no congestion control involved. Direct TCP cubic ranges 3.6 to 105.8 Mbit/s across five runs on the upload and 68 to 84 on the download. Queqiao reaches 310 and 268. A CPU profile of the transfer puts encryption under 2 percent and the coding below the top twenty, with the syscall per batch of packets dominating." width="880">
+</p>
+
 One flow, 15 to 20 seconds, arms alternated, upload direction:
 
 | | direct TCP cubic | queqiao |
