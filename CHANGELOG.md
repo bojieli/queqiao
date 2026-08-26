@@ -10,23 +10,6 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
-- The gateway reports how stale its authorization state is. A failed refresh
-  leaves the previous snapshot in force, which is correct - a briefly
-  unreadable file must not disarm a running gateway - but it was also silent:
-  the refresh runs once a second and wrote 86,400 identical error lines a day,
-  none of which said when the run started, how long it had been going, or how
-  old the rules still being enforced were, and no metric covered any of it. The
-  store now records when its snapshot was last read from disk, the run is
-  reported at its edges - always on the first failure, restated at most once a
-  minute with the run length and the age of the snapshot in force, and always
-  on recovery - and four series are exported:
-  `queqiao_authorization_refresh_failures_total`,
-  `queqiao_authorization_reloads_total`,
-  `queqiao_authorization_consecutive_refresh_failures`, and
-  `queqiao_authorization_last_good_timestamp_seconds`. This is the fault that
-  keeps every existing device working while refusing every new enrollment, so
-  nothing else in the flow counters moves when it happens.
-
 ## v0.4.0 - 2026-08-26
 
 ### Added
@@ -617,6 +600,22 @@ to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
 ### Fixed
 
+- The gateway reports how stale its authorization state is. A failed refresh
+  leaves the previous snapshot in force, which is correct - a briefly
+  unreadable file must not disarm a running gateway - but it was also silent:
+  the refresh runs once a second and wrote 86,400 identical error lines a day,
+  none of which said when the run started, how long it had been going, or how
+  old the rules still being enforced were, and no metric covered any of it. The
+  store now records when its snapshot was last read from disk, the run is
+  reported at its edges - always on the first failure, restated at most once a
+  minute with the run length and the age of the snapshot in force, and always
+  on recovery - and four series are exported:
+  `queqiao_authorization_refresh_failures_total`,
+  `queqiao_authorization_reloads_total`,
+  `queqiao_authorization_consecutive_refresh_failures`, and
+  `queqiao_authorization_last_good_timestamp_seconds`. This is the fault that
+  keeps every existing device working while refusing every new enrollment, so
+  nothing else in the flow counters moves when it happens.
 - The deployment guide's worked example created an account with a flow ceiling
   of 8, which is too low to load a web page.
 - Enrollment refusals say which of the two possible things went wrong, and say
