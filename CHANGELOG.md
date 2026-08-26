@@ -27,6 +27,242 @@ to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
   keeps every existing device working while refusing every new enrollment, so
   nothing else in the flow counters moves when it happens.
 
+## v0.4.0 - 2026-08-26
+
+### Added
+
+- `pathmeasure -mode ab` compares two arms with the test order alternated and
+  the samples pooled. It prints the order effect next to the arm effect and
+  warns when the order effect is the larger of the two.
+- The path characterisation now records whether aggregating flows gives the
+  bandwidth estimator evidence a single bursty flow cannot, measured on the
+  lane carrying data rather than on the aggregate metrics endpoint, which
+  reports the idle pooled control connection. Sixteen concurrent flows raise
+  the estimate thirteenfold over one.
+- `--class-hint` declares the class a flow starts in from what produced it, as
+  a repeatable `<match>=<interactive|bulk>`. It is refused without `--flow-
+  metadata-socket`, since nothing would be there to ask, and a misspelled
+  class name fails at startup rather than matching nothing at runtime.
+- A concurrency measurement of the request tail against the TUIC-shaped
+  reference on an emulated datacenter path, plus named `pathsim` profiles for
+  the paths we've characterized.
+- A token stream beside a saturating transfer is now measured on the emulated
+  path, where the channel holds still. The same question could not be answered
+  on the live link: the stream degraded throughout the experiment whether or not
+  a transfer was running, so the arm measured last was the worst one and it was
+  the arm with no transfer in it.
+- A measured baseline of this transport against a datacenter workload on a
+  live China-US path, in both directions.
+- The datacenter profile's flow classification is validated on the live path.
+  Sixteen concurrent 300KB requests are demoted to bulk on the access-link
+  thresholds and none on the datacenter ones, which is what those thresholds
+  exist to change: a few hundred kilobytes is one ordinary request on a
+  datacenter leg and a transfer on an access link, and a demoted flow stops
+  preferring the coding that repairs a gap inside the round trip carrying it.
+- `docs/DEPLOYING-DC-PROFILE.md` covers running the datacenter profile: what
+  to measure before choosing it, the free tuning worth more than anything the
+  profile does, why voice belongs on UDP, how to configure class hints, and
+  what to watch afterwards.
+- `docs/DESIGN-DC-PROFILE.md` covers when the datacenter profile applies, what
+  differs from the access-link deployment, and the four design assumptions our
+  measurements overturned.
+- Three figures for the datacenter documents: where 1133ms of a speech request
+  goes, the two directions of the path behaving as different channels, and the
+  comparison that says to fix the client before deploying anything. Each is an
+  SVG with a real description, on a light ground so it reads in either GitHub
+  theme.
+- `docs/PATH-CHARACTER-DC-20260826.md` characterizes our first datacenter-to-
+  datacenter path, measuring each direction separately.
+- `docs/MEASURING-A-DC-PATH.md` is the runbook for re-running the datacenter
+  measurements, including the four traps that produced wrong answers the first
+  time.
+- `queqiaod doctor` reports whether a host is in the state the deployment
+  measurements assumed: the selected profile's qualification level and
+  precondition, the kernel settings that matter, and whether the gateway
+  answers. It exists because the setting worth the most is a kernel default
+  nothing else would mention: `tcp_slow_start_after_idle` is 1 on Linux, which
+  throws a connection's window away after any idle gap, and turning it off was
+  worth 4.5x on a 300KB burst.
+- `--flow-metadata-socket` lets the client ask a local capture agent what
+  produced each flow, so its class is known before it carries anything instead
+  of after the second the classifier needs to decide. A request that finishes
+  in 200ms spends its whole life inside that second. The profile maps what the
+  agent reports, usually an executable path, to a starting class; the
+  classifier still judges the flow by what it then does. Without the flag, and
+  without a matching hint, nothing changes.
+- A measurement of what fixes the frame workload's tail, comparing duplication
+  against doing nothing on an emulated lossy path.
+- A measurement of the streaming frame workload, many small messages at high
+  frequency, alongside the existing request measurement. The two stress
+  different mechanisms and give opposite answers on the same path.
+- The datacenter deployment guide records the capture path for applications
+  that cannot be reconfigured, measured end to end on the China-US path: an
+  unmodified application reaches 624.9ms cold on a 300KB request against
+  1089.3ms direct, and 381.2ms once warm, with the connect leg falling from
+  187.3ms to 0.2ms.
+- Destination groups can be tested for whether they really share a bottleneck,
+  by correlating short-window congestion signals, and merged when they do.
+- The datacenter profile can let the path tree's shape follow measured
+  evidence instead of the static hierarchy it starts from: destination groups
+  whose congestion arrives and leaves together are merged into one segment.
+  Ordinary reporting feeds the correlator, merges are applied at a bounded
+  cadence, and the access-link profile is unchanged. Merging is not undone
+  automatically, because the evidence that would justify splitting again is
+  gathered under the shared budget that hides the difference.
+- `pathmeasure -mode h2proxy` terminates HTTP/2 with large windows and streams
+  the body onward, which makes a small receive window irrelevant without
+  changing the receiver.
+- `pathmeasure` gains `h2serve` and `h2` modes, which measure what an HTTP/2
+  receive window costs on a long path by running the same upload against
+  servers that differ only in the window they advertise.
+- A path can be modeled as a chain of segments (uplink, then peer) instead of
+  a single endpoint pair, so flows to different places pool what they share
+  and keep separate what they don't. The `dc-long-haul` profile enables it;
+  the access-link profile is unchanged.
+- Two architecture figures for the datacenter design document, one per
+  installation: the application pointed at the proxy, and the application left
+  untouched with tunless catching the connection at the socket layer and
+  reporting what opened it.
+- `deploy/install-client.sh --path-profile` and `queqiaod service install
+  --path-profile` carry a path profile into the installed service. The flag
+  existed on `queqiaod client` and nothing between the installer and the unit
+  file carried it, so running the datacenter profile as a service meant editing
+  a definition the installer rewrites on every upgrade. An unknown name fails
+  the install rather than starting a service with policy nobody asked for.
+- `pathmeasure` gains `load` and `frames` modes for the two concurrent
+  workload shapes, and counts late messages against fixed thresholds rather
+  than each arm's own floor.
+- `--path-profile` selects which deployment a client or gateway is running in.
+  `wan-shared-bottleneck` is the default and behaves as before; `dc-long-haul`
+  is experimental and changes how flows are classified on a hop where every
+  flow is a latency-sensitive request.
+- `pathmeasure`, a companion to `pathprobe` that measures what a stack
+  achieves rather than what a path does. It reports flow completion time for
+  request-sized payloads, shows what a long-lived connection keeps between
+  bursts, measures both directions, runs concurrent request and frame
+  workloads, and reads the kernel's TCP_INFO to say which constraint was
+  binding.
+- The README now carries the second problem this transport turned out to solve:
+  inference deployed across regions, where a 355KB speech upload takes 1133ms of
+  which the model spends 38ms. It states the finding that argues against
+  deploying the transport alongside the one that argues for it, because that
+  finding changes what an operator should do first.
+- The datacenter path characterization now measures the real ASR and TTS
+  endpoints rather than synthetic transfers of the same size, and reports what a
+  tuned client recovers on its own so the profile's remaining value is stated
+  honestly: cold connections, unmodifiable callers, and the tail.
+- A measurement of one shared relay against several independent ones on a
+  datacenter path, where the answer is the opposite of the access-link result
+  that led us to retire multipath.
+- `pathmeasure -mode stream` measures a token stream, which none of the other
+  modes describes: it reports time to first token and how far behind the
+  generator's own schedule each token arrived, rather than a total the reader
+  never waits for in one piece. `-mode streamserve` emits tokens at a fixed
+  cadence so the generator is not a variable in the comparison.
+- The datacenter characterization now measures sustained throughput, which it
+  had never done: every other figure in it is a request latency. One flow
+  reaches 310.4 Mbit/s through the transport against 3.6 to 105.8 Mbit/s direct,
+  which is 93% of the path's own capacity knee, and it costs 75% of one core.
+- A figure for sustained throughput, which the datacenter characterization had
+  measured and never drawn: one flow reaching 310 Mbit/s against the path's own
+  333 Mbit/s knee, beside direct TCP's 3.6 to 105.8, with what a CPU profile
+  says the cost actually is.
+- The datacenter path characterization now separates what getting off TCP is
+  worth from what our coding adds, measured against the TUIC-shaped reference
+  on the same QUIC stack.
+- `pathmeasure -mode frames -udp-frames` measures the streaming frame workload
+  over UDP ASSOCIATE rather than a stream, which is how voice actually
+  travels. On a path erasing 3.6%, carrying frames over UDP through the tunnel
+  loses 34 of 3200 messages against 163 sent directly, and keeps the tail
+  flat; the same frames over TCP lose none and arrive with a p99 three and a
+  half times the median, because reliability turns each gap into delay for the
+  frames behind it.
+- `pathmeasure -mode workload` drives a real HTTP endpoint against two arms
+  rather than a transfer of the same size, splitting each request into connect,
+  request-to-first-byte, and download so that server-side compute does not bury
+  what the transport did. On a request shape where the leg containing the server
+  should match between arms, it checks that it does and says so.
+
+### Fixed
+
+- A class declared from flow attribution is counted as a class transition. It
+  was not, because a declared class never passes through the classifier's
+  observation path, so the whole mechanism was invisible in telemetry: an
+  operator reading `queqiao_class_transitions` saw zero and could not tell
+  hints that never fired from hints that were never configured.
+- The bandwidth estimator rescanned everything in flight on every congestion
+  event to drop retired packet states. At 300 Mbit/s over a 200ms round trip
+  that is about six thousand entries per acknowledgement, and a CPU profile of a
+  294 Mbit/s transfer attributed 13% of all time to that one loop. Packet
+  numbers only increase, so it now walks the range being dropped: 23x faster on
+  a benchmark retiring one window at a realistic acknowledgement cadence.
+- A transfer that stalled once anywhere inside its first `BulkBytes` was
+  permanently classified interactive on the datacenter profile, so it was coded
+  and held a single lane for the rest of its life. The idle veto now needs two
+  separate gaps: one is an event, two is a pattern, and only the pattern says a
+  flow is a caller rather than a transfer.
+- The ASR and TTS figures in the datacenter characterization were medians across
+  eight audio files of 146KB to 405KB, labelled with the size of whichever
+  request ran last. The mislabelling had a consequence rather than being
+  cosmetic: a tuned client was recorded at 225.8ms for what was called a 355KB
+  upload, which is below the floor that size has on a 200ms path with a 30ms
+  model. Re-measured with one fixed file, and the section is marked superseded
+  rather than deleted.
+- The pacer now meters only when there is evidence of congestion. It used to
+  meter every send at a bandwidth estimate that a request-shaped flow cannot
+  raise, because such a flow is application-limited by construction: one flow
+  estimated 42 Mbit/s where sixteen estimated 88 on the same path in the same
+  minutes. On the datacenter link that spent 67ms of a 355KB request protecting
+  a queue the controller's own delay signal said was not forming, and it was the
+  whole of this transport's deficit against a tuned TCP client.
+- The unmetered burst also requires the sending direction to be delivering
+  essentially everything. A policer holds no queue and its loss is sustained
+  enough that the estimator's floor rises to meet it, so both of the other
+  signals read clean on exactly the path where bursting is worst: gating on them
+  alone took an emulated policer from 3.0x overdrive to 4.0x and from 32.9% loss
+  to 54.9%.
+- Flow completion records now say whether a replacement lane was ever attempted,
+  not only whether one arrived: `lane_replacement_attempts` and
+  `lane_replacement_failures` join the fields already written by both endpoints.
+  On a live gateway, 84% of the flows that failed with "lane replacement
+  timeout" ended with no replacement lane admitted, and the record could not say
+  why. A client pool that will not rebuild opens nothing; a path that will not
+  carry a handshake opens dials that never complete. Those need different fixes,
+  and both leave `lanes_joined` unchanged, because a dial that fails never
+  reaches lane admission. The client's own failure log now also carries the
+  `flow_id` and attempt number, so the attempts behind a failed flow can be
+  found rather than inferred.
+- A long conversation no longer loses its forward error correction partway
+  through. Whether a flow is made of small exchanges was measured over its
+  whole life, so any session eventually carried more than the budget and was
+  demoted to bulk while still behaving exactly as it always had: a voice call
+  reached that point after about a minute and carried the rest of itself
+  uncoded, which is where the repair matters most, because a stream of small
+  messages never amortises a round trip over anything and every lost frame
+  pays one by itself. It is now measured over a recent window, which a
+  transfer never drops under and a conversation never reaches whatever its
+  age.
+- A block that sealed short because the producer stopped is now sized to a
+  delivery probability rather than to throughput. The throughput objective
+  prices a retransmission in symbols the flow could have sent instead, and a
+  flow that just stopped was not going to send them, so it declined the parity
+  and took the round trip. On a token stream over the China-US path that left
+  a 1.38% residual after coding, and every unrepaired symbol is a reader
+  watching a sentence stop.
+- The advice to set `net.ipv4.tcp_slow_start_after_idle=0` is now qualified by
+  direction, in the runbook, the design document and `queqiaod doctor`. It is
+  the most valuable line here on a direction that does not lose packets, and it
+  makes an erasing one worse: a 100KB synthesis download took 827.7ms on a cold
+  connection and 2281.2ms on a warm one with the sysctl set, because restoring
+  the window hands the controller more in flight for a multiplicative decrease
+  to take away.
+- Two UDP association tests no longer fail on Windows runners. They bound a
+  loopback port for TCP and then asked for the same number on UDP, which is
+  what a gateway offering QUIC beside a TCP fallback does, but the two
+  protocols have independent namespaces and an ephemeral TCP port can land
+  inside a range Windows has reserved for UDP. They now use the shared helper
+  that already solved this for the rest of the suite.
+
 ## v0.3.1 - 2026-08-25
 
 ### Fixed
