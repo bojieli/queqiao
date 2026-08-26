@@ -99,6 +99,62 @@ of packets for reasons unrelated to congestion. This profile is for the cases a
 client fix can't reach -- cold connections, callers you can't reconfigure, and
 p99 targets -- and we'd rather say so than quote the cold-start number alone.
 
+## The five shapes this profile carries
+
+The profile was designed from one workload, a request of a few hundred
+kilobytes, and every threshold in it was chosen from that case. A threshold
+chosen from one shape is untested against the others, and this transport
+carries at least five.
+
+| Shape | What it looks like | Where it must land |
+|---|---|---|
+| Short request | one burst up, a small answer back, connection may be new | not bulk; coded |
+| Long-lived, intermittent | the same, on a connection held open across pauses | interactive, permanently |
+| Token stream | a short prompt up, then tens of bytes back every 30ms for as long as the answer takes | interactive, coded, and protected against a single loss |
+| Bulk transfer | tens of megabytes, sustained | bulk; retransmitted rather than coded |
+| Bulk beside interactive | a checkpoint pull while inference traffic runs | the transfer must not cost the requests |
+
+Two of them broke the design as written, and both breakages came from a
+quantity being read as evidence of something it is not evidence of.
+
+**A single stall decided what a flow was for the rest of its life.** The idle
+veto disqualifies a flow from ever being bulk once it has been seen quiet, on
+the reasoning that a flow seeking throughput does not stop asking for it. The
+reasoning is right; the threshold was one observation, which is a different
+claim. A 240MB pull that paused once anywhere inside its first 32MB spent every
+remaining byte classified interactive, which means coded and holding one lane.
+That window is the beginning of every transfer, and the beginning is where a
+cold source or an authorization round trip puts a stall. It now takes two
+separate gaps, because one is an event and two is a pattern. Confirmed on the
+live path: a 90-second transfer moving 1.35GB reached the bulk class, where a
+300MB one offered in a single 8.57s burst does not, the age floor being what
+stops a five-megabyte request from being read as a transfer.
+
+**A token stream was protected according to how fast it was going.** The code
+sizes a block by maximising delivered bytes per symbol time, pricing a
+retransmission in symbols the flow could have sent instead. A block that seals
+short seals because the producer stopped, so those symbols were never going to
+be sent: the spare capacity is free, and the objective was valuing it as
+scarce. Measured at the symbol size that ships, a single symbol on a 14%
+channel got no repair at all at the 20 KB/s rate estimate a token stream
+demonstrates, one repair at 100 KB/s, two at 850 KB/s. The protection followed
+the estimate, and an application-limited flow is exactly the one whose estimate
+is low.
+
+The token stream is the shape that punishes this hardest. Every other workload
+has traffic behind it, so a loss is exposed within a round trip by the packets
+that follow. A token has nothing behind it for another thirty milliseconds, so
+the loss is found by timeout, and one timeout on a 200ms path is ten tokens the
+reader is waiting on. Blocks of four symbols or fewer are now sized to a
+delivery probability rather than to throughput.
+
+The fifth shape turned out to be fine, and could only be shown to be fine on
+the emulator. A transfer taking 78% of the bottleneck moved a token stream's
+p99 lateness by 54 microseconds, with every token arriving in both arms. On the
+live path the question is unanswerable: the link drifts further in ten minutes
+than the effect being looked for, so the arm measured last is the worst one
+whether or not it is the arm with the transfer in it.
+
 ## Design
 
 ### Profiles
