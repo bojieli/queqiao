@@ -173,3 +173,62 @@ func TestIdleVetoSurvivesLaterBusyObservations(t *testing.T) {
 		}
 	}
 }
+
+// The datacenter profile's two classifier changes are checked here for whether
+// they still change any outcome, because a knob that no longer does is a knob
+// to delete rather than to document.
+//
+// Since whether a flow is made of small exchanges became a rate over a recent
+// window rather than a lifetime total, a long conversation stays interactive on
+// every profile and neither of these is what saves it. What they still do is
+// narrower and worth keeping: the thresholds stop one multi-megabyte request
+// being read as a transfer, and the veto stops many requests adding up to one.
+func TestTheDatacenterClassifierChangesStillChangeSomething(t *testing.T) {
+	dc := dcClassifierConfig()
+
+	// A single large request, busy while observed, is bulk on the access-link
+	// thresholds and not on the datacenter ones.
+	single := Observation{BytesUp: 5 << 20, Age: 2 * time.Second,
+		SinceLastPayload: 5 * time.Millisecond, UpRate: 20 << 20}
+	if New(DefaultConfig()).Observe(single) != ClassBulk {
+		t.Error("a 5MB burst is no longer bulk on the access-link profile; the thresholds have stopped differing")
+	}
+	if got := New(dc).Observe(single); got == ClassBulk {
+		t.Errorf("a 5MB request classified %v on the datacenter profile", got)
+	}
+
+	// Many requests on one connection, past even the datacenter byte
+	// threshold. Only the veto keeps these out of bulk.
+	many := func(cfg Config) Class {
+		c := New(cfg)
+		busy := Observation{Age: 12 * time.Second, SinceLastPayload: 5 * time.Millisecond,
+			UpRate: 40 << 20}
+		idle := busy
+		idle.SinceLastPayload = 2 * time.Second
+		var last Class
+		for i := 0; i < 40; i++ {
+			busy.BytesUp += 1 << 20
+			busy.Age += time.Second
+			last = c.Observe(busy)
+			idle.BytesUp, idle.Age = busy.BytesUp, busy.Age
+			c.Observe(idle)
+		}
+		return last
+	}
+	noVeto := dc
+	noVeto.BulkIdleGapVeto = 0
+	if many(dc) == ClassBulk {
+		t.Error("forty requests past the threshold went bulk with the veto on")
+	}
+	if many(noVeto) != ClassBulk {
+		t.Error("the veto no longer changes anything at these thresholds; delete it rather than document it")
+	}
+}
+
+func dcClassifierConfig() Config {
+	c := DefaultConfig()
+	c.BulkBytes = 32 << 20
+	c.BulkMinimumAge = 10 * time.Second
+	c.BulkIdleGapVeto = time.Second
+	return c
+}

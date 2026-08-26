@@ -300,3 +300,54 @@ said 30% versus 2%. It counted lateness against each arm's own floor, so the
 arm with the 10ms lower median had 10ms more room under its own bar. Against
 fixed thresholds the difference disappears. A listener doesn't have a relative
 bar.
+
+## End-to-end validation, both profiles, all three carriers
+
+One run per profile, on the live path, with the loss measured before and after
+so each row can be placed against it.
+
+**Datacenter profile** (loss 13.6% falling to 1.6% during the run):
+
+| workload | arm | result |
+|---|---|---|
+| 16 concurrent 300KB requests | direct | p50 947.1ms, p99 1135.4ms, 22.5 Mbit/s |
+| 16 concurrent 300KB requests | tunnel | p50 1852.7ms, p99 1857.8ms, 21.1 Mbit/s |
+| 8 UDP frame sessions | direct | 40 of 1200 lost, p99 210.1ms |
+| 8 UDP frame sessions | tunnel | **2 of 1200 lost**, p99 213.5ms |
+| 8 TCP frame sessions | tunnel | 0 lost, p999 731.7ms, 0.58% over 250ms |
+
+class transitions: interactive 8, **bulk 0**
+
+**Access-link profile** (loss 2.4% rising to 3.0%):
+
+| workload | arm | result |
+|---|---|---|
+| 16 concurrent 300KB requests | direct | p50 960.3ms, p99 1063.3ms, 17.2 Mbit/s |
+| 16 concurrent 300KB requests | tunnel | p50 1713.3ms, p99 1748.4ms, 21.9 Mbit/s |
+| 8 UDP frame sessions | direct | 156 of 1200 lost, p99 212.1ms |
+| 8 UDP frame sessions | tunnel | 45 of 1200 lost, p99 215.0ms |
+| 8 TCP frame sessions | tunnel | 0 lost, p99 599.9ms, 1.67% over 250ms |
+
+class transitions: interactive 8, **bulk 16**
+
+Three things this shows.
+
+**The profile difference is real and visible in the counters.** Sixteen request
+flows are demoted to bulk on the access-link thresholds and none on the
+datacenter ones, which is exactly what those thresholds were changed for: a
+300KB request is one ordinary request on a datacenter leg and a transfer on an
+access link. A demoted flow stops preferring coding, which on an erasing path
+is the difference between repairing a gap inside the round trip that carried it
+and waiting out a timeout.
+
+**Frames over UDP gain in both profiles**, by twenty times in one run and three
+and a half in the other. The two runs saw different loss, so the ratio between
+them means nothing; what transfers is that the transport repairs most of what
+the path erases while leaving the tail flat.
+
+**The tunnel trades median for variance on concurrent requests.** Direct gives a
+lower median and a wider spread; the tunnel finishes nearly every flow together
+-- p99/p50 of 1.00 and 1.02 against 1.20 and 1.11 -- at a similar aggregate and
+wall time. That is the same fairness the relay comparison found, seen from the
+other side, and it is a choice rather than a defect.
+
