@@ -153,6 +153,22 @@ Re-measure the path's loss whenever you compare anything. On the characterized
 path it moved between roughly zero and seventeen percent within minutes, and
 this transport's advantage scales with it.
 
+To check whether it's helping your own traffic rather than a transfer of the
+same size, point `pathmeasure -mode workload` at the endpoint you actually
+call, with `-a direct -b socks5=127.0.0.1:1080`. It alternates the arms every
+round, pairs each round against itself, and splits the request into connect,
+request-to-first-byte, and download, which matters because a call that spends
+seconds in a model will show a small end-to-end ratio while the bytes move
+several times faster. Run it against a tuned direct client, not an untuned one,
+or you will measure the sysctl you haven't set yet.
+
+```sh
+pathmeasure -mode workload -rounds 20 \
+  -url https://inference.internal/v1/audio/transcriptions \
+  -a direct -b socks5=127.0.0.1:1080 \
+  -post-file sample.wav -form-field file
+```
+
 ## Rolling back
 
 `--path-profile` defaults to `wan-shared-bottleneck`, which behaves exactly as
