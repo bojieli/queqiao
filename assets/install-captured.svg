@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 500" width="1240" height="500" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="Architecture when the application cannot be reconfigured. The application dials the inference endpoint directly and is not changed. Tunless catches the connection at the socket layer, scoped to a cgroup so it does not capture itself, and hands it to the Queqiao client as ordinary SOCKS5. The same agent answers a metadata socket saying what opened each flow, so the transport knows what it is carrying before the first byte moves. The Queqiao client carries it across the long hop to the gateway and on to the endpoint over loopback.">
+  <defs>
+    <marker id="d-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#2563EB"/>
+    </marker>
+    <marker id="d-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#7C3AED"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1240" height="500" fill="#FBFCFE"/>
+
+  <text x="620" y="44" text-anchor="middle" font-size="25" font-weight="700" fill="#0F172A">Installation B: the application is not touched at all</text>
+  <text x="620" y="72" text-anchor="middle" font-size="16" fill="#64748B">For vendor SDKs, containers, and anything else you cannot hand a proxy setting.</text>
+
+  <!-- application -->
+  <rect x="40" y="150" width="176" height="86" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="2"/>
+  <text x="128" y="182" text-anchor="middle" font-size="16" font-weight="600" fill="#0F172A">The application</text>
+  <text x="128" y="205" text-anchor="middle" font-size="13" fill="#64748B">dials the endpoint</text>
+  <text x="128" y="222" text-anchor="middle" font-size="13" fill="#64748B">directly, unchanged</text>
+
+  <line x1="216" y1="193" x2="234" y2="193" stroke="#2563EB" stroke-width="2.5" marker-end="url(#d-blue)"/>
+
+  <!-- tunless -->
+  <rect x="242" y="150" width="176" height="86" rx="12" fill="#F5F3FF" stroke="#7C3AED" stroke-width="2.5"/>
+  <text x="330" y="180" text-anchor="middle" font-size="16" font-weight="700" fill="#6D28D9">tunless</text>
+  <text x="330" y="201" text-anchor="middle" font-size="13" fill="#5B21B6">catches it at the socket,</text>
+  <text x="330" y="218" text-anchor="middle" font-size="13" fill="#5B21B6">scoped to a cgroup</text>
+
+  <line x1="418" y1="193" x2="436" y2="193" stroke="#2563EB" stroke-width="2.5" marker-end="url(#d-blue)"/>
+
+  <!-- queqiao client -->
+  <rect x="444" y="150" width="176" height="86" rx="12" fill="#EFF6FF" stroke="#2563EB" stroke-width="2.5"/>
+  <text x="532" y="184" text-anchor="middle" font-size="16" font-weight="700" fill="#1D4ED8">Queqiao client</text>
+  <text x="532" y="206" text-anchor="middle" font-size="13" fill="#1E40AF">SOCKS5 in, pooled</text>
+  <text x="532" y="223" text-anchor="middle" font-size="13" fill="#1E40AF">tunnel out</text>
+
+  <!-- the long hop -->
+  <rect x="624" y="150" width="172" height="86" rx="12" fill="#FEF2F2" stroke="#FCA5A5" stroke-width="2" stroke-dasharray="7 5"/>
+  <text x="710" y="180" text-anchor="middle" font-size="15" font-weight="700" fill="#B91C1C">the long hop</text>
+  <text x="710" y="201" text-anchor="middle" font-size="12.5" fill="#7F1D1D">207ms round trip</text>
+  <text x="710" y="219" text-anchor="middle" font-size="12.5" fill="#7F1D1D">~14% erased down</text>
+
+  <!-- gateway -->
+  <rect x="804" y="150" width="176" height="86" rx="12" fill="#EFF6FF" stroke="#2563EB" stroke-width="2.5"/>
+  <text x="892" y="190" text-anchor="middle" font-size="16" font-weight="700" fill="#1D4ED8">Queqiao gateway</text>
+  <text x="892" y="212" text-anchor="middle" font-size="13" fill="#1E40AF">in the model's region</text>
+
+  <line x1="980" y1="193" x2="998" y2="193" stroke="#2563EB" stroke-width="2.5" marker-end="url(#d-blue)"/>
+
+  <!-- endpoint -->
+  <rect x="1006" y="150" width="176" height="86" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="2"/>
+  <text x="1094" y="184" text-anchor="middle" font-size="16" font-weight="600" fill="#0F172A">ASR, TTS, LLM</text>
+  <text x="1094" y="206" text-anchor="middle" font-size="13" fill="#64748B">unchanged, listening</text>
+  <text x="1094" y="223" text-anchor="middle" font-size="13" fill="#64748B">on loopback</text>
+
+  <!-- metadata socket -->
+  <path d="M 330 236 L 330 286 L 532 286 L 532 240" fill="none" stroke="#7C3AED" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#d-violet)"/>
+  <text x="431" y="308" text-anchor="middle" font-size="14" font-weight="600" fill="#6D28D9">what opened this flow</text>
+  <text x="431" y="327" text-anchor="middle" font-size="13" fill="#7C3AED">the executable, the pod, the container</text>
+
+  <!-- loopback bracket -->
+  <path d="M 814 258 L 814 274 L 1172 274 L 1172 258" fill="none" stroke="#15803D" stroke-width="1.8"/>
+  <text x="993" y="294" text-anchor="middle" font-size="14" font-weight="600" fill="#15803D">loopback, about 0.05ms</text>
+
+  <rect x="120" y="356" width="1000" height="122" rx="10" fill="#F1F5F9" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="620" y="382" text-anchor="middle" font-size="15" fill="#334155">Everything Installation A gets, plus two things the socket layer knows and a proxy setting cannot carry.</text>
+  <text x="620" y="408" text-anchor="middle" font-size="15" fill="#334155">The capture is scoped by cgroup, so the agent is outside what it captures and cannot loop through itself.</text>
+  <text x="620" y="430" text-anchor="middle" font-size="15" fill="#334155">And the flow arrives already identified, which matters because the classifier needs about a second to decide</text>
+  <text x="620" y="452" text-anchor="middle" font-size="15" fill="#334155">and a 250ms request is over before then. Measured through the whole stack: 300KB cold in 624.9ms against</text>
+  <text x="620" y="470" text-anchor="middle" font-size="15" fill="#334155">1089.3ms direct, with the connect leg 0.2ms rather than 187.3ms.</text>
+</svg>

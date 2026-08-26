@@ -415,6 +415,17 @@ specific case that needs it. Don't make it the default shape.
 
 ## Deployment
 
+There are two ways to put an application behind this, and which one you can use
+depends on whether you can hand it a proxy setting.
+
+<p align="center">
+  <img src="../assets/install-configured.svg" alt="Architecture when the application is configured to use the proxy. The application dials a SOCKS5 endpoint on loopback. The Queqiao client carries the flow across the long hop to the gateway, which hands it to the inference endpoint over loopback. Both ends are loopback at about 0.05 milliseconds, so the round-trip problem is confined to the middle." width="880">
+</p>
+
+<p align="center">
+  <img src="../assets/install-captured.svg" alt="Architecture when the application cannot be reconfigured. The application dials the endpoint directly and is unchanged. Tunless catches the connection at the socket layer, scoped to a cgroup so it does not capture itself, and hands it to the Queqiao client as ordinary SOCKS5. The same agent answers a metadata socket saying what opened each flow, so the transport knows what it is carrying before the first byte moves." width="880">
+</p>
+
 Applications connect over loopback, where the round trip is about 0.05ms and
 none of the problems above apply. Everything discussed here is credit per round
 trip, so putting a zero-RTT segment on each end confines the problem to the
