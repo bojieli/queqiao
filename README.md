@@ -34,9 +34,9 @@ improve the transport, and learn from users.
 
 ### Not only client to gateway, but also inter-datacenter
 
-The same problem turned up between two machines we own. GPU capacity
-concentrates in a few regions while turn-taking has to answer in about 20ms, so
-every speech request crosses a long hop twice.
+The same problem turned up between two machines we own. This has been our own
+pain point since 2023: the models run in the US and the clients are everywhere,
+so every speech request crosses that gap twice.
 
 Speech loads the two directions differently. Recognition sends a few hundred
 kilobytes of audio up and gets a sentence back. Synthesis sends a sentence up
@@ -242,11 +242,9 @@ gateway. Typical deployments include:
 The repository provides this paired data plane. Discovery, global routing, and
 a full mesh control plane belong to a larger overlay product built around it.
 
-The last row is served by a second, experimental profile. GPU capacity
-concentrates in a few regions while turn-taking has to answer in about 20ms,
-which leaves a long hop in the middle that nobody can design away. That hop
-differs from an access link in where its bottleneck is, so it gets its own
-profile rather than the default one: see [the datacenter
+The last row is served by a second, experimental profile. A hop between two
+regions one operator runs differs from an access link in where its bottleneck
+is, so it gets its own profile rather than the default one: see [the datacenter
 profile](docs/DEPLOYING-DC-PROFILE.md), and read its measured limits before
 deploying it, because on a clean path direction a one-line client-side fix
 beats it on the median request.

@@ -15,9 +15,9 @@ carrying requests to inference endpoints.
 
 We need it because of how inference gets deployed. GPU serving wants big
 batches and warm caches, so capacity ends up concentrated in one or two
-regions. Voice activity detection and turn-taking have to answer within about
-20ms, so those run close to the user. That leaves a long hop in the middle,
-owned by one operator, that nobody can design away.
+regions. Ours have run in the US since 2023 while the clients are everywhere.
+That leaves a long hop in the middle, owned by one operator, that nobody can
+design away.
 
 ## When this profile applies
 
