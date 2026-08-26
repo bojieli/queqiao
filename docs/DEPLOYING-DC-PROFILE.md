@@ -36,11 +36,29 @@ settings the measurements assumed, and whether the gateway answers. It does not
 tell you what the path does, because no local check can: that is what
 `pathprobe` is for, and the two figures below are the ones to get from it.
 
-Then do the free things first, because they're worth more than anything below
-and they cost a config line: reuse connections, set the receiver's HTTP/2
-windows, and set `net.ipv4.tcp_slow_start_after_idle=0`. On the path we
-characterized that last one alone took a 300KB burst on an idle connection from
-941ms to 209ms.
+Then do the free things, because they cost a config line and two of the three
+are worth more than anything below: reuse connections, and set the receiver's
+HTTP/2 windows.
+
+The third, `net.ipv4.tcp_slow_start_after_idle=0`, is worth a paragraph of its
+own because it is **direction-specific and we got this wrong at first**. On the
+clean direction it is the single most valuable line here: it took a 300KB burst
+on an idle connection from 941ms to 209ms, and a real speech upload from 790ms
+to 241ms. On a direction that erases, it makes things worse. Measured on the
+synthesis download in one session, a 100KB response took 827.7ms on a cold
+connection and 2281.2ms on a warm one with that sysctl set; a second session put
+the pair at 945.2ms and 6341.1ms.
+
+The reason is Mathis, and it is not subtle once you look. At 14% erasure and a
+200ms round trip the predicted steady-state rate is 0.155 Mbit/s. A cold flow
+beats that because it never reaches steady state: slow start is still ramping
+when the transfer ends. Restore the window between requests and the flow starts
+where cubic's sawtooth actually lives, with more in flight for a multiplicative
+decrease to take away.
+
+So set it where your traffic is uploading into a clean direction, which is the
+common case for inference requests, and do not assume it helps the responses
+coming back.
 
 We mean this literally, and there's a measurement behind it. Running real ASR
 from Guiyang against a model in Irvine, a 355KB upload takes 1185ms on a new

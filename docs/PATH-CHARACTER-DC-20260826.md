@@ -787,9 +787,35 @@ a flow that had produced no evidence of congestion.
 The synthesis side was re-measured in the same session and is unchanged by the
 pacing work, which is what it should be: that direction erases about 14%, so the
 send-side loss guard keeps the gateway metering there. The download leg is
-945.2ms direct against 67.9ms through the transport, **13.9x**, and the leg
+827.7ms direct against 53.4ms through the transport, **15.5x** in the session
+these figures come from and 13.9x in the one before, and the leg
 containing the model agrees between the arms to 3%, which is the check that both
 reached the same server doing the same work.
+
+### Tuning the client makes the erasing direction worse
+
+The sysctl advice is direction-specific, and we found out by accident. Measured
+in one session, minutes apart, on the synthesis download:
+
+| direct TCP, 100KB back | download leg |
+|---|---|
+| new connection | 827.7ms |
+| held open, `tcp_slow_start_after_idle=0` | **2281.2ms** |
+
+A second session put the same pair at 945.2ms and 6341.1ms. The direction is
+consistent and the size of it is not.
+
+Mathis explains both. At this path's 14% erasure and 200ms round trip the
+predicted steady-state rate is 0.155 Mbit/s, which is 5.2 seconds for 100KB.
+The warm figures bracket that; the cold ones beat it. A cold flow beats its own
+steady state because it never reaches it: slow start is still ramping when the
+transfer ends, so the window never gets large enough for a multiplicative
+decrease to have much to take away. Warm it up and the flow starts where cubic's
+sawtooth actually lives.
+
+So the free client fix is free only on the clean direction. On a direction that
+erases, restoring the congestion window hands the controller a larger window to
+collapse from, and the transfer is slower than it would have been cold.
 
 Two cautions about the tail figures. An earlier run of the same comparison, on a
 minute when the path was dropping about 20% of pings, put direct at 834.3ms and

@@ -44,7 +44,10 @@ not this one:
 - **A connection held open is not warm.** `tcp_slow_start_after_idle` defaults
   to 1, so any gap longer than a retransmission timeout throws the window away
   and the next request begins at ten segments again. Six 300KB bursts on one
-  connection took 941ms each, all six.
+  connection took 941ms each, all six. Turning it off fixes that on a clean
+  direction and makes an erasing one worse, which is the first sign that these
+  defaults are not simply wrong: each is a reasonable answer to a question this
+  path does not ask.
 - **Receiver windows are sized for a LAN.** HTTP/2's default connection window
   is the 64KB the RFC specifies, which caps a stream at about 2.6 Mbit/s
   whatever the link can do. 1MB took 3903ms through a receiver at the default
@@ -62,10 +65,11 @@ trying to stop a request from spending five round trips discovering capacity
 that was there the whole time.
 
 It is also why the first thing the deployment guide says is to fix the client.
-Three of those five are one config line each and they cost nothing, and where
-you can apply them they reach the same median this transport does. What they do
-not reach is a connection that is genuinely cold, a direction that erases, or a
-caller you cannot reconfigure.
+Three of those five are one config line each, and on the clean direction they
+reach the same median this transport does. What they do not reach is a
+connection that is genuinely cold, a direction that erases, or a caller nobody
+can reconfigure -- and one of the three actively hurts the erasing direction,
+which is the sort of thing you only find by measuring both.
 
 ## When this profile applies
 
