@@ -285,10 +285,14 @@ func TestAShortBlockIsSizedForDeliveryRatherThanThroughput(t *testing.T) {
 	// The rate estimate an application-limited flow produces. It is low
 	// because the flow is not sending, which is exactly when this must not be
 	// read as "a retransmission is cheap".
-	p := Params{ShardBytes: 120, RateBytesPerSec: 2000, RoundTrip: 200 * time.Millisecond}
+	// A real symbol is a datagram, not a token: the size is what the carrier
+	// allows, and using a small one here would prove something about a
+	// configuration that does not ship.
+	p := Params{ShardBytes: 1100, RateBytesPerSec: 20000, RoundTrip: 200 * time.Millisecond}
 	n, ok := ShardsFor(1, snap, p)
 	if !ok {
-		t.Fatal("a single symbol on a 14% channel got no code at all")
+		t.Fatal("a single symbol on a 14% channel got no code at all, which is what " +
+			"the throughput objective did at this rate estimate")
 	}
 	if n-1 < 3 {
 		t.Fatalf("one symbol got %d repairs; at 14%% erasure that leaves a residual of "+
@@ -302,9 +306,9 @@ func TestAShortBlockIsSizedForDeliveryRatherThanThroughput(t *testing.T) {
 func TestShortBlockSizingDoesNotFollowTheRateEstimate(t *testing.T) {
 	snap := lossmodel.Snapshot{Loss: 0.14, BurstFactor: 1.03, ArrivalAfterLoss: 0.86}
 	var first int
-	for i, rate := range []float64{2000, 20000, 200000} {
+	for i, rate := range []float64{2e4, 1e5, 8.5e5, 2e6} {
 		n, _ := ShardsFor(1, snap, Params{
-			ShardBytes: 120, RateBytesPerSec: rate, RoundTrip: 200 * time.Millisecond,
+			ShardBytes: 1100, RateBytesPerSec: rate, RoundTrip: 200 * time.Millisecond,
 		})
 		if i == 0 {
 			first = n
@@ -312,7 +316,7 @@ func TestShortBlockSizingDoesNotFollowTheRateEstimate(t *testing.T) {
 		}
 		if n < first {
 			t.Fatalf("at %.0f B/s a single symbol got %d shards, fewer than the %d it got "+
-				"at 2000 B/s: the estimate is still deciding the protection", rate, n, first)
+				"at 20000 B/s: the estimate is still deciding the protection", rate, n, first)
 		}
 	}
 }
