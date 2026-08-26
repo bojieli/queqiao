@@ -417,3 +417,36 @@ measured in this document is credit per round trip, and this is what putting a
 zero-round-trip segment at each end does about them.
 
 The application was never configured for any of it.
+
+## The two projects as one system, on the live path
+
+Both real components, no stand-ins: an application inside a captured cgroup,
+`tunless` capturing it with eBPF and serving flow attribution, and the queqiao
+client asking that agent what opened each flow before deciding what it is.
+
+```
+pathmeasure (in a captured cgroup)
+  -> tunless eBPF capture -> SOCKS5 -> queqiao client -> WAN -> gateway
+                                  \-- metadata lookup --/
+```
+
+The client logged, for each flow:
+
+```
+flow class declared from attribution  identity="path=/tmp/pathmeasure"  class=1
+```
+
+and `queqiao_class_transitions_1_total` reached 2, one per flow. The class was
+known before either flow carried a byte, which is the second the classifier
+would otherwise have spent inferring it -- and which a request finishing in
+200ms spends entirely inside.
+
+300KB cold through the whole stack: 686.1ms, against 1111.1ms for the same
+request when the agent was not running.
+
+Two things the components refused, correctly, on the way to this working. The
+metadata server would not open its socket in a directory that grants group or
+world access, because that socket answers questions about what processes are
+doing. And the preflight refused to attach a capture to a cgroup containing
+tunless itself, which would have captured the agent's own connection to its
+upstream and re-captured every packet it forwarded.

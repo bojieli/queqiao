@@ -14,7 +14,11 @@ import (
 
 	"github.com/bojieli/queqiao/internal/classifier"
 	"github.com/bojieli/queqiao/internal/flowmeta"
+	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/profile"
+	"github.com/bojieli/queqiao/internal/protocol"
+	"io"
+	"log/slog"
 )
 
 // fakeAgent serves the capture agent's contract: a Unix socket answering
@@ -204,4 +208,79 @@ func TestAMisspelledHintFailsEarly(t *testing.T) {
 	if err := good.ValidateHints(); err != nil {
 		t.Errorf("a valid hint was rejected: %v", err)
 	}
+}
+
+// A declared class is counted like any other transition. Without that the
+// whole mechanism is invisible in telemetry: an operator reading
+// class_transitions sees zero and concludes the hints never fired, which is
+// indistinguishable from them not being configured at all.
+func TestADeclaredClassIsCounted(t *testing.T) {
+	reg := metrics.New()
+	c := &Client{cfg: ClientConfig{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Profile: profile.Profile{ClassHints: []profile.ClassHint{
+			{Match: "path=/app/voice", Class: "interactive"},
+		}},
+		FlowMetadataSocket: fakeAgent(t, map[uint16]map[string]any{
+			5555: {"PID": 1, "Path": "/app/voice", "Workload": map[string]any{"kind": "unknown"}},
+		}),
+	}, metrics: reg}
+	c.flowMeta = flowmeta.New(c.cfg.FlowMetadataSocket, time.Second)
+
+	inner, peer := net.Pipe()
+	defer inner.Close()
+	defer peer.Close()
+	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 1, 64*1024,
+		protocol.FlagAckUp, protocol.FlagAckDown, nil, reg, nil)
+
+	c.declareClass(context.Background(), &portConn{Conn: inner, port: 5555}, flow)
+
+	if got := classifier.Class(flow.class.Load()); got != classifier.ClassInteractive {
+		t.Errorf("flow class = %v, want interactive", got)
+	}
+	if n := reg.Snapshot().ClassTransitions[1]; n != 1 {
+		t.Errorf("interactive transitions = %d, want 1", n)
+	}
+}
+
+// An unmatched identity leaves the flow and the counters alone.
+func TestAnUnmatchedIdentityCountsNothing(t *testing.T) {
+	reg := metrics.New()
+	c := &Client{cfg: ClientConfig{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Profile: profile.Profile{ClassHints: []profile.ClassHint{
+			{Match: "path=/app/voice", Class: "interactive"},
+		}},
+		FlowMetadataSocket: fakeAgent(t, map[uint16]map[string]any{
+			5555: {"PID": 1, "Path": "/usr/bin/curl", "Workload": map[string]any{"kind": "unknown"}},
+		}),
+	}, metrics: reg}
+	c.flowMeta = flowmeta.New(c.cfg.FlowMetadataSocket, time.Second)
+
+	inner, peer := net.Pipe()
+	defer inner.Close()
+	defer peer.Close()
+	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 1, 64*1024,
+		protocol.FlagAckUp, protocol.FlagAckDown, nil, reg, nil)
+
+	c.declareClass(context.Background(), &portConn{Conn: inner, port: 5555}, flow)
+
+	if got := classifier.Class(flow.class.Load()); got != classifier.ClassNew {
+		t.Errorf("an unmatched flow was classified %v", got)
+	}
+	for i, n := range reg.Snapshot().ClassTransitions {
+		if n != 0 {
+			t.Errorf("class %d counted %d transitions for an unmatched identity", i, n)
+		}
+	}
+}
+
+// portConn reports a chosen source port, which is what the lookup is keyed by.
+type portConn struct {
+	net.Conn
+	port int
+}
+
+func (p *portConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: p.port}
 }

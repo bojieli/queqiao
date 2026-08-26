@@ -2619,6 +2619,14 @@ func (c *Client) declareClass(ctx context.Context, inner net.Conn, flow *multipa
 	}
 	flow.classifier.Declare(class)
 	flow.class.Store(uint32(protocol.Class(class)))
+	// Counted like any other transition. A declared class never passes through
+	// Observe, so without this the whole mechanism is invisible in telemetry:
+	// an operator reading class_transitions would see zero and conclude the
+	// hints never fired, which is indistinguishable from them not being
+	// configured.
+	if c.metrics != nil {
+		c.metrics.ClassTransition(int(class))
+	}
 	c.cfg.Logger.Debug("flow class declared from attribution",
 		"identity", identity, "class", class)
 }
