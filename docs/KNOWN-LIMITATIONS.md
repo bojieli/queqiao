@@ -31,7 +31,13 @@ qualification items are still open.
 
   `internal/pep/case4_test.go` asserts this behaviour rather than the fix, so
   it cannot change silently in either direction, and the redesign document
-  records what was tried, in what order, and which of it was wrong.
+  records what was tried, in what order, and which of it was wrong. It has since
+  earned that design twice: a change letting a sender release a burst when
+  neither brake reported anything took the same emulated policer from 3.0x to
+  4.0x and its loss from 32.9% to 54.9%, because on a policer neither brake
+  reports anything by construction. The burst is now also gated on the sending
+  direction being close to lossless, which is a guard against the blind spot
+  rather than a fix for it.
 - The `dc-long-haul` profile is qualified on exactly one path. Everything known
   about it comes from a Guiyang-to-Irvine link, so its constants are that
   link's constants until a second path either confirms them or doesn't. It is

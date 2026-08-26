@@ -15,6 +15,13 @@ can establish correctness, behavior under controlled impairment, and a fair
 same-window comparison; it cannot turn one path into a universal performance
 claim.
 
+`cmd/queqiaobench --cpuprofile` is how to ask where the CPU goes, and it is
+worth knowing that nothing in the data path had a benchmark until a profile
+found a bandwidth-estimator loop rescanning the whole send window on every
+acknowledgement, at 13% of all samples. A profile of a 300 Mbit/s transfer puts
+encryption at under 2% and the coding below the top twenty; what dominates is
+the syscall per batch of packets.
+
 This document covers the emulated rig, which is where a result is reproducible.
 For measuring a live path instead, `cmd/pathprobe` describes the path and
 `cmd/pathmeasure` describes what a stack achieves on it, including
