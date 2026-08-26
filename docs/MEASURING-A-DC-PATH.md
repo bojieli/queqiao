@@ -149,6 +149,13 @@ the socket layer isn't escaped by binding a source address or an interface;
 terminates at the server you're measuring, the result describes the proxy.
 `-local-address` only helps when the redirect is routing-based.
 
+Check before trusting any baseline, because the symptom is quiet: a direct arm
+that reports a 1.9ms connect on a 193ms path is not connecting to what you
+think. `route -n get <dest>` naming a `utun` interface, or a gateway inside
+`198.18.0.0/15`, means the direct arm isn't direct. We threw out a whole
+second-path control this way after the numbers came back at 1.03x, which is
+what you get when both arms share an outer tunnel that was already warm.
+
 **Completion has to be acknowledged by the peer.** Timing an upload by watching
 the local socket drain measures how long bytes took to reach a proxy's buffer
 on loopback. Our first tunnel comparison reported 17 Gbit/s across a 200ms

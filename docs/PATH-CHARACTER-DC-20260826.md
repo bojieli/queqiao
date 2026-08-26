@@ -548,7 +548,46 @@ retransmit, on a path whose download direction loses around 14% of packets in a
 memoryless pattern that has nothing to do with congestion. Repairing that
 without a round trip is the one thing here that a sysctl cannot do.
 
-So the honest summary of this section: fix the client first, because it is free
-and it is worth more than anything else on the median. Then the transport is
-for the cases the client fix does not reach -- cold connections, applications
-you cannot reconfigure, and the tail.
+### The client fix works in one direction only
+
+Run the same tuned client against the TTS side and it stops working. Sixteen
+paired rounds, connections held open, `tcp_slow_start_after_idle=0` set:
+
+| download of a 100KB MP3 | direct | queqiao |
+|---|---|---|
+| new connection, stock kernel | 916.2ms | 74.9ms |
+| held open, `ssai=0` | 629.4ms | **71.4ms** |
+
+Tuning the client moves 916.2ms to 629.4ms and then stops, while the transport
+sits at 71.4ms either way. That is 8.8x, against the same tuned client that beat
+us by 1.3x on the upload.
+
+The reason is in the second table of this document. This path's two directions
+are not the same path. Guiyang to Irvine dropped 0 packets out of 41,663.
+Irvine to Guiyang erases around 14%, memorylessly, at every rate below the knee.
+
+ASR uploads the audio, so it runs on the clean direction, and on a clean
+direction a congestion window that never gets thrown away is all TCP needs. The
+sysctl supplies exactly that, which is why it reaches the floor.
+
+TTS downloads the audio, so it runs on the erasing direction, and there the
+window is not the problem. Cubic reads 14% loss as congestion and backs off,
+and no sysctl changes that, because the sysctl fixes what happens after an idle
+gap and this is what happens during a transfer. Repairing an erasure without
+spending a round trip on it is a transport decision.
+
+### What this section concludes
+
+Fix the client first. It is free, and on the clean direction it is worth more
+than we are: 1133.5ms to 225.8ms on ASR, which beats this profile's 295.0ms.
+
+Then deploy the transport for the three things that fix does not reach:
+
+- **Cold connections.** 1133.5ms against 290.2ms. Anything that dials, or has
+  been idle past an RTO, or runs behind a load balancer that doesn't pool.
+- **Callers you can't reconfigure.** The sysctl and the connection pooling are
+  both client-side changes. Where the client is a vendor's SDK or a customer's
+  code, neither is available.
+- **Any direction that erases.** 8.8x on TTS download against a fully tuned
+  client, and a p99 of 373.5ms against 1026.5ms on ASR. This is the part that
+  is actually ours, and it is the part a config change cannot buy.
