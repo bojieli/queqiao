@@ -98,6 +98,13 @@ type ErasureSender struct {
 	// the congestion window, which run outside the callback that computes it.
 	arrival atomic.Uint64 // arrival rate in parts per million
 
+	// congestive is the share of loss the estimator attributes to this
+	// instant's sending rate rather than to the channel's own erasure, in
+	// parts per million. It is the only part a sender can remove by slowing
+	// down, and it is published here because the pacer runs outside the
+	// callback that computes it.
+	congestive atomic.Uint64
+
 	// passed counts the losses handed to the inner controller, which is now
 	// all of them. It stays because the telemetry below is an assertion as
 	// much as a measurement: what this sender saw and what the controller was
@@ -203,18 +210,10 @@ func newErasureSender(initialPacketSize quiccongestion.ByteCount) *ErasureSender
 	}
 	e.arrival.Store(partsPerMillion)
 	e.pacer = newTUICPacer(e.bandwidth)
+	e.pacer.setBurstFloor(e.unmeteredBurst)
 	return e
 }
 
-// bandwidth is the rate to put on the wire: BBR's estimate of what arrives,
-// bounded by this lane's share of the endpoint pair's bottleneck, and divided
-// by the fraction that arrives.
-//
-// The cap is what keeps lanes from compounding. Each lane's own estimate is
-// what it alone is receiving, so four lanes each probing above their own
-// estimate put four times the overshoot into one bottleneck; capping at the
-// share means the aggregate on the wire is what a single sender would have put
-// there.
 func (e *ErasureSender) bandwidth() quiccongestion.ByteCount {
 	delivered := float64(e.inner.bandwidth())
 	if share := float64(e.share.Load()); share > 0 && share < delivered {
@@ -364,6 +363,42 @@ func (e *ErasureSender) delayBounded(rate float64) float64 {
 	return rate * factor
 }
 
+// unmeteredBurst is how much this sender may release without the pacer
+// metering it, and it is the answer to a question the pacer was never asking.
+//
+// Pacing exists to stop a sender building a standing queue at a bottleneck.
+// This controller already knows whether one is forming: queueDelay reports what
+// the path is holding beyond its own minimum, and the loss estimator separates
+// the channel's rate-independent erasure from the part that only appears when
+// you push. Neither was wired to the pacer, which metered unconditionally at a
+// bandwidth estimate that a request-shaped flow cannot raise, because such a
+// flow is application-limited by construction: measured on the datacenter path,
+// one flow estimated 42 Mbit/s where sixteen estimated 88, and a 355KB request
+// spent 67ms being metered at the former against about 9ms of real wire time.
+// That was this transport's entire deficit against a tuned TCP client.
+//
+// So the rule is the one the controller's own policy already states. The delay
+// bound permits a queue of up to one round trip, which is the same statement as
+// one bandwidth-delay product. Below that, and with no loss the estimator
+// attributes to rate, there is nothing for pacing to protect: the congestion
+// window and the acknowledgement clock bound the send, which is what an unpaced
+// TCP does and why a tuned one reaches this path's floor. At the bound, or once
+// loss starts tracking rate, metering resumes at the estimate.
+//
+// The response is one round trip away in the worst case, which is the same
+// latency every window-based controller accepts, and a burst loss on the way
+// there is repaired by the code rather than by a retransmission.
+func (e *ErasureSender) unmeteredBurst() quiccongestion.ByteCount {
+	if float64(e.congestive.Load())/partsPerMillion > 0 {
+		return 0
+	}
+	queue, minRTT := e.queueDelay()
+	if minRTT <= 0 || queue >= minRTT {
+		return 0
+	}
+	return e.GetCongestionWindow()
+}
+
 func (e *ErasureSender) TimeUntilSend(quiccongestion.ByteCount) monotime.Time {
 	return e.pacer.timeUntilSend()
 }
@@ -443,6 +478,11 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		e.estimator.ObserveOutcome(outcome.arrived)
 	}
 	snapshot := e.estimator.Snapshot()
+	if snapshot.Congestive > 0 {
+		e.congestive.Store(uint64(snapshot.Congestive * partsPerMillion))
+	} else {
+		e.congestive.Store(0)
+	}
 	erasure := snapshot.Loss
 	if e.path != nil {
 		// Pool with the other lanes: the estimate converges on all their
