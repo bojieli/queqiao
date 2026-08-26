@@ -112,7 +112,8 @@ gets 5 to 10 times faster completion from the pre-warmed connection pool alone.
 Optional, and worth it when your workloads differ. The classifier needs about a
 second to decide, and a request that finishes in 200ms is gone before then.
 
-Run a capture agent that reports what opened each flow -- `tunless` does this --
+Run a capture agent that reports what opened each flow.
+[`tunless`](https://github.com/bojieli/tunless) does this,
 and point the client at its socket:
 
 ```sh
@@ -140,9 +141,10 @@ can't, a capture agent puts it there without the application knowing.
 app -> capture -> SOCKS5 -> queqiao client -> WAN -> gateway -> destination
 ```
 
-`tunless` does the capture. Its socket-layer backend needs cgroup v2, CAP_BPF
-and a 5.7 kernel and is fail-open; its `--backend redirect` needs only
-netfilter and is not. Pick the first where you can.
+[`tunless`](https://github.com/bojieli/tunless) does the capture. Its
+socket-layer backend needs cgroup v2, CAP_BPF and a 5.7 kernel and is
+fail-open; its `--backend redirect` needs only netfilter and is not. Pick the
+first where you can.
 
 Measured on the China-US path with an unmodified application: 300KB cold in
 624.9ms through the whole stack against 1089.3ms direct, and 381.2ms once warm.

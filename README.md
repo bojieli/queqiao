@@ -38,16 +38,20 @@ The same problem turned up between two machines we own. This has been our own
 pain point since 2023: the models run in the US and the clients are everywhere,
 so every speech request crosses that gap twice.
 
-Speech loads the two directions differently. Recognition sends a few hundred
-kilobytes of audio up and gets a sentence back. Synthesis sends a sentence up
-and gets a few hundred kilobytes back, in one burst once the model finishes.
-Each is a single transfer that has to complete before anything else happens,
-which is the shape a long path is worst at.
+Recognition sends a few hundred kilobytes of audio up and gets a sentence back.
+Synthesis sends a sentence up and gets a few hundred kilobytes back, in one
+burst once the model finishes. Each is a single transfer that has to finish
+before anything else happens, which is the shape a long path is worst at.
 
 Guiyang to a model in Irvine: a 355KB recognition upload takes **1133ms**, of
-which the model spends 38ms. The synthesis burst takes **916ms** to move.
-Through Queqiao, **290ms** and **75ms**. See the [datacenter
-profile](docs/DEPLOYING-DC-PROFILE.md).
+which the model spends 38ms; the synthesis burst back takes **916ms**. Through
+Queqiao, **290ms** and **75ms**.
+
+Almost none of that is the network. The path could carry 355KB in about 9ms.
+The rest is a handshake, a transfer starting at ten segments, and a window
+thrown away between requests. [Why this profile
+exists](docs/DESIGN-DC-PROFILE.md) walks through each; [the
+runbook](docs/DEPLOYING-DC-PROFILE.md) is how to run it.
 
 ## Why Queqiao?
 

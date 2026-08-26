@@ -19,6 +19,47 @@ regions. Ours have run in the US since 2023 while the clients are everywhere.
 That leaves a long hop in the middle, owned by one operator, that nobody can
 design away.
 
+## Where the time actually goes
+
+A 355KB speech request from Guiyang to a model in Irvine takes 1133ms. The
+model spends 38ms of it.
+
+Nothing about the path explains the rest. Its round trip is 199ms and its
+capacity knee is 333 Mbit/s, so 355KB is about 9ms of wire time. Two round
+trips would carry the request and the answer, and that would be roughly 400ms.
+
+The missing 700ms is a stack of defaults, each of which was chosen for a link
+that is not this one:
+
+- **The handshake buys nothing and costs a round trip.** 187ms of the 1133ms is
+  a connection being opened for a single request.
+- **The transfer starts at ten segments.** Linux opens with an initial window
+  of 10 MSS, about 14.5KB, and doubles once per round trip. Reaching 355KB
+  takes five of those, which on this path is a second by itself.
+- **A connection held open is not warm.** `tcp_slow_start_after_idle` defaults
+  to 1, so any gap longer than a retransmission timeout throws the window away
+  and the next request begins at ten segments again. Six 300KB bursts on one
+  connection took 941ms each, all six.
+- **Receiver windows are sized for a LAN.** HTTP/2's default connection window
+  is the 64KB the RFC specifies, which caps a stream at about 2.6 Mbit/s
+  whatever the link can do. 1MB took 3903ms through a receiver at the default
+  and 193ms through the same receiver with the window opened.
+- **Loss here is not congestion, and TCP cannot tell.** The downstream
+  direction erases about 14% of packets independently of the offered rate.
+  Cubic reads that as congestion and settles at a fraction of a megabit, which
+  Mathis predicts to within the measurement, while an open-loop probe pulls 256
+  Mbit/s across the same channel in the same minutes.
+
+Every one of those is a credit-per-round-trip problem, and a 199ms round trip
+is what turns each into hundreds of milliseconds. That is the whole reason this
+profile exists: on this path the transport is not fighting for bandwidth, it is
+trying to stop a request from spending five round trips discovering capacity
+that was there the whole time.
+
+It is also why the first thing the deployment guide says is to fix the client.
+Three of those five are one config line each, they cost nothing, and on a path
+direction that does not erase they are worth more than this transport is.
+
 ## When this profile applies
 
 Use it when all three hold:
