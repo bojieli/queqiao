@@ -468,3 +468,34 @@ func TestNoRoundTripMeasurementKeepsTheConstant(t *testing.T) {
 			"whether a queue is forming, so it must not stop metering", got)
 	}
 }
+
+// A policer is the path where bursting is worst and where both of the signals
+// above read clean: it holds no queue, and its loss is sustained enough that
+// the estimator's floor rises to meet it and reports nothing congestive.
+// Gating on those two alone took an emulated policer from 3.0x overdrive to
+// 4.0x and from 32.9% loss to 54.9%, because metering was the last thing
+// holding the rate down. See internal/pep/case4_test.go.
+func TestALossyDirectionIsStillMetered(t *testing.T) {
+	e := senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond)
+	if e.unmeteredBurst() <= 0 {
+		t.Fatal("precondition: a clean quiet path should not be metered")
+	}
+	e.erasure.Store(uint64(0.33 * partsPerMillion))
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Fatalf("a direction losing a third of what it sends reported an unmetered "+
+			"burst of %d; on a policed path neither the delay bound nor the congestive "+
+			"component can see the overload, so this is the only thing left", got)
+	}
+}
+
+// The datacenter path's upload direction lost nothing at all, which is the case
+// the burst exists for. A trace of loss must not close the gate, or the rule
+// would never fire on a real link.
+func TestAnAlmostCleanDirectionStillBursts(t *testing.T) {
+	e := senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond)
+	e.erasure.Store(uint64(0.001 * partsPerMillion))
+	if e.unmeteredBurst() <= 0 {
+		t.Fatal("a direction losing one packet in a thousand is being metered; the " +
+			"measured datacenter upload lost 0 of 41,663 and this rule has to fire there")
+	}
+}

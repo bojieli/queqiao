@@ -392,12 +392,43 @@ func (e *ErasureSender) unmeteredBurst() quiccongestion.ByteCount {
 	if float64(e.congestive.Load())/partsPerMillion > 0 {
 		return 0
 	}
+	// A policer is the case neither brake can see: it drops what it cannot
+	// pass and holds nothing, so there is no queue for the delay bound to
+	// measure, and its loss is sustained enough that the estimator's floor
+	// rises to meet it and reports no congestive component. Both signals above
+	// therefore read clean on exactly the path where bursting is worst.
+	// internal/pep/case4_test.go records that this transport already overdrives
+	// such a path; measured against it, gating on those two signals alone took
+	// the overdrive from 3.0x to 4.0x and the loss from 32.9% to 54.9%, because
+	// metering was the last thing holding the rate down.
+	//
+	// So the burst also requires the direction being sent into to be delivering
+	// essentially everything. That is not a third signal so much as a refusal
+	// to act on the absence of the first two: where loss is already high, this
+	// sender cannot tell its own contribution from the channel's, and the safe
+	// reading of an ambiguous channel is to keep metering. Where loss is
+	// absent, a burst that starts causing it shows up as loss within a round
+	// trip and closes this gate.
+	if float64(e.erasure.Load())/partsPerMillion > burstLossCeiling {
+		return 0
+	}
 	queue, minRTT := e.queueDelay()
 	if minRTT <= 0 || queue >= minRTT {
 		return 0
 	}
 	return e.GetCongestionWindow()
 }
+
+// burstLossCeiling is how much loss the sending direction may show and still
+// permit an unmetered burst.
+//
+// The two paths this project has measured sit far apart on either side of it,
+// which is the only reason a threshold is defensible here at all: the
+// datacenter link's upload direction lost 0 of 41,663 datagrams, and an
+// emulated policer shaped to its own capacity loses a third of everything.
+// Anything in between is a channel this sender cannot characterize from its
+// own traffic, and it meters rather than guess.
+const burstLossCeiling = 0.01
 
 func (e *ErasureSender) TimeUntilSend(quiccongestion.ByteCount) monotime.Time {
 	return e.pacer.timeUntilSend()

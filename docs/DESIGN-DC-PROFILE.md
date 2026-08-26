@@ -154,6 +154,25 @@ That took the median from 299.0ms to 248.1ms against a tuned client's 229.5ms,
 and it is profile-independent: a path that is congested produces the evidence
 and gets paced whichever profile it runs.
 
+Which is where the first version of the fix was wrong, and the way it was wrong
+is worth keeping. A policer is the path where bursting is worst, and it is
+invisible to both of those signals: it drops what it cannot pass and holds
+nothing, so there is no queue for the delay bound, and its loss is sustained
+enough that the estimator's floor rises to meet it and reports no congestive
+component. `internal/pep/case4_test.go` already records that this transport
+overdrives such a path. Gating on delay and congestive loss alone made it
+worse, from 3.0x overdrive to 4.0x and from 32.9% loss to 54.9%, because
+metering had been the last thing holding the rate down.
+
+The burst therefore also requires the direction being sent into to be
+delivering essentially everything. That is less a third signal than a refusal
+to act on the absence of the first two: where loss is already high this sender
+cannot separate its own contribution from the channel's, and an ambiguous
+channel is one to keep metering. The two paths measured sit far apart on either
+side of that line, which is the only reason a threshold is defensible: the
+datacenter upload lost 0 of 41,663 datagrams, and the emulated policer loses a
+third of everything.
+
 ## The five shapes this profile carries
 
 The profile was designed from one workload, a request of a few hundred
