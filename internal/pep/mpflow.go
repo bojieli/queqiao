@@ -361,6 +361,14 @@ type multipathFlow struct {
 
 	reinjections atomic.Uint64
 
+	// recentMu guards the two-bucket window behind recentBytes, which decides
+	// whether this flow is conversing or transferring at the moment rather
+	// than over its whole life.
+	recentMu               sync.Mutex
+	recentStart            time.Time
+	currentUp, currentDown uint64
+	priorUp, priorDown     uint64
+
 	replayMu sync.Mutex
 	// closeFrame is this flow's half-close, retained until the peer
 	// acknowledges it so a replacement lane can be handed it. It is the whole
@@ -966,20 +974,34 @@ func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool 
 func (f *multipathFlow) prefersCodingOverRetransmission() bool {
 	// How much this flow has moved is the immediate answer; the class is the
 	// considered one. Both are needed because they become available at
-	// different times.
-	//
-	// The class takes a second to settle, and a transfer from a fast local
-	// destination produces most of its frames inside that second -- measured
-	// live, 265 of a download's 557 data frames were coded before the class
-	// caught up. A flow that has already moved more than a small exchange's
-	// worth is not a small exchange, whatever it is later decided to be, and
-	// coding it spends bandwidth to save round trips it was not going to
-	// notice.
-	if f.bytesUp.Load()+f.bytesDown.Load() > codedFlowBytes {
-		return false
-	}
+	// different times, and each is wrong about a case the other gets right.
 	f.refreshClass()
-	return classifier.Class(f.class.Load()) != classifier.ClassBulk
+	switch classifier.Class(f.class.Load()) {
+	case classifier.ClassBulk:
+		// Measured by bytes per second, and a code that provisions for the
+		// binomial spends more of them than retransmitting what was lost.
+		return false
+	case classifier.ClassInteractive:
+		// A sequence of small exchanges, however many of them it has done.
+		//
+		// The byte cutoff below cannot see this and gets it exactly backwards.
+		// Eighty bytes fifty times a second is four kilobytes a second, so a
+		// voice call crosses the cutoff after about a minute and carries the
+		// rest of itself uncoded -- losing its repair precisely where the
+		// repair matters, because a stream of small messages separated by idle
+		// never amortises a round trip over anything. Every lost frame pays a
+		// full round trip by itself. Measured on an emulated 14% path, an
+		// uncoded frame stream loses 71 of 400 frames outright where a
+		// duplicated one loses 10, and the delivered frames are no slower.
+		return true
+	}
+	// Still unclassified. The class takes a second to settle, and a transfer
+	// from a fast local destination produces most of its frames inside that
+	// second -- measured live, 265 of a download's 557 data frames were coded
+	// before the class caught up. A flow that has already moved more than a
+	// small exchange's worth is not a small exchange, whatever it is later
+	// decided to be.
+	return f.bytesUp.Load()+f.bytesDown.Load() <= codedFlowBytes
 }
 
 // codedFlowBytes is how much a flow may carry and still be treated as an
@@ -2442,11 +2464,54 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 	}
 }
 
-// smallExchangeBytes is how much a direction may carry and still be one of
-// the small exchanges an interactive flow is made of. It matches the
+// smallExchangeBytes is how much a direction may carry per second and still be
+// one of the small exchanges an interactive flow is made of. It matches the
 // classifier's own new-flow byte budget: past this, a direction is carrying
 // content rather than conversation.
+//
+// It is a rate rather than a total. Measuring the total made the signal expire
+// with the flow's age: a voice call carrying eighty bytes fifty times a second
+// crosses any fixed byte budget eventually, and then stops looking like a
+// conversation for the rest of the call however it behaves. Sixty-four
+// kilobytes a second is half a megabit, which no conversation approaches and
+// no transfer stays under.
 const smallExchangeBytes = 64 * 1024
+
+// exchangeWindow is the period the rate above is measured over. It is longer
+// than a round trip on the paths this project targets, so a single burst in
+// flight does not fill it, and short enough that a flow which changes what it
+// is doing is reclassified within a few seconds.
+const exchangeWindow = time.Second
+
+// recentBytes reports what each direction has carried in the last
+// exchangeWindow, which is what says whether this flow is conversing or
+// transferring right now.
+//
+// The window is a pair of buckets rather than a ring: one accumulating and one
+// finished. When the accumulating bucket ages out it becomes the finished one
+// and a fresh bucket starts, so the reported figure covers between one and two
+// windows of traffic. That is coarse, and it is deliberately coarser than the
+// decision it feeds: the classifier's thresholds are an order of magnitude
+// apart, so a factor of two in the measurement window cannot move a
+// conversation across them.
+func (f *multipathFlow) recentBytes(now time.Time, n int, up bool) (uint64, uint64) {
+	f.recentMu.Lock()
+	defer f.recentMu.Unlock()
+	if f.recentStart.IsZero() {
+		f.recentStart = now
+	}
+	if now.Sub(f.recentStart) >= exchangeWindow {
+		f.priorUp, f.priorDown = f.currentUp, f.currentDown
+		f.currentUp, f.currentDown = 0, 0
+		f.recentStart = now
+	}
+	if up {
+		f.currentUp += uint64(n)
+	} else {
+		f.currentDown += uint64(n)
+	}
+	return f.currentUp + f.priorUp, f.currentDown + f.priorDown
+}
 
 func (f *multipathFlow) observe(n int, up bool) bool {
 	now := time.Now()
@@ -2463,6 +2528,7 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 	} else {
 		downBytes += uint64(n)
 	}
+	recentUp, recentDown := f.recentBytes(now, n, up)
 	obs := classifier.Observation{
 		BytesUp: upBytes, BytesDown: downBytes,
 		UpRate: float64(upBytes) / age.Seconds(), DownRate: float64(downBytes) / age.Seconds(),
@@ -2473,8 +2539,8 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 			}
 			return now.Sub(time.Unix(0, previousPayload))
 		}(),
-		// Whether this flow is made of small exchanges, not whether this
-		// particular read was small.
+		// Whether this flow is made of small exchanges, measured over a recent
+		// window rather than over its whole life.
 		//
 		// Taking it from the read size made a download permanently
 		// unclassifiable: a 10 MB transfer is read in 16 KiB chunks, so every
@@ -2484,7 +2550,16 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 		// flow stayed ClassNew to the end and was coded from first byte to
 		// last, which cost about a fifth of its throughput on the measured
 		// path.
-		SmallBidirectionalBursts: upBytes <= smallExchangeBytes && downBytes <= smallExchangeBytes,
+		//
+		// Taking it from the lifetime total has the opposite failure and it is
+		// the one that matters for a session. Any long-lived conversation
+		// eventually carries more than a fixed budget, so it stops satisfying
+		// this and is demoted to bulk while still behaving exactly as it
+		// always did. A voice call reaches that point after about a minute.
+		//
+		// A recent rate is right for both. A transfer never drops under it; a
+		// conversation never reaches it, whatever its age.
+		SmallBidirectionalBursts: recentUp <= smallExchangeBytes && recentDown <= smallExchangeBytes,
 	}
 	oldClass := classifier.Class(f.class.Load())
 	newClass := f.classifier.Observe(obs)

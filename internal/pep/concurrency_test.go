@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -476,4 +477,135 @@ func echoFrames(ln net.Listener) {
 			}
 		}(c)
 	}
+}
+
+// A session has to keep its repair after it crosses the byte cutoff, which is
+// where the old rule silently withdrew it.
+//
+// codedFlowBytes is 256KB. A voice call at four kilobytes a second reaches
+// that after about a minute, and before this was fixed it then carried the
+// rest of itself uncoded: the cutoff was written for a transfer, where round
+// trips amortise over many bytes, and applied to a session, where every lost
+// message pays a full round trip by itself.
+//
+// The messages here are 600 bytes at 50Hz, thirty kilobytes a second, so the
+// flow crosses the cutoff in about nine seconds instead of a minute. The rate
+// is still well inside what a conversation looks like.
+func TestASessionKeepsItsRepairPastTheByteCutoff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs a session across an emulated path for long enough to cross the cutoff")
+	}
+	const (
+		// A real voice frame at a real cadence: four kilobytes a second, which
+		// is nowhere near the rate separating a conversation from a transfer.
+		msgSize  = 80
+		cadence  = 20 * time.Millisecond
+		messages = 2600 // 52 seconds of speech, past the cutoff with room after
+	)
+	path := pathsim.DCLongHaul()
+	socks, destination := codedPairWith(t, true, &path, func(ln net.Listener) {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, msgSize)
+				for {
+					if _, err := io.ReadFull(c, buf); err != nil {
+						return
+					}
+					if _, err := c.Write(buf); err != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	})
+
+	conn, err := trySocksDial(socks, destination, 120*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Sending and receiving run apart. A voice stream does not hold the next
+	// frame until the last one is acknowledged, and a test that does is
+	// clocked by the round trip rather than by the cadence: at 208ms per
+	// exchange it sends five frames a second instead of fifty and never
+	// reaches the byte volume it was written to cross.
+	var mu sync.Mutex
+	sentAt := make(map[uint32]time.Time, messages)
+	var beforeCutoff, afterCutoff latencies
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		buf := make([]byte, msgSize)
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			seq := binary.LittleEndian.Uint32(buf[:4])
+			mu.Lock()
+			at, ok := sentAt[seq]
+			if ok {
+				rtt := float64(time.Since(at).Microseconds()) / 1000
+				// Each message costs msgSize in each direction.
+				if int(seq)*msgSize*2 < codedFlowBytes {
+					beforeCutoff = append(beforeCutoff, time.Duration(rtt*float64(time.Millisecond)))
+				} else {
+					afterCutoff = append(afterCutoff, time.Duration(rtt*float64(time.Millisecond)))
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+
+	msg := make([]byte, msgSize)
+	tick := time.NewTicker(cadence)
+	defer tick.Stop()
+	for i := 0; i < messages; i++ {
+		<-tick.C
+		binary.LittleEndian.PutUint32(msg[:4], uint32(i))
+		mu.Lock()
+		sentAt[uint32(i)] = time.Now()
+		mu.Unlock()
+		if _, err := conn.Write(msg); err != nil {
+			break
+		}
+	}
+	time.Sleep(2 * time.Second) // let the tail come back
+	conn.Close()
+	<-done
+
+	mu.Lock()
+	before, after := beforeCutoff, afterCutoff
+	mu.Unlock()
+	if len(before) == 0 || len(after) == 0 {
+		t.Fatalf("the session did not straddle the cutoff: %d before, %d after",
+			len(before), len(after))
+	}
+	before.report(t, "before cutoff")
+	after.report(t, "after cutoff")
+	// The class is the mechanism and the sharp assertion. A session demoted to
+	// bulk stops preferring coding, and on this path that is the difference
+	// between repairing a lost frame inside the round trip that carried it and
+	// waiting out a timeout. The latency below is reported rather than
+	// asserted, because the frame tail on an ordered stream is bad throughout
+	// -- that is a separate problem, and averaging the two together would let
+	// either one hide the other.
+	if reg := lastClientMetrics; reg != nil {
+		snap := reg.Snapshot()
+		t.Logf("class transitions: interactive=%d bulk=%d",
+			snap.ClassTransitions[1], snap.ClassTransitions[2])
+		if snap.ClassTransitions[2] > 0 {
+			t.Errorf("the session was demoted to bulk after carrying %d bytes; "+
+				"a call longer than a minute loses its repair exactly where it needs it",
+				messages*msgSize*2)
+		}
+	}
+	t.Logf("p99 before the cutoff %v, after %v", before.quantile(0.99), after.quantile(0.99))
 }

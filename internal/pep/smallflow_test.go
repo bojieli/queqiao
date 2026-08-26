@@ -912,3 +912,161 @@ func TestAShortFlowCostsARoundTrip(t *testing.T) {
 		t.Errorf("a short flow costs %v against a round trip of %v", median.Round(time.Millisecond), roundTrip)
 	}
 }
+
+// A voice session is a sequence of small exchanges however many it has done,
+// and the byte cutoff above cannot see that.
+//
+// Eighty bytes fifty times a second is four kilobytes a second, so a call
+// crosses codedFlowBytes after about sixty-four seconds and then carries the
+// rest of itself uncoded. That is exactly backwards: the reason the cutoff
+// exists is that a transfer amortises a round trip over many bytes, and a
+// stream of small messages separated by idle never amortises anything. Every
+// lost frame pays a full round trip on its own.
+//
+// Measured on an emulated 14% path, an uncoded frame stream loses 71 of 400
+// frames outright while a duplicated one loses 10.
+func TestALongInteractiveSessionKeepsCoding(t *testing.T) {
+	inner, peer := net.Pipe()
+	defer inner.Close()
+	defer peer.Close()
+	f := newMultipathFlow(context.Background(), inner, [16]byte{1}, 1, 64*1024,
+		protocol.FlagAckUp, protocol.FlagAckDown, nil, nil, nil)
+
+	// Two minutes of a voice call: past the cutoff, and still small messages
+	// with a gap between them.
+	f.bytesUp.Store(4 * 1024 * 120)
+	f.bytesDown.Store(4 * 1024 * 120)
+	f.started = time.Now().Add(-120 * time.Second)
+	// Frames keep arriving at a conversational rate: eighty bytes every 20ms.
+	for i := 0; i < 60; i++ {
+		f.observe(80, i%2 == 0)
+	}
+
+	if !f.prefersCodingOverRetransmission() {
+		t.Fatalf("a %d-byte interactive session stopped coding; a call longer "+
+			"than about a minute loses its repair exactly where it needs it",
+			f.bytesUp.Load()+f.bytesDown.Load())
+	}
+}
+
+// The cutoff still has to catch the case it was written for: a fast download
+// producing most of its frames before the class settles.
+func TestAFastDownloadStillStopsCodingBeforeItsClassSettles(t *testing.T) {
+	inner, peer := net.Pipe()
+	defer inner.Close()
+	defer peer.Close()
+	f := newMultipathFlow(context.Background(), inner, [16]byte{1}, 1, 64*1024,
+		protocol.FlagAckUp, protocol.FlagAckDown, nil, nil, nil)
+	f.bytesDown.Store(codedFlowBytes + 1)
+	if f.prefersCodingOverRetransmission() {
+		t.Fatal("a flow past the cutoff kept coding while still unclassified")
+	}
+}
+
+// The rate window has to keep getting the download right, which is the case
+// the previous rule was written for and the reason it used a total at all.
+// A transfer reading in 16 KiB chunks looks small per read and is not small
+// per second.
+func TestASustainedDownloadIsStillBulk(t *testing.T) {
+	inner, peer := net.Pipe()
+	defer inner.Close()
+	defer peer.Close()
+	f := newMultipathFlow(context.Background(), inner, [16]byte{1}, 1, 64*1024,
+		protocol.FlagAckUp, protocol.FlagAckDown, nil, nil, nil)
+	f.started = time.Now().Add(-5 * time.Second)
+	f.observe(64, true) // the request
+	// A megabyte inside one window, in the 16 KiB reads a transfer uses.
+	for i := 0; i < 64; i++ {
+		f.bytesDown.Add(16 << 10)
+		f.observe(16<<10, false)
+	}
+	if got := classifier.Class(f.class.Load()); got != classifier.ClassBulk {
+		t.Errorf("a megabyte per second classified %v, want bulk", got)
+	}
+	if f.prefersCodingOverRetransmission() {
+		t.Error("a sustained download still prefers coding")
+	}
+}
+
+// And a flow that transfers, then stops and starts conversing, has to be
+// allowed to become interactive again rather than carrying a bulk label it
+// earned a minute ago. Sticky bulk is deliberate, so this documents what the
+// rate window does and does not change.
+func TestBulkStaysStickyEvenWhenTheRateFalls(t *testing.T) {
+	inner, peer := net.Pipe()
+	defer inner.Close()
+	defer peer.Close()
+	f := newMultipathFlow(context.Background(), inner, [16]byte{1}, 1, 64*1024,
+		protocol.FlagAckUp, protocol.FlagAckDown, nil, nil, nil)
+	f.started = time.Now().Add(-5 * time.Second)
+	f.observe(64, true)
+	for i := 0; i < 64; i++ {
+		f.bytesDown.Add(16 << 10)
+		f.observe(16<<10, false)
+	}
+	if classifier.Class(f.class.Load()) != classifier.ClassBulk {
+		t.Fatal("setup did not reach bulk")
+	}
+	// Now converse. The classifier keeps bulk on purpose: hysteresis stops
+	// queue policy flapping through a gap in a large transfer.
+	f.lastClassified.Store(0)
+	for i := 0; i < 10; i++ {
+		f.observe(80, i%2 == 0)
+	}
+	if got := classifier.Class(f.class.Load()); got != classifier.ClassBulk {
+		t.Errorf("bulk stopped being sticky: %v", got)
+	}
+}
+
+// The window has to roll, or the rate it reports is a lifetime total wearing a
+// different name and the demotion it was written to prevent comes back.
+//
+// A voice call at four kilobytes a second passes sixty-four kilobytes after
+// sixteen seconds. If the buckets never age out, that is exactly when it stops
+// looking like a conversation, which is the bug this replaced.
+func TestTheExchangeWindowRolls(t *testing.T) {
+	inner, peer := net.Pipe()
+	defer inner.Close()
+	defer peer.Close()
+	f := newMultipathFlow(context.Background(), inner, [16]byte{1}, 1, 64*1024,
+		protocol.FlagAckUp, protocol.FlagAckDown, nil, nil, nil)
+
+	now := time.Now()
+	var up uint64
+	// Twenty windows of conversation: four kilobytes each, 80 KB in total,
+	// which is past smallExchangeBytes if nothing ever ages out.
+	for w := 0; w < 20; w++ {
+		for i := 0; i < 50; i++ {
+			up, _ = f.recentBytes(now, 80, true)
+		}
+		now = now.Add(exchangeWindow)
+	}
+	if up > smallExchangeBytes {
+		t.Errorf("recent up = %d after 20 windows of 4KB; the window is not rolling", up)
+	}
+	// It reports between one and two windows of traffic, so a conversation
+	// that just carried 4KB in a window must not report zero either.
+	if up == 0 {
+		t.Error("recent up = 0 while frames were still arriving")
+	}
+
+	// A transfer inside a single window still reports its full rate.
+	burst, _ := f.recentBytes(now, 0, true)
+	for i := 0; i < 64; i++ {
+		burst, _ = f.recentBytes(now, 16<<10, true)
+	}
+	if burst <= smallExchangeBytes {
+		t.Errorf("recent up = %d after a megabyte in one window, want above %d",
+			burst, smallExchangeBytes)
+	}
+
+	// And the bucket that just aged out still counts, or a transfer would be
+	// invisible for the first moments of every window and a download crossing
+	// a boundary would read as a conversation.
+	now = now.Add(exchangeWindow)
+	spanning, _ := f.recentBytes(now, 80, true)
+	if spanning <= smallExchangeBytes {
+		t.Errorf("recent up = %d just after a boundary that a megabyte "+
+			"preceded; the finished bucket was dropped", spanning)
+	}
+}

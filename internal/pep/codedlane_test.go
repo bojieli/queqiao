@@ -77,9 +77,11 @@ func codedPairWith(t *testing.T, pooled bool, path *pathsim.Config, serve func(n
 	if err != nil {
 		t.Fatal(err)
 	}
+	clientMetrics := metrics.New()
+	lastClientMetrics = clientMetrics
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: remote, Credentials: roots, Transport: TransportQUIC,
-		EnableQUICPool: pooled, Logger: logger, Metrics: metrics.New(),
+		EnableQUICPool: pooled, Logger: logger, Metrics: clientMetrics,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -95,6 +97,10 @@ func codedPairWith(t *testing.T, pooled bool, path *pathsim.Config, serve func(n
 // lastClient is the client the most recent harness built, for tests that need
 // to call into it rather than through its SOCKS port.
 var lastClient *Client
+
+// lastClientMetrics is that client's registry, for tests that need to say why
+// a flow behaved as it did rather than only that it did.
+var lastClientMetrics *metrics.Registry
 
 // lastRelay is the emulated path the most recent harness built, for tests that
 // change what it does while a flow is crossing it.
