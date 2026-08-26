@@ -47,7 +47,9 @@ In theory, the path's bandwidth could carry 355KB in about 9ms.
 The rest is a handshake, a transfer starting at ten segments, and a window
 thrown away between requests.
 Queqiao approaches the limits of this 200ms RTT link, achieving **302ms** end-to-end
-on a cold connection and **237ms** once warm, which is the floor.
+on a cold connection and **237ms** once warm, which is the floor. On a sustained
+transfer it reaches **310 Mbit/s**, 93% of what the path itself carries, against
+3.6 to 106 Mbit/s for direct TCP.
 [Why this profile exists](docs/DESIGN-DC-PROFILE.md) walks through each request; [the
 runbook](docs/DEPLOYING-DC-PROFILE.md) is how to deploy it.
 

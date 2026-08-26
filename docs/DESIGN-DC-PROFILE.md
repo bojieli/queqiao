@@ -497,9 +497,12 @@ digits. So:
 - One path. This profile stays experimental until we've run it on more.
 - `--cgroup kubernetes` is built and unit-tested against both cgroup drivers,
   but has never run against a real cluster.
-- Sockmap splicing would cut the relay's per-byte cost. We haven't built it
-  because no relay we've measured is CPU-bound yet, and it would be the wrong
-  thing to optimize first.
+- Sockmap splicing would cut the per-byte cost. We haven't built it because no
+  relay we've measured is CPU-bound, and it would be the wrong thing to
+  optimize first. That is now closer than it was: a client sustaining 310
+  Mbit/s spent 75% of one core doing it, so the ceiling on that host is CPU
+  rather than the path. A client is not a relay, so this does not settle it,
+  but the condition named for reconsidering has stopped being hypothetical.
 - The short-block sizing fix is proven where it can be and not where it
   matters most. At the sizing level it is deterministic and the tests fail with
   the rule disabled. End to end it is unproven, because the path changed

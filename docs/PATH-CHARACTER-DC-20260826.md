@@ -68,6 +68,50 @@ releases packets, not something the path is doing. They disappear at 150 and
 correctly to a loss signal that carries no information here, while the
 open-loop probe pulls 256 Mbit/s across the same channel.
 
+## Sustained throughput, which this document had never measured
+
+Everything else here measures how long a request takes. That is the workload,
+and it left a gap: the profile also carries transfers, and nobody had asked what
+either transport does when a flow runs long enough to reach a steady state.
+
+One flow, 15 to 20 seconds, arms alternated, upload direction:
+
+| | direct TCP cubic | queqiao |
+|---|---|---|
+| best of five runs | 105.8 Mbit/s | **310.4 Mbit/s** |
+| worst | 3.6 Mbit/s | 0.4 Mbit/s |
+| typical | 30 to 100 Mbit/s | 144 to 310 Mbit/s |
+
+310.4 Mbit/s is 93% of this path's 333 Mbit/s knee, which is what an open-loop
+UDP probe measured with no congestion control involved at all. Downstream the
+gap is wider still, because that is the direction that erases: 68 to 84 Mbit/s
+direct against 224 to 268 through the transport.
+
+Both arms vary enormously and the variance is the path. Direct upload ranged
+3.6 to 105.8 Mbit/s across five runs in one session, which is cubic meeting a
+loss rate that moves. Quote the range, not a figure from it.
+
+### The client is nearly CPU-bound, and that is the ceiling
+
+Sampled during a 310.4 Mbit/s upload, on a host with **one** core:
+
+| | share of one core |
+|---|---|
+| `queqiaod` | 75.3% |
+| the measurement tool | 1.2% |
+| system idle | 22.5% |
+
+So the throughput ceiling here is not the path, it is roughly 410 Mbit/s of
+userspace QUIC and coding on this core. The one run that collapsed to 0.4
+Mbit/s came after four back-to-back transfers had driven the load average to
+9.6 on that single core, which is core starvation rather than anything the
+transport did.
+
+This is the first measurement in this project showing the data path close to
+CPU-bound, and it is the condition that was named for reconsidering sockmap
+splicing. It is a client here rather than a relay, so it does not settle that
+question, but it stops being hypothetical.
+
 ## Flow completion time
 
 Upload direction, cubic, at the payload sizes an inference call actually sends:
