@@ -72,6 +72,70 @@ type Profile struct {
 	// justify splitting again is gathered under the shared budget that hides
 	// the difference.
 	DiscoverGrouping bool
+	// ClassHints declare what a flow is from what produced it, before any of
+	// it has been carried.
+	//
+	// The classifier needs about a second of traffic to decide, and a request
+	// that finishes in 200ms spends its whole life inside that second. A hint
+	// removes the window rather than shortening it.
+	//
+	// Each entry matches a substring of the identity the capture agent
+	// reported -- the executable path, the pod UID, the container, the systemd
+	// unit -- and names the class a flow from it starts in. First match wins,
+	// so order them most specific first.
+	//
+	// A hint is a starting point and not a promise. Once a flow is running the
+	// classifier judges it on what it actually does, so a process declared
+	// interactive that turns out to be moving a checkpoint is still demoted.
+	ClassHints []ClassHint
+}
+
+// ClassHint maps something the capture agent knows to the class a flow from it
+// begins in.
+type ClassHint struct {
+	// Match is a substring of the reported identity. Substring rather than a
+	// pattern language because the thing being matched is a path or an
+	// identifier, and every deployment that needed more than this would need
+	// something different.
+	Match string
+	// Class is "interactive" or "bulk". Anything else is a configuration
+	// error rather than a default, since a misspelling that silently did
+	// nothing would be indistinguishable from a rule that never matched.
+	Class string
+}
+
+// HintedClass returns the class declared for an identity, and whether one was.
+func (p Profile) HintedClass(identity string) (classifier.Class, bool) {
+	if identity == "" {
+		return 0, false
+	}
+	for _, h := range p.ClassHints {
+		if h.Match == "" || !strings.Contains(identity, h.Match) {
+			continue
+		}
+		switch h.Class {
+		case "interactive":
+			return classifier.ClassInteractive, true
+		case "bulk":
+			return classifier.ClassBulk, true
+		}
+	}
+	return 0, false
+}
+
+// ValidateHints reports a hint naming a class that does not exist, so a
+// misspelling fails at startup rather than quietly matching nothing.
+func (p Profile) ValidateHints() error {
+	for i, h := range p.ClassHints {
+		if strings.TrimSpace(h.Match) == "" {
+			return fmt.Errorf("class hint %d has an empty match", i)
+		}
+		if h.Class != "interactive" && h.Class != "bulk" {
+			return fmt.Errorf("class hint %d for %q names class %q; want interactive or bulk",
+				i, h.Match, h.Class)
+		}
+	}
+	return nil
 }
 
 // wanSharedBottleneck is the deployment this project was built for and the one

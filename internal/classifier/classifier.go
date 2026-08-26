@@ -110,6 +110,30 @@ type Classifier struct {
 	class   Class
 }
 
+// Declare sets the class a flow starts in, from something known before it
+// carried anything: what produced it.
+//
+// It is a starting point rather than a promise. The classifier goes on judging
+// the flow by what it does, so a process declared interactive that turns out
+// to be moving a checkpoint is still demoted -- the declaration buys the first
+// second, which is the window inference cannot cover and which a request
+// shorter than it spends entirely inside.
+//
+// Declaring bulk is sticky in the same way an inferred demotion is, because it
+// is the same conclusion reached earlier. Declaring interactive is not: it
+// says where to begin, not where to stay.
+func (c *Classifier) Declare(class Class) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.class == ClassBulk {
+		return
+	}
+	switch class {
+	case ClassInteractive, ClassBulk:
+		c.class = class
+	}
+}
+
 func New(cfg Config) *Classifier {
 	if cfg.NewBytes == 0 || cfg.NewAge <= 0 || cfg.BulkBytes == 0 ||
 		cfg.BulkRateBytesPerSec <= 0 || cfg.BulkMinimumAge <= 0 {

@@ -495,6 +495,7 @@ type runtimeOptions struct {
 	chunkSize                                                       int
 	dialTimeout, handshakeTimeout, flowIdleTimeout, flowMaxLifetime time.Duration
 	quicPool, waitForOpenAck, udpOnStream                           bool
+	flowMetadataSocket                                              string
 	// resolvedProfile is the deployment policy, parsed once at flag time so
 	// that an unknown name fails before anything starts rather than being
 	// silently replaced by the default.
@@ -554,6 +555,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.IntVar(&opts.maxPendingOpens, "max-pending-opens", 256, "concurrent remote flow opens")
 		fs.BoolVar(&opts.quicPool, "quic-pool", true, "reuse a persistent QUIC connection")
 		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this client runs in: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
+		fs.StringVar(&opts.flowMetadataSocket, "flow-metadata-socket", "", "local capture agent socket to ask what produced each flow, so its class is known before it carries anything; empty disables the lookup")
 		fs.BoolVar(&opts.waitForOpenAck, "wait-for-open-ack", false, "wait for destination confirmation before answering SOCKS")
 		fs.DurationVar(&opts.fallbackDelay, "fallback-delay", 300*time.Millisecond, "delay before preparing TCP fallback")
 		fs.DurationVar(&opts.fallbackGrace, "fallback-grace", 2*time.Second, "time a ready TCP fallback waits for QUIC")

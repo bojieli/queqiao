@@ -181,6 +181,52 @@ It does stop the demotion (`class_transitions_2_total` drops from 1-4 to 0),
 and it moves latency by 2.4ms on a 455ms baseline, which is noise. That's why
 it sits behind an experimental profile.
 
+### Knowing what a flow is before it carries anything
+
+The classifier needs about a second of traffic to decide. A request that
+finishes in 200ms spends its whole life inside that second, so it is carried in
+whatever class it started in. Shortening the window doesn't help; removing it
+does.
+
+`tunless` captures at the socket layer, so it knows the calling process and,
+on a host running containers, the pod or container it belongs to. That's
+available before the first byte moves. Point the client at the agent's socket:
+
+```sh
+queqiaod client --profile ... --path-profile dc-long-haul \
+  --flow-metadata-socket /run/tunless/metadata.sock
+```
+
+The profile maps what the agent reports to a class:
+
+```go
+ClassHints: []profile.ClassHint{
+    {Match: "path=/app/checkpoint-sync", Class: "bulk"},
+    {Match: "path=/app/", Class: "interactive"},
+}
+```
+
+First match wins, so put specific rules before general ones. A misspelled class
+name fails at startup rather than matching nothing at runtime, where it would
+look identical to a rule whose workload never appeared.
+
+Three things are deliberate here.
+
+**Policy lives in Queqiao, not in tunless.** The agent reports what produced a
+flow and stops there, which is what its own documentation promises. A pod UID
+isn't a name anybody chose, so the useful thing to match on is usually the
+executable path.
+
+**A hint is a starting point, not a promise.** The classifier keeps judging the
+flow by what it does, so a process declared interactive that turns out to be
+moving a checkpoint is still demoted. Declaring bulk is sticky, because that's
+the same conclusion inference would reach later.
+
+**Everything about it is optional and bounded.** No agent, an agent that has
+forgotten the flow, a process that exited, or no matching hint all leave the
+flow exactly as it would have been. The lookup runs on the accept path, so it
+has a short timeout: attribution is worth having and not worth waiting for.
+
 ### Frames go over UDP, where the transport already handles them
 
 A 300KB request is about 200 packets. There's a block worth coding over, and

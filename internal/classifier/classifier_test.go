@@ -232,3 +232,58 @@ func dcClassifierConfig() Config {
 	c.BulkIdleGapVeto = time.Second
 	return c
 }
+
+// A declaration buys the first second, which is the window inference cannot
+// cover and which a short request spends entirely inside.
+func TestDeclareSetsTheStartingClass(t *testing.T) {
+	c := New(DefaultConfig())
+	if c.Class() != ClassNew {
+		t.Fatalf("a fresh classifier is %v", c.Class())
+	}
+	c.Declare(ClassInteractive)
+	if c.Class() != ClassInteractive {
+		t.Errorf("after declaring interactive, class is %v", c.Class())
+	}
+}
+
+// It is a starting point, not a promise. A flow declared interactive that
+// behaves like a transfer is still demoted, or the declaration would be a way
+// to opt out of classification entirely.
+func TestADeclaredFlowIsStillJudgedByWhatItDoes(t *testing.T) {
+	c := New(DefaultConfig())
+	c.Declare(ClassInteractive)
+	o := Observation{Age: 2 * time.Second, SinceLastPayload: time.Millisecond,
+		UpRate: 100 << 20}
+	for i := 0; i < 5; i++ {
+		o.BytesUp += 8 << 20
+		o.Age += time.Second
+		if c.Observe(o) == ClassBulk {
+			return
+		}
+	}
+	t.Error("a flow declared interactive was never demoted despite moving 40MB")
+}
+
+// Bulk is sticky whether it was inferred or declared, since a declaration is
+// the same conclusion reached earlier.
+func TestDeclaringBulkIsSticky(t *testing.T) {
+	c := New(DefaultConfig())
+	c.Declare(ClassBulk)
+	c.Declare(ClassInteractive)
+	if c.Class() != ClassBulk {
+		t.Errorf("bulk was undeclared by a later hint: %v", c.Class())
+	}
+	if got := c.Observe(Observation{Age: time.Second, SinceLastPayload: 5 * time.Second}); got != ClassBulk {
+		t.Errorf("a declared-bulk flow reclassified to %v", got)
+	}
+}
+
+// An unknown class does nothing rather than defaulting, because a hint that
+// silently did nothing is indistinguishable from one that never matched.
+func TestDeclaringNonsenseChangesNothing(t *testing.T) {
+	c := New(DefaultConfig())
+	c.Declare(Class(99))
+	if c.Class() != ClassNew {
+		t.Errorf("an unknown class was applied: %v", c.Class())
+	}
+}
