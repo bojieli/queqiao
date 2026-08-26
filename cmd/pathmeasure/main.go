@@ -58,6 +58,7 @@ import (
 	"time"
 
 	"net/http"
+	"net/netip"
 
 	"golang.org/x/net/http2"
 
@@ -97,6 +98,7 @@ func run(args []string) error {
 	socks := fs.String("socks5", "", "reach the server through this SOCKS5 proxy, so the same instrument measures a tunnel and the path beneath it")
 	rate := fs.Float64("rate", 10, "udp: offered rate in Mbit/s")
 	payload := fs.Int("payload", 1200, "udp: datagram payload bytes")
+	udpFrames := fs.Bool("udp-frames", false, "frames: carry messages over UDP rather than a stream, which is how voice actually travels and removes the head-of-line blocking a stream imposes on the frames behind a lost one")
 	reverse := fs.Bool("reverse", false, "measure the download direction: the client connects, the server sends. The only way to measure the receive direction of a host that cannot accept inbound connections, which on real deployments is most of them")
 	localAddr := fs.String("local-address", "", "bind the socket to this local IP, so a host TUN route does not carry the measurement through a tunnel to the very server being measured")
 	if err := fs.Parse(args); err != nil {
@@ -143,6 +145,10 @@ func run(args []string) error {
 	case "frames":
 		if *remote == "" {
 			return errors.New("frames needs --remote")
+		}
+		if *udpFrames {
+			return udpFramesRun(*remote, *flows, *frames, *frameBytes,
+				time.Duration(*frameEvery*float64(time.Second)), *localAddr)
 		}
 		return framesRun(*remote, *flows, *frames, *frameBytes,
 			time.Duration(*frameEvery*float64(time.Second)), *localAddr)
@@ -198,6 +204,14 @@ func serve(addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
+	}
+	// The same port carries a UDP echo, so the frame workload can be measured
+	// over the carrier it actually uses without standing up a second service.
+	if pc, perr := net.ListenPacket("udp", addr); perr == nil {
+		go echoDatagrams(pc)
+		fmt.Printf("pathmeasure UDP echo on %s\n", pc.LocalAddr())
+	} else {
+		fmt.Printf("pathmeasure UDP echo unavailable: %v\n", perr)
 	}
 	fmt.Printf("pathmeasure server on %s\n", ln.Addr())
 	for {
@@ -1631,4 +1645,270 @@ func windowSetting(window int) (int32, bool) {
 		return 0, false
 	}
 	return int32(window), true
+}
+
+// udpFramesRun measures the frame workload the way it actually travels.
+//
+// A voice stream is not carried on a reliable ordered bytestream, and
+// measuring it as if it were reports a problem the application does not have.
+// When one frame is lost on a stream, every frame behind it waits for the
+// retransmission whether or not it arrived: measured across an emulated 14%
+// path, the coded substrate repaired all but five of 2270 symbols and the p99
+// was still 704ms, because those five stalled the frames queued behind them.
+//
+// Over UDP a lost frame is a lost frame. The ones after it are unaffected, the
+// jitter buffer conceals the gap, and the tail is the path's rather than the
+// transport's.
+func udpFramesRun(remote string, sessions, count, size int, every time.Duration, localAddr string) error {
+	var mu sync.Mutex
+	var got []float64
+	var lost int
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < sessions; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			conn, err := dialUDPVia(remote, localAddr)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			sentAt := make(map[uint32]time.Time, count)
+			var smu sync.Mutex
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				buf := make([]byte, size+64)
+				for {
+					_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+					n, err := conn.Read(buf)
+					if err != nil {
+						return
+					}
+					if n < 4 {
+						continue
+					}
+					seq := binary.LittleEndian.Uint32(buf[:4])
+					smu.Lock()
+					at, ok := sentAt[seq]
+					delete(sentAt, seq)
+					smu.Unlock()
+					if !ok {
+						continue
+					}
+					mu.Lock()
+					got = append(got, float64(time.Since(at).Microseconds())/1000)
+					mu.Unlock()
+				}
+			}()
+
+			frame := make([]byte, size)
+			tick := time.NewTicker(every)
+			defer tick.Stop()
+			for f := 0; f < count; f++ {
+				<-tick.C
+				binary.LittleEndian.PutUint32(frame[:4], uint32(f))
+				smu.Lock()
+				sentAt[uint32(f)] = time.Now()
+				smu.Unlock()
+				if _, err := conn.Write(frame); err != nil {
+					break
+				}
+			}
+			time.Sleep(2 * time.Second)
+			_ = conn.Close()
+			<-done
+			smu.Lock()
+			mu.Lock()
+			lost += len(sentAt)
+			mu.Unlock()
+			smu.Unlock()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if len(got) == 0 {
+		return errors.New("no message came back over UDP")
+	}
+	p50, p90, p99, p999 := quantiles(got)
+	s := append([]float64(nil), got...)
+	sort.Float64s(s)
+	over := func(bar float64) float64 {
+		n := 0
+		for _, v := range got {
+			if v > bar {
+				n++
+			}
+		}
+		return 100 * float64(n) / float64(len(got))
+	}
+	fmt.Printf("# %d UDP sessions x %d messages of %dB every %v\n", sessions, count, size, every)
+	fmt.Printf("delivered\tlost\tp50_ms\tp90_ms\tp99_ms\tp999_ms\tp99/p50\tfloor_ms\t>250ms\t>400ms\n")
+	fmt.Printf("%d\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.2f\t%.1f\t%.2f%%\t%.2f%%\n",
+		len(got), lost, p50, p90, p99, p999, p99/p50, s[0], over(250), over(400))
+	return nil
+}
+
+// udpConn is a UDP flow to one destination, either direct or through a SOCKS5
+// association.
+type udpConn struct {
+	pc     net.PacketConn
+	relay  net.Addr
+	target netip.AddrPort
+	// ctl holds the SOCKS5 control connection open. The association lives
+	// exactly as long as it does, so dropping the reference would have the
+	// proxy tear down the flow mid-measurement.
+	ctl net.Conn
+}
+
+func (u *udpConn) Write(b []byte) (int, error) {
+	if u.ctl == nil {
+		return u.pc.WriteTo(b, u.relay)
+	}
+	// RFC 1928 request header: two reserved bytes, no fragment, then the
+	// destination the datagram is for.
+	hdr := []byte{0, 0, 0, 1}
+	a4 := u.target.Addr().As4()
+	hdr = append(hdr, a4[:]...)
+	hdr = append(hdr, byte(u.target.Port()>>8), byte(u.target.Port()))
+	if _, err := u.pc.WriteTo(append(hdr, b...), u.relay); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (u *udpConn) Read(b []byte) (int, error) {
+	buf := make([]byte, len(b)+512)
+	n, _, err := u.pc.ReadFrom(buf)
+	if err != nil {
+		return 0, err
+	}
+	payload := buf[:n]
+	if u.ctl != nil {
+		// Strip the same header the proxy puts back on. Only IPv4 addresses
+		// are produced by this tool, so only that form is decoded.
+		if n < 10 || payload[3] != 1 {
+			return 0, fmt.Errorf("short or non-IPv4 SOCKS5 UDP reply (%d bytes)", n)
+		}
+		payload = payload[10:]
+	}
+	return copy(b, payload), nil
+}
+
+func (u *udpConn) Close() error {
+	if u.ctl != nil {
+		_ = u.ctl.Close()
+	}
+	return u.pc.Close()
+}
+
+func (u *udpConn) SetReadDeadline(t time.Time) error { return u.pc.SetReadDeadline(t) }
+
+// dialUDPVia opens a UDP flow, negotiating a SOCKS5 association when a proxy
+// is configured.
+//
+// UDP ASSOCIATE is the reason this exists. A voice stream carried on a
+// reliable ordered stream pays head-of-line blocking for every frame behind a
+// lost one, which is a property of the carrier rather than of the path, and
+// measuring it that way reports a problem the application does not have.
+func dialUDPVia(remote, localAddr string) (*udpConn, error) {
+	target, err := netip.ParseAddrPort(remote)
+	if err != nil {
+		return nil, fmt.Errorf("udp target %q: %w", remote, err)
+	}
+	pc, err := net.ListenPacket("udp", ":0")
+	if err != nil {
+		return nil, err
+	}
+	if proxyAddr == "" {
+		return &udpConn{pc: pc, relay: net.UDPAddrFromAddrPort(target), target: target}, nil
+	}
+
+	d, err := dialer(localAddr)
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	ctl, err := d.Dial("tcp", proxyAddr)
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	relay, err := socks5Associate(ctl, pc.LocalAddr())
+	if err != nil {
+		_ = ctl.Close()
+		_ = pc.Close()
+		return nil, err
+	}
+	return &udpConn{pc: pc, relay: relay, target: target, ctl: ctl}, nil
+}
+
+// socks5Associate performs UDP ASSOCIATE and returns the relay endpoint the
+// proxy wants datagrams sent to.
+func socks5Associate(c net.Conn, local net.Addr) (net.Addr, error) {
+	_ = c.SetDeadline(time.Now().Add(20 * time.Second))
+	defer func() { _ = c.SetDeadline(time.Time{}) }()
+	if _, err := c.Write([]byte{5, 1, 0}); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(c, resp); err != nil {
+		return nil, err
+	}
+	if resp[0] != 5 || resp[1] != 0 {
+		return nil, fmt.Errorf("socks5: server chose method %d", resp[1])
+	}
+	// The advertised source is where this client will send from. Zero is
+	// permitted and means "whatever address you see", which is what a client
+	// behind NAT has to say.
+	ap, _ := netip.ParseAddrPort(local.String())
+	req := []byte{5, 3, 0, 1, 0, 0, 0, 0}
+	req = append(req, byte(ap.Port()>>8), byte(ap.Port()))
+	if _, err := c.Write(req); err != nil {
+		return nil, err
+	}
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(c, head); err != nil {
+		return nil, err
+	}
+	if head[1] != 0 {
+		return nil, fmt.Errorf("socks5: UDP ASSOCIATE refused, reply %d", head[1])
+	}
+	if head[3] != 1 {
+		return nil, fmt.Errorf("socks5: relay address type %d is not IPv4", head[3])
+	}
+	rest := make([]byte, 6)
+	if _, err := io.ReadFull(c, rest); err != nil {
+		return nil, err
+	}
+	relayIP := netip.AddrFrom4([4]byte{rest[0], rest[1], rest[2], rest[3]})
+	relayPort := uint16(rest[4])<<8 | uint16(rest[5])
+	if relayIP.IsUnspecified() {
+		// The proxy is telling us to keep using the address we reached it on.
+		host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+		if a, err := netip.ParseAddr(host); err == nil {
+			relayIP = a
+		}
+	}
+	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(relayIP, relayPort)), nil
+}
+
+// echoDatagrams reflects each datagram to its sender, which is what the far
+// side of a frame stream does.
+func echoDatagrams(pc net.PacketConn) {
+	defer pc.Close()
+	buf := make([]byte, 2048)
+	for {
+		n, from, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		if _, err := pc.WriteTo(buf[:n], from); err != nil {
+			return
+		}
+	}
 }

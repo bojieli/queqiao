@@ -36,7 +36,9 @@ BASELINE = {
     ("G115", "internal/metrics/metrics.go"): 3,
     ("G115", "internal/multipath/reassembly.go"): 1,
     ("G115", "internal/pep/client.go"): 2,
-    ("G115", "internal/pep/mpflow.go"): 10,
+    # Two more from the exchange window: a byte count added to a uint64
+    # counter, guarded above against the negative that would wrap it.
+    ("G115", "internal/pep/mpflow.go"): 12,
     ("G115", "internal/pep/server.go"): 1,
     ("G115", "internal/pep/stripedsend.go"): 5,
     ("G115", "internal/protocol/frame.go"): 1,
@@ -48,8 +50,9 @@ BASELINE = {
     # rejected above a gigabyte, a host length the SOCKS5 encoder checks
     # against 255 before writing it, and a destination port validated to
     # 1-65535. Lengths read off the wire all pass through boundedLength; these
-    # are the reverse direction, where the value is the tool's own.
-    ("G115", "cmd/pathmeasure/main.go"): 5,
+    # are the reverse direction, where the value is the tool's own. The two
+    # added for UDP ASSOCIATE split a port that netip already types as uint16.
+    ("G115", "cmd/pathmeasure/main.go"): 7,
     # The h2 ingress forwards to the --remote given on the command line and
     # takes only the request path from the caller, which is what a proxy is.
     # Its documentation says not to put it in front of untrusted traffic, and

@@ -601,6 +601,11 @@ func TestASessionKeepsItsRepairPastTheByteCutoff(t *testing.T) {
 		snap := reg.Snapshot()
 		t.Logf("class transitions: interactive=%d bulk=%d",
 			snap.ClassTransitions[1], snap.ClassTransitions[2])
+		// Whether the coded substrate was used at all, which is a different
+		// question from whether the flow was allowed to use it.
+		t.Logf("coded: sources=%d recovered=%d lost=%d receive_erasure=%.4f",
+			snap.QUICCodedSources, snap.QUICCodedRecovered,
+			snap.QUICCodedLost, snap.ReceiveErasure())
 		if snap.ClassTransitions[2] > 0 {
 			t.Errorf("the session was demoted to bulk after carrying %d bytes; "+
 				"a call longer than a minute loses its repair exactly where it needs it",

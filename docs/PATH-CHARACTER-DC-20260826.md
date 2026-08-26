@@ -162,24 +162,47 @@ That's the opposite of the request result, and the cause is payload size. An
 80-byte frame is a single packet. There's no block to code over and no traffic
 behind it to expose the loss, so it waits out a timeout.
 
-## What fixes the frame tail
+## What fixes the frame tail: using the carrier voice actually uses
 
-Frames over **datagrams** instead of a stream, 400 per arm, emulated 14% path:
+The frame tail above was measured over a reliable ordered stream, and that was
+the wrong shape. A voice stream is not carried on TCP, and measuring it as if
+it were reports a problem the application does not have.
 
-| copies | delivered | p50 | p99 | never arrived |
-|---|---|---|---|---|
-| 1 | 329/400 | 204.4ms | 208.7ms | **71** |
-| 2 | 390/400 | 203.5ms | 207.0ms | **10** |
-| 3 | 400/400 | 203.0ms | 207.7ms | **0** |
+The mechanism is visible in the transport's own counters. Across a 52-second
+session on the emulated 14% path, the coded substrate carried 2270 symbols,
+recovered 1708 of them, and lost 5. Five failures cannot make one percent of
+frames slow on their own. They do it by stalling everything queued behind them,
+which is what an ordered stream does and what a datagram does not.
 
-Duplication removes seven eighths of the losses and doesn't move latency: p50
-varies by 1.4ms across all three arms. A windowed code can't match that,
-because parity computed over a window delays frames that were never at risk.
-Cost is 8 KB/s per session instead of 4.
+Measured on the live path, 16 sessions of 200 messages, with downstream loss at
+3.6% during the run:
 
-The second result matters more. Over datagrams, the tail is dropped frames, not
-late ones: everything that arrived did so within 209ms. The 567ms tail is what
-an ordered stream does when it loses a frame, since everything behind it waits.
+| carrier | delivered | lost | p50 | p90 | p99 | p99/p50 | >250ms |
+|---|---|---|---|---|---|---|---|
+| UDP, direct | 3037 | **163** (5.1%) | 193.6ms | 205.6ms | 213.7ms | **1.10** | 0.00% |
+| UDP, through Queqiao | 3166 | **34** (1.1%) | 208.2ms | 213.9ms | 217.6ms | **1.05** | 0.00% |
+| TCP, through Queqiao | 3200 | 0 | 208.4ms | 214.0ms | **728.4ms** | **3.49** | 2.16% |
+
+Over UDP the transport removes four fifths of the lost frames, from 5.1% to
+1.1% on a path erasing 3.6%, and the tail stays flat: p99 is five percent above
+the median rather than three and a half times it. That is the code repairing
+gaps inside the round trip that carried them, which is what it was built to do.
+
+Over TCP nothing is lost and the tail is 728ms, because reliability converts
+every gap into delay for the frames behind it.
+
+So there is no missing coding scheme here. UDP ASSOCIATE has been in this
+transport since the beginning, and a voice application using it gets both
+properties at once. The earlier reading of this as an open problem came from
+measuring frames over a stream, and the tool now measures both carriers so the
+mistake is harder to repeat.
+
+A separate defect did turn up while chasing it, and it was real: whether a flow
+counted as a series of small exchanges was decided from its lifetime byte
+total, so any long conversation eventually stopped qualifying and was demoted
+to bulk, losing its coding after about a minute. That signal is now a rate over
+a recent window, which a transfer never drops under and a conversation never
+reaches whatever its age.
 
 ## HTTP/2 flow control, and an ingress for receivers you don't control
 

@@ -120,33 +120,43 @@ It does stop the demotion (`class_transitions_2_total` drops from 1-4 to 0),
 and it moves latency by 2.4ms on a 455ms baseline, which is noise. That's why
 it sits behind an experimental profile.
 
-### Frames go over datagrams, duplicated
+### Frames go over UDP, where the transport already handles them
 
 A 300KB request is about 200 packets. There's a block worth coding over, and
 there's traffic behind a loss to expose it quickly. An 80-byte audio frame is a
-single packet with neither, so a lost one waits for a retransmit timeout.
+single packet with neither, so we expected it to need something new.
 
-We looked at three options:
+It doesn't. Measured on the live path at 3.6% loss, 16 sessions of 200
+messages:
 
-1. Code across a session's own frames. Needs a window, which delays every frame
-   to protect the few that get lost.
-2. Code across sessions. Couples flows that otherwise have nothing to do with
-   each other.
-3. Send each frame more than once.
+| carrier | lost | p50 | p99 | p99/p50 |
+|---|---|---|---|---|
+| UDP, direct | 163 of 3200 | 193.6ms | 213.7ms | 1.10 |
+| UDP, through Queqiao | 34 of 3200 | 208.2ms | 217.6ms | 1.05 |
+| TCP, through Queqiao | 0 | 208.4ms | 728.4ms | 3.49 |
 
-We measured the third. One copy loses 71 frames out of 400, two copies lose 10,
-three copies lose none, and p50 moves by 1.4ms across all three. The windowed
-options can't match that, since parity computed over a window delays frames
-that were never at risk.
+Over UDP the transport removes four fifths of the lost frames and the tail
+stays flat. Over TCP nothing is lost and the tail is three and a half times the
+median, because reliability turns every gap into delay for the frames behind
+it.
 
-There's a second result underneath. Over datagrams, the tail is dropped frames
-rather than late ones. Every frame that arrived did so within 209ms. The 567ms
-tail we measured earlier is what an ordered stream does when it loses a frame:
-everything behind it waits. A datagram turns that into a drop, which is what a
-jitter buffer is for.
+So the answer is UDP ASSOCIATE, which has been here since the beginning. Our
+earlier reading of this as an open problem came from measuring voice over TCP,
+which is not how voice travels. Point a voice application at the UDP path and
+it gets both properties at once.
 
-Cost is 8 KB/s per session instead of 4, on a hop that doesn't bend until 333
-Mbit/s.
+The transport's own counters show the mechanism. Over a 52-second session on
+an emulated 14% path the coded substrate carried 2270 symbols, recovered 1708,
+and lost 5. Five failures can't make one percent of frames slow by themselves.
+They do it by stalling what's queued behind them, which is a property of the
+carrier.
+
+One real defect turned up while chasing this. Whether a flow counted as a
+series of small exchanges was decided from its lifetime byte total, so a voice
+call crossed the budget after about a minute and was demoted to bulk, losing
+its coding for the rest of the call. It's now a rate over a recent window: a
+transfer never drops under it, and a conversation never reaches it whatever its
+age.
 
 ### L7 ingress, for receivers you don't control
 
@@ -206,8 +216,6 @@ digits. So:
 
 ## Not done yet
 
-- Frame traffic doesn't route onto the datagram path automatically. The design
-  is settled and measured; the plumbing isn't written.
 - We don't know whether aggregating flows removes the need for a synthetic
   bandwidth probe. The aggregate metrics endpoint reports the idle control
   connection, so answering this needs per-lane trace data.

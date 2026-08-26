@@ -2505,10 +2505,15 @@ func (f *multipathFlow) recentBytes(now time.Time, n int, up bool) (uint64, uint
 		f.currentUp, f.currentDown = 0, 0
 		f.recentStart = now
 	}
-	if up {
-		f.currentUp += uint64(n)
-	} else {
-		f.currentDown += uint64(n)
+	// A byte count is never negative, but this is the one place a wrong sign
+	// would wrap the window to something enormous and make every flow look
+	// like a transfer for the next two seconds.
+	if n > 0 {
+		if up {
+			f.currentUp += uint64(n)
+		} else {
+			f.currentDown += uint64(n)
+		}
 	}
 	return f.currentUp + f.priorUp, f.currentDown + f.priorDown
 }
