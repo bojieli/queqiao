@@ -324,9 +324,13 @@ func ShardsFor(k int, s lossmodel.Snapshot, p Params) (int, bool) {
 		if delivered := deliveredPerSymbolTime(k, n, residual, reissue); delivered > bestDelivered {
 			bestN, bestDelivered = n, delivered
 		}
-		if k <= shortBlockSymbols && residual <= shortBlockResidual && n > bestN {
-			// See shortBlockSymbols. Take whichever answer asks for more.
-			bestN, bestDelivered = n, math.Inf(1)
+		if k <= shortBlockSymbols && residual <= shortBlockResidual {
+			// See shortBlockSymbols. n ascends, so this is the shortest code
+			// that reaches the target; take it unless the objective above
+			// already asked for more.
+			if n > bestN {
+				bestN = n
+			}
 			break
 		}
 	}
