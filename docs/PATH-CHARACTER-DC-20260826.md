@@ -395,3 +395,25 @@ aggregate fed by many flows does give the estimator evidence a single bursty
 flow cannot, which is the argument the node-relay shape rests on. The sample
 count plateaus while the estimate keeps climbing, which is the max filter
 keeping its best sample and is what it is for.
+
+## The whole stack, on the live path
+
+An unmodified application, captured by a netfilter rule and carried through a
+local agent into the tunnel:
+
+```
+app -> capture -> SOCKS5 -> queqiao client -> WAN -> gateway -> destination
+```
+
+| path | 300KB cold | warm |
+|---|---|---|
+| direct | 1089.3ms | 1001.4ms |
+| through the stack | **624.9ms** | **381.2ms** |
+
+The connect leg is the part worth reading: 0.2ms against 187.3ms. The
+application's connection terminates on loopback, and the round trip it would
+have paid was already paid by a tunnel that stayed warm. Every constraint
+measured in this document is credit per round trip, and this is what putting a
+zero-round-trip segment at each end does about them.
+
+The application was never configured for any of it.

@@ -91,6 +91,28 @@ everything behaves as it would without the flag. We verified that on the live
 path: with a socket configured that didn't exist, requests and frames both ran
 normally and the client logged nothing.
 
+## Capturing traffic from applications you can't reconfigure
+
+Everything above assumes the application points at `127.0.0.1:12080`. When it
+can't, a capture agent puts it there without the application knowing.
+
+```
+app -> capture -> SOCKS5 -> queqiao client -> WAN -> gateway -> destination
+```
+
+`tunless` does the capture. Its socket-layer backend needs cgroup v2, CAP_BPF
+and a 5.7 kernel and is fail-open; its `--backend redirect` needs only
+netfilter and is not. Pick the first where you can.
+
+Measured on the China-US path with an unmodified application: 300KB cold in
+624.9ms through the whole stack against 1089.3ms direct, and 381.2ms once warm.
+The connect leg is 0.2ms rather than 187.3ms, because the application's
+connection terminates on loopback and the round trip was already paid by a
+tunnel that stayed warm.
+
+That is also where flow attribution comes from, if you want class hints: the
+same agent that captured the connection knows what opened it.
+
 ## Relay layout
 
 One shared relay per node, or several independent ones? On our path three
