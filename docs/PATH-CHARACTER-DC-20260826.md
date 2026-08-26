@@ -87,30 +87,32 @@ UDP probe measured with no congestion control involved at all. Downstream the
 gap is wider still, because that is the direction that erases: 68 to 84 Mbit/s
 direct against 224 to 268 through the transport.
 
-Both arms vary enormously and the variance is the path. Direct upload ranged
-3.6 to 105.8 Mbit/s across five runs in one session, which is cubic meeting a
-loss rate that moves. Quote the range, not a figure from it.
+Both arms vary enormously, and two different causes are mixed into that. The
+path's loss moves, which is what takes direct upload from 3.6 to 105.8 Mbit/s
+across five runs in one session. And the client host is a single core shared
+with other work, which is what takes the tunnel down to 0.4 Mbit/s in one run
+and is not a property of either transport. Quote the range, not a figure from
+it.
 
-### The client is nearly CPU-bound, and that is the ceiling
+### The ceiling is CPU, and this host cannot say how much
 
-Sampled during a 310.4 Mbit/s upload, on a host with **one** core:
+Sampled during a 310.4 Mbit/s upload, `queqiaod` was using 75.3% of a single
+core with 22.5% idle. That reading is not trustworthy and the reason is worth
+recording: the client host has one core and other things running on it. A later
+sample of the same measurement found 64.6 Mbit/s with the core 92% in kernel
+mode, and the cause was a Python process belonging to somebody else taking 58%
+of it. The run that collapsed to 0.4 Mbit/s was almost certainly the same thing.
 
-| | share of one core |
-|---|---|
-| `queqiaod` | 75.3% |
-| the measurement tool | 1.2% |
-| system idle | 22.5% |
+What survives is the direction rather than the figure. The transport is
+userspace QUIC plus coding and it costs real CPU, enough that on a busy single
+core it becomes the binding constraint before the path does. How much is a
+question for a host that is not shared, and this one is.
 
-So the throughput ceiling here is not the path, it is roughly 410 Mbit/s of
-userspace QUIC and coding on this core. The one run that collapsed to 0.4
-Mbit/s came after four back-to-back transfers had driven the load average to
-9.6 on that single core, which is core starvation rather than anything the
-transport did.
-
-This is the first measurement in this project showing the data path close to
-CPU-bound, and it is the condition that was named for reconsidering sockmap
-splicing. It is a client here rather than a relay, so it does not settle that
-question, but it stops being hypothetical.
+Two things a profile does settle, because they are ratios within the process
+rather than shares of a contended machine. Encryption is not the cost: AES-GCM
+is 1.7% of samples, hardware-accelerated. Neither is the coding: the `fec` and
+`coded` packages do not appear in the top twenty. What dominates is the syscall
+per batch of packets, which is what userspace UDP is.
 
 ## Flow completion time
 
