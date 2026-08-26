@@ -21,21 +21,22 @@ design away.
 
 ## Where the time actually goes
 
-A 355KB speech request from Guiyang to a model in Irvine takes 1133ms. The
-model spends 38ms of it.
+A 355KB speech request from Guiyang to a model in Irvine takes about 1.26
+seconds on a new connection. The model spends about 30ms of it.
 
 <p align="center">
-  <img src="../assets/where-the-time-goes.svg" alt="A bar chart of where 1133 milliseconds goes on a 355KB speech recognition request. The path could carry the bytes in about 9 milliseconds. Direct TCP on a new connection takes 1133: 187 for the handshake, 948 sending the audio and waiting for the answer, of which the model is 38. A tuned direct client takes 226. Queqiao takes 290." width="880">
+  <img src="../assets/where-the-time-goes.svg" alt="A bar chart of where 1.26 seconds goes on a 355KB speech recognition request. The path could carry the bytes in about 9 milliseconds. Direct TCP on a new connection takes 1263: 216 for the handshake, 1047 sending the audio and waiting for the answer, of which the model is about 30. A tuned direct client takes 230. Queqiao takes 282." width="880">
 </p>
 
-Nothing about the path explains the rest. Its round trip is 199ms and its
-capacity knee is 333 Mbit/s, so 355KB is about 9ms of wire time. Two round
-trips would carry the request and the answer, and that would be roughly 400ms.
+Nothing about the path explains the rest. Its round trip is around 200ms and
+its capacity knee is 333 Mbit/s, so 355KB is about 9ms of wire time. One round
+trip carries the request and the answer, and with the model that is about
+235ms, which is what a tuned client actually achieves.
 
-The missing 700ms is a stack of defaults, each of which was chosen for a link
-that is not this one:
+The rest is a stack of defaults, each of which was chosen for a link that is
+not this one:
 
-- **The handshake buys nothing and costs a round trip.** 187ms of the 1133ms is
+- **The handshake buys nothing and costs a round trip.** 216ms of that 1263ms is
   a connection being opened for a single request.
 - **The transfer starts at ten segments.** Linux opens with an initial window
   of 10 MSS, about 14.5KB, and doubles once per round trip. Reaching 355KB
@@ -54,15 +55,17 @@ that is not this one:
   Mathis predicts to within the measurement, while an open-loop probe pulls 256
   Mbit/s across the same channel in the same minutes.
 
-Every one of those is a credit-per-round-trip problem, and a 199ms round trip
+Every one of those is a credit-per-round-trip problem, and a 200ms round trip
 is what turns each into hundreds of milliseconds. That is the whole reason this
 profile exists: on this path the transport is not fighting for bandwidth, it is
 trying to stop a request from spending five round trips discovering capacity
 that was there the whole time.
 
 It is also why the first thing the deployment guide says is to fix the client.
-Three of those five are one config line each, they cost nothing, and on a path
-direction that does not erase they are worth more than this transport is.
+Three of those five are one config line each and they cost nothing. Where you
+can apply them, they take the median to the same place this transport does; what
+they do not reach is the tail, a direction that erases, a connection that is
+genuinely cold, or a caller you cannot reconfigure.
 
 ## When this profile applies
 
@@ -134,15 +137,22 @@ and only the second one needs work.
 a single shared one by roughly 2.5x on aggregate throughput, and that held with
 the test order reversed. Sharing buys fairness, not speed.
 
-**A tuned client beats us on the median.** We ran the real ASR and TTS services
-across the path rather than stand-ins for them. On a new connection the profile
-takes a 355KB ASR upload from 1133.5ms to 290.2ms. But a client that reuses its
-connection and sets `tcp_slow_start_after_idle=0` gets to 225.8ms on its own,
-without us. What it doesn't get is the tail: 1026.5ms at p99 against 373.5ms
-through the transport, because that sysctl does nothing about a path losing 14%
-of packets for reasons unrelated to congestion. This profile is for the cases a
-client fix can't reach -- cold connections, callers you can't reconfigure, and
-p99 targets -- and we'd rather say so than quote the cold-start number alone.
+**We paced flows that had produced no evidence of congestion.** Running the
+real services rather than stand-ins found a transport slower than a tuned TCP
+client on the median request, by 67ms out of 299ms. The cause was not a
+constant that needed tuning. This transport separates loss the channel imposes
+regardless of rate from loss a sender causes by pushing, and it computes both
+halves continuously; the pacer was wired to neither. It metered every send at
+BBR's delivery estimate, and that estimate is low for a request-shaped flow
+precisely because such a flow is application-limited: one flow estimated 42
+Mbit/s where sixteen estimated 88 on the same path in the same minutes.
+
+So every request received a congestion response having produced no congestion
+evidence, on a path whose own delay signal said there was no queue. The pacer
+now meters only when the delay bound is reached or loss starts tracking rate.
+That took the median from 299.0ms to 248.1ms against a tuned client's 229.5ms,
+and it is profile-independent: a path that is congested produces the evidence
+and gets paced whichever profile it runs.
 
 ## The five shapes this profile carries
 

@@ -41,12 +41,12 @@ TTS sends a sentence up and gets a few hundred kilobytes back, in one
 burst once the model finishes. Each is a single transfer that has to finish
 before anything else happens, which is the shape a long path is worst at.
 
-Guiyang, China to a model in Irvine, US: a 355KB audio upload takes **1133ms**, of
-which the ASR model only spends 38ms.
+Guiyang, China to a model in Irvine, US: a 355KB audio upload takes **1263ms**, of
+which the ASR model only spends about 30ms.
 In theory, the path's bandwidth could carry 355KB in about 9ms.
 The rest is a handshake, a transfer starting at ten segments, and a window
 thrown away between requests.
-Queqiao approaches the limits of this 210ms RTT link, achieving **290ms** end-to-end.
+Queqiao approaches the limits of this 207ms RTT link, achieving **282ms** end-to-end.
 [Why this profile exists](docs/DESIGN-DC-PROFILE.md) walks through each request; [the
 runbook](docs/DEPLOYING-DC-PROFILE.md) is how to deploy it.
 

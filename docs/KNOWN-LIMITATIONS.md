@@ -36,12 +36,12 @@ qualification items are still open.
   about it comes from a Guiyang-to-Irvine link, so its constants are that
   link's constants until a second path either confirms them or doesn't. It is
   marked experimental for that reason and the marking is not a formality.
-- On a path direction that does not erase, a tuned client beats this transport
-  on the median request. Reusing a connection and setting
+- On a path direction that does not erase, a fully tuned client reaches the same
+  median as this transport. Reusing a connection and setting
   `net.ipv4.tcp_slow_start_after_idle=0` took a real 355KB inference upload to
-  225.8ms against 295.0ms through the tunnel. What the client fix does not
-  reach is the tail (1026.5ms against 373.5ms at p99), a direction that erases
-  (8.8x on a real synthesis download against the same tuned client), a
+  229.5ms against 248.1ms through the tunnel, a difference that is the cost of
+  a userspace proxy and an extra local hop. What the client fix does not reach
+  is the tail (834.3ms against 274.6ms at p90), a direction that erases, a
   connection that is genuinely cold, or a caller you cannot reconfigure. Apply
   the free fixes first and deploy this for what is left; see
   [DEPLOYING-DC-PROFILE.md](DEPLOYING-DC-PROFILE.md).

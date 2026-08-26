@@ -455,6 +455,15 @@ doing. And the preflight refused to attach a capture to a cgroup containing
 tunless itself, which would have captured the agent's own connection to its
 upstream and re-captured every packet it forwarded.
 
+> [!IMPORTANT]
+> The ASR and TTS figures in this section were taken with a benchmark that
+> rotated eight audio files from 146KB to 405KB while reporting only the last
+> request's size, so every number labelled "a 355KB upload" is a median across
+> that whole range and not the 355KB case. They are superseded by
+> [the single-file re-measurement](#re-measured-with-one-fixed-file) below,
+> which also postdates the pacing fix. Kept because the reasoning they
+> prompted was sound and because a retracted measurement should stay visible.
+
 ## The workload this was built for
 
 Everything above uses synthetic transfers. This section runs the actual thing.
@@ -747,3 +756,36 @@ about what it covers: the emulator reproduces this path's delay, erasure, burst
 structure and knee, and it does not reproduce whatever was making the live link
 drift for ten minutes at a time. A contention result is a statement about the
 transport's scheduling, and the emulator is where that is a fair question.
+
+
+## Re-measured with one fixed file
+
+The figures above are medians across eight audio files of 146KB to 405KB,
+labelled with the size of whichever request happened to run last. That is not a
+labelling slip with no consequence: the median was pulled below the floor for
+the size it was attributed to. A tuned client was recorded reaching 225.8ms on
+what was described as a 355KB upload, and 355KB cannot be done in 225.8ms on
+this path. One round trip is about 200ms and the model is about 30ms, so the
+floor is roughly 230ms whatever the transport does.
+
+Re-run with one fixed file, `dashboard.wav` at 354,640 bytes, contemporaneous
+round trip 207ms, after the pacing fix:
+
+| 355KB ASR upload | direct | queqiao |
+|---|---|---|
+| new connection, p50 | 1375.8ms | **281.7ms** |
+| held open and tuned, p50 | **229.5ms** | 248.1ms |
+| held open and tuned, p90 | 834.3ms | **274.6ms** |
+| held open and tuned, p99 | 916.7ms | **289.6ms** |
+
+Paired per-round ratio on new connections: median 4.45x.
+
+229.5ms against a 207ms round trip and a 30ms model is the floor, reached. The
+transport is 18.6ms above it, which is a userspace proxy and an extra local
+hop. Before the pacing fix that gap was 67ms, and all of the difference was the
+pacer metering a flow that had produced no evidence of congestion.
+
+The tail is the other half and it moves the other way: 834.3ms against 274.6ms
+at p90. A restored congestion window does nothing about a packet that was
+dropped, and this path drops packets for reasons that have nothing to do with
+how fast anyone is sending.

@@ -43,15 +43,19 @@ characterized that last one alone took a 300KB burst on an idle connection from
 941ms to 209ms.
 
 We mean this literally, and there's a measurement behind it. Running real ASR
-from Guiyang against a model in Irvine, a 355KB upload takes 1133.5ms on a new
-connection and this profile takes it to 290.2ms. Reuse the connection and set
-that sysctl on the client, and direct TCP reaches 225.8ms at the median, which
-beats the tunnel. What it does not reach is the tail: p99 is 1026.5ms direct
-against 373.5ms through the transport, because the sysctl does nothing about a
-path that drops packets for reasons unrelated to congestion.
+from Guiyang against a model in Irvine, a 355KB upload takes 1263ms on a new
+connection and this profile takes it to 282ms. Reuse the connection and set that
+sysctl on the client, and direct TCP reaches 229.5ms at the median, which is
+where the transport gets to as well: 248.1ms, the difference being a userspace
+proxy and an extra local hop.
+
+What the sysctl does not reach is the tail. On the same runs direct TCP was
+834.3ms at p90 and 916.7ms at p99, against 274.6ms and 289.6ms through the
+transport, because a connection window restored after an idle gap does nothing
+about a path that drops packets for reasons unrelated to congestion.
 
 <p align="center">
-  <img src="../assets/fix-the-client-first.svg" alt="Two grouped bar charts. On the speech recognition upload, which runs on the clean direction, a tuned direct client reaches 226 milliseconds at the median and beats Queqiao's 295, but its 99th percentile is 1027 against Queqiao's 374. On the speech synthesis download, which erases 14 percent, tuning the client moves 916 milliseconds only to 629, while Queqiao is 71." width="880">
+  <img src="../assets/fix-the-client-first.svg" alt="Two grouped bar charts. On the speech recognition upload, which runs on the clean direction, a tuned direct client reaches 230 milliseconds at the median against Queqiao's 248, but its 99th percentile is 917 against Queqiao's 290. On the speech synthesis download, which erases 14 percent, tuning the client moves 916 milliseconds only to 629, while Queqiao is 71." width="880">
 </p>
 
 So the question to ask before deploying anything is which of those you have.
