@@ -17,6 +17,9 @@ for a future prototype before anyone can try it.
 - One-time invitations, provider-pinned identity, per-device mutual TLS,
   renewal, revocation, per-user limits, metrics, logs, packaging, and rollback.
 - Android export mode and an iOS packet tunnel using the same protocol-1 core.
+- An experimental second profile, `dc-long-haul`, for a long operator-owned hop
+  carrying inference requests, with the path model, flow attribution, and
+  live-path instruments it needs.
 
 An earlier plan to aggregate one flow by opening more paths was measured and
 retired: the motivating bottleneck is shared by endpoint pair rather than
@@ -41,6 +44,16 @@ does not control:
 Use [field validation](FIELD-VALIDATION.md) for the matrix and
 [contributing network evidence](CONTRIBUTING-NETWORK-EVIDENCE.md) for safe,
 reproducible reports.
+
+The experimental `dc-long-haul` profile needs the same thing for a different
+shape of link: a long hop between two regions one operator runs. One such path
+is characterized, which is not enough to know whether its constants are the
+profile's or that link's.
+[Qualifying a second path](MEASURING-A-DC-PATH.md#qualifying-a-second-path) is
+the ordered set of questions that would settle it, and the most useful second
+path is one that is long and does **not** erase, since every figure we have
+conflates the round trip with the loss and only a clean long path separates
+them.
 
 ## Current priority: independent review
 
