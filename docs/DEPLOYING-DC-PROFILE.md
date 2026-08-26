@@ -50,6 +50,10 @@ beats the tunnel. What it does not reach is the tail: p99 is 1026.5ms direct
 against 373.5ms through the transport, because the sysctl does nothing about a
 path that drops packets for reasons unrelated to congestion.
 
+<p align="center">
+  <img src="../assets/fix-the-client-first.svg" alt="Two grouped bar charts. On the speech recognition upload, which runs on the clean direction, a tuned direct client reaches 226 milliseconds at the median and beats Queqiao's 295, but its 99th percentile is 1027 against Queqiao's 374. On the speech synthesis download, which erases 14 percent, tuning the client moves 916 milliseconds only to 629, while Queqiao is 71." width="880">
+</p>
+
 So the question to ask before deploying anything is which of those you have.
 If you control the client and your latency budget is a median, tune the client
 and stop. Deploy this when you can't reconfigure the caller, when connections

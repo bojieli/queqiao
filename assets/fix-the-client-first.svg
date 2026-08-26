@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 600" width="1240" height="600" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="Two grouped bar charts comparing three arms. On the speech recognition upload, which runs on the clean direction, a tuned direct client reaches 226 milliseconds at the median and beats Queqiao's 295, but its 99th percentile is 1027 against Queqiao's 374. On the speech synthesis download, which runs on the direction that erases 14 percent of packets, tuning the client moves 916 milliseconds only to 629, while Queqiao is 71.">
+  <rect x="0" y="0" width="1240" height="600" fill="#FBFCFE"/>
+
+  <text x="620" y="46" text-anchor="middle" font-size="27" font-weight="700" fill="#0F172A">Fix the client first, then deploy this for what is left</text>
+  <text x="620" y="76" text-anchor="middle" font-size="17" fill="#64748B">Reusing the connection and setting one sysctl is free. Where that is enough, it is enough.</text>
+
+  <!-- legend -->
+  <rect x="380" y="98" width="14" height="14" rx="2" fill="#C2410C"/>
+  <text x="402" y="110" font-size="13.5" fill="#334155">direct, new connection</text>
+  <rect x="580" y="98" width="14" height="14" rx="2" fill="#94A3B8"/>
+  <text x="602" y="110" font-size="13.5" fill="#334155">direct, tuned client</text>
+  <rect x="760" y="98" width="14" height="14" rx="2" fill="#2563EB"/>
+  <text x="782" y="110" font-size="13.5" fill="#334155">through Queqiao</text>
+
+  <!-- ============ LEFT: ASR upload, clean direction ============ -->
+  <text x="70" y="158" font-size="18" font-weight="700" fill="#0F172A">ASR upload, 355KB</text>
+  <text x="70" y="180" font-size="14" fill="#15803D">upstream, which loses nothing</text>
+
+  <line x1="70" y1="440" x2="590" y2="440" stroke="#CBD5E1" stroke-width="1.5"/>
+
+  <!-- p50 group -->
+  <text x="180" y="464" text-anchor="middle" font-size="14" font-weight="600" fill="#475569">median</text>
+  <rect x="98" y="212" width="46" height="228" rx="3" fill="#C2410C"/>
+  <text x="121" y="204" text-anchor="middle" font-size="13" font-weight="600" fill="#9A3412">1134</text>
+  <rect x="157" y="394" width="46" height="46" rx="3" fill="#94A3B8"/>
+  <text x="180" y="386" text-anchor="middle" font-size="13" font-weight="700" fill="#15803D">226</text>
+  <rect x="216" y="381" width="46" height="59" rx="3" fill="#2563EB"/>
+  <text x="239" y="373" text-anchor="middle" font-size="13" font-weight="600" fill="#1D4ED8">295</text>
+
+  <!-- p99 group -->
+  <text x="450" y="464" text-anchor="middle" font-size="14" font-weight="600" fill="#475569">99th percentile</text>
+  <rect x="368" y="170" width="46" height="270" rx="3" fill="#C2410C"/>
+  <text x="391" y="162" text-anchor="middle" font-size="13" font-weight="600" fill="#9A3412">1344</text>
+  <rect x="427" y="234" width="46" height="206" rx="3" fill="#94A3B8"/>
+  <text x="450" y="226" text-anchor="middle" font-size="13" font-weight="600" fill="#475569">1027</text>
+  <rect x="486" y="365" width="46" height="75" rx="3" fill="#2563EB"/>
+  <text x="509" y="357" text-anchor="middle" font-size="13" font-weight="700" fill="#1D4ED8">374</text>
+
+  <!-- divider -->
+  <line x1="640" y1="150" x2="640" y2="470" stroke="#E2E8F0" stroke-width="2"/>
+
+  <!-- ============ RIGHT: TTS download, erasing direction ============ -->
+  <text x="700" y="158" font-size="18" font-weight="700" fill="#0F172A">TTS download, 100KB</text>
+  <text x="700" y="180" font-size="14" fill="#B91C1C">downstream, which erases about 14%</text>
+
+  <line x1="700" y1="440" x2="1180" y2="440" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="900" y="464" text-anchor="middle" font-size="14" font-weight="600" fill="#475569">time to move the audio back</text>
+
+  <rect x="760" y="255.9" width="60" height="184.1" rx="3" fill="#C2410C"/>
+  <text x="790" y="247.9" text-anchor="middle" font-size="13" font-weight="600" fill="#9A3412">916</text>
+
+  <rect x="860" y="313.6" width="60" height="126.4" rx="3" fill="#94A3B8"/>
+  <text x="890" y="305.6" text-anchor="middle" font-size="13" font-weight="600" fill="#475569">629</text>
+
+  <rect x="960" y="425.7" width="60" height="14.3" rx="3" fill="#2563EB"/>
+  <text x="990" y="417.7" text-anchor="middle" font-size="13" font-weight="700" fill="#1D4ED8">71</text>
+
+  <text x="1060" y="300" font-size="14" font-weight="600" fill="#7F1D1D">The sysctl fixes what</text>
+  <text x="1060" y="320" font-size="14" font-weight="600" fill="#7F1D1D">happens after an idle</text>
+  <text x="1060" y="340" font-size="14" font-weight="600" fill="#7F1D1D">gap. It does nothing</text>
+  <text x="1060" y="360" font-size="14" font-weight="600" fill="#7F1D1D">about a lost packet.</text>
+
+  <rect x="70" y="504" width="1100" height="72" rx="10" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
+  <text x="620" y="530" text-anchor="middle" font-size="15" fill="#1E40AF">Tune the client and stop, if you control it and your budget is a median on a clean direction.</text>
+  <text x="620" y="552" text-anchor="middle" font-size="15" fill="#1E40AF">Deploy this for the three things that fix cannot reach: a tail, a direction that erases, a connection</text>
+  <text x="620" y="570" text-anchor="middle" font-size="15" fill="#1E40AF">that is genuinely cold, or a caller you cannot reconfigure.</text>
+</svg>

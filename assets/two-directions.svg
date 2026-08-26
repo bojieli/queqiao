@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 620" width="1240" height="620" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="A diagram showing that the two directions of the China to US path behave like different channels. Guiyang to Irvine lost zero of 41,663 datagrams at 50 Mbit/s. Irvine to Guiyang erases about 14 percent of packets at every offered rate from 1 to 300 Mbit/s, rising to 44 percent only above the 333 Mbit/s knee. Because that erasure does not change with rate, cubic reads it as congestion and settles at a fraction of a megabit downstream, while an open-loop probe pulls 256 Mbit/s across the same channel in the same minutes.">
+  <defs>
+    <marker id="ar-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#15803D"/>
+    </marker>
+    <marker id="ar-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#B91C1C"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1240" height="620" fill="#FBFCFE"/>
+
+  <text x="620" y="46" text-anchor="middle" font-size="27" font-weight="700" fill="#0F172A">The two directions are not the same path</text>
+  <text x="620" y="76" text-anchor="middle" font-size="17" fill="#64748B">Measured minutes apart, on the same pair of machines.</text>
+
+  <!-- endpoints -->
+  <rect x="70" y="128" width="220" height="72" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="2"/>
+  <text x="180" y="158" text-anchor="middle" font-size="18" font-weight="600" fill="#0F172A">Guiyang</text>
+  <text x="180" y="182" text-anchor="middle" font-size="14" fill="#64748B">China</text>
+
+  <rect x="950" y="128" width="220" height="72" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="2"/>
+  <text x="1060" y="158" text-anchor="middle" font-size="18" font-weight="600" fill="#0F172A">Irvine</text>
+  <text x="1060" y="182" text-anchor="middle" font-size="14" fill="#64748B">California</text>
+
+  <!-- upstream -->
+  <line x1="300" y1="150" x2="938" y2="150" stroke="#15803D" stroke-width="3" marker-end="url(#ar-green)"/>
+  <text x="619" y="140" text-anchor="middle" font-size="16" font-weight="700" fill="#15803D">upstream: 0 of 41,663 datagrams lost at 50 Mbit/s</text>
+
+  <!-- downstream -->
+  <line x1="938" y1="186" x2="300" y2="186" stroke="#B91C1C" stroke-width="3" marker-end="url(#ar-red)"/>
+  <text x="619" y="212" text-anchor="middle" font-size="16" font-weight="700" fill="#B91C1C">downstream: about 14% erased, at every rate below the knee</text>
+
+  <!-- loss against offered rate -->
+  <text x="120" y="272" font-size="17" font-weight="700" fill="#0F172A">Downstream loss does not change with offered rate</text>
+  <text x="120" y="294" font-size="14" fill="#64748B">That is what separates erasure from congestion: a queue only overflows when you push it.</text>
+
+  <line x1="180" y1="470" x2="1120" y2="470" stroke="#CBD5E1" stroke-width="1.5"/>
+  <line x1="180" y1="320" x2="180" y2="470" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="168" y="326" text-anchor="end" font-size="13" fill="#94A3B8">50%</text>
+  <text x="168" y="400" text-anchor="end" font-size="13" fill="#94A3B8">25%</text>
+  <text x="168" y="474" text-anchor="end" font-size="13" fill="#94A3B8">0</text>
+
+  <!-- bars: 1, 5, 20, 150, 300, 600 Mbit/s -->
+  <rect x="230" y="426.5" width="86" height="43.5" rx="3" fill="#EF9A9A"/>
+  <text x="273" y="417.5" text-anchor="middle" font-size="14" font-weight="600" fill="#B91C1C">14.5%</text>
+  <text x="273" y="492" text-anchor="middle" font-size="13" fill="#64748B">1</text>
+
+  <rect x="336" y="417.5" width="86" height="52.5" rx="3" fill="#EF9A9A"/>
+  <text x="379" y="408.5" text-anchor="middle" font-size="14" font-weight="600" fill="#B91C1C">17.5%</text>
+  <text x="379" y="492" text-anchor="middle" font-size="13" fill="#64748B">5</text>
+
+  <rect x="442" y="425.3" width="86" height="44.7" rx="3" fill="#EF9A9A"/>
+  <text x="485" y="416.3" text-anchor="middle" font-size="14" font-weight="600" fill="#B91C1C">14.9%</text>
+  <text x="485" y="492" text-anchor="middle" font-size="13" fill="#64748B">20</text>
+
+  <rect x="548" y="428.3" width="86" height="41.7" rx="3" fill="#EF9A9A"/>
+  <text x="591" y="419.3" text-anchor="middle" font-size="14" font-weight="600" fill="#B91C1C">13.9%</text>
+  <text x="591" y="492" text-anchor="middle" font-size="13" fill="#64748B">150</text>
+
+  <rect x="654" y="426.2" width="86" height="43.8" rx="3" fill="#EF9A9A"/>
+  <text x="697" y="417.2" text-anchor="middle" font-size="14" font-weight="600" fill="#B91C1C">14.6%</text>
+  <text x="697" y="492" text-anchor="middle" font-size="13" fill="#64748B">300</text>
+
+  <rect x="760" y="336.8" width="86" height="133.2" rx="3" fill="#B91C1C"/>
+  <text x="803" y="327.8" text-anchor="middle" font-size="14" font-weight="700" fill="#7F1D1D">44.4%</text>
+  <text x="803" y="492" text-anchor="middle" font-size="13" fill="#64748B">600</text>
+
+  <text x="700" y="516" text-anchor="middle" font-size="13.5" fill="#94A3B8">offered, Mbit/s</text>
+
+  <line x1="750" y1="320" x2="750" y2="470" stroke="#94A3B8" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="880" y="336" font-size="14" font-weight="600" fill="#475569">the 333 Mbit/s knee</text>
+  <text x="880" y="356" font-size="13.5" fill="#64748B">above it, loss clusters and is</text>
+  <text x="880" y="374" font-size="13.5" fill="#64748B">genuinely congestion</text>
+
+  <rect x="180" y="540" width="940" height="58" rx="10" fill="#FEF2F2" stroke="#FCA5A5" stroke-width="1.5"/>
+  <text x="650" y="564" text-anchor="middle" font-size="15" fill="#7F1D1D">Cubic reads the flat 14% as congestion and settles at 0.13 to 0.47 Mbit/s downstream, which Mathis predicts to within</text>
+  <text x="650" y="586" text-anchor="middle" font-size="15" fill="#7F1D1D">the measurement. An open-loop probe pulls 256 Mbit/s across the same channel in the same minutes.</text>
+</svg>

@@ -24,6 +24,10 @@ design away.
 A 355KB speech request from Guiyang to a model in Irvine takes 1133ms. The
 model spends 38ms of it.
 
+<p align="center">
+  <img src="../assets/where-the-time-goes.svg" alt="A bar chart of where 1133 milliseconds goes on a 355KB speech recognition request. The path could carry the bytes in about 9 milliseconds. Direct TCP on a new connection takes 1133: 187 for the handshake, 948 sending the audio and waiting for the answer, of which the model is 38. A tuned direct client takes 226. Queqiao takes 290." width="880">
+</p>
+
 Nothing about the path explains the rest. Its round trip is 199ms and its
 capacity knee is 333 Mbit/s, so 355KB is about 9ms of wire time. Two round
 trips would carry the request and the answer, and that would be roughly 400ms.

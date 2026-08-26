@@ -24,6 +24,10 @@ whatever the loss turns out to be, it isn't congestion.
 
 ## The two directions behave like different paths
 
+<p align="center">
+  <img src="../assets/two-directions.svg" alt="A diagram showing the two directions behaving as different channels. Guiyang to Irvine lost zero of 41,663 datagrams at 50 Mbit/s. Irvine to Guiyang erases about 14 percent at every offered rate from 1 to 300 Mbit/s, rising to 44 percent only above the 333 Mbit/s knee. Cubic reads the flat erasure as congestion and settles at a fraction of a megabit, while an open-loop probe pulls 256 Mbit/s across the same channel." width="880">
+</p>
+
 | Direction | Protocol | Loss | Throughput |
 |---|---|---|---|
 | Upload, CN→US | UDP 50 Mbit/s | **0.0%** (0 of 41,663) | 49.99 Mbit/s |
