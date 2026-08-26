@@ -28,6 +28,20 @@ windows, and set `net.ipv4.tcp_slow_start_after_idle=0`. On the path we
 characterized that last one alone took a 300KB burst on an idle connection from
 941ms to 209ms.
 
+We mean this literally, and there's a measurement behind it. Running real ASR
+from Guiyang against a model in Irvine, a 355KB upload takes 1133.5ms on a new
+connection and this profile takes it to 290.2ms. Reuse the connection and set
+that sysctl on the client, and direct TCP reaches 225.8ms at the median, which
+beats the tunnel. What it does not reach is the tail: p99 is 1026.5ms direct
+against 373.5ms through the transport, because the sysctl does nothing about a
+path that drops packets for reasons unrelated to congestion.
+
+So the question to ask before deploying anything is which of those you have.
+If you control the client and your latency budget is a median, tune the client
+and stop. Deploy this when you can't reconfigure the caller, when connections
+are genuinely cold, or when the number you're held to is a p99. The full set of
+numbers is in [PATH-CHARACTER-DC-20260826.md](PATH-CHARACTER-DC-20260826.md).
+
 ## Gateway
 
 ```sh

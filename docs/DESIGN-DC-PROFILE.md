@@ -89,6 +89,16 @@ and only the second one needs work.
 a single shared one by roughly 2.5x on aggregate throughput, and that held with
 the test order reversed. Sharing buys fairness, not speed.
 
+**A tuned client beats us on the median.** We ran the real ASR and TTS services
+across the path rather than stand-ins for them. On a new connection the profile
+takes a 355KB ASR upload from 1133.5ms to 290.2ms. But a client that reuses its
+connection and sets `tcp_slow_start_after_idle=0` gets to 225.8ms on its own,
+without us. What it doesn't get is the tail: 1026.5ms at p99 against 373.5ms
+through the transport, because that sysctl does nothing about a path losing 14%
+of packets for reasons unrelated to congestion. This profile is for the cases a
+client fix can't reach -- cold connections, callers you can't reconfigure, and
+p99 targets -- and we'd rather say so than quote the cold-start number alone.
+
 ## Design
 
 ### Profiles
@@ -330,3 +340,8 @@ digits. So:
 
 - Splitting a merged group back apart is manual, for the reason above.
 - One path. This profile stays experimental until we've run it on more.
+- `--cgroup kubernetes` is built and unit-tested against both cgroup drivers,
+  but has never run against a real cluster.
+- Sockmap splicing would cut the relay's per-byte cost. We haven't built it
+  because no relay we've measured is CPU-bound yet, and it would be the wrong
+  thing to optimize first.

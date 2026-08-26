@@ -450,3 +450,105 @@ world access, because that socket answers questions about what processes are
 doing. And the preflight refused to attach a capture to a cgroup containing
 tunless itself, which would have captured the agent's own connection to its
 upstream and re-captured every packet it forwarded.
+
+## The workload this was built for
+
+Everything above uses synthetic transfers. This section runs the actual thing.
+The Irvine host serves SenseVoice ASR at `/v1/audio/transcriptions` and Fish
+Audio S2-Pro TTS at `/v1/audio/speech`, both OpenAI-shaped. The client in
+Guiyang posts real speech and asks for real synthesis. Both arms cross the same
+reverse proxy on the inference host, so that hop cancels.
+
+Arms alternate order every round, and each round's pair is compared against
+itself, so a path that drifts during the run cannot be mistaken for a result.
+
+### ASR upload
+
+Eight WAV files, 146KB to 405KB, which is the size range that started this
+whole line of work. The response is 150 bytes of transcript. Twenty paired
+rounds, new connection each time:
+
+| | direct | queqiao |
+|---|---|---|
+| total p50 | 1133.5ms | **290.2ms** |
+| total p99 | 1343.6ms | **346.5ms** |
+| connect | 187.1ms | **1.0ms** |
+| request to first byte | 948.2ms | **289.3ms** |
+
+Paired per-round ratio: median 3.63x, and the middle 80% of rounds fall between
+3.47x and 4.21x, which is about as tight as this path gets.
+
+Transcribing a 355KB file takes the model 38ms. Of the 1133.5ms a client in
+Guiyang waits, roughly 1095ms is the network, and of that, 187ms is a handshake
+that buys nothing and the rest is a 355KB upload climbing out of a 10-segment
+initial window on a 199ms path.
+
+### TTS download
+
+The synthesis side is the opposite shape: a 272-byte request, a 100KB MP3 back.
+The endpoint does not stream, so the whole file arrives as one burst after the
+model finishes. Twenty paired rounds:
+
+| | direct | queqiao |
+|---|---|---|
+| total p50 | 5661.3ms | 4550.4ms |
+| connect | 192.6ms | **0.8ms** |
+| request to first byte | 4479.3ms | 4457.7ms |
+| download | 916.2ms | **74.9ms** |
+
+The headline is 1.24x and the headline is the wrong number to read. Request to
+first byte is 4479.3ms against 4457.7ms, a 0.5% difference, which is what it
+should be: that leg is one round trip plus the model, and the model is the same
+model on the same GPU either way. No transport does anything about 4.4 seconds
+of synthesis.
+
+What a transport can touch is the part that moves bytes, and that part goes from
+916.2ms to 74.9ms. Counting the handshake with it, network-attributable time
+falls from 1108.8ms to 75.7ms, which is 14.6x, and drops from 21% of the request
+to 1.7% of it.
+
+The paired ratio spans 0.90x to 1.42x, wider than the ASR run, because 4.4
+seconds of variable model latency sits on top of a network difference of one
+second. That is a measurement artifact of dividing by a large constant, not
+instability in the transport.
+
+### What connection reuse actually recovers
+
+The advice everyone gives first is to reuse connections. It is good advice and
+it is worth measuring, because the assumption underneath it -- that a connection
+held open stays fast -- is not true on a stock kernel. Same ASR workload, same
+twenty rounds, connections held open between rounds, roughly 1.7s idle in
+between:
+
+| ASR, 355KB | direct p50 | direct p99 | queqiao p50 | queqiao p99 |
+|---|---|---|---|---|
+| new connection each time | 1133.5ms | 1343.6ms | 290.2ms | 346.5ms |
+| held open, stock kernel | 789.9ms | 1161.6ms | 292.7ms | 348.8ms |
+| held open, `tcp_slow_start_after_idle=0` | **225.8ms** | 1026.5ms | 295.0ms | **373.5ms** |
+
+Reuse on a stock kernel takes 1133.5ms to 789.9ms. That saves the handshake and
+nothing else, because `tcp_slow_start_after_idle` defaults to 1 and every idle
+gap longer than an RTO throws the congestion window away. The connection is
+open. It is not warm.
+
+Turn that sysctl off and the same client reaches 225.8ms at the median, which is
+about a round trip plus the transfer, and is roughly the floor for this path. It
+also beats queqiao at the median, by 1.3x.
+
+That result belongs in this document precisely because it is the one that argues
+against the thing being built. When you control the client, and you can set one
+sysctl and reuse a connection, TCP gets to the floor on the median request and a
+tunnel is a slower way to get there.
+
+The tail is the other half of the sentence. Direct p99 is 1026.5ms against
+373.5ms, and the paired ratio ranges from 0.66x to 2.93x depending on the round.
+The rounds where direct wins are the rounds with no loss. The rounds where it
+loses by 3x are the rounds where a packet dropped and cubic waited for a
+retransmit, on a path whose download direction loses around 14% of packets in a
+memoryless pattern that has nothing to do with congestion. Repairing that
+without a round trip is the one thing here that a sysctl cannot do.
+
+So the honest summary of this section: fix the client first, because it is free
+and it is worth more than anything else on the median. Then the transport is
+for the cases the client fix does not reach -- cold connections, applications
+you cannot reconfigure, and the tail.

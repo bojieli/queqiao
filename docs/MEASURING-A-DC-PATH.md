@@ -102,6 +102,45 @@ pathmeasure -mode h2proxy -listen :12613 -remote 127.0.0.1:12612 -h2-window 8388
 pathmeasure -mode h2 -remote HOST:12612 -sizes 300KB,1MB -repeat 3
 ```
 
+## Measuring a real inference endpoint
+
+Synthetic transfers tell you what the path does. They don't tell you what a
+request costs, because a request also contains a model. To measure the workload
+itself, put both arms behind the same reverse proxy on the inference host so
+that hop cancels, and drive the real API:
+
+```sh
+# ASR: multipart upload, tiny response. Upload-dominated.
+POST /v1/audio/transcriptions   # 150-400KB WAV in, ~150 bytes of transcript out
+
+# TTS: tiny request, one burst back. Download-dominated.
+POST /v1/audio/speech           # ~270 bytes in, ~100KB of MP3 out
+```
+
+Break each request down with `httptrace`: `GotConn`, `WroteRequest`,
+`GotFirstResponseByte`, and last byte. Then alternate the arms every round and
+compare each round against itself.
+
+Two things to get right, both of which will otherwise produce a wrong number:
+
+**Client-side upload timing is meaningless through a local proxy.** The client
+writes into a loopback socket that accepts the whole body into a buffer
+immediately, so `WroteRequest` fires in under a millisecond while the bytes have
+gone nowhere. We measured 0.4ms of "upload" for a 355KB file. The real send time
+reappears as server time. Compare `WroteRequest`-to-first-byte as one figure and
+never quote the two separately across arms.
+
+**Check that the model leg matches.** Request-to-first-byte on a TTS call is one
+round trip plus synthesis, and synthesis is the same model on the same GPU in
+both arms. If those two numbers don't agree to within a few percent, something
+other than the transport differs between the arms and the comparison is invalid.
+Ours came out 4479.3ms against 4457.7ms, which is the check passing.
+
+The corollary is that a total-latency ratio on a workload with heavy compute
+understates the transport by however much compute dominates. TTS came out at
+1.24x end to end and 12.2x on the bytes. Both are true; report both, and say
+which one the transport is responsible for.
+
 ## Four traps that cost us real time
 
 **A host running a TUN-mode proxy can't measure its own paths.** Capture below
