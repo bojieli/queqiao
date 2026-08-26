@@ -3,6 +3,7 @@ package profile
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bojieli/queqiao/internal/classifier"
 )
@@ -165,4 +166,82 @@ func TestParseClassHintsRejectsNonsense(t *testing.T) {
 			t.Errorf("accepted %q", bad)
 		}
 	}
+}
+
+// The classifier's own tests build the datacenter config by hand, because that
+// package cannot import this one. That copy silently went stale through one
+// change already: a field was added here and those tests kept passing against
+// the old value, so the shipping profile was never the thing under test.
+//
+// This asserts behaviour rather than a field list, because a field list goes
+// stale the same way. Each case is a workload this profile is expected to
+// carry, run through the classifier the profile actually ships.
+func TestDatacenterProfileMatchesWhatItsTestsAssume(t *testing.T) {
+	p, err := ByName("dc-long-haul")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The case that was wrong: one pause inside the first BulkBytes
+	// disqualified a transfer permanently.
+	t.Run("a transfer that stalls once is still a transfer", func(t *testing.T) {
+		c := classifier.New(p.Classifier)
+		var got uint64
+		age := 11 * time.Second
+		var cls classifier.Class
+		for i := range 60 {
+			got += 4 << 20
+			age += time.Second
+			since := 5 * time.Millisecond
+			if i == 2 {
+				since = 1500 * time.Millisecond
+			}
+			cls = c.Observe(classifier.Observation{
+				BytesDown: got, DownRate: 100 << 20,
+				Age: age, SinceLastPayload: since,
+			})
+		}
+		if cls != classifier.ClassBulk {
+			t.Fatalf("a 240MB pull that paused once at 12MB classified %v, want bulk. "+
+				"Interactive here means coded and one lane, for the whole transfer.", cls)
+		}
+	})
+
+	// The case the veto exists for. Every exchange is a burst and then a wait,
+	// and no number of them may add up to a transfer.
+	t.Run("a session of requests never adds up to a transfer", func(t *testing.T) {
+		c := classifier.New(p.Classifier)
+		o := classifier.Observation{Age: 2 * time.Second, UpRate: 20 << 20, Bidirectional: true}
+		for i := range 120 {
+			o.BytesUp += 1 << 20
+			o.Age += 2 * time.Second
+			o.SinceLastPayload = 10 * time.Millisecond
+			if got := c.Observe(o); got == classifier.ClassBulk {
+				t.Fatalf("exchange %d classified bulk at %d bytes", i, o.BytesUp)
+			}
+			o.SinceLastPayload = 2 * time.Second
+			if got := c.Observe(o); got == classifier.ClassBulk {
+				t.Fatalf("exchange %d classified bulk while the caller waited", i)
+			}
+		}
+	})
+
+	// A model streaming tokens: too fast to look idle, too slow to look like a
+	// transfer. The recent-rate test is the only thing separating the two.
+	t.Run("a token stream is interactive", func(t *testing.T) {
+		c := classifier.New(p.Classifier)
+		o := classifier.Observation{
+			BytesUp: 1 << 10, Age: 4 * time.Second, SinceLastPayload: 30 * time.Millisecond,
+			DownRate: 800, Bidirectional: true, SmallBidirectionalBursts: true,
+		}
+		var cls classifier.Class
+		for range 30 {
+			o.BytesDown += 800
+			o.Age += time.Second
+			cls = c.Observe(o)
+		}
+		if cls != classifier.ClassInteractive {
+			t.Fatalf("a token stream classified %v, want interactive", cls)
+		}
+	})
 }
