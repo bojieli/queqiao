@@ -54,16 +54,22 @@ type tuicBandwidthEstimator struct {
 	stateMisses    uint64
 	zeroSamples    uint64
 
-	lastAckedSentTime  monotime.Time
-	lastAckedAckTime   monotime.Time
-	totalSentAtAck     uint64
-	lastAckedPacket    quiccongestion.PacketNumber
-	lastSentPacket     quiccongestion.PacketNumber
-	appLimited         bool
-	endAppLimitedAt    quiccongestion.PacketNumber
-	maxFilter          tuicMinMax
-	ackedAtWindow      uint64
-	packetStates       map[quiccongestion.PacketNumber]tuicPacketState
+	lastAckedSentTime monotime.Time
+	lastAckedAckTime  monotime.Time
+	totalSentAtAck    uint64
+	lastAckedPacket   quiccongestion.PacketNumber
+	lastSentPacket    quiccongestion.PacketNumber
+	appLimited        bool
+	endAppLimitedAt   quiccongestion.PacketNumber
+	maxFilter         tuicMinMax
+	ackedAtWindow     uint64
+	packetStates      map[quiccongestion.PacketNumber]tuicPacketState
+	// lowestState is the smallest packet number that may still be present in
+	// packetStates. Packet numbers only increase, so it turns removeObsolete
+	// from a scan of everything in flight into a walk of what is actually
+	// being dropped. See there for what that cost.
+	lowestState        quiccongestion.PacketNumber
+	lowestKnown        bool
 	legacyPrevAcked    uint64
 	legacyPrevAckTime  monotime.Time
 	legacyPrevSent     uint64
@@ -142,6 +148,9 @@ func (e *tuicBandwidthEstimator) onSentPacket(now monotime.Time, number quiccong
 	if len(e.packetStates) >= tuicMaxSendStates {
 		e.pruneStates()
 	}
+	if !e.lowestKnown {
+		e.lowestState, e.lowestKnown = number, true
+	}
 	e.packetStates[number] = tuicPacketState{
 		sentTime:          now,
 		totalSentAtSend:   e.totalSent,
@@ -176,12 +185,37 @@ func (e *tuicBandwidthEstimator) onLost(number quiccongestion.PacketNumber) tuic
 // to retain. The extended quic-go callback does not expose FirstOutstanding,
 // so callers pass the same bounded packet-threshold approximation used by the
 // upstream TUIC controller.
+//
+// It walks the range being dropped rather than scanning the map, because
+// packet numbers only increase and so everything below leastUnacked that is
+// still present lies in [lowestState, leastUnacked). The scan it replaces cost
+// the whole of what was in flight on every congestion event: at 300 Mbit/s over
+// a 200ms round trip that is about six thousand entries, re-walked per
+// acknowledgement, and a CPU profile of a 294 Mbit/s transfer attributed 13% of
+// all time to this one loop. Walking the range instead costs one delete per
+// packet number ever sent, amortised, which is one per packet.
+//
+// pruneStates can empty the map without the watermark seeing it, so the walk is
+// only taken while the range is no longer than the map; past that the scan is
+// the cheaper of the two and is bounded by tuicMaxSendStates.
 func (e *tuicBandwidthEstimator) removeObsolete(leastUnacked quiccongestion.PacketNumber) {
+	if len(e.packetStates) == 0 {
+		e.lowestState, e.lowestKnown = leastUnacked, true
+		return
+	}
+	if gap := leastUnacked - e.lowestState; e.lowestKnown && gap >= 0 && int(gap) <= 2*len(e.packetStates) {
+		for number := e.lowestState; number < leastUnacked; number++ {
+			delete(e.packetStates, number)
+		}
+		e.lowestState = leastUnacked
+		return
+	}
 	for number := range e.packetStates {
 		if number < leastUnacked {
 			delete(e.packetStates, number)
 		}
 	}
+	e.lowestState, e.lowestKnown = leastUnacked, true
 }
 
 // bandwidthSampleTrace is one delivery-rate sample with the two quantities it
