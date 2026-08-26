@@ -591,3 +591,91 @@ Then deploy the transport for the three things that fix does not reach:
 - **Any direction that erases.** 8.8x on TTS download against a fully tuned
   client, and a p99 of 373.5ms against 1026.5ms on ASR. This is the part that
   is actually ours, and it is the part a config change cannot buy.
+
+
+## A model streaming tokens
+
+Everything above measures a workload that ends. A language model answering does
+not: a short prompt goes up, and then the answer comes back a few dozen bytes at
+a time for as long as the answer takes. The reader waits for the first token and
+then for the stream to keep up, and a total latency hides both.
+
+Measured with `pathmeasure -mode stream` against a generator emitting 300 tokens
+at a fixed 30ms cadence, so that the generator is not a variable. Ten paired
+rounds, arms alternated.
+
+Two things had to be right before any of these numbers meant anything. The mode
+counts tokens rather than reads, because at this cadence over this path several
+tokens are in flight and the segments group differently on each arm: one arm saw
+907 reads deliver what the other saw as 1536, for the same 2400 tokens. And it
+measures lateness against the generator's own schedule rather than the gaps
+between arrivals, because a stall followed by a catch-up burst produces one long
+gap and a run of zero-length ones, and the median of that looks healthy.
+
+| | direct TCP | queqiao |
+|---|---|---|
+| time to first token, p50 | 421.0ms | **244.7ms** |
+| time to first token, p99 | 471.7ms | **245.7ms** |
+| median lateness | 30.1ms | **0.7ms** |
+| tokens over 200ms late | 15.99% | **13.48%** |
+| tokens over 500ms late | **1.47%** | 3.34% |
+
+The first token arrives 1.72x sooner and the p99 of that is nearly flat, which
+is the pooled connection rather than anything clever. The median token tracks
+the generator to within a millisecond where direct TCP runs a full token
+interval behind.
+
+The last row is the one worth reading. More of the tail was worse through the
+transport, which is the opposite of every other result in this document.
+
+### Where that tail came from
+
+Against the TUIC-shaped reference in `internal/baseline`, which runs on the same
+QUIC fork in the same process, so the only difference is our coding:
+
+| | reference | queqiao |
+|---|---|---|
+| time to first token | 247.9ms | 244.7ms |
+| tokens over 200ms late | 19.00% | **8.13%** |
+| tokens over 500ms late | **0.70%** | 1.91% |
+
+Time to first token is identical, so that win belongs to QUIC and not to us.
+Coding more than halves the common case and roughly triples the 500ms tail,
+which is the signature of a code that usually works and costs an extra round
+trip when it does not.
+
+The transport's own counters said the same thing. Over one stream the code saw
+2078 symbols, recovered 322 of them, and failed on 29: a 1.38% residual on a
+workload where every unrepaired symbol is a reader watching a sentence stop.
+
+The cause was in how a short block is sized. The code picks a block length by
+maximising delivered bytes per symbol time, and prices a retransmission in
+symbols the flow could have sent instead. A block that seals short seals because
+the producer stopped, so those symbols were never going to be sent: the capacity
+is free and the objective was treating it as scarce. At a 1100-byte symbol on
+this path's erasure, a single symbol got **no repair at all** at the 20 KB/s
+rate estimate a token stream demonstrates, one repair at 100 KB/s, and two at
+850 KB/s. The protection followed the estimate, and an application-limited flow
+is precisely the one whose estimate is small.
+
+Blocks of four symbols or fewer are now sized to a delivery probability
+instead. The change is proven where it can be: at the sizing level it is
+deterministic, and the tests fail with the rule disabled.
+
+It is **not** proven end to end on this path, and the reason is the subject of
+the next section. Between the two runs the path stopped being the channel the
+first one measured: erasure fell to 4.3% and the burst factor rose to 2.0, so
+loss was arriving in runs rather than independently, which is harder for any
+code. Coding failed on 8.3% of losses before the change and 11.0% after, and
+neither figure can be attributed to the change. What can be said is that in the
+same window after it, against direct TCP:
+
+| | direct TCP | queqiao |
+|---|---|---|
+| tokens over 200ms late | 22.14% | **18.19%** |
+| tokens over 500ms late | 4.58% | **2.61%** |
+| tokens over 1s late | 1.94% | **0.00%** |
+
+queqiao now leads at every threshold, where before the change it lost the 500ms
+bar. That is consistent with the fix and is not proof of it. A second path,
+measured while this one is not moving, is what would settle it.
