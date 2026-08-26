@@ -1,4 +1,4 @@
-A `--path-profile` flag on the client and gateway selects the deployment a
-process is running in. `wan-shared-bottleneck` is the default and is unchanged;
-`dc-long-haul` is experimental and adjusts flow classification for a leg where
-every flow is a latency-critical request rather than a transfer.
+`--path-profile` selects which deployment a client or gateway is running in.
+`wan-shared-bottleneck` is the default and behaves as before; `dc-long-haul` is
+experimental and changes how flows are classified on a hop where every flow is
+a latency-sensitive request.

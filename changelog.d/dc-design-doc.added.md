@@ -1,3 +1,3 @@
-`docs/DESIGN-DC-PROFILE.md` records the datacenter profile's precondition, the
-mechanisms that differ from the access-link deployment, and the four design
-assumptions that measurement overturned.
+`docs/DESIGN-DC-PROFILE.md` covers when the datacenter profile applies, what
+differs from the access-link deployment, and the four design assumptions our
+measurements overturned.

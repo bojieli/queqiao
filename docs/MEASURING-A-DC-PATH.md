@@ -1,26 +1,26 @@
 # Reproducing the datacenter path measurements
 
-Everything in `PATH-CHARACTER-DC-20260826.md` was produced with two binaries in
-this repository. This is the runbook, so the numbers can be re-taken on another
-path rather than trusted.
+Everything in [PATH-CHARACTER-DC-20260826.md](PATH-CHARACTER-DC-20260826.md)
+came from two binaries in this repository. Here's how to re-run it, so the
+numbers can be checked on another path instead of taken on trust.
 
-## The two instruments, and why there are two
+## Why there are two tools
 
-`pathprobe` is open-loop: it sends at a rate nobody may adjust and counts what
-arrives, so it describes the path. **Its server is the sender**, so it measures
-the download direction. That detail produced a wrong conclusion once and is
-worth stating twice.
+`pathprobe` is open-loop. It sends at a rate nothing is allowed to adjust and
+counts what arrives, so it describes the path itself. **Its server does the
+sending**, which means it measures the download direction. That detail led us
+to a wrong conclusion once, so it's worth repeating.
 
-`pathmeasure` is closed-loop: it measures what a stack achieves, and names which
-constraint was binding from the kernel's own TCP_INFO. Its client is the sender
-by default and `-reverse` measures the download.
+`pathmeasure` is closed-loop. It measures what a stack achieves, and it reports
+which constraint was binding by reading the kernel's TCP_INFO. Its client does
+the sending by default; `-reverse` measures the download.
 
 ```sh
 GOOS=linux GOARCH=amd64 go build -o pathprobe   ./cmd/pathprobe
 GOOS=linux GOARCH=amd64 go build -o pathmeasure ./cmd/pathmeasure
 ```
 
-## Characterising a path
+## Characterizing a path
 
 On the far host:
 
@@ -32,97 +32,121 @@ pathmeasure -mode serve  -listen :12600 &
 From the near host:
 
 ```sh
-# Download erasure and the capacity knee. Sweep until deliver/sent falls.
+# Download loss and the capacity knee. Sweep until deliver/sent starts falling.
 pathprobe -mode client -remote HOST:12599 -sweep 1,5,20,80,300,600 -duration 8 -pattern
 
-# Upload erasure. Both directions are required: this project has measured a
-# path erasing 0.0% one way and 14% the other, minutes apart.
+# Upload loss. Measure both directions. We found a path that dropped 0.0% one
+# way and 14% the other, minutes apart.
 pathmeasure -mode udp -remote HOST:12600 -rate 50 -duration 8
 
-# Flow completion time for request-sized payloads, cold and warm separately.
+# Flow completion time for request-sized payloads, cold and warm reported apart.
 pathmeasure -mode fct -remote HOST:12600 -sizes 100KB,300KB,1MB -repeat 3
 pathmeasure -mode fct -reverse -remote HOST:12600 -sizes 100KB,300KB -repeat 3
 
-# What a long-lived connection retains between bursts.
+# What a long-lived connection keeps between bursts.
 pathmeasure -mode burst -remote HOST:12600 -bursts 6 -bytes 307200 -idle 3 -cc cubic
 pathmeasure -mode burst -remote HOST:12600 -bursts 6 -bytes 307200 -idle 3 -cc bbr
+
+# Concurrent load, both workload shapes.
+pathmeasure -mode load   -remote HOST:12600 -sizes 300KB -flows 16
+pathmeasure -mode frames -remote HOST:12600 -flows 16 -frames 100
 ```
 
-`-pattern` reports `burst_factor`. A memoryless channel has `P(loss|prev ok) = p`
-and `P(ok|prev lost) = 1-p`; when those hold, backing off will not help.
+`-pattern` reports `burst_factor`. A memoryless channel has
+`P(loss|prev ok) = p` and `P(ok|prev lost) = 1-p`. When those hold, backing off
+won't help.
+
+## Measure the loss in the same minutes
+
+This path's loss rate moves between roughly zero and 17% within minutes. A
+comparison quoted without a loss figure from the same window can't be lined up
+against any other one, because the transport repairs erasure and its advantage
+scales with how much there is. The same download comparison gave 13.5x at 14%
+loss and 6.5x in the single digits, hours apart.
+
+```sh
+# Run this before and after every comparison, not once at the start of a session.
+pathprobe -mode client -remote HOST:12599 -rate 20 -duration 6
+```
 
 ## Comparing anything
 
-**Use `-mode ab`. Do not hand-roll an A/B.** On the characterised path, position
-in the measurement sequence was worth 158ms and the policy under test was worth
-2.4ms; running the baseline first produced a 53% win that reversed when the
-order reversed. `ab` alternates order, pools, and prints the order effect beside
-the arm effect, and says so when the order dominates.
+**Use `-mode ab`. Don't hand-roll an A/B.** On this path, position in the test
+sequence was worth 158ms while the policy under test was worth 2.4ms. Running
+the baseline first produced a 53% win that reversed when we flipped the order.
+`ab` alternates, pools the samples, prints the order effect next to the arm
+effect, and says so when the order dominates.
 
 ```sh
 # direct against a tunnel
 pathmeasure -mode ab -reverse -remote HOST:12600 \
   -a direct -b socks5=127.0.0.1:12080 -sizes 300KB -repeat 3 -rounds 2
 
-# this project against the TUIC-shaped reference on the same QUIC stack --
-# without this arm, a result against TCP overstates the contribution sevenfold
+# this project against the TUIC-shaped reference on the same QUIC stack.
+# Without this arm, a result against TCP overstates our contribution by ~7x.
 pathmeasure -mode ab -reverse -remote HOST:12600 \
   -a socks5=127.0.0.1:12081 -b socks5=127.0.0.1:12080 -sizes 300KB -repeat 3 -rounds 2
 ```
 
-## Always measure the loss in the same minutes
-
-This path's erasure moves between roughly zero and seventeen percent within
-minutes. A comparison quoted without a contemporaneous loss figure cannot be
-placed against any other, because the transport repairs erasure and its
-advantage is a function of how much there is: the same download comparison gave
-13.5x at 14% loss and 6.5x at single-digit loss, hours apart.
+## HTTP/2 windows
 
 ```sh
-# before and after every comparison, not once at the start of the session
-pathprobe -mode client -remote HOST:12599 -rate 20 -duration 6
+# on the far host: two servers differing only in the window they advertise
+pathmeasure -mode h2serve -listen :12610                      # library default
+pathmeasure -mode h2serve -listen :12612 -h2-window 65535     # the RFC default
+
+# an ingress next to a receiver you can't change
+pathmeasure -mode h2proxy -listen :12613 -remote 127.0.0.1:12612 -h2-window 8388608
+
+# from the near host
+pathmeasure -mode h2 -remote HOST:12612 -sizes 300KB,1MB -repeat 3
 ```
 
-## Two traps that cost real time here
+## Four traps that cost us real time
 
-**A host running a TUN-mode proxy cannot measure its own paths.** Capture below
-the socket layer is not escaped by binding a source address or an interface;
-`curl --interface en0` still left through the tunnel. Where the tunnel
-terminates at the very server being measured, the result describes the proxy.
-`-local-address` helps only when the redirect is routing-based.
+**A host running a TUN-mode proxy can't measure its own paths.** Capture below
+the socket layer isn't escaped by binding a source address or an interface;
+`curl --interface en0` still left through the tunnel. Where that tunnel
+terminates at the server you're measuring, the result describes the proxy.
+`-local-address` only helps when the redirect is routing-based.
 
-**A relative threshold is not a fair threshold.** Counting late messages
-against each arm's own floor gives the arm with the lower median more room
-beneath its own bar, and it reports fewer late messages for that reason alone.
-The first frame comparison here showed 30% against 2% that way and no
-difference at all against fixed thresholds.
+**Completion has to be acknowledged by the peer.** Timing an upload by watching
+the local socket drain measures how long bytes took to reach a proxy's buffer
+on loopback. Our first tunnel comparison reported 17 Gbit/s across a 200ms
+path. `pathmeasure` now waits for an application-level ack, which is the only
+definition of "delivered" that survives an intermediary.
 
-**Completion must be acknowledged by the peer.** Timing an upload by watching
-the local socket drain measures how long bytes took to reach a proxy's buffer on
-loopback. The first run of the tunnel comparison reported 17 Gbit/s across a
-200ms path. `pathmeasure` now waits for an application-level ack, which is the
-only definition of delivered that survives an intermediary.
+**A relative threshold isn't a fair threshold.** Counting late messages against
+each arm's own floor gives the arm with the lower median more room under its
+own bar, so it reports fewer late messages for that reason alone. Our first
+frame comparison showed 30% versus 2% that way, and no difference at all
+against fixed thresholds.
+
+**Check what a metric is scoped to.** The aggregate metrics endpoint reports
+one lane, and with connection pooling that's usually the control connection,
+which is genuinely idle. Its bandwidth estimate says nothing about the lane
+carrying data.
 
 ## Standing up the comparison arms
 
-The reference proxy, for the "is this QUIC's win or ours" question:
+The reference proxy, for separating QUIC's win from ours:
 
 ```sh
-queqiaoref -mode gencert -gencert-prefix ref            # writes ref-cert, ref-key, ref-token
+queqiaoref -mode gencert -gencert-prefix ref            # writes cert, key, token
 queqiaoref -mode server -listen :18444 -token-file ref-token \
   -tls-cert ref-cert.pem -tls-key ref-key.pem &
 queqiaoref -mode client -listen 127.0.0.1:12081 -remote HOST:18444 \
   -token-file ref-token -root-ca ref-cert.pem &
 ```
 
-Queqiao itself, isolated from any production deployment on the same host by
+Queqiao itself, kept away from any production deployment on the same host by
 using its own state directory and port:
 
 ```sh
 queqiaod provider init -state /tmp/qqstate -name Bench -endpoint HOST:18443
 queqiaod provider add-user -state /tmp/qqstate -name bench
 queqiaod server --state /tmp/qqstate --listen :18443 --path-profile dc-long-haul &
-queqiaod provider invite -state /tmp/qqstate -user bench      # on the client:
+queqiaod provider invite -state /tmp/qqstate -user bench      # then on the client:
 queqiaod enroll 'queqiao://enroll/...' --local-address if:eth0
 queqiaod client --profile ~/.config/queqiao/*.json --path-profile dc-long-haul &
 ```

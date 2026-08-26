@@ -1,3 +1,3 @@
-`docs/MEASURING-A-DC-PATH.md` is the runbook for re-taking the datacenter path
-measurements, including the two confounds that produced wrong conclusions the
-first time.
+`docs/MEASURING-A-DC-PATH.md` is the runbook for re-running the datacenter
+measurements, including the four traps that produced wrong answers the first
+time.

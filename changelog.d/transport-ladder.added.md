@@ -1,3 +1,3 @@
-The datacenter path characterisation now separates what moving off TCP is worth
-from what this project's coding adds, measured against the TUIC-shaped
-reference on the same QUIC stack.
+The datacenter path characterization now separates what getting off TCP is
+worth from what our coding adds, measured against the TUIC-shaped reference on
+the same QUIC stack.

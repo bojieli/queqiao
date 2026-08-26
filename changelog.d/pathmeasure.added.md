@@ -1,5 +1,5 @@
-`pathmeasure`, a stack-level companion to `pathprobe`: flow completion time for
-request-sized payloads, an idle-burst mode that shows what a long-lived
-connection retains, upload and download direction measurement, and per-sample
-attribution of which constraint was binding, read from the kernel's own
-TCP_INFO.
+`pathmeasure`, a companion to `pathprobe` that measures what a stack achieves
+rather than what a path does. It reports flow completion time for
+request-sized payloads, shows what a long-lived connection keeps between
+bursts, measures both directions, runs concurrent request and frame workloads,
+and reads the kernel's TCP_INFO to say which constraint was binding.
