@@ -115,7 +115,8 @@ would have addressed it.
 ## What we got wrong
 
 We designed this profile from first principles and then went and measured it.
-Four of our assumptions were wrong. The corrections are most of what follows.
+Five of our assumptions were wrong, and the last one was wrong twice. The
+corrections are most of what follows.
 
 **We expected the transport to hurt this workload. It helps a lot.** Cold flows
 run 5-10x faster just from the pre-warmed connection pool, and the lossy
