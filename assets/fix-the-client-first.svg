@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 580" width="1240" height="580" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="Two bar charts. On the speech recognition upload, which runs on the direction that loses nothing, a tuned direct client reaches 241 milliseconds on a reused connection and Queqiao reaches 237, so the two are the same answer. On a new connection direct TCP takes 1185 milliseconds and Queqiao 302. On the speech synthesis download, which runs on the direction that erases about 14 percent, tuning the client moves 916 milliseconds only to 629, while Queqiao is 71.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 580" width="1240" height="580" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="Two bar charts. On the speech recognition upload, which runs on the direction that loses nothing, a tuned direct client reaches 241 milliseconds on a reused connection and Queqiao reaches 237, so the two are the same answer. On a new connection direct TCP takes 1185 milliseconds and Queqiao 302. On the speech synthesis download, which runs on the direction that erases about 14 percent, the download leg takes 945 milliseconds direct while Queqiao is 68, which is 13.9 times faster.">
   <rect x="0" y="0" width="1240" height="580" fill="#FBFCFE"/>
 
   <text x="620" y="44" text-anchor="middle" font-size="25" font-weight="700" fill="#0F172A">The free client fix reaches the median. It does not reach the rest.</text>
@@ -41,15 +41,13 @@
   <line x1="690" y1="430" x2="1180" y2="430" stroke="#CBD5E1" stroke-width="1.5"/>
   <text x="905" y="454" text-anchor="middle" font-size="14" font-weight="600" fill="#475569">time to move the audio back</text>
 
-  <rect x="760" y="247" width="60" height="183" rx="3" fill="#C2410C"/>
-  <text x="790" y="239" text-anchor="middle" font-size="13" font-weight="600" fill="#9A3412">916</text>
-  <rect x="860" y="304" width="60" height="126" rx="3" fill="#94A3B8"/>
-  <text x="890" y="296" text-anchor="middle" font-size="13" font-weight="600" fill="#475569">629</text>
-  <rect x="960" y="416" width="60" height="14" rx="3" fill="#2563EB"/>
-  <text x="990" y="408" text-anchor="middle" font-size="13" font-weight="700" fill="#1D4ED8">71</text>
+  <rect x="800" y="241" width="70" height="189" rx="3" fill="#C2410C"/>
+  <text x="835" y="233" text-anchor="middle" font-size="13" font-weight="600" fill="#9A3412">945</text>
+  <rect x="920" y="416" width="70" height="14" rx="3" fill="#2563EB"/>
+  <text x="955" y="408" text-anchor="middle" font-size="13" font-weight="700" fill="#1D4ED8">68</text>
 
-  <text x="935" y="486" text-anchor="middle" font-size="14" fill="#7F1D1D">The sysctl restores a window after an idle gap. It does</text>
-  <text x="935" y="506" text-anchor="middle" font-size="14" fill="#7F1D1D">nothing about a packet that was dropped.</text>
+  <text x="935" y="486" text-anchor="middle" font-size="14" fill="#7F1D1D">A sysctl restores a window after an idle gap. It does</text>
+  <text x="935" y="506" text-anchor="middle" font-size="14" fill="#7F1D1D">nothing about a packet that was dropped. 13.9x.</text>
 
   <rect x="120" y="528" width="1000" height="40" rx="10" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
   <text x="620" y="553" text-anchor="middle" font-size="15" fill="#1E40AF">Deploy this for what the config line cannot reach: a cold connection, a direction that erases, or a caller you cannot reconfigure.</text>

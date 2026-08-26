@@ -58,7 +58,7 @@ at p99 against 246.4ms; a congestion window restored after an idle gap does
 nothing about a packet that was dropped.
 
 <p align="center">
-  <img src="../assets/fix-the-client-first.svg" alt="Two bar charts. On the speech recognition upload, which runs on the direction that loses nothing, a tuned direct client reaches 241 milliseconds on a reused connection and Queqiao reaches 237, so the two are the same answer. On a new connection direct TCP takes 1185 milliseconds and Queqiao 302. On the speech synthesis download, which erases about 14 percent, tuning the client moves 916 milliseconds only to 629, while Queqiao is 71." width="880">
+  <img src="../assets/fix-the-client-first.svg" alt="Two bar charts. On the speech recognition upload, which runs on the direction that loses nothing, a tuned direct client reaches 241 milliseconds on a reused connection and Queqiao reaches 237, so the two are the same answer. On a new connection direct TCP takes 1185 milliseconds and Queqiao 302. On the speech synthesis download, which erases about 14 percent, the download leg takes 945 milliseconds direct while Queqiao is 68, which is 13.9 times faster." width="880">
 </p>
 
 So the question to ask before deploying anything is which of those you have.

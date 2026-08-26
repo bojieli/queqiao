@@ -134,6 +134,15 @@ splits each request into connect, request-to-first-byte, and download.
 
 Two things to get right, both of which will otherwise produce a wrong number:
 
+**Response timing through a local proxy has the same problem, in reverse.** The
+tunnel forwards into a loopback socket the client has not drained yet, so on a
+warm connection the whole response can be sitting in that buffer before the
+client's first read returns. We measured a 100KB synthesis response as a 3.6ms
+"download" that way, against 67.9ms for the same response on a cold connection
+where the tunnel was still filling. Neither figure is wrong about what the
+client observed; only the second is about the path. Where the two arms differ by
+three orders of magnitude, suspect the buffer rather than the transport.
+
 **Client-side upload timing is meaningless through a local proxy.** The client
 writes into a loopback socket that accepts the whole body into a buffer
 immediately, so `WroteRequest` fires in under a millisecond while the bytes have

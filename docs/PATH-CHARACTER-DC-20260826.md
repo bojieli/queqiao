@@ -784,6 +784,13 @@ put the floor around 227ms, and both arms are within ten milliseconds of it.
 Before the pacing fix the transport sat 67ms above, all of it the pacer metering
 a flow that had produced no evidence of congestion.
 
+The synthesis side was re-measured in the same session and is unchanged by the
+pacing work, which is what it should be: that direction erases about 14%, so the
+send-side loss guard keeps the gateway metering there. The download leg is
+945.2ms direct against 67.9ms through the transport, **13.9x**, and the leg
+containing the model agrees between the arms to 3%, which is the check that both
+reached the same server doing the same work.
+
 Two cautions about the tail figures. An earlier run of the same comparison, on a
 minute when the path was dropping about 20% of pings, put direct at 834.3ms and
 916.7ms at p90 and p99 against 274.6ms and 289.6ms; this run, with the path
