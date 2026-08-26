@@ -220,9 +220,19 @@ gateway. Typical deployments include:
 | Remote corporate access | employee or remote site to the corporate VPN gateway |
 | Weak access network | hotel, residential, mobile, or rural link to a stable relay |
 | Overlay network | one long-haul leg between two overlay endpoints |
+| Cross-region inference | an application in one region calling ASR, TTS, or an LLM served in another |
 
 The repository provides this paired data plane. Discovery, global routing, and
 a full mesh control plane belong to a larger overlay product built around it.
+
+The last row is served by a second, experimental profile. GPU capacity
+concentrates in a few regions while turn-taking has to answer in about 20ms,
+which leaves a long hop in the middle that nobody can design away. That hop
+differs from an access link in where its bottleneck is, so it gets its own
+profile rather than the default one: see [the datacenter
+profile](docs/DEPLOYING-DC-PROFILE.md), and read its measured limits before
+deploying it, because on a clean path direction a one-line client-side fix
+beats it on the median request.
 
 ## Project status
 

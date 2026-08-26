@@ -15,6 +15,13 @@ can establish correctness, behavior under controlled impairment, and a fair
 same-window comparison; it cannot turn one path into a universal performance
 claim.
 
+This document covers the emulated rig, which is where a result is reproducible.
+For measuring a live path instead, `cmd/pathprobe` describes the path and
+`cmd/pathmeasure` describes what a stack achieves on it, including
+`-mode workload`, which drives a real endpoint rather than a transfer of the
+same size. [MEASURING-A-DC-PATH.md](MEASURING-A-DC-PATH.md) is the procedure
+and the traps.
+
 ## One protocol, three workload views
 
 Short-lived, interactive, and bulk are evaluation families for the same

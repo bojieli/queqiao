@@ -32,6 +32,19 @@ qualification items are still open.
   `internal/pep/case4_test.go` asserts this behaviour rather than the fix, so
   it cannot change silently in either direction, and the redesign document
   records what was tried, in what order, and which of it was wrong.
+- The `dc-long-haul` profile is qualified on exactly one path. Everything known
+  about it comes from a Guiyang-to-Irvine link, so its constants are that
+  link's constants until a second path either confirms them or doesn't. It is
+  marked experimental for that reason and the marking is not a formality.
+- On a path direction that does not erase, a tuned client beats this transport
+  on the median request. Reusing a connection and setting
+  `net.ipv4.tcp_slow_start_after_idle=0` took a real 355KB inference upload to
+  225.8ms against 295.0ms through the tunnel. What the client fix does not
+  reach is the tail (1026.5ms against 373.5ms at p99), a direction that erases
+  (8.8x on a real synthesis download against the same tuned client), a
+  connection that is genuinely cold, or a caller you cannot reconfigure. Apply
+  the free fixes first and deploy this for what is left; see
+  [DEPLOYING-DC-PROFILE.md](DEPLOYING-DC-PROFILE.md).
 - Queqiao is a WAN optimization data plane, not an anonymity network. The
   desktop ingress is SOCKS5, the released Android app exports an authenticated
   SOCKS5 endpoint to a separate routing client, and the iOS app is a
