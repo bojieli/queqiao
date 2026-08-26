@@ -14,6 +14,7 @@ you choose the next document based on what you want to do.
 | Use a provider and client | [Deployment guide](DEPLOYING.md) |
 | Understand the transport in depth | [Current design](DESIGN.md), then [architecture](ARCHITECTURE.md) |
 | Measure a path or compare a baseline | [Benchmarking](BENCHMARKING.md) |
+| Run inference traffic between two regions you own | [Datacenter profile](DEPLOYING-DC-PROFILE.md) |
 | Contribute code, documentation, or network results | [Contributing](../CONTRIBUTING.md) |
 
 ## Use and operate Queqiao
@@ -27,6 +28,10 @@ you choose the next document based on what you want to do.
   and release requirements.
 - [Android export mode](ANDROID-EXPORT.md) — how the released Android app
   provides a local SOCKS5 endpoint to an existing routing client.
+- [Deploying the datacenter profile](DEPLOYING-DC-PROFILE.md) — running
+  `dc-long-haul` for inference traffic on a long hop between two regions you
+  operate, including which free client-side fixes to apply first and when the
+  transport is still worth deploying.
 - [Known limitations](KNOWN-LIMITATIONS.md) — scope, privacy, topology,
   platform, and operational limits to check before deployment.
 
@@ -45,6 +50,9 @@ you choose the next document based on what you want to do.
 - [Path characterization](PATH-CHARACTER-20260813.md) — the open-loop
   measurement that exposed the motivating path's erasure floor and congestion
   knee.
+- [Datacenter profile design](DESIGN-DC-PROFILE.md) — why a second profile
+  exists, what separates it from the access-link one, and the four assumptions
+  that measurement overturned.
 - [Control redesign](CONTROL-REDESIGN.md) — proposed delay-bounded goodput
   objective, the two latched estimators it removes, what it does not solve, and
   the cases that would falsify it.
@@ -53,6 +61,12 @@ you choose the next document based on what you want to do.
 
 - [Benchmarking](BENCHMARKING.md) — reproducible short-lived, interactive, and
   bulk workload measurements.
+- [Reproducing the datacenter measurements](MEASURING-A-DC-PATH.md) — how to
+  characterize a long hop, compare arms without fooling yourself, and measure a
+  real inference endpoint rather than a stand-in.
+- [What a China-US datacenter path actually is](PATH-CHARACTER-DC-20260826.md) —
+  the full characterization, including the real ASR and TTS results and the
+  case where a tuned client beats this transport.
 - [Field validation](FIELD-VALIDATION.md) — the real-network matrix for NAT,
   middleboxes, access diversity, and release qualification.
 - [Field-result index](field-results/README.md) — current protocol-1 records;
