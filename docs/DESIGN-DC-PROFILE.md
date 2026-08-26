@@ -5,6 +5,7 @@
 >
 > **Applies to:** the `dc-long-haul` profile
 > **Evidence:** [PATH-CHARACTER-DC-20260826.md](PATH-CHARACTER-DC-20260826.md)
+> **Running it:** [DEPLOYING-DC-PROFILE.md](DEPLOYING-DC-PROFILE.md)
 > **Last reviewed:** 2026-08-26
 
 Queqiao's supported deployment is a client talking to a trusted gateway over a
