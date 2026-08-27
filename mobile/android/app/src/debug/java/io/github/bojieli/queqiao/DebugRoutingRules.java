@@ -18,15 +18,15 @@ import mobilecore.Session;
  * <p>The released app is not a VPN and has no routing engine — it exports a
  * SOCKS5 endpoint and the consumer client that owns the device tunnel supplies
  * rules, per-app policy, and DNS. That is the arrangement
- * {@code docs/KNOWN-LIMITATIONS.md} describes and the release checklist asserts
- * against the assembled artifact, which declares no {@code BIND_VPN_SERVICE}.
+ * docs/KNOWN-LIMITATIONS.md describes and the release checklist asserts
+ * against the assembled artifact, which declares no BIND_VPN_SERVICE.
  * So rules here can only ever serve the debug tunnel, and that is what this
  * class is: the same core, the same rule syntax, the same country set, reachable
  * from a build that has a TUN to apply them to.
  *
  * <p>The rules come from a file rather than a settings screen. The debug build
  * exists to exercise the core against a real device, and a file that can be
- * pushed with {@code adb push} is the shortest path from a rule list to a
+ * pushed with adb push is the shortest path from a rule list to a
  * running tunnel — no UI to navigate on every iteration, and the same file can
  * be handed to the iOS client's editor.
  */

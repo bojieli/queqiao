@@ -46,7 +46,15 @@ type fakeDNS struct {
 // than a device has live at once; the eviction below is a bound on the map
 // rather than something expected to run.
 const (
-	fakeDNSPrefix   = "198.18.0.0/15"
+	fakeDNSPrefix = "198.18.0.0/15"
+	// fakeDNSPoolBits is the prefix length above, and fakeDNSPoolSize how many
+	// addresses that holds. Both are constants rather than arithmetic on the
+	// parsed prefix: the prefix is a literal, so the calculation never had an
+	// input that could vary, and deriving it meant converting a bit count no
+	// caller can influence. TestThePoolSizeMatchesItsPrefix keeps the two from
+	// drifting apart.
+	fakeDNSPoolBits = 15
+	fakeDNSPoolSize = uint32(1) << (32 - fakeDNSPoolBits)
 	fakeDNSCapacity = 8192
 	// fakeDNSTTL is what the answer claims, in seconds. It is short because the
 	// mapping is only meaningful to this process: a client that caches it past
@@ -58,7 +66,7 @@ func newFakeDNS() *fakeDNS {
 	prefix := netip.MustParsePrefix(fakeDNSPrefix)
 	return &fakeDNS{
 		base:    prefix.Masked().Addr(),
-		size:    1 << (32 - uint32(prefix.Bits())),
+		size:    fakeDNSPoolSize,
 		next:    2, // skip the network address and the one after it
 		byName:  make(map[string]netip.Addr),
 		byAddr:  make(map[netip.Addr]string),

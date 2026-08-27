@@ -420,3 +420,15 @@ func (c *recordingConn) Write(p []byte) (int, error) {
 
 func (c *recordingConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *recordingConn) SetWriteDeadline(time.Time) error { return nil }
+
+// The pool size is written as a constant, so nothing derives it from the
+// prefix at run time. This is what stops the two drifting apart.
+func TestThePoolSizeMatchesItsPrefix(t *testing.T) {
+	prefix := netip.MustParsePrefix(fakeDNSPrefix)
+	if prefix.Bits() != fakeDNSPoolBits {
+		t.Fatalf("%s is a /%d, but the constant says /%d", fakeDNSPrefix, prefix.Bits(), fakeDNSPoolBits)
+	}
+	if want := uint64(1) << (32 - prefix.Bits()); want != uint64(fakeDNSPoolSize) {
+		t.Errorf("the pool holds %d addresses, but the constant says %d", want, fakeDNSPoolSize)
+	}
+}

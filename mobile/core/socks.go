@@ -203,6 +203,8 @@ func socksDomainRequest(command byte, host string, port uint16) ([]byte, error) 
 		return nil, fmt.Errorf("SOCKS destination name is %d bytes, over the 255 the wire allows", len(host))
 	}
 	request := make([]byte, 0, 7+len(host))
+	// #nosec G115 -- the length is refused above if it exceeds 255, which is
+	// the whole reason that check is there rather than a truncation here.
 	request = append(request, socksVersion, command, 0, socksDomain, byte(len(host)))
 	request = append(request, host...)
 	return binary.BigEndian.AppendUint16(request, port), nil
