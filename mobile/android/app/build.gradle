@@ -126,3 +126,16 @@ androidComponents {
 dependencies {
     implementation files("libs/mobilecore.aar")
 }
+
+// The debug VPN build carries the same packed country set the iOS client ships,
+// so a GEOIP rule means the same thing on both. It is copied from that one file
+// at build time rather than committed a second time: two copies of a generated
+// artifact drift, and the one that drifts is the one nobody regenerates.
+def bundledCountrySet = tasks.register("copyCountrySetForDebug", Copy) {
+    from rootProject.file("../ios/PacketTunnel/Resources/cn-direct.bin")
+    into layout.buildDirectory.dir("generated/countrySet/assets")
+}
+
+android.sourceSets.debug.assets.srcDir(
+    bundledCountrySet.map { it.destinationDir }
+)
