@@ -110,17 +110,37 @@ qualification items are still open.
   network answers it directly — but the answer is advisory: it names a likely
   cause in the notification and in the connection test, and never blocks a
   connection, because a VPN carrying Queqiao's uplink is not by itself proof of
-  a loop.
-- The iOS client is a full-device tunnel with a bounded routing subset, not a
-  rule engine. It offers typed CIDR bypass, an experimental bundled registry
-  set, and automatic connection rules; it does not offer per-app routing,
-  domain or process rules, or custom DNS. DNS uses Cloudflare through the
-  encrypted Queqiao tunnel.
-- The iOS bundled China route set matches addresses, not names. DNS resolves
-  through the tunnel, so a Chinese domain resolved from the gateway's vantage
-  point can return addresses outside the set and still route through Queqiao.
-  The registry also delegates address space that need not be in use. The
-  feature is therefore experimental and off by default.
+  a loop. The debug build, which does carry a `VpnService`, reads the same rule
+  list as iOS from `routing-rules.conf` in its files directory; that is a
+  development affordance and cannot ship, because the released artifact
+  declares no `BIND_VPN_SERVICE` and CI asserts it against the assembled APK.
+- The iOS client is a full-device tunnel with a routing rule list: `DOMAIN`,
+  `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`, `GEOIP` and `DST-PORT` rules
+  choosing between `PROXY`, `DIRECT` and `REJECT`, first match wins, in the
+  syntax Clash, mihomo, sing-box and Shadowrocket read. A flow no rule matches
+  takes the tunnel. It does not offer per-app routing, process rules,
+  `URL-REGEX` or `USER-AGENT` matching, remote rule-set subscriptions, or a
+  choice of outbound: there is one tunnel, so a rule naming a proxy group is
+  refused rather than read as `PROXY`.
+- Name rules work by the core answering lookups itself, from `198.18.0.0/15`,
+  and reversing the handle when the connection arrives. Two consequences are
+  worth knowing. An application that ignores the tunnel's resolver and speaks
+  DNS-over-HTTPS to a server of its own never asks, so its flows arrive as
+  literal addresses and only the address rules can see them. And the handles
+  live for as long as the tunnel does: a name evicted from a full map ends the
+  flows still using it rather than misrouting them, which is a reset the
+  application sees rather than traffic going somewhere it should not.
+- `DIRECT` flows are resolved on the device, which is the point of matching
+  `DIRECT`; proxied flows are resolved by the gateway, which is the vantage
+  they are being sent to use. Queries that are not answered locally still go
+  to Cloudflare through the encrypted tunnel.
+- The iOS bundled China route set matches addresses, not names, and the
+  registry delegates address space that need not be in use. The "keep Chinese
+  addresses direct" toggle is therefore still experimental and still off by
+  default. What it could never do on its own was follow a Chinese domain that
+  answers with a CDN address outside the registry set; a `DOMAIN-SUFFIX` rule
+  can, which is why the bundled China preset pairs name rules with `GEOIP,CN`
+  rather than relying on either alone.
 - iOS automatic connection rules match Wi-Fi networks by typed name. Queqiao
   never scans, so a network the user has not named is treated as untrusted, and
   a renamed network stops matching until the user updates the list.
