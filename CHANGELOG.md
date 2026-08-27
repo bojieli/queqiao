@@ -204,6 +204,16 @@ to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
   signals read clean on exactly the path where bursting is worst: gating on them
   alone took an emulated policer from 3.0x overdrive to 4.0x and from 32.9% loss
   to 54.9%.
+- The unmetered burst is what the path already holds rather than an addition to
+  it: what is in flight comes out of the allowance, and the bandwidth-delay
+  product it is measured against is the one the path delivers, not the larger
+  figure this sender puts on the wire to compensate erasure. A request-shaped
+  flow arrives with an empty pipe and is unaffected, which is the case the
+  burst exists for. A saturating flow is already holding that product, and
+  granting it another drove a burst into the bottleneck that the delay brake
+  then read as congestion: on the emulated erasure path the erasure controller
+  fell from 10.5 to 0.9 Mbit/s of a 14.5 Mbit/s capacity, and monotonically
+  worse the larger the burst.
 - Flow completion records now say whether a replacement lane was ever attempted,
   not only whether one arrived: `lane_replacement_attempts` and
   `lane_replacement_failures` join the fields already written by both endpoints.

@@ -407,6 +407,16 @@ func TestTheSenderPublishesTheMeasurementItsCodeIsSizedFrom(t *testing.T) {
 
 }
 
+// characterized gives a sender the evidence the burst rule needs before it will
+// read a clean channel as clean. The tests below state the estimator's
+// conclusions directly rather than driving packets through it, so they have to
+// state how much was behind them as well: a sender that has just started has
+// measured nothing, and nothing is not a report of a clean path.
+func characterized(e *ErasureSender) *ErasureSender {
+	e.samples.Store(burstEvidenceSamples)
+	return e
+}
+
 // The pacer used to meter every send at a bandwidth estimate that a
 // request-shaped flow cannot raise, because such a flow is application-limited
 // by construction. On the measured datacenter path that cost 67ms of a 355KB
@@ -417,7 +427,7 @@ func TestTheSenderPublishesTheMeasurementItsCodeIsSizedFrom(t *testing.T) {
 // path's own minimum, and no loss the estimator attributed to rate. These pin
 // that the burst follows that evidence rather than a constant.
 func TestNoCongestionEvidenceMeansNoMetering(t *testing.T) {
-	e := senderAtRTT(t, 200*time.Millisecond, 202*time.Millisecond)
+	e := characterized(senderAtRTT(t, 200*time.Millisecond, 202*time.Millisecond))
 	got := e.unmeteredBurst()
 	if got <= 0 {
 		t.Fatal("a path holding almost no queue, with no loss attributed to rate, is " +
@@ -433,7 +443,7 @@ func TestNoCongestionEvidenceMeansNoMetering(t *testing.T) {
 // The delay bound permits a queue of one round trip. At it, the sender is doing
 // the thing pacing exists to prevent, so metering has to come back.
 func TestAQueueAtTheBoundRestoresMetering(t *testing.T) {
-	e := senderAtRTT(t, 200*time.Millisecond, 400*time.Millisecond)
+	e := characterized(senderAtRTT(t, 200*time.Millisecond, 400*time.Millisecond))
 	if got := e.unmeteredBurst(); got != 0 {
 		t.Fatalf("a path holding a full round trip of queue reported an unmetered burst "+
 			"of %d; that is the bound this controller says must not be exceeded", got)
@@ -444,7 +454,7 @@ func TestAQueueAtTheBoundRestoresMetering(t *testing.T) {
 // separating it from the channel's own erasure is what this project is for.
 // Erasure alone must not restore metering; congestive loss must.
 func TestOnlyCongestiveLossRestoresMetering(t *testing.T) {
-	e := senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond)
+	e := characterized(senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond))
 	if e.unmeteredBurst() <= 0 {
 		t.Fatal("precondition: a quiet path should not be metered")
 	}
@@ -476,7 +486,7 @@ func TestNoRoundTripMeasurementKeepsTheConstant(t *testing.T) {
 // 4.0x and from 32.9% loss to 54.9%, because metering was the last thing
 // holding the rate down. See internal/pep/case4_test.go.
 func TestALossyDirectionIsStillMetered(t *testing.T) {
-	e := senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond)
+	e := characterized(senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond))
 	if e.unmeteredBurst() <= 0 {
 		t.Fatal("precondition: a clean quiet path should not be metered")
 	}
@@ -492,10 +502,95 @@ func TestALossyDirectionIsStillMetered(t *testing.T) {
 // the burst exists for. A trace of loss must not close the gate, or the rule
 // would never fire on a real link.
 func TestAnAlmostCleanDirectionStillBursts(t *testing.T) {
-	e := senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond)
+	e := characterized(senderAtRTT(t, 200*time.Millisecond, 201*time.Millisecond))
 	e.erasure.Store(uint64(0.001 * partsPerMillion))
 	if e.unmeteredBurst() <= 0 {
 		t.Fatal("a direction losing one packet in a thousand is being metered; the " +
 			"measured datacenter upload lost 0 of 41,663 and this rule has to fire there")
+	}
+}
+
+// The burst has to come out of what the path already holds, not be added to
+// it. Every signal the two rules above consult reads clean for a saturating
+// flow on an erasing path -- no queue past the minimum, no loss attributed to
+// rate -- so without this the flow was handed a further bandwidth-delay
+// product on top of a window that was already in flight. It drove that into
+// the bottleneck, the delay brake read the queue that built, and the rate it
+// clamped to was the rate the flow kept: on the emulated erasure path the
+// erasure controller fell from 10.5 to 0.9 Mbit/s of a 14.5 Mbit/s capacity,
+// and monotonically worse the larger the burst.
+//
+// TestTheErasureControllerReachesThePathOthersGiveAway is what caught it, and
+// that test skips under -short, so it reached main through a green CI and was
+// found by a release candidate. This one is here so the next such change fails
+// in the normal suite instead.
+func TestAFlowAlreadyUsingThePathIsStillMetered(t *testing.T) {
+	const minRTT = 200 * time.Millisecond
+	e := characterized(senderAtRTT(t, minRTT, minRTT+2*time.Millisecond))
+
+	// The product is computed from what the path delivers rather than from
+	// what this sender puts on the wire. The two differ by the erasure
+	// compensation, and it is the delivered figure that says how much the path
+	// holds; the compensated one says only that we send more to get it there.
+	product := quiccongestion.ByteCount(float64(e.inner.bandwidth()) * minRTT.Seconds())
+	if product <= 0 {
+		t.Fatalf("no bandwidth-delay product to reason about: %d", product)
+	}
+
+	// An empty pipe is the case the burst exists for and must keep.
+	e.TimeUntilSend(0)
+	empty := e.unmeteredBurst()
+	if empty <= 0 {
+		t.Fatal("a flow with an empty pipe on an uncongested path is being metered; " +
+			"that is the 355KB request this rule was written for")
+	}
+
+	// A flow already holding a product is doing the thing pacing exists to
+	// bound, whatever the other two signals say about it.
+	e.TimeUntilSend(product)
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Errorf("a flow already holding one product in flight was granted a further "+
+			"%d bytes unmetered; the burst has to be what the path holds, not an "+
+			"addition to it", got)
+	}
+
+	// And between the two the allowance is what remains of the product, so it
+	// falls as the pipe fills rather than switching off at one end of it. The
+	// window is the other bound and binds first on an empty pipe, so leave
+	// less than a window of the product to see the product doing the work.
+	window := e.GetCongestionWindow()
+	e.TimeUntilSend(product - window/2)
+	partial := e.unmeteredBurst()
+	if partial != window/2 {
+		t.Errorf("with %d bytes of the product unused, the allowance is %d, want %d: "+
+			"what is left of it", window/2, partial, window/2)
+	}
+	if partial >= empty {
+		t.Errorf("a part-full pipe was granted %d, no less than the %d an empty one "+
+			"gets", partial, empty)
+	}
+}
+
+// Both gates read their own zero value as a clean channel, so a sender that has
+// measured nothing looks exactly like a sender on a perfect path. It is not the
+// same claim, and reading it as one granted a startup burst on a channel erasing
+// 42%: by the time the erasure ceiling had a measurement to refuse with, the
+// burst had built the queue that the delay brake then holds the rate down for.
+// Closing this window was worth about a tenth of the erasure controller's rate
+// on the emulated path, over and above the in-flight bound above.
+func TestAChannelNothingHasMeasuredIsNotACleanChannel(t *testing.T) {
+	e := senderAtRTT(t, 200*time.Millisecond, 202*time.Millisecond)
+	e.TimeUntilSend(0)
+
+	if got := e.unmeteredBurst(); got != 0 {
+		t.Errorf("a sender that has decided no packets granted a burst of %d; nothing "+
+			"has reported on this channel, and nothing is not a report of a clean one", got)
+	}
+
+	// The same sender, once there is evidence behind that reading.
+	e.samples.Store(burstEvidenceSamples)
+	if e.unmeteredBurst() <= 0 {
+		t.Error("a measured clean path is being metered; the evidence gate has to open " +
+			"once there is evidence, or the burst never fires on a real link")
 	}
 }

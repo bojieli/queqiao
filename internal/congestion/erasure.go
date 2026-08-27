@@ -105,6 +105,18 @@ type ErasureSender struct {
 	// callback that computes it.
 	congestive atomic.Uint64
 
+	// inFlight is what this connection already has on the wire, recorded from
+	// the callbacks that carry it because the pacer, like the fields above,
+	// runs outside them.
+	inFlight atomic.Uint64
+
+	// samples is how many decided packets the estimator's report rests on.
+	// Both gates above read their own zero value as a clean path, so until
+	// there is evidence behind that reading, the absence of evidence is
+	// indistinguishable from evidence of absence -- the reading this sender
+	// refuses everywhere else.
+	samples atomic.Uint64
+
 	// passed counts the losses handed to the inner controller, which is now
 	// all of them. It stays because the telemetry below is an assertion as
 	// much as a measurement: what this sender saw and what the controller was
@@ -214,14 +226,28 @@ func newErasureSender(initialPacketSize quiccongestion.ByteCount) *ErasureSender
 	return e
 }
 
-func (e *ErasureSender) bandwidth() quiccongestion.ByteCount {
+// deliveredRate is BBR's estimate of what arrives, bounded by this lane's
+// share of the endpoint pair's bottleneck.
+//
+// The cap is what keeps lanes from compounding. Each lane's own estimate is
+// what it alone is receiving, so four lanes each probing above their own
+// estimate put four times the overshoot into one bottleneck; capping at the
+// share means the aggregate on the wire is what a single sender would have put
+// there. The burst allowance is measured against this for the same reason.
+func (e *ErasureSender) deliveredRate() float64 {
 	delivered := float64(e.inner.bandwidth())
 	if share := float64(e.share.Load()); share > 0 && share < delivered {
 		delivered = share
 	}
+	return delivered
+}
+
+// bandwidth is the rate to put on the wire: what arrives, divided by the
+// fraction that arrives.
+func (e *ErasureSender) bandwidth() quiccongestion.ByteCount {
 	// The delay bound is applied after the erasure compensation rather than
 	// before it, because the queue holds what was sent and not what arrived.
-	return quiccongestion.ByteCount(e.delayBounded(delivered / e.arrivalRate()))
+	return quiccongestion.ByteCount(e.delayBounded(e.deliveredRate() / e.arrivalRate()))
 }
 
 // compensationFor decides how much of a proposed compensation to apply, by
@@ -389,6 +415,16 @@ func (e *ErasureSender) delayBounded(rate float64) float64 {
 // latency every window-based controller accepts, and a burst loss on the way
 // there is repaired by the code rather than by a retransmission.
 func (e *ErasureSender) unmeteredBurst() quiccongestion.ByteCount {
+	// Too little has reported on this channel for the two gates below to be
+	// reading anything but their own initial zeroes, which is a clean path. That
+	// is how a startup burst was granted on a channel erasing 42%: by the time
+	// the erasure ceiling had a measurement to refuse it with, the burst had
+	// already built the queue, and the delay brake holds the rate down long
+	// after. Measured on the emulated erasure path, closing this window alone
+	// was the difference between 9.4 and 10.5 Mbit/s.
+	if e.samples.Load() < burstEvidenceSamples {
+		return 0
+	}
 	if float64(e.congestive.Load())/partsPerMillion > 0 {
 		return 0
 	}
@@ -416,7 +452,32 @@ func (e *ErasureSender) unmeteredBurst() quiccongestion.ByteCount {
 	if minRTT <= 0 || queue >= minRTT {
 		return 0
 	}
-	return e.GetCongestionWindow()
+	// What is already on the wire has to come out of the allowance, and the
+	// paragraph above is what explains why. A burst below the bandwidth-delay
+	// product cannot build a standing queue only if it is what the path holds;
+	// granted on top of a window that is already in flight it is not that, it
+	// is one product of overshoot, and the congestion window is no bound on it
+	// because this sender's window is inflated by the erasure compensation.
+	//
+	// The two flows this has to separate both look uncongested by the signals
+	// above. A request-shaped flow arrives with an empty pipe and gets the
+	// whole product, which is the case this exists for: 355KB against a 1.09MB
+	// product on the 207ms datacenter path, released without paying the 67ms.
+	// A saturating flow is already holding a product or more, gets nothing, and
+	// stays metered. Measured on the emulated erasure path, granting it the
+	// window regardless drove a burst into a 25 Mbit/s bottleneck, the delay
+	// brake read the queue that built, and the controller fell from 10.5 to
+	// 0.9 Mbit/s of a 14.5 Mbit/s capacity -- worse, monotonically, the larger
+	// the burst: 0.53 at 128KB and 0.09 at 1MB.
+	product := quiccongestion.ByteCount(e.deliveredRate() * minRTT.Seconds())
+	allowance := product - quiccongestion.ByteCount(e.inFlight.Load())
+	if allowance <= 0 {
+		return 0
+	}
+	if window := e.GetCongestionWindow(); window < allowance {
+		return window
+	}
+	return allowance
 }
 
 // burstLossCeiling is how much loss the sending direction may show and still
@@ -430,8 +491,22 @@ func (e *ErasureSender) unmeteredBurst() quiccongestion.ByteCount {
 // own traffic, and it meters rather than guess.
 const burstLossCeiling = 0.01
 
-func (e *ErasureSender) TimeUntilSend(quiccongestion.ByteCount) monotime.Time {
+// burstEvidenceSamples is how many decided packets must lie behind that
+// measurement before it is allowed to open the gate rather than close it. It is
+// the ceiling above read backwards: a channel cannot be called cleaner than one
+// packet in a hundred on the evidence of fewer than a few hundred of them.
+const burstEvidenceSamples = 4 / burstLossCeiling
+
+func (e *ErasureSender) TimeUntilSend(bytesInFlight quiccongestion.ByteCount) monotime.Time {
+	e.recordInFlight(bytesInFlight)
 	return e.pacer.timeUntilSend()
+}
+
+func (e *ErasureSender) recordInFlight(bytesInFlight quiccongestion.ByteCount) {
+	if bytesInFlight < 0 {
+		bytesInFlight = 0
+	}
+	e.inFlight.Store(uint64(bytesInFlight))
 }
 
 func (e *ErasureSender) HasPacingBudget(now monotime.Time) bool {
@@ -447,6 +522,7 @@ func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 // compensated rate: the window bounds what is on the wire, and on an erasure
 // channel what is on the wire is more than what will arrive.
 func (e *ErasureSender) CanSend(bytesInFlight quiccongestion.ByteCount) bool {
+	e.recordInFlight(bytesInFlight)
 	return bytesInFlight < e.GetCongestionWindow()
 }
 
@@ -509,6 +585,9 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		e.estimator.ObserveOutcome(outcome.arrived)
 	}
 	snapshot := e.estimator.Snapshot()
+	if snapshot.Samples > 0 {
+		e.samples.Store(uint64(snapshot.Samples))
+	}
 	if snapshot.Congestive > 0 {
 		e.congestive.Store(uint64(snapshot.Congestive * partsPerMillion))
 	} else {
