@@ -133,6 +133,21 @@ struct ProfileStore: Sendable {
         try save(catalog)
     }
 
+    /// Stores the rule list as text, exactly as the user wrote it.
+    ///
+    /// It is not parsed or reordered on the way in. The core is what acts on
+    /// these rules and what reports on them, and a store that quietly rewrote
+    /// the text would hand the user back something they did not type while the
+    /// tunnel ran something else again.
+    func setRoutingRules(_ rules: String, for id: String) throws {
+        var catalog = try catalog()
+        guard let index = catalog.profiles.firstIndex(where: { $0.id == id }) else {
+            throw ProfileStoreError.profileNotFound
+        }
+        catalog.profiles[index].routingRules = rules
+        try save(catalog)
+    }
+
     /// Writes the whole on-demand policy at once. Splitting it into three
     /// setters would let the catalog hold a half-applied policy between saves,
     /// and this one decides when the tunnel comes up on its own.

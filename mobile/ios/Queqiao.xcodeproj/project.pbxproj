@@ -63,6 +63,7 @@
 		AE0C9D533965F2EBEE29BBF2 /* DiagnosticExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1188477F059F8F42E5A2B2E1 /* DiagnosticExporter.swift */; };
 		B25FEDFD51756D3F16858CF1 /* VPNDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D1A32A7D2EA758E64DF5615 /* VPNDiagnostics.swift */; };
 		B29C3BEEFE05BCF4AF1DFD82 /* ProfileRoutingSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8325591D1B5330766175145 /* ProfileRoutingSection.swift */; };
+		B29C3BEEFE05BCF4AF1DFD83 /* ProfileRulesSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8325591D1B5330766175146 /* ProfileRulesSection.swift */; };
 		B5E6AFBE8082FE6958A4F4C0 /* Mobilecore.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 219A9C59F3F189F39004E980 /* Mobilecore.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		B61D6221C49C32C886381815 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C48647B91FBCC1F15F977C5 /* KeychainStore.swift */; };
 		C5079853D38C771D73BA70EC /* cn-direct.bin in Resources */ = {isa = PBXBuildFile; fileRef = B699E2250E6B3CC6C82DED5F /* cn-direct.bin */; };
@@ -80,6 +81,7 @@
 		F5EEBA8451B659266152FB2B /* ProviderEndpoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = E85BC6F6EB97A4D90EB38EB5 /* ProviderEndpoint.swift */; };
 		F8514BB5053E0BFE434E1EFA /* TunnelModel+VPN.swift in Sources */ = {isa = PBXBuildFile; fileRef = 996ABCB2304649D0527D7BA4 /* TunnelModel+VPN.swift */; };
 		FCA4D8B2A92C0267FBFCF77D /* CountryRoutesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D902CF2632815D3C3F6B0E1 /* CountryRoutesTests.swift */; };
+		FCA4D8B2A92C0267FBFCF77E /* RuleReviewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D902CF2632815D3C3F6B0E2 /* RuleReviewTests.swift */; };
 		FD333468E8B953F05D6E981E /* QueqiaoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85EB3D7717BB422AD61D738D /* QueqiaoApp.swift */; };
 /* End PBXBuildFile section */
 
@@ -152,6 +154,7 @@
 		430D58D7442C39B4BD9C12FB /* LicenseNoticeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LicenseNoticeView.swift; sourceTree = "<group>"; };
 		4802E6E5533792D16DDFA25B /* TunnelSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelSupport.swift; sourceTree = "<group>"; };
 		4D902CF2632815D3C3F6B0E1 /* CountryRoutesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CountryRoutesTests.swift; sourceTree = "<group>"; };
+		4D902CF2632815D3C3F6B0E2 /* RuleReviewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuleReviewTests.swift; sourceTree = "<group>"; };
 		4FD6CEDE24F430E9529E3A3A /* THIRD_PARTY_NOTICES.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = THIRD_PARTY_NOTICES.txt; sourceTree = "<group>"; };
 		5DD1C9B5069B4FCAB19D623D /* ProfileCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileCatalog.swift; sourceTree = "<group>"; };
 		64EB9E99A5F2F55C5635AE87 /* PacketFlowBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketFlowBridge.swift; sourceTree = "<group>"; };
@@ -174,6 +177,7 @@
 		B1A0052E94D098F8C7C9C7AB /* BypassRoutesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BypassRoutesTests.swift; sourceTree = "<group>"; };
 		B699E2250E6B3CC6C82DED5F /* cn-direct.bin */ = {isa = PBXFileReference; lastKnownFileType = archive.macbinary; path = "cn-direct.bin"; sourceTree = "<group>"; };
 		B8325591D1B5330766175145 /* ProfileRoutingSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileRoutingSection.swift; sourceTree = "<group>"; };
+		B8325591D1B5330766175146 /* ProfileRulesSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileRulesSection.swift; sourceTree = "<group>"; };
 		BCDA99C2486E8ABD530118BE /* QueqiaoTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = QueqiaoTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C0722AD3C50275E1BCDD5351 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		C68809144D3F97622B923A85 /* Queqiao.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Queqiao.entitlements; sourceTree = "<group>"; };
@@ -235,6 +239,7 @@
 				0825E32D40A85D473CED722B /* ProfileOnDemandSection.swift */,
 				B177679FBC7D995ACD2B8D5E /* ProfileProbe.swift */,
 				B8325591D1B5330766175145 /* ProfileRoutingSection.swift */,
+				B8325591D1B5330766175146 /* ProfileRulesSection.swift */,
 				06E70DE072DD84C6BF2E8288 /* ProfilesView.swift */,
 				C68809144D3F97622B923A85 /* Queqiao.entitlements */,
 				85EB3D7717BB422AD61D738D /* QueqiaoApp.swift */,
@@ -254,6 +259,7 @@
 				B1A0052E94D098F8C7C9C7AB /* BypassRoutesTests.swift */,
 				F638CF570C7A5852DE2269B7 /* CoreBoundaryTests.swift */,
 				4D902CF2632815D3C3F6B0E1 /* CountryRoutesTests.swift */,
+				4D902CF2632815D3C3F6B0E2 /* RuleReviewTests.swift */,
 				9AD9D8FC50C293C44417209F /* OnDemandRulesTests.swift */,
 				A73080843F759E47498727DB /* RoutePlanTests.swift */,
 				30DF918B060C4D661A7E9E05 /* TunnelNetworkSettingsTests.swift */,
@@ -497,6 +503,7 @@
 				937A5486A266F1541EC3C445 /* ProfileOnDemandSection.swift in Sources */,
 				A220EC905FD9ED834F0DF619 /* ProfileProbe.swift in Sources */,
 				B29C3BEEFE05BCF4AF1DFD82 /* ProfileRoutingSection.swift in Sources */,
+				B29C3BEEFE05BCF4AF1DFD83 /* ProfileRulesSection.swift in Sources */,
 				5E0CBFE215332DDE2B40736C /* ProfileStore.swift in Sources */,
 				EFAAE976107F9765D9616D73 /* ProfilesView.swift in Sources */,
 				CEF53BD49453638B9109EE4C /* ProviderEndpoint.swift in Sources */,
@@ -521,6 +528,7 @@
 				A90475B33DB098B5DC21F192 /* CoreBoundaryTests.swift in Sources */,
 				26D4ED0B36D14998D5C4A9C5 /* CountryRoutes.swift in Sources */,
 				FCA4D8B2A92C0267FBFCF77D /* CountryRoutesTests.swift in Sources */,
+				FCA4D8B2A92C0267FBFCF77E /* RuleReviewTests.swift in Sources */,
 				375FB5454F776236A3760973 /* DiagnosticStore.swift in Sources */,
 				25A3E872695919417DAE9CCE /* IPPrefix.swift in Sources */,
 				B61D6221C49C32C886381815 /* KeychainStore.swift in Sources */,

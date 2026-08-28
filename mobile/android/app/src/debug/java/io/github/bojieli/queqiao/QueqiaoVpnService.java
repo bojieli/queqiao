@@ -75,6 +75,9 @@ public final class QueqiaoVpnService extends VpnService
             tunnel = established;
         }
         Session session = Mobilecore.newSession(observer, this);
+        // Rules are installed before the session starts, so no flow is ever
+        // carried under a different list than the one it was decided by.
+        DebugRoutingRules.install(this, session);
         session.start(profile.profileJson, established.getFd(), 0, MTU, true);
         return session;
     }

@@ -43,7 +43,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
                 routing: TunnelRouting(
                     policy: policy,
                     bypassRoutes: record.bypassRoutes,
-                    chinaDirect: record.bypassChinaDirect
+                    chinaDirect: record.bypassChinaDirect,
+                    rules: record.routingRules
                 ),
                 startup: startup,
                 completion: completion
@@ -176,7 +177,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
             // cold initialization of the statically linked Go/gVisor runtime
             // must not block NetworkExtension's internal callback queue.
             engineQueue.async { [self] in
-                startPacketEngine(profile: profile, startup: startup, completion: completion)
+                startPacketEngine(profile: profile, routing: routing, startup: startup, completion: completion)
             }
         }
     }
@@ -213,6 +214,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
 
     private func startPacketEngine(
         profile: String,
+        routing: TunnelRouting,
         startup: StartupAttempt,
         completion: OneShotErrorCompletion
     ) {
@@ -226,6 +228,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
             guard let newSession = MobilecoreNewSession(self, nil) else {
                 throw TunnelError.coreStopped
             }
+            installRouting(on: newSession, routing: routing)
             packetBridge.start()
             try newSession.startChecked(
                 profile: profile,
@@ -307,6 +310,10 @@ private struct TunnelRouting {
     let policy: TrafficPolicy
     let bypassRoutes: [String]
     let chinaDirect: Bool
+    /// The rule list as stored, empty when the profile carries none. An empty
+    /// list is the state every existing installation is in, and it means the
+    /// tunnel carries everything exactly as it did before rules existed.
+    let rules: String
 }
 
 private enum TunnelError: LocalizedError {
@@ -326,5 +333,39 @@ private enum TunnelError: LocalizedError {
         case .startCancelled:
             return "Tunnel startup was cancelled."
         }
+    }
+}
+
+/// Installing routing is a self-contained step rather than part of the
+/// provider's lifecycle, and the provider's own body is at the length the lint
+/// configuration allows. Keeping it here also keeps the two failure paths --
+/// a country set that will not load, a rule list with bad lines -- beside each
+/// other, since both are reported and neither stops the tunnel.
+extension PacketTunnelProvider {
+    /// Hands the core the rule list and the country set behind any GEOIP rule,
+    /// before anything is carried.
+    ///
+    /// Both are reported rather than enforced. A rule list with bad lines still
+    /// loads the good ones and says which failed; a country set that will not
+    /// load leaves GEOIP rules deciding nothing. Neither stops the tunnel: a
+    /// user whose rule file has a typo wants their connection, and a diagnostic
+    /// they can find, rather than a refusal to start.
+    private func installRouting(on session: MobilecoreSession, routing: TunnelRouting) {
+        if let data = CountryRoutes.packedChinaSet() {
+            do {
+                try session.setCountrySet("CN", blob: data)
+            } catch {
+                recordDiagnostic(
+                    level: .error,
+                    "The bundled China set did not load, so GEOIP rules will not match: "
+                        + error.localizedDescription
+                )
+            }
+        }
+        guard !routing.rules.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+        let report = session.setRoutingRules(routing.rules)
+        recordDiagnostic(level: .info, "Routing rules: \(report)")
     }
 }

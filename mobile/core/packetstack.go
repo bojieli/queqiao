@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/bojieli/queqiao/internal/routerule"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -62,6 +64,11 @@ type packetStack struct {
 	link      *channel.Endpoint
 	admission chan struct{}
 	log       func(level, message string)
+	// route decides per flow whether the tunnel, the ordinary interface, or
+	// nothing at all carries it. Never nil: a stack with no rules gets a
+	// router that answers "tunnel" to everything, so the decision has one code
+	// path rather than two.
+	route *router
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -84,6 +91,11 @@ type packetStackSnapshot struct {
 	PacketsOut      uint64 `json:"packets_out"`
 	Malformed       uint64 `json:"malformed_packets"`
 	SessionRejected uint64 `json:"sessions_rejected"`
+	// Routing is how the rule list is behaving, and is reported even when no
+	// list is loaded. Zero rules with traffic flowing is a different fault
+	// from a loaded list whose DIRECT count never moves, and an operator
+	// cannot tell them apart without seeing both numbers.
+	Routing routerSnapshot `json:"routing"`
 }
 
 func newPacketStack(parent context.Context, tunFD, packetOffset, mtu, maxSessions int, proxy socksClient, log func(string, string)) (*packetStack, error) {
@@ -123,6 +135,7 @@ func newPacketStackWithDevice(parent context.Context, device io.ReadWriteCloser,
 		ctx: ctx, cancel: cancel, tun: device,
 		offset: packetOffset, mtu: mtu, proxy: proxy, admission: make(chan struct{}, maxSessions),
 		log: log, firstErr: make(chan error, 1),
+		route: newRouter(nil, newFakeDNS()),
 	}
 	if p.log == nil {
 		p.log = func(string, string) {}
@@ -258,6 +271,7 @@ func (p *packetStack) snapshot() packetStackSnapshot {
 	return packetStackSnapshot{
 		PacketsIn: p.packetsIn.Load(), PacketsOut: p.packetsOut.Load(),
 		Malformed: p.malformed.Load(), SessionRejected: p.sessionRejected.Load(),
+		Routing: p.route.snapshot(),
 	}
 }
 
@@ -382,6 +396,26 @@ func (p *packetStack) acquire() bool {
 	}
 }
 
+// useRules points this stack at a rule list, before it starts carrying
+// anything. A nil list leaves the router answering "tunnel" to every flow,
+// which is what a session with no rules does.
+func (p *packetStack) useRules(rules *routerule.Set) {
+	if p == nil {
+		return
+	}
+	p.route = newRouter(rules, p.route.dnsResolver())
+}
+
+// dnsResolver returns the existing fake resolver, or a new one. The map has to
+// survive a rule change within a session build, because a handle already handed
+// to an application is a promise this process made.
+func (r *router) dnsResolver() *fakeDNS {
+	if r == nil || r.dns == nil {
+		return newFakeDNS()
+	}
+	return r.dns
+}
+
 func (p *packetStack) release() { <-p.admission }
 
 func (p *packetStack) forwardTCP(request *tcp.ForwarderRequest) {
@@ -397,14 +431,25 @@ func (p *packetStack) forwardTCP(request *tcp.ForwarderRequest) {
 		request.Complete(true)
 		return
 	}
-	outer, err := p.proxy.dialTCP(p.ctx, destination)
+	verdict := p.route.route(destination)
+	if verdict.action == routerule.Reject {
+		// Refused before anything is dialled. Completing with true sends a
+		// reset, so the application fails now instead of waiting out a
+		// connect timeout for a flow that was never going anywhere.
+		request.Complete(true)
+		if verdict.stale {
+			p.log("debug", fmt.Sprintf("refused a flow to a forgotten name handle %s", destination))
+		}
+		return
+	}
+	outer, err := p.dialFor(verdict)
 	if err != nil {
 		request.Complete(true)
 		level := "warning"
 		if errors.Is(err, errSocksMethodUnavailable) {
 			level = "debug"
 		}
-		p.log(level, fmt.Sprintf("TCP proxy connection failed: %v", err))
+		p.log(level, fmt.Sprintf("TCP connection to %s failed: %v", verdict.target(), err))
 		return
 	}
 	var queue waiter.Queue
@@ -431,6 +476,10 @@ func (p *packetStack) forwardUDP(request *udp.ForwarderRequest) bool {
 		if err != nil {
 			return
 		}
+		verdict := p.route.route(destination)
+		if verdict.action == routerule.Reject {
+			return
+		}
 		var queue waiter.Queue
 		endpoint, udpErr := request.CreateEndpoint(&queue)
 		if udpErr != nil {
@@ -438,6 +487,17 @@ func (p *packetStack) forwardUDP(request *udp.ForwarderRequest) bool {
 		}
 		inner := gonet.NewUDPConn(&queue, endpoint)
 		defer inner.Close()
+		// A name lookup is answered here rather than forwarded, which is what
+		// gives every rule below a name to match on. Anything this resolver
+		// will not answer falls through to the tunnel exactly as before.
+		var pending []byte
+		if destination.Port() == dnsPort {
+			handled, unanswered := p.serveDNS(inner)
+			if handled {
+				return
+			}
+			pending = unanswered
+		}
 		outer, err := p.proxy.dialUDP(p.ctx)
 		if err != nil {
 			level := "warning"
@@ -448,10 +508,96 @@ func (p *packetStack) forwardUDP(request *udp.ForwarderRequest) bool {
 			return
 		}
 		defer outer.Close()
-		bridgeUDP(p.ctx, inner, outer, destination)
+		bridgeUDP(p.ctx, inner, outer, destination, pending)
 	}()
 	return true
 }
+
+// dnsPort is where a name lookup goes. Only UDP is intercepted: a resolver
+// falling back to TCP is doing so because an answer did not fit, and the
+// answers this hands out are one A record.
+const dnsPort = 53
+
+// dialFor opens the connection a decision calls for.
+//
+// The two paths differ in more than which socket they use. A proxied flow that
+// carries a name sends the name, so the gateway resolves it from the vantage
+// the flow is being sent to use. A direct flow resolves here, on the device,
+// which is the whole point of having matched DIRECT.
+func (p *packetStack) dialFor(verdict decision) (net.Conn, error) {
+	if verdict.action == routerule.Direct {
+		return dialDirect(p.ctx, verdict)
+	}
+	if verdict.host != "" {
+		return p.proxy.dialTCPDomain(p.ctx, verdict.host, verdict.addr.Port())
+	}
+	return p.proxy.dialTCP(p.ctx, verdict.addr)
+}
+
+// serveDNS answers one lookup from the fake resolver and reports whether it
+// did. A false return leaves the flow to the tunnel, unchanged, which is what
+// happens for a query this does not understand or a type it cannot answer.
+//
+// One exchange per flow is deliberate. gVisor hands each UDP flow its own
+// endpoint, resolvers open one per query, and a handler that stayed to wait for
+// a second would hold a session slot for a client that had already moved on.
+func (p *packetStack) serveDNS(inner net.Conn) (handled bool, pending []byte) {
+	if p.route == nil || p.route.dns == nil {
+		return false, nil
+	}
+	if err := inner.SetReadDeadline(time.Now().Add(dnsReadTimeout)); err != nil {
+		return false, nil
+	}
+	buffer := make([]byte, maxDNSMessage)
+	read, err := inner.Read(buffer)
+	_ = inner.SetReadDeadline(time.Time{})
+	if err != nil || read == 0 {
+		return false, nil
+	}
+	datagram := buffer[:read]
+	question, err := parseDNSQuestion(datagram)
+	// Anything this will not answer is handed back so the caller forwards it
+	// upstream, unchanged and to the destination it was addressed to. The
+	// alternative -- dropping what has already been read off the flow -- turns
+	// every query shape this parser does not cover, and every non-DNS use of
+	// port 53, into a silent black hole. An existing test sends exactly that.
+	if err != nil || question.class != dnsClassIN {
+		return false, datagram
+	}
+	var response []byte
+	switch question.qtype {
+	case dnsTypeA:
+		handle, ok := p.route.dns.Handle(question.name)
+		if !ok {
+			return false, datagram
+		}
+		response = answerWithAddress(datagram, question, handle)
+	case dnsTypeAAAA:
+		// The handles are v4. Saying "this name has no AAAA" is true of the
+		// handle and makes the client ask for A immediately, where a silence
+		// would make it wait.
+		if _, ok := p.route.dns.Handle(question.name); !ok {
+			return false, datagram
+		}
+		response = answerEmpty(datagram, question)
+	default:
+		return false, datagram
+	}
+	if err := inner.SetWriteDeadline(time.Now().Add(dnsWriteTimeout)); err != nil {
+		return true, nil
+	}
+	if _, err := inner.Write(response); err != nil {
+		p.log("debug", fmt.Sprintf("writing a DNS answer for %s failed: %v", question.name, err))
+	}
+	_ = inner.SetWriteDeadline(time.Time{})
+	return true, nil
+}
+
+const (
+	maxDNSMessage   = 1500
+	dnsReadTimeout  = 5 * time.Second
+	dnsWriteTimeout = 5 * time.Second
+)
 
 func endpointAddress(address tcpip.Address, port uint16) (netip.AddrPort, error) {
 	raw := append([]byte(nil), (&address).AsSlice()...)
@@ -490,9 +636,18 @@ func bridgeTCP(parent context.Context, left *gonet.TCPConn, right net.Conn) {
 	})
 }
 
-func bridgeUDP(parent context.Context, inner *gonet.UDPConn, outer *socksUDPAssociation, destination netip.AddrPort) {
+// bridgeUDP carries a UDP flow. first, when not nil, is a datagram already read
+// off the flow -- the resolver looked at it, would not answer it, and handed it
+// back -- and is sent before anything else so the flow's ordering is what the
+// application produced.
+func bridgeUDP(parent context.Context, inner *gonet.UDPConn, outer *socksUDPAssociation, destination netip.AddrPort, first []byte) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
+	if len(first) > 0 {
+		if err := outer.WriteTo(first, destination); err != nil {
+			return
+		}
+	}
 	done := make(chan struct{}, 2)
 	refresh := func() {
 		deadline := time.Now().Add(udpIdleTimeout)

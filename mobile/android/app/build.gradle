@@ -126,3 +126,38 @@ androidComponents {
 dependencies {
     implementation files("libs/mobilecore.aar")
 }
+
+// The debug VPN build carries the same packed country set the iOS client ships,
+// so a GEOIP rule means the same thing on both. It is copied from that one file
+// at build time rather than committed a second time: two copies of a generated
+// artifact drift, and the one that drifts is the one nobody regenerates.
+//
+// Registered through the variant API rather than by adding a directory to the
+// debug source set, so Gradle carries the task dependency: an assets directory
+// contributed as a bare path is one the build may read before anything has
+// written it.
+abstract class CopyCountrySet extends DefaultTask {
+    @InputFile
+    abstract RegularFileProperty getPackedSet()
+
+    @OutputDirectory
+    abstract DirectoryProperty getOutputDirectory()
+
+    @TaskAction
+    void copy() {
+        File destination = outputDirectory.get().asFile
+        destination.mkdirs()
+        new File(destination, "cn-direct.bin").bytes = packedSet.get().asFile.bytes
+    }
+}
+
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        def copyTask = tasks.register(
+                "copyCountrySet${variant.name.capitalize()}", CopyCountrySet) {
+            packedSet.set(rootProject.file("../ios/PacketTunnel/Resources/cn-direct.bin"))
+        }
+        variant.sources.assets.addGeneratedSourceDirectory(
+                copyTask, CopyCountrySet::getOutputDirectory)
+    }
+}

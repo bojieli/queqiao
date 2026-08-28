@@ -51,6 +51,21 @@ enum CountryRoutes {
         return try decode(Data(contentsOf: url, options: .mappedIfSafe))
     }
 
+    /// The packed set as bytes, for handing to the core.
+    ///
+    /// The Go side reads the same file by the same rules and searches it in
+    /// place; it needs the bytes rather than the prefixes because a GEOIP rule
+    /// is consulted per flow and the parsed form is a quarter of a megabyte to
+    /// keep resident. Returns nil rather than throwing: a build without the
+    /// resource still runs every rule that is not GEOIP, and the caller records
+    /// that it is missing.
+    static func packedChinaSet(in bundle: Bundle = .main) -> Data? {
+        guard let url = bundle.url(forResource: chinaResource, withExtension: "bin") else {
+            return nil
+        }
+        return try? Data(contentsOf: url, options: .mappedIfSafe)
+    }
+
     /// How many blocks the bundled set holds, without parsing it.
     ///
     /// The counts sit in the header, so a screen can say how heavy the toggle

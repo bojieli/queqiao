@@ -307,6 +307,27 @@ extension TunnelModel {
         }
     }
 
+    /// Saves the rule list. Like every other routing change this needs the
+    /// tunnel down, because the rules a flow was opened under are the rules it
+    /// keeps: re-pointing a running tunnel would leave live flows decided by a
+    /// list the user can no longer see.
+    func updateRoutingRules(_ rules: String, for id: String) {
+        Task { await saveRoutingRules(rules, for: id) }
+    }
+
+    func saveRoutingRules(_ rules: String, for id: String) async {
+        guard canChangeProfile else {
+            present(ModelError.disconnectBeforeEditing, title: "Disconnect first")
+            return
+        }
+        do {
+            try await Task.detached { try ProfileStore().setRoutingRules(rules, for: id) }.value
+            await refreshProfiles()
+        } catch {
+            present(error, title: "Could not save the routing rules")
+        }
+    }
+
     func setBypassChinaDirect(_ enabled: Bool, for id: String) async {
         guard canChangeProfile else {
             present(ModelError.disconnectBeforeEditing, title: "Disconnect first")

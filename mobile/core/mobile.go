@@ -10,15 +10,19 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/pep"
+	"github.com/bojieli/queqiao/internal/routerule"
 	"github.com/bojieli/queqiao/internal/socks5"
 )
 
@@ -70,6 +74,14 @@ type Session struct {
 	// from changing the clock under a still-stopping session.
 	identityMaintenanceInterval time.Duration
 	identityRenewalLead         time.Duration
+
+	// routing is the rule list and country set this session will start with.
+	// They are set before Start and read when the packet engine is built, so a
+	// running tunnel is never re-pointed underneath its own flows: changing
+	// rules is a reconnect, which is what makes "what is this flow doing"
+	// answerable from the rules that were loaded when it opened.
+	ruleSet     atomic.Pointer[routerule.Set]
+	countrySets sync.Map // code -> *routerule.Packed
 }
 
 func NewSession(observer Observer, protector Protector) *Session {
@@ -99,7 +111,12 @@ func (s *Session) Start(profileJSON string, tunFD, packetOffset, mtu int64, requ
 		listenAddr:              privateListenAddr,
 		mode:                    ModeTunnel,
 		makePacketEngine: func(ctx context.Context, proxy socksClient, log func(string, string)) (packetEngine, error) {
-			return newPacketStack(ctx, int(tunFD), int(packetOffset), int(mtu), limits.maxSessions, proxy, log)
+			stack, err := newPacketStack(ctx, int(tunFD), int(packetOffset), int(mtu), limits.maxSessions, proxy, log)
+			if err != nil {
+				return nil, err
+			}
+			stack.useRules(s.boundRules())
+			return stack, nil
 		},
 	})
 }
@@ -120,7 +137,12 @@ func (s *Session) StartPacketFlow(profileJSON string, packetIO PacketIO, mtu int
 		listenAddr:  privateListenAddr,
 		mode:        ModeTunnel,
 		makePacketEngine: func(ctx context.Context, proxy socksClient, log func(string, string)) (packetEngine, error) {
-			return newPacketStackWithDevice(ctx, &callbackPacketDevice{packetIO: packetIO}, 0, int(mtu), limits.maxSessions, proxy, log)
+			stack, err := newPacketStackWithDevice(ctx, &callbackPacketDevice{packetIO: packetIO}, 0, int(mtu), limits.maxSessions, proxy, log)
+			if err != nil {
+				return nil, err
+			}
+			stack.useRules(s.boundRules())
+			return stack, nil
 		},
 	})
 }
@@ -196,6 +218,88 @@ type sessionOptions struct {
 	auth             *socks5.Credentials
 	mode             string
 	makePacketEngine packetStackFactory
+}
+
+// SetRoutingRules loads the rule list this session will start with, and reports
+// what it made of it.
+//
+// The report is JSON: the number of rules loaded and every line that did not
+// become one, with its number and the reason. A client is expected to show that
+// rather than swallow it -- a rule list is somebody stating where their traffic
+// may and may not go, and a line silently dropped is that statement not being
+// enforced for as long as the file lives.
+//
+// An empty list clears the rules, which returns the tunnel to carrying
+// everything. That is also what happens if this is never called.
+func (s *Session) SetRoutingRules(text string) string {
+	set, problems := routerule.Parse(text)
+	if set.Len() == 0 && len(problems) == 0 {
+		s.ruleSet.Store(nil)
+	} else {
+		s.ruleSet.Store(set)
+	}
+	report := struct {
+		Loaded   int      `json:"loaded"`
+		Problems []string `json:"problems,omitempty"`
+	}{Loaded: set.Len()}
+	for _, problem := range problems {
+		report.Problems = append(report.Problems, problem.String())
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		return `{"loaded":0,"problems":["could not encode the report"]}`
+	}
+	return string(encoded)
+}
+
+// SetCountrySet hands the core a packed country set for GEOIP rules to consult.
+//
+// The clients own the file -- it ships inside the iOS extension bundle and the
+// Android assets -- so the bytes come in from there rather than being read
+// here. A set that will not load is refused with a reason instead of being
+// half-installed: a GEOIP rule with nothing behind it decides nothing, and an
+// operator who thinks their China rule is live when it is not has the same
+// problem this feature exists to remove.
+func (s *Session) SetCountrySet(code string, blob []byte) error {
+	packed, err := routerule.LoadPacked(code, blob)
+	if err != nil {
+		return fmt.Errorf("country set %s: %w", code, err)
+	}
+	s.countrySets.Store(packed.Code(), packed)
+	return nil
+}
+
+// RoutingRuleCount reports how many rules are loaded, so a screen can say so
+// without holding the list.
+func (s *Session) RoutingRuleCount() int {
+	if set := s.ruleSet.Load(); set != nil {
+		return set.Len()
+	}
+	return 0
+}
+
+// boundRules pairs the loaded list with the country sets it may consult. It is
+// called once, when the packet engine is built.
+func (s *Session) boundRules() *routerule.Set {
+	set := s.ruleSet.Load()
+	if set == nil {
+		return nil
+	}
+	return set.WithCountries(sessionCountries{session: s})
+}
+
+// sessionCountries answers a GEOIP rule from whichever sets the client
+// installed. A code with no set installed answers false, which leaves the rule
+// deciding nothing rather than deciding wrongly.
+type sessionCountries struct{ session *Session }
+
+func (c sessionCountries) Contains(code string, addr netip.Addr) bool {
+	value, ok := c.session.countrySets.Load(strings.ToUpper(code))
+	if !ok {
+		return false
+	}
+	packed, ok := value.(*routerule.Packed)
+	return ok && packed.Contains(code, addr)
 }
 
 // privateListenAddr is the tunnel products' listener: loopback, kernel-assigned

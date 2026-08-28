@@ -21,13 +21,29 @@ deliberately different products:
 - **iOS** is a full-device packet tunnel, because it cannot compose: the
   platform runs one tunnel provider at a time, a plain app cannot hold a
   background listener, and no App Store routing client offers a plugin
-  interface. It therefore carries a deliberately bounded routing subset of its
-  own.
+  interface. It therefore carries its own routing rules.
 
 This follows the scope rule in [Vision](VISION.md) — Queqiao supplies the
 paired data plane, and a larger overlay supplies discovery, routing, and
-policy. Android can honour it because loopback is shared between apps; iOS
-cannot, so it gets a bounded subset rather than a rule engine.
+policy. Android can honour it because loopback is shared between apps, so the
+released app hands routing to whichever client owns the tunnel. iOS cannot
+hand it anywhere: there is no client to hand it to, so the rules live here.
+
+What "here" means is one rule list per profile, in the `TYPE,VALUE,ACTION`
+syntax that Clash, mihomo, sing-box and Shadowrocket all read, evaluated in
+the shared core rather than in either client. `DOMAIN`, `DOMAIN-SUFFIX`,
+`DOMAIN-KEYWORD`, `IP-CIDR`, `GEOIP` and `DST-PORT` decide between `PROXY`,
+`DIRECT` and `REJECT`, first match wins, and a flow no rule matches takes the
+tunnel. Name rules work because the core answers lookups itself from a
+reserved range and reverses the handle when the connection arrives; a
+`DIRECT` flow is then resolved on the device, which is the vantage that makes
+the answer right. The Android debug build reads the same list from a file, so
+the two tunnels behave the same where Android has a tunnel at all.
+
+What it still is not: per-app routing, process rules, `URL-REGEX`,
+`USER-AGENT`, remote rule-set subscriptions, or several outbounds to choose
+between. There is one tunnel, so an action naming a proxy group is refused
+rather than guessed at.
 
 The iOS app and its packet-tunnel extension use public Network Extension APIs,
 including `NEPacketTunnelFlow`. The Android debug build, and only the debug
@@ -72,7 +88,7 @@ the linked primary sources are authoritative.
 | Capability | Desktop | Android | iOS |
 | --- | --- | --- | --- |
 | Product model | SOCKS5 helper | SOCKS5 helper | Full-device tunnel |
-| Owner of routing policy | Clash/mihomo | The consumer VPN client | Queqiao, bounded |
+| Owner of routing policy | Clash/mihomo | The consumer VPN client (debug build: Queqiao) | Queqiao |
 | One-time `queqiao://` enrollment | Yes | Yes | Yes |
 | Crash-safe enrollment draft | Mode-0600 file | Keystore-encrypted | This-device-only Keychain |
 | TLS 1.3 mutual authentication and root pin | Yes | Same core | Same core |

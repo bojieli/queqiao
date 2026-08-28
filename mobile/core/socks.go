@@ -60,6 +60,41 @@ func (c socksClient) dialTCP(ctx context.Context, destination netip.AddrPort) (n
 	return conn, nil
 }
 
+// dialTCPDomain opens a connection naming the destination rather than
+// addressing it.
+//
+// A flow the fake resolver answered carries a handle out of 198.18.0.0/15,
+// which means something only inside this process. Sending that to the gateway
+// would ask it to connect to a benchmarking address on its own network. SOCKS5
+// carries a domain form for exactly this, and using it also puts the name
+// resolution at the far end, which is where a proxied flow wants it: the
+// gateway resolves from its own vantage, which is the vantage the flow is
+// being sent to use.
+func (c socksClient) dialTCPDomain(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	conn, reader, err := c.dialControl(ctx)
+	if err != nil {
+		return nil, err
+	}
+	request, err := socksDomainRequest(socksConnect, host, port)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := writeFull(conn, request); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("write SOCKS CONNECT: %w", err)
+	}
+	if _, err := readSocksReply(reader); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("read SOCKS CONNECT reply: %w", err)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
 func (c socksClient) dialUDP(ctx context.Context) (*socksUDPAssociation, error) {
 	control, reader, err := c.dialControl(ctx)
 	if err != nil {
@@ -155,6 +190,24 @@ func socksRequest(command byte, destination netip.AddrPort) ([]byte, error) {
 	request := make([]byte, 0, 3+len(address))
 	request = append(request, socksVersion, command, 0)
 	return append(request, address...), nil
+}
+
+// socksDomainRequest builds a request whose destination is a name. The length
+// is a single byte on the wire, so a name that cannot be expressed is refused
+// here rather than truncated into a request for a different host.
+func socksDomainRequest(command byte, host string, port uint16) ([]byte, error) {
+	if host == "" {
+		return nil, errors.New("SOCKS destination name is empty")
+	}
+	if len(host) > 255 {
+		return nil, fmt.Errorf("SOCKS destination name is %d bytes, over the 255 the wire allows", len(host))
+	}
+	request := make([]byte, 0, 7+len(host))
+	// #nosec G115 -- the length is refused above if it exceeds 255, which is
+	// the whole reason that check is there rather than a truncation here.
+	request = append(request, socksVersion, command, 0, socksDomain, byte(len(host)))
+	request = append(request, host...)
+	return binary.BigEndian.AppendUint16(request, port), nil
 }
 
 func appendSocksAddr(dst []byte, address netip.AddrPort) ([]byte, error) {

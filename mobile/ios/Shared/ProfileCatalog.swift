@@ -77,6 +77,14 @@ struct StoredProfile: Codable, Identifiable, Equatable, Sendable {
     /// Whether the bundled registry set for China is added to the bypass list.
     /// Experimental, and address-based only: see CountryRoutes.
     var bypassChinaDirect = false
+    /// The routing rule list, as the user typed or imported it, one rule per
+    /// line in the `TYPE,VALUE,ACTION` syntax the lists in circulation use.
+    ///
+    /// Stored as text rather than as parsed rules on purpose. The text is what
+    /// the user wrote and what they will edit next; parsing it here would mean
+    /// this catalog owning a second copy of the grammar, and the core -- which
+    /// is the only thing that acts on it -- already owns the first.
+    var routingRules = ""
     /// Whether the tunnel may bring itself up without being asked.
     var onDemandEnabled = false
     /// Wi-Fi networks on which on-demand keeps the tunnel down. Typed by the
@@ -118,6 +126,7 @@ extension StoredProfile {
         trafficPolicy = try container.decode(TrafficPolicy.self, forKey: .trafficPolicy)
         bypassRoutes = try container.decodeIfPresent([String].self, forKey: .bypassRoutes) ?? []
         bypassChinaDirect = try container.decodeIfPresent(Bool.self, forKey: .bypassChinaDirect) ?? false
+        routingRules = try container.decodeIfPresent(String.self, forKey: .routingRules) ?? ""
         onDemandEnabled = try container.decodeIfPresent(Bool.self, forKey: .onDemandEnabled) ?? false
         trustedNetworks = try container.decodeIfPresent([String].self, forKey: .trustedNetworks) ?? []
         connectOnCellular = try container.decodeIfPresent(Bool.self, forKey: .connectOnCellular) ?? true
