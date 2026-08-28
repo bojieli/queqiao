@@ -10,6 +10,108 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.5.0 - 2026-08-28
+
+### Added
+
+- The Android debug build reads the same rule list as iOS, from
+  `routing-rules.conf` in its files directory, and carries the same packed
+  country set for `GEOIP` rules. It is a development affordance rather than a
+  shipped feature: the released Android app is not a VPN, declares no
+  `BIND_VPN_SERVICE`, and continues to hand routing to whichever consumer client
+  owns the device tunnel.
+- A new guide, [choosing and placing a gateway](docs/CHOOSING-A-GATEWAY.md),
+  covers the decision that precedes deployment and previously had no home in
+  the documentation. It states plainly that both ends run this software, so a
+  destination someone else operates needs a gateway on a host the reader
+  controls; it gives the placement rule that follows from the transport
+  improving the client-to-gateway segment and nothing past it; it works
+  through the anycast case, where a destination already served from an edge
+  near the caller is made slower by a gateway on another continent; and it
+  promotes the free client-side fixes out of the datacenter profile's
+  appendix, where they applied to every reader but only one audience could
+  find them.
+- `queqiaod doctor` now answers the question that decides a deployment before
+  it exists: whether this gateway is on the useful side of this client's path
+  to a destination it actually calls. Given `--destination host:port`, it
+  establishes connections to that destination directly and through the local
+  SOCKS listener, alternating the arms every round, and reports the two
+  distributions beside the verdict. The gateway round trip is now sampled
+  rather than dialled once, and is subtracted from the tunnelled
+  establishment to leave the gateway's own hop onward, which separates a
+  placement decision the operator can revisit from transit that relocating
+  the client will not change. Where the drift measured between arms is larger
+  than the difference between them, the check reports that the comparison did
+  not resolve anything rather than offering a conclusion, which is the
+  discipline `pathmeasure -mode ab` already follows and for the same reason.
+  This matters most for a destination published behind an anycast edge, where
+  the session already terminates near the caller and routing it through a
+  distant gateway adds the whole gateway leg for nothing while every other
+  check on the host still passes. The command continues to say nothing about
+  what the path does, because no local check can; `pathprobe` and
+  `pathmeasure` remain the instruments for that.
+- The iOS client routes by rule rather than only by address. A profile carries
+  a rule list in the `TYPE,VALUE,ACTION` syntax that Clash, mihomo, sing-box and
+  Shadowrocket all read, so an existing list can be pasted in: `DOMAIN`,
+  `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`, `GEOIP` and `DST-PORT` choosing
+  between `PROXY`, `DIRECT` and `REJECT`, first match wins. A flow no rule
+  matches takes the tunnel, so a list that fails to load cannot put traffic on
+  the open path. The editor counts what loaded and names every line that did
+  not, by number, before you connect. There is one tunnel, so a rule naming a
+  proxy group is refused rather than quietly read as `PROXY`.
+- Name rules work on a packet tunnel, which needed the core to answer lookups
+  itself. A query is answered from `198.18.0.0/15`, the address becomes that
+  name's handle, and when the connection arrives the handle is reversed so the
+  rule list sees the name rather than an address. A proxied flow is then dialled
+  by name, so the gateway resolves it from the vantage the flow is being sent to
+  use; a `DIRECT` flow is resolved on the device, which is the vantage that
+  makes the answer right. This is what the bundled China set could not do on its
+  own: `docs/KNOWN-LIMITATIONS.md` recorded that a Chinese domain resolved
+  through the tunnel can answer with a CDN address outside the registry set and
+  take the tunnel anyway, and the bundled China preset now pairs `DOMAIN-SUFFIX`
+  rules with `GEOIP,CN` rather than relying on either alone.
+- The tunnel's metrics report what routing is doing: how many rules loaded, and
+  how many flows were proxied, sent direct, refused, decided by name, or refused
+  because they named a handle the resolver had forgotten. Zero rules with
+  traffic flowing is a different fault from a loaded list whose direct count
+  never moves, and an operator could not tell them apart without both numbers.
+
+### Changed
+
+- iOS routing is one setting, and all of it can be changed while the tunnel is
+  connected. Until now the traffic policy, the bundled China toggle, and the
+  typed bypass list were three controls answering one question, and they did not
+  agree about who was in charge: the bypass list and the country set applied
+  whatever the policy said, so a profile reading "All traffic" could be keeping
+  whole countries off the tunnel. There is now a routing mode, the bypass rules
+  underneath it, and the rule list this release adds, all carried in one value
+  the settings screen and the tunnel both compose through. Switching to global
+  routing leaves the rules stored rather than making someone dismantle a list to
+  turn the tunnel up. None of it needs a reconnect: the app saves the change and
+  asks the running provider to re-read it, and the provider reinstalls the
+  routes and hands the new rule list to the core without restarting the packet
+  engine. Flows already open keep the rules they started under, which is the
+  cost of not dropping the connection to edit them. A catalog written before the
+  merge migrates on load, and anything that was carving traffic out of the
+  tunnel comes back as a bypass rule rather than quietly rejoining it.
+
+### Fixed
+
+- The iOS packet-tunnel extension no longer runs itself into the memory ceiling
+  NetworkExtension enforces on it. The Go runtime soft limit was 40 MiB inside a
+  50 MiB whole-process cap, which left too little of that cap for everything the
+  Go heap does not cover: the resident text pages of the statically linked Go
+  and gVisor code, runtime metadata, goroutine and thread stacks, the Swift
+  packet bridge, and CoreFoundation. The collector spent whole minutes at
+  130-200% CPU defending a limit the process could not honour, and jetsam killed
+  the extension anyway, twelve to twenty-one minutes into a session. Because the
+  kill is a SIGKILL, the provider never ran `stopTunnel` and never recorded a
+  diagnostic, so the tunnel's network settings stayed installed and the VPN went
+  on showing connected while no packets moved — the failure a user sees is a
+  stall, with an empty connection log behind it. The limit is now 28 MiB, and
+  the test suite holds it far enough below the ceiling to leave that remainder
+  room.
+
 ## v0.4.0 - 2026-08-26
 
 ### Added
