@@ -209,8 +209,10 @@ Point an application or Clash/mihomo at that SOCKS5 endpoint.
 The scripts live in this repository: clone it, or copy `deploy/` beside the
 downloaded binary. From the next release they also ship inside the archives.
 
-The [deployment guide](docs/DEPLOYING.md) is the reference for everything past
-this point -- what the scripts do, the hosts they do not cover, the manual
+[Choosing and placing a gateway](docs/CHOOSING-A-GATEWAY.md) is the decision
+that comes before all of this: whether a gateway will help at all, and where it
+has to sit. The [deployment guide](docs/DEPLOYING.md) is the reference for
+everything past this point -- what the scripts do, the hosts they do not cover, the manual
 gateway and enrollment steps for a host they do not fit, firewall and socket
 tuning, multiple users, source-interface selection, verification, upgrades, and
 rollback. To serve several providers from one client process, see
@@ -252,6 +254,15 @@ is, so it gets its own profile rather than the default one: see [the datacenter
 profile](docs/DEPLOYING-DC-PROFILE.md), and read its measured limits before
 deploying it, because on a clean path direction a one-line client-side fix
 beats it on the median request.
+
+Both ends run this software, so a destination someone else operates -- a hosted
+model API, a SaaS endpoint -- needs a gateway on a host you do control. Where
+that gateway goes decides whether any of this helps: a destination already
+served from an anycast edge near you can be made slower by a gateway placed on
+another continent. [Choosing and placing a
+gateway](docs/CHOOSING-A-GATEWAY.md) is how to settle that before spending
+anything, and it covers the free client-side fixes that on a clean path reach
+the same median this transport does.
 
 ## Project status
 

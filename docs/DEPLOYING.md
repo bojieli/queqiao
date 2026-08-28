@@ -23,6 +23,13 @@ For a quick overview, start with the [repository README](../README.md). Use
 [known limitations](KNOWN-LIMITATIONS.md) to check whether the paired-gateway
 assumption fits your network before exposing a service.
 
+This guide assumes the placement decision has already been made. If it has not
+-- if the gateway host is not chosen yet, or the destinations are operated by
+someone else -- read [choosing and placing a
+gateway](CHOOSING-A-GATEWAY.md) first. A gateway on the wrong side of the
+traffic's real bottleneck lengthens the path while everything below still
+verifies correctly.
+
 ## Install with the scripts
 
 Two scripts perform everything below and verify the result. Read this section

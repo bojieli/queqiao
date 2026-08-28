@@ -32,9 +32,20 @@ queqiaod doctor --path-profile dc-long-haul --profile ~/.config/queqiao/*.json
 ```
 
 It reports the profile's qualification level and precondition, the kernel
-settings the measurements assumed, and whether the gateway answers. It does not
-tell you what the path does, because no local check can: that is what
-`pathprobe` is for, and the two figures below are the ones to get from it.
+settings the measurements assumed, the round trip to the gateway, and, for each
+destination you name, whether routing that destination through this gateway
+makes the path shorter or longer:
+
+```sh
+queqiaod doctor --path-profile dc-long-haul --profile ~/.config/queqiao/*.json \
+  --destination inference.internal:443
+```
+
+It still does not tell you what the path does, because no local check can: that
+is what `pathprobe` is for, and the two figures below are the ones to get from
+it. [Choosing and placing a gateway](CHOOSING-A-GATEWAY.md) covers the
+placement question in full, including the case where the destination is served
+from an edge near the caller and no gateway helps.
 
 Then do the free things, because they cost a config line and two of the three
 are worth more than anything below: reuse connections, and set the receiver's

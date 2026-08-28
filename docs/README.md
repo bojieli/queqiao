@@ -10,7 +10,8 @@ you choose the next document based on what you want to do.
 | If you want to… | Read |
 | --- | --- |
 | Understand the problem and the design principles | [Vision and principles](VISION.md) |
-| Decide whether Queqiao fits your network | [Project status](STATUS.md) and [known limitations](KNOWN-LIMITATIONS.md) |
+| Decide whether it fits, and where the gateway has to go | [Choosing and placing a gateway](CHOOSING-A-GATEWAY.md) |
+| Check what has been qualified and what has not | [Project status](STATUS.md) and [known limitations](KNOWN-LIMITATIONS.md) |
 | Use a provider and client | [Deployment guide](DEPLOYING.md) |
 | Understand the transport in depth | [Current design](DESIGN.md), then [architecture](ARCHITECTURE.md) |
 | Measure a path or compare a baseline | [Benchmarking](BENCHMARKING.md) |
@@ -19,6 +20,11 @@ you choose the next document based on what you want to do.
 
 ## Use and operate Queqiao
 
+- [Choosing and placing a gateway](CHOOSING-A-GATEWAY.md) — the decision that
+  precedes deployment: why both ends must run this software, where a gateway
+  has to sit to help, why a destination served from an anycast edge can be made
+  slower by one, the client-side fixes to try first, and how to measure all of
+  it before spending anything.
 - [Deployment guide](DEPLOYING.md) — provider setup, invitations, desktop
   enrollment, multi-provider clients, Clash/mihomo, service installation,
   monitoring, upgrades, and rollback.
