@@ -23,8 +23,26 @@ type mobileResourceLimits struct {
 	memory             pep.MemoryLimits
 }
 
+// iosProcessMemoryCap is the whole-process ceiling iOS enforces on a
+// NEPacketTunnelProvider. Crossing it is not a soft failure: jetsam SIGKILLs
+// the extension with reason "per-process-limit", so the provider never runs
+// stopTunnel, never records a diagnostic, and leaves its network settings
+// installed — the VPN keeps showing connected while no packets move.
+const iosProcessMemoryCap = 50 * 1024 * 1024
+
+// iosNonHeapHeadroom is what the Go limit must leave unclaimed inside that
+// ceiling. SetMemoryLimit governs Go-owned memory only, while the resident text
+// pages of the statically linked Go and gVisor code, runtime metadata,
+// goroutine and thread stacks, the Swift packet bridge, and CoreFoundation are
+// all charged to the same process.
+const iosNonHeapHeadroom = 20 * 1024 * 1024
+
 var iosResourceLimits = mobileResourceLimits{
-	name: "ios-fixed-40m", goMemoryLimit: 40 * 1024 * 1024,
+	// Sized against iosProcessMemoryCap, not against the heap alone. At 40 MiB
+	// the runtime collected continuously against a limit the process could not
+	// honour — whole minutes at 130-200% CPU — and was killed anyway 12 to 21
+	// minutes into a session.
+	name: "ios-fixed-28m", goMemoryLimit: 28 * 1024 * 1024,
 	// Session admission is intentionally independent from the payload arenas
 	// below.  A session mostly owns a small state machine; retained bytes are
 	// charged to the shared budgets, so raising this ceiling does not multiply

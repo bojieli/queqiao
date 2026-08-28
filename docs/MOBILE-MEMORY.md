@@ -34,7 +34,7 @@ must not multiply retained payload memory without limit.
 
 | Resource | iOS packet extension | Android VPN service |
 | --- | ---: | ---: |
-| Go runtime soft limit | 40 MiB | 72 MiB |
+| Go runtime soft limit | 28 MiB | 72 MiB |
 | Shared retained transmit payload | 3 MiB | 8 MiB |
 | Shared out-of-order receive payload | 3 MiB | 8 MiB |
 | Per-flow transmit ceiling | 1 MiB | 2 MiB |
@@ -53,6 +53,20 @@ The limits intentionally favor survival and interactive traffic over maximum
 bandwidth-delay-product utilization. They can be changed only as a complete
 profile: raising a session or queue count requires redoing the worst-case
 memory calculation.
+
+On iOS the Go runtime limit is not the binding constraint. NetworkExtension
+enforces a 50 MiB ceiling on the whole packet-tunnel process, and
+`SetMemoryLimit` governs Go-owned memory only, so the profile leaves 22 MiB of
+that ceiling unclaimed for the resident text pages of the statically linked Go
+and gVisor code, runtime metadata, goroutine and thread stacks, the Swift packet
+bridge, and CoreFoundation. Crossing the ceiling is not a soft failure: jetsam
+SIGKILLs the extension with reason `per-process-limit`, so the provider never
+runs `stopTunnel`, never records a diagnostic, and leaves its network settings
+installed — the VPN keeps showing connected while no packets move. A Go limit
+set too close to the ceiling also makes the collector run continuously against a
+limit the process cannot honour, which burns CPU without averting the kill.
+`mobile/core/resources_test.go` holds the limit below the ceiling with that
+remainder reserved.
 
 ## Overload behavior
 

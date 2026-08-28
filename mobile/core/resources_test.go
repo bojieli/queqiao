@@ -2,6 +2,7 @@ package mobilecore
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -25,6 +26,28 @@ func TestMobileResourceProfilesHaveFixedEndpointBudgets(t *testing.T) {
 	}
 	if iosResourceLimits.maxSessions < 1024 {
 		t.Fatalf("iOS admission capacity = %d, want at least 1024", iosResourceLimits.maxSessions)
+	}
+}
+
+// The iOS profile is bounded by the whole process, not by the Go heap. Jetsam
+// enforces iosProcessMemoryCap with SIGKILL, and everything outside the Go heap
+// is charged against the same ceiling, so the runtime limit has to stay far
+// enough below it to leave that remainder room. Raising goMemoryLimit without
+// redoing this arithmetic is how the extension came to be killed mid-session.
+func TestIOSGoMemoryLimitLeavesHeadroomBelowTheProcessCap(t *testing.T) {
+	headroom := iosProcessMemoryCap - iosResourceLimits.goMemoryLimit
+	if headroom < iosNonHeapHeadroom {
+		t.Fatalf(
+			"iOS Go memory limit = %d bytes, leaving %d bytes of the %d byte process cap "+
+				"for non-heap memory, want at least %d",
+			iosResourceLimits.goMemoryLimit, headroom, iosProcessMemoryCap, iosNonHeapHeadroom,
+		)
+	}
+	// The profile name is what a soak operator reads out of the metrics JSON, so
+	// it must not keep advertising a limit the profile no longer carries.
+	wantName := fmt.Sprintf("ios-fixed-%dm", iosResourceLimits.goMemoryLimit/(1024*1024))
+	if iosResourceLimits.name != wantName {
+		t.Fatalf("iOS profile name = %q, want %q", iosResourceLimits.name, wantName)
 	}
 }
 
