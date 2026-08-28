@@ -7,6 +7,8 @@ import XCTest
 /// migration as about routing.
 final class BypassRoutesTests: XCTestCase {
     private func makeProfile(
+        routingMode: RoutingMode = .allTraffic,
+        bypassLocalNetworks: Bool = false,
         bypassRoutes: [String] = [],
         bypassChinaDirect: Bool = false
     ) -> StoredProfile {
@@ -25,7 +27,8 @@ final class BypassRoutesTests: XCTestCase {
                 deviceName: "Phone",
                 certificateExpiry: "2030-01-01T00:00:00Z"
             ),
-            trafficPolicy: .allTraffic,
+            routingMode: routingMode,
+            bypassLocalNetworks: bypassLocalNetworks,
             bypassRoutes: bypassRoutes,
             bypassChinaDirect: bypassChinaDirect,
             importedAt: "2026-08-18T00:00:00Z"
@@ -138,6 +141,81 @@ final class BypassRoutesTests: XCTestCase {
             ["10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"]
         )
         XCTAssertEqual(StoredProfile.routeEntries(from: "   \n  \n "), [])
+    }
+
+    /// The old policy only ever decided local networks; a bypass list and the
+    /// country set applied whatever it said. Anything that was carving traffic
+    /// out of the tunnel therefore has to come back as `bypassRules`, or an
+    /// upgrade would quietly push those destinations through the tunnel.
+    private func legacyCatalog(policy: String, extraFields: String = "") -> String {
+        """
+        {"version":1,"selectedProfileID":"first","profiles":[{
+          "id":"first","secretAccount":"secret.first","displayName":"Example",
+          "trafficPolicy":"\(policy)","importedAt":"2026-08-18T00:00:00Z"\(extraFields),
+          "summary":{"version":1,"name":"Example","endpoint":"gateway.example:443",
+            "provider_id":"provider","gateway_id":"gateway","account_id":"account",
+            "device_id":"device","device_name":"Phone",
+            "certificate_expiry":"2030-01-01T00:00:00Z"}
+        }]}
+        """
+    }
+
+    func testALegacyExcludeLocalNetworksPolicyBecomesARuleInBypassMode() throws {
+        let catalog = try decodeCatalog(legacyCatalog(policy: "exclude-local-networks"))
+
+        let routing = catalog.profiles[0].routing
+        XCTAssertEqual(routing.mode, .bypassRules)
+        XCTAssertTrue(routing.bypassLocalNetworks)
+    }
+
+    func testALegacyGlobalPolicyWithNoRulesStaysGlobal() throws {
+        let catalog = try decodeCatalog(legacyCatalog(policy: "all-traffic"))
+
+        let routing = catalog.profiles[0].routing
+        XCTAssertEqual(routing.mode, .allTraffic)
+        XCTAssertFalse(routing.bypassLocalNetworks)
+    }
+
+    func testALegacyGlobalPolicyStillHonoursRulesThatUsedToApplyRegardless() throws {
+        let withRoutes = try decodeCatalog(
+            legacyCatalog(policy: "all-traffic", extraFields: ",\"bypassRoutes\":[\"10.0.0.0/8\"]")
+        )
+        let withCountrySet = try decodeCatalog(
+            legacyCatalog(policy: "all-traffic", extraFields: ",\"bypassChinaDirect\":true")
+        )
+
+        XCTAssertEqual(withRoutes.profiles[0].routing.mode, .bypassRules)
+        XCTAssertEqual(withCountrySet.profiles[0].routing.mode, .bypassRules)
+    }
+
+    /// A downgrade decodes `trafficPolicy` without a default, so dropping it
+    /// from the written catalog would take every enrolled profile with it.
+    func testTheLegacyPolicyFieldIsStillWrittenForOlderBuilds() throws {
+        let catalog = ProfileCatalog(
+            selectedProfileID: "first",
+            profiles: [makeProfile(routingMode: .bypassRules, bypassLocalNetworks: true)]
+        )
+
+        let encoded = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(catalog)
+        ) as? [String: Any]
+        let profiles = encoded?["profiles"] as? [[String: Any]]
+
+        XCTAssertEqual(profiles?.first?["trafficPolicy"] as? String, "exclude-local-networks")
+    }
+
+    func testTheLegacyPolicyFieldTracksTheRulesRatherThanBeingStored() throws {
+        XCTAssertEqual(makeProfile(routingMode: .allTraffic).legacyTrafficPolicy, .allTraffic)
+        // Local networks bypassed but the mode global: an older build must not
+        // be told to exclude them, because this build does not.
+        XCTAssertEqual(
+            makeProfile(routingMode: .allTraffic, bypassLocalNetworks: true).legacyTrafficPolicy,
+            .allTraffic
+        )
+        XCTAssertEqual(
+            makeProfile(routingMode: .bypassRules, bypassLocalNetworks: true).legacyTrafficPolicy,
+            .excludeLocalNetworks
+        )
     }
 
     func testParseListNamesTheEntriesThatFailedRatherThanCountingThem() {

@@ -103,10 +103,11 @@ extension TunnelModel {
         configuration.providerBundleIdentifier = providerIdentifier
         configuration.serverAddress = record.summary.endpoint
         configuration.disconnectOnSleep = false
-        configuration.providerConfiguration = [
-            "profileID": record.id,
-            "trafficPolicy": record.trafficPolicy.rawValue
-        ]
+        // The profile identity, and nothing else. Routing used to be copied in
+        // here too and read back in preference to the stored record, so a rule
+        // could only take effect by rewriting the saved configuration — which
+        // is precisely what cannot be done while the tunnel is up.
+        configuration.providerConfiguration = ["profileID": record.id]
         manager.protocolConfiguration = configuration
         manager.localizedDescription = "Queqiao"
         manager.isEnabled = true
@@ -303,23 +304,54 @@ extension TunnelModel {
         if reset { publishMetrics(.empty) }
     }
 
-    func refreshMetrics() async {
+    /// Sends one request to the running provider and returns its answer.
+    ///
+    /// Returns nil when no tunnel is running, which is a normal state for both
+    /// callers rather than a failure: metrics simply have nothing to report,
+    /// and a routing change has nothing live to apply itself to.
+    func sendProviderRequest(_ request: ProviderRequest) async throws -> Data? {
         guard let session = manager?.connection as? NETunnelProviderSession,
-              session.status == .connected else { return }
-        do {
-            let response: Data = try await withCheckedThrowingContinuation { continuation in
-                do {
-                    try session.sendProviderMessage(Data("metrics".utf8)) { data in
-                        guard let data else {
-                            continuation.resume(throwing: ModelError.emptyMetrics)
-                            return
-                        }
-                        continuation.resume(returning: data)
+              session.status == .connected else { return nil }
+        return try await withCheckedThrowingContinuation { continuation in
+            do {
+                try session.sendProviderMessage(request.payload) { data in
+                    guard let data else {
+                        continuation.resume(throwing: ModelError.emptyProviderResponse)
+                        return
                     }
-                } catch {
-                    continuation.resume(throwing: error)
+                    continuation.resume(returning: data)
                 }
+            } catch {
+                continuation.resume(throwing: error)
             }
+        }
+    }
+
+    /// Pushes the stored routing rules onto the running tunnel.
+    ///
+    /// The rules are already saved by the time this runs, so a failure here
+    /// means the tunnel is still carrying traffic by the previous plan. That
+    /// has to be said out loud: silently leaving the two out of step is how a
+    /// user ends up believing a destination is off the tunnel when it is not.
+    func applyRoutingToRunningTunnel() async {
+        do {
+            guard let response = try await sendProviderRequest(.reloadRouting) else { return }
+            let result = try RoutingReloadResult(payload: response)
+            guard result.applied else {
+                present(
+                    ModelError.routingNotApplied(result.failure ?? "the extension declined it"),
+                    title: "Routing not applied"
+                )
+                return
+            }
+        } catch {
+            present(ModelError.routingNotApplied(error.localizedDescription), title: "Routing not applied")
+        }
+    }
+
+    func refreshMetrics() async {
+        do {
+            guard let response = try await sendProviderRequest(.metrics) else { return }
             publishMetrics(try TunnelMetrics.decode(response))
         } catch {
             // Metrics are operational decoration; a transient extension IPC failure must not alter tunnel state.

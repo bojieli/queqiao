@@ -186,16 +186,20 @@ final class TunnelModel: ObservableObject {
         }
     }
 
-    func setTrafficPolicy(_ policy: TrafficPolicy, for id: String) async {
-        guard canChangeProfile else {
-            present(ModelError.disconnectBeforeEditing, title: "Disconnect first")
-            return
-        }
+    /// Persists a routing change and installs it on the tunnel if one is up.
+    ///
+    /// Deliberately not gated on `canChangeProfile`. Which destinations skip
+    /// the tunnel is the setting most worth changing precisely while
+    /// connected, and iOS lets the interface description be replaced without
+    /// stopping the provider. The store is written first so that whatever the
+    /// live push does, the next connection uses the rules the user chose.
+    func setRouting(_ routing: RoutingConfiguration, for id: String) async {
         do {
-            try await Task.detached { try ProfileStore().setTrafficPolicy(policy, for: id) }.value
+            try await Task.detached { try ProfileStore().setRouting(routing, for: id) }.value
             await refreshProfiles()
+            await applyRoutingToRunningTunnel()
         } catch {
-            present(error, title: "Could not update traffic policy")
+            present(error, title: "Could not update routing")
         }
     }
 
@@ -203,22 +207,15 @@ final class TunnelModel: ObservableObject {
     /// than dropping them: silently discarding a typed route would leave the
     /// user believing a destination is off the tunnel when it is not.
     func setBypassRoutes(from text: String, for id: String) async {
-        guard canChangeProfile else {
-            present(ModelError.disconnectBeforeEditing, title: "Disconnect first")
-            return
-        }
+        guard var routing = profile(id: id)?.routing else { return }
         let entries = StoredProfile.routeEntries(from: text)
         let rejected = IPPrefix.parseList(entries).rejected
         guard rejected.isEmpty else {
             present(ModelError.invalidBypassRoutes(rejected), title: "Check the bypass list")
             return
         }
-        do {
-            try await Task.detached { try ProfileStore().setBypassRoutes(entries, for: id) }.value
-            await refreshProfiles()
-        } catch {
-            present(error, title: "Could not update bypass routes")
-        }
+        routing.customRoutes = entries
+        await setRouting(routing, for: id)
     }
 
     func deleteProfile(id: String) async {
@@ -307,37 +304,36 @@ extension TunnelModel {
         }
     }
 
-    /// Saves the rule list. Like every other routing change this needs the
-    /// tunnel down, because the rules a flow was opened under are the rules it
-    /// keeps: re-pointing a running tunnel would leave live flows decided by a
-    /// list the user can no longer see.
+    /// Saves the rule list and hands it to the running core when there is one.
+    ///
+    /// This used to require the tunnel down, on the reasoning that a flow keeps
+    /// the rules it was opened under and re-pointing a live tunnel would leave
+    /// those flows decided by a list the user can no longer see. That is still
+    /// true and is the cost of this: flows already open keep their decision,
+    /// and only flows opened after the change follow the new list. Being unable
+    /// to fix a rule without dropping the connection was the larger problem.
     func updateRoutingRules(_ rules: String, for id: String) {
         Task { await saveRoutingRules(rules, for: id) }
     }
 
     func saveRoutingRules(_ rules: String, for id: String) async {
-        guard canChangeProfile else {
-            present(ModelError.disconnectBeforeEditing, title: "Disconnect first")
-            return
-        }
         do {
             try await Task.detached { try ProfileStore().setRoutingRules(rules, for: id) }.value
             await refreshProfiles()
+            await applyRoutingToRunningTunnel()
         } catch {
             present(error, title: "Could not save the routing rules")
         }
     }
 
-    func setBypassChinaDirect(_ enabled: Bool, for id: String) async {
-        guard canChangeProfile else {
-            present(ModelError.disconnectBeforeEditing, title: "Disconnect first")
-            return
-        }
-        do {
-            try await Task.detached { try ProfileStore().setBypassChinaDirect(enabled, for: id) }.value
-            await refreshProfiles()
-        } catch {
-            present(error, title: "Could not update the bundled route set")
-        }
+    /// Applies one edit to a profile's routing, reading the current value so a
+    /// toggle cannot write back a stale copy of the other rules.
+    func updateRouting(
+        for id: String,
+        _ edit: (inout RoutingConfiguration) -> Void
+    ) async {
+        guard var routing = profile(id: id)?.routing else { return }
+        edit(&routing)
+        await setRouting(routing, for: id)
     }
 }

@@ -30,7 +30,8 @@ final class CoreBoundaryTests: XCTestCase {
             secretAccount: "secret.first",
             displayName: "Example",
             summary: summary,
-            trafficPolicy: .excludeLocalNetworks,
+            routingMode: .bypassRules,
+            bypassLocalNetworks: true,
             importedAt: "2026-08-18T00:00:00Z"
         )
         var catalog = ProfileCatalog(

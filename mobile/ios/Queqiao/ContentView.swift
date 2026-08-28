@@ -126,7 +126,7 @@ private struct ConnectionView: View {
             Divider()
             LabeledContent("Profile", value: profile.displayName)
             LabeledContent("Provider", value: profile.summary.endpoint)
-            LabeledContent("Traffic policy", value: profile.trafficPolicy.title)
+            LabeledContent("Routing", value: profile.routing.summary)
             LabeledContent("Active device", value: profile.summary.deviceName)
         }
         .padding()
