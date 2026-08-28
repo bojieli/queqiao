@@ -111,9 +111,12 @@ qualification items are still open.
   cause in the notification and in the connection test, and never blocks a
   connection, because a VPN carrying Queqiao's uplink is not by itself proof of
   a loop. The debug build, which does carry a `VpnService`, reads the same rule
-  list as iOS from `routing-rules.conf` in its files directory; that is a
-  development affordance and cannot ship, because the released artifact
-  declares no `BIND_VPN_SERVICE` and CI asserts it against the assembled APK.
+  list as iOS from `routing-rules.conf` in its files directory — which does not
+  exist until the app writes something, so a fresh install needs `mkdir -p
+  files` under `run-as` before the push lands; see `DebugRoutingRules` for the
+  exact command. That is a development affordance and cannot ship, because the
+  released artifact declares no `BIND_VPN_SERVICE` and CI asserts it against
+  the assembled APK.
 - The iOS client is a full-device tunnel with a routing rule list: `DOMAIN`,
   `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`, `GEOIP` and `DST-PORT` rules
   choosing between `PROXY`, `DIRECT` and `REJECT`, first match wins, in the

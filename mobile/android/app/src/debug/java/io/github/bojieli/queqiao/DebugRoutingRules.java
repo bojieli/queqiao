@@ -29,6 +29,19 @@ import mobilecore.Session;
  * pushed with adb push is the shortest path from a rule list to a
  * running tunnel — no UI to navigate on every iteration, and the same file can
  * be handed to the iOS client's editor.
+ *
+ * <p>The files directory does not exist until the app writes something, so on a
+ * fresh install the push has to create it:
+ *
+ * <pre>
+ * adb push rules.conf /data/local/tmp/routing-rules.conf
+ * adb shell "run-as io.github.bojieli.queqiao.debug sh -c \
+ *     'mkdir -p files &amp;&amp; cat /data/local/tmp/routing-rules.conf &gt; files/routing-rules.conf'"
+ * </pre>
+ *
+ * <p>The list is read when a session starts, so it takes effect on the next
+ * connect. Whether it loaded, and which lines did not, is in logcat under the
+ * QueqiaoRouting tag.
  */
 final class DebugRoutingRules {
     private static final String TAG = "QueqiaoRouting";
