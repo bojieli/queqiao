@@ -39,7 +39,8 @@ enum ModelError: LocalizedError {
     case emptyCoreResult
     case invalidPacketTunnelIdentifier
     case disconnectBeforeEditing
-    case emptyMetrics
+    case emptyProviderResponse
+    case routingNotApplied(String)
     case invalidBypassRoutes([String])
 
     var errorDescription: String? {
@@ -51,9 +52,12 @@ enum ModelError: LocalizedError {
         case .invalidPacketTunnelIdentifier:
             return "The packet-tunnel bundle identifier is not configured."
         case .disconnectBeforeEditing:
-            return "Disconnect the VPN before changing its selected profile or routing policy."
-        case .emptyMetrics:
-            return "The packet-tunnel extension returned no metrics."
+            return "Disconnect the VPN before changing which profile it uses."
+        case .emptyProviderResponse:
+            return "The packet-tunnel extension returned no response."
+        case .routingNotApplied(let reason):
+            return "The routing change was saved, but the running tunnel is still using "
+                + "the previous rules: \(reason)"
         case .invalidBypassRoutes(let entries):
             let listed = entries.prefix(5).joined(separator: ", ")
             let suffix = entries.count > 5 ? " and \(entries.count - 5) more" : ""

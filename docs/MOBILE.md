@@ -176,20 +176,23 @@ the shared packet stack end to end on real hardware, and is never published.
 iOS cannot compose, so the tunnel carries routing policy itself. What it
 carries is deliberately a subset rather than a rule engine.
 
-Each profile has one of two base policies:
+Each profile has one routing mode:
 
-- **All traffic** routes IPv4, IPv6, and DNS through Queqiao.
-- **Exclude local networks** keeps IPv4 private, shared-address, loopback, and
+- **Route all traffic** sends IPv4, IPv6, and DNS through Queqiao. The bypass
+  rules below stay stored but are not applied.
+- **Use bypass rules** sends everything through Queqiao except the destinations
+  an enabled rule matches.
+
+The bypass rules are:
+
+- **Local networks** keeps IPv4 private, shared-address, loopback, and
   link-local destinations plus IPv6 unique-local, loopback, and link-local
   destinations outside the tunnel. Internet and DNS traffic still use
   Queqiao. iOS expresses these as excluded Network Extension routes. The
   Android debug tunnel constructs the exact complement as included CIDR routes
   so behavior is the same on every supported API level, including releases
   before Android added `VpnService.Builder.excludeRoute`.
-
-On top of the base policy, a profile may carry:
-
-- **Typed bypass routes** — up to 256 hand-entered CIDR blocks kept off the
+- **Custom routes** — up to 256 hand-entered CIDR blocks kept off the
   tunnel. An entry that is not a CIDR block is refused as it is saved rather
   than dropped quietly, because a discarded route would leave the user
   believing a destination is off the tunnel when it is not.
@@ -204,6 +207,29 @@ On top of the base policy, a profile may carry:
   gateway's vantage point returns addresses that need not be in the set and
   will still route through Queqiao. The UI states this rather than implying
   domain-level routing.
+The mode and the rules were three settings that did not know about each other:
+a two-value traffic policy, a bundled-set toggle, and a route list, where the
+latter two applied whatever the policy said. A profile reading "All traffic"
+could therefore be keeping whole countries off the tunnel. A catalog written
+before the merge migrates on load, and anything that was carving traffic out of
+the tunnel loads as **Use bypass rules** — an upgrade never pushes an excluded
+destination back through the tunnel. The catalog still carries the old
+`trafficPolicy` field, derived from the rules on every save, so that
+downgrading to an earlier build does not fail to decode and take every enrolled
+profile with it.
+
+Routing is editable while the tunnel is connected, which is the state in which
+it most often needs changing. The app writes the change to the Keychain catalog
+and asks the running provider to re-read it over the NetworkExtension
+app-message channel; the provider rebuilds the plan and replaces the interface
+description with `setTunnelNetworkSettings`. The packet engine and its uplink
+are left running, so a routing edit does not renegotiate the tunnel. iOS still
+re-plumbs the interface's routes, so a connection can be disturbed by the
+change — much less than the disconnect this replaces, but not nothing. When the push fails the change is still saved, and the UI
+says the running tunnel is still on the previous rules rather than letting the
+screen and the tunnel silently disagree. Which profile a tunnel uses still
+requires disconnecting; that replaces the device identity, not a route.
+
 - **Automatic connection rules**, off by default. A profile may bring the
   tunnel up on Wi-Fi, on cellular, or both, and keep it down on Wi-Fi networks
   the user names. Names are typed, never scanned — scanning would require

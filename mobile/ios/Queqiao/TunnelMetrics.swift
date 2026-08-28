@@ -10,7 +10,7 @@ struct TunnelMetrics: Equatable, Sendable {
     static func decode(_ data: Data) throws -> TunnelMetrics {
         let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard let transport = root?["transport"] as? [String: Any] else {
-            throw ModelError.emptyMetrics
+            throw ModelError.emptyProviderResponse
         }
         return TunnelMetrics(
             bytesUp: (transport["BytesUp"] as? NSNumber)?.uint64Value ?? 0,

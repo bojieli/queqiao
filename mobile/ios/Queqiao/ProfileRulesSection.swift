@@ -56,7 +56,8 @@ struct ProfileRulesSection: View {
                 DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, IP-CIDR, GEOIP and \
                 DST-PORT, with PROXY, DIRECT or REJECT. A flow no rule \
                 matches takes the tunnel, so end with FINAL if you want \
-                otherwise. Changing rules takes effect on the next connect.
+                otherwise. Saved rules reach a running tunnel immediately; flows \
+                already open keep the rules they started under.
                 """
             )
         }

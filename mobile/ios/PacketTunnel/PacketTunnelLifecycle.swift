@@ -26,6 +26,11 @@ final class PacketTunnelLifecycle: @unchecked Sendable {
     private var session: MobilecoreSession?
     private var bridge: PacketFlowBridge?
     private var profileID: String?
+    /// Kept so a routing change applied while connected can rebuild the
+    /// interface settings without resolving the provider endpoint again. A
+    /// second resolution could return a different address, which would move the
+    /// tunnel to another gateway as a side effect of editing a bypass rule.
+    private var remoteAddress: String?
     private var startCompletion: OneShotErrorCompletion?
 
     func beginStartup(completion: OneShotErrorCompletion) -> StartupAttempt {
@@ -45,6 +50,14 @@ final class PacketTunnelLifecycle: @unchecked Sendable {
         defer { lock.unlock() }
         guard !stopping, startup.generation == generation else { return false }
         profileID = id
+        return true
+    }
+
+    func recordRemoteAddress(_ address: String, for startup: StartupAttempt) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopping, startup.generation == generation else { return false }
+        remoteAddress = address
         return true
     }
 
@@ -72,6 +85,7 @@ final class PacketTunnelLifecycle: @unchecked Sendable {
         if startup.generation == generation {
             generation &+= 1
             profileID = nil
+            remoteAddress = nil
             startCompletion = nil
         }
         lock.unlock()
@@ -98,6 +112,7 @@ final class PacketTunnelLifecycle: @unchecked Sendable {
         session = nil
         bridge = nil
         profileID = nil
+        remoteAddress = nil
         startCompletion = nil
         return resources
     }
@@ -112,6 +127,15 @@ final class PacketTunnelLifecycle: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return profileID
+    }
+
+    /// The profile and endpoint a live routing change has to rebuild against,
+    /// read together so the pair cannot be torn by a concurrent stop.
+    var activeRouting: (profileID: String, remoteAddress: String)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopping, let profileID, let remoteAddress else { return nil }
+        return (profileID, remoteAddress)
     }
 
     var isStopping: Bool {

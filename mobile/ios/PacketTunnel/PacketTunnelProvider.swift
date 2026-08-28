@@ -28,24 +28,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
                 throw TunnelError.missingProfile
             }
             try MobileCore.validateProfile(profile)
-            let requestedPolicy = configuration.providerConfiguration?["trafficPolicy"] as? String
-            let policy = TrafficPolicy(rawValue: requestedPolicy ?? "") ?? record.trafficPolicy
             guard lifecycle.selectProfile(profileID, for: startup) else {
                 throw TunnelError.startCancelled
             }
+            // The stored record is the only routing source. It used to be read
+            // from the saved provider configuration first, which meant a change
+            // saved while connected was invisible until the configuration was
+            // rewritten — and the two could disagree in the meantime.
             recordDiagnostic(
                 level: .info,
-                "Starting profile \(record.displayName) with \(policy.title.lowercased())"
+                "Starting profile \(record.displayName) with \(record.routingMode.title.lowercased())"
             )
             resolveAndConfigureTunnel(
                 endpoint: record.summary.endpoint,
                 profile: profile,
-                routing: TunnelRouting(
-                    policy: policy,
-                    bypassRoutes: record.bypassRoutes,
-                    chinaDirect: record.bypassChinaDirect,
-                    rules: record.routingRules
-                ),
+                routing: record.routing,
                 startup: startup,
                 completion: completion
             )
@@ -89,8 +86,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
-        let metrics = lifecycle.currentSession?.metricsJSON() ?? "{\"version\":2,\"state\":\"stopped\"}"
-        completionHandler?(metrics.data(using: .utf8))
+        guard let request = ProviderRequest(payload: messageData) else {
+            completionHandler?(nil)
+            return
+        }
+        switch request {
+        case .metrics:
+            let metrics = lifecycle.currentSession?.metricsJSON()
+                ?? "{\"version\":2,\"state\":\"stopped\"}"
+            completionHandler?(metrics.data(using: .utf8))
+        case .reloadRouting:
+            reloadRouting(completionHandler: completionHandler)
+        }
     }
 
     func onStateChanged(_ state: String?) {
@@ -132,7 +139,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
 
     private func configureTunnel(
         profile: String,
-        routing: TunnelRouting,
+        routing: RoutingConfiguration,
         remoteAddress: String,
         startup: StartupAttempt,
         completion: OneShotErrorCompletion
@@ -185,7 +192,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
     private func resolveAndConfigureTunnel(
         endpoint: String,
         profile: String,
-        routing: TunnelRouting,
+        routing: RoutingConfiguration,
         startup: StartupAttempt,
         completion: OneShotErrorCompletion
     ) {
@@ -197,6 +204,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
                 }
                 let remoteAddress = try ProviderEndpoint.resolvedAddress(from: endpoint)
                 recordDiagnostic(level: .info, "Provider endpoint resolved to \(remoteAddress)")
+                guard lifecycle.recordRemoteAddress(remoteAddress, for: startup) else {
+                    completion.call(TunnelError.startCancelled)
+                    return
+                }
                 configureTunnel(
                     profile: profile,
                     routing: routing,
@@ -214,7 +225,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
 
     private func startPacketEngine(
         profile: String,
-        routing: TunnelRouting,
+        routing: RoutingConfiguration,
         startup: StartupAttempt,
         completion: OneShotErrorCompletion
     ) {
@@ -276,20 +287,67 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, MobilecoreObserverProt
 }
 
 private extension PacketTunnelProvider {
+    /// Installs the profile's current routing rules on the running interface.
+    ///
+    /// iOS allows the interface description to be replaced while the tunnel is
+    /// up, which is what makes a bypass rule editable without disconnecting.
+    /// The packet engine and its uplink are deliberately left running, so the
+    /// tunnel is not renegotiated for a routing edit. iOS still re-plumbs the
+    /// interface's routes, so a connection can be disturbed by the change —
+    /// that is a far smaller interruption than the disconnect this replaces,
+    /// but it is not nothing.
+    func reloadRouting(completionHandler: ((Data?) -> Void)?) {
+        guard let active = lifecycle.activeRouting else {
+            completionHandler?(RoutingReloadResult.failed("The tunnel is not running.").payload)
+            return
+        }
+        engineQueue.async { [self] in
+            do {
+                guard let (record, _) = try ProfileStore().profile(id: active.profileID) else {
+                    throw TunnelError.missingProfile
+                }
+                let plan = routePlan(for: record.routing)
+                let settings = TunnelNetworkSettings.make(
+                    plan: plan,
+                    remoteAddress: active.remoteAddress
+                )
+                setTunnelNetworkSettings(settings) { [self] error in
+                    if let error {
+                        let detail = error.localizedDescription
+                        recordDiagnostic(level: .error, "Could not apply new routing: \(detail)")
+                        completionHandler?(RoutingReloadResult.failed(detail).payload)
+                        return
+                    }
+                        if let session = lifecycle.currentSession {
+                        installRouting(on: session, routing: record.routing)
+                    }
+                    recordDiagnostic(
+                        level: .info,
+                        "Routing changed while connected: \(plan.diagnosticSummary)"
+                    )
+                    completionHandler?(
+                        RoutingReloadResult.succeeded(excludedRouteCount: plan.excluded.count).payload
+                    )
+                }
+            } catch {
+                let detail = error.localizedDescription
+                recordDiagnostic(level: .error, "Could not read new routing rules: \(detail)")
+                completionHandler?(RoutingReloadResult.failed(detail).payload)
+            }
+        }
+    }
+
     /// The set of destinations that stay off the tunnel for this profile.
     ///
-    /// Everything about how those prefixes are parsed, deduplicated, coalesced
-    /// and capped lives in RoutePlan so it can be tested without a
-    /// NetworkExtension host.
-    func routePlan(for routing: TunnelRouting) -> RoutePlan {
-        var userRoutes = routing.bypassRoutes
-        if routing.policy == .excludeLocalNetworks {
-            userRoutes = RoutePlan.localNetworks + userRoutes
-        }
-        var builtIn: [IPPrefix] = []
-        if routing.chinaDirect {
+    /// How the mode and the rules combine lives in RoutePlan, so the settings
+    /// screen previews exactly what this installs rather than reimplementing
+    /// it. What stays here is the part the screen cannot do: reading the
+    /// bundled set off disk, and saying so when it cannot be read.
+    func routePlan(for routing: RoutingConfiguration) -> RoutePlan {
+        var chinaDirect: [IPPrefix] = []
+        if routing.bypassChinaDirect {
             do {
-                builtIn = try CountryRoutes.chinaDirect()
+                chinaDirect = try CountryRoutes.chinaDirect()
             } catch {
                 // A missing or unreadable set is worth saying out loud, but it
                 // is not worth refusing to connect over: the tunnel still
@@ -300,39 +358,7 @@ private extension PacketTunnelProvider {
                 )
             }
         }
-        return RoutePlan.make(userRoutes: userRoutes, builtIn: builtIn)
-    }
-}
-
-/// Where this profile's traffic goes, read once from the stored record at
-/// startup and carried through resolution into the settings build.
-private struct TunnelRouting {
-    let policy: TrafficPolicy
-    let bypassRoutes: [String]
-    let chinaDirect: Bool
-    /// The rule list as stored, empty when the profile carries none. An empty
-    /// list is the state every existing installation is in, and it means the
-    /// tunnel carries everything exactly as it did before rules existed.
-    let rules: String
-}
-
-private enum TunnelError: LocalizedError {
-    case missingProfile
-    case missingProfileSelection
-    case coreStopped
-    case startCancelled
-
-    var errorDescription: String? {
-        switch self {
-        case .missingProfile:
-            return "No enrolled Queqiao device identity is available."
-        case .missingProfileSelection:
-            return "The VPN configuration does not identify a Queqiao profile. Open the app and connect again."
-        case .coreStopped:
-            return "The Queqiao packet engine stopped unexpectedly."
-        case .startCancelled:
-            return "Tunnel startup was cancelled."
-        }
+        return RoutePlan.make(for: routing, chinaDirect: chinaDirect)
     }
 }
 
@@ -341,7 +367,7 @@ private enum TunnelError: LocalizedError {
 /// configuration allows. Keeping it here also keeps the two failure paths --
 /// a country set that will not load, a rule list with bad lines -- beside each
 /// other, since both are reported and neither stops the tunnel.
-extension PacketTunnelProvider {
+private extension PacketTunnelProvider {
     /// Hands the core the rule list and the country set behind any GEOIP rule,
     /// before anything is carried.
     ///
@@ -350,7 +376,7 @@ extension PacketTunnelProvider {
     /// load leaves GEOIP rules deciding nothing. Neither stops the tunnel: a
     /// user whose rule file has a typo wants their connection, and a diagnostic
     /// they can find, rather than a refusal to start.
-    private func installRouting(on session: MobilecoreSession, routing: TunnelRouting) {
+    private func installRouting(on session: MobilecoreSession, routing: RoutingConfiguration) {
         if let data = CountryRoutes.packedChinaSet() {
             do {
                 try session.setCountrySet("CN", blob: data)
