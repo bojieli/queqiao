@@ -12,10 +12,10 @@ labelled experimental in the app and the reasons are below.
 | File | `delegated-apnic-latest` |
 | URL | <https://ftp.apnic.net/stats/apnic/delegated-apnic-latest> |
 | Publisher | Asia-Pacific Network Information Centre (APNIC) |
-| Serial | `88913`, dated `20260819` (the file's `2\|apnic\|…` header line) |
-| SHA-256 of the source | `b8a2fba3e99f40ac871f14b6ae0a17201047f39d35de0372974bd89494520b3f` |
-| SHA-256 of `cn-direct.bin` | `9bda9abea411b9f012ab710c08c0a347ff663ddee79342b44e56d2889a1bd5eb` |
-| Contents | 5492 IPv4 and 2012 IPv6 blocks, 61680 bytes, from 10830 delegation records |
+| Serial | `88964`, dated `20260829` (the file's `2\|apnic\|…` header line) |
+| SHA-256 of the source | `a8c0f001e70b5c32221fc5cc37760bb63f4eef058959124eb29e62bc66a6dd44` |
+| SHA-256 of `cn-direct.bin` | `900983e9e5993ce1033c2734bde2914563194f89e70c799a75031f46bbfcc896` |
+| Contents | 5493 IPv4 and 2014 IPv6 blocks, 61719 bytes, from 10833 delegation records |
 
 ## Terms
 

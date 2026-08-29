@@ -152,8 +152,8 @@ final class CountryRoutesTests: XCTestCase {
 
     func testTheShippedSetParsesToTheBlockCountsItWasGeneratedWith() throws {
         let prefixes = try shippedSet()
-        XCTAssertEqual(prefixes.filter { $0.family == .ipv4 }.count, 5_492)
-        XCTAssertEqual(prefixes.filter { $0.family == .ipv6 }.count, 2_012)
+        XCTAssertEqual(prefixes.filter { $0.family == .ipv4 }.count, 5_493)
+        XCTAssertEqual(prefixes.filter { $0.family == .ipv6 }.count, 2_014)
     }
 
     func testTheShippedSetIsAlreadySortedAndCollapsed() throws {
