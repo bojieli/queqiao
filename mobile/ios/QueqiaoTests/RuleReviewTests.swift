@@ -70,7 +70,36 @@ final class RuleReviewTests: XCTestCase {
     func testTheChinaPresetIsItselfValid() {
         let review = RuleReview(text: RuleReview.chinaPreset)
         XCTAssertTrue(review.problems.isEmpty, "the preset does not review clean: \(review.problems)")
-        XCTAssertEqual(review.count, 4)
+        XCTAssertGreaterThan(review.count, 4)
+    }
+
+    /// The preset exists because an address set cannot answer these.
+    ///
+    /// Each of these resolves to space the registry does not call Chinese, so
+    /// `GEOIP,CN` never matches it and the flow takes the tunnel while the
+    /// toggle says direct — measured, not assumed: ip138.com answers 138.113.x
+    /// and bilibili.com 148.153.x from Chinese and foreign resolvers alike. If
+    /// one of these lines is ever dropped, that symptom comes back, so the
+    /// names are asserted rather than left to a reviewer's eye.
+    func testThePresetNamesTheServicesAnAddressSetCannotReach() {
+        let preset = RuleReview.chinaPreset
+        for host in ["ip138.com", "bilibili.com", "lxdns.com", "hdslb.com"] {
+            XCTAssertTrue(
+                preset.contains("DOMAIN-SUFFIX,\(host),DIRECT"),
+                "the preset no longer keeps \(host) direct by name"
+            )
+        }
+    }
+
+    /// First match wins, so a name rule placed after the address rule would
+    /// never be reached for anything the address rule already claims.
+    func testTheAddressRuleComesAfterTheNameRules() throws {
+        let lines = RuleReview.chinaPreset
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        let geoip = try XCTUnwrap(lines.firstIndex(of: "GEOIP,CN,DIRECT"))
+        let lastName = try XCTUnwrap(lines.lastIndex { $0.hasPrefix("DOMAIN-") })
+        XCTAssertLessThan(lastName, geoip, "a name rule sits below GEOIP and cannot be reached")
     }
 
     /// A pasted list can be long and wrong in many places; the screen shows the

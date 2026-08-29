@@ -98,13 +98,111 @@ struct RuleReview {
     let count: Int
     let problems: [String]
 
+    /// A starting point for keeping China direct, not an exhaustive list.
+    ///
+    /// The GEOIP line matches on address, using the bundled registry set. That
+    /// set records where a block was *delegated*, which is not where it is
+    /// *used*, so a Chinese service answering from a CDN in space delegated
+    /// elsewhere never matches it: ip138.com resolves to 138.113.x and
+    /// bilibili.com to 148.153.x, neither of which the registry calls Chinese,
+    /// and both took the tunnel while the toggle said direct. Querying a
+    /// Chinese resolver does not help — 223.5.5.5 and 119.29.29.29 return those
+    /// same addresses — because nothing is being mis-resolved. The address is
+    /// simply not what the registry describes.
+    ///
+    /// Name rules are the answer, which is why the list below is mostly names.
+    /// `.cn` is one line; everything after it is a Chinese service on a TLD
+    /// that line cannot reach, or the CDN and asset domain it loads from.
+    /// Anyone wanting real coverage should paste in a geosite-derived list —
+    /// this is what fits in a button.
     static let chinaPreset = """
         # Keep China direct by name as well as by address. The GEOIP line uses
         # the bundled registry set; the name rules are what an address set
         # cannot do, because a Chinese domain can answer with a CDN address
-        # outside it.
+        # outside it. First match wins, so names come before GEOIP.
         DOMAIN-SUFFIX,cn,DIRECT
         DOMAIN-KEYWORD,-cn,DIRECT
+
+        # Search, portals, mail
+        DOMAIN-SUFFIX,baidu.com,DIRECT
+        DOMAIN-SUFFIX,bdstatic.com,DIRECT
+        DOMAIN-SUFFIX,bdimg.com,DIRECT
+        DOMAIN-SUFFIX,163.com,DIRECT
+        DOMAIN-SUFFIX,126.net,DIRECT
+        DOMAIN-SUFFIX,netease.com,DIRECT
+        DOMAIN-SUFFIX,sohu.com,DIRECT
+        DOMAIN-SUFFIX,sogou.com,DIRECT
+        DOMAIN-SUFFIX,ip138.com,DIRECT
+
+        # Tencent
+        DOMAIN-SUFFIX,qq.com,DIRECT
+        DOMAIN-SUFFIX,tencent.com,DIRECT
+        DOMAIN-SUFFIX,gtimg.com,DIRECT
+        DOMAIN-SUFFIX,myqcloud.com,DIRECT
+        DOMAIN-SUFFIX,tencentcs.com,DIRECT
+
+        # Alibaba
+        DOMAIN-SUFFIX,taobao.com,DIRECT
+        DOMAIN-SUFFIX,tmall.com,DIRECT
+        DOMAIN-SUFFIX,alipay.com,DIRECT
+        DOMAIN-SUFFIX,alicdn.com,DIRECT
+        DOMAIN-SUFFIX,aliyun.com,DIRECT
+        DOMAIN-SUFFIX,aliyuncs.com,DIRECT
+        DOMAIN-SUFFIX,alikunlun.com,DIRECT
+        DOMAIN-SUFFIX,mmstat.com,DIRECT
+
+        # Retail
+        DOMAIN-SUFFIX,jd.com,DIRECT
+        DOMAIN-SUFFIX,360buyimg.com,DIRECT
+        DOMAIN-SUFFIX,pinduoduo.com,DIRECT
+        DOMAIN-SUFFIX,yangkeduo.com,DIRECT
+        DOMAIN-SUFFIX,meituan.com,DIRECT
+        DOMAIN-SUFFIX,meituan.net,DIRECT
+        DOMAIN-SUFFIX,dianping.com,DIRECT
+
+        # Social, video, reading
+        DOMAIN-SUFFIX,weibo.com,DIRECT
+        DOMAIN-SUFFIX,weibocdn.com,DIRECT
+        DOMAIN-SUFFIX,bilibili.com,DIRECT
+        DOMAIN-SUFFIX,hdslb.com,DIRECT
+        DOMAIN-SUFFIX,bilivideo.com,DIRECT
+        DOMAIN-SUFFIX,zhihu.com,DIRECT
+        DOMAIN-SUFFIX,zhimg.com,DIRECT
+        DOMAIN-SUFFIX,douban.com,DIRECT
+        DOMAIN-SUFFIX,doubanio.com,DIRECT
+        DOMAIN-SUFFIX,xiaohongshu.com,DIRECT
+        DOMAIN-SUFFIX,xhscdn.com,DIRECT
+        DOMAIN-SUFFIX,douyin.com,DIRECT
+        DOMAIN-SUFFIX,toutiao.com,DIRECT
+        DOMAIN-SUFFIX,bytedance.com,DIRECT
+        DOMAIN-SUFFIX,byteimg.com,DIRECT
+        DOMAIN-SUFFIX,pstatp.com,DIRECT
+        DOMAIN-SUFFIX,snssdk.com,DIRECT
+        DOMAIN-SUFFIX,kuaishou.com,DIRECT
+        DOMAIN-SUFFIX,yximgs.com,DIRECT
+        DOMAIN-SUFFIX,iqiyi.com,DIRECT
+        DOMAIN-SUFFIX,qiyipic.com,DIRECT
+        DOMAIN-SUFFIX,youku.com,DIRECT
+        DOMAIN-SUFFIX,ykimg.com,DIRECT
+
+        # Maps, travel, services
+        DOMAIN-SUFFIX,amap.com,DIRECT
+        DOMAIN-SUFFIX,autonavi.com,DIRECT
+        DOMAIN-SUFFIX,ctrip.com,DIRECT
+        DOMAIN-SUFFIX,tripcdn.com,DIRECT
+
+        # Content delivery for the above. These are why an address set is not
+        # enough: the name is Chinese, the address it answers with need not be.
+        DOMAIN-SUFFIX,lxdns.com,DIRECT
+        DOMAIN-SUFFIX,wscdns.com,DIRECT
+        DOMAIN-SUFFIX,chinanetcenter.com,DIRECT
+        DOMAIN-SUFFIX,ccgslb.com,DIRECT
+        DOMAIN-SUFFIX,ccgslb.net,DIRECT
+        DOMAIN-SUFFIX,qiniu.com,DIRECT
+        DOMAIN-SUFFIX,qbox.me,DIRECT
+        DOMAIN-SUFFIX,upaiyun.com,DIRECT
+        DOMAIN-SUFFIX,upyun.com,DIRECT
+
         GEOIP,CN,DIRECT
         FINAL,PROXY
         """
