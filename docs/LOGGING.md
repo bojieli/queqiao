@@ -271,3 +271,13 @@ Rotation is internal and does not require `logrotate`, a SIGHUP, or reopening
 the process. Do not configure an external rotator to rename the same files.
 The process fails startup rather than silently running without its configured
 file when the directory cannot be created or the file cannot be opened.
+
+Do not capture stdout or stderr to a file from the service manager either. A
+LaunchAgent `StandardOutPath` or `StandardErrorPath`, or a systemd
+`StandardOutput=file:`, stores a second copy of every line somewhere nothing
+rotates, so it grows without bound while the rotating log beside it stays
+within its five backups. Mirroring to a journal is not the same thing:
+journald applies its own retention, which is why the generated systemd unit
+leaves stderr on, while the generated LaunchAgent has no journal to write to
+and passes `--log-stderr=false` instead. A unit hand-written before that
+should drop the redirect, pass `--log-stderr=false`, or both.
