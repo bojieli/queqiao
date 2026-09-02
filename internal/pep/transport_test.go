@@ -13,6 +13,7 @@ import (
 
 	"github.com/apernet/quic-go"
 	"github.com/bojieli/queqiao/internal/identity"
+	"github.com/bojieli/queqiao/internal/netbind"
 )
 
 type routeErrorPacketConn struct{ err error }
@@ -392,12 +393,15 @@ func TestValidateLocalAddressSpec(t *testing.T) {
 }
 
 func TestResolveLocalAddressLiteral(t *testing.T) {
-	got, err := resolveLocalAddress("192.0.2.10")
+	got, err := netbind.ResolveWithInterface("192.0.2.10")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.String() != "192.0.2.10" {
-		t.Fatalf("resolved literal = %s", got)
+	if got.Addr.String() != "192.0.2.10" {
+		t.Fatalf("resolved literal = %s", got.Addr)
+	}
+	if got.InterfaceName != "" {
+		t.Fatalf("literal IP should have no interface name, got %q", got.InterfaceName)
 	}
 }
 
@@ -405,15 +409,15 @@ func TestResolveLocalAddressAutoOrInterfaceReportsOperationalState(t *testing.T)
 	// The CI host may have no physical IPv4 interface, or may expose more than
 	// one. In either case the important contract is a bounded, actionable error;
 	// when auto succeeds it must return an IPv4 address that can be bound.
-	got, err := resolveLocalAddress("auto")
+	got, err := netbind.ResolveWithInterface("auto")
 	if err != nil {
 		if !strings.Contains(err.Error(), "IPv4") && !strings.Contains(err.Error(), "physical") {
 			t.Fatalf("unexpected auto-resolution error: %v", err)
 		}
 		return
 	}
-	if !got.Is4() {
-		t.Fatalf("auto selected non-IPv4 address %s", got)
+	if !got.Addr.Is4() {
+		t.Fatalf("auto selected non-IPv4 address %s", got.Addr)
 	}
 }
 
