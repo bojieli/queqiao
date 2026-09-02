@@ -41,6 +41,9 @@ BASELINE = {
     ("G115", "internal/pep/mpflow.go"): 12,
     ("G115", "internal/pep/server.go"): 1,
     ("G115", "internal/pep/stripedsend.go"): 5,
+    # The hop walk index is bounded by the configured pool size (order 100),
+    # far inside int32.
+    ("G115", "internal/portmux/hop.go"): 1,
     ("G115", "internal/protocol/frame.go"): 1,
     ("G115", "internal/session/packet.go"): 1,
     ("G115", "internal/socks5/socks5.go"): 1,

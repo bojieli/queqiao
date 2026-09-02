@@ -2,8 +2,9 @@ package portmux
 
 import (
 	"context"
+	"crypto/rand"
 	"log/slog"
-	"math/rand/v2"
+	"math/big"
 	"sync"
 	"time"
 )
@@ -19,6 +20,20 @@ type HopWalk struct {
 	pos   int
 }
 
+// shuffleInts is Fisher-Yates over crypto/rand. The port order is meant to be
+// unpredictable to the same network observer who already knows the HopPorts
+// derivation hash, so a weak PRNG would not do.
+func shuffleInts(order []int) {
+	for i := len(order) - 1; i > 0; i-- {
+		j, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		if err != nil {
+			return // leave the rest unshuffled rather than fail the dial path
+		}
+		k := int(j.Int64())
+		order[i], order[k] = order[k], order[i]
+	}
+}
+
 // NewHopWalk returns a walk over the port-list indices [0, count) in a
 // freshly shuffled order.
 func NewHopWalk(count int) *HopWalk {
@@ -26,7 +41,7 @@ func NewHopWalk(count int) *HopWalk {
 	for i := range order {
 		order[i] = i
 	}
-	rand.Shuffle(count, func(i, j int) { order[i], order[j] = order[j], order[i] })
+	shuffleInts(order)
 	return &HopWalk{order: order}
 }
 
@@ -36,11 +51,13 @@ func (w *HopWalk) Next() int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.pos >= len(w.order) {
-		rand.Shuffle(len(w.order), func(i, j int) { w.order[i], w.order[j] = w.order[j], w.order[i] })
+		shuffleInts(w.order)
 		w.pos = 0
 	}
 	idx := w.order[w.pos]
 	w.pos++
+	// idx < count, and count is the configured hop pool size (order 100), so
+	// the int32 conversion cannot overflow.
 	return int32(idx)
 }
 
