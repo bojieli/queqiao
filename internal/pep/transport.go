@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -16,8 +17,10 @@ import (
 	"github.com/bojieli/queqiao/internal/coded"
 	wancongestion "github.com/bojieli/queqiao/internal/congestion"
 	"github.com/bojieli/queqiao/internal/identity"
+	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/netbind"
 	"github.com/bojieli/queqiao/internal/pathmodel"
+	"github.com/bojieli/queqiao/internal/portmux"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
@@ -94,6 +97,15 @@ type udpHealth struct {
 	threshold int
 	cooldown  time.Duration
 	blockedTo time.Time
+}
+
+// hopDialConfig carries port-hopping configuration for dialQUICConnection.
+// A zero value disables port hopping.
+type hopDialConfig struct {
+	portCount  int    // 0 or 1 = disabled; ≥2 = enabled
+	providerID string // for deterministic HopPorts derivation
+	metrics    *metrics.Registry
+	logger     *slog.Logger
 }
 
 // quicPathEvidence is deliberately narrower than "a QUIC operation ended".
@@ -581,8 +593,8 @@ func quicConfig(windows flowWindows) *quic.Config {
 	}
 }
 
-func dialQUIC(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), ccfg congestionConfig, windows flowWindows) (streamConn, error) {
-	conn, packetConn, err := dialQUICConnection(ctx, remote, credentials, dialTimeout, localAddress, control, observeTransientWrite, windows)
+func dialQUIC(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), ccfg congestionConfig, windows flowWindows, hop hopDialConfig) (streamConn, error) {
+	conn, packetConn, err := dialQUICConnection(ctx, remote, credentials, dialTimeout, localAddress, control, observeTransientWrite, windows, hop)
 	if err != nil {
 		return nil, err
 	}
@@ -706,7 +718,13 @@ func transientRouteWriteError(err error) bool {
 // dialQUICConnection establishes only the QUIC connection. Keeping this
 // separate from stream creation allows the client to pool one connection and
 // open a stream for each logical flow without paying another handshake.
-func dialQUICConnection(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), windows flowWindows) (*quic.Conn, net.PacketConn, error) {
+//
+// When hop.portCount ≥ 2, the raw UDP socket is wrapped in a ClientPortMux
+// before being handed to quic-go, and a HopController goroutine is started to
+// monitor for the per-port blocking pattern caused by GFW and trigger port
+// hops reactively. The mux's context is cancelled when the PacketConn is
+// closed, which stops the goroutine.
+func dialQUICConnection(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), windows flowWindows, hop hopDialConfig) (*quic.Conn, net.PacketConn, error) {
 	dialCtx := ctx
 	var cancel context.CancelFunc
 	if dialTimeout > 0 {
@@ -734,6 +752,21 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 	packetConn, err := (&net.ListenConfig{Control: composed}).ListenPacket(dialCtx, "udp", listenAddress)
 	if err != nil {
 		return nil, nil, err
+	}
+	if hop.portCount >= 2 {
+		// Wrap the raw UDP socket with bidirectional port rewriting. The mux
+		// is transparent to quic-go: outgoing packets are redirected to the
+		// active hop port and incoming packets appear to originate from the
+		// primary port.
+		rawUDP := packetConn.(*net.UDPConn)
+		ports := portmux.HopPorts(hop.providerID, remoteAddr.Port, hop.portCount)
+		mux := portmux.NewClientPortMux(rawUDP, remoteAddr, ports)
+		ctrl := portmux.NewHopController(mux, portmux.HopConfig{
+			Metrics: hop.metrics,
+			Logger:  hop.logger,
+		})
+		go ctrl.Run(mux.Context())
+		packetConn = mux
 	}
 	packetConn = tolerateTransientRouteErrors(packetConn, observeTransientWrite)
 	conn, err := quic.Dial(dialCtx, packetConn, remoteAddr, tlsCfg, quicConfig(windows))

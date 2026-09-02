@@ -41,6 +41,7 @@ type Registry struct {
 	udpRescueFailures      atomic.Uint64
 	completionTimeouts     atomic.Uint64
 	flowTimeouts           atomic.Uint64
+	portHops               atomic.Uint64
 	// The authorization counters below describe the gateway's own state
 	// rather than any flow. A store that cannot be re-read leaves the last
 	// snapshot in force, which keeps established devices connecting while
@@ -276,6 +277,7 @@ type Snapshot struct {
 	UDPAssociationReconnects, UDPAssociationRescueFailures        uint64
 	CompletionTimeouts                                            uint64
 	FlowTimeouts                                                  uint64
+	PortHops                                                      uint64
 	AuthorizationRefreshFailures, AuthorizationReloads            uint64
 	AuthorizationConsecutiveRefreshFailures                       uint64
 	AuthorizationLastGoodUnix                                     int64
@@ -563,6 +565,7 @@ func (r *Registry) PeerProtocolViolation() { r.peerProtocolViolations.Add(1) }
 
 func (r *Registry) CompletionTimeout() { r.completionTimeouts.Add(1) }
 func (r *Registry) FlowTimeout()       { r.flowTimeouts.Add(1) }
+func (r *Registry) PortHop()           { r.portHops.Add(1) }
 
 // AuthorizationRefreshFailed records one failed attempt to re-read the
 // authorization store, carrying how many have now failed in a row so a chronic
@@ -650,6 +653,7 @@ func (r *Registry) Snapshot() Snapshot {
 		UDPAssociationRescueFailures:            r.udpRescueFailures.Load(),
 		CompletionTimeouts:                      r.completionTimeouts.Load(),
 		FlowTimeouts:                            r.flowTimeouts.Load(),
+		PortHops:                                r.portHops.Load(),
 		AuthorizationRefreshFailures:            r.authorizationRefreshFailures.Load(),
 		AuthorizationReloads:                    r.authorizationReloads.Load(),
 		AuthorizationConsecutiveRefreshFailures: r.authorizationConsecutiveFailures.Load(),
@@ -832,6 +836,7 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	fmt.Fprintf(w, "queqiao_udp_association_rescue_failures_total %d\n", s.UDPAssociationRescueFailures)
 	fmt.Fprintf(w, "queqiao_completion_timeouts_total %d\n", s.CompletionTimeouts)
 	fmt.Fprintf(w, "queqiao_flow_timeouts_total %d\n", s.FlowTimeouts)
+	fmt.Fprintf(w, "queqiao_port_hops_total %d\n", s.PortHops)
 	// A non-zero consecutive count means the gateway is enforcing a snapshot
 	// it can no longer re-read: established devices keep working while every
 	// enrollment fails. Alert on the consecutive count, and use

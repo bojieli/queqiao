@@ -17,6 +17,7 @@ import (
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/limiter"
 	"github.com/bojieli/queqiao/internal/metrics"
+	"github.com/bojieli/queqiao/internal/portmux"
 	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
@@ -67,6 +68,13 @@ type ServerConfig struct {
 	// it is a measurement control, and both endpoints must agree for the
 	// comparison to mean anything.
 	UDPOnStream bool
+	// HopPortCount enables the server to accept QUIC connections on multiple
+	// UDP ports simultaneously. It must match the client's hop_port_count in
+	// the profile. 0 and 1 both disable port hopping. Values ≥ 2 cause the
+	// server to listen on that many ports derived from the provider ID and
+	// route responses back through whichever port each client most recently
+	// used.
+	HopPortCount int
 	// testLaneWriteHook is intentionally unexported and nil in production. It
 	// lets package integration tests reproduce loss of a specific logical
 	// frame without depending on encrypted QUIC packet layout.
@@ -477,11 +485,36 @@ func (s *Server) handleTCP(ctx context.Context, conn *tls.Conn) {
 }
 
 func (s *Server) serveQUIC(ctx context.Context) error {
-	packetConn, err := net.ListenPacket("udp", s.cfg.ListenAddr)
+	if s.cfg.HopPortCount < 2 {
+		// Fast path: single port, no mux overhead.
+		packetConn, err := net.ListenPacket("udp", s.cfg.ListenAddr)
+		if err != nil {
+			return fmt.Errorf("listen on remote QUIC address: %w", err)
+		}
+		return s.ServePacketConn(ctx, packetConn)
+	}
+
+	// Port-hopping path: bind the primary socket, derive the port list, then
+	// open secondary sockets and hand everything to a ServerPortMux.
+	listenAddr, err := net.ResolveUDPAddr("udp", s.cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("resolve QUIC listen address: %w", err)
+	}
+	primaryConn, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on remote QUIC address: %w", err)
 	}
-	return s.ServePacketConn(ctx, packetConn)
+	primaryPort := primaryConn.LocalAddr().(*net.UDPAddr).Port
+	ports := portmux.HopPorts(s.cfg.Credentials.ProviderID, primaryPort, s.cfg.HopPortCount)
+	mux, err := portmux.NewServerPortMux(primaryConn, ports)
+	if err != nil {
+		_ = primaryConn.Close()
+		return fmt.Errorf("create server port mux: %w", err)
+	}
+	s.cfg.Logger.Info("port hop listener ready",
+		"primary_addr", primaryConn.LocalAddr(),
+		"hop_port_count", len(ports))
+	return s.ServePacketConn(ctx, mux)
 }
 
 // ServePacketConn runs the QUIC listener on an already-bound UDP socket.
