@@ -508,6 +508,7 @@ type runtimeOptions struct {
 	aggregateBytesPerSec, interactiveReserveBytesPerSec         uint64
 	fallbackDelay, fallbackGrace, udpCooldown                   time.Duration
 	udpFailureThreshold                                         int
+	hopPortCount                                                int
 	allowPrivate                                                bool
 	logLevel, logFile, logFormat                                string
 	jsonLogs                                                    bool
@@ -538,6 +539,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.StringVar(&opts.transport, "transport", string(pep.TransportAuto), "transport: auto, quic, or tcp")
 	fs.IntVar(&opts.tcpFallbackLanes, "tcp-fallback-lanes", 0, "TCP lanes per bulk flow (0 uses role default)")
 	fs.BoolVar(&opts.udpOnStream, "udp-on-stream", false, "carry UDP packets on streams instead of QUIC datagrams")
+	fs.IntVar(&opts.hopPortCount, "hop-port-count", 0, "number of UDP ports to listen on for port hopping (0/1 = disabled)")
 	fs.StringVar(&opts.congestion, "congestion", string(pep.CongestionErasure), "QUIC congestion controller")
 	fs.Uint64Var(&opts.brutalBytesPerSec, "brutal-bytes-per-sec", 0, "Brutal fixed byte rate")
 	fs.Uint64Var(&opts.adaptiveMinBytesSec, "adaptive-min-bytes-per-sec", 64*1024, "Adaptive minimum byte rate")
@@ -794,6 +796,7 @@ func runServer(args []string) (returnErr error) {
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
 		Logger: logger, UDPOnStream: opts.udpOnStream, Profile: serverProfile,
+		HopPortCount: opts.hopPortCount,
 	})
 	if err != nil {
 		return err

@@ -52,6 +52,11 @@ type ClientProfile struct {
 	DeviceCertificate string `json:"device_certificate_pem"`
 	DevicePrivateKey  string `json:"device_private_key_pem"`
 	CreatedAt         string `json:"created_at"`
+	// HopPortCount enables UDP port hopping to evade per-port GFW blocking.
+	// 0 and 1 both mean disabled (single port). Values ≥ 2 cause the client
+	// to maintain a list of that many ports and hop among them reactively when
+	// sustained packet loss is detected on the current port.
+	HopPortCount int `json:"hop_port_count,omitempty"`
 }
 
 func (p *Provider) CreateInvitation(account string, ttl time.Duration, now time.Time) (string, Invitation, error) {

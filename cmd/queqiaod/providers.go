@@ -202,6 +202,7 @@ func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtim
 		Budget:             budget,
 		FallbackDelay:      opts.fallbackDelay, FallbackGrace: opts.fallbackGrace,
 		UDPFailureThreshold: opts.udpFailureThreshold, UDPCooldown: opts.udpCooldown,
+		HopPortCount: profile.HopPortCount,
 		Metrics: registry, Logger: logger,
 	})
 }

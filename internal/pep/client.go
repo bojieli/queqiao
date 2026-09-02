@@ -21,6 +21,7 @@ import (
 	"github.com/bojieli/queqiao/internal/limiter"
 	"github.com/bojieli/queqiao/internal/memlimit"
 	"github.com/bojieli/queqiao/internal/metrics"
+	"github.com/bojieli/queqiao/internal/portmux"
 	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
@@ -184,7 +185,12 @@ type ClientConfig struct {
 	FallbackGrace       time.Duration
 	UDPFailureThreshold int
 	UDPCooldown         time.Duration
-	Logger              *slog.Logger
+	// HopPortCount enables reactive UDP port hopping to evade per-port GFW
+	// blocking. 0 and 1 both mean disabled. Values ≥ 2 cause the client to
+	// maintain a pool of that many ports derived from the provider ID and hop
+	// reactively when sustained zero-receive loss is detected.
+	HopPortCount int
+	Logger       *slog.Logger
 }
 
 type Client struct {
@@ -215,6 +221,10 @@ type Client struct {
 	// transientUDPLogNS rate-limits an otherwise synchronized burst of local
 	// route errors while still counting every suppressed send in metrics.
 	transientUDPLogNS atomic.Int64
+	// hopWalk is the client-wide hop port selection state, built lazily on
+	// the first hop-enabled dial so all dials share one walk.
+	hopWalkOnce sync.Once
+	hopWalk     *portmux.HopWalk
 	// openFlowForTest stands in for one flow-open attempt, so the retry policy
 	// can be tested without a network that loses things on demand.
 	openFlowForTest func() (*openedFlow, error)
@@ -1122,6 +1132,26 @@ func (c *Client) observeUDPPath(evidence quicPathEvidence, quicErr error) {
 
 const transientUDPSendLogInterval = 5 * time.Second
 
+// hopDialConfig builds the port-hopping configuration for this client's QUIC
+// dials from ClientConfig. A zero HopPortCount returns a zero hopDialConfig,
+// which disables port hopping in dialQUICConnection. All dials share one
+// HopWalk so port selection persists across connection attempts.
+func (c *Client) hopDialConfig() hopDialConfig {
+	if c.cfg.HopPortCount < 2 {
+		return hopDialConfig{}
+	}
+	c.hopWalkOnce.Do(func() {
+		c.hopWalk = portmux.NewHopWalk(c.cfg.HopPortCount)
+	})
+	return hopDialConfig{
+		portCount:  c.cfg.HopPortCount,
+		providerID: c.cfg.Credentials.ProviderID,
+		walk:       c.hopWalk,
+		metrics:    c.cfg.Metrics,
+		logger:     c.cfg.Logger,
+	}
+}
+
 func (c *Client) observeTransientUDPSendFailure(err error) {
 	if c.metrics != nil {
 		c.metrics.TransientUDPSendError()
@@ -1365,7 +1395,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 			outer, err = c.dialPooledQUICLane(ctx, ccfg)
 			reserveControl = true
 		} else {
-			outer, err = dialQUIC(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, ccfg, c.windows())
+			outer, err = dialQUIC(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, ccfg, c.windows(), c.hopDialConfig())
 		}
 	default:
 		return nil, fmt.Errorf("cannot dial transport %q", kind)
@@ -1467,7 +1497,7 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 }
 
 func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDial, ccfg congestionConfig) {
-	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows())
+	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
 	var generation *controlQUICGeneration
 	if err == nil {
 		generation = &controlQUICGeneration{
@@ -1734,7 +1764,7 @@ func (c *Client) bulkConnCount() int {
 
 func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 	started := time.Now()
-	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows())
+	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
 	if err != nil {
 		return nil, err
 	}
