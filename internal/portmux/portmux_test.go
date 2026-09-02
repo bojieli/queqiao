@@ -214,6 +214,71 @@ type nopMetrics struct{ count int }
 
 func (n *nopMetrics) PortHop() { n.count++ }
 
+// — HopWalk tests —
+
+func TestHopWalkVisitsEveryIndexOncePerRound(t *testing.T) {
+	const count = 20
+	w := portmux.NewHopWalk(count)
+	for round := 0; round < 3; round++ {
+		seen := make(map[int32]bool, count)
+		for i := 0; i < count; i++ {
+			idx := w.Next()
+			if idx < 0 || idx >= count {
+				t.Fatalf("round %d: index %d out of range [0, %d)", round, idx, count)
+			}
+			if seen[idx] {
+				t.Fatalf("round %d: index %d returned twice within one permutation", round, idx)
+			}
+			seen[idx] = true
+		}
+	}
+}
+
+// Note: HopConfig clamps PollInterval to a minimum of 1s and the controller
+// requires a full detect window before triggering, so these tests run on a
+// 1s poll cadence and need multi-second durations.
+
+func TestHopControllerWaitsForFullWindow(t *testing.T) {
+	clientConn, _ := newLoopbackPair(t)
+	defer clientConn.Close()
+
+	serverAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19998}
+	ports := portmux.HopPorts("test", serverAddr.Port, 5)
+	mux := portmux.NewClientPortMux(clientConn, serverAddr, ports)
+	defer mux.Close()
+
+	m := &nopMetrics{}
+	ctrl := portmux.NewHopController(mux, portmux.HopConfig{
+		DetectWindow: 1500 * time.Millisecond, // 2 samples at the clamped 1s poll
+		PollInterval: 100 * time.Millisecond,  // clamped to 1s
+		MinSent:      3,
+		Cooldown:     time.Second,
+		Metrics:      m,
+	})
+	go ctrl.Run(mux.Context())
+
+	send := func(d time.Duration) {
+		deadline := time.Now().Add(d)
+		for time.Now().Before(deadline) {
+			clientConn.SetWriteDeadline(time.Now().Add(time.Millisecond))
+			_, _ = mux.WriteTo([]byte("x"), serverAddr)
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	// A partially filled window must not trigger, no matter how lossy it looks.
+	send(1500 * time.Millisecond)
+	if m.count != 0 {
+		t.Fatalf("hop triggered after one sample with a two-sample detect window")
+	}
+
+	// Once the window is full of zero-receive evidence, the hop fires.
+	send(2500 * time.Millisecond)
+	if m.count == 0 {
+		t.Fatal("no hop after a full window of zero-receive loss")
+	}
+}
+
 func TestHopControllerTriggersOnLoss(t *testing.T) {
 	clientConn, _ := newLoopbackPair(t)
 	defer clientConn.Close()
@@ -247,8 +312,9 @@ func TestHopControllerTriggersOnLoss(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// Wait for the detect window plus a couple of poll intervals.
-	time.Sleep(800 * time.Millisecond)
+	// Wait for the two-sample detect window to fill at the clamped 1s poll
+	// cadence, plus margin.
+	time.Sleep(2600 * time.Millisecond)
 
 	if m.count == 0 {
 		t.Error("HopController did not trigger a hop despite sustained zero-receive loss")
@@ -296,7 +362,10 @@ func TestHopControllerNoHopWhenReceiving(t *testing.T) {
 	}()
 
 	buf := make([]byte, 8)
-	for i := 0; i < 20; i++ {
+	// Keep the path busy well past the two-sample detect window (1s clamped
+	// polls), so the receive guard is what actually suppresses the hop.
+	deadline := time.Now().Add(2600 * time.Millisecond)
+	for time.Now().Before(deadline) {
 		_, _ = mux.WriteTo([]byte("x"), serverAddr)
 		clientConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		_, _, _ = mux.ReadFrom(buf)

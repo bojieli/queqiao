@@ -21,6 +21,7 @@ import (
 	"github.com/bojieli/queqiao/internal/limiter"
 	"github.com/bojieli/queqiao/internal/memlimit"
 	"github.com/bojieli/queqiao/internal/metrics"
+	"github.com/bojieli/queqiao/internal/portmux"
 	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
@@ -220,6 +221,10 @@ type Client struct {
 	// transientUDPLogNS rate-limits an otherwise synchronized burst of local
 	// route errors while still counting every suppressed send in metrics.
 	transientUDPLogNS atomic.Int64
+	// hopWalk is the client-wide hop port selection state, built lazily on
+	// the first hop-enabled dial so all dials share one walk.
+	hopWalkOnce sync.Once
+	hopWalk     *portmux.HopWalk
 	// openFlowForTest stands in for one flow-open attempt, so the retry policy
 	// can be tested without a network that loses things on demand.
 	openFlowForTest func() (*openedFlow, error)
@@ -1129,14 +1134,19 @@ const transientUDPSendLogInterval = 5 * time.Second
 
 // hopDialConfig builds the port-hopping configuration for this client's QUIC
 // dials from ClientConfig. A zero HopPortCount returns a zero hopDialConfig,
-// which disables port hopping in dialQUICConnection.
+// which disables port hopping in dialQUICConnection. All dials share one
+// HopWalk so port selection persists across connection attempts.
 func (c *Client) hopDialConfig() hopDialConfig {
 	if c.cfg.HopPortCount < 2 {
 		return hopDialConfig{}
 	}
+	c.hopWalkOnce.Do(func() {
+		c.hopWalk = portmux.NewHopWalk(c.cfg.HopPortCount)
+	})
 	return hopDialConfig{
 		portCount:  c.cfg.HopPortCount,
 		providerID: c.cfg.Credentials.ProviderID,
+		walk:       c.hopWalk,
 		metrics:    c.cfg.Metrics,
 		logger:     c.cfg.Logger,
 	}

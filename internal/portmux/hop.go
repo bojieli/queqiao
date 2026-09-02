@@ -3,8 +3,46 @@ package portmux
 import (
 	"context"
 	"log/slog"
+	"math/rand/v2"
+	"sync"
 	"time"
 )
+
+// HopWalk is the client-wide port-walking state shared by every dial. Each
+// new dial and each reactive hop consumes the next index from a shuffled
+// permutation of the hop port list, so successive dials neither restart on
+// the (typically burned) primary port nor repeat one another, and ports are
+// tried in an order an observer cannot predict from the derivation hash.
+type HopWalk struct {
+	mu    sync.Mutex
+	order []int
+	pos   int
+}
+
+// NewHopWalk returns a walk over the port-list indices [0, count) in a
+// freshly shuffled order.
+func NewHopWalk(count int) *HopWalk {
+	order := make([]int, count)
+	for i := range order {
+		order[i] = i
+	}
+	rand.Shuffle(count, func(i, j int) { order[i], order[j] = order[j], order[i] })
+	return &HopWalk{order: order}
+}
+
+// Next returns the next port-list index to try, reshuffling whenever the
+// current permutation is exhausted so no long-term order is observable.
+func (w *HopWalk) Next() int32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.pos >= len(w.order) {
+		rand.Shuffle(len(w.order), func(i, j int) { w.order[i], w.order[j] = w.order[j], w.order[i] })
+		w.pos = 0
+	}
+	idx := w.order[w.pos]
+	w.pos++
+	return int32(idx)
+}
 
 // HopMetrics is the narrow interface the HopController needs from the metrics
 // registry. Using an interface avoids a direct import of the metrics package
@@ -16,21 +54,27 @@ type HopMetrics interface {
 // HopConfig controls the loss-detection and cooldown behaviour.
 type HopConfig struct {
 	// DetectWindow is how long a zero-receive window must persist before a
-	// hop is triggered. Default 10 s. The GFW blocking window is measured at
-	// 10+ minutes, so any value from 5–15 s balances false-positive risk
-	// (congestion) against detection latency.
+	// hop is triggered. Default 4 s: short enough that a 10 s dial timeout
+	// still allows several hops per dial, long enough that a slow but
+	// working path (which keeps receiving) never trips it.
 	DetectWindow time.Duration
 	// MinSent is the minimum number of packets that must have been sent in the
 	// detect window before loss is considered actionable. A quiet connection
 	// should not hop just because it sent nothing and received nothing.
 	MinSent uint64
-	// Cooldown is the minimum interval between successive hops. Default 15 s.
-	// This prevents thrashing when all ports are blocked.
+	// Cooldown is the minimum interval between successive hops. Default 3 s.
+	// It must stay well below the QUIC dial timeout so one dial can walk
+	// several ports; it also bounds thrash when every port is blocked.
 	Cooldown time.Duration
 	// PollInterval is how often the controller samples the counters.
 	// Default 2 s. Lower values improve detection latency at the cost of
 	// slightly more CPU; values below 1 s are clamped to 1 s.
 	PollInterval time.Duration
+	// Walk selects which port to hop to. It is shared across all dials of a
+	// client so port choices accumulate across connection attempts instead
+	// of restarting at the primary port every dial. Nil installs a private
+	// shuffled walk (used by tests).
+	Walk *HopWalk
 
 	Metrics HopMetrics
 	Logger  *slog.Logger
@@ -39,13 +83,13 @@ type HopConfig struct {
 func (c *HopConfig) resolved() HopConfig {
 	r := *c
 	if r.DetectWindow <= 0 {
-		r.DetectWindow = 10 * time.Second
+		r.DetectWindow = 4 * time.Second
 	}
 	if r.MinSent == 0 {
 		r.MinSent = 5
 	}
 	if r.Cooldown <= 0 {
-		r.Cooldown = 15 * time.Second
+		r.Cooldown = 3 * time.Second
 	}
 	if r.PollInterval <= 0 {
 		r.PollInterval = 2 * time.Second
@@ -70,28 +114,27 @@ func (c *HopConfig) resolved() HopConfig {
 // harmless (the new port shares the same bottleneck) but the guard keeps churn
 // low on paths that are merely slow.
 //
-// Cooldown: successive hops are separated by at least Cooldown. If all ports
-// are exhausted the controller wraps around; the number of ports (typically
-// 100) makes wrap-around negligible.
+// Cooldown: successive hops are separated by at least Cooldown. Ports are
+// chosen from the shared HopWalk (shuffled, persistent across dials), so the
+// pool is walked in random order rather than scanned predictably from the
+// primary port.
 type HopController struct {
 	mux  *ClientPortMux
 	cfg  HopConfig
-	// nextIdx is the next port index to try; wraps modulo len(ports).
-	nextIdx int32
+	walk *HopWalk
 }
 
 // NewHopController creates a controller for mux using cfg.
 func NewHopController(mux *ClientPortMux, cfg HopConfig) *HopController {
 	cfg = cfg.resolved()
-	// Start at index 1 (skip the primary, which is index 0).
-	var startIdx int32
-	if len(mux.ports) > 1 {
-		startIdx = 1
+	walk := cfg.Walk
+	if walk == nil {
+		walk = NewHopWalk(len(mux.ports))
 	}
 	return &HopController{
-		mux:     mux,
-		cfg:     cfg,
-		nextIdx: startIdx,
+		mux:  mux,
+		cfg:  cfg,
+		walk: walk,
 	}
 }
 
@@ -113,6 +156,10 @@ func (h *HopController) Run(ctx context.Context) {
 	}
 	ring := make([]sample, samplesPerWindow)
 	ringPos := 0
+	// filled counts recorded samples up to a full window. Triggering on a
+	// partially filled window hops on as little as one poll interval of
+	// evidence, which made every fresh dial hop almost immediately.
+	filled := 0
 
 	var (
 		lastSend uint64
@@ -141,6 +188,9 @@ func (h *HopController) Run(ctx context.Context) {
 		lastSend = sent
 		lastRecv = recv
 		ringPos = (ringPos + 1) % samplesPerWindow
+		if filled < samplesPerWindow {
+			filled++
+		}
 
 		// Sum the entire window.
 		var windowSent, windowRecv uint64
@@ -149,8 +199,9 @@ func (h *HopController) Run(ctx context.Context) {
 			windowRecv += s.recv
 		}
 
-		// Trigger condition: we are actively sending but receiving nothing.
-		if windowSent < cfg.MinSent || windowRecv > 0 {
+		// Trigger condition: a full window of actively sending but receiving
+		// nothing.
+		if filled < samplesPerWindow || windowSent < cfg.MinSent || windowRecv > 0 {
 			continue
 		}
 
@@ -160,17 +211,15 @@ func (h *HopController) Run(ctx context.Context) {
 			continue
 		}
 
-		// Choose the next port index, wrapping around the list.
-		ports := h.mux.ports
-		if len(ports) <= 1 {
+		if len(h.mux.ports) <= 1 {
 			continue // no alternative ports
 		}
-		// Advance to the next index, skipping the current one.
-		idx := h.nextIdx
-		if idx >= int32(len(ports)) {
-			idx = 1 // wrap, skipping primary at index 0
+		// Draw until the walk offers a different port: hopping "to" the port
+		// already in use wastes a cooldown on no change.
+		idx := h.walk.Next()
+		for idx == h.mux.CurrentIndex() {
+			idx = h.walk.Next()
 		}
-		h.nextIdx = idx + 1
 
 		fromPort, toPort := h.mux.Hop(idx)
 		lastHop = now
@@ -179,6 +228,7 @@ func (h *HopController) Run(ctx context.Context) {
 		for i := range ring {
 			ring[i] = sample{}
 		}
+		filled = 0
 
 		if cfg.Metrics != nil {
 			cfg.Metrics.PortHop()

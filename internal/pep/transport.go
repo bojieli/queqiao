@@ -104,8 +104,12 @@ type udpHealth struct {
 type hopDialConfig struct {
 	portCount  int    // 0 or 1 = disabled; ≥2 = enabled
 	providerID string // for deterministic HopPorts derivation
-	metrics    *metrics.Registry
-	logger     *slog.Logger
+	// walk is the client-wide port selection state, shared by all dials so
+	// each attempt continues where the previous one left off instead of
+	// restarting on the primary port.
+	walk    *portmux.HopWalk
+	metrics *metrics.Registry
+	logger  *slog.Logger
 }
 
 // quicPathEvidence is deliberately narrower than "a QUIC operation ended".
@@ -761,7 +765,18 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 		rawUDP := packetConn.(*net.UDPConn)
 		ports := portmux.HopPorts(hop.providerID, remoteAddr.Port, hop.portCount)
 		mux := portmux.NewClientPortMux(rawUDP, remoteAddr, ports)
+		if hop.walk != nil {
+			// Start the dial on the next walked port rather than the
+			// primary: the primary is the port a blocker watches, and
+			// restarting there every dial strands the pool's other ports.
+			idx := hop.walk.Next()
+			from, to := mux.Hop(idx)
+			if hop.logger != nil {
+				hop.logger.Debug("QUIC dial starting on walked hop port", "from_port", from, "to_port", to)
+			}
+		}
 		ctrl := portmux.NewHopController(mux, portmux.HopConfig{
+			Walk:    hop.walk,
 			Metrics: hop.metrics,
 			Logger:  hop.logger,
 		})

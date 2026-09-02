@@ -24,12 +24,8 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
-
-// muxOOBSize is enough room for ECN / DSCP ancillary data on all platforms.
-const muxOOBSize = 128
 
 // HopPorts derives a reproducible, collision-free set of count UDP ports for
 // the given provider and primary port. The primary port is always first;
@@ -77,9 +73,18 @@ func HopPorts(providerID string, primaryPort, count int) []int {
 }
 
 // ClientPortMux wraps a single UDP socket with bidirectional port rewriting so
-// that port hops are invisible to quic-go. It implements net.PacketConn,
-// quic.OOBCapablePacketConn, and net.Conn so it composes cleanly with the
-// existing tolerateTransientRouteErrors wrapper.
+// that port hops are invisible to quic-go. It implements net.PacketConn and
+// net.Conn so it composes cleanly with the existing tolerateTransientRouteErrors
+// wrapper.
+//
+// It deliberately does NOT implement quic.OOBCapablePacketConn. quic-go binds
+// OOB-capable conns with ipv4.NewPacketConn and reads them with recvmmsg
+// directly on the raw file descriptor, bypassing ReadMsgUDP: hop-port source
+// addresses would never be normalised back to the primary port, the
+// send/receive counters would never move, and the HopController would fire on
+// phantom zero-receive. The plain ReadFrom/WriteTo path keeps the rewriting
+// and counters exact, at the cost of ECN/GSO/batched I/O on hop-enabled
+// sockets — a fair trade on the hostile paths hopping exists for.
 //
 // Thread safety: all exported methods are safe for concurrent use. Hop() is
 // the only writer of currentIdx and is called at most once per cooldown
@@ -130,6 +135,11 @@ func (m *ClientPortMux) PrimaryAddr() *net.UDPAddr { return m.primaryAddr }
 // CurrentPort returns the currently active hop port.
 func (m *ClientPortMux) CurrentPort() int {
 	return m.ports[m.currentIdx.Load()]
+}
+
+// CurrentIndex returns the port-list index the mux is currently sending to.
+func (m *ClientPortMux) CurrentIndex() int32 {
+	return m.currentIdx.Load()
 }
 
 // Hop atomically switches to ports[idx], returning the old and new ports.
@@ -212,41 +222,14 @@ func (m *ClientPortMux) SetWriteDeadline(t time.Time) error {
 	return m.conn.SetWriteDeadline(t)
 }
 
-// — net.Conn (required by transientRouteOOBPacketConn's type assertion) —
+// — net.Conn (required by transientRoutePacketConn's type assertion) —
 
 func (m *ClientPortMux) Read(b []byte) (int, error)  { return m.conn.Read(b) }
 func (m *ClientPortMux) Write(b []byte) (int, error) { return m.conn.Write(b) }
 func (m *ClientPortMux) RemoteAddr() net.Addr        { return m.primaryAddr }
 
-// — quic.OOBCapablePacketConn (preserves ECN / GSO fast path) —
-
-func (m *ClientPortMux) SyscallConn() (syscall.RawConn, error) {
-	return m.conn.SyscallConn()
-}
-
 func (m *ClientPortMux) SetReadBuffer(bytes int) error {
 	return m.conn.SetReadBuffer(bytes)
-}
-
-func (m *ClientPortMux) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error) {
-	n, oobn, flags, addr, err = m.conn.ReadMsgUDP(b, oob)
-	if err == nil {
-		m.recvCount.Add(1)
-		addr = m.normSrc(addr)
-	}
-	return n, oobn, flags, addr, err
-}
-
-func (m *ClientPortMux) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
-	m.sendCount.Add(1)
-	target := addr
-	if addr != nil {
-		hopPort := m.ports[m.currentIdx.Load()]
-		if addr.Port == m.primaryAddr.Port && hopPort != m.primaryAddr.Port {
-			target = &net.UDPAddr{IP: addr.IP, Port: hopPort, Zone: addr.Zone}
-		}
-	}
-	return m.conn.WriteMsgUDP(b, oob, target)
 }
 
 // — ServerPortMux —
@@ -254,17 +237,21 @@ func (m *ClientPortMux) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn i
 // serverPacket carries one UDP datagram received by any of the server's
 // listening sockets.
 type serverPacket struct {
-	data  []byte
-	oob   []byte // ECN / ancillary data; empty for non-primary sockets
-	flags int
-	src   *net.UDPAddr
-	conn  *net.UDPConn // socket the datagram arrived on
+	data []byte
+	src  *net.UDPAddr
+	conn *net.UDPConn // socket the datagram arrived on
 }
 
 // ServerPortMux listens on N UDP ports simultaneously and presents them as a
 // single net.PacketConn to quic.Listen. It remembers which socket each client
 // address most recently used and routes responses back through that socket so
 // the client's address-rewriting stays consistent.
+//
+// Like ClientPortMux it deliberately does NOT implement
+// quic.OOBCapablePacketConn: quic-go would read the primary socket directly
+// with recvmmsg, racing this mux's reader goroutines for primary packets and
+// never touching the merged queue the hop-port sockets feed. Every packet the
+// listener processes must come through ReadFrom.
 //
 // Thread safety: all exported methods are safe for concurrent use.
 type ServerPortMux struct {
@@ -313,47 +300,19 @@ func NewServerPortMux(primary *net.UDPConn, ports []int) (*ServerPortMux, error)
 	}
 
 	m.wg.Add(1)
-	go m.readPrimary()
+	go m.readSocket(m.primary)
 	for _, sec := range secondaries {
 		m.wg.Add(1)
-		go m.readSecondary(sec)
+		go m.readSocket(sec)
 	}
 
 	return m, nil
 }
 
-// readPrimary reads from the primary socket using ReadMsgUDP to capture ECN /
-// DSCP ancillary data. Packets are forwarded to the incoming channel together
-// with their OOB data so the upper layer receives full ECN information for
-// primary-socket traffic.
-func (m *ServerPortMux) readPrimary() {
-	defer m.wg.Done()
-	buf := make([]byte, 1500)
-	oob := make([]byte, muxOOBSize)
-	for {
-		n, oobn, flags, src, err := m.primary.ReadMsgUDP(buf, oob)
-		if err != nil {
-			return // socket closed
-		}
-		data := make([]byte, n)
-		copy(data, buf[:n])
-		oobCopy := make([]byte, oobn)
-		copy(oobCopy, oob[:oobn])
-		pkt := serverPacket{data: data, oob: oobCopy, flags: flags, src: src, conn: m.primary}
-		select {
-		case m.incoming <- pkt:
-		case <-m.done:
-			return
-		}
-	}
-}
-
-// readSecondary reads from a secondary socket using ReadFrom. OOB data is not
-// captured on secondary sockets, so ECN is not propagated for packets that
-// arrive on a hop port. This is an acceptable trade-off: secondary sockets
-// are used only after the client has hopped away from the primary port, and
-// the server's ECN feedback is less critical than correctness of routing.
-func (m *ServerPortMux) readSecondary(conn *net.UDPConn) {
+// readSocket copies datagrams from one listening socket into the merged
+// incoming queue, tagging each with the socket it arrived on so replies can
+// take the same path back.
+func (m *ServerPortMux) readSocket(conn *net.UDPConn) {
 	defer m.wg.Done()
 	buf := make([]byte, 1500)
 	for {
@@ -385,15 +344,20 @@ func (m *ServerPortMux) pickConn(addr *net.UDPAddr) *net.UDPConn {
 // — net.PacketConn —
 
 // ReadFrom returns the next datagram from the merged receive queue and updates
-// the routing table so responses go back through the correct socket.
+// the routing table so responses go back through the correct socket. Closing
+// the mux unblocks it, since quic-go's read loop parks here.
 func (m *ServerPortMux) ReadFrom(b []byte) (int, net.Addr, error) {
-	pkt, ok := <-m.incoming
-	if !ok {
+	select {
+	case pkt, ok := <-m.incoming:
+		if !ok {
+			return 0, nil, net.ErrClosed
+		}
+		n := copy(b, pkt.data)
+		m.routes.Store(pkt.src.String(), pkt.conn)
+		return n, pkt.src, nil
+	case <-m.done:
 		return 0, nil, net.ErrClosed
 	}
-	n := copy(b, pkt.data)
-	m.routes.Store(pkt.src.String(), pkt.conn)
-	return n, pkt.src, nil
 }
 
 func (m *ServerPortMux) WriteTo(b []byte, addr net.Addr) (int, error) {
@@ -459,42 +423,6 @@ func (m *ServerPortMux) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// — quic.OOBCapablePacketConn (preserves ECN on primary-socket traffic) —
-
-// SyscallConn returns the primary socket's RawConn so quic.Listen can apply
-// socket options such as IP_RECVTOS. Options applied here affect only the
-// primary socket; secondary sockets are created with default options which is
-// acceptable given their role as fallback paths.
-func (m *ServerPortMux) SyscallConn() (syscall.RawConn, error) {
-	return m.primary.SyscallConn()
-}
-
 func (m *ServerPortMux) SetReadBuffer(bytes int) error {
 	return m.primary.SetReadBuffer(bytes)
 }
-
-// ReadMsgUDP returns the next datagram from the merged queue, including any
-// ECN / ancillary data captured from the primary socket. Datagrams from
-// secondary sockets return empty OOB.
-func (m *ServerPortMux) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error) {
-	pkt, ok := <-m.incoming
-	if !ok {
-		return 0, 0, 0, nil, net.ErrClosed
-	}
-	n = copy(b, pkt.data)
-	oobn = copy(oob, pkt.oob)
-	flags = pkt.flags
-	addr = pkt.src
-	m.routes.Store(pkt.src.String(), pkt.conn)
-	return n, oobn, flags, addr, nil
-}
-
-func (m *ServerPortMux) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
-	return m.pickConn(addr).WriteMsgUDP(b, oob, addr)
-}
-
-// net.Conn shim for transientRouteOOBPacketConn compatibility.
-
-func (m *ServerPortMux) Read(b []byte) (int, error) { return m.primary.Read(b) }
-func (m *ServerPortMux) Write(b []byte) (int, error) { return m.primary.Write(b) }
-func (m *ServerPortMux) RemoteAddr() net.Addr        { return nil }
