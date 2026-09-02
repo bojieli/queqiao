@@ -62,14 +62,14 @@ func (c *Client) currentUplink() string {
 // belongs to the network which disappeared.
 func (c *Client) currentUplinkState() (address string, unavailable bool) {
 	if c.cfg.LocalAddress != "" {
-		ip, err := resolveLocalAddress(c.cfg.LocalAddress)
+		result, err := netbind.ResolveWithInterface(c.cfg.LocalAddress)
 		if err != nil {
 			// A literal address is immutable, while if:NAME and auto are resolved
 			// from live interface state. Failure of the latter is positive
 			// evidence that the bound uplink is currently unavailable.
 			return "", netbind.IsDynamic(c.cfg.LocalAddress)
 		}
-		return ip.String(), false
+		return result.Addr.String(), false
 	}
 	conn, err := (&net.Dialer{Control: c.cfg.SocketControl}).Dial("udp", c.cfg.RemoteAddr)
 	if err != nil {

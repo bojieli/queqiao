@@ -42,17 +42,42 @@ func IsDynamic(spec string) bool {
 	return spec == "auto" || strings.HasPrefix(spec, "if:")
 }
 
+// ResolveResult is the outcome of resolving a local-address spec.
+type ResolveResult struct {
+	Addr netip.Addr
+	// InterfaceName is the name of the physical interface the address belongs
+	// to. It is set for "if:NAME" and "auto" specs, and empty for a literal IP
+	// (where the interface is inferred from routing, not specified by the
+	// operator). Callers can pass this name to InterfaceControl to assert the
+	// OS-level interface binding (IP_BOUND_IF / IPV6_BOUND_IF) that makes
+	// NEAppProxyFlow.isBound true in macOS Network Extensions.
+	InterfaceName string
+}
+
+// ResolveWithInterface is like Resolve but also returns the interface name.
+func ResolveWithInterface(spec string) (ResolveResult, error) {
+	addr, ifName, err := resolve(spec)
+	return ResolveResult{Addr: addr, InterfaceName: ifName}, err
+}
+
 // Resolve returns the address selected by a literal IP, "if:NAME", or
 // "auto". Automatic and interface modes deliberately consider only IPv4
 // addresses on active, non-loopback, non-point-to-point interfaces. Excluding
 // point-to-point interfaces prevents a Clash or other host TUN from being
 // selected as the outer path. Ambiguity is reported instead of guessing.
 func Resolve(spec string) (netip.Addr, error) {
+	addr, _, err := resolve(spec)
+	return addr, err
+}
+
+func resolve(spec string) (netip.Addr, string, error) {
 	if err := Validate(spec); err != nil {
-		return netip.Addr{}, err
+		return netip.Addr{}, "", err
 	}
 	if spec != "" && !IsDynamic(spec) {
-		return netip.ParseAddr(spec)
+		// Literal IP: interface is inferred from routing, not declared.
+		addr, err := netip.ParseAddr(spec)
+		return addr, "", err
 	}
 
 	wantedInterface := ""
@@ -61,7 +86,7 @@ func Resolve(spec string) (netip.Addr, error) {
 	}
 	interfaces, err := net.Interfaces()
 	if err != nil {
-		return netip.Addr{}, fmt.Errorf("enumerate local interfaces: %w", err)
+		return netip.Addr{}, "", fmt.Errorf("enumerate local interfaces: %w", err)
 	}
 	candidates := make([]candidate, 0, 2)
 	for _, iface := range interfaces {
@@ -89,9 +114,9 @@ func Resolve(spec string) (netip.Addr, error) {
 	}
 	if len(candidates) == 0 {
 		if wantedInterface != "" {
-			return netip.Addr{}, fmt.Errorf("interface %q has no active IPv4 address; check its name and network connection", wantedInterface)
+			return netip.Addr{}, "", fmt.Errorf("interface %q has no active IPv4 address; check its name and network connection", wantedInterface)
 		}
-		return netip.Addr{}, errors.New("no active physical IPv4 address found; use --local-address with an interface name or IP address")
+		return netip.Addr{}, "", errors.New("no active physical IPv4 address found; use --local-address with an interface name or IP address")
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].interfaceName != candidates[j].interfaceName {
@@ -102,8 +127,8 @@ func Resolve(spec string) (netip.Addr, error) {
 	first := candidates[0]
 	for _, other := range candidates[1:] {
 		if other.address != first.address {
-			return netip.Addr{}, fmt.Errorf("more than one physical IPv4 address is active (%s on %s and %s on %s); choose one with --local-address if:NAME", first.address, first.interfaceName, other.address, other.interfaceName)
+			return netip.Addr{}, "", fmt.Errorf("more than one physical IPv4 address is active (%s on %s and %s on %s); choose one with --local-address if:NAME", first.address, first.interfaceName, other.address, other.interfaceName)
 		}
 	}
-	return first.address, nil
+	return first.address, first.interfaceName, nil
 }

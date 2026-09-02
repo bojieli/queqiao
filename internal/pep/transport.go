@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
 	"strings"
 	"sync"
 	"syscall"
@@ -398,19 +397,21 @@ func tlsClientConfig(credentials identity.ClientCredentials) (*tls.Config, error
 
 func dialTCP(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error) (streamConn, error) {
 	var localAddr net.Addr
+	composed := control
 	if localAddress != "" {
-		ip, err := resolveLocalAddress(localAddress)
+		result, err := netbind.ResolveWithInterface(localAddress)
 		if err != nil {
 			return nil, err
 		}
-		localAddr = &net.TCPAddr{IP: ip.AsSlice()}
+		localAddr = &net.TCPAddr{IP: result.Addr.AsSlice()}
+		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
 	}
 	tlsConfig, err := tlsClientConfig(credentials)
 	if err != nil {
 		return nil, err
 	}
 	conn, err := (&tls.Dialer{
-		NetDialer: &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second, LocalAddr: localAddr, Control: control},
+		NetDialer: &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second, LocalAddr: localAddr, Control: composed},
 		Config:    tlsConfig,
 	}).DialContext(ctx, "tcp", remote)
 	if err != nil {
@@ -717,18 +718,20 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 		return nil, nil, err
 	}
 	listenAddress := ":0"
+	composed := control
 	if localAddress != "" {
-		ip, parseErr := resolveLocalAddress(localAddress)
+		result, parseErr := netbind.ResolveWithInterface(localAddress)
 		if parseErr != nil {
 			return nil, nil, parseErr
 		}
-		listenAddress = net.JoinHostPort(ip.String(), "0")
+		listenAddress = net.JoinHostPort(result.Addr.String(), "0")
+		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
 	}
 	remoteAddr, err := net.ResolveUDPAddr("udp", remote)
 	if err != nil {
 		return nil, nil, err
 	}
-	packetConn, err := (&net.ListenConfig{Control: control}).ListenPacket(dialCtx, "udp", listenAddress)
+	packetConn, err := (&net.ListenConfig{Control: composed}).ListenPacket(dialCtx, "udp", listenAddress)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -751,19 +754,27 @@ func explainDataHandshakeError(remote, transport string, err error) error {
 // validateLocalAddressSpec checks syntax without requiring the address or
 // interface to be present at process startup. DHCP and interface state can
 // change after startup; resolution is therefore repeated for every outer
-// dial by resolveLocalAddress.
+// dial by netbind.ResolveWithInterface.
 func validateLocalAddressSpec(spec string) error {
 	return netbind.Validate(spec)
 }
 
-// resolveLocalAddress supports a literal IP, `if:NAME`, or `auto`. Interface
-// and automatic modes deliberately consider only IPv4 addresses on active,
-// non-loopback, non-point-to-point interfaces: the fixed deployment endpoint
-// is IPv4, and excluding point-to-point links prevents selecting the Clash
-// TUN itself. Ambiguity is an error rather than silently routing the optimizer
-// through an unintended NIC.
-func resolveLocalAddress(spec string) (netip.Addr, error) {
-	return netbind.Resolve(spec)
+// composeSocketControls returns a control function that calls a then b. Either
+// may be nil; if both are nil the result is nil. The first non-nil error aborts
+// the chain.
+func composeSocketControls(a, b func(string, string, syscall.RawConn) error) func(string, string, syscall.RawConn) error {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return func(network, address string, conn syscall.RawConn) error {
+		if err := a(network, address, conn); err != nil {
+			return err
+		}
+		return b(network, address, conn)
+	}
 }
 
 func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestion.TelemetryProvider {
