@@ -100,8 +100,12 @@ func TestClientPortMuxRewritesOnWrite(t *testing.T) {
 	defer server.Close()
 
 	serverAddr := server.LocalAddr().(*net.UDPAddr)
-	// Build a 3-port list; ports[1] is a fake "second" port.
+	// Build a 2-port list; ports[1] is a fake "second" port. Stay inside the
+	// valid port range no matter which ephemeral port the OS assigned.
 	altPort := serverAddr.Port + 100
+	if altPort > 65535 {
+		altPort = serverAddr.Port - 100
+	}
 	ports := []int{serverAddr.Port, altPort}
 
 	mux := portmux.NewClientPortMux(client, serverAddr, ports)

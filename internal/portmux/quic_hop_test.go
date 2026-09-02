@@ -51,7 +51,7 @@ func serveQUICEcho(t *testing.T, conn net.PacketConn, tlsCfg *tls.Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { listener.Close() })
+	t.Cleanup(func() { _ = conn.Close(); _ = listener.Close() })
 	go func() {
 		for {
 			quicConn, err := listener.Accept(context.Background())
