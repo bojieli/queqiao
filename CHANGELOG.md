@@ -10,6 +10,44 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.5.1 - 2026-09-02
+
+### Changed
+
+- When `--local-address if:NAME` or `--local-address auto` is used, the outer
+  UDP and TCP sockets now call `IP_BOUND_IF` (IPv4) and `IPV6_BOUND_IF` (IPv6)
+  in addition to binding to the resolved IP address. This sets the kernel
+  `INP_BOUND_IF` flag, which is what `NEAppProxyFlow.isBound` reflects in the
+  macOS Network Extension API.
+
+  The practical effect is that transparent proxy software on macOS that honours
+  `isBound` — including Tunless with its default `--capture-bound-flows=false`
+  setting — will now automatically bypass queqiaod's outer transport sockets
+  without any per-process exclusion rule. The outer connection to the upstream
+  gateway routes directly via the named interface as before; the only change is
+  that the intent is now declared at the OS socket level rather than implied by
+  the IP address alone.
+
+  A literal `--local-address 192.0.2.1` is unchanged: the interface is inferred
+  from routing, not declared, so `IP_BOUND_IF` is not set.
+
+### Fixed
+
+- The bundled China preset keeps Chinese services direct by name, not only by
+  address, and the registry set is refreshed to APNIC serial 88964. The address
+  set records where a block was delegated, which is not where it is used, so a
+  Chinese service answering from a CDN in space delegated elsewhere never
+  matched GEOIP,CN and took the tunnel while the toggle said direct: ip138.com
+  answers 138.113.x and bilibili.com 148.153.x, and a Chinese resolver returns
+  those same addresses, so nothing was being mis-resolved and no fresher list
+  could have helped. The preset now names the major Chinese services on TLDs
+  that a .cn rule cannot reach, together with the CDN and asset domains they
+  load from, and keeps GEOIP,CN last so the names are reached first. It is a
+  starting point rather than coverage: a geosite-derived list pasted into the
+  rule editor is still the way to be thorough. Refreshing the registry set moved
+  three blocks in ten days, which is the measure of how little staleness was
+  ever the problem.
+
 ## v0.5.0 - 2026-08-28
 
 ### Added
