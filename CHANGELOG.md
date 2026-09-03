@@ -10,6 +10,74 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.6.0 - 2026-09-03
+
+### Added
+
+- `queqiaod segments` profiles a live tunnel and says which segment the loss
+  is on, rather than only how much there is. A slow deployment has three
+  candidates that need three different responses — the client's own access
+  link, the long haul this transport carries, and the gateway's transit
+  onward — and until now every instrument here described the path end to
+  end, so an operator losing a seventh of what crossed the path learned only
+  that they were losing a seventh. The command measures both ends in the
+  same minutes and localises the fault by what the legs share: it reads the
+  running client's own per-direction erasure from `--metrics-listen`, which
+  is the only measurement that separates upstream from downstream, and with
+  `--ssh` it runs the same code on the gateway to measure that end's transit
+  directly instead of inferring it by subtraction. Anchors are chosen per
+  vantage point and never averaged, because a probe from a filtered network
+  to a filtered destination measures the filter: a Chinese and a global
+  anchor are probed from both ends, whichever answers cleanly establishes
+  that end's own link, and an address that answers echo while refusing a
+  handshake is reported as filtering rather than charged to anyone's link. A
+  leg that returns nothing is reported as unanswered, not as total loss.
+
+### Fixed
+
+- Flows stalled on one-way loss now recover in seconds instead of failing
+  after a minute. A lane used to be declared dead only on I/O error — fifteen
+  seconds of total receive silence — so on a path erasing the upstream
+  direction, downstream keepalives kept every connection nominally alive
+  while flows with a full send window made no progress at all. A per-flow
+  stall watchdog now measures forward progress where delivery to the peer is
+  actually recorded (the acknowledged send offset and payload arrival) and,
+  finding none for three minimum round trips while work is pending, demotes
+  the lane and starts a rescue beside it: the suspected lane keeps receiving
+  and is fully eligible again the moment an acknowledgement arrives on it.
+  The rescue dials up to three concurrent JOIN attempts sprayed uniformly
+  across the hop-port pool — or across independent handshakes on the single
+  port when hopping is off — and the first completed JOIN wins. The gateway
+  protects a freshly admitted lane from eviction at its lane ceiling, so the
+  losing JOINs of a parallel rescue can no longer retire the winner's server
+  side; such a late JOIN is refused by capacity instead, which the client
+  treats as one lost attempt rather than a lost session. A gateway that sees
+  a rescue JOIN arrive while a flow is waiting out its replacement grace now
+  restarts that grace instead of letting it expire mid-handshake, and
+  --handshake-timeout no longer overrides the client's safer 30-second
+  default with 10 seconds.
+- Port hopping actually hops now. The client and server port muxes implemented
+  quic-go's OOB socket interface, so quic-go bypassed them with recvmmsg on the
+  raw file descriptor: the server never read hop-port sockets at all, and the
+  client never rewrote reply addresses nor counted receives, which also made
+  the loss detector hop on phantom evidence. Both muxes now use the plain
+  packet path they can control. The client also walks the hop pool in a
+  shuffled order that persists across dials — previously every dial restarted
+  on the primary port and could hop only once before the dial timeout, so 98
+  of the 100 configured ports were never tried — and the detector waits for a
+  full measurement window before firing instead of hopping seconds after
+  connect.
+- Rescue races no longer misfire on the peer's lane ceiling. A capacity
+  refusal of the pooled control JOIN is a benign per-attempt outcome — usually
+  a sibling attempt already holds the lane — but it fell through to the
+  fallback paths: an ordinary QUIC join under `--transport quic`, or the AUTO
+  TCP commit, which could hand the flow to TCP while a QUIC sibling won the
+  race. Capacity refusals now end the attempt instead. The TCP fallback
+  metric also moved from commit time to install time, so a TCP commit that
+  loses its race no longer counts as a fallback, and the stall watchdog stays
+  silent while a rescue round is in flight rather than queueing another round
+  behind it.
+
 ## v0.5.1 - 2026-09-02
 
 ### Changed
