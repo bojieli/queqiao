@@ -533,7 +533,11 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.IntVar(&opts.maxSessions, "max-sessions", defaultMaxSessions, "global concurrent-session limit")
 	fs.IntVar(&opts.chunkSize, "chunk-size", 32*1024, "stream data frame size")
 	fs.DurationVar(&opts.dialTimeout, "dial-timeout", 10*time.Second, "dial timeout")
-	fs.DurationVar(&opts.handshakeTimeout, "handshake-timeout", 10*time.Second, "TLS, protocol, and SOCKS handshake timeout")
+	// 30s, matching the default NewClient applies when nothing is configured:
+	// a first handshake on an erasing path takes about five seconds at 42%
+	// loss, and the flag used to silently override the safer library default
+	// with ten, making that first connection a coin flip.
+	fs.DurationVar(&opts.handshakeTimeout, "handshake-timeout", 30*time.Second, "TLS, protocol, and SOCKS handshake timeout")
 	fs.DurationVar(&opts.flowIdleTimeout, "flow-idle-timeout", 30*time.Minute, "flow idle timeout")
 	fs.DurationVar(&opts.flowMaxLifetime, "flow-max-lifetime", 24*time.Hour, "maximum flow lifetime")
 	fs.StringVar(&opts.transport, "transport", string(pep.TransportAuto), "transport: auto, quic, or tcp")
@@ -1073,6 +1077,16 @@ func logPerformanceSnapshot(logger *slog.Logger, s metrics.Snapshot, interval ti
 		slog.Uint64("queqiao_class_transitions_0_total", s.ClassTransitions[0]),
 		slog.Uint64("queqiao_class_transitions_1_total", s.ClassTransitions[1]),
 		slog.Uint64("queqiao_class_transitions_2_total", s.ClassTransitions[2]),
+		// The stall watchdog and its parallel rescue. rescue wins are flat,
+		// one per attempt slot, matching the labelled /metrics series; a win
+		// above slot zero is a sprayed dial beating the established strategy.
+		slog.Uint64("queqiao_flow_stalls_detected_total", s.FlowStallsDetected),
+		slog.Uint64("queqiao_stall_spare_attaches_total", s.StallSpareAttaches),
+		slog.Uint64("queqiao_lane_rescue_attempts_total", s.LaneRescueAttempts),
+		slog.Uint64("queqiao_lane_rescue_wins_0_total", s.LaneRescueWins[0]),
+		slog.Uint64("queqiao_lane_rescue_wins_1_total", s.LaneRescueWins[1]),
+		slog.Uint64("queqiao_lane_rescue_wins_2_total", s.LaneRescueWins[2]),
+		slog.Uint64("queqiao_lane_grace_extensions_total", s.LaneGraceExtensions),
 	)
 }
 

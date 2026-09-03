@@ -129,6 +129,47 @@ func TestReplayAndIsolationCountersAreExported(t *testing.T) {
 	}
 }
 
+// The stall-watchdog and parallel-rescue counters are exported both in the
+// snapshot and on /metrics, with the winning attempt as a bounded label.
+func TestStallAndRescueCountersAreExported(t *testing.T) {
+	registry := New()
+	registry.FlowStallDetected()
+	registry.StallSpareAttached()
+	registry.LaneRescueAttempt()
+	registry.LaneRescueAttempt()
+	registry.LaneRescueAttempt()
+	registry.LaneRescueWin(2)
+	registry.LaneRescueWin(-1)
+	registry.LaneRescueWin(RescueAttemptSlots)
+	registry.LaneGraceExtended()
+
+	got := registry.Snapshot()
+	if got.FlowStallsDetected != 1 || got.StallSpareAttaches != 1 || got.LaneGraceExtensions != 1 {
+		t.Fatalf("unexpected stall snapshot: %+v", got)
+	}
+	if got.LaneRescueAttempts != 3 {
+		t.Fatalf("rescue attempts = %d, want 3", got.LaneRescueAttempts)
+	}
+	if got.LaneRescueWins != [RescueAttemptSlots]uint64{0, 0, 1} {
+		t.Fatalf("rescue wins = %v, want only attempt 2", got.LaneRescueWins)
+	}
+
+	recorder := httptest.NewRecorder()
+	registry.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"queqiao_flow_stalls_detected_total 1",
+		"queqiao_stall_spare_attaches_total 1",
+		"queqiao_lane_rescue_attempts_total 3",
+		"queqiao_lane_rescue_wins_total{attempt=\"2\"} 1",
+		"queqiao_lane_grace_extensions_total 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics output is missing %q", want)
+		}
+	}
+}
+
 // Releasing more than was acquired must not drive the gauge negative, or the
 // endpoint budget would appear to have capacity it does not have.
 func TestReplayBytesGaugeCannotGoNegative(t *testing.T) {
