@@ -116,7 +116,19 @@ Prometheus `/metrics` names. They cover:
 - transient local UDP send errors absorbed into QUIC loss recovery;
 - flow telemetry entries expired because nothing refreshed them, which is how
   a round-trip aggregate frozen at a stale constant announces itself;
-- lane joins refused and account flow opens refused, each split by reason; and
+- lane joins refused and account flow opens refused, each split by reason;
+- the flow-stall watchdog and its parallel rescue:
+  `queqiao_flow_stalls_detected_total` counts stall episodes (work pending
+  with no forward progress for three minimum round trips),
+  `queqiao_stall_spare_attaches_total` counts stalls where an already-healthy
+  lane took over at once, `queqiao_lane_rescue_attempts_total` counts
+  individual dial+JOIN attempts and
+  `queqiao_lane_rescue_wins_total{attempt="N"}` which attempt of a round
+  produced the lane the flow kept -- a win above zero is an independent QUIC
+  dial beating the established strategy, and
+  `queqiao_lane_grace_extensions_total` counts replacement graces a gateway
+  restarted because a rescue JOIN arrived while the flow was still waiting;
+  and
 - the erasure the path is measured to be applying to the direction this
   endpoint sends into, published as `queqiao_erasure_ratio{direction="send"}`
   and as `queqiao_erasure_ratio_send` in the log. A gateway's send direction is

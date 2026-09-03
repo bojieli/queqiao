@@ -176,6 +176,11 @@ func TestServerReplacesALaneWithTheSameRole(t *testing.T) {
 	if err := session.addLane(bulk); err != nil {
 		t.Fatal(err)
 	}
+	// Eviction exists for lanes whose peer has already moved on, so the
+	// victims here must be older than the protection window: a freshly
+	// admitted lane is never retired to make room.
+	control.admitted = time.Now().Add(-2 * laneDeadPathDetection)
+	bulk.admitted = time.Now().Add(-2 * laneDeadPathDetection)
 
 	bulkReplacement := isolationLane(t, 2)
 	if err := session.addLane(bulkReplacement); err != nil {
@@ -192,6 +197,43 @@ func TestServerReplacesALaneWithTheSameRole(t *testing.T) {
 	}
 	if !control.closed.Load() || bulkReplacement.closed.Load() {
 		t.Fatalf("control replacement retired old-control=%t bulk=%t, want true/false", control.closed.Load(), bulkReplacement.closed.Load())
+	}
+}
+
+// Parallel rescue JOINs race one another to the gateway, which admits in
+// arrival order while the peer crowns the first finisher. A freshly admitted
+// lane must therefore be protected from eviction at the lane ceiling:
+// without the protection, a losing JOIN admitted moments after the winner
+// retires the winner's server side before its own close lands, and the
+// "rescue" leaves the flow with no lane at all.
+func TestFreshlyAdmittedLaneIsProtectedFromEviction(t *testing.T) {
+	flow := newIsolationTestFlow(t, true)
+	session := newServerFlow(flow, identity.Principal{}, TransportQUIC, 1)
+	control := isolationLane(t, 0)
+	control.control = true
+	bulk := isolationLane(t, 1)
+	if err := session.addLane(control); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.addLane(bulk); err != nil {
+		t.Fatal(err)
+	}
+
+	racing := isolationLane(t, 2)
+	if err := session.addLane(racing); err == nil {
+		t.Fatal("a racing join evicted a freshly admitted lane")
+	}
+	if bulk.closed.Load() {
+		t.Fatal("the freshly admitted lane was retired by the racing join")
+	}
+	// Once the lane is older than the path-detection budget it is the
+	// half-open socket eviction exists for, and the next join takes its slot.
+	bulk.admitted = time.Now().Add(-2 * laneDeadPathDetection)
+	if err := session.addLane(racing); err != nil {
+		t.Fatalf("replacement of an aged lane refused: %v", err)
+	}
+	if !bulk.closed.Load() || racing.closed.Load() {
+		t.Fatalf("aged replacement retired bulk=%t racing=%t, want true/false", bulk.closed.Load(), racing.closed.Load())
 	}
 }
 

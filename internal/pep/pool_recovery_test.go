@@ -135,8 +135,16 @@ func TestPooledFlowsRecoverThroughOneReplacementGeneration(t *testing.T) {
 			if t.Failed() {
 				return
 			}
-			if got := udpSockets.Load(); got != baselineSockets+1 {
-				t.Fatalf("generation recovery opened %d new UDP sockets, want one", got-baselineSockets)
+			if got := udpSockets.Load(); got < baselineSockets+1 {
+				t.Fatalf("generation recovery opened %d new UDP sockets, want at least one", got-baselineSockets)
+			} else if want := baselineSockets + 1 + 2*flowCount; got > want {
+				// The replacement generation dial is still singleflight --
+				// one new socket however many flows wait on it, which is what
+				// the old exact assertion pinned. Each flow's rescue round
+				// now also runs two independent sprayed QUIC dials beside it
+				// (first JOIN wins, the losers are cancelled), so the ceiling
+				// is one coalesced generation dial plus two racers per flow.
+				t.Fatalf("generation recovery opened %d new UDP sockets, want the coalesced dial plus at most two racers per flow (%d)", got-baselineSockets, want-baselineSockets)
 			}
 			snapshot := client.Metrics().Snapshot()
 			if snapshot.LaneReplacements != flowCount {

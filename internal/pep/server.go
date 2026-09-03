@@ -165,8 +165,12 @@ func (s *serverFlow) addLane(lane *mpLane) error {
 		// (for example, when the return path is black-holed). Retire the
 		// oldest lane with the same role as its authenticated replacement.
 		// A bulk replacement must never evict the control lane, and a control
-		// generation replacement must not evict healthy bulk capacity.
-		if !s.flow.retireOldestLane(lane.control) || s.flow.laneCount() >= s.maxLanes {
+		// generation replacement must not evict healthy bulk capacity. A lane
+		// younger than the path-detection budget is protected: several rescue
+		// JOINs racing here must not evict the winner the peer already
+		// crowned, and the half-open lanes eviction exists for are never
+		// that young.
+		if !s.flow.retireOldestLane(lane.control, laneDeadPathDetection) || s.flow.laneCount() >= s.maxLanes {
 			return errors.New("flow lane limit reached")
 		}
 	}
@@ -968,6 +972,16 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 	case !samePrincipal(serverSession.principal, principal):
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinPrincipalMismatch, session.ResetProtocol, "unknown session")
 		return
+	}
+	// A JOIN that gets this far is the peer's rescue, observable while it is
+	// still only a handshake. If the flow is waiting out a lane-replacement
+	// outage, that grace exists to cover exactly this arrival, so it restarts
+	// here rather than expiring underneath the handshake it was waiting for.
+	// The grace is per outage, so a rescue that dials several JOINs in
+	// parallel extends it once per arriving JOIN, each one fresh evidence.
+	if !serverSession.completed.Load() && serverSession.flow.extendReplacementOutage(time.Now(), laneReplacementWait) {
+		s.metrics.LaneGraceExtended()
+		s.cfg.Logger.Debug("lane replacement grace extended by rescue join", "lane", laneID, "flow_id", open.Header.FlowID)
 	}
 	kind := transportKindForConn(conn)
 	controlReplacement := open.Header.Flags&protocol.FlagReserveControl != 0

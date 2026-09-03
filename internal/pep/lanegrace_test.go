@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bojieli/queqiao/internal/identity"
+	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
@@ -312,5 +314,89 @@ func TestAFlowRecordsWhetherAReplacementWasEvenAttempted(t *testing.T) {
 	if got["lane_replacement_attempts"] != uint64(1) || got["lane_replacement_failures"] != uint64(0) {
 		t.Fatalf("an outstanding dial reported attempts=%v failures=%v, want 1 and 0",
 			got["lane_replacement_attempts"], got["lane_replacement_failures"])
+	}
+}
+
+// A rescue JOIN arriving mid-grace is the peer's recovery proving itself
+// alive. The grace restarts from that evidence rather than expiring
+// underneath the handshake it was waiting for; a flow not in an outage has
+// nothing to extend, and a deadline a whole grace in the past is an ended
+// outage's residue, not evidence to build on.
+func TestRescueEvidenceRestartsTheReplacementGrace(t *testing.T) {
+	flow := newGraceTestFlow(t)
+	now := time.Now()
+	if flow.extendReplacementOutage(now, laneReplacementWait) {
+		t.Fatal("a flow not in an outage had its grace extended")
+	}
+	if remaining := flow.replacementBudget(now, laneReplacementWait); remaining != laneReplacementWait {
+		t.Fatalf("opening an outage left %s, want the whole grace", remaining)
+	}
+	before := flow.replacementDeadline.Load()
+	later := now.Add(time.Second)
+	if !flow.extendReplacementOutage(later, laneReplacementWait) {
+		t.Fatal("a live outage refused its extension")
+	}
+	if got, want := flow.replacementDeadline.Load(), later.Add(laneReplacementWait).UnixNano(); got != want {
+		t.Fatalf("extended deadline = %d, want %d", got, want)
+	}
+	if flow.replacementDeadline.Load() <= before {
+		t.Fatal("the extension did not move the deadline forward")
+	}
+	flow.replacementDeadline.Store(now.Add(-2 * laneReplacementWait).UnixNano())
+	if flow.extendReplacementOutage(now, laneReplacementWait) {
+		t.Fatal("a stale deadline was revived by rescue evidence")
+	}
+}
+
+// The gateway observes the rescue at JOIN validation time: a JOIN naming a
+// live session currently waiting out an outage restarts that outage's grace
+// and is counted.
+func TestLaneJoinDuringGraceExtendsTheBudget(t *testing.T) {
+	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "owner"}
+	registry := metrics.New()
+	server := &Server{
+		cfg:      ServerConfig{Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil))},
+		sessions: map[[16]byte]*serverFlow{},
+		metrics:  registry,
+	}
+	flow := newGraceTestFlow(t)
+	server.sessions[flow.sessionID] = newServerFlow(flow, owner, TransportTCP, 1)
+	now := time.Now()
+	if remaining := flow.replacementBudget(now, laneReplacementWait); remaining != laneReplacementWait {
+		t.Fatalf("opening an outage left %s, want the whole grace", remaining)
+	}
+
+	local, remote := net.Pipe()
+	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	request := protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeJoin, SessionID: flow.sessionID,
+		FlowID: flow.flowID, Class: protocol.ClassBulk,
+	}}
+	go server.handleLaneJoinOpen(ctx, local, newFrameConn(local), owner, flow.sessionID, 1, request)
+	response, err := newFrameConn(remote).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Header.Type != protocol.TypeOpenOK {
+		t.Fatalf("response = %d, want OPEN_OK", response.Header.Type)
+	}
+	if got := registry.Snapshot().LaneGraceExtensions; got != 1 {
+		t.Fatalf("grace extensions = %d, want 1", got)
+	}
+	// The deadline itself goes away once the admitted lane is activated,
+	// which is the extension working as intended: what it bought was the time
+	// between this JOIN becoming observable and its admission completing.
+	// Activation trails the acknowledgement by a scheduling beat, so wait
+	// for it.
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		if flow.replacementDeadline.Load() == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the admitted lane never ended the outage")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

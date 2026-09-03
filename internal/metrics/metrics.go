@@ -79,6 +79,30 @@ type Registry struct {
 	// here is the other half of a peer's stalling and failing flows -- the
 	// half the endpoint doing the refusing can see.
 	laneJoinRefusals [LaneJoinReasons]atomic.Uint64
+	// flowStallsDetected counts flows whose watchdog saw no forward progress
+	// for three round trips while work was pending. A stall is a suspicion,
+	// not a failure: the lane stays in service while a rescue runs beside it,
+	// so this counter rising without lane_failures is the watchdog doing the
+	// job the idle timeout used to do fifteen seconds later.
+	flowStallsDetected atomic.Uint64
+	// stallSpareAttaches counts stalls where a second healthy lane already
+	// existed and took over the flow's new writes immediately, without
+	// waiting for a rescue handshake.
+	stallSpareAttaches atomic.Uint64
+	// laneRescueAttempts counts individual dial+JOIN attempts started by the
+	// parallel rescue. One rescue round starts several, so this outpaces
+	// lane_replacements: the difference is what the first-wins race cancelled.
+	laneRescueAttempts atomic.Uint64
+	// laneRescueWins is indexed by the attempt that produced the winning
+	// lane. Attempt zero is the established strategy (pooled generation, or
+	// the committed TCP handoff); the rest are independent QUIC dials. A win
+	// by a later attempt is the parallel rescue paying for itself.
+	laneRescueWins [RescueAttemptSlots]atomic.Uint64
+	// laneGraceExtensions counts replacement graces this gateway restarted
+	// because a rescue JOIN arrived while the flow was still waiting out an
+	// outage. Without the extension the hard grace could expire in the middle
+	// of the very handshake that was coming to save the flow.
+	laneGraceExtensions atomic.Uint64
 	// accountAdmissionRefusals counts flow opens this gateway answered with a
 	// reset because of the opening account's own policy, by reason. It exists
 	// because these refusals used to be the one admission decision the
@@ -138,6 +162,12 @@ const (
 	// LaneJoinReasons is how many reasons there are.
 	LaneJoinReasons
 )
+
+// RescueAttemptSlots is how many concurrent dial+JOIN attempts one parallel
+// rescue round runs. It is a compile-time bound because the winning attempt
+// is an exported label value, and this exposition carries no unbounded
+// labels.
+const RescueAttemptSlots = 3
 
 var laneJoinRefusalNames = [LaneJoinReasons]string{
 	LaneJoinInvalidIdentity:           "invalid_identity",
@@ -313,7 +343,11 @@ type Snapshot struct {
 	// LaneJoinRefusals is indexed by LaneJoinRefusal.
 	LaneJoinRefusals [LaneJoinReasons]uint64
 	// AccountAdmissionRefusals is indexed by AccountRefusal.
-	AccountAdmissionRefusals [AccountRefusalReasons]uint64
+	AccountAdmissionRefusals                [AccountRefusalReasons]uint64
+	FlowStallsDetected, StallSpareAttaches  uint64
+	LaneRescueAttempts, LaneGraceExtensions uint64
+	// LaneRescueWins is indexed by the winning attempt of a rescue round.
+	LaneRescueWins [RescueAttemptSlots]uint64
 }
 
 // QUICObservation is a point-in-time aggregate over the lanes of one logical
@@ -567,6 +601,33 @@ func (r *Registry) CompletionTimeout() { r.completionTimeouts.Add(1) }
 func (r *Registry) FlowTimeout()       { r.flowTimeouts.Add(1) }
 func (r *Registry) PortHop()           { r.portHops.Add(1) }
 
+// FlowStallDetected records one flow stall episode: work was pending and no
+// forward progress was observed for three round trips. It is counted once per
+// episode, not per scan, so a flow that stays stalled is one event.
+func (r *Registry) FlowStallDetected() { r.flowStallsDetected.Add(1) }
+
+// StallSpareAttached records a stall where an already-healthy lane took over
+// the flow's new writes without waiting for a rescue handshake.
+func (r *Registry) StallSpareAttached() { r.stallSpareAttaches.Add(1) }
+
+// LaneRescueAttempt records one dial+JOIN attempt started by the parallel
+// rescue, winning or not.
+func (r *Registry) LaneRescueAttempt() { r.laneRescueAttempts.Add(1) }
+
+// LaneRescueWin records which attempt of a rescue round produced the lane the
+// flow kept. Attempt zero is the established recovery strategy; a later index
+// is an independent QUIC dial that beat it.
+func (r *Registry) LaneRescueWin(attempt int) {
+	if attempt < 0 || attempt >= RescueAttemptSlots {
+		return
+	}
+	r.laneRescueWins[attempt].Add(1)
+}
+
+// LaneGraceExtended records a replacement grace restarted because a rescue
+// JOIN arrived while the flow was waiting out an outage.
+func (r *Registry) LaneGraceExtended() { r.laneGraceExtensions.Add(1) }
+
 // AuthorizationRefreshFailed records one failed attempt to re-read the
 // authorization store, carrying how many have now failed in a row so a chronic
 // outage is distinguishable from a single missed tick.
@@ -671,6 +732,13 @@ func (r *Registry) Snapshot() Snapshot {
 	}
 	for i := range s.AccountAdmissionRefusals {
 		s.AccountAdmissionRefusals[i] = r.accountAdmissionRefusals[i].Load()
+	}
+	s.FlowStallsDetected = r.flowStallsDetected.Load()
+	s.StallSpareAttaches = r.stallSpareAttaches.Load()
+	s.LaneRescueAttempts = r.laneRescueAttempts.Load()
+	s.LaneGraceExtensions = r.laneGraceExtensions.Load()
+	for i := range s.LaneRescueWins {
+		s.LaneRescueWins[i] = r.laneRescueWins[i].Load()
 	}
 	now := r.now()
 	var expired uint64
@@ -938,6 +1006,17 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	for i, value := range s.AccountAdmissionRefusals {
 		fmt.Fprintf(w, "queqiao_account_admission_refused_total{reason=\"%s\"} %d\n", AccountRefusal(i), value)
 	}
+	// Stalls are suspicions, not failures: the suspected lane stays in
+	// service while the rescue runs beside it. rescue_attempts outpaces
+	// rescue wins by what the first-wins race cancelled, and a win by an
+	// attempt above zero is a parallel dial beating the established strategy.
+	fmt.Fprintf(w, "queqiao_flow_stalls_detected_total %d\n", s.FlowStallsDetected)
+	fmt.Fprintf(w, "queqiao_stall_spare_attaches_total %d\n", s.StallSpareAttaches)
+	fmt.Fprintf(w, "queqiao_lane_rescue_attempts_total %d\n", s.LaneRescueAttempts)
+	for i, value := range s.LaneRescueWins {
+		fmt.Fprintf(w, "queqiao_lane_rescue_wins_total{attempt=\"%d\"} %d\n", i, value)
+	}
+	fmt.Fprintf(w, "queqiao_lane_grace_extensions_total %d\n", s.LaneGraceExtensions)
 }
 
 // ReceiveErasure is the share of the peer's source symbols that did not arrive,
