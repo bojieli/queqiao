@@ -382,3 +382,87 @@ func TestHopControllerNoHopWhenReceiving(t *testing.T) {
 	}
 	<-done
 }
+
+// A hop pool is derived from a hash, so a derivation will eventually land on a
+// port the host will not hand out -- Windows carves dynamic exclusion ranges
+// out of the same space and refuses them outright. Losing one of several hop
+// ports has to degrade the pool rather than take the gateway down with it.
+func TestAnUnbindableHopPortIsSkippedRatherThanFatal(t *testing.T) {
+	primary, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hold one hop port ourselves, which is the portable stand-in for a port
+	// the operating system has reserved.
+	blocker, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Close() }()
+	blocked := blocker.LocalAddr().(*net.UDPAddr).Port
+
+	free, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	usable := free.LocalAddr().(*net.UDPAddr).Port
+	_ = free.Close()
+
+	primaryPort := primary.LocalAddr().(*net.UDPAddr).Port
+	mux, err := portmux.NewServerPortMux(primary, []int{primaryPort, blocked, usable})
+	if err != nil {
+		t.Fatalf("one unbindable hop port took the whole mux down: %v", err)
+	}
+	defer func() { _ = mux.Close() }()
+
+	if got := mux.SkippedPorts(); len(got) != 1 || got[0] != blocked {
+		t.Fatalf("skipped ports %v, want exactly [%d]", got, blocked)
+	}
+	// The port that was available still has to be listening, or the pool has
+	// silently collapsed to the primary.
+	probe, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: usable})
+	if err != nil {
+		t.Fatalf("the usable hop port is not listening: %v", err)
+	}
+	_ = probe.Close()
+}
+
+// Losing every hop port is a different condition from losing one: hopping is
+// then not degraded but absent, and an operator who configured it should be
+// told rather than left to infer it from traffic that never evades anything.
+func TestAHopPoolThatBindsNothingIsAnError(t *testing.T) {
+	primary, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = primary.Close() }()
+	blocker, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Close() }()
+	blocked := blocker.LocalAddr().(*net.UDPAddr).Port
+
+	primaryPort := primary.LocalAddr().(*net.UDPAddr).Port
+	if _, err := portmux.NewServerPortMux(primary, []int{primaryPort, blocked}); err == nil {
+		t.Fatal("a pool that bound no hop port at all was accepted")
+	}
+}
+
+// A mux asked for no hop ports at all is not a degraded pool; it is hopping
+// switched off, and it must not be turned into an error by the check above.
+func TestASinglePortPoolIsNotTreatedAsAFailure(t *testing.T) {
+	primary, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	primaryPort := primary.LocalAddr().(*net.UDPAddr).Port
+	mux, err := portmux.NewServerPortMux(primary, []int{primaryPort})
+	if err != nil {
+		t.Fatalf("a single-port pool was rejected: %v", err)
+	}
+	defer func() { _ = mux.Close() }()
+	if len(mux.SkippedPorts()) != 0 {
+		t.Fatalf("skipped %v with nothing to skip", mux.SkippedPorts())
+	}
+}

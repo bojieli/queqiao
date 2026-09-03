@@ -515,9 +515,14 @@ func (s *Server) serveQUIC(ctx context.Context) error {
 		_ = primaryConn.Close()
 		return fmt.Errorf("create server port mux: %w", err)
 	}
+	// A pool narrower than configured is reported rather than inferred: the
+	// deployment still works, but it hops across fewer ports than the operator
+	// asked for, and that is a fact about this host worth having in the log.
 	s.cfg.Logger.Info("port hop listener ready",
 		"primary_addr", primaryConn.LocalAddr(),
-		"hop_port_count", len(ports))
+		"hop_port_count", len(ports)-len(mux.SkippedPorts()),
+		"hop_ports_configured", len(ports),
+		"hop_ports_unavailable", mux.SkippedPorts())
 	return s.ServePacketConn(ctx, mux)
 }
 

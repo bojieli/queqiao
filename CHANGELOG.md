@@ -67,6 +67,18 @@ to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
   of the 100 configured ports were never tried — and the detector waits for a
   full measurement window before firing instead of hopping seconds after
   connect.
+- A gateway with port hopping enabled no longer refuses to start because one
+  hop port is unavailable. The pool is derived from a hash over the provider
+  identity, so a derivation eventually lands on a port the host will not hand
+  out -- Windows carves dynamic exclusion ranges out of the same space and
+  refuses them with a permissions error, Linux has `ip_local_reserved_ports`,
+  and on any host another service may already hold one -- and binding the pool
+  was all-or-nothing, so a single such port took the whole listener down with
+  it. Ports that cannot be bound are now skipped and named in the listener's
+  log, leaving a narrower pool rather than no gateway. A pool that binds no
+  hop port at all is still an error, because hopping is then absent rather
+  than degraded, and an operator who asked for it should not have to infer
+  that from traffic which never evades anything.
 - Rescue races no longer misfire on the peer's lane ceiling. A capacity
   refusal of the pooled control JOIN is a benign per-attempt outcome — usually
   a sibling attempt already holds the lane — but it fell through to the

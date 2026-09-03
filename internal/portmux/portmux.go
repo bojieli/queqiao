@@ -257,6 +257,9 @@ type serverPacket struct {
 type ServerPortMux struct {
 	primary     *net.UDPConn
 	secondaries []*net.UDPConn
+	// skipped records hop ports the host refused, so a degraded pool is
+	// visible in the log rather than silently narrower than configured.
+	skipped []int
 	// incoming is the merged receive queue. It is sized large enough to absorb
 	// bursts across all sockets without a secondary blocking a primary read.
 	incoming  chan serverPacket
@@ -270,6 +273,23 @@ type ServerPortMux struct {
 // primary, starts per-socket reader goroutines, and returns the multiplexed
 // PacketConn. primary must already be bound to ports[0].
 //
+// A hop port that cannot be bound is skipped rather than fatal, and the caller
+// can read which ones with SkippedPorts. The pool is derived from a hash over
+// the provider identity, so it is only a matter of time before a derivation
+// lands on a port the host will not hand out: Windows carves dynamic exclusion
+// ranges out of [1024, 65535) for WinNAT and Hyper-V and refuses them with a
+// permissions error, Linux has ip_local_reserved_ports, and on any host
+// another service may already hold one. Refusing to start a gateway because
+// one of several hop ports is unavailable trades a working deployment for a
+// slightly wider pool, which is the wrong way round -- hopping is best-effort
+// by construction, and a client that hops to a port this server could not bind
+// sees the same silence it sees from a blocked port and hops again.
+//
+// Losing every hop port is different, and still an error. It means hopping is
+// entirely non-functional rather than degraded, which an operator who asked
+// for it needs to be told rather than left to infer from traffic that never
+// evades anything.
+//
 // On error, any successfully opened extra sockets are closed before returning.
 func NewServerPortMux(primary *net.UDPConn, ports []int) (*ServerPortMux, error) {
 	primaryAddr, ok := primary.LocalAddr().(*net.UDPAddr)
@@ -278,16 +298,21 @@ func NewServerPortMux(primary *net.UDPConn, ports []int) (*ServerPortMux, error)
 	}
 
 	secondaries := make([]*net.UDPConn, 0, len(ports)-1)
+	var skipped []int
+	var lastErr error
 	for _, port := range ports[1:] {
 		addr := &net.UDPAddr{IP: primaryAddr.IP, Port: port}
 		conn, err := net.ListenUDP("udp", addr)
 		if err != nil {
-			for _, s := range secondaries {
-				_ = s.Close()
-			}
-			return nil, fmt.Errorf("server portmux: listen on hop port %d: %w", port, err)
+			skipped = append(skipped, port)
+			lastErr = err
+			continue
 		}
 		secondaries = append(secondaries, conn)
+	}
+	if len(ports) > 1 && len(secondaries) == 0 {
+		return nil, fmt.Errorf("server portmux: no hop port could be bound, last error on %d: %w",
+			skipped[len(skipped)-1], lastErr)
 	}
 
 	// Buffer depth: 4096 slots shared across all sockets. At 1500 B/packet
@@ -295,6 +320,7 @@ func NewServerPortMux(primary *net.UDPConn, ports []int) (*ServerPortMux, error)
 	m := &ServerPortMux{
 		primary:     primary,
 		secondaries: secondaries,
+		skipped:     skipped,
 		incoming:    make(chan serverPacket, 4096),
 		done:        make(chan struct{}),
 	}
@@ -308,6 +334,10 @@ func NewServerPortMux(primary *net.UDPConn, ports []int) (*ServerPortMux, error)
 
 	return m, nil
 }
+
+// SkippedPorts returns the hop ports this host would not bind. The caller must
+// not modify it.
+func (m *ServerPortMux) SkippedPorts() []int { return m.skipped }
 
 // readSocket copies datagrams from one listening socket into the merged
 // incoming queue, tagging each with the socket it arrived on so replies can
