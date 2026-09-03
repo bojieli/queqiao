@@ -760,7 +760,14 @@ func TestAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T) {
 		writeErr <- writeErrValue
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
+	// Every healthy lane is examined rather than only the first. healthyLanes
+	// sorts by lane id and the QUIC lane is created first, so the original
+	// lane keeps position zero until it is evicted -- which means a rescue
+	// could be fully installed while a check of lanes[0] still reported a
+	// QUIC lane. That asked whether the rescue happens to sort first, not
+	// whether it happened, and it is why this test failed roughly half the
+	// time on the CI runner while passing everywhere else.
+	deadline := time.Now().Add(20 * time.Second)
 	closedQUIC := false
 	rescuedTCP := false
 	for time.Now().Before(deadline) {
@@ -770,19 +777,26 @@ func TestAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T) {
 			sessionFlow = candidate
 			break
 		}
-		var lane *mpLane
+		var quicLane *mpLane
+		haveTCP := false
 		if sessionFlow != nil {
-			lanes := sessionFlow.flow.healthyLanes()
-			if len(lanes) > 0 {
-				lane = lanes[0]
+			for _, lane := range sessionFlow.flow.healthyLanes() {
+				switch lane.kind {
+				case TransportQUIC:
+					if quicLane == nil {
+						quicLane = lane
+					}
+				case TransportTCP:
+					haveTCP = true
+				}
 			}
 		}
 		server.sessionsMu.RUnlock()
-		if lane != nil && lane.kind == TransportQUIC && !closedQUIC {
-			_ = lane.fc.Close()
+		if quicLane != nil && !closedQUIC {
+			_ = quicLane.fc.Close()
 			closedQUIC = true
 		}
-		if closedQUIC && lane != nil && lane.kind == TransportTCP {
+		if closedQUIC && haveTCP {
 			rescuedTCP = true
 			break
 		}
