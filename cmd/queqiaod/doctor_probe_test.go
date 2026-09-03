@@ -401,3 +401,20 @@ func startSOCKSProxy(t *testing.T) string {
 	}()
 	return ln.Addr().String()
 }
+
+// doctor derives the gateway's hop to a destination by subtracting one
+// measurement from another, and queqiaod segments measures that same leg from
+// the gateway. Two commands answering one question by two methods will
+// disagree, so the derived figure has to say which it is and where the measured
+// one lives -- otherwise an operator reads a subtraction as an observation.
+func TestTheDerivedFarLegNamesTheCommandThatMeasuresIt(t *testing.T) {
+	decomposed := decomposition(destinationProbe{Decomposed: true, GatewayLeg: 197, FarLeg: 14})
+	for _, want := range []string{"subtraction rather than a measurement", "segments --ssh"} {
+		if !strings.Contains(decomposed, want) {
+			t.Fatalf("the decomposition omits %q: %s", want, decomposed)
+		}
+	}
+	if !strings.Contains(decomposition(destinationProbe{}), "segments") {
+		t.Fatalf("an undecomposed report does not point anywhere: %s", decomposition(destinationProbe{}))
+	}
+}

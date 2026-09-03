@@ -4,6 +4,12 @@ Everything in [PATH-CHARACTER-DC-20260826.md](PATH-CHARACTER-DC-20260826.md)
 came from two binaries in this repository. Here's how to re-run it, so the
 numbers can be checked on another path instead of taken on trust.
 
+These two describe a path end to end. To find out *which segment* of a
+deployment a loss belongs to — the client's access link, the long haul, or the
+gateway's own transit — see [which segment is at
+fault](PROFILING-A-TUNNEL.md), which measures both ends in the same minutes and
+localises it.
+
 ## Why there are two tools
 
 `pathprobe` is open-loop. It sends at a rate nothing is allowed to adjust and

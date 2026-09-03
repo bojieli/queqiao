@@ -43,7 +43,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("a command is required: provider, enroll, client, service, server, doctor, logs, or version")
+		return errors.New("a command is required: provider, enroll, client, service, server, doctor, segments, logs, or version")
 	}
 	switch args[0] {
 	case "version", "--version", "-version":
@@ -62,12 +62,14 @@ func run(args []string) error {
 		return runServer(args[1:])
 	case "doctor":
 		return runDoctorCommand(args[1:])
+	case "segments":
+		return runSegmentsCommand(args[1:])
 	case "logs":
 		return runLogs(args[1:])
 	case "service":
 		return runService(args[1:])
 	default:
-		return fmt.Errorf("unknown command %q; want provider, enroll, client, service, server, logs, or version", args[0])
+		return fmt.Errorf("unknown command %q; want provider, enroll, client, service, server, doctor, segments, logs, or version", args[0])
 	}
 }
 
