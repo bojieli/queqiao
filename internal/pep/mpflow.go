@@ -324,6 +324,16 @@ type multipathFlow struct {
 	// loses nothing, and a flow with no listener (the server end) never
 	// blocks its watchdog.
 	stallSignal chan struct{}
+	// rescueInFlight is set by the lane manager for the duration of one
+	// rescue round. While it is set the watchdog does not signal: a request
+	// queued behind an active round would only fire a redundant round the
+	// moment the first one returns, before its fresh lane had any chance to
+	// prove itself.
+	rescueInFlight atomic.Bool
+	// stallWatchdogDisabled turns the watchdog goroutine off entirely. Zero
+	// in production; tests that pin exact dial counts set it so recovery
+	// behaviour under measurement is deterministic.
+	stallWatchdogDisabled bool
 	// stallScan and stallGrace are zero in production. Tests shorten them so
 	// the watchdog can be exercised without sleeping for seconds, the same
 	// pattern as abortGrace above.
@@ -1376,7 +1386,9 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 	completionStop := make(chan struct{})
 	go f.completionWatchdog(completionStop)
 	stallStop := make(chan struct{})
-	go f.stallWatchdog(stallStop)
+	if !f.stallWatchdogDisabled {
+		go f.stallWatchdog(stallStop)
+	}
 	limitsStop := make(chan struct{})
 	limitErr := make(chan error, 1)
 	go f.watchLimits(limitsStop, limitErr)
@@ -1818,8 +1830,10 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		// The manager's own backoff paces the dials; this pacing only keeps a
 		// persistent stall from queueing signals faster than they can be
 		// acted on. An episode that outlives its rescue still re-asks, because
-		// the stall it describes is still true.
-		if now.Sub(lastSignal) >= threshold {
+		// the stall it describes is still true. While a round is in flight it
+		// does not ask at all: the queued request would be answered by state
+		// the round is about to change.
+		if now.Sub(lastSignal) >= threshold && !f.rescueInFlight.Load() {
 			select {
 			case f.stallSignal <- struct{}{}:
 				lastSignal = now

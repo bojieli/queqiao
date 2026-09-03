@@ -238,6 +238,10 @@ type Client struct {
 	// production path still goes through dialAuthenticatedLane; tests can make
 	// TCP ready before QUIC without relying on scheduler timing or live loss.
 	dialAuthenticatedLaneForTest func(context.Context, TransportKind) (*authenticatedLane, error)
+	// disableStallWatchdogForTest keeps the flow stall watchdog off, so tests
+	// that pin exact dial counts see only the recovery they injected, not
+	// rescue rounds the watchdog starts on a slow runner.
+	disableStallWatchdogForTest bool
 
 	// quicPoolActive counts flows currently sharing the pooled control
 	// connection. A bulk flow only needs to move off it when another flow
@@ -812,6 +816,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	}
 	c.cfg.Logger.Debug("local flow opened", "transport", flow.kind, "duration", time.Since(flowOpenStarted))
 	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
+	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
 	c.declareClass(ctx, inner, flowSession)
 	flowSession.ackRanges.Store(true)
 	flowSession.idleTimeout = c.cfg.FlowIdleTimeout
@@ -1965,7 +1970,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 			if now.Before(nextStallRescue) {
 				continue
 			}
-			if err := c.openParallelRescue(manageCtx, flow, sessionID, flowID); err != nil {
+			if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
 				if manageCtx.Err() != nil || flow.doneChanClosed() {
 					return
 				}
@@ -2070,7 +2075,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				recoveryAttempts++
 				lastRecoveryAttempt = now
 				flow.noteReplacementAttempt()
-				if err := c.openParallelRescue(manageCtx, flow, sessionID, flowID); err != nil {
+				if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
 					flow.noteReplacementFailure()
 					if errors.Is(err, errLaneJoinRejected) {
 						// The peer answered, and its answer was that it does
@@ -2443,6 +2448,22 @@ type rescueAttempt func(ctx context.Context) (*mpLane, error)
 // independent retransmission schedules rather than port diversity. The TCP
 // fallback's conditions are untouched: a TCP commit can still only come from
 // attempt zero, on the same terms openRecoveryLane always had.
+// runRescueRound executes one parallel rescue round under the flow's
+// in-flight guard: the stall watchdog stays silent for the round, and any
+// request it managed to queue just before the guard engaged is dropped
+// afterwards, because the round has just changed the state that request
+// described.
+func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) error {
+	flow.rescueInFlight.Store(true)
+	err := c.openParallelRescue(ctx, flow, sessionID, flowID)
+	flow.rescueInFlight.Store(false)
+	select {
+	case <-flow.stallSignals():
+	default:
+	}
+	return err
+}
+
 func (c *Client) openParallelRescue(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) error {
 	// As in openRecoveryLane: a completed flow must not keep dialing. Only
 	// attempt zero checks this itself; the sprayed racers rely on the guard
@@ -2620,13 +2641,25 @@ func (c *Client) openRecoveryLane(ctx context.Context, flow *multipathFlow, sess
 		if recoveryCtx.Err() != nil || flow.doneChanClosed() {
 			return nil, context.Canceled
 		}
+		if errors.Is(err, errLaneJoinCapacity) {
+			// The peer is alive and at its lane ceiling, which in a rescue
+			// race usually means a sibling attempt already holds the lane.
+			// Falling back here -- an ordinary QUIC join, or the AUTO TCP
+			// commit -- would burn another handshake on an answer that
+			// cannot change, and could even hand the flow to TCP while a
+			// QUIC sibling wins.
+			return nil, err
+		}
 		if c.cfg.Transport == TransportQUIC {
 			// Protocol-v1 development peers predating control-role JOINs reject the flag.
 			// One ordinary QUIC join preserves rolling-upgrade recovery; a new
 			// peer which genuinely lost the session rejects this one as well.
 			lane, err = c.openJoinLane(recoveryCtx, TransportQUIC, sessionID, flowID, laneID)
 		} else {
-			c.metrics.Fallback()
+			// The fallback is counted where the TCP lane is installed, not
+			// here: in a parallel rescue round this commit races sprayed
+			// QUIC dials, and when one of those wins the flow never touches
+			// TCP at all.
 			c.cfg.Logger.Debug("shared QUIC generation recovery unavailable; committing flow to TCP",
 				"flow", flowID, "error", err)
 			lane, err = c.openJoinLane(recoveryCtx, TransportTCP, sessionID, flowID, laneID)
@@ -2654,8 +2687,13 @@ func (c *Client) installRecoveryLane(flow *multipathFlow, lane *mpLane) error {
 		_ = lane.fc.Close()
 		return err
 	}
-	if lane.kind == TransportTCP && c.cfg.TCPFallbackLanes > 1 {
-		flow.tcpStriping.Store(lane.tcpStriping)
+	if lane.kind == TransportTCP {
+		// The handoff is real only now: the lane won its rescue round and
+		// will actually carry the flow.
+		c.metrics.Fallback()
+		if c.cfg.TCPFallbackLanes > 1 {
+			flow.tcpStriping.Store(lane.tcpStriping)
+		}
 	}
 	c.metrics.LaneReplacement()
 	return nil

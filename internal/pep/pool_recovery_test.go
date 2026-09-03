@@ -71,6 +71,11 @@ func TestPooledFlowsRecoverThroughOneReplacementGeneration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// This test pins exact dial counts for the recovery it injects.
+			// On a slow runner the stall watchdog would start rounds of its
+			// own -- a slow echo is a real stall to it -- and each of those
+			// rounds opens two sprayed dials the ceiling does not budget for.
+			client.disableStallWatchdogForTest = true
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
