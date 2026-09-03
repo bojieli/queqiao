@@ -144,6 +144,11 @@ workload; see the full [comparison and methodology](docs/COMPARISON.md).
   listener, for Clash/mihomo routing and failover.
 - Bounded JSON logs, metrics, a local visualizer, deterministic benchmarks,
   release packaging, SBOMs, and rollback procedures.
+- `queqiaod segments`, which profiles a live tunnel and says *which* segment
+  the loss is on — the client's own access link, the long haul this transport
+  carries, or the gateway's transit onward — measuring the far end over SSH
+  rather than inferring it. See [which segment is at
+  fault](docs/PROFILING-A-TUNNEL.md).
 
 All of it ships as a prebuilt binary. Download it below, or from the
 [latest release](https://github.com/bojieli/queqiao/releases/latest); there is no build step for normal use.

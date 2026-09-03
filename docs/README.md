@@ -15,6 +15,7 @@ you choose the next document based on what you want to do.
 | Use a provider and client | [Deployment guide](DEPLOYING.md) |
 | Understand the transport in depth | [Current design](DESIGN.md), then [architecture](ARCHITECTURE.md) |
 | Measure a path or compare a baseline | [Benchmarking](BENCHMARKING.md) |
+| Work out which segment a deployment's loss is on | [Which segment is at fault](PROFILING-A-TUNNEL.md) |
 | Run inference traffic between two regions you own | [Datacenter profile](DEPLOYING-DC-PROFILE.md) |
 | Contribute code, documentation, or network results | [Contributing](../CONTRIBUTING.md) |
 
@@ -65,6 +66,10 @@ you choose the next document based on what you want to do.
 
 ## Measure and qualify
 
+- [Finding out which segment is at fault](PROFILING-A-TUNNEL.md) — profiling a
+  live tunnel to localise loss to the client's access link, the long haul, or
+  the gateway's own transit, and why each end needs an anchor that is unfiltered
+  where it is probing from.
 - [Benchmarking](BENCHMARKING.md) — reproducible short-lived, interactive, and
   bulk workload measurements.
 - [Reproducing the datacenter measurements](MEASURING-A-DC-PATH.md) — how to

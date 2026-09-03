@@ -107,8 +107,10 @@ reasoning about the vendor that operates it.
 
 ## Establishing the facts before deploying
 
-Three instruments answer three different questions, and reaching for the wrong
-one produces a confident answer to a question nobody asked.
+Four instruments answer four different questions, and reaching for the wrong
+one produces a confident answer to a question nobody asked. The first three
+below settle whether to deploy at all; the fourth is for a deployment that
+already exists and is misbehaving.
 
 ### What a local check can settle
 
@@ -206,6 +208,31 @@ transport's advantage scales with how much of it there is.
 
 [Reproducing the datacenter measurements](MEASURING-A-DC-PATH.md) gives the
 commands and the analysis in full.
+
+### What only a second vantage point can settle
+
+The three above are run from the client, and none of them can say *which
+segment* a loss belongs to. A slow deployment has three candidates that need
+three different responses -- the client's own access link, the long haul this
+transport carries, and the gateway's transit onward -- and a figure measured end
+to end is consistent with all three.
+
+`queqiaod segments` localises it by measuring both ends in the same minutes and
+reading the running client's own per-direction erasure, which is the only
+measurement that separates upstream from downstream. Note that the far leg
+`doctor` prints above is a subtraction; `--ssh` measures it from the gateway
+instead:
+
+```sh
+queqiaod segments --profile ~/.config/queqiao/*.json \
+  --metrics http://127.0.0.1:12090/metrics \
+  --ssh operator@gateway.example.net
+```
+
+This is the one instrument here that needs a live, busy session rather than a
+quiet host, so it belongs after deployment rather than before it. [Which segment
+is at fault](PROFILING-A-TUNNEL.md) explains the reasoning, and why each end
+needs an anchor that is unfiltered where it is probing from.
 
 ### What only the workload can settle
 

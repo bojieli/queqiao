@@ -369,12 +369,19 @@ func checkPlacement(p destinationProbe) check {
 // a large gateway leg is a placement decision the operator can revisit, and a
 // large far leg is the gateway's own transit, which moving the client will not
 // change.
+// The far leg here is a subtraction, and queqiaod segments --ssh measures the
+// same leg from the gateway itself. Two commands answering one question with
+// two methods will disagree, so the derived one has to name the measured one
+// rather than let a reader take a subtraction for an observation.
 func decomposition(p destinationProbe) string {
 	if !p.Decomposed {
-		return "the gateway leg was not measured, so the tunnelled time is not decomposed"
+		return "the gateway leg was not measured, so the tunnelled time is not decomposed; " +
+			"queqiaod segments measures the legs separately"
 	}
 	return fmt.Sprintf("of which %.1fms is the leg to the gateway and about %.1fms is the gateway's own hop "+
-		"to the destination", p.GatewayLeg, p.FarLeg)
+		"to the destination -- a subtraction rather than a measurement, which queqiaod segments --ssh "+
+		"takes from the gateway itself, along with the loss on each leg that this check cannot see",
+		p.GatewayLeg, p.FarLeg)
 }
 
 // wantsTLS decides whether a handshake belongs in the measurement. Port 443 is
