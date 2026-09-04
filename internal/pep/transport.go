@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"syscall"
@@ -426,9 +427,24 @@ func dialTCP(ctx context.Context, remote string, credentials identity.ClientCred
 	if err != nil {
 		return nil, err
 	}
+	// LocalAddr and Control apply to the connection this dialer makes, never to
+	// the lookup that turns the endpoint name into the address it connects to.
+	// An endpoint named rather than numbered therefore asked its question over
+	// an unbound socket, which capture is free to claim and send to the very
+	// gateway the answer is needed to reach.
+	resolver, err := netbind.ResolverFor(localAddress, control)
+	if err != nil {
+		return nil, err
+	}
 	conn, err := (&tls.Dialer{
-		NetDialer: &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second, LocalAddr: localAddr, Control: composed},
-		Config:    tlsConfig,
+		NetDialer: &net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+			LocalAddr: localAddr,
+			Control:   composed,
+			Resolver:  resolver,
+		},
+		Config: tlsConfig,
 	}).DialContext(ctx, "tcp", remote)
 	if err != nil {
 		return nil, explainDataHandshakeError(remote, "TCP", err)
@@ -749,7 +765,7 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 		listenAddress = net.JoinHostPort(result.Addr.String(), "0")
 		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
 	}
-	remoteAddr, err := net.ResolveUDPAddr("udp", remote)
+	remoteAddr, err := resolveUDPAddrBound(dialCtx, remote, localAddress, control)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -805,6 +821,38 @@ func explainDataHandshakeError(remote, transport string, err error) error {
 // dial by netbind.ResolveWithInterface.
 func validateLocalAddressSpec(spec string) error {
 	return netbind.Validate(spec)
+}
+
+// resolveUDPAddrBound resolves a UDP endpoint using a resolver bound the same
+// way the lane socket will be.
+//
+// net.ResolveUDPAddr uses the default resolver, whose sockets carry neither the
+// local address nor the interface binding the lane is about to use. A literal
+// address needs no lookup and takes the same path it always did.
+func resolveUDPAddrBound(ctx context.Context, remote, localAddress string, control func(string, string, syscall.RawConn) error) (*net.UDPAddr, error) {
+	host, port, err := net.SplitHostPort(remote)
+	if err != nil {
+		return nil, err
+	}
+	if addr, parseErr := netip.ParseAddr(host); parseErr == nil {
+		return net.ResolveUDPAddr("udp", net.JoinHostPort(addr.String(), port))
+	}
+	resolver, err := netbind.ResolverFor(localAddress, control)
+	if err != nil {
+		return nil, err
+	}
+	portNumber, err := net.LookupPort("udp", port)
+	if err != nil {
+		return nil, err
+	}
+	addresses, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("no addresses for %q", host)
+	}
+	return &net.UDPAddr{IP: addresses[0].IP, Zone: addresses[0].Zone, Port: portNumber}, nil
 }
 
 // composeSocketControls returns a control function that calls a then b. Either
