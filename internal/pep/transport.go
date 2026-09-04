@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"syscall"
@@ -414,6 +415,13 @@ func tlsClientConfig(credentials identity.ClientCredentials) (*tls.Config, error
 func dialTCP(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error) (streamConn, error) {
 	var localAddr net.Addr
 	composed := control
+	// LocalAddr and Control apply to the connection this dialer makes, never to
+	// the lookup that turns the endpoint name into the address it connects to.
+	// An endpoint named rather than numbered therefore asked its question over
+	// an unbound socket, which capture is free to claim and send to the very
+	// gateway the answer is needed to reach. Built from the resolution the
+	// binding already needed, so a dial does not enumerate interfaces twice.
+	resolver := net.DefaultResolver
 	if localAddress != "" {
 		result, err := netbind.ResolveWithInterface(localAddress)
 		if err != nil {
@@ -421,14 +429,21 @@ func dialTCP(ctx context.Context, remote string, credentials identity.ClientCred
 		}
 		localAddr = &net.TCPAddr{IP: result.Addr.AsSlice()}
 		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
+		resolver = netbind.ResolverForResult(result, control)
 	}
 	tlsConfig, err := tlsClientConfig(credentials)
 	if err != nil {
 		return nil, err
 	}
 	conn, err := (&tls.Dialer{
-		NetDialer: &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second, LocalAddr: localAddr, Control: composed},
-		Config:    tlsConfig,
+		NetDialer: &net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+			LocalAddr: localAddr,
+			Control:   composed,
+			Resolver:  resolver,
+		},
+		Config: tlsConfig,
 	}).DialContext(ctx, "tcp", remote)
 	if err != nil {
 		return nil, explainDataHandshakeError(remote, "TCP", err)
@@ -741,6 +756,9 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 	}
 	listenAddress := ":0"
 	composed := control
+	// See dialTCP: the lookup that turns a named endpoint into an address does
+	// not inherit the socket's binding, so it needs a resolver that carries it.
+	resolver := net.DefaultResolver
 	if localAddress != "" {
 		result, parseErr := netbind.ResolveWithInterface(localAddress)
 		if parseErr != nil {
@@ -748,8 +766,9 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 		}
 		listenAddress = net.JoinHostPort(result.Addr.String(), "0")
 		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
+		resolver = netbind.ResolverForResult(result, control)
 	}
-	remoteAddr, err := net.ResolveUDPAddr("udp", remote)
+	remoteAddr, err := resolveUDPAddr(dialCtx, remote, resolver)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -805,6 +824,33 @@ func explainDataHandshakeError(remote, transport string, err error) error {
 // dial by netbind.ResolveWithInterface.
 func validateLocalAddressSpec(spec string) error {
 	return netbind.Validate(spec)
+}
+
+// resolveUDPAddr resolves a UDP endpoint through the given resolver.
+//
+// net.ResolveUDPAddr would use the default one, whose sockets carry neither the
+// local address nor the interface binding the lane is about to use. A literal
+// address needs no lookup and takes the same path it always did.
+func resolveUDPAddr(ctx context.Context, remote string, resolver *net.Resolver) (*net.UDPAddr, error) {
+	host, port, err := net.SplitHostPort(remote)
+	if err != nil {
+		return nil, err
+	}
+	if addr, parseErr := netip.ParseAddr(host); parseErr == nil {
+		return net.ResolveUDPAddr("udp", net.JoinHostPort(addr.String(), port))
+	}
+	portNumber, err := net.LookupPort("udp", port)
+	if err != nil {
+		return nil, err
+	}
+	addresses, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("no addresses for %q", host)
+	}
+	return &net.UDPAddr{IP: addresses[0].IP, Zone: addresses[0].Zone, Port: portNumber}, nil
 }
 
 // composeSocketControls returns a control function that calls a then b. Either
