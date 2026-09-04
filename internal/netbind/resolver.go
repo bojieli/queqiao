@@ -48,6 +48,15 @@ func ResolverFor(spec string, extra func(string, string, syscall.RawConn) error)
 	if err != nil {
 		return nil, err
 	}
+	return ResolverForResult(result, extra), nil
+}
+
+// ResolverForResult is ResolverFor for a caller that has already resolved the
+// spec. Dialing a lane resolves it to build the socket's own binding, and
+// resolving an "auto" or "if:NAME" spec enumerates the host's interfaces, so a
+// caller on a dial path should pass what it already has rather than pay for
+// that a second time on every connection.
+func ResolverForResult(result ResolveResult, extra func(string, string, syscall.RawConn) error) *net.Resolver {
 	control := composeControls(InterfaceControl(result.InterfaceName), extra)
 	local := result.Addr
 	return &net.Resolver{
@@ -61,7 +70,7 @@ func ResolverFor(spec string, extra func(string, string, syscall.RawConn) error)
 			}
 			return dialer.DialContext(ctx, network, address)
 		},
-	}, nil
+	}
 }
 
 // localAddrFor returns the source address to bind for one nameserver dial, and

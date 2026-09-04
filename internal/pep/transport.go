@@ -415,6 +415,13 @@ func tlsClientConfig(credentials identity.ClientCredentials) (*tls.Config, error
 func dialTCP(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error) (streamConn, error) {
 	var localAddr net.Addr
 	composed := control
+	// LocalAddr and Control apply to the connection this dialer makes, never to
+	// the lookup that turns the endpoint name into the address it connects to.
+	// An endpoint named rather than numbered therefore asked its question over
+	// an unbound socket, which capture is free to claim and send to the very
+	// gateway the answer is needed to reach. Built from the resolution the
+	// binding already needed, so a dial does not enumerate interfaces twice.
+	resolver := net.DefaultResolver
 	if localAddress != "" {
 		result, err := netbind.ResolveWithInterface(localAddress)
 		if err != nil {
@@ -422,17 +429,9 @@ func dialTCP(ctx context.Context, remote string, credentials identity.ClientCred
 		}
 		localAddr = &net.TCPAddr{IP: result.Addr.AsSlice()}
 		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
+		resolver = netbind.ResolverForResult(result, control)
 	}
 	tlsConfig, err := tlsClientConfig(credentials)
-	if err != nil {
-		return nil, err
-	}
-	// LocalAddr and Control apply to the connection this dialer makes, never to
-	// the lookup that turns the endpoint name into the address it connects to.
-	// An endpoint named rather than numbered therefore asked its question over
-	// an unbound socket, which capture is free to claim and send to the very
-	// gateway the answer is needed to reach.
-	resolver, err := netbind.ResolverFor(localAddress, control)
 	if err != nil {
 		return nil, err
 	}
@@ -757,6 +756,9 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 	}
 	listenAddress := ":0"
 	composed := control
+	// See dialTCP: the lookup that turns a named endpoint into an address does
+	// not inherit the socket's binding, so it needs a resolver that carries it.
+	resolver := net.DefaultResolver
 	if localAddress != "" {
 		result, parseErr := netbind.ResolveWithInterface(localAddress)
 		if parseErr != nil {
@@ -764,8 +766,9 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 		}
 		listenAddress = net.JoinHostPort(result.Addr.String(), "0")
 		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
+		resolver = netbind.ResolverForResult(result, control)
 	}
-	remoteAddr, err := resolveUDPAddrBound(dialCtx, remote, localAddress, control)
+	remoteAddr, err := resolveUDPAddr(dialCtx, remote, resolver)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -823,23 +826,18 @@ func validateLocalAddressSpec(spec string) error {
 	return netbind.Validate(spec)
 }
 
-// resolveUDPAddrBound resolves a UDP endpoint using a resolver bound the same
-// way the lane socket will be.
+// resolveUDPAddr resolves a UDP endpoint through the given resolver.
 //
-// net.ResolveUDPAddr uses the default resolver, whose sockets carry neither the
+// net.ResolveUDPAddr would use the default one, whose sockets carry neither the
 // local address nor the interface binding the lane is about to use. A literal
 // address needs no lookup and takes the same path it always did.
-func resolveUDPAddrBound(ctx context.Context, remote, localAddress string, control func(string, string, syscall.RawConn) error) (*net.UDPAddr, error) {
+func resolveUDPAddr(ctx context.Context, remote string, resolver *net.Resolver) (*net.UDPAddr, error) {
 	host, port, err := net.SplitHostPort(remote)
 	if err != nil {
 		return nil, err
 	}
 	if addr, parseErr := netip.ParseAddr(host); parseErr == nil {
 		return net.ResolveUDPAddr("udp", net.JoinHostPort(addr.String(), port))
-	}
-	resolver, err := netbind.ResolverFor(localAddress, control)
-	if err != nil {
-		return nil, err
 	}
 	portNumber, err := net.LookupPort("udp", port)
 	if err != nil {
