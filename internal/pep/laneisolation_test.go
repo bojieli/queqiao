@@ -177,7 +177,7 @@ func TestServerReplacesALaneWithTheSameRole(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Eviction exists for lanes whose peer has already moved on, so the
-	// victims here must be older than the protection window: a freshly
+	// victims here must be older than the rescue-race window: a freshly
 	// admitted lane is never retired to make room.
 	control.admitted = time.Now().Add(-2 * laneDeadPathDetection)
 	bulk.admitted = time.Now().Add(-2 * laneDeadPathDetection)
@@ -201,12 +201,11 @@ func TestServerReplacesALaneWithTheSameRole(t *testing.T) {
 }
 
 // Parallel rescue JOINs race one another to the gateway, which admits in
-// arrival order while the peer crowns the first finisher. A freshly admitted
-// lane must therefore be protected from eviction at the lane ceiling:
-// without the protection, a losing JOIN admitted moments after the winner
-// retires the winner's server side before its own close lands, and the
-// "rescue" leaves the flow with no lane at all.
-func TestFreshlyAdmittedLaneIsProtectedFromEviction(t *testing.T) {
+// arrival order while the peer crowns the first finisher. Once the live
+// lanes are older than the rescue-race window, admission at the lane ceiling
+// is always by eviction: a stalled flow's retry matters more than seniority,
+// so an old lane is never shielded from a newer rescue.
+func TestRacingJoinIsAdmittedByEvictingTheOldestLane(t *testing.T) {
 	flow := newIsolationTestFlow(t, true)
 	session := newServerFlow(flow, identity.Principal{}, TransportQUIC, 1)
 	control := isolationLane(t, 0)
@@ -218,23 +217,111 @@ func TestFreshlyAdmittedLaneIsProtectedFromEviction(t *testing.T) {
 	if err := session.addLane(bulk); err != nil {
 		t.Fatal(err)
 	}
+	control.admitted = time.Now().Add(-2 * laneDeadPathDetection)
+	bulk.admitted = time.Now().Add(-2 * laneDeadPathDetection)
 
 	racing := isolationLane(t, 2)
-	if err := session.addLane(racing); err == nil {
-		t.Fatal("a racing join evicted a freshly admitted lane")
-	}
-	if bulk.closed.Load() {
-		t.Fatal("the freshly admitted lane was retired by the racing join")
-	}
-	// Once the lane is older than the path-detection budget it is the
-	// half-open socket eviction exists for, and the next join takes its slot.
-	bulk.admitted = time.Now().Add(-2 * laneDeadPathDetection)
 	if err := session.addLane(racing); err != nil {
-		t.Fatalf("replacement of an aged lane refused: %v", err)
+		t.Fatalf("racing join refused at the lane ceiling: %v", err)
 	}
-	if !bulk.closed.Load() || racing.closed.Load() {
-		t.Fatalf("aged replacement retired bulk=%t racing=%t, want true/false", bulk.closed.Load(), racing.closed.Load())
+	if !bulk.closed.Load() || control.closed.Load() || racing.closed.Load() {
+		t.Fatalf("racing join retired bulk=%t control=%t racing=%t, want true/false/false", bulk.closed.Load(), control.closed.Load(), racing.closed.Load())
 	}
+	if got := flow.laneCount(); got != 2 {
+		t.Fatalf("lane count = %d, want the admission ceiling of 2", got)
+	}
+}
+
+// A lane whose JOIN handshake is still in flight is the one lane eviction
+// never takes: parallel rescue attempts race to the gateway, and evicting a
+// staged lane can kill the attempt the peer has just crowned. The racing
+// join is refused instead -- the transient capacity answer the peer already
+// expects for its losing attempts -- and the protection ends with the
+// rescue-race window: once the lane is live and older than the window, it is
+// evictable by any newer rescue.
+func TestStagedLaneIsProtectedOnlyUntilActivated(t *testing.T) {
+	flow := newIsolationTestFlow(t, false)
+	session := newServerFlow(flow, identity.Principal{}, TransportQUIC, 1)
+	staged := isolationLane(t, 1)
+	staged.staged = true
+	if err := session.addLane(staged); err != nil {
+		t.Fatal(err)
+	}
+	racer := isolationLane(t, 2)
+	if err := session.addLane(racer); err == nil {
+		t.Fatal("a racing join evicted a lane whose handshake was in flight")
+	}
+	if staged.closed.Load() {
+		t.Fatal("the in-flight lane was retired by the racing join")
+	}
+	if err := flow.activateLane(staged); err != nil {
+		t.Fatal(err)
+	}
+	staged.admitted = time.Now().Add(-2 * laneDeadPathDetection)
+	if err := session.addLane(racer); err != nil {
+		t.Fatalf("join behind a live lane refused: %v", err)
+	}
+	if !staged.closed.Load() || racer.closed.Load() {
+		t.Fatalf("eviction retired staged=%t racer=%t, want true/false", staged.closed.Load(), racer.closed.Load())
+	}
+	if got := flow.laneCount(); got != 1 {
+		t.Fatalf("lane count = %d, want the admission ceiling of 1", got)
+	}
+}
+
+// Role only orders the victim choice; it never blocks a rescue. When no
+// lane with the replacement's role is evictable, the oldest lane of any role
+// is retired instead of refusing the join.
+func TestEvictionCrossesRolesWhenNoSameRoleLaneIsLive(t *testing.T) {
+	flow := newIsolationTestFlow(t, true)
+	session := newServerFlow(flow, identity.Principal{}, TransportQUIC, 1)
+	control := isolationLane(t, 0)
+	control.control = true
+	otherControl := isolationLane(t, 1)
+	otherControl.control = true
+	if err := flow.addLane(control); err != nil {
+		t.Fatal(err)
+	}
+	if err := flow.addLane(otherControl); err != nil {
+		t.Fatal(err)
+	}
+	control.admitted = time.Now().Add(-2 * laneDeadPathDetection)
+	otherControl.admitted = time.Now().Add(-2 * laneDeadPathDetection)
+	bulk := isolationLane(t, 2)
+	if err := session.addLane(bulk); err != nil {
+		t.Fatalf("bulk join behind two control lanes refused: %v", err)
+	}
+	if !control.closed.Load() || otherControl.closed.Load() {
+		t.Fatalf("cross-role eviction retired oldest-control=%t other=%t, want true/false", control.closed.Load(), otherControl.closed.Load())
+	}
+	if got := flow.laneCount(); got != 2 {
+		t.Fatalf("lane count = %d, want the admission ceiling of 2", got)
+	}
+}
+
+// A staged JOIN lane whose acknowledgement could not be written must leave
+// the flow entirely: keeping it would count a lane that can never carry
+// traffic against the admission ceiling for the life of the flow.
+func TestFailedStagedJoinIsRemovedFromTheFlow(t *testing.T) {
+	flow := newIsolationTestFlow(t, true)
+	lane := isolationLane(t, 1)
+	lane.staged = true
+	if err := flow.addLane(lane); err != nil {
+		t.Fatal(err)
+	}
+	if got := flow.laneCount(); got != 1 {
+		t.Fatalf("staged lane consumes %d admission slots, want one", got)
+	}
+	flow.removeLane(lane)
+	if got := flow.laneCount(); got != 0 {
+		t.Fatalf("failed staged join still consumes %d admission slots", got)
+	}
+	if !lane.closed.Load() {
+		t.Fatal("removed lane was not closed")
+	}
+	// A second removal -- for example when a racing eviction already withdrew
+	// the lane -- must not panic or miscount.
+	flow.removeLane(lane)
 }
 
 // Without the reservation there is no separate control lane, so the budget is

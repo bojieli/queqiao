@@ -162,14 +162,12 @@ func (s *serverFlow) addLane(lane *mpLane) error {
 	}
 	if s.flow.laneCount() >= s.maxLanes {
 		// The peer can detect a dead QUIC socket before this endpoint does
-		// (for example, when the return path is black-holed). Retire the
-		// oldest lane with the same role as its authenticated replacement.
-		// A bulk replacement must never evict the control lane, and a control
-		// generation replacement must not evict healthy bulk capacity. A lane
-		// younger than the path-detection budget is protected: several rescue
-		// JOINs racing here must not evict the winner the peer already
-		// crowned, and the half-open lanes eviction exists for are never
-		// that young.
+		// (for example, when the return path is black-holed). Admission at
+		// the ceiling is by eviction, and no role blocks it: the choice is
+		// limited only by the rescue-race window -- lanes whose JOIN
+		// handshake is in flight or whose admission is younger than the
+		// path-detection budget may still be waiting on the peer's crowning
+		// decision, so evicting one can kill the rescue that just won.
 		if !s.flow.retireOldestLane(lane.control, laneDeadPathDetection) || s.flow.laneCount() >= s.maxLanes {
 			return errors.New("flow lane limit reached")
 		}
@@ -1037,9 +1035,11 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 		return
 	}
 	if err := fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}); err != nil {
+		serverSession.flow.removeLane(replacement)
 		return
 	}
 	if err := serverSession.flow.activateLane(replacement); err != nil {
+		serverSession.flow.removeLane(replacement)
 		return
 	}
 	s.cfg.Logger.Debug("lane joined", "lane", laneID, "transport", kind, "control", controlReplacement, "lanes", serverSession.flow.laneCount())
