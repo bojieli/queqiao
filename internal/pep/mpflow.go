@@ -133,8 +133,9 @@ type mpLane struct {
 	cwndBytes     int
 	inFlightBytes int
 	cwndSampled   time.Time
-	// admitted is when this lane joined the flow, which is what bounds the
-	// handover of bulk traffic off the shared control lane.
+	// admitted is when this lane joined the flow. It bounds eviction at the
+	// lane ceiling: a lane younger than the rescue-race window may still be
+	// waiting on the peer's crowning decision, so it is never the victim.
 	admitted          time.Time
 	writeInteractiveQ chan laneFrame
 	writeSlots        chan struct{}
@@ -872,23 +873,35 @@ func (f *multipathFlow) laneCount() int {
 // the configured lane cap; deleting the entry keeps the cap a real resource
 // bound rather than allowing unbounded historical lane IDs.
 //
-// A lane younger than minAge is never the victim. Parallel rescue JOINs race
-// one another to this endpoint, and admission order is not the order the
-// peer crowned its winner in: retiring a lane admitted moments ago lets a
-// losing JOIN evict the winner's server side before its own close lands.
-// The lanes eviction legitimately exists for -- half-open sockets whose
-// peer has already given up -- are at least a path-detection budget old.
+// The victim is the oldest evictable lane with the replacement's role, or the
+// oldest evictable lane of any role when no same-role lane exists: role
+// orders the choice but never blocks a rescue. Two lanes are never evictable.
+// A lane whose JOIN handshake is still in flight: parallel rescue attempts
+// race to this endpoint, and evicting a staged lane can kill the attempt the
+// peer has just crowned. And a lane younger than minAge: admission order is
+// not the order the peer crowned its winner in, so a freshly admitted lane
+// may still be waiting on the peer's decision while the racing losers it
+// beat are still arriving; the half-open sockets eviction exists for are
+// never that young. With no evictable lane the JOIN is refused -- the
+// transient capacity answer the racing peer already expects for its losing
+// attempts.
 func (f *multipathFlow) retireOldestLane(control bool, minAge time.Duration) bool {
 	f.lanesMu.Lock()
 	var victim *mpLane
 	for _, lane := range f.lanes {
-		if lane.closed.Load() || !f.laneReady(lane) || f.laneIsControl(lane) != control {
+		if lane.closed.Load() || !f.laneReady(lane) {
 			continue
 		}
 		if minAge > 0 && time.Since(lane.admitted) < minAge {
 			continue
 		}
-		if victim == nil || lane.id < victim.id {
+		switch {
+		case victim == nil:
+			victim = lane
+		case f.laneIsControl(lane) == control && f.laneIsControl(victim) != control:
+			// A lane with the replacement's role always beats any other role.
+			victim = lane
+		case f.laneIsControl(lane) == f.laneIsControl(victim) && lane.id < victim.id:
 			victim = lane
 		}
 	}
@@ -903,6 +916,24 @@ func (f *multipathFlow) retireOldestLane(control bool, minAge time.Duration) boo
 		_ = victim.fc.Close()
 	}
 	return true
+}
+
+// removeLane withdraws a lane whose admission failed after it entered the
+// flow -- a staged JOIN lane whose OPEN_OK never left. Anything less leaves
+// a lane that counts against the admission cap but can neither carry traffic
+// nor be scheduled, leaking the slot for the life of the flow.
+func (f *multipathFlow) removeLane(lane *mpLane) {
+	f.lanesMu.Lock()
+	if f.lanes[lane.id] != lane {
+		f.lanesMu.Unlock()
+		return
+	}
+	delete(f.lanes, lane.id)
+	lane.closed.Store(true)
+	f.lanesMu.Unlock()
+	if lane.fc != nil {
+		_ = lane.fc.Close()
+	}
 }
 
 // retireLanesExcept performs an intentional transport handoff without

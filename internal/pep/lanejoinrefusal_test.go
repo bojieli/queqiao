@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net"
 	"testing"
@@ -79,5 +80,30 @@ func TestLaneJoinRefusalsAreVisibleAndCountedByReason(t *testing.T) {
 				t.Fatalf("record total = %#v, want 1", record["total"])
 			}
 		})
+	}
+}
+
+// A JOIN admitted whose OPEN_OK cannot be written must not leave the staged
+// lane behind: it counts against the flow's admission ceiling yet can never
+// carry traffic, so one failed handshake would wedge the slot for the life
+// of the flow.
+func TestJoinLaneIsRemovedWhenOpenOKCannotBeWritten(t *testing.T) {
+	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "owner"}
+	flow := newIsolationTestFlow(t, false)
+	server := &Server{
+		cfg:      ServerConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
+		sessions: map[[16]byte]*serverFlow{flow.sessionID: newServerFlow(flow, owner, TransportTCP, 1)},
+		metrics:  metrics.New(),
+	}
+	local, remote := net.Pipe()
+	_ = remote.Close()
+	t.Cleanup(func() { _ = local.Close() })
+	request := protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeJoin, SessionID: flow.sessionID,
+		FlowID: flow.flowID, Class: protocol.ClassBulk,
+	}}
+	server.handleLaneJoinOpen(context.Background(), local, newFrameConn(local), owner, flow.sessionID, 1, request)
+	if got := flow.laneCount(); got != 0 {
+		t.Fatalf("lane whose OPEN_OK could not be written still consumes %d admission slots", got)
 	}
 }

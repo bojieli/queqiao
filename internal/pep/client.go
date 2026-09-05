@@ -2519,10 +2519,11 @@ func (c *Client) openSprayedQUICRescueJoin(ctx context.Context, flow *multipathF
 // The race is deliberately not transactional with the server, which admits
 // JOINs in arrival order while the winner here is the first finisher. What
 // keeps a late losing JOIN from evicting the winner's server side at the
-// lane ceiling is the server: it protects freshly admitted lanes from
-// eviction and refuses the loser by capacity instead (see retireOldestLane),
-// and a capacity refusal is exactly the per-attempt failure errLaneJoinCapacity
-// carries back here.
+// lane ceiling is the server: a lane is unevictable while its JOIN handshake
+// is in flight and for one path-detection budget afterwards, so the loser is
+// refused by capacity instead (see retireOldestLane), and a capacity refusal
+// is exactly the per-attempt failure errLaneJoinCapacity carries back here.
+// Past that window no role or seniority shields a lane from a newer rescue.
 func (c *Client) raceRescueAttempts(ctx context.Context, flow *multipathFlow, attempts []rescueAttempt) (*mpLane, int, error) {
 	raceCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
