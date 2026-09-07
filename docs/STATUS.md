@@ -35,7 +35,7 @@ limitations](KNOWN-LIMITATIONS.md) before deploying it.
 
 | Area | Current capability |
 | --- | --- |
-| Data plane | SOCKS5 TCP CONNECT and UDP ASSOCIATE; pooled QUIC streams and datagrams; authenticated TLS/TCP fallback |
+| Data plane | SOCKS5 TCP CONNECT and UDP ASSOCIATE; pooled QUIC streams and datagrams; authenticated TLS/TCP fallback; optional gateway chaining through a loopback SOCKS5 upstream |
 | WAN policy | shared endpoint-pair path model, erasure-aware control, aggregate pacing, and interactive reserve |
 | Recovery | byte-offset reassembly, range acknowledgements, bounded replay, sliding-window coding, lane replacement, and UDP relay reclamation |
 | Contention | behavioral flow state, priority queues, reactive bulk isolation, and bounded opt-in TCP fallback striping |

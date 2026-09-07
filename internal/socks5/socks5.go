@@ -98,6 +98,67 @@ type UDPDatagram struct {
 	Payload     []byte
 }
 
+// ClientRequest performs an unauthenticated SOCKS5 client negotiation and
+// sends one CONNECT or UDP ASSOCIATE request. It returns the bound address from
+// the successful reply. This is intentionally the small client surface needed
+// by the gateway's loopback upstream proxy; authenticated remote proxying is a
+// different trust boundary and is not silently enabled here.
+func ClientRequest(rw io.ReadWriter, command byte, destination string) (string, error) {
+	if command != CommandConnect && command != CommandUDPAssociate {
+		return "", errors.New("unsupported SOCKS5 client command")
+	}
+	if err := writeFull(rw, []byte{version5, 1, methodNone}); err != nil {
+		return "", fmt.Errorf("write SOCKS5 greeting: %w", err)
+	}
+	var method [2]byte
+	if _, err := io.ReadFull(rw, method[:]); err != nil {
+		return "", fmt.Errorf("read SOCKS5 method: %w", err)
+	}
+	if method != [2]byte{version5, methodNone} {
+		return "", errors.New("SOCKS5 upstream did not accept no authentication")
+	}
+
+	host, portText, err := net.SplitHostPort(destination)
+	if err != nil || host == "" {
+		return "", errors.New("invalid SOCKS5 client destination")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 0 || port > 65535 || command == CommandConnect && port == 0 {
+		return "", errors.New("invalid SOCKS5 client destination port")
+	}
+	address, err := encodeHost(host)
+	if err != nil {
+		return "", err
+	}
+	request := []byte{version5, command, 0}
+	request = append(request, address...)
+	var portBytes [2]byte
+	binary.BigEndian.PutUint16(portBytes[:], uint16(port))
+	request = append(request, portBytes[:]...)
+	if err := writeFull(rw, request); err != nil {
+		return "", fmt.Errorf("write SOCKS5 request: %w", err)
+	}
+
+	var reply [4]byte
+	if _, err := io.ReadFull(rw, reply[:]); err != nil {
+		return "", fmt.Errorf("read SOCKS5 reply: %w", err)
+	}
+	if reply[0] != version5 || reply[2] != 0 {
+		return "", errors.New("invalid SOCKS5 upstream reply")
+	}
+	if reply[1] != ReplySucceeded {
+		return "", fmt.Errorf("SOCKS5 upstream rejected request with code %d", reply[1])
+	}
+	boundHost, err := readHost(rw, reply[3])
+	if err != nil {
+		return "", fmt.Errorf("read SOCKS5 bound address: %w", err)
+	}
+	if _, err := io.ReadFull(rw, portBytes[:]); err != nil {
+		return "", fmt.Errorf("read SOCKS5 bound port: %w", err)
+	}
+	return net.JoinHostPort(boundHost, strconv.Itoa(int(binary.BigEndian.Uint16(portBytes[:])))), nil
+}
+
 // ReadRequest performs method negotiation, any required authentication, and
 // then reads one request. Passing nil credentials preserves the
 // no-authentication behaviour used by the loopback desktop listener.
