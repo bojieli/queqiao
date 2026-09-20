@@ -2475,17 +2475,13 @@ type rescueAttempt func(ctx context.Context) (*mpLane, error)
 // flip repeated slowly, while several independent handshakes fail together
 // only when the path truly carries nothing.
 //
-// Attempt zero is the established recovery strategy unchanged -- for a pooled
-// flow that is the shared control generation (whose dial stays singleflight:
-// every affected flow coalesces onto it, and the racers below never touch
-// that generation's state), and for AUTO it keeps the bounded QUIC window
-// followed by exactly one committed TCP JOIN. The remaining attempts are
-// independent dedicated QUIC dials. Each one draws the next walked hop port,
-// so with port hopping configured they spray across the pool; without it they
-// dial the same single port, where the value is independent handshakes with
-// independent retransmission schedules rather than port diversity. The TCP
-// fallback's conditions are untouched: a TCP commit can still only come from
-// attempt zero, on the same terms openRecoveryLane always had.
+// Parallel JOINs are safe only in QUIC-only mode. AUTO uses the established
+// sequential strategy: shared QUIC recovery first when available, then TCP.
+// A TCP JOIN retires the server's QUIC lanes before its acknowledgement reaches
+// the client. Racing that commit against a QUIC JOIN can therefore destroy
+// the apparent QUIC winner, even if the losing TCP attempt is cancelled.
+// QUIC-only racers remain independent dedicated dials over the hop walk.
+//
 // runRescueRound executes one parallel rescue round under the flow's
 // in-flight guard: the stall watchdog stays silent for the round, and any
 // request it managed to queue just before the guard engaged is dropped
@@ -2522,7 +2518,7 @@ func (c *Client) openParallelRescue(ctx context.Context, flow *multipathFlow, se
 	attempts = append(attempts, func(ctx context.Context) (*mpLane, error) {
 		return c.openRecoveryLane(ctx, flow, sessionID, flowID)
 	})
-	if c.cfg.Transport != TransportTCP {
+	if c.cfg.Transport == TransportQUIC {
 		for len(attempts) < metrics.RescueAttemptSlots {
 			attempts = append(attempts, func(ctx context.Context) (*mpLane, error) {
 				return c.openSprayedQUICRescueJoin(ctx, flow, sessionID, flowID)
@@ -2728,10 +2724,8 @@ func (c *Client) openRecoveryLane(ctx context.Context, flow *multipathFlow, sess
 			// peer which genuinely lost the session rejects this one as well.
 			lane, err = c.openJoinLane(recoveryCtx, TransportQUIC, sessionID, flowID, laneID)
 		} else {
-			// The fallback is counted where the TCP lane is installed, not
-			// here: in a parallel rescue round this commit races sprayed
-			// QUIC dials, and when one of those wins the flow never touches
-			// TCP at all.
+			// The fallback is counted when the acknowledged TCP lane is
+			// installed. No competing QUIC JOIN may race this handoff.
 			c.cfg.Logger.Debug("shared QUIC generation recovery unavailable; committing flow to TCP",
 				"flow", flowID, "error", err)
 			lane, err = c.openJoinLane(recoveryCtx, TransportTCP, sessionID, flowID, laneID)
@@ -2760,8 +2754,8 @@ func (c *Client) installRecoveryLane(flow *multipathFlow, lane *mpLane) error {
 		return err
 	}
 	if lane.kind == TransportTCP {
-		// The handoff is real only now: the lane won its rescue round and
-		// will actually carry the flow.
+		// The server committed the handoff at JOIN admission. Count it
+		// locally only after its acknowledged lane is installed.
 		c.metrics.Fallback()
 		if c.cfg.TCPFallbackLanes > 1 {
 			flow.tcpStriping.Store(lane.tcpStriping)

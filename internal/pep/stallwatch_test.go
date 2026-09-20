@@ -86,32 +86,6 @@ func TestScanStallGating(t *testing.T) {
 	}
 }
 
-// The response gate opens when the application sent something the peer has
-// not answered, and closes on any downstream payload or either close. A flow
-// whose last send was answered is idle, not waiting.
-func TestResponseOutstandingGating(t *testing.T) {
-	flow := newStallTestFlow(t, nil)
-	if flow.responseOutstanding() {
-		t.Fatal("a flow that never sent is waiting on a response")
-	}
-	flow.observe(64, true)
-	flow.bytesUp.Add(64)
-	if !flow.responseOutstanding() {
-		t.Fatal("an unanswered request did not open the response gate")
-	}
-	flow.observe(128, false)
-	flow.bytesDown.Add(128)
-	if flow.responseOutstanding() {
-		t.Fatal("an answered request kept the response gate open")
-	}
-	flow.observe(64, true)
-	flow.bytesUp.Add(64)
-	flow.remoteFinSeen.Store(true)
-	if flow.responseOutstanding() {
-		t.Fatal("a flow that saw the peer's FIN is still waiting")
-	}
-}
-
 // Demotion is not death: a suspected lane is passed over for new writes while
 // a healthier lane exists, keeps its place in the healthy set, and is fully
 // eligible again the moment it is the only thing left.

@@ -70,13 +70,107 @@ func (p DestinationPolicy) DialContext(ctx context.Context, destination string) 
 
 	dialer := net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	var lastErr error
+	var candidates []string
 	for _, candidate := range addresses {
 		if !p.AllowPrivate && !publicDestinationIP(candidate.IP) {
 			lastErr = errors.New("destination address is not public")
 			continue
 		}
-		address := net.JoinHostPort(candidate.IP.String(), strconv.Itoa(port))
-		conn, dialErr := dialer.DialContext(ctx, "tcp", address)
+		candidates = append(candidates, net.JoinHostPort(candidate.IP.String(), strconv.Itoa(port)))
+	}
+	if len(candidates) == 0 {
+		return nil, lastErr
+	}
+	return dialDestinationCandidates(ctx, candidates, func(ctx context.Context, address string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "tcp", address)
+	})
+}
+
+func dialDestinationCandidates(ctx context.Context, addresses []string, dial func(context.Context, string) (net.Conn, error)) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(addresses) < 2 {
+		return dialDestinationSerial(ctx, addresses, dial)
+	}
+	// The addresses have already passed policy validation. Race only concrete
+	// addresses so a second DNS lookup cannot rebind a public name to a private
+	// destination. Two staggered workers bound sockets per OPEN; a healthy
+	// first address costs no speculative connection.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan result)
+	start := func(offset int) {
+		candidates := make([]string, 0, (len(addresses)+1)/2)
+		for i := offset; i < len(addresses); i += 2 {
+			candidates = append(candidates, addresses[i])
+		}
+		go func() {
+			conn, err := dialDestinationSerial(ctx, candidates, dial)
+			select {
+			case results <- result{conn, err}:
+			case <-ctx.Done():
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}
+		}()
+	}
+	start(0)
+	delay := 250 * time.Millisecond
+	if deadline, ok := ctx.Deadline(); ok {
+		delay = min(delay, max(0, time.Until(deadline)/2))
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	timerC := timer.C
+	active := 1
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timerC:
+			timerC = nil
+			active++
+			start(1)
+		case r := <-results:
+			if r.err == nil {
+				return r.conn, nil
+			}
+			active--
+			if timerC != nil {
+				// An exhausted worker should not wait for the stagger timer.
+				timerC = nil
+				timer.Stop()
+				active++
+				start(1)
+			}
+			if active == 0 {
+				return nil, r.err
+			}
+		}
+	}
+}
+
+func dialDestinationSerial(ctx context.Context, addresses []string, dial func(context.Context, string) (net.Conn, error)) (net.Conn, error) {
+	var lastErr error
+	for i, address := range addresses {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		attemptCtx := ctx
+		cancel := func() {}
+		if deadline, ok := ctx.Deadline(); ok && i+1 < len(addresses) {
+			// Reserve time for later addresses instead of letting a blackholed
+			// candidate consume the whole flow-open deadline.
+			attemptCtx, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(addresses)-i))
+		}
+		conn, dialErr := dial(attemptCtx, address)
+		cancel()
 		if dialErr == nil {
 			return conn, nil
 		}
