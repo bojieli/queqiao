@@ -5,6 +5,7 @@ struct ImportProfileView: View {
     @EnvironmentObject private var model: TunnelModel
     @Environment(\.dismiss) private var dismiss
     @State private var confirmDiscard = false
+    @State private var isScannerPresented = false
 
     var body: some View {
         NavigationStack {
@@ -25,6 +26,9 @@ struct ImportProfileView: View {
                     Button("Cancel") { dismiss() }
                         .disabled(model.isBusy)
                 }
+            }
+            .sheet(isPresented: $isScannerPresented) {
+                InvitationScannerView()
             }
             .confirmationDialog(
                 "Discard pending enrollment?",
@@ -68,6 +72,13 @@ struct ImportProfileView: View {
                 .autocorrectionDisabled()
                 .privacySensitive()
                 .accessibilityLabel("Queqiao invitation")
+            if InvitationScannerView.isAvailable {
+                Button {
+                    isScannerPresented = true
+                } label: {
+                    Label("Scan QR code", systemImage: "qrcode.viewfinder")
+                }
+            }
             Button {
                 if let value = UIPasteboard.general.string {
                     model.invitation = value.trimmingCharacters(in: .whitespacesAndNewlines)

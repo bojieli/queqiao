@@ -10,6 +10,73 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.8.0 - 2026-09-19
+
+### Added
+
+- The Android app ships the full-device tunnel, and it is the default connection
+  mode for a new install. Until now a released build could only export a local
+  SOCKS5 endpoint for another VPN client, which left a phone with no such client
+  unable to connect at all. Both modes ship and are chosen under Settings; an
+  install that had already picked one keeps it. Because the release build now
+  declares a `VpnService`, a Google Play listing needs an Organization account
+  and Play's VPN declaration; direct APK distribution is unaffected.
+- The Android full tunnel routes the way the iOS tunnel does: a routing mode,
+  bypasses for local networks, the bundled Chinese address set and up to 256
+  hand-entered routes, and a rule-list editor with the same lint and the same
+  China preset, which keeps Chinese sites direct by name as well as by address.
+  Hand-entered routes are read as numeric addresses only, so a typo is refused
+  instead of being looked up. The address set installs as routes on Android 13
+  and later; earlier releases keep those addresses direct through a
+  `GEOIP,CN,DIRECT` rule. Routing is edited while disconnected and applies at
+  the next connect. While connected, the
+  home screen shows how many flows the rules sent through Queqiao, direct, or
+  rejected.
+
+### Changed
+
+- "Test all connections" on Android probes up to four profiles at once, as iOS
+  already did, and shows each result as it arrives; one slow or unreachable
+  provider no longer delays the verdict on the rest. Connection tests can also
+  be run while the tunnel is connected.
+
+## v0.7.0 - 2026-09-19
+
+### Added
+
+- The Android and iOS apps can read a one-time invitation from a QR code with
+  the device camera, from the same import screen that takes a pasted one. Five
+  hundred characters of base64 were never going to be typed from another
+  screen. Android decodes the frame on the device in the Go core and iOS uses
+  the system's own detector; no image or invitation leaves the process, and a
+  scanned code that is not a valid Queqiao invitation is refused at the
+  viewfinder. The released Android build gains only the CAMERA permission,
+  which is optional.
+- `queqiaod provider invite --qr` draws the new invitation as a QR code in the
+  terminal, black on a white field whatever the terminal theme, for the mobile
+  apps to scan. It goes to standard error, so standard output is still exactly
+  the URI and piping it into a portal keeps working.
+
+## v0.6.3 - 2026-09-07
+
+### Fixed
+
+- A gateway that stopped reading in the middle of a lane JOIN no longer wedges
+  that flow's lane admission slots for the flow's life: the OPEN_OK
+  acknowledgement is now written under a deadline, and a staged lane that
+  somehow stays stuck past the rescue-race window is evictable by the next
+  JOIN instead of counting against the ceiling forever. Permanent refusals --
+  a flow already committed to TCP fallback, a closed flow, a duplicate lane id
+  -- are now answered with the reset codes that mean so, rather than the
+  retryable lane-capacity answer the client would otherwise retry for the
+  flow's whole life. The client in turn stops believing a capacity answer that
+  repeats without a single successful rescue: after eight consecutive refusals
+  the flow fails fast so the application reconnects on a fresh session, after
+  three an AUTO flow commits to TCP fallback as its remaining escape, a peer
+  that says the flow already lives on TCP is taken at its word, and a TCP
+  bundle's widening pause after one capacity refusal now expires with the
+  recovery cooldown instead of lasting the flow's life.
+
 ## v0.6.2 - 2026-09-05
 
 ### Fixed

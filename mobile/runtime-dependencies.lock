@@ -4,6 +4,7 @@ github.com/andybalholm/brotli@v1.0.6|MIT|https://github.com/andybalholm/brotli
 github.com/apernet/quic-go@v0.61.1-0.20260806010916-184d081eef3e|MIT|https://github.com/apernet/quic-go
 github.com/google/btree@v1.1.2|Apache-2.0|https://github.com/google/btree
 github.com/klauspost/compress@v1.18.7|BSD-3-Clause|https://github.com/klauspost/compress
+github.com/liyue201/goqr@v0.0.0-20200803022322-df443203d4ea|MIT|https://github.com/liyue201/goqr
 github.com/refraction-networking/utls@v1.8.2|BSD-3-Clause|https://github.com/refraction-networking/utls
 golang.org/x/crypto@v0.55.0|BSD-3-Clause|https://go.googlesource.com/crypto
 golang.org/x/exp@v0.0.0-20250711185948-6ae5c78190dc|BSD-3-Clause|https://go.googlesource.com/exp

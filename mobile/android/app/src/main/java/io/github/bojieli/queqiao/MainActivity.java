@@ -49,6 +49,7 @@ import mobilecore.Mobilecore;
 public final class MainActivity extends Activity implements TunnelHost {
     private static final int REQUEST_CONSENT = 7001;
     private static final int REQUEST_NOTIFICATIONS = 7002;
+    private static final int REQUEST_SCAN_INVITATION = 7003;
     private static final String PREFERENCES = "io.github.bojieli.queqiao.ui";
     private static final String PREFERENCE_MODE = "mode";
 
@@ -60,6 +61,14 @@ public final class MainActivity extends Activity implements TunnelHost {
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "queqiao-app-work");
+        thread.setDaemon(true);
+        return thread;
+    });
+    // Connection tests run side by side, up to the same four at a time as iOS: a
+    // slow or unreachable provider should not hold up the verdict on the others.
+    private static final int MAX_CONCURRENT_PROBES = 4;
+    private final ExecutorService probePool = Executors.newFixedThreadPool(MAX_CONCURRENT_PROBES, runnable -> {
+        Thread thread = new Thread(runnable, "queqiao-probe");
         thread.setDaemon(true);
         return thread;
     });
@@ -77,6 +86,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     private TextView downloadedView;
     private TextView uploadedView;
     private TextView flowsView;
+    private TextView routedView;
     private Button connectionButton;
     private Page currentPage = Page.HOME;
     private String tunnelState = Mobilecore.StateStopped;
@@ -87,7 +97,13 @@ public final class MainActivity extends Activity implements TunnelHost {
     private long bytesUp;
     private long bytesDown;
     private long activeFlows;
+    private String routedSummary = "";
     private final Map<String, ConnectionProbe> profileProbes = new HashMap<>();
+    // The import dialog stays up while the scanner is in front, so a scanned
+    // invitation lands in the field the user was looking at; if the system
+    // reclaimed the activity meanwhile, the dialog is rebuilt around the value.
+    private AlertDialog importDialog;
+    private EditText importInvitationField;
     private boolean testingProfiles;
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
@@ -150,6 +166,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     @Override
     protected void onDestroy() {
         worker.shutdownNow();
+        probePool.shutdownNow();
         super.onDestroy();
     }
 
@@ -282,6 +299,12 @@ public final class MainActivity extends Activity implements TunnelHost {
             row.addView(uploadedView, UiKit.weightedWrap());
             row.addView(flowsView, UiKit.weightedWrap());
             metrics.addView(row, UiKit.matchWrap());
+            // What the rule list decided, so "my rules are working" is something
+            // the screen can show rather than something the user has to infer.
+            routedView = ui.text(routedSummary, 13, Typeface.NORMAL);
+            routedView.setPadding(0, ui.dp(10), 0, 0);
+            routedView.setVisibility(routedSummary.isEmpty() ? View.GONE : View.VISIBLE);
+            metrics.addView(routedView, UiKit.matchWrap());
             content.addView(metrics, ui.spacedCard());
         }
 
@@ -461,6 +484,12 @@ public final class MainActivity extends Activity implements TunnelHost {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_SCAN_INVITATION) {
+            if (resultCode == RESULT_OK && data != null) {
+                acceptScannedInvitation(data.getStringExtra(ScanInvitationActivity.EXTRA_INVITATION));
+            }
+            return;
+        }
         if (requestCode != REQUEST_CONSENT) {
             return;
         }
@@ -537,9 +566,19 @@ public final class MainActivity extends Activity implements TunnelHost {
             invitation.setGravity(Gravity.TOP | Gravity.START);
             content.addView(invitation, UiKit.matchWrap());
 
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            if (ScanInvitationActivity.hasCamera(this)) {
+                Button scan = ui.secondaryButton("Scan QR code");
+                scan.setOnClickListener(view -> startActivityForResult(
+                        new Intent(this, ScanInvitationActivity.class),
+                        REQUEST_SCAN_INVITATION));
+                actions.addView(scan, UiKit.weightedWrap());
+            }
             Button paste = ui.secondaryButton("Paste invitation");
             paste.setOnClickListener(view -> pasteInvitation(invitation));
-            content.addView(paste, ui.topSpaced());
+            actions.addView(paste, UiKit.weightedWrap());
+            content.addView(actions, ui.topSpaced());
 
             deviceName.setHint("Device name");
             deviceName.setText(Build.MODEL);
@@ -556,6 +595,14 @@ public final class MainActivity extends Activity implements TunnelHost {
                 .setNeutralButton(hasDraft ? "Discard pending" : null, null)
                 .setPositiveButton(hasDraft ? "Resume" : "Import", null)
                 .create();
+        importDialog = dialog;
+        importInvitationField = hasDraft ? null : invitation;
+        dialog.setOnDismissListener(ignored -> {
+            if (importDialog == dialog) {
+                importDialog = null;
+                importInvitationField = null;
+            }
+        });
         dialog.setOnShowListener(ignored -> {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
                 String invitationText = invitation.getText().toString().trim();
@@ -764,13 +811,6 @@ public final class MainActivity extends Activity implements TunnelHost {
     }
 
     private void testProfiles(java.util.List<String> profileIds) {
-        if (isTunnelActive() && !controller.allowsProviderTestWhileConnected()) {
-            showFailure(
-                    "Disconnect first",
-                    new IllegalStateException(
-                            "Disconnect the " + controller.noun() + " before testing provider connections"));
-            return;
-        }
         if (!canTestProfiles() || profileIds.isEmpty()) {
             return;
         }
@@ -780,8 +820,9 @@ public final class MainActivity extends Activity implements TunnelHost {
         }
         showPage(currentPage);
         renderConnectionState();
-        worker.execute(() -> {
-            for (String profileId : profileIds) {
+        int[] remaining = {profileIds.size()};
+        for (String profileId : profileIds) {
+            probePool.execute(() -> {
                 ConnectionProbe outcome;
                 try {
                     ProfileRepository.ActiveProfile active = repository.profile(profileId);
@@ -794,21 +835,19 @@ public final class MainActivity extends Activity implements TunnelHost {
                     outcome = ConnectionProbe.unavailable(exception, VpnExclusion.current(this));
                 }
                 ConnectionProbe completed = outcome;
+                // The count lives on the UI thread, where every completion lands.
                 runOnUiThread(() -> {
                     profileProbes.put(profileId, completed);
+                    if (--remaining[0] == 0) {
+                        testingProfiles = false;
+                        renderConnectionState();
+                    }
                     if (currentPage == Page.PROFILES) {
                         showPage(Page.PROFILES);
                     }
                 });
-            }
-            runOnUiThread(() -> {
-                testingProfiles = false;
-                if (currentPage == Page.PROFILES) {
-                    showPage(Page.PROFILES);
-                }
-                renderConnectionState();
             });
-        });
+        }
     }
 
     private void refreshCatalog() {
@@ -859,6 +898,8 @@ public final class MainActivity extends Activity implements TunnelHost {
                     R.string.uploaded_metric,
                     formatBytes(bytesUp)));
             flowsView.setText(getString(R.string.active_flows_metric, activeFlows));
+            routedView.setText(routedSummary);
+            routedView.setVisibility(routedSummary.isEmpty() ? View.GONE : View.VISIBLE);
         }
     }
 
@@ -880,6 +921,7 @@ public final class MainActivity extends Activity implements TunnelHost {
                 bytesUp = 0;
                 bytesDown = 0;
                 activeFlows = 0;
+                routedSummary = "";
             }
             return;
         }
@@ -890,6 +932,13 @@ public final class MainActivity extends Activity implements TunnelHost {
                 bytesDown = transport.optLong("BytesDown", 0);
                 activeFlows = transport.optLong("ActiveFlows", 0);
             }
+            JSONObject packets = new JSONObject(encoded).optJSONObject("packets");
+            JSONObject routing = packets == null ? null : packets.optJSONObject("routing");
+            routedSummary = routing == null || routing.optInt("rules", 0) == 0
+                    ? ""
+                    : "Rules sent " + routing.optLong("proxied", 0) + " flows through Queqiao, "
+                            + routing.optLong("directed", 0) + " direct, "
+                            + routing.optLong("rejected", 0) + " rejected";
         } catch (Exception ignored) {
             // Metrics are optional UI decoration and never affect tunnel state.
         }
@@ -905,6 +954,18 @@ public final class MainActivity extends Activity implements TunnelHost {
             invitation = intent.getStringExtra(Intent.EXTRA_TEXT);
         }
         if (invitation != null && invitation.trim().startsWith("queqiao://")) {
+            showImportDialog(invitation.trim());
+        }
+    }
+
+    private void acceptScannedInvitation(String invitation) {
+        if (invitation == null || invitation.isBlank()) {
+            return;
+        }
+        if (importDialog != null && importDialog.isShowing() && importInvitationField != null) {
+            importInvitationField.setText(invitation.trim());
+            importInvitationField.setError(null);
+        } else {
             showImportDialog(invitation.trim());
         }
     }
@@ -1003,9 +1064,8 @@ public final class MainActivity extends Activity implements TunnelHost {
     }
 
     /**
-     * The mode picker exists only where more than one mode is compiled in, which
-     * today means the debug build. Switching while connected would leave the
-     * other service running with nothing on screen driving it.
+     * Switching while connected would leave the other service running with
+     * nothing on screen driving it.
      */
     @SuppressLint("SetTextI18n")
     private View buildModeCard() {
@@ -1104,8 +1164,10 @@ public final class MainActivity extends Activity implements TunnelHost {
     }
 
     private boolean canTestProfiles() {
-        boolean blockedByConnection = isTunnelActive() && !controller.allowsProviderTestWhileConnected();
-        return !blockedByConnection && !busy && !testingProfiles;
+        // A test may run while connected in either mode: the full tunnel excludes
+        // this app's UID, and export mode holds no interface, so the probe always
+        // leaves by the device's ordinary route rather than through Queqiao.
+        return !busy && !testingProfiles;
     }
 
     private boolean isTransitioning() {

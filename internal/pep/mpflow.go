@@ -255,6 +255,12 @@ type multipathFlow struct {
 	// does not know this session. That answer is permanent, so it ends the
 	// replacement grace rather than being retried.
 	resumeRefused atomic.Bool
+	// capacityRefusals counts consecutive rescue rounds the peer answered
+	// with its lane-admission ceiling. One answer is the ordinary loser of a
+	// rescue race; several in a row with no successful round between them are
+	// the signature of a wedged admission slot the peer cannot see, which is
+	// when the answer stops being treated as transient.
+	capacityRefusals atomic.Int64
 	// replacementAbandoned records that whatever opens replacement lanes for
 	// this flow has stopped: its attempt budget is spent, or its manager has
 	// returned. The grace exists to cover the time a replacement needs to
@@ -502,13 +508,13 @@ func (f *multipathFlow) addLane(lane *mpLane) error {
 	}
 	select {
 	case <-f.done:
-		return errors.New("flow is closed")
+		return errLaneFlowClosed
 	default:
 	}
 	f.lanesMu.Lock()
 	if _, exists := f.lanes[lane.id]; exists {
 		f.lanesMu.Unlock()
-		return errors.New("duplicate lane id")
+		return errLaneDuplicateID
 	}
 	limits := f.memoryLimits
 	if limits.laneWriteQueue < 2 || limits.laneControlReserve >= limits.laneWriteQueue {
@@ -856,6 +862,15 @@ func (f *multipathFlow) observeTransport(lanes []*mpLane) {
 	}
 }
 
+// noteLaneCapacityRefusal records a rescue round the peer answered with its
+// lane-admission ceiling; resetLaneCapacityRefusals clears the streak on any
+// other round outcome, since only consecutive answers mark the desync.
+func (f *multipathFlow) noteLaneCapacityRefusal() { f.capacityRefusals.Add(1) }
+
+func (f *multipathFlow) resetLaneCapacityRefusals() { f.capacityRefusals.Store(0) }
+
+func (f *multipathFlow) laneCapacityRefusals() int64 { return f.capacityRefusals.Load() }
+
 func (f *multipathFlow) laneCount() int {
 	f.lanesMu.RLock()
 	defer f.lanesMu.RUnlock()
@@ -875,21 +890,23 @@ func (f *multipathFlow) laneCount() int {
 //
 // The victim is the oldest evictable lane with the replacement's role, or the
 // oldest evictable lane of any role when no same-role lane exists: role
-// orders the choice but never blocks a rescue. Two lanes are never evictable.
-// A lane whose JOIN handshake is still in flight: parallel rescue attempts
-// race to this endpoint, and evicting a staged lane can kill the attempt the
-// peer has just crowned. And a lane younger than minAge: admission order is
-// not the order the peer crowned its winner in, so a freshly admitted lane
-// may still be waiting on the peer's decision while the racing losers it
-// beat are still arriving; the half-open sockets eviction exists for are
-// never that young. With no evictable lane the JOIN is refused -- the
-// transient capacity answer the racing peer already expects for its losing
-// attempts.
+// orders the choice but never blocks a rescue. One lane is never evictable --
+// a lane younger than minAge, whatever its state. Parallel rescue JOINs race
+// to this endpoint, and admission order is not the order the peer crowned its
+// winner in, so a freshly admitted lane may still be waiting on the peer's
+// decision while the racing losers it beat are still arriving; the half-open
+// sockets eviction exists for are never that young. The age window is also
+// what protects a staged lane whose JOIN handshake is still in flight:
+// admission writes its OPEN_OK under a deadline of the same budget, so a
+// staged lane that never activated and is older than minAge is not a
+// handshake in flight but a wedged admission, and retiring it is how the slot
+// is freed. With no evictable lane the JOIN is refused -- the transient
+// capacity answer the racing peer already expects for its losing attempts.
 func (f *multipathFlow) retireOldestLane(control bool, minAge time.Duration) bool {
 	f.lanesMu.Lock()
 	var victim *mpLane
 	for _, lane := range f.lanes {
-		if lane.closed.Load() || !f.laneReady(lane) {
+		if lane.closed.Load() {
 			continue
 		}
 		if minAge > 0 && time.Since(lane.admitted) < minAge {

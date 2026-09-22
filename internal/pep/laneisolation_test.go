@@ -363,6 +363,73 @@ func TestBulkIsolationAppliesAtOneConfiguredLane(t *testing.T) {
 	}
 }
 
+// A staged lane is protected from eviction only while its handshake could
+// still be in flight. The admission's OPEN_OK write is bounded by the same
+// budget as the rescue-race window, so a staged lane older than the window
+// that never activated is not a handshake in flight but a wedged admission,
+// and the next join must be able to take its slot.
+func TestStaleStagedLaneIsEvictableWithoutActivation(t *testing.T) {
+	flow := newIsolationTestFlow(t, false)
+	session := newServerFlow(flow, identity.Principal{}, TransportQUIC, 1)
+	staged := isolationLane(t, 1)
+	staged.staged = true
+	if err := session.addLane(staged); err != nil {
+		t.Fatal(err)
+	}
+	racer := isolationLane(t, 2)
+	if err := session.addLane(racer); err == nil {
+		t.Fatal("a racing join evicted a lane whose handshake could still be in flight")
+	}
+	if staged.closed.Load() {
+		t.Fatal("the young staged lane was retired inside the rescue-race window")
+	}
+	// Past the window the never-activated staged lane is a wedged admission:
+	// counted against the ceiling yet never able to carry traffic.
+	staged.admitted = time.Now().Add(-2 * laneDeadPathDetection)
+	if err := session.addLane(racer); err != nil {
+		t.Fatalf("join behind a wedged staged lane refused: %v", err)
+	}
+	if !staged.closed.Load() || racer.closed.Load() {
+		t.Fatalf("eviction retired staged=%t racer=%t, want true/false", staged.closed.Load(), racer.closed.Load())
+	}
+	if got := flow.laneCount(); got != 1 {
+		t.Fatalf("lane count = %d, want the admission ceiling of 1", got)
+	}
+}
+
+// Admission refusals are typed by how permanent they are, because the join
+// handler answers each with the reset code the peer's retry policy is built
+// on: only the genuine ceiling may wear the transient capacity answer.
+func TestLaneAdmissionRefusalsAreTypedByPermanence(t *testing.T) {
+	flow := newIsolationTestFlow(t, false)
+	session := newServerFlow(flow, identity.Principal{}, TransportTCP, 4)
+	if err := session.addLane(isolationLaneKind(t, 1, TransportQUIC)); !errors.Is(err, errLaneFlowTCPMode) {
+		t.Fatalf("QUIC join against a TCP-mode flow = %v, want %v", err, errLaneFlowTCPMode)
+	}
+	if err := session.addLane(isolationLaneKind(t, 1, TransportTCP)); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.addLane(isolationLaneKind(t, 1, TransportTCP)); !errors.Is(err, errLaneDuplicateID) {
+		t.Fatalf("duplicate lane id = %v, want %v", err, errLaneDuplicateID)
+	}
+	closedFlow := newIsolationTestFlow(t, false)
+	closedSession := newServerFlow(closedFlow, identity.Principal{}, TransportTCP, 1)
+	closedFlow.closeAll()
+	if err := closedSession.addLane(isolationLaneKind(t, 1, TransportTCP)); !errors.Is(err, errLaneFlowClosed) {
+		t.Fatalf("join against a closed flow = %v, want %v", err, errLaneFlowClosed)
+	}
+	// The ceiling answer: one young lane fills a budget of one, and eviction
+	// cannot take it inside the rescue-race window.
+	fullFlow := newIsolationTestFlow(t, false)
+	fullSession := newServerFlow(fullFlow, identity.Principal{}, TransportTCP, 1)
+	if err := fullSession.addLane(isolationLaneKind(t, 1, TransportTCP)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fullSession.addLane(isolationLaneKind(t, 2, TransportTCP)); !errors.Is(err, errLaneLimitReached) {
+		t.Fatalf("join at the admission ceiling = %v, want %v", err, errLaneLimitReached)
+	}
+}
+
 // Isolation costs a handshake and a fresh congestion window, so it must only
 // happen while another flow actually shares the control connection. The count
 // that decides this has to track pooled flows exactly, or a lone bulk transfer

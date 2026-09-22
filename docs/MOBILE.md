@@ -10,24 +10,26 @@ qualification remains open; do not read their source availability as a
 production-ready mobile release.
 
 Queqiao has native Android and iOS applications backed by one shared Go core.
-Neither is a wrapper around the desktop user interface, and the two are
-deliberately different products:
+Neither is a wrapper around the desktop user interface:
 
-- **Android** is an export client. It enrolls the device, holds the identity,
-  keeps the certificate renewed, and serves the gateway as one authenticated
-  SOCKS5 endpoint on loopback for whichever routing client the user already
-  runs. The released build declares no `VpnService`.
-  [Android export mode](ANDROID-EXPORT.md) is the full account.
+- **Android** ships two connection modes and lets the user choose. The
+  **full-device tunnel**, the default, installs a `VpnService` interface and
+  carries every app's traffic under Queqiao's own routing rules. **Export
+  mode** installs nothing: it enrolls the device, holds the identity, keeps
+  the certificate renewed, and serves the gateway as one authenticated SOCKS5
+  endpoint on loopback for whichever routing client the user already runs.
+  [Android export mode](ANDROID-EXPORT.md) is the full account of the second.
 - **iOS** is a full-device packet tunnel, because it cannot compose: the
   platform runs one tunnel provider at a time, a plain app cannot hold a
   background listener, and no App Store routing client offers a plugin
   interface. It therefore carries its own routing rules.
 
-This follows the scope rule in [Vision](VISION.md) — Queqiao supplies the
-paired data plane, and a larger overlay supplies discovery, routing, and
-policy. Android can honour it because loopback is shared between apps, so the
-released app hands routing to whichever client owns the tunnel. iOS cannot
-hand it anywhere: there is no client to hand it to, so the rules live here.
+The scope rule in [Vision](VISION.md) — Queqiao supplies the paired data plane,
+and a larger overlay supplies discovery, routing, and policy — is what export
+mode honours: loopback is shared between Android apps, so routing can be handed
+to whichever client owns the tunnel. A user with no such client still needs a
+connection, which is what the full tunnel is for, and iOS cannot hand routing
+anywhere at all. Those two tunnels carry the rules described next.
 
 What "here" means is one rule list per profile, in the `TYPE,VALUE,ACTION`
 syntax that Clash, mihomo, sing-box and Shadowrocket all read, evaluated in
@@ -37,8 +39,10 @@ the shared core rather than in either client. `DOMAIN`, `DOMAIN-SUFFIX`,
 tunnel. Name rules work because the core answers lookups itself from a
 reserved range and reverses the handle when the connection arrives; a
 `DIRECT` flow is then resolved on the device, which is the vantage that makes
-the answer right. The Android debug build reads the same list from a file, so
-the two tunnels behave the same where Android has a tunnel at all.
+the answer right. The Android full tunnel has the same editor, the same lint
+and the same China preset, so the two tunnels behave the same; the preset is
+one text, and `scripts/test_mobile_route_parity.py` checks the Android asset
+against the Swift literal byte for byte.
 
 What it still is not: per-app routing, process rules, `URL-REGEX`,
 `USER-AGENT`, remote rule-set subscriptions, or several outbounds to choose
@@ -46,9 +50,8 @@ between. There is one tunnel, so an action naming a proxy group is refused
 rather than guessed at.
 
 The iOS app and its packet-tunnel extension use public Network Extension APIs,
-including `NEPacketTunnelFlow`. The Android debug build, and only the debug
-build, additionally offers a `VpnService` tunnel as the test vehicle for the
-shared packet stack. No private iOS API is used.
+including `NEPacketTunnelFlow`; no private iOS API is used. The Android full
+tunnel uses `VpnService` and drives the same shared packet stack.
 
 ## Distribution constraints
 
@@ -62,12 +65,11 @@ These constraints are store policy, not a technical restriction in the source:
   eligible for public App Store publication.
 - [Google Play Console requirements](https://support.google.com/googleplay/android-developer/answer/10788890)
   require developers of *apps approved to use the `VpnService` class* to
-  register as an Organization. The released Android app declares no
-  `VpnService`, so it falls outside that clause. That removes the one blocker
-  known by name; it is not a guarantee of publication, because the app's
-  `specialUse` foreground-service justification is a review surface of its own
-  and Play has separate policy pages. CI asserts the property on the assembled
-  release APK so it cannot regress unnoticed.
+  register as an Organization. The released Android app declares a
+  `VpnService` for its full-device tunnel, so publishing it on Google Play
+  needs an Organization account and Play's VPN declaration, in addition to the
+  `specialUse` foreground-service justification that is a review surface of
+  its own. Direct distribution of the signed APK carries no such requirement.
 - Android distribution outside Google Play is a separate system. The
   [Android Developer Console](https://developer.android.com/developer-verification)
   supports verified direct distribution, including personal accounts. Its
@@ -87,16 +89,17 @@ the linked primary sources are authoritative.
 
 | Capability | Desktop | Android | iOS |
 | --- | --- | --- | --- |
-| Product model | SOCKS5 helper | SOCKS5 helper | Full-device tunnel |
-| Owner of routing policy | Clash/mihomo | The consumer VPN client (debug build: Queqiao) | Queqiao |
+| Product model | SOCKS5 helper | Full-device tunnel (default) or SOCKS5 helper | Full-device tunnel |
+| Owner of routing policy | Clash/mihomo | Queqiao in the full tunnel; the consumer VPN client in export mode | Queqiao |
 | One-time `queqiao://` enrollment | Yes | Yes | Yes |
+| Invitation from a QR code | `provider invite --qr` draws it | Camera scan, decoded by the Go core | Camera scan, detected by AVFoundation |
 | Crash-safe enrollment draft | Mode-0600 file | Keystore-encrypted | This-device-only Keychain |
 | TLS 1.3 mutual authentication and root pin | Yes | Same core | Same core |
 | Hourly certificate maintenance | Yes | Yes | Yes |
 | QUIC with TLS/TCP fallback | Yes | Same core | Same core |
 | SOCKS TCP and UDP | Ingress API | Exported listener | Internal adapter |
 | SOCKS listener authentication | None; loopback-only | Required, per install | N/A |
-| Full IPv4 and IPv6 tunnel | Via external TUN client | Debug build only | Native |
+| Full IPv4 and IPv6 tunnel | Via external TUN client | Native, in the full tunnel | Native |
 | Bounded sessions and packet queues | Yes | Yes | Yes |
 | Aggregate in-memory metrics | Yes | Yes | Yes |
 | Multiple device-bound provider profiles | N/A (one profile per process) | Yes | Yes |
@@ -139,7 +142,15 @@ platforms; what differs is what a connection *is*.
   as a false disconnect.
 
 Both apps import a `queqiao://` invitation through an explicit in-app paste
-action; Android can also appear as a user-selected target for shared plain text.
+action or by scanning it as a QR code with the device camera, which is what
+`queqiaod provider invite --qr` draws in the provider's terminal. Android can
+also appear as a user-selected target for shared plain text. The camera opens
+only from the import screen and only while that screen is in front. On Android
+the frame is decoded on the device by the Go core; on iOS the detection is
+AVFoundation's own. On neither platform does the image or the decoded
+invitation leave the process, and both platforms validate the scanned
+invitation before it reaches the form, so a QR code that is not a Queqiao
+invitation is refused rather than imported.
 They intentionally do not register the `queqiao` custom URL scheme because
 mobile platforms cannot authenticate which installed application owns a custom
 scheme, while an unused invitation is a bearer credential. Enrollment remains
@@ -154,11 +165,24 @@ Android-Keystore-encrypted envelope excluded from backup. The portable input is
 the provider-issued one-time invitation. Deleting a profile therefore requires
 a new invitation, consistent with the desktop identity model.
 
-### Android: one endpoint, someone else's rules
+### Android: two modes
 
-The released Android app connects by starting a foreground service that serves
-an authenticated SOCKS5 endpoint on loopback, and by doing nothing else. It
-declares no `VpnService`, holds no routing rules, and answers no DNS. The
+The Android app asks which mode to connect in, under **Settings → Connection
+mode**, and remembers the answer. A new install starts in the full-device
+tunnel; an install that had already chosen keeps its choice. The mode cannot be
+changed while connected, because that would leave the other service running
+with nothing on screen driving it.
+
+The **full-device tunnel** asks for Android's VPN consent once, installs an
+interface with an MTU of 1280, resolves DNS through Queqiao, and excludes its
+own package so identity renewal and connection tests never re-enter the tunnel.
+It carries the routing subset described below. Always-on VPN stays declined
+until restart and locked-device behaviour has completed the physical-device
+qualification matrix.
+
+**Export mode** connects by starting a foreground service that serves an
+authenticated SOCKS5 endpoint on loopback, and by doing nothing else. It
+installs no interface, holds no routing rules, and answers no DNS. The
 client that owns the device's tunnel decides what reaches Queqiao, and has to
 exclude Queqiao's own package from that tunnel or Queqiao's uplink is captured
 by it and the connection loops rather than failing. The app watches its own
@@ -168,13 +192,11 @@ enforcement.
 credentials, the bypass step for each consumer client, and the setup snippets
 the app renders with the live values filled in.
 
-The full-device tunnel remains in the debug build as the vehicle that drives
-the shared packet stack end to end on real hardware, and is never published.
+### The tunnels: a bounded routing subset
 
-### iOS: a bounded routing subset
-
-iOS cannot compose, so the tunnel carries routing policy itself. What it
-carries is deliberately a subset rather than a rule engine.
+The iOS tunnel and the Android full tunnel carry routing policy themselves.
+What they carry is deliberately a subset rather than a rule engine, and it is
+the same subset on both.
 
 Each profile has one routing mode:
 
@@ -188,10 +210,10 @@ The bypass rules are:
 - **Local networks** keeps IPv4 private, shared-address, loopback, and
   link-local destinations plus IPv6 unique-local, loopback, and link-local
   destinations outside the tunnel. Internet and DNS traffic still use
-  Queqiao. iOS expresses these as excluded Network Extension routes. The
-  Android debug tunnel constructs the exact complement as included CIDR routes
-  so behavior is the same on every supported API level, including releases
-  before Android added `VpnService.Builder.excludeRoute`.
+  Queqiao. iOS expresses these as excluded Network Extension routes, and
+  Android 13 and later as `VpnService.Builder.excludeRoute`. Earlier Android
+  releases have no way to exclude a route, so there the tunnel constructs the
+  exact complement as included CIDR routes instead.
 - **Custom routes** — up to 256 hand-entered CIDR blocks kept off the
   tunnel. An entry that is not a CIDR block is refused as it is saved rather
   than dropped quietly, because a discarded route would leave the user
@@ -206,7 +228,10 @@ The bypass rules are:
   through the tunnel via Cloudflare, so a Chinese domain resolved from the
   gateway's vantage point returns addresses that need not be in the set and
   will still route through Queqiao. The UI states this rather than implying
-  domain-level routing.
+  domain-level routing. On Android the set needs `excludeRoute`, so it is
+  offered on Android 13 and later; a complement of several thousand blocks is
+  not a route table worth installing, and on earlier releases a
+  `GEOIP,CN,DIRECT` rule keeps the same addresses direct in the core.
 The mode and the rules were three settings that did not know about each other:
 a two-value traffic policy, a bundled-set toggle, and a route list, where the
 latter two applied whatever the policy said. A profile reading "All traffic"
@@ -218,8 +243,8 @@ destination back through the tunnel. The catalog still carries the old
 downgrading to an earlier build does not fail to decode and take every enrolled
 profile with it.
 
-Routing is editable while the tunnel is connected, which is the state in which
-it most often needs changing. The app writes the change to the Keychain catalog
+On iOS, routing is editable while the tunnel is connected, which is the state in
+which it most often needs changing. The app writes the change to the Keychain catalog
 and asks the running provider to re-read it over the NetworkExtension
 app-message channel; the provider rebuilds the plan and replaces the interface
 description with `setTunnelNetworkSettings`. The packet engine and its uplink
@@ -229,6 +254,8 @@ change — much less than the disconnect this replaces, but not nothing. When th
 says the running tunnel is still on the previous rules rather than letting the
 screen and the tunnel silently disagree. Which profile a tunnel uses still
 requires disconnecting; that replaces the device identity, not a route.
+Android cannot re-plumb an established `VpnService` interface, so there routing
+is edited while disconnected and applies at the next connect.
 
 - **Automatic connection rules**, off by default. A profile may bring the
   tunnel up on Wi-Fi, on cellular, or both, and keep it down on Wi-Fi networks
@@ -256,11 +283,10 @@ than failing and taking every enrolled profile on the device with it.
 The apps deliberately do not expose experimental transport tuning in their
 primary UI. They use the reviewed desktop defaults. The iOS tunnel installs an
 MTU of 1280 and sends DNS through Queqiao to Cloudflare's `1.1.1.1` and
-`2606:4700:4700::1111` resolvers; on Android the consumer client decides both.
-Always-on VPN is not offered by the released Android app at all, since it
-declares no `VpnService`; the debug tunnel keeps it disabled until restart and
-locked-device behavior has completed the physical-device qualification
-matrix.
+`2606:4700:4700::1111` resolvers, and the Android full tunnel does the same;
+in Android export mode the consumer client decides both. Always-on VPN is
+declined by the Android tunnel until restart and locked-device behavior has
+completed the physical-device qualification matrix.
 
 ## Dependency policy
 
@@ -268,8 +294,11 @@ The packet adapter, SOCKS5 CONNECT/UDP ASSOCIATE implementation, lifecycle,
 storage integration, and platform UI are maintained in this repository. The
 only non-Queqiao runtime networking foundation added for mobile is the actively
 maintained Apache-2.0 gVisor netstack; it supplies TCP/IP state machines, not a
-proxy protocol or application. Android UI uses only the platform SDK, and iOS
-uses only Apple system frameworks.
+proxy protocol or application. The Android QR-code reader is the MIT-licensed
+[goqr](https://github.com/liyue201/goqr) port of quirc, linked into the Go core
+so a camera frame is decoded in process; the camera itself is the platform
+Camera2 API. Android UI uses only the platform SDK, and iOS uses only Apple
+system frameworks.
 
 Every linked Go module is pinned in `mobile/runtime-dependencies.lock`, limited
 to MIT, BSD-3-Clause, or Apache-2.0, and checked from the compiled package graph
@@ -340,20 +369,19 @@ Never commit a keystore or password. Keep an offline backup: losing the key
 prevents trustworthy updates. Register the final package name and signing
 certificate through the applicable Android distribution console before a wide
 release. Google Play additionally requires a privacy policy and Data safety
-answers; its Organization requirement is scoped to apps approved to use
-`VpnService`, which the release build is not.
+answers, and, because the release build declares a `VpnService`, an
+Organization account and Play's VPN declaration.
 
-The release APK must declare no `BIND_VPN_SERVICE` and no
-`android.net.VpnService` intent filter. CI checks this with `aapt2 dump
-xmltree` over the assembled artifact, and it holds structurally as well: the
-tunnel sources live in `app/src/debug/`, so the release build never compiles
-them. Verify it locally the same way when changing anything about the manifest
-or the source-set split:
+The release APK must declare both services, neither exported: the tunnel,
+protected by `BIND_VPN_SERVICE` so only the system can bind it, and the export
+endpoint. CI checks this with `aapt2 dump xmltree` over the assembled artifact,
+next to the enumerated permission set. Verify it locally the same way when
+changing anything about the manifest:
 
 ```sh
 "$ANDROID_HOME"/build-tools/36.0.0/aapt2 dump xmltree \
   --file AndroidManifest.xml app/build/outputs/apk/release/*.apk \
-  | grep -iE 'BIND_VPN_SERVICE|android\.net\.VpnService'
+  | grep -E 'QueqiaoVpnService|QueqiaoProxyService|BIND_VPN_SERVICE|exported'
 ```
 
 ## Build iOS for a physical device
@@ -409,7 +437,12 @@ QUIC-to-TCP fallback, certificate renewal, revocation, suspend/resume,
 Wi-Fi/cellular transitions, bounded 24-hour load, clean install/update/rollback,
 store/direct-distribution declarations, and independent security review.
 
-Two qualifications are specific to the current product split:
+Three qualifications are specific to the current product split:
+
+- The Android full tunnel is qualified on a physical device in each routing
+  mode: exit address through the gateway, a bypassed local and custom
+  destination reached directly, the China preset keeping a named Chinese site
+  direct, and a connection test run while connected.
 
 - Android export mode is qualified against a real consumer client with Queqiao
   excluded from its tunnel, and then again with the exclusion removed to

@@ -111,7 +111,11 @@ public final class SecureStoreTestRunner extends Instrumentation {
                 "secret.first",
                 "Example",
                 summary,
-                TrafficPolicy.EXCLUDE_LOCAL_NETWORKS,
+                RoutingConfiguration.DEFAULT
+                        .withMode(RoutingConfiguration.Mode.BYPASS_RULES)
+                        .withBypassChinaDirect(true)
+                        .withCustomRoutes(java.util.Collections.singletonList("203.0.113.0/24"))
+                        .withRules("GEOIP,CN,DIRECT\nFINAL,PROXY"),
                 "2026-08-18T00:00:00Z");
         ProfileRepository.Catalog catalog = new ProfileRepository.Catalog();
         catalog.selectedProfileId = "missing";
@@ -124,12 +128,58 @@ public final class SecureStoreTestRunner extends Instrumentation {
 
         ProfileRepository.Catalog decoded = ProfileRepository.Catalog.fromJson(catalog.toJson());
         require(decoded.profiles.size() == 1, "catalog round-trip lost its profile");
-        require(decoded.profiles.get(0).trafficPolicy == TrafficPolicy.EXCLUDE_LOCAL_NETWORKS,
-                "catalog round-trip changed the traffic policy");
+        RoutingConfiguration routing = decoded.profiles.get(0).routing;
+        require(routing.mode == RoutingConfiguration.Mode.BYPASS_RULES
+                        && routing.bypassChinaDirect
+                        && !routing.bypassLocalNetworks
+                        && routing.customRoutes.equals(java.util.Collections.singletonList("203.0.113.0/24"))
+                        && routing.rules.equals("GEOIP,CN,DIRECT\nFINAL,PROXY"),
+                "catalog round-trip changed the routing settings");
+
+        // A catalog written before routing rules existed excluded local networks
+        // through traffic_policy alone; it has to keep doing so after the upgrade.
+        org.json.JSONObject legacy = profile.toJson();
+        for (String key : new String[] {
+                "routing_mode", "bypass_local_networks", "bypass_china_direct", "bypass_routes", "routing_rules"}) {
+            legacy.remove(key);
+        }
+        legacy.put("traffic_policy", "exclude-local-networks");
+        RoutingConfiguration migrated = ProfileRepository.ProfileRecord.fromJson(legacy).routing;
+        require(migrated.mode == RoutingConfiguration.Mode.BYPASS_RULES && migrated.bypassLocalNetworks,
+                "a legacy local-network exclusion did not survive the migration");
     }
 
     private void testLocalNetworkRoutePolicy() throws Exception {
-        java.util.List<RoutePolicy.RouteSpec> routes = RoutePolicy.routesExcludingLocalNetworks();
+        RoutingConfiguration routing = RoutingConfiguration.DEFAULT
+                .withMode(RoutingConfiguration.Mode.BYPASS_RULES)
+                .withBypassLocalNetworks(true)
+                .withCustomRoutes(java.util.Arrays.asList("203.0.113.0/24", "198.51.100.7", "not-a-route"));
+        RoutePolicy.Plan plan = RoutePolicy.plan(routing, java.util.Collections.emptyList());
+        require(plan.rejected.equals(java.util.Collections.singletonList("not-a-route")),
+                "an invalid custom route was not reported");
+        java.util.List<RoutePolicy.RouteSpec> routes = RoutePolicy.remainderAfter(plan.excluded);
+        require(!isRouted(routes, "203.0.113.9"), "a custom bypass block is routed");
+        require(!isRouted(routes, "198.51.100.7"), "a custom bypass address is routed");
+        require(isRouted(routes, "198.51.100.8"), "the neighbour of a bypassed address is not routed");
+        require(RoutePolicy.plan(routing.withMode(RoutingConfiguration.Mode.ALL_TRAFFIC),
+                        java.util.Collections.emptyList()).excluded.isEmpty(),
+                "bypass rules were applied while routing all traffic");
+
+        byte[] packed = CountryRoutes.packedChinaSet(getTargetContext());
+        java.util.List<RoutePolicy.RouteSpec> chinaDirect = CountryRoutes.decode(packed);
+        require(chinaDirect.size() == CountryRoutes.blockCount(packed) && chinaDirect.size() > 1000,
+                "the bundled country set did not decode to its declared block count");
+        RoutePolicy.Plan withChina = RoutePolicy.plan(routing.withBypassChinaDirect(true), chinaDirect);
+        require(withChina.excluded.size() > plan.excluded.size()
+                        && withChina.excluded.size() <= RoutePolicy.ROUTE_LIMIT,
+                "the country set was not added within the route limit");
+
+        // The builder validates every prefix it is handed (it refuses loopback, for
+        // one), so the whole plan has to survive the real thing, not just the model.
+        RoutePolicy.apply(new android.net.VpnService().new Builder(),
+                routing.withBypassChinaDirect(true)
+                        .withCustomRoutes(java.util.Arrays.asList("203.0.113.0/24", "127.0.0.1", "::1")),
+                chinaDirect);
         require(isRouted(routes, "8.8.8.8"), "public IPv4 address is not routed");
         require(isRouted(routes, "2001:4860:4860::8888"), "public IPv6 address is not routed");
         require(!isRouted(routes, "10.0.0.1"), "private IPv4 address is routed");
@@ -173,7 +223,7 @@ public final class SecureStoreTestRunner extends Instrumentation {
         // has no public constructor or builder, so the only capabilities an
         // instrumented test can obtain are the ones the device actually has.
         // Standing up a real VpnService to produce one would be testing the
-        // debug tunnel, not this. What remains checkable is checked.
+        // full tunnel, not this. What remains checkable is checked.
     }
 
     /**

@@ -3,6 +3,7 @@
     <string name="app_name">Queqiao</string>
     <string name="connection_channel_name">Queqiao connection</string>
     <string name="connection_channel_description">Queqiao connection state</string>
+    <string name="scan_invitation_title">Scan invitation</string>
     <string name="import_profile_intro">Import a profile to get started</string>
     <string name="connection_profile_summary">%1$s · %2$s</string>
     <string name="downloaded_metric">Downloaded\n%1$s</string>

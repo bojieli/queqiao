@@ -4,6 +4,7 @@ go 1.26.6
 
 require (
 	github.com/bojieli/queqiao v0.0.0
+	github.com/liyue201/goqr v0.0.0-20200803022322-df443203d4ea
 	golang.org/x/sys v0.47.0
 	gvisor.dev/gvisor v0.0.0-20260701204157-69c2d17aea96
 )

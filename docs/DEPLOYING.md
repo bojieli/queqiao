@@ -331,12 +331,17 @@ authenticated private channel:
 sudo -u queqiao /usr/local/bin/queqiaod provider invite \
   --state /var/lib/queqiao/provider \
   --user alice \
-  --expires-in 1h
+  --expires-in 1h \
+  --qr
 ```
 
 The URI is a temporary bearer credential. The provider stores only its token
-digest, and the lifetime cannot exceed seven days. A portal may capture the
-stdout value or render it as a QR code without translating any fields.
+digest, and the lifetime cannot exceed seven days. With `--qr` the command
+also draws the invitation as a QR code, which the Android and iOS apps scan
+from their import screens; the code goes to standard error so standard output
+stays the bare URI and is still safe to pipe. A portal may capture that value
+or render it as a QR code without translating any fields. Do not render it
+through a web QR generator, which would receive the credential.
 
 Audit or revoke unused invitations without printing their tokens:
 

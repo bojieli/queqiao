@@ -40,6 +40,13 @@ const (
 
 	maxLaneRecoveryAttempts = 8
 	laneRecoveryResetAfter  = 5 * time.Minute
+	// laneJoinCapacityTCPCommit is how many consecutive capacity answers a
+	// recovery path takes before it stops believing the answer is transient.
+	// One or two in a row are the ordinary losers of a rescue race; at three
+	// the likelier reading is an admission slot wedged on the peer, and the
+	// AUTO TCP commit -- deliberately suppressed for a fresh answer, since a
+	// QUIC sibling may already hold the lane -- becomes the flow's escape.
+	laneJoinCapacityTCPCommit = 3
 	// A rejected speculative lane must not be reopened on every scheduler tick.
 	// The backoff is intentionally shorter than a normal bulk request timeout,
 	// but long enough to collect a fresh throughput/RTT sample on the surviving
@@ -1575,6 +1582,14 @@ var errLaneJoinRejected = errors.New("lane join rejected")
 // lane cap, where all but the first admitted are supposed to lose.
 var errLaneJoinCapacity = errors.New("lane join refused by peer lane capacity")
 
+// errLaneJoinTCPMode is the peer saying the flow has already committed to
+// TCP fallback, so a QUIC lane can never be admitted to it. It stays an
+// errLaneJoinRejected -- a configuration-pinned QUIC client has no TCP commit
+// to make and must fail the flow fast as before -- but an AUTO recovery path
+// matches it specifically to commit to TCP at once instead of spending its
+// replacement grace on QUIC retries the peer has already ruled out.
+var errLaneJoinTCPMode = fmt.Errorf("%w: flow switched to TCP fallback", errLaneJoinRejected)
+
 // errBulkConnectionLimit is a scheduling answer, not a transport failure.
 // The caller keeps the flow on its pooled control connection when every
 // isolation slot is occupied. Falling back to a dedicated connection here
@@ -1639,8 +1654,11 @@ func (c *Client) completeLaneJoin(lane *authenticatedLane, flowID uint64, flags 
 	if response.Header.Type == protocol.TypeReset && response.Header.SessionID == lane.sessionID && response.Header.FlowID == flowID {
 		_ = lane.fc.Close()
 		if len(response.Payload) > 1 {
-			if session.ResetCode(response.Payload[0]) == session.ResetFlowLimit {
+			switch session.ResetCode(response.Payload[0]) {
+			case session.ResetFlowLimit:
 				return nil, fmt.Errorf("%w: %s", errLaneJoinCapacity, string(response.Payload[1:]))
+			case session.ResetTransport:
+				return nil, fmt.Errorf("%w: %s", errLaneJoinTCPMode, string(response.Payload[1:]))
 			}
 			return nil, fmt.Errorf("%w: %s", errLaneJoinRejected, string(response.Payload[1:]))
 		}
@@ -1980,6 +1998,17 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 					c.cfg.Logger.Debug("peer cannot resume this association", "flow_id", flowID, "error", err)
 					return
 				}
+				if errors.Is(err, errLaneJoinCapacity) && flow.laneCapacityRefusals() >= maxLaneRecoveryAttempts {
+					// The ceiling answer is transient only while lanes
+					// genuinely come and go. This many consecutive refusals
+					// without one successful round is a wedged admission slot
+					// the peer cannot see, so the flow fails fast here exactly
+					// as it does for a permanent refusal, and the application
+					// reconnects on a fresh flow.
+					flow.resumeRefused.Store(true)
+					c.cfg.Logger.Debug("peer lane capacity answer persisted; giving up on this association", "flow_id", flowID, "refusals", flow.laneCapacityRefusals())
+					return
+				}
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					c.cfg.Logger.Warn("stall rescue unavailable", "flow_id", flowID, "error", err)
 				}
@@ -2221,6 +2250,12 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 	recoveryAttempts := 0
 	var lastRecoveryAttempt time.Time
 	bundleDisabled := false
+	// bundleCapacityBlockedUntil pauses widening after the peer answers a
+	// bundle join with its lane ceiling. The ceiling answer is transient by
+	// design -- lanes come and go -- so the pause expires with the recovery
+	// cooldown and a successful join clears it, rather than one refusal
+	// disabling widening for the flow's life.
+	var bundleCapacityBlockedUntil time.Time
 	activated := false
 	var nextAttempt time.Time
 	var retryBackoff time.Duration
@@ -2277,8 +2312,9 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 				}
 				if errors.Is(result.err, errLaneJoinCapacity) {
 					// The peer's lane ceiling, not a lost session: stop
-					// widening, but the lanes the bundle has stay valid.
-					bundleDisabled = true
+					// widening for the cooldown, but the lanes the bundle
+					// has stay valid.
+					bundleCapacityBlockedUntil = time.Now().Add(laneRecoveryResetAfter)
 					c.cfg.Logger.Debug("peer lane capacity reached for TCP bundle", "lane", result.id, "error", result.err)
 					continue
 				}
@@ -2311,6 +2347,8 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 				continue
 			}
 			c.cfg.Logger.Debug("TCP bundle lane joined", "lane", result.id, "lanes", flow.laneCount())
+			// A fresh lane just proved the ceiling has room again.
+			bundleCapacityBlockedUntil = time.Time{}
 		case <-ticker.C:
 		}
 
@@ -2365,7 +2403,7 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 		if flow.remoteFinSeen.Load() {
 			continue
 		}
-		if c.cfg.TCPFallbackLanes <= 1 || !flow.tcpStriping.Load() || bundleDisabled {
+		if c.cfg.TCPFallbackLanes <= 1 || !flow.tcpStriping.Load() || bundleDisabled || now.Before(bundleCapacityBlockedUntil) {
 			continue
 		}
 		if snapshot.Class != classifier.ClassBulk && !shouldPrewarmBulkLane(snapshot) {
@@ -2457,6 +2495,15 @@ func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessio
 	flow.rescueInFlight.Store(true)
 	err := c.openParallelRescue(ctx, flow, sessionID, flowID)
 	flow.rescueInFlight.Store(false)
+	// The capacity streak is kept per round rather than per attempt: a round
+	// is the unit the peer's ceiling answer is believed or doubted on, and
+	// the attempts inside one round race exactly because only one of them is
+	// supposed to win.
+	if errors.Is(err, errLaneJoinCapacity) {
+		flow.noteLaneCapacityRefusal()
+	} else {
+		flow.resetLaneCapacityRefusals()
+	}
 	select {
 	case <-flow.stallSignals():
 	default:
@@ -2573,10 +2620,15 @@ func (c *Client) raceRescueAttempts(ctx context.Context, flow *multipathFlow, at
 			c.metrics.LaneRescueWin(r.attempt)
 			return r.lane, r.attempt, nil
 		}
-		if errors.Is(r.err, errLaneJoinRejected) {
+		if errors.Is(r.err, errLaneJoinRejected) && (!errors.Is(r.err, errLaneJoinTCPMode) || r.attempt == 0) {
 			// The peer answered, and its answer does not change between
 			// attempts: a session identifier is random and is never reissued.
 			// Cancel the rest of the round rather than learn it twice more.
+			// A sprayed attempt's TCP-mode refusal is the one exemption: that
+			// answer is actionable, and only attempt zero can act on it with a
+			// TCP commit, so it must not cancel the round attempt zero is
+			// still running. When attempt zero itself reports it there is no
+			// commit to wait for, and the round ends like any rejection.
 			cancel()
 			go drain(pending)
 			return nil, -1, r.err
@@ -2649,9 +2701,28 @@ func (c *Client) openRecoveryLane(ctx context.Context, flow *multipathFlow, sess
 			// commit -- would burn another handshake on an answer that
 			// cannot change, and could even hand the flow to TCP while a
 			// QUIC sibling wins.
-			return nil, err
+			//
+			// The suppression ends once the answer repeats: consecutive
+			// capacity refusals with no successful round between them mark a
+			// wedged admission slot rather than a lost race, and then the
+			// AUTO TCP commit is the flow's remaining escape. A
+			// configuration-pinned QUIC client has no TCP commit to make and
+			// keeps the transient reading to the last.
+			if c.cfg.Transport != TransportAuto || flow.laneCapacityRefusals() < laneJoinCapacityTCPCommit-1 {
+				return nil, err
+			}
 		}
-		if c.cfg.Transport == TransportQUIC {
+		if errors.Is(err, errLaneJoinTCPMode) {
+			// The peer says the flow already lives on TCP fallback. An AUTO
+			// client commits at once rather than spending the replacement
+			// grace on QUIC retries the peer has ruled out; a
+			// configuration-pinned QUIC client has no TCP commit to make, and
+			// the refusal propagates as the permanent answer it is.
+			if c.cfg.Transport != TransportAuto {
+				return nil, err
+			}
+			lane, err = c.openJoinLane(recoveryCtx, TransportTCP, sessionID, flowID, laneID)
+		} else if c.cfg.Transport == TransportQUIC {
 			// Protocol-v1 development peers predating control-role JOINs reject the flag.
 			// One ordinary QUIC join preserves rolling-upgrade recovery; a new
 			// peer which genuinely lost the session rejects this one as well.

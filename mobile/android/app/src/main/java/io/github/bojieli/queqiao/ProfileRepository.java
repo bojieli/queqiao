@@ -61,7 +61,7 @@ final class ProfileRepository {
                     account,
                     summary.name,
                     summary,
-                    TrafficPolicy.ALL_TRAFFIC,
+                    RoutingConfiguration.DEFAULT,
                     Instant.now().toString());
             store.put(account, profileJson);
             try {
@@ -119,14 +119,14 @@ final class ProfileRepository {
         }
     }
 
-    void setTrafficPolicy(String id, TrafficPolicy policy) throws Exception {
+    void setRouting(String id, RoutingConfiguration routing) throws Exception {
         synchronized (CATALOG_LOCK) {
             Catalog catalog = loadCatalogLocked();
             int index = catalog.indexOf(id);
             if (index < 0) {
                 throw new GeneralSecurityException("The selected Queqiao profile no longer exists");
             }
-            catalog.profiles.set(index, catalog.profiles.get(index).withTrafficPolicy(policy));
+            catalog.profiles.set(index, catalog.profiles.get(index).withRouting(routing));
             saveCatalogLocked(catalog);
         }
     }
@@ -230,7 +230,7 @@ final class ProfileRepository {
                 account,
                 summary.name,
                 summary,
-                TrafficPolicy.ALL_TRAFFIC,
+                RoutingConfiguration.DEFAULT,
                 Instant.now().toString());
         store.put(account, legacy);
         catalog.profiles.add(record);
@@ -339,7 +339,7 @@ final class ProfileRepository {
         final String secretAccount;
         final String displayName;
         final ProfileSummary summary;
-        final TrafficPolicy trafficPolicy;
+        final RoutingConfiguration routing;
         final String importedAt;
 
         ProfileRecord(
@@ -347,36 +347,37 @@ final class ProfileRepository {
                 String secretAccount,
                 String displayName,
                 ProfileSummary summary,
-                TrafficPolicy trafficPolicy,
+                RoutingConfiguration routing,
                 String importedAt) {
             this.id = id;
             this.secretAccount = secretAccount;
             this.displayName = displayName;
             this.summary = summary;
-            this.trafficPolicy = trafficPolicy;
+            this.routing = routing;
             this.importedAt = importedAt;
         }
 
         ProfileRecord withDisplayName(String name) {
-            return new ProfileRecord(id, secretAccount, name, summary, trafficPolicy, importedAt);
+            return new ProfileRecord(id, secretAccount, name, summary, routing, importedAt);
         }
 
-        ProfileRecord withTrafficPolicy(TrafficPolicy policy) {
-            return new ProfileRecord(id, secretAccount, displayName, summary, policy, importedAt);
+        ProfileRecord withRouting(RoutingConfiguration replacement) {
+            return new ProfileRecord(id, secretAccount, displayName, summary, replacement, importedAt);
         }
 
         ProfileRecord withSummary(ProfileSummary replacement) {
-            return new ProfileRecord(id, secretAccount, displayName, replacement, trafficPolicy, importedAt);
+            return new ProfileRecord(id, secretAccount, displayName, replacement, routing, importedAt);
         }
 
         JSONObject toJson() throws JSONException {
-            return new JSONObject()
+            JSONObject object = new JSONObject()
                     .put("id", id)
                     .put("secret_account", secretAccount)
                     .put("display_name", displayName)
                     .put("summary", summary.toJson())
-                    .put("traffic_policy", trafficPolicy.wireValue)
                     .put("imported_at", importedAt);
+            routing.writeTo(object);
+            return object;
         }
 
         static ProfileRecord fromJson(JSONObject object) throws JSONException {
@@ -385,7 +386,7 @@ final class ProfileRepository {
                     object.getString("secret_account"),
                     object.getString("display_name"),
                     ProfileSummary.fromJson(object.getJSONObject("summary")),
-                    TrafficPolicy.fromWireValue(object.getString("traffic_policy")),
+                    RoutingConfiguration.readFrom(object),
                     object.getString("imported_at"));
         }
     }

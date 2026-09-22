@@ -240,6 +240,7 @@ func runProvider(args []string) error {
 		state := fs.String("state", "", "provider state directory")
 		user := fs.String("user", "", "user name or ID")
 		expiresIn := fs.Duration("expires-in", 24*time.Hour, "one-time invitation lifetime (maximum 7d)")
+		showQR := fs.Bool("qr", false, "also draw the invitation as a QR code on standard error, for the mobile apps to scan")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -255,9 +256,19 @@ func runProvider(args []string) error {
 			return err
 		}
 		// stdout is intentionally only the importable value, making it safe to
-		// pipe into a QR encoder or provider portal.
+		// pipe into a QR encoder or provider portal. The drawn code goes to
+		// stderr for the same reason: a terminal shows both, a pipe sees one.
+		var qrErr error
+		if *showQR {
+			art, err := renderQRCode(uri)
+			if err != nil {
+				qrErr = err
+			} else {
+				fmt.Fprint(os.Stderr, art)
+			}
+		}
 		fmt.Println(uri)
-		return nil
+		return qrErr
 	case "list-invites":
 		fs := newFlagSet("provider list-invites")
 		state := fs.String("state", "", "provider state directory")

@@ -146,11 +146,38 @@ func serverLaneBudget(reserveControl bool) int {
 	return bulk + control
 }
 
+// laneJoinAdmissionTimeout bounds the OPEN_OK write of an admitted JOIN. The
+// connection handshake deadline is already cleared by then, so without its
+// own bound a blocked write holds a staged lane -- counted against the
+// admission ceiling, never ready, never schedulable -- for as long as the
+// peer stays half-open. One path-detection budget matches the rescue-race
+// window a young staged lane is protected from eviction for.
+const laneJoinAdmissionTimeout = laneDeadPathDetection
+
+// Lane admission refusals are typed so the join handler can answer with the
+// reset code matching how permanent the refusal is. The client retries the
+// ceiling answer forever by design, so only the genuine ceiling may carry
+// ResetFlowLimit; answers that cannot change during the flow's life must not
+// wear it.
+var (
+	// errLaneFlowTCPMode refuses a non-TCP lane: the flow committed to TCP
+	// fallback and stays there for the rest of its life.
+	errLaneFlowTCPMode = errors.New("flow has switched to TCP fallback")
+	// errLaneFlowClosed refuses a lane for a flow that is already gone.
+	errLaneFlowClosed = errors.New("flow is closed")
+	// errLaneDuplicateID refuses a lane id the flow already carries.
+	errLaneDuplicateID = errors.New("duplicate lane id")
+	// errLaneLimitReached is the genuine admission ceiling, the one refusal
+	// a peer may legitimately retry: lanes come and go, so the answer can
+	// change during the flow's life.
+	errLaneLimitReached = errors.New("flow lane limit reached")
+)
+
 func (s *serverFlow) addLane(lane *mpLane) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.tcpMode && lane.kind != TransportTCP {
-		return errors.New("flow has switched to TCP fallback")
+		return errLaneFlowTCPMode
 	}
 	if lane.kind == TransportTCP && !s.tcpMode {
 		// The first authenticated TCP rescue is a transport handoff, not another
@@ -169,7 +196,7 @@ func (s *serverFlow) addLane(lane *mpLane) error {
 		// path-detection budget may still be waiting on the peer's crowning
 		// decision, so evicting one can kill the rescue that just won.
 		if !s.flow.retireOldestLane(lane.control, laneDeadPathDetection) || s.flow.laneCount() >= s.maxLanes {
-			return errors.New("flow lane limit reached")
+			return errLaneLimitReached
 		}
 	}
 	if err := s.flow.addLane(lane); err != nil {
@@ -1031,10 +1058,37 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 	}
 	if err := serverSession.addLane(replacement); err != nil {
 		s.cfg.Logger.Debug("lane join admission refused", "lane", laneID, "error", err)
-		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinLaneUnavailable, session.ResetFlowLimit, "lane unavailable")
+		switch {
+		case errors.Is(err, errLaneFlowTCPMode):
+			// The flow committed to TCP fallback for the rest of its life, so
+			// a QUIC join can never be admitted. Saying so with the transport
+			// code -- rather than the transient ceiling answer -- lets a new
+			// peer commit to TCP at once instead of retrying an answer that
+			// cannot change.
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinLaneUnavailable, session.ResetTransport, "flow switched to TCP fallback")
+		case errors.Is(err, errLaneFlowClosed), errors.Is(err, errLaneDuplicateID):
+			// Both mean this endpoint cannot make the named lane part of the
+			// flow the peer thinks it is joining, and neither heals with a
+			// retry: the same permanent answer "unknown session" already
+			// carries for the refusals above.
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinUnknownSession, session.ResetProtocol, "unknown session")
+		default:
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinLaneUnavailable, session.ResetFlowLimit, "lane unavailable")
+		}
 		return
 	}
-	if err := fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}); err != nil {
+	// The handshake deadline was cleared above, so the OPEN_OK write needs its
+	// own bound: without one a peer that stops reading wedges the staged lane
+	// in the lane map, where it counts against the admission ceiling yet can
+	// never carry traffic. One path-detection budget matches the rescue-race
+	// window a young staged lane is protected from eviction for. WriteContext
+	// holds the lane's write mutex while it arms the deadline, so a concurrent
+	// control write neither misses nor keeps it.
+	openOK := protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}
+	writeCtx, cancelWrite := context.WithTimeout(ctx, laneJoinAdmissionTimeout)
+	writeErr := fc.WriteContext(writeCtx, openOK)
+	cancelWrite()
+	if writeErr != nil {
 		serverSession.flow.removeLane(replacement)
 		return
 	}

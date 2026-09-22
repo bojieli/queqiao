@@ -5,6 +5,14 @@
          carrying Queqiao's own uplink, which is the failure export mode has
          to be able to name. See VpnExclusion. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Reads a queqiao:// invitation from a QR code on another screen. Held
+         only by ScanInvitationActivity, only while it is in front, and the
+         frame is decoded on the device by the Go core; no image leaves the
+         process. Not required: the invitation can always be pasted. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="false" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
@@ -35,6 +43,30 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ScanInvitationActivity"
+            android:exported="false"
+            android:label="@string/scan_invitation_title" />
+
+        <!-- The full-device tunnel. Android requires the service to be
+             protected by BIND_VPN_SERVICE so only the system can bind it;
+             always-on is declined because a profile must be chosen in the
+             app before a connection means anything. -->
+        <service
+            android:name=".QueqiaoVpnService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn" />
+            <meta-data
+                android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
+                android:value="false" />
+        </service>
         <service
             android:name=".QueqiaoProxyService"
             android:exported="false"

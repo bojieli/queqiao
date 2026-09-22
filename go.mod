@@ -4,6 +4,8 @@ go 1.25.13
 
 require (
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
+	github.com/liyue201/goqr v0.0.0-20200803022322-df443203d4ea
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
 )
