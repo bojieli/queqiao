@@ -284,4 +284,52 @@ func TestStallRescueGivesUpAfterConsecutiveCapacityRefusals(t *testing.T) {
 	if !flow.resumeRefused.Load() {
 		t.Fatal("consecutive capacity refusals did not mark the flow unresumable")
 	}
+	if !flow.doneChanClosed() {
+		t.Fatal("exhausted stall rescue left the application connection open")
+	}
+}
+
+func TestStallRescueRejectionClosesApplicationConnection(t *testing.T) {
+	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+	inner, application := net.Pipe()
+	t.Cleanup(func() { _ = inner.Close(); _ = application.Close() })
+	// The transport still looks alive locally, but the gateway has forgotten
+	// this session. The application must not wait for the transport timeout.
+	flow := newMultipathFlow(context.Background(), inner, [16]byte{99}, 7,
+		defaultChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, nil, nil)
+	t.Cleanup(flow.closeAll)
+	flow.reserveControlLane = true
+	if err := flow.addLane(isolationLane(t, 0)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() {
+		_, _ = flow.run(ctx)
+		close(runDone)
+	}()
+	done := make(chan struct{})
+	go func() {
+		rig.client.manageQUICLanes(ctx, flow, flow.sessionID, flow.flowID)
+		close(done)
+	}()
+	flow.stallSignal <- struct{}{}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("rejected rescue did not return")
+	}
+	if !flow.resumeRefused.Load() {
+		t.Fatal("peer did not reject the missing session")
+	}
+	_ = application.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, err := application.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("application read = %v, want immediate EOF after terminal rescue refusal", err)
+	}
+	select {
+	case <-runDone:
+	case <-ctx.Done():
+		t.Fatal("terminal rescue refusal left the flow workers running")
+	}
 }

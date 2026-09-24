@@ -1993,9 +1993,12 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 					return
 				}
 				if errors.Is(err, errLaneJoinRejected) {
-					// As below: the peer's answer is permanent, so stop.
+					// The suspect lane still counts as healthy locally, so no
+					// replacement waiter will observe this flag. Close the flow
+					// to release the application on this terminal peer answer.
 					flow.resumeRefused.Store(true)
 					c.cfg.Logger.Debug("peer cannot resume this association", "flow_id", flowID, "error", err)
+					flow.closeAll()
 					return
 				}
 				if errors.Is(err, errLaneJoinCapacity) && flow.laneCapacityRefusals() >= maxLaneRecoveryAttempts {
@@ -2007,6 +2010,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 					// reconnects on a fresh flow.
 					flow.resumeRefused.Store(true)
 					c.cfg.Logger.Debug("peer lane capacity answer persisted; giving up on this association", "flow_id", flowID, "refusals", flow.laneCapacityRefusals())
+					flow.closeAll()
 					return
 				}
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
