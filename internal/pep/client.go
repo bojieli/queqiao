@@ -221,10 +221,13 @@ type Client struct {
 	// dead shared connection causes one handshake rather than one handshake per
 	// affected flow. The dial has a client lifetime of its own and is not
 	// cancelled merely because the first flow waiting for it goes away.
-	quicMu         sync.Mutex
-	quicGeneration *controlQUICGeneration
-	quicDial       *controlQUICDial
-	quicEpoch      uint64
+	quicMu          sync.Mutex
+	quicGeneration  *controlQUICGeneration
+	quicDial        *controlQUICDial
+	quicEpoch       uint64
+	resumeMu        sync.Mutex
+	resumeState     suspendWatchState
+	readSuspendTime func() (time.Duration, error)
 	// transientUDPLogNS rate-limits an otherwise synchronized burst of local
 	// route errors while still counting every suppressed send in metrics.
 	transientUDPLogNS atomic.Int64
@@ -568,13 +571,15 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := cfg.Profile.ValidateHints(); err != nil {
 		return nil, fmt.Errorf("client profile: %w", err)
 	}
-	return &Client{
+	client := &Client{
 		flowMeta: flowmeta.New(cfg.FlowMetadataSocket, cfg.FlowMetadataTimeout),
 		cfg:      cfg, udpHealth: newUDPHealth(cfg.UDPFailureThreshold, cfg.UDPCooldown),
 		credentials: cfg.Credentials, budget: budget,
 		metrics: cfg.Metrics, sessionLimit: cfg.SessionLimit, pendingOpens: make(chan struct{}, cfg.MaxPendingOpens),
 		sendMemory: sendMemory, receiveMemory: receiveMemory, memoryLimits: memoryLimits,
-	}, nil
+	}
+	client.checkSystemResume()
+	return client, nil
 }
 
 func (c *Client) MemoryStats() MemoryStats {
@@ -1469,6 +1474,7 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		c.checkSystemResume()
 		c.quicMu.Lock()
 		if generation := c.quicGeneration; generation != nil && generation.conn.Context().Err() == nil {
 			c.quicMu.Unlock()
@@ -1500,11 +1506,9 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 		if attempt.err != nil {
 			return nil, attempt.err
 		}
-		if attempt.generation != nil {
-			return attempt.generation, nil
-		}
 		// A path reset can supersede an in-flight dial. Its waiters retry against
 		// the new epoch instead of inheriting a connection bound to the old path.
+		// Recheck suspend time too: the waiter may have slept while dialing.
 	}
 }
 
@@ -1729,6 +1733,7 @@ func (c *Client) openBulkPoolStream(ctx context.Context) (streamConn, error) {
 // reserveBulkConn returns an idle authenticated connection, or establishes a
 // new one when every existing connection is already carrying a lane.
 func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
+	c.checkSystemResume()
 	c.bulkMu.Lock()
 	live := c.bulkConns[:0]
 	for _, entry := range c.bulkConns {
