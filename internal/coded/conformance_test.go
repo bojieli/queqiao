@@ -11,7 +11,7 @@ import (
 	"github.com/bojieli/queqiao/internal/fec"
 )
 
-// TestCodedDatagramVectors replays the committed protocol-1 datagram vectors
+// TestCodedDatagramVectors replays the committed protocol-2 datagram vectors
 // against the parser that faces the wire.
 //
 // It lives in this package rather than in internal/conformance because the
@@ -19,13 +19,13 @@ import (
 // exported: a vector checked against a reimplementation of the parser proves
 // that the reimplementation is right.
 func TestCodedDatagramVectors(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "testdata", "protocol1", "vectors.json"))
+	raw, err := os.ReadFile(filepath.Join("..", "..", "testdata", "protocol2", "vectors.json"))
 	if err != nil {
-		t.Fatalf("read protocol-1 vectors: %v", err)
+		t.Fatalf("read protocol-2 vectors: %v", err)
 	}
 	var file conformance.File
 	if err := json.Unmarshal(raw, &file); err != nil {
-		t.Fatalf("parse protocol-1 vectors: %v", err)
+		t.Fatalf("parse protocol-2 vectors: %v", err)
 	}
 	if file.Limits.MaxRepairWindow != fec.MaxRepairWindow {
 		t.Fatalf("vectors bound a repair at %d symbols, this build at %d", file.Limits.MaxRepairWindow, fec.MaxRepairWindow)
@@ -51,7 +51,7 @@ func TestCodedDatagramVectors(t *testing.T) {
 			// session above would not be.
 			if v.Reject {
 				if len(frames) != 0 {
-					t.Fatalf("a datagram protocol 1 forbids delivered %d frames (%s)", len(frames), v.Why)
+					t.Fatalf("a datagram protocol 2 forbids delivered %d frames (%s)", len(frames), v.Why)
 				}
 				return
 			}

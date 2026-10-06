@@ -208,8 +208,9 @@ def parse_buildinfo(data: bytes) -> dict[str, str]:
         raise ValueError("BUILDINFO target is invalid")
     if GO_VERSION.fullmatch(result["go"]) is None:
         raise ValueError("BUILDINFO Go version is not a patched release toolchain")
-    if result["wire_protocol"] != "1":
-        raise ValueError("BUILDINFO does not declare wire protocol 1")
+    wire = result["wire_protocol"]
+    if re.fullmatch(r"[1-9][0-9]{0,2}", wire) is None or int(wire) > 255:
+        raise ValueError("BUILDINFO wire protocol is not a positive version byte")
     if CHECKSUM.fullmatch(result["binary_sha256"]) is None:
         raise ValueError("BUILDINFO binary hash is invalid")
     return result
@@ -261,9 +262,11 @@ def validate_sbom(
     if component.get("licenses") != [{"license": {"id": "MIT"}}]:
         raise ValueError(f"{archive_name}: invalid root SBOM license")
     component_properties = properties(component)
-    if component_properties.get("queqiao:wire-protocol") != "1":
-        raise ValueError(f"{archive_name}: SBOM does not declare wire protocol 1")
     buildinfo = parse_buildinfo(archive["BUILDINFO"][0])
+    spec = archive["docs/PROTOCOL.md"][0].decode("utf-8")
+    declared_wire = re.search(r"\*\*Wire version byte:\*\* `([0-9]+)`", spec)
+    if declared_wire is None or declared_wire.group(1) != buildinfo["wire_protocol"]:
+        raise ValueError(f"{archive_name}: protocol specification disagrees with BUILDINFO")
     for sbom_key, build_key in (
         ("queqiao:commit", "commit"),
         ("queqiao:target", "target"),

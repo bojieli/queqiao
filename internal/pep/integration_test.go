@@ -750,6 +750,21 @@ func TestAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T) {
 	conn := dialTestSOCKS(t, clientListener.Addr().String(), destinationListener.Addr().String())
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	// SOCKS success is optimistic, and server session registration precedes
+	// OPEN_OK. An application round trip proves the flow is established before
+	// we remove its lane; closing on registration can instead abort OPEN_OK,
+	// unregister the session, and make the recovery JOIN correctly fail.
+	probe := []byte("established-auto-rescue")
+	if err := writeFull(conn, probe); err != nil {
+		t.Fatal(err)
+	}
+	probeEcho := make([]byte, len(probe))
+	if _, err := io.ReadFull(conn, probeEcho); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(probeEcho, probe) {
+		t.Fatalf("initial QUIC echo mismatch: got %q, want %q", probeEcho, probe)
+	}
 	payload := bytes.Repeat([]byte("queqiao-auto-rescue-"), 32*1024)
 	writeErr := make(chan error, 1)
 	go func() {

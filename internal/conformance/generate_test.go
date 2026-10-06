@@ -15,24 +15,24 @@ import (
 	"github.com/bojieli/queqiao/internal/session"
 )
 
-var update = flag.Bool("update", false, "rewrite the committed protocol-1 vectors from this build")
+var update = flag.Bool("update", false, "rewrite the committed protocol-2 vectors from this build")
 
 // vectorPath is deliberately outside this package. The vectors describe the
 // protocol, not this package's tests, and a second implementation should be
 // able to find them without reading Go.
 func vectorPath() string {
-	return filepath.Join("..", "..", "testdata", "protocol1", "vectors.json")
+	return filepath.Join("..", "..", "testdata", "protocol2", "vectors.json")
 }
 
 func loadVectors(t *testing.T) File {
 	t.Helper()
 	raw, err := os.ReadFile(vectorPath())
 	if err != nil {
-		t.Fatalf("read protocol-1 vectors: %v", err)
+		t.Fatalf("read protocol-2 vectors: %v", err)
 	}
 	var f File
 	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatalf("parse protocol-1 vectors: %v", err)
+		t.Fatalf("parse protocol-2 vectors: %v", err)
 	}
 	return f
 }
@@ -55,15 +55,15 @@ func TestVectorsAreCurrent(t *testing.T) {
 		if err := os.WriteFile(vectorPath(), encoded, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		t.Log("protocol-1 vectors rewritten")
+		t.Log("protocol-2 vectors rewritten")
 		return
 	}
 	committed, err := os.ReadFile(vectorPath())
 	if err != nil {
-		t.Fatalf("read protocol-1 vectors: %v", err)
+		t.Fatalf("read protocol-2 vectors: %v", err)
 	}
 	if string(committed) != string(encoded) {
-		t.Fatalf("this build no longer produces the committed protocol-1 vectors.\n"+
+		t.Fatalf("this build no longer produces the committed protocol-2 vectors.\n"+
 			"If the wire genuinely changed, protocol.Version must change with it and the\n"+
 			"data ALPN with that. If it did not, this is a regression. Only once one of\n"+
 			"those two is true, run:\n    go test ./internal/conformance -update\n"+
@@ -75,7 +75,7 @@ func generate(t *testing.T) File {
 	t.Helper()
 	return File{
 		Protocol: int(protocol.Version),
-		Note: "Frozen conformance vectors for queqiao wire protocol 1. Every credential-shaped " +
+		Note: "Frozen conformance vectors for queqiao wire protocol 2. Every credential-shaped " +
 			"value here is synthetic. Regenerating this file is a wire change: protocol.Version " +
 			"and the data ALPN must move with it.",
 		FrameHeaders:    frameHeaderVectors(t),
@@ -119,6 +119,7 @@ func frameHeaderVectors(t *testing.T) FrameHeaderVectors {
 		{"open reserving the control lane", protocol.Header{Version: protocol.Version, Type: protocol.TypeOpen, Flags: protocol.FlagReserveControl, SessionID: sid, FlowID: 1, PayloadLen: 16, Class: protocol.ClassNew}},
 		{"open ok", protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sid, FlowID: 1, Class: protocol.ClassNew}},
 		{"join", protocol.Header{Version: protocol.Version, Type: protocol.TypeJoin, SessionID: sid, FlowID: 1, PayloadLen: 8, Class: protocol.ClassNew}},
+		{"replacement join", protocol.Header{Version: protocol.Version, Type: protocol.TypeJoin, Flags: protocol.FlagReplaceLane, SessionID: sid, FlowID: 1, PayloadLen: 16, Class: protocol.ClassNew}},
 		{"interactive data", protocol.Header{Version: protocol.Version, Type: protocol.TypeData, SessionID: sid, FlowID: 1, Sequence: 4096, PayloadLen: 1200, Class: protocol.ClassInteractive}},
 		{"bulk data at the payload limit", protocol.Header{Version: protocol.Version, Type: protocol.TypeData, SessionID: sid, FlowID: 1, Sequence: 1 << 40, PayloadLen: protocol.MaxPayload, Class: protocol.ClassBulk}},
 		{"cumulative ack upstream", protocol.Header{Version: protocol.Version, Type: protocol.TypeAck, Flags: protocol.FlagAckUp, SessionID: sid, FlowID: 1, Sequence: 8192, Class: protocol.ClassInteractive}},
@@ -156,11 +157,11 @@ func frameHeaderVectors(t *testing.T) FrameHeaderVectors {
 	out.Reject = []RejectVector{
 		{"wrong magic", mutate(func(raw []byte) { raw[0] = 'X' }), "the first two bytes are not WO"},
 		{"version 0", mutate(func(raw []byte) { raw[2] = 0 }), "a receiver speaks exactly one wire version and refuses every other"},
-		{"version 2", mutate(func(raw []byte) { raw[2] = 2 }), "a future version is refused rather than partially understood"},
+		{"version 1", mutate(func(raw []byte) { raw[2] = 1 }), "an older version is refused rather than partially understood"},
 		{"frame type 0", mutate(func(raw []byte) { raw[3] = 0 }), "types are 1..9; there is no zero type"},
 		{"frame type 10", mutate(func(raw []byte) { raw[3] = 10 }), "an unknown type is refused, never ignored"},
 		{"class 3", mutate(func(raw []byte) { raw[42] = 3 }), "classes are 0..2"},
-		{"reserved flag bit 6", mutate(func(raw []byte) { raw[5] |= 1 << 6 }), "bit 6 is reserved and must be zero"},
+		{"replacement flag on data", mutate(func(raw []byte) { raw[5] |= 1 << 6 }), "the replacement flag is valid only on JOIN"},
 		{"reserved flag bit 8", mutate(func(raw []byte) { raw[4] |= 1 << 0 }), "bits 8..15 are reserved and must be zero"},
 		{"ack-ranges flag on data", mutate(func(raw []byte) { raw[5] |= byte(protocol.FlagAckRanges) }), "the range flag is valid only on ACK"},
 		{"reserve-control flag on data", mutate(func(raw []byte) { raw[5] |= byte(protocol.FlagReserveControl) }), "the reserve flag is valid only on OPEN and JOIN"},

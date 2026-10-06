@@ -35,6 +35,7 @@
 package coded
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -227,6 +228,13 @@ const initialWindow = 16
 // Send queues a frame. Delivery is not guaranteed: the code repairs what the
 // path erases, and what it cannot repair is the caller's to notice.
 func (p *Path) Send(frame []byte) error {
+	return p.SendContext(context.Background(), frame)
+}
+
+func (p *Path) SendContext(ctx context.Context, frame []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(frame) > maxFrameBytes {
 		return fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, len(frame))
 	}
@@ -243,6 +251,8 @@ func (p *Path) Send(frame []byte) error {
 	select {
 	case p.pending <- queued:
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-p.done:
 		return p.failure()
 	}

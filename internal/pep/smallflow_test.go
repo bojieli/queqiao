@@ -3,6 +3,7 @@ package pep
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -780,9 +781,9 @@ func TestAGapIsReportedWhenItIsSeenNotWhenItCloses(t *testing.T) {
 // A browser opens a connection, asks for something small, and closes it. Every
 // such flow is a new one, so nothing about it is warm except the connection
 // underneath, and there is never any data behind its packets to prove one
-// lost. Measured live, most cost one round trip and a quarter cost a second
-// and a half more: the difference is a chunk the code failed to repair, waited
-// out by a timer.
+// lost. End-to-end latency includes remote OPEN admission as well as coded
+// request/reply delivery. Record both: a fast local SOCKS acknowledgement does
+// not mean OPEN has reached the gateway, and a failed flow is not a fast one.
 func TestAShortFlowCostsARoundTrip(t *testing.T) {
 	if testing.Short() {
 		t.Skip("brings up QUIC across an emulated 300 ms path")
@@ -793,17 +794,24 @@ func TestAShortFlowCostsARoundTrip(t *testing.T) {
 		OneWayDelay: oneWay, RateBytesPerSec: uint64(25e6 / 8),
 		PolicerRefillPeriod: 8 * time.Millisecond, LossRate: 0.45, Seed: 61,
 	}
-	const replyBytes = 1400
-	// The destination records when each request reached it, which splits what
-	// a flow costs into the half spent getting there and the half coming back.
-	arrivals := make(chan time.Time, 64)
+	const replyBytes, warmExchanges, flows = 1400, 5, 20
+	// Accept is the destination-side observation of remote OPEN admission;
+	// reading the request is a separate data-delivery event. Carry the request
+	// ID with both timestamps so warm-up or late failed flows cannot be
+	// mistaken for the next flow. The channel holds every expected request.
+	type arrival struct {
+		id                uint64
+		accepted, arrived time.Time
+	}
+	arrivals := make(chan arrival, warmExchanges+flows)
 	socks, destination := codedPairWith(t, true, &path, func(listener net.Listener) {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
-			go func(c net.Conn) {
+			accepted := time.Now()
+			go func(c net.Conn, accepted time.Time) {
 				defer c.Close()
 				buf := make([]byte, 16)
 				body := make([]byte, replyBytes)
@@ -811,15 +819,14 @@ func TestAShortFlowCostsARoundTrip(t *testing.T) {
 					if _, err := io.ReadFull(c, buf); err != nil {
 						return
 					}
-					select {
-					case arrivals <- time.Now():
-					default:
+					arrivals <- arrival{
+						id: binary.BigEndian.Uint64(buf), accepted: accepted, arrived: time.Now(),
 					}
 					if _, err := c.Write(body); err != nil {
 						return
 					}
 				}
-			}(conn)
+			}(conn, accepted)
 		}
 	})
 	// The path has to be known before the question is asked: a flow on an
@@ -833,7 +840,7 @@ func TestAShortFlowCostsARoundTrip(t *testing.T) {
 	warm := dialWithRetries(t, socks, destination, 3)
 	request := make([]byte, 16)
 	reply := make([]byte, replyBytes)
-	for i := 0; i < 5; i++ {
+	for i := 0; i < warmExchanges; i++ {
 		if _, err := warm.Write(request); err != nil {
 			t.Fatal(err)
 		}
@@ -843,60 +850,91 @@ func TestAShortFlowCostsARoundTrip(t *testing.T) {
 	}
 	warm.Close()
 
-	const flows = 20
-	var samples, dials, outbound []time.Duration
-	for i := 0; i < flows; i++ {
-		for len(arrivals) > 0 {
-			<-arrivals
-		}
-		start := time.Now()
-		conn, err := trySocksDial(socks, destination, 20*time.Second)
-		if err != nil {
-			t.Fatalf("flow %d: %v", i, err)
-		}
-		dialed := time.Now()
-		if _, err := conn.Write(request); err == nil {
-			if _, err := io.ReadFull(conn, reply); err != nil {
-				conn.Close()
+	// Keep every attempted flow, including failures. Otherwise a premature
+	// close removes a slow sample and can make the remaining median pass.
+	attempts := make([]shortFlowAttempt, flows)
+	for i := range attempts {
+		binary.BigEndian.PutUint64(request, uint64(i+1)) // zero is reserved for warm-up
+		attempts[i] = measureShortFlow(func() (net.Conn, error) {
+			return trySocksDial(socks, destination, 20*time.Second)
+		}, request, reply)
+	}
+
+	// A completed reply necessarily follows the buffered arrival event. Drain
+	// by ID after all attempts so late events from failed flows remain useful.
+	observed := make(map[uint64]arrival, flows)
+collect:
+	for {
+		select {
+		case at := <-arrivals:
+			if at.id == 0 {
 				continue
 			}
-			samples = append(samples, time.Since(start))
-			dials = append(dials, dialed.Sub(start))
-			select {
-			case at := <-arrivals:
-				outbound = append(outbound, at.Sub(start))
-			default:
+			if at.id > flows {
+				t.Errorf("destination observed unknown request ID %d", at.id)
+				continue
+			}
+			if _, exists := observed[at.id]; exists {
+				t.Errorf("destination observed request ID %d more than once", at.id)
+				continue
+			}
+			observed[at.id] = at
+		default:
+			break collect
+		}
+	}
+
+	var samples, dials, admissions, outbound, requestAfterAdmission, replies, afterAdmission []time.Duration
+	for i, attempt := range attempts {
+		id := uint64(i + 1)
+		elapsed := attempt.ended.Sub(attempt.started)
+		if !attempt.dialed.IsZero() {
+			dials = append(dials, attempt.dialed.Sub(attempt.started))
+			t.Logf("flow %d: local SOCKS acknowledgement=%v", id, attempt.dialed.Sub(attempt.started))
+		}
+		if at, ok := observed[id]; ok {
+			admissions = append(admissions, at.accepted.Sub(attempt.started))
+			outbound = append(outbound, at.arrived.Sub(attempt.started))
+			requestAfterAdmission = append(requestAfterAdmission, at.arrived.Sub(at.accepted))
+			t.Logf("flow %d: remote admission=%v request arrival=%v admission-to-request=%v",
+				id, at.accepted.Sub(attempt.started), at.arrived.Sub(attempt.started), at.arrived.Sub(at.accepted))
+			if attempt.err == nil {
+				replies = append(replies, attempt.ended.Sub(at.arrived))
+				afterAdmission = append(afterAdmission, attempt.ended.Sub(at.accepted))
+				t.Logf("flow %d: request-to-reply=%v admission-to-reply=%v",
+					id, attempt.ended.Sub(at.arrived), attempt.ended.Sub(at.accepted))
+			}
+		} else {
+			// Without a request ID the destination's Accept cannot safely be
+			// attributed to this attempt, so missing timing stays unavailable.
+			t.Logf("flow %d: no matched destination request; remote timing unavailable", id)
+			if attempt.err == nil {
+				t.Errorf("flow %d completed without a destination timing event", id)
 			}
 		}
-		conn.Close()
+		if attempt.err != nil {
+			t.Errorf("flow %d failed after %v (request bytes %d/%d, reply bytes %d/%d): %v",
+				id, elapsed, attempt.written, len(request), attempt.read, len(reply), attempt.err)
+			continue
+		}
+		samples = append(samples, elapsed)
+		t.Logf("flow %d: completed end-to-end=%v", id, elapsed)
 	}
-	if len(outbound) > 0 {
-		sorted := append([]time.Duration(nil), outbound...)
-		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-		t.Logf("  of which the request reaching the destination: median %v, max %v",
-			sorted[len(sorted)/2].Round(time.Millisecond), sorted[len(sorted)-1].Round(time.Millisecond))
-	}
-	if len(dials) > 0 {
-		sorted := append([]time.Duration(nil), dials...)
-		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-		t.Logf("  of which opening the flow: median %v, max %v",
-			sorted[len(sorted)/2].Round(time.Millisecond), sorted[len(sorted)-1].Round(time.Millisecond))
-	}
-	if len(samples) < flows/2 {
-		t.Fatalf("only %d of %d short flows completed", len(samples), flows)
-	}
-	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-	median := samples[len(samples)/2]
-	p90 := samples[int(float64(len(samples)-1)*0.9)]
+
 	roundTrip := 2 * oneWay
-	rounded := make([]string, len(samples))
-	for i, s := range samples {
-		rounded[i] = s.Round(time.Millisecond).String()
+	t.Logf("%d/%d short flows completed, %d failed over a %.0f%% erasure channel (round trip %v)",
+		len(samples), flows, flows-len(samples), path.LossRate*100, roundTrip)
+	logShortFlowDistribution(t, "local SOCKS acknowledgement", dials)
+	logShortFlowDistribution(t, "remote admission (destination Accept)", admissions)
+	logShortFlowDistribution(t, "request arrival", outbound)
+	logShortFlowDistribution(t, "admission-to-request", requestAfterAdmission)
+	logShortFlowDistribution(t, "request-to-reply", replies)
+	logShortFlowDistribution(t, "admission-to-reply", afterAdmission)
+	logShortFlowDistribution(t, "completed end-to-end", samples)
+	if len(samples) == 0 {
+		t.Fatal("no short flow completed; cannot measure end-to-end latency")
 	}
-	t.Logf("%d short flows over a %.0f%% erasure channel: median %v, p90 %v, max %v (round trip %v)",
-		len(samples), path.LossRate*100, median.Round(time.Millisecond),
-		p90.Round(time.Millisecond), samples[len(samples)-1].Round(time.Millisecond), roundTrip)
-	t.Logf("  each: %s", strings.Join(rounded, " "))
+	flowMedian := median(samples)
 	// Three round trips, not one: the channel erases, and a flow whose repair
 	// was itself erased pays for it. What this separates is a transport where
 	// a short flow costs round trips from one where it costs a timer -- before
@@ -904,12 +942,15 @@ func TestAShortFlowCostsARoundTrip(t *testing.T) {
 	// every short flow cost 1.055 s on a 300 ms path, which is the reissue
 	// delay and not the path.
 	//
-	// Only the median is asserted. The distribution above it is real and worth
+	// Every flow must complete, and the original end-to-end median bound is
+	// retained. Admission/data timings diagnose a failure; they do not replace
+	// it with a shorter interval or excuse an uncoded OPEN delay.
+	// The distribution above the median is real and worth
 	// reading -- it is logged in full -- but it moves with how fast the machine
 	// running the test is, and under the race detector it moves by a round
 	// trip. A bound that fails on a slow machine tests the machine.
-	if median > 3*roundTrip {
-		t.Errorf("a short flow costs %v against a round trip of %v", median.Round(time.Millisecond), roundTrip)
+	if flowMedian > 3*roundTrip {
+		t.Errorf("a short flow costs %v end-to-end against a round trip of %v", flowMedian.Round(time.Millisecond), roundTrip)
 	}
 }
 

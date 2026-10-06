@@ -451,7 +451,7 @@ func dialTCP(ctx context.Context, remote string, credentials identity.ClientCred
 	tlsConn := conn.(*tls.Conn)
 	if tlsConn.ConnectionState().NegotiatedProtocol != defaultALPN {
 		_ = tlsConn.Close()
-		return nil, fmt.Errorf("gateway %q did not negotiate Queqiao protocol 1 over TCP; check that the endpoint and server version match", remote)
+		return nil, fmt.Errorf("gateway %q did not negotiate Queqiao protocol %d over TCP; check that the endpoint and server version match", remote, protocol.Version)
 	}
 	return tlsConn, nil
 }
@@ -768,10 +768,87 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
 		resolver = netbind.ResolverForResult(result, control)
 	}
-	remoteAddr, err := resolveUDPAddr(dialCtx, remote, resolver)
+
+	addresses, err := resolveUDPAddrs(dialCtx, remote, resolver)
 	if err != nil {
 		return nil, nil, err
 	}
+	localHost, _, _ := net.SplitHostPort(listenAddress)
+	localIP, _ := netip.ParseAddr(localHost)
+	candidates := addresses[:0]
+	for _, addr := range addresses {
+		if !localIP.IsValid() || localIP.Unmap().Is4() == (addr.IP.To4() != nil) {
+			candidates = append(candidates, addr)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil, fmt.Errorf("no gateway address compatible with local binding %q", listenAddress)
+	}
+	raceCtx, cancelRace := context.WithCancel(dialCtx)
+	defer cancelRace()
+	type result struct {
+		conn   *quic.Conn
+		packet net.PacketConn
+		err    error
+	}
+	results := make(chan result)
+	next, active := 0, 0
+	launch := func() {
+		addr := candidates[next]
+		waves := (len(candidates) - next + 1) / 2
+		next++
+		active++
+		go func() {
+			attemptCtx := raceCtx
+			if deadline, ok := raceCtx.Deadline(); ok && waves > 1 {
+				var stop context.CancelFunc
+				attemptCtx, stop = context.WithTimeout(raceCtx, time.Until(deadline)/time.Duration(waves))
+				defer stop()
+			}
+			conn, packet, err := dialQUICAddress(attemptCtx, remote, addr, tlsCfg, listenAddress, composed, observeTransientWrite, windows, hop)
+			select {
+			case results <- result{conn, packet, err}:
+			case <-raceCtx.Done():
+				if conn != nil {
+					_ = conn.CloseWithError(0, "unused address candidate")
+				}
+				if packet != nil {
+					_ = packet.Close()
+				}
+			}
+		}()
+	}
+	launch()
+	delay := 250 * time.Millisecond
+	if deadline, ok := raceCtx.Deadline(); ok {
+		delay = min(delay, max(time.Millisecond, time.Until(deadline)/2))
+	}
+	stagger := time.NewTicker(delay)
+	defer stagger.Stop()
+	var failures []error
+	for active > 0 {
+		select {
+		case got := <-results:
+			active--
+			if got.err == nil {
+				return got.conn, got.packet, nil
+			}
+			failures = append(failures, got.err)
+			if next < len(candidates) {
+				launch()
+			}
+		case <-stagger.C:
+			if active < 2 && next < len(candidates) {
+				launch()
+			}
+		case <-raceCtx.Done():
+			return nil, nil, raceCtx.Err()
+		}
+	}
+	return nil, nil, errors.Join(failures...)
+}
+
+func dialQUICAddress(dialCtx context.Context, remote string, remoteAddr *net.UDPAddr, tlsCfg *tls.Config, listenAddress string, composed func(string, string, syscall.RawConn) error, observeTransientWrite func(error), windows flowWindows, hop hopDialConfig) (*quic.Conn, net.PacketConn, error) {
 	packetConn, err := (&net.ListenConfig{Control: composed}).ListenPacket(dialCtx, "udp", listenAddress)
 	if err != nil {
 		return nil, nil, err
@@ -813,7 +890,7 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 
 func explainDataHandshakeError(remote, transport string, err error) error {
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no application protocol") {
-		return fmt.Errorf("gateway %q rejected Queqiao protocol 1 over %s; the endpoint may still run an incompatible development server or another TLS service: %w", remote, transport, err)
+		return fmt.Errorf("gateway %q rejected Queqiao protocol %d over %s; the endpoint may still run an incompatible development server or another TLS service: %w", remote, protocol.Version, transport, err)
 	}
 	return err
 }
@@ -832,16 +909,24 @@ func validateLocalAddressSpec(spec string) error {
 // local address nor the interface binding the lane is about to use. A literal
 // address needs no lookup and takes the same path it always did.
 func resolveUDPAddr(ctx context.Context, remote string, resolver *net.Resolver) (*net.UDPAddr, error) {
+	addresses, err := resolveUDPAddrs(ctx, remote, resolver)
+	if err != nil {
+		return nil, err
+	}
+	return addresses[0], nil
+}
+
+func resolveUDPAddrs(ctx context.Context, remote string, resolver *net.Resolver) ([]*net.UDPAddr, error) {
 	host, port, err := net.SplitHostPort(remote)
 	if err != nil {
 		return nil, err
 	}
-	if addr, parseErr := netip.ParseAddr(host); parseErr == nil {
-		return net.ResolveUDPAddr("udp", net.JoinHostPort(addr.String(), port))
-	}
 	portNumber, err := net.LookupPort("udp", port)
 	if err != nil {
 		return nil, err
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return []*net.UDPAddr{{IP: net.IP(addr.AsSlice()), Zone: addr.Zone(), Port: portNumber}}, nil
 	}
 	addresses, err := resolver.LookupIPAddr(ctx, host)
 	if err != nil {
@@ -850,7 +935,11 @@ func resolveUDPAddr(ctx context.Context, remote string, resolver *net.Resolver) 
 	if len(addresses) == 0 {
 		return nil, fmt.Errorf("no addresses for %q", host)
 	}
-	return &net.UDPAddr{IP: addresses[0].IP, Zone: addresses[0].Zone, Port: portNumber}, nil
+	result := make([]*net.UDPAddr, 0, len(addresses))
+	for _, address := range addresses {
+		result = append(result, &net.UDPAddr{IP: address.IP, Zone: address.Zone, Port: portNumber})
+	}
+	return result, nil
 }
 
 // composeSocketControls returns a control function that calls a then b. Either

@@ -1,7 +1,7 @@
 # Known limitations
 
 > [!NOTE]
-> **Status:** Current limitations for public protocol 1
+> **Status:** Current limitations for public protocol 2
 > **Last reviewed:** 2026-08-26
 
 These are the boundaries of the ready-to-use public-preview deployment. Read
@@ -63,15 +63,15 @@ qualification items are still open.
   public resource outside the operator's authority.
 - No complete multi-network protocol-1 field campaign has been published yet;
   performance on unmeasured paths is not guaranteed.
-- The frame payload limit is a constant of protocol 1 rather than a deployment
+- The frame payload limit is a constant of protocol 2 rather than a deployment
   setting, so a gateway cannot be configured to accept less than the wire
-  requires. Version 1 negotiates no capabilities, and a private receive limit
+  requires. Version 2 negotiates no capabilities, and a private receive limit
   would fail one direction of traffic without naming the setting or the peer
   holding it. The former `--max-payload` flag is removed; `--chunk-size`
   remains, because what a sender chooses to emit is a local choice.
 - The committed conformance vectors are replayed only against this
   implementation. They pin the wire and make a silent divergence loud, but no
-  independent implementation has been checked against them yet, so protocol 1
+  independent implementation has been checked against them yet, so protocol 2
   is documented rather than demonstrated interoperable.
 - Metrics have no authentication; bind them to loopback or protect them.
 - Provider state is an online high-value secret. Queqiao does not yet integrate
@@ -155,3 +155,7 @@ qualification items are still open.
   `VpnService`, which the released Android app now is, so a Play listing needs
   an Organization account and Play's VPN declaration; direct distribution
   remains the supported Android path.
+
+Wire version 2 requires paired upgrades. It rejects version 1 at data ALPN
+negotiation and does not provide an in-place, mixed-version rolling upgrade.
+See [the protocol upgrade procedure](PROTOCOL.md) for parallel-endpoint staging.

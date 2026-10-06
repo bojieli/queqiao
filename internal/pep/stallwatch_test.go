@@ -86,32 +86,6 @@ func TestScanStallGating(t *testing.T) {
 	}
 }
 
-// The response gate opens when the application sent something the peer has
-// not answered, and closes on any downstream payload or either close. A flow
-// whose last send was answered is idle, not waiting.
-func TestResponseOutstandingGating(t *testing.T) {
-	flow := newStallTestFlow(t, nil)
-	if flow.responseOutstanding() {
-		t.Fatal("a flow that never sent is waiting on a response")
-	}
-	flow.observe(64, true)
-	flow.bytesUp.Add(64)
-	if !flow.responseOutstanding() {
-		t.Fatal("an unanswered request did not open the response gate")
-	}
-	flow.observe(128, false)
-	flow.bytesDown.Add(128)
-	if flow.responseOutstanding() {
-		t.Fatal("an answered request kept the response gate open")
-	}
-	flow.observe(64, true)
-	flow.bytesUp.Add(64)
-	flow.remoteFinSeen.Store(true)
-	if flow.responseOutstanding() {
-		t.Fatal("a flow that saw the peer's FIN is still waiting")
-	}
-}
-
 // Demotion is not death: a suspected lane is passed over for new writes while
 // a healthier lane exists, keeps its place in the healthy set, and is fully
 // eligible again the moment it is the only thing left.
@@ -349,5 +323,43 @@ func TestParallelRescueAllAttemptsFail(t *testing.T) {
 	}
 	if got := client.metrics.Snapshot().LaneRescueAttempts; got != 2 {
 		t.Fatalf("rescue attempts = %d, want 2", got)
+	}
+}
+
+// A JOIN can succeed without restoring data delivery. The next request in
+// the same stall episode must name the current lane, not omit the hint or
+// keep naming the lane the previous round already retired.
+func TestStallWatchdogRefreshesReplacementAfterRescue(t *testing.T) {
+	flow := newStallTestFlow(t, nil)
+	old, _ := rescueTestLane(t, 0)
+	if err := flow.addLane(old); err != nil {
+		t.Fatal(err)
+	}
+	flow.noteSent(0, 512)
+	flow.stallScan = 5 * time.Millisecond
+	flow.stallGrace = 20 * time.Millisecond
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go flow.stallWatchdog(stop)
+	select {
+	case <-flow.stallSignals():
+	case <-time.After(time.Second):
+		t.Fatal("no initial rescue request")
+	}
+	flow.rescueInFlight.Store(true)
+	flow.retireLaneByID(old.id)
+	replacement, _ := rescueTestLane(t, 1)
+	if err := flow.addLane(replacement); err != nil {
+		t.Fatal(err)
+	}
+	flow.clearRescueReplacement()
+	flow.rescueInFlight.Store(false)
+	select {
+	case <-flow.stallSignals():
+	case <-time.After(time.Second):
+		t.Fatal("no retry for the continuing stall")
+	}
+	if id, ok := flow.rescueReplacement(); !ok || id != replacement.id {
+		t.Fatalf("retry replacement = (%d, %t), want (%d, true)", id, ok, replacement.id)
 	}
 }

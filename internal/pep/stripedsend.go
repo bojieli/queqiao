@@ -267,8 +267,9 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		// A lane carrying its data over coded datagrams does not retransmit
 		// for itself: the code repairs most loss and not all, and what it
 		// cannot repair has no other way back on a single-lane flow.
-		Reliable: f.laneRetransmits,
-		Windows:  &laneAdmission{flow: f},
+		Reliable:      f.laneRetransmits,
+		ForceReliable: f.recoverChunkReliably,
+		Windows:       &laneAdmission{flow: f},
 	})
 	defer sched.Close()
 
@@ -528,13 +529,17 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 	if sched := f.scheduler.Load(); sched != nil {
 		written = func() { sched.Wrote(lane.id, chunk) }
 	}
-	return f.enqueueFrameWritten(ctx, lane, frame, bulk, written)
+	return f.enqueueFrameWritten(ctx, lane, frame, bulk, written, chunk.Reliable)
 }
 
 // sendFinal closes the outbound direction once every byte has been
 // acknowledged, and waits for the peer's final acknowledgement.
 func (f *multipathFlow) sendFinal(ctx context.Context, sequence uint64) error {
 	f.noteLocalClose(sequence)
+	if f.localAbortSent.Load() {
+		return nil
+	}
+	sequence = f.finSequence.Load()
 	fin := protocol.Frame{Header: protocol.Header{
 		Version: protocol.Version, Type: protocol.TypeClose, Flags: protocol.FlagFin,
 		SessionID: f.sessionID, FlowID: f.flowID, Sequence: sequence, Class: protocol.Class(f.class.Load()),

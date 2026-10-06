@@ -422,12 +422,12 @@ func TestResolveLocalAddressAutoOrInterfaceReportsOperationalState(t *testing.T)
 }
 
 func TestALPNFailureExplainsEndpointOrVersionMismatch(t *testing.T) {
-	if defaultALPN != "queqiao/1" {
-		t.Fatalf("data ALPN = %q, want first public protocol ALPN", defaultALPN)
+	if defaultALPN != "queqiao/2" {
+		t.Fatalf("data ALPN = %q, want replacement JOIN protocol ALPN", defaultALPN)
 	}
 	err := explainDataHandshakeError("gateway.example:443", "TCP", errors.New("remote error: tls: no application protocol"))
 	message := err.Error()
-	if !strings.Contains(message, "protocol 1") || !strings.Contains(message, "gateway.example:443") || !strings.Contains(message, "incompatible") {
+	if !strings.Contains(message, "protocol 2") || !strings.Contains(message, "gateway.example:443") || !strings.Contains(message, "incompatible") {
 		t.Fatalf("unhelpful ALPN error: %v", err)
 	}
 	original := errors.New("connection refused")

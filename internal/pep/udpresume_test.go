@@ -205,7 +205,6 @@ func TestARescuedUDPAssociationKeepsItsRemoteSourceAddress(t *testing.T) {
 	defer serviceCancel()
 	quicCtx, quicCancel := context.WithCancel(serviceCtx)
 	errorsCh := make(chan error, 3)
-	go func() { errorsCh <- server.ServeListener(serviceCtx, tcpListener) }()
 	go func() { errorsCh <- server.ServePacketConn(quicCtx, quicPacketConn) }()
 	go func() { errorsCh <- client.ServeListener(serviceCtx, clientListener) }()
 
@@ -256,6 +255,10 @@ func TestARescuedUDPAssociationKeepsItsRemoteSourceAddress(t *testing.T) {
 	// TLS/TCP, which is a different transport to the same server -- so the
 	// relay it reclaims is genuinely the retained one and not an artefact of
 	// the connection surviving.
+	// Start the fallback server only after the first QUIC exchange. Otherwise
+	// a loaded CI host can select TCP initially and the test never injects a
+	// fault into the transport actually carrying the association.
+	go func() { errorsCh <- server.ServeListener(serviceCtx, tcpListener) }()
 	quicCancel()
 	deadline := time.Now().Add(10 * time.Second)
 	for client.Metrics().Snapshot().UDPAssociationReconnects == 0 && time.Now().Before(deadline) {

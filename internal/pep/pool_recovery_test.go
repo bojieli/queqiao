@@ -16,6 +16,68 @@ import (
 	"time"
 )
 
+// Keep the address and QUIC context alive locally while advancing only the
+// suspend clock, as happens before the transport processes wake-up timers.
+func TestResumeReplacesPoolsBeforeConcurrentBorrowersReuseThem(t *testing.T) {
+	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+	client := rig.client
+	t.Cleanup(client.closeQUICPool)
+	var suspended atomic.Int64
+	client.readSuspendTime = func() (time.Duration, error) {
+		return time.Duration(suspended.Load()), nil
+	}
+	client.resumeState = suspendWatchState{known: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ccfg := congestionConfig{kind: defaultCongestion()}
+	first, err := client.dialPooledQUICLane(ctx, ccfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	old := first.(*controlPoolStreamConn).generation
+	bulk, err := client.reserveBulkConn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suspended.Store(int64(laneDeadPathDetection + time.Second))
+	const borrowers = 8
+	results := make(chan streamConn, borrowers)
+	errorsCh := make(chan error, borrowers)
+	for range borrowers {
+		go func() {
+			stream, err := client.dialPooledQUICLane(ctx, ccfg)
+			results <- stream
+			errorsCh <- err
+		}()
+	}
+	var replacement *controlQUICGeneration
+	for range borrowers {
+		stream := <-results
+		if err := <-errorsCh; err != nil {
+			t.Errorf("borrow after resume: %v", err)
+		}
+		if stream == nil {
+			continue
+		}
+		generation := stream.(*controlPoolStreamConn).generation
+		_ = stream.Close()
+		if generation == old {
+			t.Error("wake-up request reused the pre-sleep generation")
+		}
+		if replacement != nil && replacement != generation {
+			t.Error("concurrent wake-up requests replaced each other's generation")
+		}
+		replacement = generation
+	}
+	if old.conn.Context().Err() == nil || bulk.conn.Context().Err() == nil {
+		t.Fatal("resume left a pre-sleep control or bulk connection open")
+	}
+	if client.checkSystemResume() {
+		t.Fatal("watcher consumed the same resume again after borrowers handled it")
+	}
+}
+
 // A pooled connection is a failure domain, but it must not be a recovery
 // stampede. Retiring one generation with several live logical flows should
 // create exactly one new UDP socket, rejoin every flow as a stream on it, and
@@ -388,7 +450,7 @@ func TestControlPoolDialOwnershipAndGenerationGuards(t *testing.T) {
 	}
 }
 
-func TestTimedOutControlStreamRetiresItsQUICGeneration(t *testing.T) {
+func TestTimedOutControlStreamPreservesItsQUICGeneration(t *testing.T) {
 	certificate, roots := testCertificate(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
@@ -448,8 +510,8 @@ func TestTimedOutControlStreamRetiresItsQUICGeneration(t *testing.T) {
 	client.quicMu.Lock()
 	afterTimeout := client.quicGeneration
 	client.quicMu.Unlock()
-	if afterTimeout != nil {
-		t.Fatal("timed-out stream left its pooled generation reusable")
+	if afterTimeout != firstGeneration {
+		t.Fatal("stream timeout retired a healthy shared generation")
 	}
 	_ = first.Close()
 
@@ -462,11 +524,11 @@ func TestTimedOutControlStreamRetiresItsQUICGeneration(t *testing.T) {
 	if !ok {
 		t.Fatalf("replacement pooled lane type = %T", second)
 	}
-	if secondPooled.generation == firstGeneration {
-		t.Fatal("next lane reused the timed-out QUIC generation")
+	if secondPooled.generation != firstGeneration {
+		t.Fatal("next lane did not reuse the healthy QUIC generation")
 	}
-	if got := sockets.Load(); got != 2 {
-		t.Fatalf("UDP sockets = %d, want one replacement generation", got)
+	if got := sockets.Load(); got != 1 {
+		t.Fatalf("UDP sockets = %d, want one shared generation", got)
 	}
 
 	client.closeQUICPool()
@@ -518,4 +580,37 @@ func assertEchoRoundTrip(t *testing.T, conn net.Conn, payload string) {
 	if string(got) != payload {
 		t.Fatalf("echo = %q, want %q", got, payload)
 	}
+}
+
+// Sleep may happen during the handshake, after the initial resume check.
+// Do not publish that pre-sleep bulk connection into the post-wake pool.
+func TestBulkDialRechecksResumeBeforePublishing(t *testing.T) {
+	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+	client := rig.client
+	t.Cleanup(client.closeQUICPool)
+	var reads atomic.Int64
+	client.resumeState = suspendWatchState{known: true}
+	client.readSuspendTime = func() (time.Duration, error) {
+		if reads.Add(1) == 1 {
+			return 0, nil
+		}
+		return laneDeadPathDetection + time.Second, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entry, err := client.reserveBulkConn(ctx)
+	if entry != nil {
+		client.releaseBulkConn(entry, true)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-sleep bulk dial published: %v", err)
+	}
+	if got := client.bulkConnCount(); got != 0 {
+		t.Fatalf("obsolete bulk connections: %d", got)
+	}
+	fresh, err := client.reserveBulkConn(ctx)
+	if err != nil {
+		t.Fatalf("fresh bulk dial after resume: %v", err)
+	}
+	client.releaseBulkConn(fresh, true)
 }

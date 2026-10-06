@@ -3,7 +3,7 @@
 > [!NOTE]
 > **Status:** Current implementation reference
 >
-> **Applies to:** Public protocol 1
+> **Applies to:** Public protocol 2
 > **Last reviewed:** 2026-08-20
 
 This document describes the implementation behind the [How it works](../README.md#how-it-works)

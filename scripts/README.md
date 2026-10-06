@@ -228,6 +228,13 @@ opaque path label rather than an ISP account or subscriber address.
   --output-dir /tmp/queqiao-field-mobile-a
 ```
 
+For a stable test fixture, pass `--expected-https-sha256 HASH` to require the
+SHA-256 of the decoded HTTP body. Truncated Content-Length or chunked bodies
+fail instead of counting as HTTP successes. Without an expected digest,
+`body_integrity_checked` is false: recorded hashes alone do not prove integrity.
+Without resource inputs, `resources_checked` is false and `resources_settled`
+is null, not a resource-convergence pass.
+
 The harness does not create network diversity. Run it separately on the exact
 independent paths recorded in `docs/FIELD-VALIDATION.md`; endpoint-injected
 faults must be labeled as such.

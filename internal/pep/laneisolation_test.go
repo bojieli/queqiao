@@ -200,6 +200,28 @@ func TestServerReplacesALaneWithTheSameRole(t *testing.T) {
 	}
 }
 
+// A stall rescue names the lane it is replacing. The peer must retire that
+// still-young socket before checking the ceiling; otherwise every rescue in
+// the first idle-timeout window is rejected as lane_unavailable.
+func TestExplicitLaneReplacementEvictsYoungLaneAtCapacity(t *testing.T) {
+	flow := newIsolationTestFlow(t, false)
+	session := newServerFlow(flow, identity.Principal{}, TransportQUIC, 1)
+	old := isolationLane(t, 0)
+	if err := session.addLane(old); err != nil {
+		t.Fatal(err)
+	}
+	replacement := isolationLane(t, 1)
+	if err := session.addLaneReplacing(replacement, old.id, true); err != nil {
+		t.Fatalf("explicit replacement refused: %v", err)
+	}
+	if !old.closed.Load() || replacement.closed.Load() {
+		t.Fatalf("old closed=%t replacement closed=%t, want true/false", old.closed.Load(), replacement.closed.Load())
+	}
+	if got := flow.laneCount(); got != 1 || flow.laneByID(old.id) != nil || flow.laneByID(replacement.id) != replacement {
+		t.Fatalf("lane state count=%d old=%v replacement=%v, want only replacement", got, flow.laneByID(old.id), flow.laneByID(replacement.id))
+	}
+}
+
 // Parallel rescue JOINs race one another to the gateway, which admits in
 // arrival order while the peer crowns the first finisher. Once the live
 // lanes are older than the rescue-race window, admission at the lane ceiling

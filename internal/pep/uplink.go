@@ -81,9 +81,86 @@ func (c *Client) currentUplinkState() (address string, unavailable bool) {
 	return addressHost(conn.LocalAddr()), false
 }
 
+// uplinkInterface identifies the physical owner of the source address, never
+// an unrelated default TUN route.
+func (c *Client) uplinkInterface() *net.Interface {
+	address, _ := c.currentUplinkState()
+	if c.cfg.LocalAddress != "" {
+		if result, err := netbind.ResolveWithInterface(c.cfg.LocalAddress); err == nil && result.InterfaceName != "" {
+			iface, _ := net.InterfaceByName(result.InterfaceName)
+			return iface
+		}
+	}
+	interfaces, _ := net.Interfaces()
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagPointToPoint != 0 {
+			continue
+		}
+		addresses, _ := iface.Addrs()
+		for _, a := range addresses {
+			ip, _, _ := net.ParseCIDR(a.String())
+			if ip != nil && ip.String() == address {
+				return &iface
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Client) currentUplinkIdentity() (string, bool) {
+	address, unavailable := c.currentUplinkState()
+	if address == "" {
+		return "", unavailable
+	}
+	if iface := c.uplinkInterface(); iface != nil {
+		return fmt.Sprintf("%s|%s|%d|%s", address, iface.Name, iface.Index, uplinkGateway(iface.Index, address)), false
+	}
+	return address, false
+}
+
 type uplinkWatchState struct {
 	known       string
 	interrupted bool
+}
+
+// Suspend time advances while the process cannot observe its uplink, even
+// when that uplink has exactly the same address on wake. Unlike wall time,
+// the platform clocks used here are unaffected by clock corrections.
+type suspendWatchState struct {
+	total time.Duration
+	known bool
+}
+
+func (s *suspendWatchState) observe(total time.Duration, err error) bool {
+	if err != nil || total < 0 || (s.known && total < s.total) {
+		return false
+	}
+	expired := s.known && total-s.total >= laneDeadPathDetection
+	s.total, s.known = total, true
+	return expired
+}
+
+// Both the existing uplink watcher and pool borrowers check this boundary.
+// One borrower invalidates the old epoch; concurrent borrowers then share
+// the existing singleflight dial instead of each resetting its replacement.
+func (c *Client) checkSystemResume() bool {
+	c.resumeMu.Lock()
+	defer c.resumeMu.Unlock()
+	read := c.readSuspendTime
+	if read == nil {
+		read = systemSuspendTime
+	}
+	if !c.resumeState.observe(read()) {
+		return false
+	}
+	if c.udpHealth != nil {
+		c.udpHealth.reset()
+	}
+	c.closeQUICPool()
+	if c.cfg.Logger != nil {
+		c.cfg.Logger.Info("system resumed after transport idle budget; expired QUIC pools")
+	}
+	return true
 }
 
 // observe reports whether connections belonging to the previous path must be
@@ -107,16 +184,30 @@ func (s *uplinkWatchState) observe(current string, unavailable bool) (from strin
 // watchUplink notices the machine changing how it reaches the server.
 func (c *Client) watchUplink(ctx context.Context, known string) {
 	state := uplinkWatchState{known: known}
+	events := c.uplinkEvents(ctx)
+	pathEvent := false
 	ticker := time.NewTicker(uplinkPollInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-events:
+			pathEvent = true
+			continue
 		case <-ticker.C:
 		}
-		current, unavailable := c.currentUplinkState()
+		resumed := c.checkSystemResume()
+		current, unavailable := c.currentUplinkIdentity()
+		if pathEvent {
+			state.interrupted = true
+			pathEvent = false
+		}
 		from, changed := state.observe(current, unavailable)
+		if resumed {
+			c.prewarmPath(ctx)
+			continue
+		}
 		if !changed {
 			continue
 		}

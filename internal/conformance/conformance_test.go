@@ -29,7 +29,7 @@ func decodeHex(t *testing.T, name, s string) []byte {
 func TestLimitsMatchTheVectors(t *testing.T) {
 	got, want := limitVector(), loadVectors(t).Limits
 	if got != want {
-		t.Fatalf("protocol 1 limits changed.\n build: %+v\nvector: %+v", got, want)
+		t.Fatalf("protocol 2 limits changed.\n build: %+v\nvector: %+v", got, want)
 	}
 	// The relationship that motivates the payload limit, stated rather than
 	// assumed: a receiver that cannot hold the largest legal PACKET cannot
@@ -58,11 +58,11 @@ func TestFrameHeaderVectors(t *testing.T) {
 		t.Run("accept/"+v.Name, func(t *testing.T) {
 			raw := decodeHex(t, v.Name, v.Hex)
 			if len(raw) != protocol.HeaderSize {
-				t.Fatalf("header is %d bytes, protocol 1 headers are %d", len(raw), protocol.HeaderSize)
+				t.Fatalf("header is %d bytes, protocol 2 headers are %d", len(raw), protocol.HeaderSize)
 			}
 			h, err := protocol.DecodeHeader(raw)
 			if err != nil {
-				t.Fatalf("a header protocol 1 requires was refused: %v", err)
+				t.Fatalf("a header protocol 2 requires was refused: %v", err)
 			}
 			if int(h.Type) != v.Type || int(h.Flags) != v.Flags || h.FlowID != v.FlowID ||
 				h.Sequence != v.Sequence || h.PayloadLen != v.PayloadLen || int(h.Class) != v.Class {
@@ -86,7 +86,7 @@ func TestFrameHeaderVectors(t *testing.T) {
 	for _, v := range vectors.FrameHeaders.Reject {
 		t.Run("reject/"+v.Name, func(t *testing.T) {
 			if _, err := protocol.DecodeHeader(decodeHex(t, v.Name, v.Hex)); err == nil {
-				t.Fatalf("accepted a header protocol 1 forbids (%s)", v.Why)
+				t.Fatalf("accepted a header protocol 2 forbids (%s)", v.Why)
 			}
 		})
 	}
@@ -99,7 +99,7 @@ func TestAckRangeVectors(t *testing.T) {
 			got, err := protocol.DecodeAckRanges(payload, v.Cumulative)
 			if v.Reject {
 				if err == nil {
-					t.Fatalf("accepted an acknowledgement protocol 1 forbids (%s)", v.Why)
+					t.Fatalf("accepted an acknowledgement protocol 2 forbids (%s)", v.Why)
 				}
 				return
 			}
@@ -134,7 +134,7 @@ func TestDestinationVectors(t *testing.T) {
 			encoded, err := session.EncodeDestination(v.Input)
 			if v.Reject {
 				if err == nil {
-					t.Fatalf("accepted a destination protocol 1 forbids (%s)", v.Why)
+					t.Fatalf("accepted a destination protocol 2 forbids (%s)", v.Why)
 				}
 				return
 			}
@@ -174,7 +174,7 @@ func TestUDPVectors(t *testing.T) {
 			token, ok := session.DecodeUDPResumeOpen(payload)
 			if o.Reject {
 				if ok {
-					t.Fatalf("accepted a resume open protocol 1 forbids (%s)", o.Why)
+					t.Fatalf("accepted a resume open protocol 2 forbids (%s)", o.Why)
 				}
 				return
 			}
@@ -193,7 +193,7 @@ func TestUDPVectors(t *testing.T) {
 			_, token, ok := session.DecodeUDPResumeGrant(payload)
 			if g.Reject {
 				if ok {
-					t.Fatalf("accepted a resume grant protocol 1 forbids (%s)", g.Why)
+					t.Fatalf("accepted a resume grant protocol 2 forbids (%s)", g.Why)
 				}
 				return
 			}
@@ -230,7 +230,7 @@ func TestUDPVectors(t *testing.T) {
 	for _, r := range v.RejectPackets {
 		t.Run("reject-packet/"+r.Name, func(t *testing.T) {
 			if _, _, err := session.DecodeUDPPacket(decodeHex(t, r.Name, r.Hex)); err == nil {
-				t.Fatalf("accepted a packet protocol 1 forbids (%s)", r.Why)
+				t.Fatalf("accepted a packet protocol 2 forbids (%s)", r.Why)
 			}
 		})
 	}

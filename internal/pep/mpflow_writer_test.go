@@ -215,15 +215,13 @@ func TestFlowIdleTimeoutReleasesResources(t *testing.T) {
 
 // A TCP EOF does not distinguish CloseWrite from Close: both tell the proxy
 // only that the application's send half is finished. A quiet peer therefore
-// must not be aborted merely because the local reader reached EOF. The abort
-// grace starts only once response traffic is stalled or the peer has
-// acknowledged the local FIN.
+// must not be aborted merely because the local reader reached EOF. The
+// receive direction remains valid until explicit cancellation or a failed write.
 func TestQuietLocalHalfCloseDoesNotArmAbort(t *testing.T) {
 	inner, peer := net.Pipe()
 	defer peer.Close()
 	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024,
 		protocol.FlagAckUp, protocol.FlagAckDown, nil, nil)
-	flow.abortGrace = 10 * time.Millisecond
 	flow.noteLocalClose(0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
@@ -237,29 +235,17 @@ func TestQuietLocalHalfCloseDoesNotArmAbort(t *testing.T) {
 	}
 }
 
-// The four durations below are a budget, not free parameters. Writing them as
-// named constants because the original spelled them inline as 35ms of gap
-// against a 60ms grace, and that 25ms of headroom was thinner than a Windows
-// timer tick: the abort fired mid-run and the pipe EOF'd, failing the test in
-// exactly abortGrace. Every margin here is now at least a gap wide.
-//
-//	gap < grace                  one late sleep must not exhaust the grace
-//	gaps*gap < timeout           all four frames get sent before ctx expires
-//	timeout < gaps*gap + grace   ctx ends the loop before the last grace does
-//	grace < gaps*gap             a grace that stopped renewing still fails
 const (
-	halfCloseGraceProbeGap     = 100 * time.Millisecond
-	halfCloseGraceProbeGrace   = 250 * time.Millisecond
-	halfCloseGraceProbeTimeout = 450 * time.Millisecond
-	halfCloseGraceProbeFrames  = 4
+	halfCloseGraceProbeGap     = 6 * time.Second
+	halfCloseGraceProbeTimeout = 7 * time.Second
+	halfCloseGraceProbeFrames  = 2
 )
 
-func TestResponseProgressRenewsLocalHalfCloseGrace(t *testing.T) {
+func TestSlowResponseAfterLocalHalfCloseRemainsReadable(t *testing.T) {
 	inner, application := net.Pipe()
 	defer application.Close()
 	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024,
 		protocol.FlagAckUp, protocol.FlagAckDown, nil, nil)
-	flow.abortGrace = halfCloseGraceProbeGrace
 	flow.noteLocalClose(0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), halfCloseGraceProbeTimeout)
@@ -279,8 +265,8 @@ func TestResponseProgressRenewsLocalHalfCloseGrace(t *testing.T) {
 			// An EOF here is the abort closing inner, which is the failure
 			// this test exists to catch -- say so rather than reporting a
 			// bare read error.
-			t.Fatalf("read response byte %d after %v: %v; the half-close grace "+
-				"stopped being renewed by response progress",
+			t.Fatalf("read response byte %d after %v: %v; the receive direction "+
+				"was closed while the application was still reading",
 				sequence, time.Duration(sequence)*halfCloseGraceProbeGap, err)
 		}
 	}
@@ -334,116 +320,28 @@ func TestFailedApplicationWriteSendsAbortImmediately(t *testing.T) {
 	}
 }
 
-// This is the live leak reduced to one deterministic flow. The application
-// closes after the peer has delivered only an out-of-order response segment.
-// The local sender is deliberately left with an unacknowledged request, so
-// neither the scheduler nor the remote-FIN path can end the flow for us.
-func TestLocalCloseAbortsStalledReceiveAndReleasesRun(t *testing.T) {
+func TestHalfCloseWithBufferedResponseAndFinalACKWaitsForResponse(t *testing.T) {
 	inner, application := net.Pipe()
-	outer, peer := net.Pipe()
 	defer application.Close()
-	defer peer.Close()
-
-	sessionID := [16]byte{1}
-	const flowID = uint64(7)
-	flow := newMultipathFlow(context.Background(), inner, sessionID, flowID, 1024,
+	defer inner.Close()
+	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024,
 		protocol.FlagAckUp, protocol.FlagAckDown, nil, nil)
-	flow.abortGrace = 20 * time.Millisecond
-	flow.abortDrainGrace = 100 * time.Millisecond
-	if err := flow.addLane(&mpLane{id: 0, fc: newFrameConn(outer)}); err != nil {
-		t.Fatal(err)
-	}
-
-	responseBuffered := make(chan struct{})
-	abortSeen := make(chan protocol.Frame, 1)
-	peerErr := make(chan error, 1)
-	go func() {
-		buffered := false
-		for {
-			frame, err := protocol.ReadFrame(peer)
-			if err != nil {
-				peerErr <- err
-				return
-			}
-			switch frame.Header.Type {
-			case protocol.TypeData:
-				if buffered {
-					continue
-				}
-				buffered = true
-				// Sequence zero is intentionally absent. receiveInner holds
-				// this byte in its reassembler and cannot discover the closed
-				// application by attempting a write.
-				if err := protocol.WriteFrame(peer, protocol.Frame{Header: protocol.Header{
-					Version: protocol.Version, Type: protocol.TypeData,
-					SessionID: sessionID, FlowID: flowID, Sequence: 1,
-				}, Payload: []byte("stalled")}); err != nil {
-					peerErr <- err
-					return
-				}
-				close(responseBuffered)
-			case protocol.TypeClose:
-				if frame.Header.Flags&protocol.FlagCloseAbort == 0 {
-					peerErr <- errors.New("received ordinary FIN instead of abort")
-					return
-				}
-				if frame.Header.Sequence != uint64(len("request")) {
-					peerErr <- errors.New("abort did not carry the complete source sequence")
-					return
-				}
-				abortSeen <- frame
-				// Deliberately withhold the final ACK. The regression was a
-				// flow whose scheduler and receive loop both waited forever;
-				// cleanup must therefore be bounded even when the abort's
-				// completion signal is also absent.
-				return
-			}
-		}
-	}()
-
-	type runResult struct {
-		stats FlowStats
-		err   error
-	}
-	result := make(chan runResult, 1)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	flow.noteLocalClose(0)
+	flow.events <- inboundEvent{frame: protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeData,
+		SessionID: [16]byte{1}, FlowID: 7, Sequence: 1,
+	}, Payload: []byte("later")}}
+	flow.events <- inboundEvent{frame: protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeAck, Flags: protocol.FlagAckUp | protocol.FlagAckFinal,
+		SessionID: [16]byte{1}, FlowID: 7, Sequence: 0,
+	}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	go func() {
-		stats, err := flow.run(ctx)
-		result <- runResult{stats: stats, err: err}
-	}()
-	if _, err := application.Write([]byte("request")); err != nil {
-		t.Fatal(err)
+	if err := flow.receiveInner(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("half-close ended early: %v", err)
 	}
-	select {
-	case <-responseBuffered:
-	case err := <-peerErr:
-		t.Fatalf("peer failed before buffering response: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("peer did not send the stalled response segment")
-	}
-	_ = application.Close()
-
-	select {
-	case frame := <-abortSeen:
-		if frame.Header.Flags != protocol.FlagFin|protocol.FlagCloseAbort {
-			t.Fatalf("abort flags = %#x, want FIN|CLOSE_ABORT", frame.Header.Flags)
-		}
-	case err := <-peerErr:
-		t.Fatalf("peer failed before receiving abort: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("local close did not produce a bounded abort")
-	}
-	select {
-	case got := <-result:
-		if got.err != nil {
-			t.Fatalf("locally aborted flow returned error: %v", got.err)
-		}
-		if got.stats.BytesSent != uint64(len("request")) {
-			t.Fatalf("sent bytes = %d, want %d", got.stats.BytesSent, len("request"))
-		}
-	case <-time.After(time.Second):
-		t.Fatal("flow remained stuck after the bounded abort drain")
+	if flow.localAbortSent.Load() {
+		t.Fatal("half-close sent an abort")
 	}
 }
 

@@ -457,7 +457,8 @@ func (c *Client) openUDPAssociationMode(ctx context.Context, resume []byte, fast
 		return nil, encodeErr
 	}
 	payload := encoded
-	_ = lane.outer.SetDeadline(time.Now().Add(handshakeBound(lane.outer, c.cfg.HandshakeTimeout)))
+	_, finishHandshake := bindHandshake(ctx, lane.outer, handshakeBound(lane.outer, c.cfg.HandshakeTimeout))
+	defer finishHandshake()
 	if err := lane.fc.Write(protocol.Frame{Header: protocol.Header{
 		Version: protocol.Version, Type: protocol.TypeOpen, SessionID: lane.sessionID,
 		FlowID: flowID, Class: protocol.ClassInteractive,
@@ -493,7 +494,10 @@ func (c *Client) openUDPAssociationMode(ctx context.Context, resume []byte, fast
 		// works, and the destination sees a new source address.
 		c.cfg.Logger.Debug("UDP association relay not resumed", "flow", flowID)
 	}
-	_ = lane.outer.SetDeadline(time.Time{})
+	if err := finishHandshake(); err != nil {
+		_ = lane.fc.Close()
+		return nil, err
+	}
 	return association, nil
 }
 
@@ -809,9 +813,14 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	}
 	packets := make(chan udpDatagram, 32)
 	packetErr := make(chan error, 1)
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		buf := make([]byte, 65535)
 		for {
+			if assocCtx.Err() != nil {
+				return
+			}
 			_ = udpConn.SetReadDeadline(time.Now().Add(udpReadPoll))
 			n, addr, readErr := udpConn.ReadFromUDP(buf)
 			if readErr != nil {
@@ -843,6 +852,22 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	}()
 
 	var counters udpCounters
+	activity := make(chan struct{}, 1)
+	forward := newUDPForwarder(assocCtx, udpConn, s.cfg.DestinationPolicy.ResolveUDPAddr, func(n int) {
+		if n < 0 {
+			return
+		}
+		counters.up.Add(uint64(n))
+		notifyActivity(activity)
+	})
+	defer func() {
+		cancel()
+		_ = udpConn.SetReadDeadline(time.Now())
+		<-readerDone
+		forward.wg.Wait()
+		_ = udpConn.SetDeadline(time.Time{})
+	}()
+
 	var window packetWindow
 	var replySequence uint64
 	s.metrics.FlowStarted()
@@ -903,23 +928,8 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 				// reconnect.
 				continue
 			}
-			resolveCtx, resolveCancel := context.WithTimeout(assocCtx, 10*time.Second)
-			addresses, resolveErr := s.cfg.DestinationPolicy.ResolveUDPAddr(resolveCtx, destination)
-			resolveCancel()
-			if resolveErr != nil {
-				continue
-			}
-			var writeErr error
-			for _, address := range addresses {
-				_ = udpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if _, writeErr = udpConn.WriteToUDP(payload, address); writeErr == nil {
-					break
-				}
-			}
-			if writeErr != nil {
-				continue
-			}
-			counters.up.Add(uint64(len(payload)))
+			forward.enqueue(destination, payload)
+		case <-activity:
 			resetIdle()
 		case packet := <-packets:
 			payload, encodeErr := session.EncodeUDPPacket(packet.destination, packet.payload)

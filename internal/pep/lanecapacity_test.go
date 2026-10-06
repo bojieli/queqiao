@@ -3,6 +3,7 @@ package pep
 import (
 	"context"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -15,6 +16,39 @@ import (
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
 )
+
+func TestCompletedLaneJoinCarriesReplacementHint(t *testing.T) {
+	local, remote := net.Pipe()
+	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
+	seen := make(chan protocol.Frame, 1)
+	go func() {
+		frames := newFrameConn(remote)
+		request, err := frames.Read()
+		if err != nil {
+			return
+		}
+		seen <- request
+		_ = frames.Write(protocol.Frame{Header: protocol.Header{
+			Version: protocol.Version, Type: protocol.TypeOpenOK,
+			SessionID: request.Header.SessionID, FlowID: request.Header.FlowID,
+			Class: protocol.ClassBulk,
+		}})
+	}()
+	ctx := context.WithValue(context.Background(), laneReplacementContextKey{}, laneReplacementHint{id: 0})
+	client := &Client{cfg: ClientConfig{HandshakeTimeout: time.Second}}
+	if _, err := client.completeLaneJoin(ctx, &authenticatedLane{
+		fc: newFrameConn(local), outer: local, sessionID: [16]byte{1}, kind: TransportQUIC, laneID: 9,
+	}, 7, 0); err != nil {
+		t.Fatal(err)
+	}
+	request := <-seen
+	if request.Header.Flags&protocol.FlagReplaceLane == 0 || len(request.Payload) != 16 {
+		t.Fatalf("replacement JOIN flags=%#x payload=%d, want replacement flag and 16-byte payload", request.Header.Flags, len(request.Payload))
+	}
+	if got := binary.BigEndian.Uint64(request.Payload[8:]); got != 0 {
+		t.Fatalf("replaced lane ID = %d, want the zero-numbered initial lane", got)
+	}
+}
 
 // The reset code on a refused JOIN is the peer's retry policy: capacity must
 // stay the transient answer, while the TCP-mode refusal is a permanent
@@ -47,7 +81,7 @@ func TestCompleteLaneJoinMapsResetCodesToRetryPolicy(t *testing.T) {
 				}, Payload: session.ResetPayload(test.code, "refused")})
 			}()
 			client := &Client{cfg: ClientConfig{Logger: logger, HandshakeTimeout: 2 * time.Second}}
-			_, err := client.completeLaneJoin(&authenticatedLane{
+			_, err := client.completeLaneJoin(context.Background(), &authenticatedLane{
 				fc: newFrameConn(local), outer: local, sessionID: [16]byte{1}, kind: TransportQUIC, laneID: 1,
 			}, 7, 0)
 			if !errors.Is(err, test.want) {
@@ -283,5 +317,53 @@ func TestStallRescueGivesUpAfterConsecutiveCapacityRefusals(t *testing.T) {
 	}
 	if !flow.resumeRefused.Load() {
 		t.Fatal("consecutive capacity refusals did not mark the flow unresumable")
+	}
+	if !flow.doneChanClosed() {
+		t.Fatal("exhausted stall rescue left the application connection open")
+	}
+}
+
+func TestStallRescueRejectionClosesApplicationConnection(t *testing.T) {
+	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+	inner, application := net.Pipe()
+	t.Cleanup(func() { _ = inner.Close(); _ = application.Close() })
+	// The transport still looks alive locally, but the gateway has forgotten
+	// this session. The application must not wait for the transport timeout.
+	flow := newMultipathFlow(context.Background(), inner, [16]byte{99}, 7,
+		defaultChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, nil, nil)
+	t.Cleanup(flow.closeAll)
+	flow.reserveControlLane = true
+	if err := flow.addLane(isolationLane(t, 0)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() {
+		_, _ = flow.run(ctx)
+		close(runDone)
+	}()
+	done := make(chan struct{})
+	go func() {
+		rig.client.manageQUICLanes(ctx, flow, flow.sessionID, flow.flowID)
+		close(done)
+	}()
+	flow.stallSignal <- struct{}{}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("rejected rescue did not return")
+	}
+	if !flow.resumeRefused.Load() {
+		t.Fatal("peer did not reject the missing session")
+	}
+	_ = application.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, err := application.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("application read = %v, want immediate EOF after terminal rescue refusal", err)
+	}
+	select {
+	case <-runDone:
+	case <-ctx.Done():
+		t.Fatal("terminal rescue refusal left the flow workers running")
 	}
 }

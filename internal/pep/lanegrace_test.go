@@ -317,6 +317,52 @@ func TestAFlowRecordsWhetherAReplacementWasEvenAttempted(t *testing.T) {
 	}
 }
 
+// An already armed wait must observe rescue evidence, not just a waiter that
+// starts after the extension has been stored.
+func TestWaitingFlowHonorsAnExtendedReplacementGrace(t *testing.T) {
+	flow := newGraceTestFlow(t)
+	const grace = 400 * time.Millisecond
+	originalDeadline := time.Now().Add(grace)
+	flow.replacementDeadline.Store(originalDeadline.UnixNano())
+	waits := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { waits <- flow.waitForHealthyLane(ctx, grace) }()
+
+	// Let the waiter arm its timer before validated rescue evidence extends
+	// the shared deadline. Merely changing the stored deadline is insufficient.
+	select {
+	case err := <-waits:
+		t.Fatalf("wait ended before rescue evidence: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if !flow.extendReplacementOutage(time.Now(), time.Second) {
+		t.Fatal("the active outage refused its extension")
+	}
+	select {
+	case err := <-waits:
+		t.Fatalf("wait ignored the extended deadline: %v", err)
+	case <-time.After(time.Until(originalDeadline.Add(75 * time.Millisecond))):
+	}
+
+	local, remote := net.Pipe()
+	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
+	flow.lanesMu.Lock()
+	flow.lanes[1] = &mpLane{id: 1, kind: TransportQUIC, fc: newFrameConn(local)}
+	flow.lanesMu.Unlock()
+	select {
+	case err := <-waits:
+		if err != nil {
+			t.Fatalf("a rescued flow failed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the waiter did not observe the rescued lane")
+	}
+	if got := flow.replacementTimeouts.Load(); got != 0 {
+		t.Fatalf("successful recovery recorded %d timeouts", got)
+	}
+}
+
 // A rescue JOIN arriving mid-grace is the peer's recovery proving itself
 // alive. The grace restarts from that evidence rather than expiring
 // underneath the handshake it was waiting for; a flow not in an outage has

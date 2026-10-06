@@ -61,7 +61,8 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 	var peakPacing, peakBandwidth uint64
 	var lanes int64
 	var lastMode uint32
-	var maxQueue time.Duration
+	var maxQueue, maxQueueSmoothed, maxQueueMin time.Duration
+	var validQueueSamples, pendingQueueSamples int
 	var maxBrake float64
 	var lastLoss float64
 	deadline := time.After(24 * time.Second)
@@ -80,8 +81,14 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 		if s.QUICControllerMaxBandwidth > peakBandwidth {
 			peakBandwidth = s.QUICControllerMaxBandwidth
 		}
-		if q := s.QUICSmoothedRTT - s.QUICControllerMinRTT; q > maxQueue {
-			maxQueue = q
+		if q, valid := policerQueueDelay(s.QUICSmoothedRTT, s.QUICControllerMinRTT); valid {
+			validQueueSamples++
+			if validQueueSamples == 1 || q > maxQueue {
+				maxQueue = q
+				maxQueueSmoothed, maxQueueMin = s.QUICSmoothedRTT, s.QUICControllerMinRTT
+			}
+		} else {
+			pendingQueueSamples++
 		}
 		if s.QUICDelayBrake > maxBrake {
 			maxBrake = s.QUICDelayBrake
@@ -98,6 +105,11 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 		shaped, peakPacing, float64(peakPacing)/shaped,
 		peakBandwidth, float64(peakBandwidth)/shaped,
 		maxQueue.Round(time.Millisecond), maxBrake, lastLoss, lanes, lastMode)
+	t.Logf("queue observation: smoothed RTT %v, controller minimum %v; %d valid samples, %d pending baselines",
+		maxQueueSmoothed, maxQueueMin, validQueueSamples, pendingQueueSamples)
+	if validQueueSamples == 0 {
+		t.Fatal("the flow never supplied a measured RTT baseline, so queue delay was not characterized")
+	}
 
 	if peakPacing == 0 {
 		t.Skip("the flow never got going, so this run measured nothing")

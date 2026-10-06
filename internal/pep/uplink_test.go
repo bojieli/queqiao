@@ -1,6 +1,29 @@
 package pep
 
-import "testing"
+import (
+	"errors"
+	"testing"
+	"time"
+)
+
+func TestSuspendBoundaryUsesTransportIdleBudget(t *testing.T) {
+	var state suspendWatchState
+	if state.observe(time.Hour, nil) {
+		t.Fatal("initial clock reading reset a new client")
+	}
+	if state.observe(time.Hour+laneDeadPathDetection-time.Second, nil) {
+		t.Fatal("short sleep reset a live transport")
+	}
+	if state.observe(0, errors.New("clock unavailable")) || state.observe(0, nil) {
+		t.Fatal("failed or regressed clock observation reset the pool")
+	}
+	if !state.observe(time.Hour+2*laneDeadPathDetection-time.Second, nil) {
+		t.Fatal("sleep crossing the transport idle budget was missed")
+	}
+	if state.observe(time.Hour+2*laneDeadPathDetection-time.Second, nil) {
+		t.Fatal("same resume reset the pool twice")
+	}
+}
 
 func TestUplinkReconnectWithTheSameAddressStartsANewPath(t *testing.T) {
 	state := uplinkWatchState{known: "192.0.2.10"}

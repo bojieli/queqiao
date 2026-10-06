@@ -174,36 +174,70 @@ var (
 )
 
 func (s *serverFlow) addLane(lane *mpLane) error {
+	return s.addLaneReplacing(lane, 0, false)
+}
+
+func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, replaceLane bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	f := s.flow
+	f.lanesMu.Lock()
+	retired := make(map[uint64]*mpLane)
+	defer func() {
+		f.lanesMu.Unlock()
+		for _, old := range retired {
+			if sched := f.scheduler.Load(); sched != nil {
+				sched.RetireLane(old.id)
+			}
+			if old.fc != nil {
+				_ = old.fc.Close()
+			}
+		}
+	}()
+	if err := f.validateLaneLocked(lane); err != nil {
+		return err
+	}
 	if s.tcpMode && lane.kind != TransportTCP {
 		return errLaneFlowTCPMode
 	}
-	if lane.kind == TransportTCP && !s.tcpMode {
-		// The first authenticated TCP rescue is a transport handoff, not another
-		// path in a mixed bundle. Retiring QUIC immediately re-offers its chunks
-		// to the reliable scheduler before admitting the TCP lane.
-		s.flow.retireLanesExcept(TransportTCP)
-		s.tcpMode = true
-		s.maxLanes = s.tcpMaxLanes
+	handoff := lane.kind == TransportTCP && !s.tcpMode
+	limit := s.maxLanes
+	if handoff {
+		limit = s.tcpMaxLanes
 	}
-	if s.flow.laneCount() >= s.maxLanes {
-		// The peer can detect a dead QUIC socket before this endpoint does
-		// (for example, when the return path is black-holed). Admission at
-		// the ceiling is by eviction, and no role blocks it: the choice is
-		// limited only by the rescue-race window -- lanes whose JOIN
-		// handshake is in flight or whose admission is younger than the
-		// path-detection budget may still be waiting on the peer's crowning
-		// decision, so evicting one can kill the rescue that just won.
-		if !s.flow.retireOldestLane(lane.control, laneDeadPathDetection) || s.flow.laneCount() >= s.maxLanes {
-			return errLaneLimitReached
+	// Plan the entire admission before retiring anything. Duplicate IDs,
+	// shutdown, or a capacity refusal must leave the old transport intact.
+	remaining := 0
+	for id, old := range f.lanes {
+		if old.closed.Load() {
+			continue
+		}
+		if (handoff && old.kind != TransportTCP) || (replaceLane && replacedLaneID != lane.id && id == replacedLaneID) {
+			retired[id] = old
+		} else {
+			remaining++
 		}
 	}
-	if err := s.flow.addLane(lane); err != nil {
-		return err
+	if remaining >= limit {
+		victim := f.oldestLaneLocked(lane.control, laneDeadPathDetection, retired)
+		if victim == nil || remaining-1 >= limit {
+			// The deferred cleanup owns committed retirements only.
+			clear(retired)
+			return errLaneLimitReached
+		}
+		retired[victim.id] = victim
 	}
+	for id, old := range retired {
+		delete(f.lanes, id)
+		old.closed.Store(true)
+	}
+	if handoff {
+		s.tcpMode = true
+		s.maxLanes = limit
+	}
+	f.addLaneLocked(lane)
 	if s.tcpMode && s.maxLanes > 1 {
-		s.flow.tcpStriping.Store(true)
+		f.tcpStriping.Store(true)
 	}
 	return nil
 }
@@ -744,16 +778,22 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		return
 	}
 	if open.Header.Type == protocol.TypeJoin {
-		if session.IsZeroSessionID(open.Header.SessionID) || open.Header.FlowID == 0 || open.Header.Sequence != 0 || open.Header.Flags&^protocol.FlagReserveControl != 0 || len(open.Payload) != 8 {
+		validJoinFlags := protocol.FlagReserveControl | protocol.FlagReplaceLane
+		if session.IsZeroSessionID(open.Header.SessionID) || open.Header.FlowID == 0 || open.Header.Sequence != 0 || open.Header.Flags&^validJoinFlags != 0 || len(open.Payload) != 8 && len(open.Payload) != 16 || len(open.Payload) == 16 && open.Header.Flags&protocol.FlagReplaceLane == 0 || len(open.Payload) == 8 && open.Header.Flags&protocol.FlagReplaceLane != 0 {
 			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: open.Header.SessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}, Payload: session.ResetPayload(session.ResetProtocol, "invalid lane join")})
 			return
 		}
 		laneID := binary.BigEndian.Uint64(open.Payload)
+		replaceLane := open.Header.Flags&protocol.FlagReplaceLane != 0
+		replacedLaneID := uint64(0)
+		if replaceLane {
+			replacedLaneID = binary.BigEndian.Uint64(open.Payload[8:])
+		}
 		if laneID == 0 {
 			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: open.Header.SessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}, Payload: session.ResetPayload(session.ResetProtocol, "invalid lane join")})
 			return
 		}
-		s.handleLaneJoinOpen(ctx, conn, fc, principal, open.Header.SessionID, laneID, open)
+		s.handleLaneJoinOpenWithReplacement(ctx, conn, fc, principal, open.Header.SessionID, laneID, replacedLaneID, replaceLane, open)
 		return
 	}
 	sessionID := open.Header.SessionID
@@ -982,6 +1022,10 @@ func (s *Server) refuseLaneJoin(fc *frameConn, sessionID [16]byte, flowID, laneI
 // additionally binds the new lane to the principal that created the session;
 // session and flow IDs are routing identifiers, never bearer credentials.
 func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *frameConn, principal identity.Principal, sessionID [16]byte, laneID uint64, open protocol.Frame) {
+	s.handleLaneJoinOpenWithReplacement(ctx, conn, fc, principal, sessionID, laneID, 0, false, open)
+}
+
+func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn streamConn, fc *frameConn, principal identity.Principal, sessionID [16]byte, laneID, replacedLaneID uint64, replaceLane bool, open protocol.Frame) {
 	if session.IsZeroSessionID(sessionID) || laneID == 0 || open.Header.FlowID == 0 {
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinInvalidIdentity, session.ResetProtocol, "invalid lane join identity")
 		return
@@ -1020,14 +1064,18 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
+	// One bounded write phase covers admission and replay, including completed
+	// sessions which have no live flow watchdog left to interrupt a stuck peer.
+	writeCtx, cancelWrite := context.WithTimeout(ctx, laneJoinAdmissionTimeout)
+	defer cancelWrite()
 	if serverSession.completed.Load() {
 		s.cfg.Logger.Debug("lane join reached a completed session", "lane", laneID)
-		if err := fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}); err != nil {
+		if err := fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}); err != nil {
 			return
 		}
 		// The completed server flow has already acknowledged the peer's FIN;
 		// repeat that ACK on this authenticated replacement lane.
-		_ = fc.Write(protocol.Frame{Header: protocol.Header{
+		_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
 			Version: protocol.Version, Type: protocol.TypeAck, Flags: protocol.FlagAckFinal | serverSession.flow.recvAckFlag,
 			SessionID: sessionID, FlowID: open.Header.FlowID, Sequence: serverSession.flow.remoteFinSequence.Load(),
 			Class: protocol.ClassBulk,
@@ -1044,7 +1092,7 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 			if serverSession.flow.localAbortSent.Load() {
 				flags |= protocol.FlagCloseAbort
 			}
-			_ = fc.Write(protocol.Frame{Header: protocol.Header{
+			_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
 				Version: protocol.Version, Type: protocol.TypeClose, Flags: flags,
 				SessionID: sessionID, FlowID: open.Header.FlowID, Sequence: serverSession.flow.finSequence.Load(),
 				Class: protocol.ClassBulk,
@@ -1056,7 +1104,7 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 		id: laneID, kind: kind, fc: fc, writeHook: s.cfg.testLaneWriteHook,
 		control: controlReplacement, staged: true,
 	}
-	if err := serverSession.addLane(replacement); err != nil {
+	if err := serverSession.addLaneReplacing(replacement, replacedLaneID, replaceLane); err != nil {
 		s.cfg.Logger.Debug("lane join admission refused", "lane", laneID, "error", err)
 		switch {
 		case errors.Is(err, errLaneFlowTCPMode):
@@ -1085,9 +1133,7 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 	// holds the lane's write mutex while it arms the deadline, so a concurrent
 	// control write neither misses nor keeps it.
 	openOK := protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}}
-	writeCtx, cancelWrite := context.WithTimeout(ctx, laneJoinAdmissionTimeout)
 	writeErr := fc.WriteContext(writeCtx, openOK)
-	cancelWrite()
 	if writeErr != nil {
 		serverSession.flow.removeLane(replacement)
 		return
@@ -1107,7 +1153,7 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 	// idempotent at the reassembler and cumulative-ACK state, so replaying them
 	// is safe even when the original frame was merely delayed.
 	if serverSession.flow.remoteFinSeen.Load() {
-		_ = fc.Write(protocol.Frame{Header: protocol.Header{
+		_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
 			Version: protocol.Version, Type: protocol.TypeAck,
 			Flags:     protocol.FlagAckFinal | serverSession.flow.recvAckFlag,
 			SessionID: sessionID, FlowID: open.Header.FlowID,
@@ -1119,13 +1165,17 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 		if serverSession.flow.localAbortSent.Load() {
 			flags |= protocol.FlagCloseAbort
 		}
-		_ = fc.Write(protocol.Frame{Header: protocol.Header{
+		_ = fc.WriteContext(writeCtx, protocol.Frame{Header: protocol.Header{
 			Version: protocol.Version, Type: protocol.TypeClose, Flags: flags,
 			SessionID: sessionID, FlowID: open.Header.FlowID,
 			Sequence: serverSession.flow.finSequence.Load(), Class: protocol.ClassBulk,
 		}})
 	}
+	cancelWrite()
+	// A retired lane must release its admission slot while the logical flow
+	// continues on its replacement. Waiting only for the flow leaks slots.
 	select {
+	case <-fc.done:
 	case <-serverSession.flow.doneChan():
 	case <-ctx.Done():
 	}

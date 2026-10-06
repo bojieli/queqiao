@@ -52,7 +52,7 @@ func TestTheSpecificationStatesTheLimitsThisBuildEnforces(t *testing.T) {
 	}
 
 	// The vectors are only normative if the specification says they are.
-	if !strings.Contains(spec, "testdata/protocol1/vectors.json") {
+	if !strings.Contains(spec, "testdata/protocol2/vectors.json") {
 		t.Error("docs/PROTOCOL.md does not point at the conformance vectors")
 	}
 
@@ -61,7 +61,7 @@ func TestTheSpecificationStatesTheLimitsThisBuildEnforces(t *testing.T) {
 	// which is the failure mode this whole package is about.
 	for _, forbidden := range []string{"MAY configure a smaller limit", "max-payload"} {
 		if strings.Contains(spec, forbidden) {
-			t.Errorf("docs/PROTOCOL.md still describes %q, which version 1 does not have", forbidden)
+			t.Errorf("docs/PROTOCOL.md still describes %q, which version 2 does not have", forbidden)
 		}
 	}
 }

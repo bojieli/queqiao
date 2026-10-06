@@ -37,7 +37,7 @@ type frameConn struct {
 	control io.ReadWriteCloser
 	bulk    *coded.Path
 
-	writeMu sync.Mutex
+	writeMu chan struct{}
 	// writeBuf is reused under writeMu so that every frame reaches the
 	// transport as one write without allocating per frame.
 	writeBuf []byte
@@ -151,6 +151,7 @@ func newSplitFrameConnLimited(control io.ReadWriteCloser, bulk *coded.Path, read
 	}
 	return &frameConn{
 		control:         control,
+		writeMu:         make(chan struct{}, 1),
 		bulk:            bulk,
 		reader:          bufio.NewReaderSize(control, readBuffer),
 		bulkQueueFrames: bulkQueueFrames,
@@ -310,37 +311,33 @@ func (c *frameConn) countData(f protocol.Frame, coded bool) {
 
 func (c *frameConn) Write(f protocol.Frame) error {
 	if c.bulkFrame(f) {
-		c.countData(f, true)
-		if err := c.writeCoded(f); err != nil {
+		if err := c.writeCoded(context.Background(), f); err != nil {
 			return err
 		}
 		if c.needsOpenSafetyCopy(f) {
-			c.countData(f, false)
-			c.writeMu.Lock()
-			defer c.writeMu.Unlock()
+			c.writeMu <- struct{}{}
+			defer func() { <-c.writeMu }()
 			return c.writeLocked(f)
 		}
 		return nil
 	}
-	c.countData(f, false)
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	c.writeMu <- struct{}{}
+	defer func() { <-c.writeMu }()
 	return c.writeLocked(f)
 }
 
 // writeCoded hands a bulk frame to the coded substrate, falling back to the
 // control stream if it will not take it: correctness is not worth trading for
 // the coding.
-func (c *frameConn) writeCoded(f protocol.Frame) error {
+func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame) error {
 	buf, err := protocol.AppendFrame(nil, f)
 	if err != nil {
 		return err
 	}
-	if err := c.bulk.Send(buf); err != nil {
-		c.writeMu.Lock()
-		defer c.writeMu.Unlock()
-		return c.writeLocked(f)
+	if err := c.bulk.SendContext(ctx, buf); err != nil {
+		return c.writeControlContext(ctx, f)
 	}
+	c.countData(f, true)
 	return nil
 }
 
@@ -360,7 +357,11 @@ func (c *frameConn) writeLocked(f protocol.Frame) error {
 	if cap(buf) <= writeBufferRetain {
 		c.writeBuf = buf
 	}
-	return writeFull(c.control, buf)
+	if err := writeFull(c.control, buf); err != nil {
+		return err
+	}
+	c.countData(f, false)
+	return nil
 }
 
 const frameWriteTimeout = 15 * time.Second
@@ -370,21 +371,24 @@ const frameWriteTimeout = 15 * time.Second
 // deadline; transports without that optional method retain their normal
 // behavior and are still interruptible by Close from the flow coordinator.
 func (c *frameConn) WriteContext(ctx context.Context, f protocol.Frame) error {
-	if c.bulkFrame(f) {
+	return c.writeContextMode(ctx, f, false)
+}
+
+func (c *frameConn) writeContextMode(ctx context.Context, f protocol.Frame, forceReliable bool) error {
+	ctx, cancel := context.WithTimeout(ctx, frameWriteTimeout)
+	defer cancel()
+	if !forceReliable && c.bulkFrame(f) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		c.countData(f, true)
-		if err := c.writeCoded(f); err != nil {
+		if err := c.writeCoded(ctx, f); err != nil {
 			return err
 		}
 		if !c.needsOpenSafetyCopy(f) {
 			return nil
 		}
-		c.countData(f, false)
 		return c.writeControlContext(ctx, f)
 	}
-	c.countData(f, false)
 	return c.writeControlContext(ctx, f)
 }
 
@@ -394,8 +398,14 @@ func (c *frameConn) needsOpenSafetyCopy(f protocol.Frame) bool {
 }
 
 func (c *frameConn) writeControlContext(ctx context.Context, f protocol.Frame) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	select {
+	case c.writeMu <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return io.ErrClosedPipe
+	}
+	defer func() { <-c.writeMu }()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -407,7 +417,17 @@ func (c *frameConn) writeControlContext(ctx context.Context, f protocol.Frame) e
 		if err := deadlineConn.SetWriteDeadline(deadline); err != nil {
 			return err
 		}
-		defer deadlineConn.SetWriteDeadline(time.Time{})
+		finished := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = deadlineConn.SetWriteDeadline(time.Now())
+			close(finished)
+		})
+		defer func() {
+			if !stop() {
+				<-finished
+			}
+			_ = deadlineConn.SetWriteDeadline(time.Time{})
+		}()
 	}
 	return c.writeLocked(f)
 }

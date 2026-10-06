@@ -1,1 +1,1 @@
-testdata/protocol1/vectors.json text eol=lf
+testdata/**/vectors.json text eol=lf

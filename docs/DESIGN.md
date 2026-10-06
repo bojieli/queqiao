@@ -3,7 +3,7 @@
 > [!NOTE]
 > **Status:** Current technical design reference
 >
-> **Applies to:** Public protocol 1
+> **Applies to:** Public protocol 2
 > **Last reviewed:** 2026-08-20
 
 This is the technical deep dive behind the user-facing explanation in the
