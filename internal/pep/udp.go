@@ -676,8 +676,10 @@ func runClientUDPDownlink(ctx context.Context, udpConn *net.UDPConn, fc *frameCo
 		if err != nil {
 			return err
 		}
-		// The destination is returned by the server as a numeric source address.
-		// It is encoded back into the SOCKS response below.
+		// The destination is the source address reported by the gateway relay.
+		// Direct relays return a numeric address; an upstream SOCKS5 relay may
+		// legally preserve the domain from the request. Encode either form back
+		// into the local SOCKS response.
 		var packet bytes.Buffer
 		if err := socks5.WriteUDPDatagram(&packet, destination, payload); err != nil {
 			return err
@@ -705,7 +707,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	// Claiming is best effort: if the token is unknown, spent, or expired,
 	// this is an ordinary open with a fresh socket, which is exactly the
 	// behaviour that existed before resume did.
-	var udpConn *net.UDPConn
+	var udpConn serverUDPRelay
 	resumed := false
 	if resumable && len(resume) > 0 {
 		if held := s.udpRelays.claim(resume, principal); held != nil {
@@ -713,7 +715,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		}
 	}
 	if udpConn == nil {
-		listened, err := net.ListenUDP("udp", &net.UDPAddr{})
+		listened, err := s.cfg.DestinationPolicy.OpenUDPRelay(ctx)
 		if err != nil {
 			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: flowID, Class: protocol.ClassInteractive}, Payload: session.ResetPayload(session.ResetTransport, "UDP relay unavailable")})
 			return
@@ -813,7 +815,17 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		buf := make([]byte, 65535)
 		for {
 			_ = udpConn.SetReadDeadline(time.Now().Add(udpReadPoll))
-			n, addr, readErr := udpConn.ReadFromUDP(buf)
+			var (
+				n           int
+				addr        *net.UDPAddr
+				destination string
+				readErr     error
+			)
+			if relay, ok := udpConn.(namedUDPRelay); ok {
+				n, destination, readErr = relay.ReadFromDestination(buf)
+			} else {
+				n, addr, readErr = udpConn.ReadFromUDP(buf)
+			}
 			if readErr != nil {
 				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
 					if assocCtx.Err() != nil {
@@ -830,9 +842,12 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 				packetErr <- readErr
 				return
 			}
-			destination, err := session.DestinationFromUDPAddr(addr)
-			if err != nil {
-				continue
+			if destination == "" {
+				var destinationErr error
+				destination, destinationErr = session.DestinationFromUDPAddr(addr)
+				if destinationErr != nil {
+					continue
+				}
 			}
 			select {
 			case packets <- udpDatagram{destination: destination, payload: append([]byte(nil), buf[:n]...)}:
@@ -910,10 +925,15 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 				continue
 			}
 			var writeErr error
-			for _, address := range addresses {
+			if relay, ok := udpConn.(namedUDPRelay); ok {
 				_ = udpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if _, writeErr = udpConn.WriteToUDP(payload, address); writeErr == nil {
-					break
+				_, writeErr = relay.WriteToDestination(payload, destination)
+			} else {
+				for _, address := range addresses {
+					_ = udpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					if _, writeErr = udpConn.WriteToUDP(payload, address); writeErr == nil {
+						break
+					}
 				}
 			}
 			if writeErr != nil {

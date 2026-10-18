@@ -216,6 +216,61 @@ Private, loopback, link-local, multicast, and unspecified destinations are
 blocked after DNS resolution. Add `--allow-private-destinations` only when the
 service is intentionally an access proxy into a private network.
 
+### Route gateway traffic through sing-box
+
+The gateway can hand all accepted destination traffic to a SOCKS5 upstream on
+the same host, leaving sing-box to choose a direct or proxied final outbound.
+For example, route ChatGPT or another selected service through a designated
+proxy while other traffic leaves directly from the gateway. Keep those rules
+in sing-box; Queqiao provides the transport to the gateway and the handoff.
+
+Configure a sing-box SOCKS inbound on loopback with both TCP and UDP enabled,
+then add this server option:
+
+```sh
+queqiaod server \
+  --state /var/lib/queqiao/provider \
+  --listen :443 \
+  --outbound-socks5 127.0.0.1:1080
+```
+
+For the packaged systemd unit, append the same option to `QUEQIAOD_ARGS` and
+restart the service. The setting affects only application destination traffic
+leaving the gateway. Queqiao carrier, enrollment, renewal, and metrics sockets
+do not pass through it.
+
+The upstream is deliberately restricted to a literal loopback address and
+uses SOCKS5 without authentication: the unencrypted protocol is treated as a
+local process boundary, not a remote proxy transport. When it is configured,
+failure of the upstream fails the destination open; Queqiao does not silently
+bypass routing policy by falling back to a direct connection.
+
+TCP uses SOCKS5 CONNECT. Each Queqiao UDP association uses SOCKS5 UDP
+ASSOCIATE, and its TCP control connection is retained together with the UDP
+relay during Queqiao lane recovery. The sing-box inbound must therefore
+support UDP; a TCP-only inbound makes UDP association opens fail closed.
+
+Queqiao resolves and validates the requested destination at the gateway before
+contacting the upstream. If every current answer passes the destination policy,
+the SOCKS5 request retains the original domain so sing-box domain rules can
+select an outbound. The trusted upstream then performs the final resolution.
+This makes the local sing-box configuration and its DNS path part of the
+destination-policy boundary: do not let an untrusted user control them, and do
+not point this option at a remote SOCKS server. A later or divergent upstream
+DNS answer cannot be compared with Queqiao's earlier validation.
+`--allow-private-destinations` still controls the initial validation and should
+be enabled only for an intentional private-access service. The gateway must
+therefore be able to resolve destination names even when sing-box uses its own
+DNS configuration; enabling private destinations does not skip that lookup.
+UDP destinations are validated for each packet, so slow gateway DNS can also
+delay an association. Domain rules require the client to supply the domain;
+a request containing only an IP does not carry the original hostname.
+
+Verify TCP and UDP separately. An IP check through the client proves the final
+TCP egress; a DNS query through SOCKS5 UDP proves that sing-box's UDP inbound
+and selected outbound both work. Check the sing-box log as well as Queqiao's
+`remote flow opened` and UDP metrics before relying on the route.
+
 ## Add users and issue invitations
 
 Create a separate account for every customer or administrative boundary:

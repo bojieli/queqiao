@@ -48,7 +48,8 @@ provider admin CLI ── atomic authorization state ─────────
 application → SOCKS5 → unified client data path → TLS 1.3 → gateway → destination
                          │                   │                  │
                          │                   ├─ QUIC/UDP        ├─ destination policy
-                         │                   └─ TLS/TCP         └─ UDP relay store
+                         │                   └─ TLS/TCP         ├─ UDP relay store
+                         │                                      └─ optional loopback SOCKS5 upstream
                          │
                          ├─ endpoint-pair path model
                          ├─ aggregate pacing and priority
@@ -199,6 +200,17 @@ under a random single-use token. A replacement association with both the token
 and the same authenticated device principal can reclaim it, preserving the
 source address seen by the destination. At most 256 relays are retained.
 Datagrams in flight during failure are not recovered.
+
+The gateway normally opens TCP and UDP destinations directly. An operator may
+instead configure one unauthenticated loopback SOCKS5 upstream. TCP flows use
+CONNECT and UDP associations use UDP ASSOCIATE; the latter's TCP control
+connection is retained as part of the bounded relay so lane recovery does not
+silently destroy the upstream association. Destination policy first resolves
+and validates every current address, then preserves the original domain in the
+SOCKS request so the trusted local router can apply domain rules. The router's
+final DNS resolution is therefore part of the operator-controlled trust
+boundary. This is a local egress integration point, not another Queqiao carrier
+or a wire-protocol feature.
 
 ## Trust boundaries
 

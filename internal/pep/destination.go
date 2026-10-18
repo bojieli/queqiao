@@ -11,8 +11,9 @@ import (
 )
 
 type DestinationPolicy struct {
-	AllowPrivate bool
-	DialTimeout  time.Duration
+	AllowPrivate   bool
+	DialTimeout    time.Duration
+	OutboundSOCKS5 string
 }
 
 var additionallyForbidden = []netip.Prefix{
@@ -67,6 +68,25 @@ func (p DestinationPolicy) DialContext(ctx context.Context, destination string) 
 	if len(addresses) == 0 {
 		return nil, errors.New("destination did not resolve")
 	}
+	if p.OutboundSOCKS5 != "" {
+		// Resolve before handing the original name to the trusted loopback
+		// router. Requiring every current answer to pass the public-address
+		// policy prevents a mixed public/private answer from letting the
+		// upstream choose the private one while preserving domain metadata for
+		// sing-box routing rules.
+		if !p.AllowPrivate {
+			for _, candidate := range addresses {
+				if !publicDestinationIP(candidate.IP) {
+					return nil, errors.New("destination address is not public")
+				}
+			}
+		}
+		conn, dialErr := dialSOCKS5TCP(ctx, p.OutboundSOCKS5, destination, timeout)
+		if dialErr != nil {
+			return nil, fmt.Errorf("destination unavailable: %w", dialErr)
+		}
+		return conn, nil
+	}
 
 	dialer := net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	var lastErr error
@@ -88,10 +108,26 @@ func (p DestinationPolicy) DialContext(ctx context.Context, destination string) 
 	return nil, fmt.Errorf("destination unavailable: %w", lastErr)
 }
 
+func (p DestinationPolicy) OpenUDPRelay(ctx context.Context) (serverUDPRelay, error) {
+	if p.OutboundSOCKS5 == "" {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
+	}
+	timeout := p.DialTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return openSOCKS5UDPRelay(ctx, p.OutboundSOCKS5, timeout)
+}
+
 // ResolveUDPAddr validates and resolves a destination using exactly the same
-// public-address policy as TCP CONNECT. It deliberately returns a concrete
-// address: the server performs DNS resolution at the US egress and does not
-// let the client influence a later DNS rebinding or private-address hop.
+// public-address policy as TCP CONNECT. Direct relays use the returned concrete
+// addresses. A configured, trusted loopback SOCKS5 router receives the original
+// name only after every current answer passes this check, so it can apply
+// domain routing before performing its own final resolution.
 func (p DestinationPolicy) ResolveUDPAddr(ctx context.Context, destination string) ([]*net.UDPAddr, error) {
 	host, port, err := parseDestination(destination)
 	if err != nil {
@@ -115,6 +151,9 @@ func (p DestinationPolicy) ResolveUDPAddr(ctx context.Context, destination strin
 	result := make([]*net.UDPAddr, 0, len(addresses))
 	for _, candidate := range addresses {
 		if !p.AllowPrivate && !publicDestinationIP(candidate.IP) {
+			if p.OutboundSOCKS5 != "" {
+				return nil, errors.New("destination address is not public")
+			}
 			continue
 		}
 		result = append(result, &net.UDPAddr{IP: append(net.IP(nil), candidate.IP...), Port: port})
