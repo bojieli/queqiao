@@ -16,6 +16,68 @@ import (
 	"time"
 )
 
+// Keep the address and QUIC context alive locally while advancing only the
+// suspend clock, as happens before the transport processes wake-up timers.
+func TestResumeReplacesPoolsBeforeConcurrentBorrowersReuseThem(t *testing.T) {
+	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+	client := rig.client
+	t.Cleanup(client.closeQUICPool)
+	var suspended atomic.Int64
+	client.readSuspendTime = func() (time.Duration, error) {
+		return time.Duration(suspended.Load()), nil
+	}
+	client.resumeState = suspendWatchState{known: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ccfg := congestionConfig{kind: defaultCongestion()}
+	first, err := client.dialPooledQUICLane(ctx, ccfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	old := first.(*controlPoolStreamConn).generation
+	bulk, err := client.reserveBulkConn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suspended.Store(int64(laneDeadPathDetection + time.Second))
+	const borrowers = 8
+	results := make(chan streamConn, borrowers)
+	errorsCh := make(chan error, borrowers)
+	for range borrowers {
+		go func() {
+			stream, err := client.dialPooledQUICLane(ctx, ccfg)
+			results <- stream
+			errorsCh <- err
+		}()
+	}
+	var replacement *controlQUICGeneration
+	for range borrowers {
+		stream := <-results
+		if err := <-errorsCh; err != nil {
+			t.Errorf("borrow after resume: %v", err)
+		}
+		if stream == nil {
+			continue
+		}
+		generation := stream.(*controlPoolStreamConn).generation
+		_ = stream.Close()
+		if generation == old {
+			t.Error("wake-up request reused the pre-sleep generation")
+		}
+		if replacement != nil && replacement != generation {
+			t.Error("concurrent wake-up requests replaced each other's generation")
+		}
+		replacement = generation
+	}
+	if old.conn.Context().Err() == nil || bulk.conn.Context().Err() == nil {
+		t.Fatal("resume left a pre-sleep control or bulk connection open")
+	}
+	if client.checkSystemResume() {
+		t.Fatal("watcher consumed the same resume again after borrowers handled it")
+	}
+}
+
 // A pooled connection is a failure domain, but it must not be a recovery
 // stampede. Retiring one generation with several live logical flows should
 // create exactly one new UDP socket, rejoin every flow as a stream on it, and
