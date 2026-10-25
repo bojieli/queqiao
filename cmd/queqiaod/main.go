@@ -68,8 +68,10 @@ func run(args []string) error {
 		return runLogs(args[1:])
 	case "service":
 		return runService(args[1:])
+	case "relay":
+		return runRelay(args[1:])
 	default:
-		return fmt.Errorf("unknown command %q; want provider, enroll, client, service, server, doctor, segments, logs, or version", args[0])
+		return fmt.Errorf("unknown command %q; want provider, enroll, client, service, server, relay, doctor, segments, logs, or version", args[0])
 	}
 }
 
