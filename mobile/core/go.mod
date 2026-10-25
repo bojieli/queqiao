@@ -1,6 +1,6 @@
 module github.com/bojieli/queqiao/mobile/core
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/bojieli/queqiao v0.0.0
