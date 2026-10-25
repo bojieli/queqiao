@@ -227,7 +227,7 @@ func relayTCP(ctx context.Context, listenAddr, upstream string, dialTimeout, idl
 	if err != nil {
 		return fmt.Errorf("tcp listen %s: %w", listenAddr, err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	sem := make(chan struct{}, maxConns)
 	for {
 		conn, err := ln.Accept()
@@ -240,18 +240,18 @@ func relayTCP(ctx context.Context, listenAddr, upstream string, dialTimeout, idl
 		select {
 		case sem <- struct{}{}:
 		default:
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 		go func() {
 			defer func() { <-sem }()
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			d := net.Dialer{Timeout: dialTimeout}
 			up, err := d.DialContext(ctx, "tcp", upstream)
 			if err != nil {
 				return
 			}
-			defer up.Close()
+			defer func() { _ = up.Close() }()
 			// Disable Nagle so the queqiao handshake's small writes are not
 			// delayed across relay hops.
 			if tc, ok := conn.(*net.TCPConn); ok {
@@ -282,8 +282,8 @@ func relayCopy(a, b net.Conn, idle time.Duration) {
 		select {
 		case <-done:
 		case <-timer.C:
-			a.Close()
-			b.Close()
+			_ = a.Close()
+			_ = b.Close()
 			return
 		}
 	}
@@ -295,7 +295,7 @@ func relayUDP(ctx context.Context, listenAddr, upstream string, dialTimeout, idl
 	if err != nil {
 		return fmt.Errorf("udp listen %s: %w", listenAddr, err)
 	}
-	defer pc.Close()
+	defer func() { _ = pc.Close() }()
 
 	type assoc struct {
 		up     *net.UDPConn
@@ -317,7 +317,7 @@ func relayUDP(ctx context.Context, listenAddr, upstream string, dialTimeout, idl
 				mu.Lock()
 				for k, a := range assocs {
 					if time.Since(a.last) > idleTimeout {
-						a.up.Close()
+						_ = a.up.Close()
 						delete(assocs, k)
 					}
 				}
