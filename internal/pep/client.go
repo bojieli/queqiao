@@ -182,7 +182,21 @@ type ClientConfig struct {
 	// serve the current flow over TCP, but it is neutral UDP evidence. With a
 	// pool, the QUIC attempt continues in the background so later flows can
 	// return to the preferred transport.
-	FallbackGrace       time.Duration
+	//
+	// It is a floor: on a high-RTT path a fixed window is too short for the
+	// QUIC handshake to finish, so the client silently rides TCP. When
+	// FallbackGraceRTTFactor is positive the effective window is scaled by the
+	// observed round-trip time, clamped to [FallbackGrace, FallbackGraceMax].
+	FallbackGrace time.Duration
+	// FallbackGraceRTTFactor multiplies the observed path RTT to derive the
+	// adaptive QUIC preference window. Zero disables adaptation (the fixed
+	// FallbackGrace is used). A handshake costs several round trips, so values
+	// well above 1 are appropriate; the default is tuned for lossy long-haul
+	// paths where a QUIC handshake can need a dozen or more RTTs.
+	FallbackGraceRTTFactor float64
+	// FallbackGraceMax caps the adaptive window so a pathological RTT cannot
+	// stall the first flow indefinitely. Zero means no cap.
+	FallbackGraceMax    time.Duration
 	UDPFailureThreshold int
 	UDPCooldown         time.Duration
 	// HopPortCount enables reactive UDP port hopping to evade per-port GFW
@@ -196,8 +210,12 @@ type ClientConfig struct {
 type Client struct {
 	// flowMeta asks a local capture agent what produced a flow. Nil when no
 	// agent is configured, which is the default.
-	flowMeta      *flowmeta.Lookup
-	cfg           ClientConfig
+	flowMeta *flowmeta.Lookup
+	cfg      ClientConfig
+	// observedRTT caches the most recent lane dial round-trip (nanoseconds) so
+	// the adaptive fallback grace can scale with the path. Updated on every
+	// authenticated lane; zero until the first dial.
+	observedRTT   atomic.Int64
 	udpHealth     *udpHealth
 	budget        *limiter.Budget
 	sessionLimit  *SessionLimit
@@ -620,10 +638,25 @@ func (c *Client) UpdateCredentials(updated identity.ClientCredentials) error {
 }
 
 func (c *Client) fallbackGrace() time.Duration {
-	if c.cfg.FallbackGrace <= 0 {
-		return defaultFallbackGrace
+	base := c.cfg.FallbackGrace
+	if base <= 0 {
+		base = defaultFallbackGrace
 	}
-	return c.cfg.FallbackGrace
+	// Adaptive: scale the QUIC preference window with the observed path RTT so
+	// a high-RTT, multi-hop link gets a window long enough for its handshake,
+	// while a fast single-hop link keeps the snappy default. base is the floor.
+	if c.cfg.FallbackGraceRTTFactor > 0 {
+		if rtt := time.Duration(c.observedRTT.Load()); rtt > 0 {
+			adaptive := time.Duration(float64(rtt) * c.cfg.FallbackGraceRTTFactor)
+			if adaptive > base {
+				base = adaptive
+			}
+		}
+	}
+	if c.cfg.FallbackGraceMax > 0 && base > c.cfg.FallbackGraceMax {
+		base = c.cfg.FallbackGraceMax
+	}
+	return base
 }
 
 func (c *Client) windows() flowWindows {
@@ -1085,7 +1118,7 @@ func (c *Client) racePipelinedFlow(ctx context.Context, payload []byte) (*opened
 			// changing endpoint health.
 			standbyC = nil
 			c.metrics.Fallback()
-			c.cfg.Logger.Debug("QUIC preference window elapsed; using TCP without penalizing UDP health",
+			c.cfg.Logger.Info("QUIC preference window elapsed; using TCP without penalizing UDP health",
 				"endpoint", c.cfg.RemoteAddr, "grace", c.fallbackGrace())
 			cancel()
 			closeLateFlow(quicResult)
@@ -1409,6 +1442,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 		return nil, transportError(kind, err)
 	}
 	outerReady := time.Now()
+	c.observedRTT.Store(int64(outerReady.Sub(dialStarted)))
 	_ = outer.SetDeadline(time.Now().Add(handshakeBound(outer, c.cfg.HandshakeTimeout)))
 	fc := newFrameConnLimited(outer, c.memoryLimits.frameReadBuffer, c.memoryLimits.eventQueue)
 	fc.setPacketsOnStream(c.cfg.UDPOnStream)
@@ -2821,7 +2855,7 @@ func (c *Client) raceUDPAndTCP(ctx context.Context) (*authenticatedLane, error) 
 		case <-standbyC:
 			standbyC = nil
 			c.metrics.Fallback()
-			c.cfg.Logger.Debug("QUIC preference window elapsed; using TCP without penalizing UDP health",
+			c.cfg.Logger.Info("QUIC preference window elapsed; using TCP without penalizing UDP health",
 				"endpoint", c.cfg.RemoteAddr, "grace", c.fallbackGrace())
 			if c.cfg.EnableQUICPool {
 				// The current request has its bounded answer, while the one
