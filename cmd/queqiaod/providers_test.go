@@ -422,7 +422,7 @@ func TestProviderClientsShareOneAggregateBudgetAndSessionBudget(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	clients := make([]*pep.Client, len(configs))
 	for i := range configs {
-		clients[i], err = newRuntimeClient(configs[i].profile, configs[i].listen, opts, logger, nil, limits[i], budget)
+		clients[i], err = newRuntimeClient(configs[i].profile, configs[i].listen, opts, logger, nil, limits[i], budget, configs[i].transport, configs[i].fallbackGrace)
 		if err != nil {
 			t.Fatal(err)
 		}

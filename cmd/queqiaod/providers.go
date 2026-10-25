@@ -33,11 +33,23 @@ type providerManifestEntry struct {
 	Name    string `json:"name"`
 	Profile string `json:"profile"`
 	Listen  string `json:"listen"`
+	// Transport optionally overrides the client-wide --transport for this
+	// provider: "auto", "quic", or "tcp". A provider reached through two or
+	// more relays can prefer "tcp" so queqiao does not spend the QUIC
+	// preference window on a handshake the path cannot complete quickly.
+	Transport string `json:"transport,omitempty"`
+	// FallbackGrace optionally overrides the client-wide --fallback-grace for
+	// this provider (a Go duration string such as "3s"). Together with
+	// transport this lets a long-haul, multi-hop provider bound its first-flow
+	// latency without changing the fast single-hop providers.
+	FallbackGrace string `json:"fallbackGrace,omitempty"`
 }
 
 type providerClientConfig struct {
 	name, profilePath, listen string
 	profile                   identity.ClientProfile
+	transport                 string
+	fallbackGrace             time.Duration
 }
 
 type providerClientRuntime struct {
@@ -134,9 +146,26 @@ func loadProviderClients(manifestPath string) ([]providerClientConfig, error) {
 			return nil, fmt.Errorf("duplicate provider profile path %q", profilePath)
 		}
 		profilePaths[profilePath] = struct{}{}
-		configs = append(configs, providerClientConfig{
+		config := providerClientConfig{
 			name: entry.Name, profilePath: profilePath, listen: listen,
-		})
+		}
+		switch entry.Transport {
+		case "", "auto", "quic", "tcp":
+			config.transport = entry.Transport
+		default:
+			return nil, fmt.Errorf("provider %q transport %q is not auto, quic, or tcp", entry.Name, entry.Transport)
+		}
+		if entry.FallbackGrace != "" {
+			grace, err := time.ParseDuration(entry.FallbackGrace)
+			if err != nil {
+				return nil, fmt.Errorf("provider %q fallbackGrace: %w", entry.Name, err)
+			}
+			if grace <= 0 {
+				return nil, fmt.Errorf("provider %q fallbackGrace must be positive", entry.Name)
+			}
+			config.fallbackGrace = grace
+		}
+		configs = append(configs, config)
 	}
 
 	// Distinct paths can still name one enrolled device: a copied profile, a
@@ -181,17 +210,25 @@ func normalizeProviderListener(address string) (string, error) {
 	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
 }
 
-func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtimeOptions, logger *slog.Logger, registry *metrics.Registry, sessionLimit *pep.SessionLimit, budget *limiter.Budget) (*pep.Client, error) {
+func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtimeOptions, logger *slog.Logger, registry *metrics.Registry, sessionLimit *pep.SessionLimit, budget *limiter.Budget, transportOverride string, graceOverride time.Duration) (*pep.Client, error) {
 	credentials, err := profile.Credentials()
 	if err != nil {
 		return nil, err
+	}
+	transport := opts.transport
+	if transportOverride != "" {
+		transport = transportOverride
+	}
+	fallbackGrace := opts.fallbackGrace
+	if graceOverride > 0 {
+		fallbackGrace = graceOverride
 	}
 	return pep.NewClient(pep.ClientConfig{
 		ListenAddr: listen, RemoteAddr: profile.Endpoint, LocalAddress: opts.localAddress,
 		Credentials: credentials, ChunkSize: opts.chunkSize,
 		DialTimeout: opts.dialTimeout, HandshakeTimeout: opts.handshakeTimeout,
 		FlowIdleTimeout: opts.flowIdleTimeout, FlowMaxLifetime: opts.flowMaxLifetime,
-		MaxSessions: opts.maxSessions, SessionLimit: sessionLimit, MaxPendingOpens: opts.maxPendingOpens, Transport: pep.TransportKind(opts.transport),
+		MaxSessions: opts.maxSessions, SessionLimit: sessionLimit, MaxPendingOpens: opts.maxPendingOpens, Transport: pep.TransportKind(transport),
 		TCPFallbackLanes: opts.tcpFallbackLanes, EnableQUICPool: opts.quicPool,
 		WaitForOpenAcknowledgement: opts.waitForOpenAck, UDPOnStream: opts.udpOnStream,
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
@@ -200,7 +237,8 @@ func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtim
 		Profile:            opts.resolvedProfile,
 		FlowMetadataSocket: opts.flowMetadataSocket,
 		Budget:             budget,
-		FallbackDelay:      opts.fallbackDelay, FallbackGrace: opts.fallbackGrace,
+		FallbackDelay:      opts.fallbackDelay, FallbackGrace: fallbackGrace,
+		FallbackGraceRTTFactor: opts.fallbackGraceRTTFactor, FallbackGraceMax: opts.fallbackGraceMax,
 		UDPFailureThreshold: opts.udpFailureThreshold, UDPCooldown: opts.udpCooldown,
 		HopPortCount: profile.HopPortCount,
 		Metrics:      registry, Logger: logger,
@@ -317,7 +355,7 @@ func runProviderClientsContext(ctx context.Context, manifestPath string, noAutoR
 
 	runtimes := make([]providerClientRuntime, 0, len(configs))
 	for i := range configs {
-		client, err := newRuntimeClient(configs[i].profile, configs[i].listen, opts, loggers[i], registry, sessionLimits[i], budget)
+		client, err := newRuntimeClient(configs[i].profile, configs[i].listen, opts, loggers[i], registry, sessionLimits[i], budget, configs[i].transport, configs[i].fallbackGrace)
 		if err != nil {
 			closeListeners()
 			return fmt.Errorf("configure provider %q: %w", configs[i].name, err)
