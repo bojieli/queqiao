@@ -10,6 +10,29 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.11.0 - 2026-10-25
+
+### Added
+
+- The QUIC preference window (`--fallback-grace`) now scales with the observed
+  path round-trip time instead of being a fixed 2s, so a high-RTT or multi-hop
+  path gets a window its QUIC handshake can actually complete while a fast
+  single-hop link keeps the snappy default. `--fallback-grace-rtt-factor` and
+  `--fallback-grace-max` tune the scaling and its cap. The "QUIC preference
+  window elapsed" message is now logged at info level, so a flow riding TCP
+  because QUIC lost the race is visible instead of silent.
+- The provider manifest accepts optional per-provider `transport` ("auto",
+  "quic", or "tcp") and `fallbackGrace` fields that override the client-wide
+  flags for that provider. A provider reached through two or more relays can
+  select TCP and a bounded first-flow latency without changing the fast
+  single-hop providers in the same manifest.
+- New `queqiaod relay install` provisions relay proxies so a "CN" or "HK" hop
+  no longer needs hand-written systemd units. It renders and installs a
+  TCP+UDP forwarder (`queqiaod relay run`) for the queqiao channel, or a
+  socket-activated systemd-socket-proxyd unit for a plain TCP/VLESS leg, from
+  flags or a whole-host manifest. `relay uninstall` and `relay status` manage
+  them, and `--dry-run` prints the units without writing.
+
 ## v0.10.0 - 2026-10-19
 
 ### Fixed
