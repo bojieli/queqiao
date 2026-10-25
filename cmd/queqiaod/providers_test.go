@@ -438,3 +438,69 @@ func TestProviderClientsShareOneAggregateBudgetAndSessionBudget(t *testing.T) {
 		t.Fatalf("session reservations = %d and %d, want the shared budget divided", limits[0].Reserved(), limits[1].Reserved())
 	}
 }
+
+func TestProviderManifestTransportAndFallbackGrace(t *testing.T) {
+	directory := t.TempDir()
+	endpoint := "127.0.0.1:12540"
+	_, profilePath := providerTestProfile(t, directory, 0, endpoint)
+
+	// Valid per-provider transport and fallbackGrace are parsed and carried
+	// through to the client config, and a provider that omits them keeps the
+	// client-wide defaults (empty transport, zero grace).
+	t.Run("parses overrides", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, transport, grace string
+			wantTransport          string
+			wantGrace              time.Duration
+		}{
+			{"both", "tcp", "3s", "tcp", 3 * time.Second},
+			{"quic", "quic", "2s", "quic", 2 * time.Second},
+			{"auto", "auto", "450ms", "auto", 450 * time.Millisecond},
+			{"omitted", "", "", "", 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				entry := providerManifestEntry{Name: "p", Profile: profilePath, Listen: "127.0.0.1:1080"}
+				entry.Transport = tc.transport
+				if tc.grace != "" {
+					entry.FallbackGrace = tc.grace
+				}
+				path := writeProviderManifest(t, directory, providerManifest{Version: 1, Providers: []providerManifestEntry{entry}})
+				configs, err := loadProviderClients(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(configs) != 1 {
+					t.Fatalf("got %d configs, want 1", len(configs))
+				}
+				if configs[0].transport != tc.wantTransport {
+					t.Errorf("transport = %q, want %q", configs[0].transport, tc.wantTransport)
+				}
+				if configs[0].fallbackGrace != tc.wantGrace {
+					t.Errorf("fallbackGrace = %v, want %v", configs[0].fallbackGrace, tc.wantGrace)
+				}
+			})
+		}
+	})
+
+	// A malformed transport, an unparseable duration, or a non-positive grace
+	// must be rejected at load time rather than surfacing as a runtime surprise.
+	t.Run("rejects invalid", func(t *testing.T) {
+		for _, tc := range []struct{ name, transport, grace, want string }{
+			{"bad transport", "udp", "", "transport"},
+			{"bad grace", "tcp", "soon", "fallbackGrace"},
+			{"zero grace", "tcp", "0s", "fallbackGrace must be positive"},
+			{"negative grace", "tcp", "-1s", "fallbackGrace must be positive"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				entry := providerManifestEntry{Name: "p", Profile: profilePath, Listen: "127.0.0.1:1080"}
+				entry.Transport = tc.transport
+				entry.FallbackGrace = tc.grace
+				path := writeProviderManifest(t, directory, providerManifest{Version: 1, Providers: []providerManifestEntry{entry}})
+				_, err := loadProviderClients(path)
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("want error containing %q, got %v", tc.want, err)
+				}
+			})
+		}
+	})
+}
