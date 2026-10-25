@@ -42,7 +42,7 @@ version=v0.1.0
 commit=$(git rev-parse HEAD)
 build_date=$(git show -s --format=%cI HEAD)
 GOENV=off GOEXPERIMENT= GOFIPS140=off GOFLAGS=-mod=readonly \
-  GOTOOLCHAIN=go1.26.9 GOWORK=off GOAMD64=v1 GOARM64=v8.0 \
+  GOTOOLCHAIN=go1.26.10 GOWORK=off GOAMD64=v1 GOARM64=v8.0 \
   go run ./cmd/queqiaopack \
   --version "$version" --commit "$commit" --build-date "$build_date" \
   --output dist

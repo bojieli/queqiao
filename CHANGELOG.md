@@ -33,6 +33,12 @@ to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
   flags or a whole-host manifest. `relay uninstall` and `relay status` manage
   them, and `--dry-run` prints the units without writing.
 
+### Security
+
+- Builds use Go 1.26.10, which fixes GO-2026-6809, a crypto/x509 issue that
+  distrusted compromised intermediate certificates. The previous toolchain left
+  queqiao's certificate verification affected.
+
 ## v0.10.0 - 2026-10-19
 
 ### Fixed
