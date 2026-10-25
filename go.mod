@@ -1,6 +1,6 @@
 module github.com/bojieli/queqiao
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
