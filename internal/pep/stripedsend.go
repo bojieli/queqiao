@@ -524,9 +524,9 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 	// it is acknowledged, and is the thing that will re-issue it if this lane
 	// stops. Recording it again would put the same bytes under two limits.
 	f.noteSent(chunk.Offset, len(chunk.Data))
-	var written func()
+	var written func(reliable bool)
 	if sched := f.scheduler.Load(); sched != nil {
-		written = func() { sched.Wrote(lane.id, chunk) }
+		written = func(reliable bool) { sched.WroteAs(lane.id, chunk, reliable) }
 	}
 	return f.enqueueFrameWritten(ctx, lane, frame, bulk, written)
 }

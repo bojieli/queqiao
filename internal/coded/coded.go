@@ -279,13 +279,32 @@ func (p *Path) Receive() ([]byte, error) {
 // rate cover the symbols that precede them, and the last symbols of a burst
 // have nothing following: without this they would be the only ones the code
 // left bare, and they are the ones an interactive exchange consists of.
+//
+// A drain is not the end of a burst, though, only a pause in its producer. A
+// gateway relays a response as each read from the destination returns it, so
+// a 100 KB body arrives as dozens of frames and the queue is empty between
+// most of them. Protecting every drain as though it ended the exchange buys
+// the short-block residual dozens of times over -- three repairs per source
+// symbol, measured, where one burst of the same body needs a fifth of one. So
+// the tail waits tailDefer for the producer to resume. The symbols themselves
+// are already on the wire; only their protection waits, and only matters if
+// one of them is lost, which costs tailDefer against the round trip a
+// retransmission would.
 func (p *Path) sendLoop() {
 	defer p.wg.Done()
+	var tail *time.Timer
+	var tailC <-chan time.Time
 	for {
 		var frame []byte
 		select {
 		case <-p.done:
 			return
+		case <-tailC:
+			tailC = nil
+			if err := p.protectBurst(); err != nil {
+				return
+			}
+			continue
 		case frame = <-p.pending:
 		}
 		for {
@@ -304,11 +323,42 @@ func (p *Path) sendLoop() {
 		if err := p.flushPacked(); err != nil {
 			return
 		}
-		if err := p.protectBurst(); err != nil {
-			return
+		if p.burstSymbols == 0 {
+			continue
 		}
+		if tail == nil {
+			tail = time.NewTimer(p.tailDefer())
+		} else {
+			if !tail.Stop() && tailC != nil {
+				<-tail.C
+			}
+			tail.Reset(p.tailDefer())
+		}
+		tailC = tail.C
 	}
 }
+
+// tailDefer is how long a drained burst waits for its producer before its tail
+// is protected. It is a small fraction of the round trip because that is what
+// it is weighed against: a lost tail symbol recovered tailDefer late rather
+// than a full round trip late. The ceiling keeps a long path from deferring
+// protection by more than a scheduling hiccup; the floor keeps a LAN from
+// protecting every write of a stream it is about to continue.
+func (p *Path) tailDefer() time.Duration {
+	d := p.roundTrip() / 40
+	if d < minTailDefer {
+		return minTailDefer
+	}
+	if d > maxTailDefer {
+		return maxTailDefer
+	}
+	return d
+}
+
+const (
+	minTailDefer = 500 * time.Microsecond
+	maxTailDefer = 5 * time.Millisecond
+)
 
 // appendFrame puts one frame on the wire, whole where it fits and in fragments
 // where it does not.
@@ -505,12 +555,29 @@ func (p *Path) put(d []byte) (bool, error) {
 	}
 }
 
+// receiveLoop decodes what drainCarrier has taken off the carrier.
+//
+// Taking and decoding are separate because the carrier does not wait. A QUIC
+// connection holds 128 received datagrams and discards the next one silently,
+// after its packet has already been acknowledged -- so the sender's loss
+// detector never hears of it, while this path's estimator counts the gap as
+// erasure and asks for parity the channel never needed. One goroutine doing
+// both stalled the reading whenever decoding a repair took a while or the
+// consumer of frames was slow, and either is ordinary.
 func (p *Path) receiveLoop() {
 	defer p.wg.Done()
+	arrivals := make(chan []byte, receiveBacklog)
+	p.wg.Add(1)
+	go p.drainCarrier(arrivals)
 	for {
-		d, err := p.carrier.Receive()
-		if err != nil {
-			p.fail(err)
+		var d []byte
+		var ok bool
+		select {
+		case d, ok = <-arrivals:
+		case <-p.done:
+			return
+		}
+		if !ok {
 			return
 		}
 		for _, frame := range p.onDatagram(d) {
@@ -519,6 +586,31 @@ func (p *Path) receiveLoop() {
 			case <-p.done:
 				return
 			}
+		}
+	}
+}
+
+// receiveBacklog is how many datagrams may wait between the carrier and the
+// decoder: eight times what quic-go itself holds, about 1.3 MB at full size,
+// and only that much while the decoder is behind.
+const receiveBacklog = 1024
+
+// drainCarrier takes datagrams off the carrier as fast as it offers them. It
+// blocks once the backlog is full, which leaves the carrier to drop exactly as
+// it did before this existed; it never drops anything itself.
+func (p *Path) drainCarrier(arrivals chan<- []byte) {
+	defer p.wg.Done()
+	defer close(arrivals)
+	for {
+		d, err := p.carrier.Receive()
+		if err != nil {
+			p.fail(err)
+			return
+		}
+		select {
+		case arrivals <- d:
+		case <-p.done:
+			return
 		}
 	}
 }

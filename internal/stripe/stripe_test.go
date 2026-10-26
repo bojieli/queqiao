@@ -967,6 +967,52 @@ func TestAChunkTakenUnreliablyStaysReissuableWhenTheLaneChanges(t *testing.T) {
 	}
 }
 
+// The opposite of the case above, and the one that strands a flow. The lane
+// answered "reliable" when it took the chunk, but by the time its writer put
+// the bytes on the wire the substrate had changed and they went out as a coded
+// datagram. What the attempt has to remember is what the wire was given, not
+// what the lane said it would do: an attempt still believed reliable is never
+// re-offered to its own lane, so on a single-lane flow the erased chunk waits
+// for a second lane or the flow's whole progress budget.
+func TestAChunkWrittenUnreliablyIsReissuableEvenIfTakenReliably(t *testing.T) {
+	now := time.Now()
+	scheduler := New(bytes.NewReader([]byte("12345678")), Config{
+		ChunkSize: 8, LaneWindow: 4, MaxOutstanding: 8,
+		RetransmitAfter: after(time.Second),
+		Reliable:        func(uint64) bool { return true },
+		Now:             func() time.Time { return now },
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	first, err := scheduler.Next(ctx, 1, 1<<20)
+	if err != nil {
+		t.Fatalf("no chunk offered: %v", err)
+	}
+	// Taken as a stream write, written as a datagram.
+	scheduler.WroteAs(1, first, false)
+	now = now.Add(2 * time.Second)
+	if reissued := scheduler.ReissueExpired(); reissued != 1 {
+		t.Fatalf("re-issued %d chunks, want the one written unreliably", reissued)
+	}
+	again, err := scheduler.Next(ctx, 1, 1<<20)
+	if err != nil || again == nil || again.Offset != first.Offset {
+		t.Fatalf("the only lane was not offered the chunk its datagram lost (%v, %v)", again, err)
+	}
+	if chunks, retained, _ := scheduler.LaneOutstanding(1); chunks != 1 || retained != 8 {
+		t.Fatalf("live attempts = %d chunks/%d bytes, want the lost attempt retired", chunks, retained)
+	}
+	// And the converse still holds: taken unreliably but written to the
+	// stream, the attempt is reliable and must not be copied onto its own lane.
+	scheduler.WroteAs(1, again, true)
+	now = now.Add(2 * time.Second)
+	scheduler.ReissueExpired()
+	blocked, stop := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer stop()
+	if duplicate, err := scheduler.Next(blocked, 1, 1<<20); err == nil {
+		t.Fatalf("a chunk written to the stream was copied onto its own lane: %+v", duplicate)
+	}
+}
+
 func TestLostUnreliableSpeculationDoesNotBlockAReliableOriginal(t *testing.T) {
 	now := time.Now()
 	scheduler := New(bytes.NewReader([]byte("12345678")), Config{
