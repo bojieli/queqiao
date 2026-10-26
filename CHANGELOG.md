@@ -10,6 +10,58 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.12.0 - 2026-10-26
+
+### Fixed
+
+- The coded path keeps reading QUIC datagrams while it decodes and while the
+  flow consuming its frames is slow. Reading and decoding shared one goroutine,
+  so either stalled the reads; QUIC then discards received datagrams beyond
+  128 after acknowledging them, which the sender never learns of and this end
+  counted as path erasure, inflating the parity the peer sent for a channel
+  that had delivered everything.
+- The coded path protects the tail of a burst once, when the producer has
+  actually paused, instead of at every momentary drain of its send queue. A
+  response relayed as many small frames was protected afresh after each of
+  them as though it ended the exchange, which spent up to three repair
+  datagrams per source symbol -- 75% of the wire for a 100 KB body on a 14%
+  erasure path, against 21% for the same body sent at once. Source symbols are
+  still sent immediately; only their tail protection waits, for one fortieth
+  of the round trip and never more than 5 ms.
+- The adaptive QUIC preference window (`--fallback-grace-rtt-factor`) now
+  scales the connection's measured round trip rather than how long the last
+  dial took. A fresh dial is a handshake and an authentication, several round
+  trips, so after any cold dial the window sat at its 30 second ceiling and
+  every request made while the pool was down waited that long for QUIC with a
+  TCP lane already established; a 200 ms path now gets 3.2 seconds.
+- What a path model remembers between connections -- its erasure rate, burst
+  factor and minimum round trip -- is forgotten after 10 minutes with nothing
+  reporting. A gateway keeps one model per client address for the life of its
+  process, so a client returning hours later was seeded with the measurements
+  of its previous visit, including a round trip floor that only ever moved
+  down.
+- The client starts accepting SOCKS connections after at most 3 seconds of
+  path measurement at startup, instead of after the measurement finishes. On a
+  gateway that was slow to answer, the measurement ran to its own 20 second
+  timeout while browser connections queued unanswered; it now continues in the
+  background and the first flows share its handshake.
+- A pooled QUIC connection that sends and hears nothing back for four round
+  trips (at least one second) stops receiving new flows, and a replacement is
+  dialed at once; if it stays silent for four times that it is closed, so the
+  flows still on it fail in seconds and are retried on the replacement.
+  Acknowledgements, which a peer never answers, are not counted as unanswered
+  sends. A connection whose path had gone away -- a NAT rebinding, a blocked
+  port -- used to carry every new request until QUIC's 15 second idle timeout,
+  so a page load in that window hung for all of it.
+- A chunk that a lane took while its data was going over the stream, but whose
+  bytes reached the wire as a coded datagram because the coding plan or the
+  flow's class changed while it waited in the lane's queue, is now re-issued
+  when that datagram is lost. Its attempt used to remember the answer the lane
+  gave when it took the chunk, so the scheduler believed it was on a stream and
+  never offered it to its own lane again: a single-lane flow then waited for a
+  second lane or its whole 45 second progress budget, which looked like a page
+  that loaded part of a response and then hung.
+
 ## v0.11.0 - 2026-10-25
 
 ### Added
