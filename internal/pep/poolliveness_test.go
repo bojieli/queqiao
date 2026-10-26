@@ -30,12 +30,12 @@ func TestAPooledConnectionThatStopsAnsweringIsNoticedWithinRoundTrips(t *testing
 		t.Fatalf("a connection unanswered for %v was still presumed alive", silenceBound(srtt)*3/2)
 	}
 	if l.dead(now) {
-		t.Fatal("a connection silent for less than twice the bound was declared dead")
+		t.Fatal("a connection merely silent was declared dead")
 	}
-	now = now.Add(silenceBound(srtt))
+	now = now.Add(deadSilenceFactor * silenceBound(srtt))
 	l.observe(now, 22, 10, srtt)
 	if !l.dead(now) {
-		t.Fatal("a connection silent for over twice the bound was not declared dead")
+		t.Fatalf("a connection silent for over %d bounds was not declared dead", deadSilenceFactor)
 	}
 	// Anything arriving clears it.
 	l.observe(now, 20, 11, srtt)
@@ -53,5 +53,33 @@ func TestTheSilenceBoundIsRoundTripsWithAFloor(t *testing.T) {
 	}
 	if got := silenceBound(0); got != minPoolSilence {
 		t.Fatalf("bound with no RTT = %v, want the floor", got)
+	}
+}
+
+// The case that made the first version of this wrong on every healthy
+// connection. Having received the last packet of a response, a client sends an
+// acknowledgement for it -- a packet the counter counts and the peer never
+// answers -- and then hears nothing until the next keepalive.
+func TestAnAcknowledgementIsNotAnUnansweredSend(t *testing.T) {
+	var l poolLiveness
+	now := time.Now()
+	const srtt = 200 * time.Millisecond
+	l.observe(now, 100, 80, srtt)
+	// The response's last packets arrive, and the client acknowledges them.
+	l.observe(now, 100, 85, srtt)
+	l.observe(now.Add(10*time.Millisecond), 101, 85, srtt)
+	l.observe(now.Add(30*time.Millisecond), 102, 85, srtt)
+	// Then a keepalive interval of quiet.
+	now = now.Add(5 * time.Second)
+	l.observe(now, 102, 85, srtt)
+	if l.silent(now) {
+		t.Fatal("a connection that acknowledged what it received and then went quiet was judged silent")
+	}
+	// A request that goes out and is not answered still is.
+	l.observe(now, 106, 85, srtt)
+	now = now.Add(2 * silenceBound(srtt))
+	l.observe(now, 109, 85, srtt)
+	if !l.silent(now) {
+		t.Fatal("a request unanswered past the bound was not noticed")
 	}
 }

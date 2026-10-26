@@ -22,13 +22,25 @@ import (
 // idle connection that is sending nothing has not been asked anything.
 type poolLiveness struct {
 	mu sync.Mutex
-	// received and sent are the connection's packet counters at the last
-	// observation; unansweredSince is when packets were first seen leaving
-	// after the last one arrived, zero while nothing is waiting for an answer.
-	received, sent  uint64
-	unansweredSince time.Time
-	srtt            time.Duration
+	// received is the connection's received-packet counter at the last
+	// observation, and sentAtReceive its sent-packet counter when received
+	// last moved. unansweredSince is when more than ackOnlyAllowance packets
+	// were first seen to have left since then, zero while nothing is waiting
+	// for an answer.
+	received, sentAtReceive uint64
+	unansweredSince         time.Time
+	srtt                    time.Duration
 }
+
+// ackOnlyAllowance is how many packets may leave after the last arrival
+// without anything being owed in return. The packet counter cannot tell an
+// acknowledgement from anything else, and an acknowledgement is never
+// answered: having received the last packet of a response, a client sends
+// one, and then hears nothing until its next keepalive -- which, read as
+// "sent and unanswered", looked like a dead connection on every healthy one.
+// A receiver owes at most one or two acknowledgements for what it last
+// received; anything beyond that is a packet that elicits one.
+const ackOnlyAllowance = 2
 
 // observe records the connection's counters as of now.
 func (l *poolLiveness) observe(now time.Time, sent, received uint64, srtt time.Duration) {
@@ -38,11 +50,11 @@ func (l *poolLiveness) observe(now time.Time, sent, received uint64, srtt time.D
 		l.srtt = srtt
 	}
 	if received != l.received {
-		l.received, l.sent = received, sent
+		l.received, l.sentAtReceive = received, sent
 		l.unansweredSince = time.Time{}
 		return
 	}
-	if sent != l.sent && l.unansweredSince.IsZero() {
+	if sent > l.sentAtReceive+ackOnlyAllowance && l.unansweredSince.IsZero() {
 		l.unansweredSince = now
 	}
 }
@@ -53,12 +65,17 @@ func (l *poolLiveness) silent(now time.Time) bool {
 	return l.unanswered(now) > l.bound()
 }
 
-// dead reports whether that silence has lasted twice as long. By then QUIC has
-// sent several probes into it, and a connection still hearing nothing is not
-// worth the flows that are waiting on it.
+// dead reports whether that silence has lasted four times as long. Silence is
+// enough to stop opening flows on a connection, because being wrong about that
+// costs one handshake. Closing it costs the flows already on it, so it waits
+// until QUIC has sent enough probes into the silence that a live connection
+// answering none of them, even on a path erasing a seventh of its packets, is
+// not a case worth keeping those flows waiting for.
 func (l *poolLiveness) dead(now time.Time) bool {
-	return l.unanswered(now) > 2*l.bound()
+	return l.unanswered(now) > deadSilenceFactor*l.bound()
 }
+
+const deadSilenceFactor = 4
 
 func (l *poolLiveness) unanswered(now time.Time) time.Duration {
 	l.mu.Lock()

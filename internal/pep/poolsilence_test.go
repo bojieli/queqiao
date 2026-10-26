@@ -81,3 +81,35 @@ func TestARequestAfterThePooledConnectionDiesDoesNotWaitForTheIdleTimeout(t *tes
 			"connection's idle timeout instead of moving to a fresh one", took)
 	}
 }
+
+// The other half of the property, and the one an earlier version of the
+// detector broke on every healthy connection: a pool that is working, and
+// that goes quiet between page loads, is left alone.
+func TestAHealthyIdlePoolIsNotSuperseded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("brings up QUIC across an emulated path and idles it")
+	}
+	path := pathsim.Config{OneWayDelay: 25 * time.Millisecond, Seed: 5}
+	socks, destination := codedPairWith(t, true, &path, responseDestination)
+	if err := tryFetch(socks, destination, 300_000, 20*time.Second); err != nil {
+		t.Fatalf("the healthy pool did not carry a request: %v", err)
+	}
+	lastClient.quicMu.Lock()
+	first := lastClient.quicGeneration
+	lastClient.quicMu.Unlock()
+	if first == nil {
+		t.Fatal("no pooled generation after a request")
+	}
+	// Longer than a keepalive interval, and than every bound the detector has.
+	time.Sleep(7 * time.Second)
+	if err := tryFetch(socks, destination, 20_000, 20*time.Second); err != nil {
+		t.Fatalf("the idle pool did not carry the next request: %v", err)
+	}
+	lastClient.quicMu.Lock()
+	second := lastClient.quicGeneration
+	lastClient.quicMu.Unlock()
+	if second != first || first.superseded.Load() || first.conn.Context().Err() != nil {
+		t.Fatalf("a healthy pool was replaced while idle (superseded=%v closed=%v)",
+			first.superseded.Load(), first.conn.Context().Err() != nil)
+	}
+}
