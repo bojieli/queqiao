@@ -120,6 +120,11 @@ type Config struct {
 	Path pathmodel.Model
 	// Pending bounds the frames queued for sending before Send blocks.
 	Pending int
+	// tailDefer replaces the deferral Path.tailDefer derives from the round
+	// trip. It is unexported because only tests need it: telling a drain from
+	// a pause by wall clock needs a deferral that a loaded runner's timer
+	// cannot overrun, and the production one is at most 5 ms.
+	tailDefer time.Duration
 }
 
 func (c Config) withDefaults() Config {
@@ -345,6 +350,9 @@ func (p *Path) sendLoop() {
 // protection by more than a scheduling hiccup; the floor keeps a LAN from
 // protecting every write of a stream it is about to continue.
 func (p *Path) tailDefer() time.Duration {
+	if p.cfg.tailDefer > 0 {
+		return p.cfg.tailDefer
+	}
 	d := p.roundTrip() / 40
 	if d < minTailDefer {
 		return minTailDefer
