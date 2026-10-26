@@ -194,8 +194,10 @@ func (l *mpLane) sendRate() (float64, time.Duration) {
 // laneFrame is a frame queued for one lane's writer, with an optional
 // notification for when the transport has taken its bytes.
 type laneFrame struct {
-	frame     protocol.Frame
-	onWritten func()
+	frame protocol.Frame
+	// onWritten is told whether the frame went out on a substrate that
+	// recovers its own losses; see frameConn.writeContextVia.
+	onWritten func(reliable bool)
 }
 
 type inboundEvent struct {
@@ -626,7 +628,7 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 				return
 			}
 		}
-		err := lane.fc.WriteContext(f.ctx, frame)
+		reliable, err := lane.fc.writeContextVia(f.ctx, frame)
 		if err != nil {
 			f.failLane(lane, fmt.Errorf("lane %d write: %w", lane.id, err))
 			return
@@ -638,7 +640,7 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 		// accept more. A QUIC stream write returns only once the packer has
 		// consumed the data, so this is the transport's own congestion clock.
 		if queued.onWritten != nil {
-			queued.onWritten()
+			queued.onWritten(reliable)
 		}
 	}
 }
@@ -2025,7 +2027,7 @@ func (f *multipathFlow) enqueueFrameClass(ctx context.Context, lane *mpLane, fra
 
 // enqueueFrameWritten is enqueueFrameClass with a callback invoked once the
 // lane's transport has taken the frame's bytes.
-func (f *multipathFlow) enqueueFrameWritten(ctx context.Context, lane *mpLane, frame protocol.Frame, bulk bool, onWritten func()) error {
+func (f *multipathFlow) enqueueFrameWritten(ctx context.Context, lane *mpLane, frame protocol.Frame, bulk bool, onWritten func(reliable bool)) error {
 	if lane == nil || lane.closed.Load() {
 		return errors.New("lane is closed")
 	}

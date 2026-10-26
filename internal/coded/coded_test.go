@@ -2,10 +2,12 @@ package coded
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -620,5 +622,178 @@ func TestParityCostsACodeRateAndNotAByteRate(t *testing.T) {
 	if lossyWire < budget/2 {
 		t.Fatalf("the coded path used only %d of a %d byte window, so this proves nothing "+
 			"about what it would do with a full one", lossyWire, budget)
+	}
+}
+
+// A response is not one write. A gateway relays what each read from the
+// destination returned, so a 100 KB body reaches the coded path as dozens of
+// frames, and the send loop finds its queue empty between most of them. Each of
+// those drains is a moment the producer paused, not the end of the exchange.
+//
+// Tail protection is for the end of an exchange: the last symbols of a burst
+// have nothing following to cover them. Sizing it afresh at every drain, as
+// though each were the last, buys the short-block residual over and over --
+// measured on a gateway, 177 repairs for 304 datagrams. What the body needs is
+// one burst's protection, topped up as it grows.
+func TestTailProtectionCostsOneBurstNotOnePerWrite(t *testing.T) {
+	parity := func(drainEvery bool) (sources, repairs uint64) {
+		m := pathmodel.NewPathModel()
+		m.Report(1, pathmodel.Observation{
+			Erasure: 0.14, BurstFactor: 1,
+			ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
+		})
+		pa, _ := newPipes(1, 0)
+		p := New(pa, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Path: m})
+		defer p.Close()
+		frame := make([]byte, 1000)
+		for i := 0; i < 100; i++ {
+			if err := p.Send(frame); err != nil {
+				t.Fatal(err)
+			}
+			if drainEvery {
+				waitDrained(t, p)
+			}
+		}
+		waitDrained(t, p)
+		// The tail is protected once the producer has stayed quiet.
+		time.Sleep(4 * maxTailDefer)
+		stats := p.Stats()
+		return stats.Sent - stats.Repairs, stats.Repairs
+	}
+	oneSources, oneRepairs := parity(false)
+	manySources, manyRepairs := parity(true)
+	t.Logf("one write: %d repairs for %d sources; 100 drained writes: %d repairs for %d sources",
+		oneRepairs, oneSources, manyRepairs, manySources)
+	if oneRepairs == 0 {
+		t.Fatal("a 14% erasure path sent no parity at all; this test measures nothing")
+	}
+	if manyRepairs > oneRepairs*3/2+4 {
+		t.Fatalf("the same body cost %d repairs written in pieces against %d written at once: "+
+			"every drain is being protected as though it ended the exchange", manyRepairs, oneRepairs)
+	}
+}
+
+// waitDrained returns once the send loop has taken everything queued and had a
+// moment to protect it.
+func waitDrained(t *testing.T, p *Path) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(p.pending) > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the send loop did not drain")
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+	time.Sleep(2 * time.Millisecond)
+}
+
+// Deferring the tail must not lose it. A single short exchange -- the case tail
+// protection exists for -- still gets its repairs, and gets them within the
+// deferral rather than whenever the next exchange happens to come along.
+func TestAShortExchangeIsStillProtectedPromptly(t *testing.T) {
+	m := pathmodel.NewPathModel()
+	m.Report(1, pathmodel.Observation{
+		Erasure: 0.14, BurstFactor: 1,
+		ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
+	})
+	pa, _ := newPipes(1, 0)
+	p := New(pa, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Path: m})
+	defer p.Close()
+	if err := p.Send(make([]byte, 80)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(p.tailDefer() + 50*time.Millisecond)
+	for p.Stats().Repairs == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("a single-symbol exchange on a 14%% path had no repair %v after it was sent",
+				p.tailDefer()+50*time.Millisecond)
+		}
+		time.Sleep(200 * time.Microsecond)
+	}
+	if got := p.Stats().Repairs; got < 2 {
+		t.Fatalf("a single-symbol exchange got %d repairs; the short-block residual asks for more", got)
+	}
+}
+
+// boundedCarrier holds at most a fixed number of undelivered datagrams and drops
+// the rest, which is what a QUIC connection does with received DATAGRAM frames
+// nobody has read yet.
+type boundedCarrier struct {
+	queue   chan []byte
+	dropped atomic.Int64
+	once    sync.Once
+	closed  chan struct{}
+}
+
+func newBoundedCarrier(depth int) *boundedCarrier {
+	return &boundedCarrier{queue: make(chan []byte, depth), closed: make(chan struct{})}
+}
+
+func (c *boundedCarrier) deliver(d []byte) {
+	select {
+	case c.queue <- d:
+	default:
+		c.dropped.Add(1)
+	}
+}
+func (c *boundedCarrier) Send([]byte) error { return nil }
+func (c *boundedCarrier) Receive() ([]byte, error) {
+	select {
+	case d := <-c.queue:
+		return d, nil
+	case <-c.closed:
+		return nil, io.EOF
+	}
+}
+func (c *boundedCarrier) Close() error { c.once.Do(func() { close(c.closed) }); return nil }
+
+// A consumer that is slow to take frames must not become erasure. The carrier
+// discards what nobody reads, so a receive loop that stops reading while it
+// waits on its consumer turns local backpressure into measured loss -- which
+// sizes the peer's parity for a channel that delivered everything.
+func TestASlowConsumerDoesNotStopTheCarrierBeingRead(t *testing.T) {
+	sender, receiver := newPipes(1, 0)
+	_ = receiver
+	src := New(sender, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond})
+	defer src.Close()
+	carrier := newBoundedCarrier(128)
+	dst := New(carrier, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Pending: 4})
+	defer dst.Close()
+
+	// Nobody reads dst's frames. A burst larger than both the consumer's
+	// mailbox and the carrier's own queue arrives at once.
+	for i := 0; i < 600; i++ {
+		frame := make([]byte, 1000)
+		binary.BigEndian.PutUint32(frame, uint32(i))
+		if err := src.Send(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Deliver in batches no larger than the carrier's queue, waiting for each
+	// to be taken before the next, so what is measured is whether the path
+	// keeps reading while its consumer is stalled -- not whether a goroutine
+	// was scheduled in time on a loaded machine.
+	got := 0
+	for got < 600 {
+		for batch := 0; batch < 100 && got < 600; batch++ {
+			select {
+			case d := <-sender.out:
+				carrier.deliver(d)
+				got++
+			case <-time.After(2 * time.Second):
+				t.Fatalf("the sender produced only %d datagrams", got)
+			}
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for len(carrier.queue) > 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("the path stopped reading its carrier after %d datagrams, with %d "+
+					"left waiting: the receive loop is blocked on its consumer", got, len(carrier.queue))
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if dropped := carrier.dropped.Load(); dropped > 0 {
+		t.Fatalf("the carrier discarded %d of %d datagrams while the path's consumer was slow", dropped, got)
 	}
 }

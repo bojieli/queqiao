@@ -371,22 +371,33 @@ const frameWriteTimeout = 15 * time.Second
 // deadline; transports without that optional method retain their normal
 // behavior and are still interruptible by Close from the flow coordinator.
 func (c *frameConn) WriteContext(ctx context.Context, f protocol.Frame) error {
+	_, err := c.writeContextVia(ctx, f)
+	return err
+}
+
+// writeContextVia is WriteContext reporting whether the frame went out on a
+// substrate that recovers its own losses -- the stream, or a stream copy
+// beside a coded one. The substrate is chosen here, at the write, and not when
+// the frame was queued, so this is the only place that knows; a caller that
+// assumed the answer it was given earlier can be wrong by the time the bytes
+// reach the wire.
+func (c *frameConn) writeContextVia(ctx context.Context, f protocol.Frame) (reliable bool, err error) {
 	if c.bulkFrame(f) {
 		if err := ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
 		c.countData(f, true)
 		if err := c.writeCodedContext(ctx, f); err != nil {
-			return err
+			return false, err
 		}
 		if !c.needsOpenSafetyCopy(f) {
-			return nil
+			return false, nil
 		}
 		c.countData(f, false)
-		return c.writeControlContext(ctx, f)
+		return true, c.writeControlContext(ctx, f)
 	}
 	c.countData(f, false)
-	return c.writeControlContext(ctx, f)
+	return true, c.writeControlContext(ctx, f)
 }
 
 func (c *frameConn) needsOpenSafetyCopy(f protocol.Frame) bool {

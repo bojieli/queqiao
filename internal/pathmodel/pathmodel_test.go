@@ -223,3 +223,30 @@ func TestTheShareDoesNotRatchetDown(t *testing.T) {
 		})
 	}
 }
+
+// What a path measured outlives the connection that measured it, but not for
+// ever. A gateway keys these by client address for the life of its process, so
+// a client back hours later was seeded with the erasure and the minimum round
+// trip of its last visit -- the round trip a floor that only moves down.
+func TestPathKnowledgeExpiresWhenNothingHasReportedForLong(t *testing.T) {
+	now := time.Now()
+	m := NewPathModel()
+	m.now = func() time.Time { return now }
+	m.Report(1, Observation{Erasure: 0.3, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 40 * time.Millisecond})
+
+	// A minute later the member has gone idle, but the path is remembered.
+	now = now.Add(time.Minute)
+	if got := m.Current(); got.Erasure != 0.3 || got.RoundTrip != 40*time.Millisecond {
+		t.Fatalf("a path idle for a minute forgot its measurements: %+v", got)
+	}
+	// Long after, it is not.
+	now = now.Add(11 * time.Minute)
+	if got := m.Current(); got.Erasure != 0 || got.RoundTrip != 0 || got.ObservedSamples != 0 {
+		t.Fatalf("a path nothing has reported on for %v still answers %+v", knowledgeLifetime, got)
+	}
+	// And a new report starts from what it measures, not from the old floor.
+	got := m.Report(2, Observation{Erasure: 0.05, BurstFactor: 1, ObservedSamples: 200, Delivered: 1e6, RoundTrip: 210 * time.Millisecond})
+	if got.RoundTrip != 210*time.Millisecond {
+		t.Fatalf("a fresh report on an expired path got round trip %v, want its own 210ms", got.RoundTrip)
+	}
+}

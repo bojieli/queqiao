@@ -297,15 +297,7 @@ const handshakeRoundTrips = 30
 // measured path needs. It never shortens the configured value: an operator who
 // asked for longer gets longer.
 func handshakeBound(conn streamConn, configured time.Duration) time.Duration {
-	provider, ok := conn.(laneStatsProvider)
-	if !ok {
-		return configured
-	}
-	stats := provider.transportStats()
-	rtt := stats.smoothedRTT
-	if rtt <= 0 {
-		rtt = stats.latestRTT
-	}
+	rtt := transportRTT(conn)
 	if rtt <= 0 {
 		return configured
 	}
@@ -313,6 +305,22 @@ func handshakeBound(conn streamConn, configured time.Duration) time.Duration {
 		return scaled
 	}
 	return configured
+}
+
+// transportRTT is the round trip the lane's transport has measured, or zero
+// when it measures none. It is a round trip and nothing else: a dial's duration
+// includes the handshake, the authentication and, for a fresh connection,
+// every round trip those took.
+func transportRTT(conn streamConn) time.Duration {
+	provider, ok := conn.(laneStatsProvider)
+	if !ok {
+		return 0
+	}
+	stats := provider.transportStats()
+	if stats.smoothedRTT > 0 {
+		return stats.smoothedRTT
+	}
+	return stats.latestRTT
 }
 
 type quicStreamConn struct {
