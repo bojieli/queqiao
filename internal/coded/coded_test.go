@@ -643,7 +643,7 @@ func TestTailProtectionCostsOneBurstNotOnePerWrite(t *testing.T) {
 			ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
 		})
 		pa, _ := newPipes(1, 0)
-		p := New(pa, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Path: m})
+		p := New(pa, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Path: m, tailDefer: testTailDefer})
 		defer p.Close()
 		frame := make([]byte, 1000)
 		for i := 0; i < 100; i++ {
@@ -656,7 +656,7 @@ func TestTailProtectionCostsOneBurstNotOnePerWrite(t *testing.T) {
 		}
 		waitDrained(t, p)
 		// The tail is protected once the producer has stayed quiet.
-		time.Sleep(4 * maxTailDefer)
+		time.Sleep(2 * testTailDefer)
 		stats := p.Stats()
 		return stats.Sent - stats.Repairs, stats.Repairs
 	}
@@ -672,6 +672,14 @@ func TestTailProtectionCostsOneBurstNotOnePerWrite(t *testing.T) {
 			"every drain is being protected as though it ended the exchange", manyRepairs, oneRepairs)
 	}
 }
+
+// testTailDefer stands in for the production tail deferral, which is at most
+// 5 ms. The test tells a drain from a pause by the time between writes, and on
+// a loaded Windows runner a 2 ms sleep overran 5 ms often enough to protect a
+// handful of drains -- 46 repairs where one burst needed 27. A deferral longer
+// than any gap a runner puts between two writes measures the mechanism rather
+// than the machine's timer.
+const testTailDefer = 250 * time.Millisecond
 
 // waitDrained returns once the send loop has taken everything queued and had a
 // moment to protect it.
@@ -702,11 +710,13 @@ func TestAShortExchangeIsStillProtectedPromptly(t *testing.T) {
 	if err := p.Send(make([]byte, 80)); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(p.tailDefer() + 50*time.Millisecond)
+	// The margin is for a loaded runner's timer, not for the design: what
+	// this guards against is protection that waits for the next exchange.
+	deadline := time.Now().Add(p.tailDefer() + 500*time.Millisecond)
 	for p.Stats().Repairs == 0 {
 		if time.Now().After(deadline) {
 			t.Fatalf("a single-symbol exchange on a 14%% path had no repair %v after it was sent",
-				p.tailDefer()+50*time.Millisecond)
+				p.tailDefer()+500*time.Millisecond)
 		}
 		time.Sleep(200 * time.Microsecond)
 	}

@@ -56,6 +56,7 @@ func TestARequestAfterThePooledConnectionDiesDoesNotWaitForTheIdleTimeout(t *tes
 	if testing.Short() {
 		t.Skip("brings up QUIC across an emulated path")
 	}
+	requireStableImpairmentClock(t)
 	path := pathsim.Config{OneWayDelay: 25 * time.Millisecond, Seed: 3}
 	socks, destination := codedPairWith(t, true, &path, responseDestination)
 	if err := tryFetch(socks, destination, 20_000, 20*time.Second); err != nil {
@@ -89,6 +90,7 @@ func TestAHealthyIdlePoolIsNotSuperseded(t *testing.T) {
 	if testing.Short() {
 		t.Skip("brings up QUIC across an emulated path and idles it")
 	}
+	requireStableImpairmentClock(t)
 	path := pathsim.Config{OneWayDelay: 25 * time.Millisecond, Seed: 5}
 	socks, destination := codedPairWith(t, true, &path, responseDestination)
 	if err := tryFetch(socks, destination, 300_000, 20*time.Second); err != nil {
