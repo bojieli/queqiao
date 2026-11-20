@@ -10,6 +10,34 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.12.2 - 2026-11-20
+
+### Added
+
+- The Android app imports invitations in batches. One paste, or one shared
+  message, takes every `queqiao://` invitation in the text, the QR scanner keeps
+  reading codes until Done instead of closing after the first, and the import
+  dialog lists the queued providers and enrolls them in one go, each with its
+  own device key and crash-safe draft. A scan button on the Profiles screen
+  opens the camera directly. The clipboard is still read only when Paste is
+  tapped.
+- `queqiaod provider invite` accepts a repeatable `--path NAME=HOST:PORT` that
+  issues one invitation per route to the gateway, such as a direct address and
+  relays in front of it, in a single run. Each invitation pins the same gateway
+  and root, and the gateway records its route and answers enrollment with it, so
+  the enrolled profile keeps dialing the relay and existing clients accept it
+  unchanged. The URIs are printed one per line so a mobile app can take them in
+  one paste. Before this, an invitation whose endpoint was edited by hand to
+  point at a relay consumed its token and then failed enrollment.
+- The iOS app imports invitations in batches. One paste takes every
+  `queqiao://` invitation on the clipboard, the QR scanner keeps reading codes
+  until Done instead of closing after the first, and the import screen lists the
+  queued providers and enrolls them in one go, each with its own device key and
+  crash-safe draft. A scan button on the Profiles screen opens the camera
+  directly, and when copied text is waiting, Profiles offers a paste banner.
+  Pasting uses the system paste button, so no paste prompt appears and the
+  clipboard is never read until it is tapped.
+
 ## v0.12.1 - 2026-11-20
 
 ### Fixed
