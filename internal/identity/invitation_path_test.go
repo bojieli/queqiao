@@ -1,6 +1,9 @@
 package identity
 
 import (
+	"context"
+	"crypto/tls"
+	"net"
 	"testing"
 	"time"
 )
@@ -72,5 +75,90 @@ func TestInvalidInvitationPathIssuesNoToken(t *testing.T) {
 	}
 	if invites := provider.Store.Invites(account.ID, now); len(invites) != 0 {
 		t.Fatalf("%d invitations outstanding after refused paths", len(invites))
+	}
+}
+
+// The whole point of a path: enroll through a relay address that is not the
+// provider's own endpoint, keep that route in the profile, and renew over it.
+// Clients compare the enrollment response's endpoint with the invitation's
+// and build the profile from the response, so the provider must answer with
+// the route the invitation was issued for.
+func TestEnrollmentThroughAPathKeepsThePathAndRenews(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	// The provider's own endpoint is not where anything listens; only the
+	// path's endpoint, standing in for a relay, reaches the gateway.
+	provider := testProvider(t, "gateway.example:443", time.Now())
+	account, err := provider.Store.AddAccount("alice", time.Time{}, AccountLimits{}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := InvitationPath{Name: "example-hk", Endpoint: listener.Addr().String()}
+	_, invitation, err := provider.CreateInvitationForPath(account.ID, route, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConfig, _ := ServerTLSConfig(provider.ServerCredentials(), "queqiao/1", true)
+	service := EnrollmentService{Provider: provider}
+	accept := func(handle func(*tls.Conn)) {
+		raw, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer raw.Close()
+		conn := tls.Server(raw, serverConfig)
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if conn.Handshake() == nil {
+			handle(conn)
+		}
+	}
+	go accept(func(conn *tls.Conn) { _, _ = service.Serve(conn) })
+	options := DialOptions{Timeout: 3 * time.Second, LocalAddress: "127.0.0.1"}
+	profile, err := EnrollWithOptions(context.Background(), invitation, "phone", options)
+	if err != nil {
+		t.Fatalf("enrollment through a path failed: %v", err)
+	}
+	if profile.Endpoint != route.Endpoint || profile.Name != route.Name {
+		t.Fatalf("profile = %q at %q, want the path %q at %q", profile.Name, profile.Endpoint, route.Name, route.Endpoint)
+	}
+	if profile.ProviderID != provider.Metadata.ProviderID || profile.GatewayID != provider.Metadata.GatewayID {
+		t.Fatal("a path profile must pin the same provider and gateway")
+	}
+
+	// Certificate validity has one-second resolution, and a renewal must
+	// extend it; renewing in the issuing second could not.
+	time.Sleep(1100 * time.Millisecond)
+	go accept(func(conn *tls.Conn) {
+		principal, principalErr := PrincipalFromTLS(conn.ConnectionState())
+		if principalErr == nil {
+			_, _ = service.Renew(conn, principal)
+		}
+	})
+	renewed, err := RenewProfileWithOptions(context.Background(), profile, options)
+	if err != nil {
+		t.Fatalf("renewal over the path failed: %v", err)
+	}
+	if renewed.Endpoint != route.Endpoint || renewed.Name != route.Name || renewed.DeviceID != profile.DeviceID {
+		t.Fatalf("renewal moved the profile to %q at %q", renewed.Name, renewed.Endpoint)
+	}
+}
+
+// An invitation without a path still answers with the provider's own values.
+func TestEnrollmentWithoutAPathAnswersWithTheProvider(t *testing.T) {
+	now := time.Now()
+	provider := testProvider(t, "127.0.0.1:443", now)
+	account, err := provider.Store.AddAccount("alice", time.Time{}, AccountLimits{}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, _, err := provider.Store.CreateInvite(account.ID, time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Name != "" || record.Endpoint != "" {
+		t.Fatalf("a plain invitation recorded a route: %+v", record)
 	}
 }

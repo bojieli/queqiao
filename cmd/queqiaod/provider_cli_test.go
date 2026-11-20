@@ -111,7 +111,10 @@ func TestInvitationPathsParse(t *testing.T) {
 			t.Fatalf("route %d = %+v, want %+v", i, routes[i], want[i])
 		}
 	}
-	for _, bad := range []string{"rtx-pro-hk", "x=no-port", "x=host:99999"} {
+	if _, err := parseInvitationPaths([]string{"hk=203.0.113.9:1", "hk=203.0.113.9:1"}); err == nil {
+		t.Fatal("a repeated --path was accepted")
+	}
+	for _, bad := range []string{"rtx-pro-hk", "x=no-port", "x=host:99999", "a\nb=203.0.113.9:1"} {
 		if _, err := parseInvitationPaths([]string{bad}); err == nil {
 			t.Fatalf("--path %q was accepted", bad)
 		}

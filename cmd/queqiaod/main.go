@@ -1206,7 +1206,12 @@ func parseInvitationPaths(values []string) ([]identity.InvitationPath, error) {
 		return []identity.InvitationPath{{}}, nil
 	}
 	routes := make([]identity.InvitationPath, 0, len(values))
+	seen := make(map[string]bool, len(values))
 	for _, value := range values {
+		if seen[value] {
+			return nil, fmt.Errorf("--path %q is given twice", value)
+		}
+		seen[value] = true
 		name, endpoint, ok := strings.Cut(value, "=")
 		if !ok {
 			return nil, fmt.Errorf("--path %q: want NAME=HOST:PORT", value)

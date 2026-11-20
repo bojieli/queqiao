@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -66,7 +67,10 @@ func (p *Provider) CreateInvitation(account string, ttl time.Duration, now time.
 // InvitationPath names another route to the same gateway: a relay or a
 // second address in front of it. The invitation still pins this provider's
 // root and gateway, so the endpoint decides only where the client dials, never
-// whom it trusts. Empty fields keep the provider's own name and endpoint.
+// whom it trusts. Empty fields keep the provider's own name and endpoint. The
+// provider stores the route with the invitation and returns it in the
+// enrollment response, which is what clients compare the invitation against
+// and build the profile from.
 type InvitationPath struct {
 	Name     string
 	Endpoint string
@@ -74,7 +78,8 @@ type InvitationPath struct {
 
 // Validate reports whether the path can be placed in an invitation.
 func (p InvitationPath) Validate() error {
-	if p.Name != strings.TrimSpace(p.Name) || len(p.Name) > 128 {
+	if p.Name != strings.TrimSpace(p.Name) || len(p.Name) > 128 ||
+		strings.IndexFunc(p.Name, unicode.IsControl) >= 0 {
 		return fmt.Errorf("invalid invitation name %q", p.Name)
 	}
 	if p.Endpoint != "" {
@@ -99,7 +104,7 @@ func (p *Provider) CreateInvitationForPath(account string, path InvitationPath, 
 	if !ok {
 		return "", Invitation{}, errors.New("unknown account")
 	}
-	record, token, err := p.Store.CreateInvite(resolved.ID, ttl, now)
+	record, token, err := p.Store.CreateInviteForPath(resolved.ID, path, ttl, now)
 	if err != nil {
 		return "", Invitation{}, err
 	}

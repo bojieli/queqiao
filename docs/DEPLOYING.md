@@ -304,7 +304,13 @@ sudo -u queqiao /usr/local/bin/queqiaod provider invite \
   --path gateway-cn=relay-cn.example:12548
 ```
 
-A run with any invalid `--path` issues no invitation at all.
+Every `--path` is checked before any token is issued, so a run with an invalid
+or repeated `--path` issues nothing; a storage failure part-way through leaves
+the invitations already printed valid. The gateway records each invitation's
+route and answers enrollment with it, so the enrolled profile keeps dialing
+that route, and clients already in the field accept it unchanged. A provider
+state holding outstanding path invitations cannot be read by a release older
+than the one that added `--path`; revoke them before rolling back.
 
 Audit or revoke unused invitations without printing their tokens:
 
