@@ -1,24 +1,32 @@
 import SwiftUI
 import UIKit
 
+/// Collects any number of invitations -- scanned one after another, pasted
+/// several at a time, or typed -- and imports them as one batch. Each
+/// invitation still becomes its own device-bound profile with its own key.
 struct ImportProfileView: View {
     @EnvironmentObject private var model: TunnelModel
     @Environment(\.dismiss) private var dismiss
     @State private var confirmDiscard = false
     @State private var isScannerPresented = false
+    @State private var pasteNote: String?
+    @State private var isManualEntryExpanded = false
 
     var body: some View {
         NavigationStack {
             Form {
                 if model.hasDraft {
                     pendingSection
-                } else {
-                    invitationSection
-                    deviceSection
                 }
+                addSection
+                if !model.queuedInvitations.isEmpty {
+                    queueSection
+                }
+                manualSection
+                deviceSection
                 importSection
             }
-            .navigationTitle("Import Profile")
+            .navigationTitle("Import Profiles")
             .navigationBarTitleDisplayMode(.inline)
             .interactiveDismissDisabled(model.isBusy)
             .toolbar {
@@ -29,6 +37,12 @@ struct ImportProfileView: View {
             }
             .sheet(isPresented: $isScannerPresented) {
                 InvitationScannerView()
+            }
+            .onAppear {
+                if model.importerStartsScanning {
+                    model.importerStartsScanning = false
+                    isScannerPresented = InvitationScannerView.isAvailable
+                }
             }
             .confirmationDialog(
                 "Discard pending enrollment?",
@@ -58,42 +72,78 @@ struct ImportProfileView: View {
             Button("Discard pending enrollment", role: .destructive) {
                 confirmDiscard = true
             }
+            .disabled(model.isBusy)
         } header: {
             Text("Pending import")
         }
     }
 
-    private var invitationSection: some View {
+    private var addSection: some View {
         Section {
-            TextEditor(text: $model.invitation)
-                .frame(minHeight: 112)
-                .font(.footnote.monospaced())
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .privacySensitive()
-                .accessibilityLabel("Queqiao invitation")
             if InvitationScannerView.isAvailable {
                 Button {
                     isScannerPresented = true
                 } label: {
-                    Label("Scan QR code", systemImage: "qrcode.viewfinder")
+                    Label("Scan QR codes", systemImage: "qrcode.viewfinder")
                 }
             }
-            Button {
-                if let value = UIPasteboard.general.string {
-                    model.invitation = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-            } label: {
-                Label("Paste invitation", systemImage: "doc.on.clipboard")
+            // PasteButton reads the clipboard only when tapped, and without
+            // the system's paste-permission prompt.
+            PasteButton(payloadType: String.self) { values in
+                Task { @MainActor in paste(values) }
+            }
+            .labelStyle(.titleAndIcon)
+            if let pasteNote {
+                Text(pasteNote)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         } header: {
-            Text("One-time invitation")
+            Text("Add invitations")
         } footer: {
             Text(
-                "The invitation is exchanged once. The permanent device key is generated " +
-                "on this iPhone and never leaves it."
+                "Scan or paste as many invitations as you have; a paste takes every " +
+                "invitation on the clipboard. Each one is used once, and its permanent " +
+                "device key is generated on this iPhone and never leaves it."
             )
         }
+        .disabled(model.isBusy)
+    }
+
+    private var queueSection: some View {
+        Section {
+            ForEach(model.queuedInvitations) { item in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.name)
+                    if !item.endpoint.isEmpty {
+                        Text(item.endpoint)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .onDelete { offsets in
+                model.queuedInvitations.remove(atOffsets: offsets)
+            }
+            .deleteDisabled(model.isBusy)
+        } header: {
+            Text("Ready to import (\(model.queuedInvitations.count))")
+        }
+    }
+
+    private var manualSection: some View {
+        Section {
+            DisclosureGroup("Enter invitation text", isExpanded: $isManualEntryExpanded) {
+                TextEditor(text: $model.invitation)
+                    .frame(minHeight: 112)
+                    .font(.footnote.monospaced())
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .privacySensitive()
+                    .accessibilityLabel("Queqiao invitations")
+            }
+        }
+        .disabled(model.isBusy)
     }
 
     private var deviceSection: some View {
@@ -101,22 +151,56 @@ struct ImportProfileView: View {
             TextField("Device name", text: $model.deviceName)
                 .textInputAutocapitalization(.words)
         }
+        .disabled(model.isBusy)
     }
 
     private var importSection: some View {
         Section {
-            Button(model.hasDraft ? "Resume import" : "Import profile") {
+            Button(importTitle) {
                 Task { await model.enroll() }
             }
             .frame(maxWidth: .infinity)
             .disabled(model.isBusy || !hasRequiredInput)
+            if model.isBusy {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text(model.status)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+            }
         }
+    }
+
+    private var pendingCount: Int {
+        let typed = InvitationBatch.extract(model.invitation).filter { uri in
+            !model.queuedInvitations.contains(where: { $0.uri == uri })
+        }
+        return model.queuedInvitations.count + typed.count + (model.hasDraft ? 1 : 0)
+    }
+
+    private var importTitle: String {
+        if model.hasDraft && pendingCount <= 1 {
+            return "Resume import"
+        }
+        return pendingCount > 1 ? "Import \(pendingCount) profiles" : "Import profile"
     }
 
     private var hasRequiredInput: Bool {
         model.hasDraft || (
-            !model.invitation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            pendingCount > 0 &&
             !model.deviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+    }
+
+    private func paste(_ values: [String]) {
+        let result = InvitationBatch.evaluate(values.joined(separator: "\n"))
+        let added = model.queueInvitations(result.accepted)
+        pasteNote = InvitationBatch.pasteSummary(
+            added: added,
+            alreadyQueued: result.accepted.count - added,
+            rejected: result.rejected
         )
     }
 }

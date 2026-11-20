@@ -8,6 +8,11 @@ final class TunnelModel: ObservableObject {
     @Published var invitation = ""
     @Published var deviceName = ""
     @Published var isImporterPresented = false
+    /// Invitations scanned or pasted but not yet enrolled, in import order.
+    @Published var queuedInvitations: [QueuedInvitation] = []
+    /// Set by the Profiles scan shortcut so the importer opens straight onto
+    /// the camera; cleared as soon as the importer has acted on it.
+    @Published var importerStartsScanning = false
     @Published private(set) var status = "Loading VPN configuration…"
     @Published private(set) var profiles: [StoredProfile] = []
     @Published private(set) var selectedProfileID: String?
@@ -74,35 +79,48 @@ final class TunnelModel: ObservableObject {
         await refreshDiagnostics()
     }
 
+    /// Enrolls every queued invitation, plus any typed into the manual field,
+    /// one after another with the same device name. A pending draft from an
+    /// interrupted import is resumed first. Each invitation leaves the queue
+    /// as soon as its draft is saved, because from then on the draft -- not
+    /// the invitation -- is what a retry must resume; so a failure stops the
+    /// batch with the failed invitation either still queued (nothing was
+    /// sent) or held as the resumable draft, and the rest still queued.
     func enroll() async {
         guard !isBusy else { return }
-        let invitation = invitation.trimmingCharacters(in: .whitespacesAndNewlines)
+        queueInvitations(InvitationBatch.extract(invitation))
+        invitation = ""
         let deviceName = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard hasDraft || (!invitation.isEmpty && !deviceName.isEmpty) else { return }
+        let resuming = hasDraft
+        guard resuming || (!queuedInvitations.isEmpty && !deviceName.isEmpty) else { return }
         isBusy = true
-        status = hasDraft ? "Resuming enrollment…" : "Importing profile…"
+        let total = queuedInvitations.count + (resuming ? 1 : 0)
+        var imported = 0
         do {
-            try await Task.detached(priority: .userInitiated) {
-                let store = try ProfileStore()
-                var draft = try store.enrollmentDraft()
-                if draft == nil {
-                    try MobileCore.validateInvitation(invitation)
-                    draft = try MobileCore.prepareEnrollment(invitation: invitation, deviceName: deviceName)
-                    guard let draft else { throw ModelError.emptyCoreResult }
-                    try store.saveEnrollmentDraft(draft)
-                }
-                guard let draft else { throw ModelError.emptyCoreResult }
-                let profile = try MobileCore.completeEnrollment(draft: draft)
-                _ = try store.importProfile(profile)
-                try store.discardEnrollmentDraft()
-            }.value
-            self.invitation = ""
+            if resuming {
+                status = "Resuming enrollment…"
+                try await Self.completeEnrollmentDraft()
+                hasDraft = false
+                imported += 1
+            }
+            while let next = queuedInvitations.first {
+                status = total > 1 ? "Importing profile \(imported + 1) of \(total)…" : "Importing profile…"
+                try await Self.prepareEnrollmentDraft(invitation: next.uri, deviceName: deviceName)
+                queuedInvitations.removeFirst()
+                hasDraft = true
+                try await Self.completeEnrollmentDraft()
+                hasDraft = false
+                imported += 1
+            }
             self.deviceName = UIDevice.current.name
             isImporterPresented = false
-            await refreshProfiles()
         } catch {
-            present(error, title: "Profile import failed")
+            let title = imported == 0
+                ? "Profile import failed"
+                : "Imported \(imported) of \(total) profiles, then import failed"
+            present(error, title: title)
         }
+        await refreshProfiles()
         isBusy = false
         if managerReloadPending {
             await loadManager(reason: "queued VPN configuration change")

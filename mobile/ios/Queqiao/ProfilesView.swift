@@ -44,9 +44,16 @@ struct ProfilesView: View {
             }
             .navigationTitle("Profiles")
             .toolbar {
+                if InvitationScannerView.isAvailable {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button { model.presentImporter(scanning: true) } label: {
+                            Label("Scan invitations", systemImage: "qrcode.viewfinder")
+                        }
+                    }
+                }
                 ToolbarItem(placement: .primaryAction) {
-                    Button { model.isImporterPresented = true } label: {
-                        Label("Import profile", systemImage: "plus")
+                    Button { model.presentImporter(scanning: false) } label: {
+                        Label("Import profiles", systemImage: "plus")
                     }
                 }
             }
