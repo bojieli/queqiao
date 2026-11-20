@@ -242,33 +242,46 @@ func runProvider(args []string) error {
 		user := fs.String("user", "", "user name or ID")
 		expiresIn := fs.Duration("expires-in", 24*time.Hour, "one-time invitation lifetime (maximum 7d)")
 		showQR := fs.Bool("qr", false, "also draw the invitation as a QR code on standard error, for the mobile apps to scan")
+		var paths stringList
+		fs.Var(&paths, "path", "issue one invitation per route to this gateway, as NAME=HOST:PORT (a relay or another address); repeatable, and NAME or HOST:PORT may be empty to keep the provider's own")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if err := requireNoArguments(fs); err != nil {
 			return err
 		}
+		routes, err := parseInvitationPaths(paths)
+		if err != nil {
+			return err
+		}
 		provider, err := loadProviderRequired(*state)
 		if err != nil {
 			return err
 		}
-		uri, _, err := provider.CreateInvitation(*user, *expiresIn, time.Now())
-		if err != nil {
-			return err
-		}
-		// stdout is intentionally only the importable value, making it safe to
-		// pipe into a QR encoder or provider portal. The drawn code goes to
-		// stderr for the same reason: a terminal shows both, a pipe sees one.
+		// stdout is intentionally only the importable values, one per line,
+		// making it safe to pipe into a QR encoder or provider portal and to
+		// paste whole into a mobile app, which takes every invitation in one
+		// paste. Drawn codes go to stderr for the same reason: a terminal
+		// shows both, a pipe sees one.
 		var qrErr error
-		if *showQR {
-			art, err := renderQRCode(uri)
+		for _, route := range routes {
+			uri, invitation, err := provider.CreateInvitationForPath(*user, route, *expiresIn, time.Now())
 			if err != nil {
-				qrErr = err
-			} else {
-				fmt.Fprint(os.Stderr, art)
+				return err
 			}
+			if *showQR {
+				art, err := renderQRCode(uri)
+				if err != nil {
+					qrErr = err
+				} else {
+					if len(routes) > 1 {
+						fmt.Fprintf(os.Stderr, "%s (%s)\n", invitation.ProviderName, invitation.Endpoint)
+					}
+					fmt.Fprint(os.Stderr, art)
+				}
+			}
+			fmt.Println(uri)
 		}
-		fmt.Println(uri)
 		return qrErr
 	case "list-invites":
 		fs := newFlagSet("provider list-invites")
@@ -1183,4 +1196,26 @@ func (r *repeatedFlag) String() string { return strings.Join(*r, ",") }
 func (r *repeatedFlag) Set(v string) error {
 	*r = append(*r, v)
 	return nil
+}
+
+// parseInvitationPaths turns repeated --path NAME=HOST:PORT values into
+// invitation routes. With none, one invitation uses the provider's own name
+// and endpoint, as before the flag existed.
+func parseInvitationPaths(values []string) ([]identity.InvitationPath, error) {
+	if len(values) == 0 {
+		return []identity.InvitationPath{{}}, nil
+	}
+	routes := make([]identity.InvitationPath, 0, len(values))
+	for _, value := range values {
+		name, endpoint, ok := strings.Cut(value, "=")
+		if !ok {
+			return nil, fmt.Errorf("--path %q: want NAME=HOST:PORT", value)
+		}
+		route := identity.InvitationPath{Name: name, Endpoint: endpoint}
+		if err := route.Validate(); err != nil {
+			return nil, fmt.Errorf("--path %q: %w", value, err)
+		}
+		routes = append(routes, route)
+	}
+	return routes, nil
 }

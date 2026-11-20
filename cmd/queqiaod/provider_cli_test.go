@@ -3,6 +3,7 @@ package main
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/bojieli/queqiao/internal/identity"
 )
@@ -85,5 +86,67 @@ func TestSetUserLimitsChangesOnlyWhatIsNamed(t *testing.T) {
 	}
 	if err := runProvider([]string{"set-user-limits", "--state", state, "--user", "nobody", "--max-clients", "4"}); err == nil {
 		t.Fatal("limits were set on an unknown user")
+	}
+}
+
+func TestInvitationPathsParse(t *testing.T) {
+	routes, err := parseInvitationPaths(nil)
+	if err != nil || len(routes) != 1 || routes[0] != (identity.InvitationPath{}) {
+		t.Fatalf("no --path = %+v, %v; want one invitation with the provider's own values", routes, err)
+	}
+	routes, err = parseInvitationPaths([]string{"rtx-pro=", "rtx-pro-hk=203.0.113.9:12548", "=198.51.100.1:443"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []identity.InvitationPath{
+		{Name: "rtx-pro"},
+		{Name: "rtx-pro-hk", Endpoint: "203.0.113.9:12548"},
+		{Endpoint: "198.51.100.1:443"},
+	}
+	if len(routes) != len(want) {
+		t.Fatalf("routes = %+v, want %+v", routes, want)
+	}
+	for i := range want {
+		if routes[i] != want[i] {
+			t.Fatalf("route %d = %+v, want %+v", i, routes[i], want[i])
+		}
+	}
+	for _, bad := range []string{"rtx-pro-hk", "x=no-port", "x=host:99999"} {
+		if _, err := parseInvitationPaths([]string{bad}); err == nil {
+			t.Fatalf("--path %q was accepted", bad)
+		}
+	}
+}
+
+// One run with several paths issues one invitation per path and nothing when
+// any path is invalid.
+func TestProviderInviteIssuesOneInvitationPerPath(t *testing.T) {
+	state := providerStateForTest(t)
+	if err := runProvider([]string{"add-user", "--state", state, "--name", "alice"}); err != nil {
+		t.Fatal(err)
+	}
+	err := runProvider([]string{"invite", "--state", state, "--user", "alice",
+		"--path", "direct=", "--path", "hk=203.0.113.9:12548", "--path", "broken"})
+	if err == nil {
+		t.Fatal("an invalid --path was accepted")
+	}
+	account := accountForTest(t, state, "alice")
+	provider, err := loadProviderRequired(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(provider.Store.Invites(account.ID, time.Now())); n != 0 {
+		t.Fatalf("%d invitations issued by a run with an invalid path", n)
+	}
+	if err := runProvider([]string{"invite", "--state", state, "--user", "alice",
+		"--path", "direct=", "--path", "hk=203.0.113.9:12548"}); err != nil {
+		t.Fatal(err)
+	}
+	provider, err = loadProviderRequired(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(provider.Store.Invites(account.ID, time.Now())); n != 2 {
+		t.Fatalf("%d invitations outstanding, want one per path", n)
 	}
 }

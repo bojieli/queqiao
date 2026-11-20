@@ -288,6 +288,24 @@ stays the bare URI and is still safe to pipe. A portal may capture that value
 or render it as a QR code without translating any fields. Do not render it
 through a web QR generator, which would receive the credential.
 
+A gateway reached through relays or more than one address can issue one
+invitation per route in a single run. Each `--path NAME=HOST:PORT` produces its
+own one-time invitation, labelled NAME, that dials HOST:PORT but pins this
+gateway's root, so the route decides only where the client connects, never whom
+it trusts. An empty NAME or HOST:PORT keeps the provider's own. The invitations
+are printed one per line, and the iOS app takes them all in one paste:
+
+```sh
+sudo -u queqiao /usr/local/bin/queqiaod provider invite \
+  --state /var/lib/queqiao/provider \
+  --user alice \
+  --path gateway= \
+  --path gateway-hk=relay-hk.example:12548 \
+  --path gateway-cn=relay-cn.example:12548
+```
+
+A run with any invalid `--path` issues no invitation at all.
+
 Audit or revoke unused invitations without printing their tokens:
 
 ```sh
