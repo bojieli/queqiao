@@ -760,7 +760,7 @@ public final class MainActivity extends Activity implements TunnelHost {
         startActivityForResult(new Intent(this, ScanInvitationActivity.class), REQUEST_SCAN_INVITATION);
     }
 
-    /** Queues every valid invitation in {@code text} and says what happened. */
+    /** Queues every valid invitation in text and says what happened. */
     private String queueFromText(String text) {
         InvitationBatch.Evaluation result = InvitationBatch.evaluate(text, InvitationBatch.CORE);
         int added = importQueue.add(result.accepted);

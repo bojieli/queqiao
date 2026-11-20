@@ -42,8 +42,8 @@ final class InvitationBatch {
     static final Validator CORE = Mobilecore::validateInvitation;
 
     /**
-     * One invitation waiting in the import queue. Only {@code uri} is ever
-     * sent anywhere; {@code name} and {@code endpoint} are read locally from
+     * One invitation waiting in the import queue. Only uri is ever
+     * sent anywhere; name and endpoint are read locally from
      * the invitation's own payload so the queue can say which provider each
      * entry is before anything is enrolled.
      */
@@ -71,10 +71,10 @@ final class InvitationBatch {
     }
 
     /**
-     * Every {@code queqiao://} invitation in {@code text}, in order, without
+     * Every queqiao:// invitation in text, in order, without
      * duplicates. A provider operator can hand over several invitations in
      * one message -- one per line, or as the output of several
-     * {@code provider invite} runs -- and one paste should take all of them.
+     * provider invite runs -- and one paste should take all of them.
      * Candidates are not validated here.
      */
     static List<String> extract(String text) {
@@ -106,7 +106,7 @@ final class InvitationBatch {
                 || SEPARATORS.indexOf(value) >= 0;
     }
 
-    /** Extracts every candidate in {@code text} and validates each one. */
+    /** Extracts every candidate in text and validates each one. */
     static Evaluation evaluate(String text, Validator validator) {
         List<String> accepted = new ArrayList<>();
         int rejected = 0;
@@ -165,7 +165,7 @@ final class InvitationBatch {
     }
 
     /**
-     * The import button's label. {@code pending} counts the queue, any typed
+     * The import button's label. pending counts the queue, any typed
      * invitations not yet queued, and the resumable draft.
      */
     static String importTitle(int pending, boolean hasDraft) {
