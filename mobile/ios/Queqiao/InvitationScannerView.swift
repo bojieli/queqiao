@@ -24,14 +24,16 @@ enum InvitationScan: Equatable {
     }
 }
 
-/// Reads a queqiao:// invitation from a QR code with the camera, for the case
-/// where the invitation is on another screen and typing five hundred
-/// characters of base64 is not an option. Detection is AVFoundation's own, so
-/// nothing but a system framework sees the frame, and the decoded string goes
-/// straight into the import form the user opened this from. The session is
-/// held only while the sheet is on screen.
+/// Reads queqiao:// invitations from QR codes with the camera, for the case
+/// where the invitations are on another screen and typing five hundred
+/// characters of base64 is not an option. It keeps scanning: each new valid
+/// code joins the import queue with a haptic tick, so a page of codes is read
+/// by sweeping the camera across it and tapping Done once. Detection is
+/// AVFoundation's own, so nothing but a system framework sees the frame, and
+/// the decoded strings go only into the import form the user opened this
+/// from. The session is held only while the sheet is on screen.
 struct InvitationScannerView: View {
-    static let defaultHint = "Point the camera at the invitation QR code shown on your computer."
+    static let defaultHint = "Point the camera at an invitation QR code. Scan as many as you like, then tap Done."
     static let permissionHint = "Queqiao needs the camera to read the code. Allow camera access for " +
         "Queqiao in Settings, or paste the invitation instead."
 
@@ -44,7 +46,7 @@ struct InvitationScannerView: View {
     @State private var authorization = CameraAuthorization.undetermined
     @State private var message = InvitationScannerView.defaultHint
     @State private var lastRejection = Date.distantPast
-    @State private var delivered = false
+    @State private var lastDuplicate = Date.distantPast
 
     var body: some View {
         NavigationStack {
@@ -62,13 +64,14 @@ struct InvitationScannerView: View {
                         .background(.black.opacity(0.6))
                 }
             }
-            .navigationTitle("Scan invitation")
+            .navigationTitle(scanTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
                 }
             }
+            .sensoryFeedback(.success, trigger: model.queuedInvitations.count)
             .task { await requestAccess() }
         }
     }
@@ -115,15 +118,43 @@ struct InvitationScannerView: View {
         }
     }
 
+    private var scanTitle: String {
+        let count = model.queuedInvitations.count
+        return count == 0 ? "Scan invitations" : "\(count) ready to import"
+    }
+
     private func handle(_ value: String) {
-        guard !delivered else { return }
-        switch InvitationScan.evaluate(value) {
+        let candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The camera reports a code many times a second while it stays in
+        // view; one already queued is acknowledged, not re-validated.
+        if model.queuedInvitations.contains(where: { $0.uri == candidate }) {
+            let now = Date()
+            if now.timeIntervalSince(lastDuplicate) > 2 {
+                lastDuplicate = now
+                show("Already added. Point the camera at the next code, or tap Done.")
+            }
+            return
+        }
+        switch InvitationScan.evaluate(candidate) {
         case .accepted(let invitation):
-            delivered = true
-            model.invitation = invitation
-            dismiss()
+            model.queueInvitations([invitation])
+            // The same code stays in view for the next frames; keep them from
+            // replacing this confirmation with "Already added" at once.
+            lastDuplicate = Date()
+            let name = InvitationBatch.describe(invitation).name
+            show("Added \(name). Scan the next code, or tap Done.")
         case .rejected(let reason):
             reject(reason)
+        }
+    }
+
+    private func show(_ text: String) {
+        message = text
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            if message == text {
+                message = Self.defaultHint
+            }
         }
     }
 
