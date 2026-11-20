@@ -720,6 +720,13 @@ func TestAShortExchangeIsStillProtectedPromptly(t *testing.T) {
 		}
 		time.Sleep(200 * time.Microsecond)
 	}
+	// The repairs for one exchange leave as one burst, but the counter can be
+	// read between them; seeing the first is not seeing the burst finish.
+	// A design that sends only one still fails once the burst has had time.
+	settle := time.Now().Add(250 * time.Millisecond)
+	for p.Stats().Repairs < 2 && time.Now().Before(settle) {
+		time.Sleep(200 * time.Microsecond)
+	}
 	if got := p.Stats().Repairs; got < 2 {
 		t.Fatalf("a single-symbol exchange got %d repairs; the short-block residual asks for more", got)
 	}
