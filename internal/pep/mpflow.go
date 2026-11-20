@@ -1896,9 +1896,10 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			// rescue lane is healthy and is replaying the bytes that
 			// stalled. Ending it here threw away a successful rescue a
 			// few hundred milliseconds after it landed. A lane that
-			// exists but never delivers is still bounded below by the
-			// no-progress budget, as waitForHealthyLane already treats a
-			// healthy lane as the answer whatever the manager has done.
+			// exists but never delivers is still ended by the
+			// no-progress budget in the next case, and waitForHealthyLane
+			// already treats a healthy lane as the answer whatever the
+			// manager has done.
 			terminal = errReplacementAbandoned
 		case now.Sub(sendSince) >= f.progressTimeout():
 			terminal = errFlowNoProgress

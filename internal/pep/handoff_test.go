@@ -21,7 +21,8 @@ import (
 // hours ended within two seconds of a TCP handoff, interactive SSH sessions
 // among them.
 func TestAbandonedReplacementDoesNotKillAFlowRescuedOntoTCP(t *testing.T) {
-	flow := newStallTestFlow(t, metrics.New())
+	registry := metrics.New()
+	flow := newStallTestFlow(t, registry)
 	local, remote := net.Pipe()
 	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
 	if err := flow.addLane(&mpLane{id: 5, kind: TransportTCP, fc: newFrameConn(local)}); err != nil {
@@ -42,6 +43,9 @@ func TestAbandonedReplacementDoesNotKillAFlowRescuedOntoTCP(t *testing.T) {
 	// Well past the stall threshold, far short of the no-progress budget:
 	// the replay on the rescue lane has its chance to be acknowledged.
 	time.Sleep(300 * time.Millisecond)
+	if got := registry.Snapshot().FlowStallsDetected; got == 0 {
+		t.Fatal("the watchdog never saw the stall, so its survival proves nothing")
+	}
 	if flow.doneChanClosed() {
 		t.Fatal("the watchdog closed a flow whose TCP rescue lane was still healthy")
 	}
