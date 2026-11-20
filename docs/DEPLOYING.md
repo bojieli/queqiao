@@ -308,9 +308,12 @@ Every `--path` is checked before any token is issued, so a run with an invalid
 or repeated `--path` issues nothing; a storage failure part-way through leaves
 the invitations already printed valid. The gateway records each invitation's
 route and answers enrollment with it, so the enrolled profile keeps dialing
-that route, and clients already in the field accept it unchanged. A provider
-state holding outstanding path invitations cannot be read by a release older
-than the one that added `--path`; revoke them before rolling back.
+that route, and clients already in the field accept it unchanged. A release
+older than the one that added `--path` cannot read provider state holding a
+path invitation record. Outstanding ones can be revoked, but a consumed one is
+kept for seven days so an interrupted enrollment can be retried, so a rollback
+past that release must wait seven days after the last enrollment through a
+path, or not use `--path` meanwhile.
 
 Audit or revoke unused invitations without printing their tokens:
 
