@@ -166,6 +166,23 @@ crash-safe: a draft containing the newly generated device key is encrypted
 before the one-time token is sent, and an interrupted import resumes that exact
 draft.
 
+The Android import dialog collects a batch. Paste reads the clipboard only
+when tapped and takes every `queqiao://` invitation on it, a shared plain-text
+message may likewise carry several, and the scanner keeps reading code after
+code until Done; each candidate is validated by the Go core before it is
+queued. The queue lists each provider by the name and endpoint in the
+invitation's own payload and is held in memory only, never persisted. The
+queued invitations are then enrolled one after another under one device name,
+each with its own device key and its own crash-safe draft: an invitation
+leaves the queue only once its encrypted draft is saved, so a failure leaves
+it either still queued, with nothing sent, or as the draft to resume, which is
+always enrolled first. A new draft is never written over a pending one. Only
+one batch runs per process, on a single process-wide thread, so recreating the
+activity (a rotation, for example) cannot start a second batch over the same
+queue and draft. A batch takes the invitations queued when Import was tapped;
+anything shared or scanned later waits for the next tap. A scan button on the
+Profiles screen opens the import dialog directly onto the camera.
+
 Queqiao does not import or export the resulting private client-profile JSON as
 a portable configuration file. That JSON contains the device identity and is
 intentionally stored only in this-device-only Keychain storage on iOS or an
