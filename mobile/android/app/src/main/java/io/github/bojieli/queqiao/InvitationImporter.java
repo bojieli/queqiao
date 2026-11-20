@@ -61,7 +61,16 @@ final class InvitationImporter {
     interface Listener {
         void onImportProgress(String message);
 
-        void onImportFinished(Result result);
+        /**
+         * Returns false when the listener cannot show the result (its
+         * activity is finishing); the importer then holds it for the next.
+         */
+        boolean onImportFinished(Result result);
+    }
+
+    /** Delivered on the main thread; failure is null when the draft is gone. */
+    interface DiscardCallback {
+        void onDiscarded(Exception failure);
     }
 
     static final class Result {
@@ -221,6 +230,38 @@ final class InvitationImporter {
         return true;
     }
 
+    /**
+     * Deletes the pending draft on the import thread, so a discard is ordered
+     * with batches rather than racing one: it can never delete a draft a
+     * batch has just saved for an invitation it already dequeued. Returns
+     * false, and deletes nothing, while a batch or another discard runs;
+     * Import is refused until the discard is done.
+     */
+    synchronized boolean discard(Store store, DiscardCallback callback) {
+        if (running) {
+            return false;
+        }
+        running = true;
+        status = "Discarding pending enrollment…";
+        executor.execute(() -> {
+            Exception failure = null;
+            try {
+                store.discardDraft();
+            } catch (Exception exception) {
+                failure = exception;
+            }
+            Exception outcome = failure;
+            main.post(() -> {
+                synchronized (this) {
+                    running = false;
+                    status = "";
+                }
+                callback.onDiscarded(outcome);
+            });
+        });
+        return true;
+    }
+
     synchronized boolean isRunning() {
         return running;
     }
@@ -272,7 +313,7 @@ final class InvitationImporter {
                     return;
                 }
             }
-            current.onImportFinished(result);
+            offer(current, result);
         });
     }
 
@@ -283,6 +324,15 @@ final class InvitationImporter {
                 return;
             }
         }
-        target.onImportFinished(result);
+        offer(target, result);
+    }
+
+    /** Hands the result over, or holds it when the listener cannot show it. */
+    private void offer(Listener target, Result result) {
+        if (!target.onImportFinished(result)) {
+            synchronized (this) {
+                undelivered = result;
+            }
+        }
     }
 }

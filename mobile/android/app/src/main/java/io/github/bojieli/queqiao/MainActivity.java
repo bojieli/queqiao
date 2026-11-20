@@ -54,6 +54,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     private static final int REQUEST_SCAN_INVITATION = 7003;
     private static final String PREFERENCES = "io.github.bojieli.queqiao.ui";
     private static final String PREFERENCE_MODE = "mode";
+    private static final String STATE_IMPORT_DIALOG_OPEN = "import_dialog_open";
 
     private enum Page {
         HOME,
@@ -153,14 +154,23 @@ public final class MainActivity extends Activity implements TunnelHost {
         importer.setListener(importListener);
         // A recreated activity (a rotation, say) rebuilds the import dialog
         // the old one was showing, including a batch still running in the
-        // process-wide importer.
+        // process-wide importer, but not one the user had closed.
         if (importForm == null && (importer.isRunning()
-                || (savedInstanceState != null && importQueue.size() > 0))) {
+                || (savedInstanceState != null
+                        && savedInstanceState.getBoolean(STATE_IMPORT_DIALOG_OPEN)
+                        && importQueue.size() > 0))) {
             showImportDialog(null, false);
             if (importer.isRunning()) {
                 setBusy(true, importer.status());
             }
         }
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        // Only whether the dialog was open; the queue itself stays in memory.
+        outState.putBoolean(STATE_IMPORT_DIALOG_OPEN, importForm != null && importForm.dialog.isShowing());
     }
 
     @Override
@@ -872,9 +882,10 @@ public final class MainActivity extends Activity implements TunnelHost {
         }
 
         @Override
-        public void onImportFinished(InvitationImporter.Result result) {
+        public boolean onImportFinished(InvitationImporter.Result result) {
             if (isFinishing() || isDestroyed()) {
-                return;
+                // The importer holds it for the next activity.
+                return false;
             }
             ImportForm form = importForm;
             refreshCatalog();
@@ -885,7 +896,7 @@ public final class MainActivity extends Activity implements TunnelHost {
                 setBusy(false, result.imported == 1
                         ? "Profile imported"
                         : result.imported + " profiles imported");
-                return;
+                return true;
             }
             if (form != null && form.dialog.isShowing()) {
                 renderImportForm(form);
@@ -894,6 +905,7 @@ public final class MainActivity extends Activity implements TunnelHost {
                     ? "Profile import failed"
                     : "Imported " + result.imported + " of " + result.total + " profiles, then import failed",
                     result.failure);
+            return true;
         }
     };
 
@@ -907,30 +919,26 @@ public final class MainActivity extends Activity implements TunnelHost {
                         "The pending device key will be deleted. The invitation may already be consumed and might not be reusable.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Discard", (dialog, which) -> {
-                    // Checked again here: the draft belongs to a running batch.
-                    if (importer.isRunning()) {
-                        return;
-                    }
-                    worker.execute(() -> {
-                        try {
-                            repository.discardEnrollmentDraft();
-                            runOnUiThread(() -> {
-                                if (isFinishing() || isDestroyed()) {
-                                    return;
-                                }
-                                if (form.dialog.isShowing()) {
-                                    if (importQueue.size() == 0) {
-                                        form.dialog.dismiss();
-                                    } else {
-                                        renderImportForm(form);
-                                    }
-                                }
-                                refreshCatalog();
-                            });
-                        } catch (Exception exception) {
-                            showFailure("Could not discard enrollment", exception);
+                    // The delete runs on the importer's thread, ordered with
+                    // batches; it is refused while one runs, and Import is
+                    // refused until it is done.
+                    boolean started = importer.discard(InvitationImporter.store(repository), failure -> {
+                        if (isFinishing() || isDestroyed()) {
+                            return;
                         }
+                        if (failure != null) {
+                            showFailure("Could not discard enrollment", failure);
+                        } else if (form.dialog.isShowing() && importQueue.size() == 0) {
+                            form.dialog.dismiss();
+                        }
+                        if (form.dialog.isShowing()) {
+                            renderImportForm(form);
+                        }
+                        refreshCatalog();
                     });
+                    if (started && form.dialog.isShowing()) {
+                        renderImportForm(form);
+                    }
                 })
                 .show();
     }
@@ -1303,6 +1311,11 @@ public final class MainActivity extends Activity implements TunnelHost {
         String finalMessage = message;
         runOnUiThread(() -> {
             busy = false;
+            // Posted from background work that can outlive this activity; a
+            // dialog on a dead window would throw BadTokenException.
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
             new AlertDialog.Builder(this)
                     .setTitle(title)
                     .setMessage(finalMessage)
