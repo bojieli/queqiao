@@ -88,11 +88,13 @@ final class TunnelModel: ObservableObject {
     /// sent) or held as the resumable draft, and the rest still queued.
     func enroll() async {
         guard !isBusy else { return }
-        queueInvitations(InvitationBatch.extract(invitation))
-        invitation = ""
+        guard queueTypedInvitations() else { return }
         let deviceName = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         let resuming = hasDraft
-        guard resuming || (!queuedInvitations.isEmpty && !deviceName.isEmpty) else { return }
+        // A queued invitation always needs a name, resumed draft or not.
+        guard (resuming || !queuedInvitations.isEmpty) && (queuedInvitations.isEmpty || !deviceName.isEmpty) else {
+            return
+        }
         isBusy = true
         let total = queuedInvitations.count + (resuming ? 1 : 0)
         var imported = 0
@@ -106,7 +108,7 @@ final class TunnelModel: ObservableObject {
             while let next = queuedInvitations.first {
                 status = total > 1 ? "Importing profile \(imported + 1) of \(total)…" : "Importing profile…"
                 try await Self.prepareEnrollmentDraft(invitation: next.uri, deviceName: deviceName)
-                queuedInvitations.removeFirst()
+                queuedInvitations.removeAll { $0.id == next.id }
                 hasDraft = true
                 try await Self.completeEnrollmentDraft()
                 hasDraft = false

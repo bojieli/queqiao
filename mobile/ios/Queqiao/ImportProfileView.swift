@@ -38,11 +38,13 @@ struct ImportProfileView: View {
             .sheet(isPresented: $isScannerPresented) {
                 InvitationScannerView()
             }
-            .onAppear {
-                if model.importerStartsScanning {
-                    model.importerStartsScanning = false
-                    isScannerPresented = InvitationScannerView.isAvailable
-                }
+            .task {
+                // Presenting the camera while this sheet is still animating
+                // in can be dropped by SwiftUI; let the sheet settle first.
+                guard model.importerStartsScanning else { return }
+                model.importerStartsScanning = false
+                try? await Task.sleep(for: .milliseconds(350))
+                isScannerPresented = InvitationScannerView.isAvailable
             }
             .confirmationDialog(
                 "Discard pending enrollment?",
@@ -188,10 +190,9 @@ struct ImportProfileView: View {
     }
 
     private var hasRequiredInput: Bool {
-        model.hasDraft || (
-            pendingCount > 0 &&
-            !model.deviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        )
+        let hasName = !model.deviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let queued = pendingCount - (model.hasDraft ? 1 : 0)
+        return (model.hasDraft || queued > 0) && (queued == 0 || hasName)
     }
 
     private func paste(_ values: [String]) {
@@ -212,7 +213,9 @@ struct ImportProfileView: View {
 struct ClipboardInvitationBanner: View {
     @EnvironmentObject private var model: TunnelModel
     @State private var visible = false
-    @State private var dismissedChangeCount = -1
+    /// The clipboard generation the user dismissed, kept across launches so a
+    /// dismissal sticks until something new is copied.
+    @AppStorage("clipboardBannerDismissedChangeCount") private var dismissedChangeCount = -1
     @State private var note: String?
 
     var body: some View {
@@ -251,6 +254,9 @@ struct ClipboardInvitationBanner: View {
             refresh()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIPasteboard.changedNotification)) { _ in
+            refresh()
+        }
+        .onChange(of: model.isBusy) {
             refresh()
         }
     }

@@ -16,9 +16,10 @@ struct QueuedInvitation: Identifiable, Equatable {
 /// so it can be tested without a pasteboard or camera.
 enum InvitationBatch {
     /// Characters that cannot occur inside an invitation URI and commonly
-    /// surround one in a message, a list or a quoted line.
+    /// surround one in a message, a list or a quoted line. A full stop is one:
+    /// neither the scheme nor base64url contains it, and prose ends with it.
     private static let separators = CharacterSet.whitespacesAndNewlines
-        .union(CharacterSet(charactersIn: "\"'<>()[]{},;|"))
+        .union(CharacterSet(charactersIn: "\"'<>()[]{},;|."))
 
     /// Every `queqiao://` invitation in `text`, in order, without duplicates.
     /// A provider operator can hand over several invitations in one message --
@@ -98,6 +99,21 @@ extension TunnelModel {
         return added
     }
 
+    /// Validates the manual-entry text like a paste and queues what it holds.
+    /// Text with no usable invitation stays in the field so it can be
+    /// corrected, and the import does not start.
+    func queueTypedInvitations() -> Bool {
+        guard !invitation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return true }
+        let typed = InvitationBatch.evaluate(invitation)
+        guard !typed.accepted.isEmpty else {
+            present(InvitationTextError.noUsableInvitation(typed.rejected), title: "Profile import failed")
+            return false
+        }
+        queueInvitations(typed.accepted)
+        invitation = ""
+        return true
+    }
+
     func presentImporter(scanning: Bool) {
         importerStartsScanning = scanning
         isImporterPresented = true
@@ -108,6 +124,10 @@ extension TunnelModel {
     nonisolated static func prepareEnrollmentDraft(invitation: String, deviceName: String) async throws {
         try await Task.detached(priority: .userInitiated) {
             let store = try ProfileStore()
+            // The cached hasDraft can be stale; the store is the authority.
+            // Replacing a draft would lose a device key whose invitation may
+            // already be consumed.
+            guard try store.enrollmentDraft() == nil else { throw ModelError.pendingEnrollment }
             try MobileCore.validateInvitation(invitation)
             let draft = try MobileCore.prepareEnrollment(invitation: invitation, deviceName: deviceName)
             try store.saveEnrollmentDraft(draft)
@@ -124,5 +144,19 @@ extension TunnelModel {
             _ = try store.importProfile(profile)
             try store.discardEnrollmentDraft()
         }.value
+    }
+}
+
+/// Why typed text could not be imported.
+enum InvitationTextError: LocalizedError, Equatable {
+    case noUsableInvitation(Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .noUsableInvitation(let rejected):
+            return rejected == 0
+                ? "The text holds no Queqiao invitation."
+                : "The text holds no usable Queqiao invitation; \(rejected) could not be used."
+        }
     }
 }

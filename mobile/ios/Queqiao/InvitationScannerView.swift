@@ -138,6 +138,9 @@ struct InvitationScannerView: View {
         switch InvitationScan.evaluate(candidate) {
         case .accepted(let invitation):
             model.queueInvitations([invitation])
+            // The same code stays in view for the next frames; keep them from
+            // replacing this confirmation with "Already added" at once.
+            lastDuplicate = Date()
             let name = InvitationBatch.describe(invitation).name
             show("Added \(name). Scan the next code, or tap Done.")
         case .rejected(let reason):

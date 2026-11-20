@@ -60,6 +60,22 @@ final class InvitationBatchTests: XCTestCase {
         XCTAssertEqual(InvitationBatch.extract(text), [first, second])
     }
 
+    func testExtractStopsAtAFullStopEndingASentence() {
+        let uri = invitation(name: "rtx-pro", endpoint: "198.51.100.1:12540", seed: 8)
+        XCTAssertEqual(InvitationBatch.extract("Your invitation is \(uri)."), [uri])
+    }
+
+    func testTypedTextErrorSaysWhetherAnythingWasRecognised() {
+        XCTAssertEqual(
+            InvitationTextError.noUsableInvitation(0).errorDescription,
+            "The text holds no Queqiao invitation."
+        )
+        XCTAssertEqual(
+            InvitationTextError.noUsableInvitation(2).errorDescription,
+            "The text holds no usable Queqiao invitation; 2 could not be used."
+        )
+    }
+
     func testExtractFindsNothingInUnrelatedText() {
         XCTAssertEqual(InvitationBatch.extract("vless://example\nhttps://example.com"), [])
     }

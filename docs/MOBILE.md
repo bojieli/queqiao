@@ -148,9 +148,9 @@ import screen collects a batch: one paste takes every invitation on the
 clipboard, the scanner keeps reading code after code until Done, and the
 queued invitations are then enrolled one after another, each with its own
 device key and its own crash-safe draft. A scan shortcut on the Profiles
-screen opens the camera directly, and when the clipboard has changed and
-holds text, Profiles shows a paste banner; deciding that consults only
-`hasStrings` and `changeCount`. Every paste control is the system
+screen opens the camera directly, and while the clipboard holds text the user
+has not dismissed the banner for, Profiles shows a paste banner; deciding that
+consults only `hasStrings` and `changeCount`. Every paste control is the system
 `PasteButton`, which reads the clipboard only when tapped. Android can
 also appear as a user-selected target for shared plain text. The camera opens
 only from the import screen and only while that screen is in front. On Android
