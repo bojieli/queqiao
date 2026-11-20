@@ -288,6 +288,33 @@ stays the bare URI and is still safe to pipe. A portal may capture that value
 or render it as a QR code without translating any fields. Do not render it
 through a web QR generator, which would receive the credential.
 
+A gateway reached through relays or more than one address can issue one
+invitation per route in a single run. Each `--path NAME=HOST:PORT` produces its
+own one-time invitation, labelled NAME, that dials HOST:PORT but pins this
+gateway's root, so the route decides only where the client connects, never whom
+it trusts. An empty NAME or HOST:PORT keeps the provider's own. The invitations
+are printed one per line, and the iOS app takes them all in one paste:
+
+```sh
+sudo -u queqiao /usr/local/bin/queqiaod provider invite \
+  --state /var/lib/queqiao/provider \
+  --user alice \
+  --path gateway= \
+  --path gateway-hk=relay-hk.example:12548 \
+  --path gateway-cn=relay-cn.example:12548
+```
+
+Every `--path` is checked before any token is issued, so a run with an invalid
+or repeated `--path` issues nothing; a storage failure part-way through leaves
+the invitations already printed valid. The gateway records each invitation's
+route and answers enrollment with it, so the enrolled profile keeps dialing
+that route, and clients already in the field accept it unchanged. A release
+older than the one that added `--path` cannot read provider state holding a
+path invitation record. Outstanding ones can be revoked, but a consumed one is
+kept for seven days so an interrupted enrollment can be retried, so a rollback
+past that release must wait seven days after the last enrollment through a
+path, or not use `--path` meanwhile.
+
 Audit or revoke unused invitations without printing their tokens:
 
 ```sh
