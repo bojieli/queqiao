@@ -1889,7 +1889,16 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		switch {
 		case f.resumeRefused.Load():
 			terminal = errResumeRefused
-		case f.replacementAbandoned.Load():
+		case f.replacementAbandoned.Load() && len(f.healthyLanes()) == 0:
+			// Abandonment means nothing will open another lane, not that
+			// the flow has none. A QUIC flow handed off to its TCP rescue
+			// lane is exactly that case: the manager returns, but the
+			// rescue lane is healthy and is replaying the bytes that
+			// stalled. Ending it here threw away a successful rescue a
+			// few hundred milliseconds after it landed. A lane that
+			// exists but never delivers is still bounded below by the
+			// no-progress budget, as waitForHealthyLane already treats a
+			// healthy lane as the answer whatever the manager has done.
 			terminal = errReplacementAbandoned
 		case now.Sub(sendSince) >= f.progressTimeout():
 			terminal = errFlowNoProgress
