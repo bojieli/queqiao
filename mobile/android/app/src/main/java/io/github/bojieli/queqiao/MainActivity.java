@@ -16,7 +16,9 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
+import android.text.Editable;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowInsets;
@@ -99,11 +101,12 @@ public final class MainActivity extends Activity implements TunnelHost {
     private long activeFlows;
     private String routedSummary = "";
     private final Map<String, ConnectionProbe> profileProbes = new HashMap<>();
-    // The import dialog stays up while the scanner is in front, so a scanned
-    // invitation lands in the field the user was looking at; if the system
-    // reclaimed the activity meanwhile, the dialog is rebuilt around the value.
-    private AlertDialog importDialog;
-    private EditText importInvitationField;
+    // Scanned, pasted, and shared invitations wait here, in memory only, until
+    // the import dialog enrolls them. The dialog stays up while the scanner is
+    // in front and re-renders the queue when it returns; if the system
+    // reclaimed this activity meanwhile, the dialog is rebuilt around it.
+    private final InvitationBatch.Queue importQueue = InvitationBatch.Queue.SHARED;
+    private ImportForm importForm;
     private boolean testingProfiles;
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
@@ -141,7 +144,11 @@ public final class MainActivity extends Activity implements TunnelHost {
         setContentView(buildShell());
         showPage(Page.HOME);
         refreshCatalog();
-        handleIncomingIntent(getIntent());
+        // A recreated activity still carries the share that first opened it;
+        // its invitations were queued then and may since have been used.
+        if (savedInstanceState == null) {
+            handleIncomingIntent(getIntent());
+        }
     }
 
     @Override
@@ -270,7 +277,7 @@ public final class MainActivity extends Activity implements TunnelHost {
             detail.setPadding(0, ui.dp(6), 0, ui.dp(12));
             empty.addView(detail, UiKit.matchWrap());
             Button add = ui.primaryButton("Import invitation");
-            add.setOnClickListener(view -> showImportDialog(null));
+            add.setOnClickListener(view -> showImportDialog(null, false));
             empty.addView(add, UiKit.matchWrap());
             content.addView(empty, ui.spacedCard());
         } else {
@@ -322,9 +329,16 @@ public final class MainActivity extends Activity implements TunnelHost {
     private View buildProfilesPage() {
         LinearLayout content = pageContent(
                 "Profiles", "Choose the identity and provider used by the " + controller.noun());
-        Button add = ui.primaryButton("Import invitation");
-        add.setOnClickListener(view -> showImportDialog(null));
+        Button add = ui.primaryButton("Import invitations");
+        add.setOnClickListener(view -> showImportDialog(null, false));
         content.addView(add, ui.spacedCard());
+        if (ScanInvitationActivity.hasCamera(this)) {
+            // Opens the import dialog straight onto the camera, so a page of
+            // codes can be read without first finding the scan button.
+            Button scan = ui.secondaryButton("Scan invitation QR codes");
+            scan.setOnClickListener(view -> showImportDialog(null, true));
+            content.addView(scan, ui.spacedCard());
+        }
 
         Button testAll = ui.secondaryButton(testingProfiles ? "Testing connections…" : "Test all connections");
         testAll.setEnabled(canTestProfiles() && !catalog.profiles.isEmpty());
@@ -345,7 +359,7 @@ public final class MainActivity extends Activity implements TunnelHost {
                     14,
                     Typeface.NORMAL), UiKit.matchWrap());
             Button resume = ui.secondaryButton("Resume import");
-            resume.setOnClickListener(view -> showImportDialog(null));
+            resume.setOnClickListener(view -> showImportDialog(null, false));
             pending.addView(resume, ui.topSpaced());
             content.addView(pending, ui.spacedCard());
         }
@@ -431,7 +445,7 @@ public final class MainActivity extends Activity implements TunnelHost {
 
     private void prepareConnection() {
         if (selectedRecord() == null) {
-            showImportDialog(null);
+            showImportDialog(null, false);
             return;
         }
         if (Build.VERSION.SDK_INT >= 33
@@ -448,7 +462,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     private void prepareConnectionAfterNotificationPermission() {
         ProfileRepository.ProfileRecord selected = selectedRecord();
         if (selected == null) {
-            showImportDialog(null);
+            showImportDialog(null, false);
             return;
         }
         setBusy(true, "Validating profile…");
@@ -485,8 +499,11 @@ public final class MainActivity extends Activity implements TunnelHost {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_SCAN_INVITATION) {
-            if (resultCode == RESULT_OK && data != null) {
-                acceptScannedInvitation(data.getStringExtra(ScanInvitationActivity.EXTRA_INVITATION));
+            // The scanner queued what it read; show the queue it left.
+            if (importForm != null && importForm.dialog.isShowing()) {
+                renderImportForm(importForm);
+            } else if (importQueue.size() > 0) {
+                showImportDialog(null, false);
             }
             return;
         }
@@ -536,120 +553,349 @@ public final class MainActivity extends Activity implements TunnelHost {
         renderConnectionState();
     }
 
+    /**
+     * The import dialog collects any number of invitations -- scanned one
+     * after another, pasted or shared several at a time, or typed -- and
+     * imports them as one batch. Each invitation still becomes its own
+     * device-bound profile with its own key and its own crash-safe draft.
+     */
     @SuppressLint("SetTextI18n")
-    private void showImportDialog(String suppliedInvitation) {
-        boolean hasDraft = repository.hasEnrollmentDraft();
+    private void showImportDialog(String note, boolean startScanning) {
+        ImportForm open = importForm;
+        if (open != null && open.dialog.isShowing()) {
+            if (note != null) {
+                open.pasteNote.setText(note);
+                open.pasteNote.setVisibility(View.VISIBLE);
+            }
+            renderImportForm(open);
+            if (startScanning && !open.importing) {
+                startScanner();
+            }
+            return;
+        }
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(ui.dp(20), ui.dp(8), ui.dp(20), 0);
+        content.setPadding(ui.dp(20), ui.dp(8), ui.dp(20), ui.dp(8));
+
+        TextView pending = ui.text(
+                "An interrupted enrollment is ready to resume with its original device key. "
+                        + "It is imported first.",
+                14,
+                Typeface.NORMAL);
+        pending.setPadding(0, 0, 0, ui.dp(8));
+        content.addView(pending, UiKit.matchWrap());
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        Button scan = null;
+        if (ScanInvitationActivity.hasCamera(this)) {
+            scan = ui.secondaryButton("Scan QR codes");
+            scan.setOnClickListener(view -> startScanner());
+            actions.addView(scan, UiKit.weightedWrap());
+        }
+        Button paste = ui.secondaryButton("Paste invitations");
+        actions.addView(paste, UiKit.weightedWrap());
+        content.addView(actions, UiKit.matchWrap());
+
+        TextView pasteNote = ui.text(note == null ? "" : note, 13, Typeface.NORMAL);
+        pasteNote.setPadding(0, ui.dp(4), 0, 0);
+        pasteNote.setVisibility(note == null ? View.GONE : View.VISIBLE);
+        content.addView(pasteNote, UiKit.matchWrap());
+
+        TextView explanation = ui.text(
+                "Scan or paste as many invitations as you have; a paste takes every invitation "
+                        + "on the clipboard. Each one is used once, and its permanent device key is "
+                        + "generated on this device and never leaves it.",
+                12,
+                Typeface.NORMAL);
+        explanation.setPadding(0, ui.dp(6), 0, 0);
+        content.addView(explanation, UiKit.matchWrap());
+
+        TextView queueHeader = ui.text("", 15, Typeface.BOLD);
+        queueHeader.setPadding(0, ui.dp(12), 0, ui.dp(4));
+        content.addView(queueHeader, UiKit.matchWrap());
+        LinearLayout queueList = new LinearLayout(this);
+        queueList.setOrientation(LinearLayout.VERTICAL);
+        content.addView(queueList, UiKit.matchWrap());
 
         EditText invitation = new EditText(this);
+        invitation.setHint("Or enter queqiao:// invitations");
+        invitation.setInputType(
+                InputType.TYPE_CLASS_TEXT
+                        | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                        | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                        | InputType.TYPE_TEXT_VARIATION_URI);
+        // The invitation is a short-lived bearer credential. Keep Android
+        // from offering it to Autofill or saving it in view-instance state.
+        invitation.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        invitation.setSaveEnabled(false);
+        invitation.setMinLines(2);
+        invitation.setGravity(Gravity.TOP | Gravity.START);
+        content.addView(invitation, ui.topSpaced());
+
         EditText deviceName = new EditText(this);
-        if (hasDraft) {
-            content.addView(ui.text(
-                    "An enrollment is ready to resume with its original device key.",
-                    14,
-                    Typeface.NORMAL), UiKit.matchWrap());
-        } else {
-            invitation.setHint("queqiao:// one-time invitation");
-            invitation.setText(suppliedInvitation == null ? "" : suppliedInvitation);
-            invitation.setInputType(
-                    InputType.TYPE_CLASS_TEXT
-                            | InputType.TYPE_TEXT_FLAG_MULTI_LINE
-                            | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                            | InputType.TYPE_TEXT_VARIATION_URI);
-            // The invitation is a short-lived bearer credential. Keep Android
-            // from offering it to Autofill or saving it in view-instance state.
-            invitation.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
-            invitation.setSaveEnabled(false);
-            invitation.setMinLines(4);
-            invitation.setGravity(Gravity.TOP | Gravity.START);
-            content.addView(invitation, UiKit.matchWrap());
+        deviceName.setHint("Device name");
+        deviceName.setText(Build.MODEL);
+        deviceName.setSelectAllOnFocus(true);
+        deviceName.setInputType(
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        content.addView(deviceName, ui.topSpaced());
 
-            LinearLayout actions = new LinearLayout(this);
-            actions.setOrientation(LinearLayout.HORIZONTAL);
-            if (ScanInvitationActivity.hasCamera(this)) {
-                Button scan = ui.secondaryButton("Scan QR code");
-                scan.setOnClickListener(view -> startActivityForResult(
-                        new Intent(this, ScanInvitationActivity.class),
-                        REQUEST_SCAN_INVITATION));
-                actions.addView(scan, UiKit.weightedWrap());
-            }
-            Button paste = ui.secondaryButton("Paste invitation");
-            paste.setOnClickListener(view -> pasteInvitation(invitation));
-            actions.addView(paste, UiKit.weightedWrap());
-            content.addView(actions, ui.topSpaced());
-
-            deviceName.setHint("Device name");
-            deviceName.setText(Build.MODEL);
-            deviceName.setSelectAllOnFocus(true);
-            deviceName.setInputType(
-                    InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
-            content.addView(deviceName, ui.topSpaced());
-        }
+        TextView progress = ui.text("", 13, Typeface.NORMAL);
+        progress.setPadding(0, ui.dp(8), 0, 0);
+        progress.setVisibility(View.GONE);
+        content.addView(progress, UiKit.matchWrap());
 
         AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle(hasDraft ? "Resume profile import" : "Import profile")
-                .setView(content)
+                .setTitle("Import profiles")
+                .setView(ui.scroll(content))
                 .setNegativeButton("Cancel", null)
-                .setNeutralButton(hasDraft ? "Discard pending" : null, null)
-                .setPositiveButton(hasDraft ? "Resume" : "Import", null)
+                .setNeutralButton("Discard pending", null)
+                .setPositiveButton("Import profile", null)
                 .create();
-        importDialog = dialog;
-        importInvitationField = hasDraft ? null : invitation;
+        ImportForm form = new ImportForm(
+                dialog, pending, scan, paste, pasteNote, queueHeader, queueList, invitation, deviceName, progress);
+        importForm = form;
+        paste.setOnClickListener(view -> {
+            form.pasteNote.setText(queueFromText(readClipboard()));
+            form.pasteNote.setVisibility(View.VISIBLE);
+            renderImportForm(form);
+        });
+        invitation.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence text, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence text, int start, int before, int count) {
+            }
+
+            @Override
+            public void afterTextChanged(Editable text) {
+                renderImportForm(form);
+            }
+        });
         dialog.setOnDismissListener(ignored -> {
-            if (importDialog == dialog) {
-                importDialog = null;
-                importInvitationField = null;
+            if (importForm == form) {
+                importForm = null;
             }
         });
         dialog.setOnShowListener(ignored -> {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
-                String invitationText = invitation.getText().toString().trim();
-                String requestedDeviceName = deviceName.getText().toString().trim();
-                if (!hasDraft && (invitationText.isEmpty() || requestedDeviceName.isEmpty())) {
-                    invitation.setError(invitationText.isEmpty() ? "Invitation is required" : null);
-                    deviceName.setError(requestedDeviceName.isEmpty() ? "Device name is required" : null);
-                    return;
-                }
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
-                enrollOrResume(invitationText, requestedDeviceName, dialog);
-            });
-            if (hasDraft) {
-                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setTextColor(Color.RED);
-                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view ->
-                        confirmDiscardEnrollment(dialog));
-            }
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> startImport(form));
+            Button discard = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+            discard.setTextColor(Color.RED);
+            discard.setOnClickListener(view -> confirmDiscardEnrollment(form));
+            renderImportForm(form);
         });
         dialog.show();
+        if (startScanning) {
+            startScanner();
+        }
     }
 
-    private void enrollOrResume(String invitation, String deviceName, AlertDialog dialog) {
-        setBusy(true, repository.hasEnrollmentDraft() ? "Resuming import…" : "Importing profile…");
+    @SuppressLint("SetTextI18n")
+    private void renderImportForm(ImportForm form) {
+        boolean hasDraft = repository.hasEnrollmentDraft();
+        boolean editable = !form.importing;
+        form.pending.setVisibility(hasDraft ? View.VISIBLE : View.GONE);
+
+        List<InvitationBatch.QueuedInvitation> queued = importQueue.snapshot();
+        form.queueHeader.setText("Ready to import (" + queued.size() + ")");
+        form.queueHeader.setVisibility(queued.isEmpty() ? View.GONE : View.VISIBLE);
+        form.queueList.removeAllViews();
+        for (InvitationBatch.QueuedInvitation item : queued) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            TextView label = ui.text(
+                    item.endpoint.isEmpty() ? item.name : item.name + "\n" + item.endpoint,
+                    14,
+                    Typeface.NORMAL);
+            row.addView(label, UiKit.weightedWrap());
+            Button remove = ui.secondaryButton("Remove");
+            remove.setEnabled(editable);
+            remove.setContentDescription("Remove " + item.name);
+            remove.setOnClickListener(view -> {
+                importQueue.remove(item.uri);
+                renderImportForm(form);
+            });
+            row.addView(remove, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT));
+            form.queueList.addView(row, UiKit.matchWrap());
+        }
+
+        if (form.scan != null) {
+            form.scan.setEnabled(editable);
+        }
+        form.paste.setEnabled(editable);
+        form.invitation.setEnabled(editable);
+        form.deviceName.setEnabled(editable);
+        form.progress.setVisibility(form.importing ? View.VISIBLE : View.GONE);
+        form.dialog.setCancelable(editable);
+
+        int pendingCount = queued.size() + (hasDraft ? 1 : 0);
+        for (String typed : InvitationBatch.extract(form.invitation.getText().toString())) {
+            if (!importQueue.contains(typed)) {
+                pendingCount++;
+            }
+        }
+        Button importButton = form.dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        if (importButton != null) {
+            importButton.setText(InvitationBatch.importTitle(pendingCount, hasDraft));
+            importButton.setEnabled(editable && pendingCount > 0);
+        }
+        Button discard = form.dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+        if (discard != null) {
+            discard.setVisibility(hasDraft ? View.VISIBLE : View.GONE);
+            discard.setEnabled(editable);
+        }
+        Button cancel = form.dialog.getButton(AlertDialog.BUTTON_NEGATIVE);
+        if (cancel != null) {
+            cancel.setEnabled(editable);
+        }
+    }
+
+    private void startScanner() {
+        startActivityForResult(new Intent(this, ScanInvitationActivity.class), REQUEST_SCAN_INVITATION);
+    }
+
+    /** Queues every valid invitation in {@code text} and says what happened. */
+    private String queueFromText(String text) {
+        InvitationBatch.Evaluation result = InvitationBatch.evaluate(text, InvitationBatch.CORE);
+        int added = importQueue.add(result.accepted);
+        return InvitationBatch.pasteSummary(added, result.accepted.size() - added, result.rejected);
+    }
+
+    /** Read only here, in response to the user's tap on Paste. */
+    private String readClipboard() {
+        ClipboardManager clipboard = getSystemService(ClipboardManager.class);
+        if (clipboard == null || !clipboard.hasPrimaryClip()) {
+            return "";
+        }
+        ClipData clip = clipboard.getPrimaryClip();
+        if (clip == null) {
+            return "";
+        }
+        StringBuilder text = new StringBuilder();
+        for (int index = 0; index < clip.getItemCount(); index++) {
+            CharSequence value = clip.getItemAt(index).coerceToText(this);
+            if (value != null) {
+                text.append(value).append('\n');
+            }
+        }
+        return text.toString();
+    }
+
+    private void startImport(ImportForm form) {
+        String typed = form.invitation.getText().toString();
+        if (!InvitationBatch.extract(typed).isEmpty()) {
+            InvitationBatch.Evaluation result = InvitationBatch.evaluate(typed, InvitationBatch.CORE);
+            int added = importQueue.add(result.accepted);
+            if (result.rejected > 0) {
+                // Keep the text so the invitation that failed can be corrected.
+                form.invitation.setError(InvitationBatch.pasteSummary(
+                        added, result.accepted.size() - added, result.rejected));
+                renderImportForm(form);
+                return;
+            }
+            form.invitation.setText("");
+        } else if (!typed.isBlank()) {
+            form.invitation.setError("That is not a Queqiao invitation");
+            return;
+        }
+        boolean resuming = repository.hasEnrollmentDraft();
+        String deviceName = form.deviceName.getText().toString().trim();
+        if (!resuming && importQueue.size() == 0) {
+            form.invitation.setError("Scan, paste, or enter an invitation");
+            return;
+        }
+        if (importQueue.size() > 0 && deviceName.isEmpty()) {
+            form.deviceName.setError("Device name is required");
+            return;
+        }
+        form.invitation.setError(null);
+        form.deviceName.setError(null);
+        form.importing = true;
+        renderImportForm(form);
+        importBatch(form, resuming, deviceName);
+    }
+
+    /**
+     * Enrolls the pending draft, if any, and then every queued invitation, one
+     * after another with the same device name. Each invitation leaves the
+     * queue only once its draft is saved, because from then on the draft --
+     * not the invitation -- is what a retry must resume; so a failure stops
+     * the batch with the failed invitation either still queued (nothing was
+     * sent) or held as the resumable draft, and the rest still queued.
+     */
+    private void importBatch(ImportForm form, boolean resuming, String deviceName) {
+        String first = resuming ? "Resuming import…" : "Importing profile…";
+        setBusy(true, first);
+        form.progress.setText(first);
         worker.execute(() -> {
+            int imported = 0;
+            int total = importQueue.size() + (resuming ? 1 : 0);
             try {
-                String draft = repository.enrollmentDraft();
-                if (draft == null) {
-                    Mobilecore.validateInvitation(invitation);
-                    draft = Mobilecore.prepareEnrollment(invitation, deviceName);
-                    repository.saveEnrollmentDraft(draft);
+                if (resuming) {
+                    completeEnrollmentDraft();
+                    imported++;
                 }
-                String profile = Mobilecore.completeEnrollment(draft);
-                repository.importProfile(profile);
-                repository.discardEnrollmentDraft();
+                InvitationBatch.QueuedInvitation next;
+                while ((next = importQueue.first()) != null) {
+                    total = imported + importQueue.size();
+                    String message = total > 1
+                            ? "Importing profile " + (imported + 1) + " of " + total + "…"
+                            : "Importing profile…";
+                    runOnUiThread(() -> {
+                        form.progress.setText(message);
+                        setBusy(true, message);
+                    });
+                    Mobilecore.validateInvitation(next.uri);
+                    String draft = Mobilecore.prepareEnrollment(next.uri, deviceName);
+                    repository.saveEnrollmentDraft(draft);
+                    importQueue.remove(next.uri);
+                    runOnUiThread(() -> renderImportForm(form));
+                    completeEnrollmentDraft();
+                    imported++;
+                }
+                int done = imported;
                 runOnUiThread(() -> {
-                    dialog.dismiss();
-                    setBusy(false, "Profile imported");
+                    form.importing = false;
+                    form.dialog.dismiss();
+                    setBusy(false, done == 1 ? "Profile imported" : done + " profiles imported");
                     refreshCatalog();
                 });
             } catch (Exception exception) {
-                runOnUiThread(() -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true));
-                showFailure("Profile import failed", exception);
+                int done = imported;
+                int planned = total;
+                runOnUiThread(() -> {
+                    form.importing = false;
+                    renderImportForm(form);
+                    refreshCatalog();
+                });
+                showFailure(done == 0
+                        ? "Profile import failed"
+                        : "Imported " + done + " of " + planned + " profiles, then import failed", exception);
             }
         });
     }
 
-    private void confirmDiscardEnrollment(AlertDialog parent) {
+    /**
+     * Sends the saved draft, stores the resulting profile, and only then
+     * discards the draft, so an interrupted exchange can be resumed.
+     */
+    private void completeEnrollmentDraft() throws Exception {
+        String draft = repository.enrollmentDraft();
+        if (draft == null) {
+            throw new GeneralSecurityException("The pending enrollment is unavailable");
+        }
+        String profile = Mobilecore.completeEnrollment(draft);
+        repository.importProfile(profile);
+        repository.discardEnrollmentDraft();
+    }
+
+    private void confirmDiscardEnrollment(ImportForm form) {
         new AlertDialog.Builder(this)
                 .setTitle("Discard pending enrollment?")
                 .setMessage(
@@ -659,7 +905,11 @@ public final class MainActivity extends Activity implements TunnelHost {
                     try {
                         repository.discardEnrollmentDraft();
                         runOnUiThread(() -> {
-                            parent.dismiss();
+                            if (importQueue.size() == 0) {
+                                form.dialog.dismiss();
+                            } else {
+                                renderImportForm(form);
+                            }
                             refreshCatalog();
                         });
                     } catch (Exception exception) {
@@ -667,6 +917,44 @@ public final class MainActivity extends Activity implements TunnelHost {
                     }
                 }))
                 .show();
+    }
+
+    /** The views of the open import dialog, which re-renders as the queue changes. */
+    private static final class ImportForm {
+        final AlertDialog dialog;
+        final TextView pending;
+        final Button scan;
+        final Button paste;
+        final TextView pasteNote;
+        final TextView queueHeader;
+        final LinearLayout queueList;
+        final EditText invitation;
+        final EditText deviceName;
+        final TextView progress;
+        boolean importing;
+
+        ImportForm(
+                AlertDialog dialog,
+                TextView pending,
+                Button scan,
+                Button paste,
+                TextView pasteNote,
+                TextView queueHeader,
+                LinearLayout queueList,
+                EditText invitation,
+                EditText deviceName,
+                TextView progress) {
+            this.dialog = dialog;
+            this.pending = pending;
+            this.scan = scan;
+            this.paste = paste;
+            this.pasteNote = pasteNote;
+            this.queueHeader = queueHeader;
+            this.queueList = queueList;
+            this.invitation = invitation;
+            this.deviceName = deviceName;
+            this.progress = progress;
+        }
     }
 
     @SuppressLint("SetTextI18n")
@@ -944,45 +1232,21 @@ public final class MainActivity extends Activity implements TunnelHost {
         }
     }
 
+    /**
+     * A user-selected share of plain text. Every invitation in it is validated
+     * and queued, so a message carrying several invitations imports them all.
+     */
     private void handleIncomingIntent(Intent intent) {
-        if (intent == null) {
+        if (intent == null
+                || !Intent.ACTION_SEND.equals(intent.getAction())
+                || !"text/plain".equals(intent.getType())) {
             return;
         }
-        String invitation = null;
-        if (Intent.ACTION_SEND.equals(intent.getAction())
-                && "text/plain".equals(intent.getType())) {
-            invitation = intent.getStringExtra(Intent.EXTRA_TEXT);
-        }
-        if (invitation != null && invitation.trim().startsWith("queqiao://")) {
-            showImportDialog(invitation.trim());
-        }
-    }
-
-    private void acceptScannedInvitation(String invitation) {
-        if (invitation == null || invitation.isBlank()) {
+        String text = intent.getStringExtra(Intent.EXTRA_TEXT);
+        if (InvitationBatch.extract(text).isEmpty()) {
             return;
         }
-        if (importDialog != null && importDialog.isShowing() && importInvitationField != null) {
-            importInvitationField.setText(invitation.trim());
-            importInvitationField.setError(null);
-        } else {
-            showImportDialog(invitation.trim());
-        }
-    }
-
-    private void pasteInvitation(EditText destination) {
-        ClipboardManager clipboard = getSystemService(ClipboardManager.class);
-        if (!clipboard.hasPrimaryClip()) {
-            destination.setError("The clipboard is empty");
-            return;
-        }
-        ClipData clip = clipboard.getPrimaryClip();
-        if (clip == null || clip.getItemCount() == 0) {
-            destination.setError("The clipboard is empty");
-            return;
-        }
-        CharSequence value = clip.getItemAt(0).coerceToText(this);
-        destination.setText(value == null ? "" : value.toString().trim());
+        showImportDialog(queueFromText(text), false);
     }
 
     private void showLicenses() {

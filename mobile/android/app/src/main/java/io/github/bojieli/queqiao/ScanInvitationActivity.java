@@ -3,7 +3,6 @@ package io.github.bojieli.queqiao;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
-import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.ImageFormat;
@@ -40,6 +39,7 @@ import android.widget.TextView;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -49,9 +49,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import mobilecore.Mobilecore;
 
 /**
- * Reads a queqiao:// invitation out of a QR code with the device
- * camera, for the case where the invitation is on another screen and typing
- * five hundred characters of base64 is not an option.
+ * Reads queqiao:// invitations out of QR codes with the device camera, for
+ * the case where the invitations are on another screen and typing five
+ * hundred characters of base64 is not an option. It keeps scanning: each new
+ * valid code joins the import queue and the screen names it and shows the
+ * running count, so a page of codes is read by sweeping the camera across it
+ * and tapping Done once.
  *
  * <p>The camera is the platform Camera2 API and the decoder is the Go core, so
  * no vision SDK is linked and no frame leaves the process. Frames arrive as
@@ -60,15 +63,14 @@ import mobilecore.Mobilecore;
  * being decoded is dropped rather than queued. The camera is held only while
  * this activity is in front.
  *
- * <p>The result travels back to the caller in EXTRA_INVITATION. It
- * is a bearer credential: the activity neither stores nor logs it, and it
- * refuses codes that are not a Queqiao invitation rather than returning them.
+ * <p>Accepted codes go into the in-memory import queue
+ * (InvitationBatch.Queue.SHARED) that the import dialog shows when this
+ * activity returns. Each is a bearer credential: the activity neither
+ * persists nor logs it, and it refuses codes that are not a valid Queqiao
+ * invitation rather than queueing them.
  */
 public final class ScanInvitationActivity extends Activity {
-    static final String EXTRA_INVITATION = "io.github.bojieli.queqiao.INVITATION";
-
     private static final int REQUEST_CAMERA = 7101;
-    private static final String INVITATION_SCHEME = "queqiao://";
     /**
      * The decoder's cost grows with frame area, and a code that fills a third
      * of a 720p frame is already six pixels per module for a full-size
@@ -77,9 +79,10 @@ public final class ScanInvitationActivity extends Activity {
     private static final int MAX_DECODE_SIDE = 1280;
     private static final int MAX_PREVIEW_PIXELS = 1920 * 1080;
     private static final long REJECTION_INTERVAL_MILLIS = 1500;
-    private static final long HINT_RESTORE_MILLIS = 2500;
+    private static final long DUPLICATE_INTERVAL_MILLIS = 3000;
+    private static final long HINT_RESTORE_MILLIS = 3000;
     private static final String DEFAULT_HINT =
-            "Point the camera at the invitation QR code shown on your computer.";
+            "Point the camera at an invitation QR code. Scan as many as you like, then tap Done.";
     private static final String PERMISSION_HINT =
             "Queqiao needs the camera to read the code. Allow camera access for Queqiao "
                     + "in system settings, or paste the invitation instead.";
@@ -92,8 +95,11 @@ public final class ScanInvitationActivity extends Activity {
     private final AtomicBoolean decoding = new AtomicBoolean();
     private final Object cameraLock = new Object();
 
+    private final InvitationBatch.Queue queue = InvitationBatch.Queue.SHARED;
+
     private UiKit ui;
     private TextureView preview;
+    private TextView title;
     private TextView hint;
     private HandlerThread cameraThread;
     private Handler cameraHandler;
@@ -106,6 +112,7 @@ public final class ScanInvitationActivity extends Activity {
     private boolean permissionRequested;
     private boolean finished;
     private long lastRejectionAt;
+    private long lastDuplicateAt;
 
     private final TextureView.SurfaceTextureListener surfaceListener =
             new TextureView.SurfaceTextureListener() {
@@ -181,7 +188,7 @@ public final class ScanInvitationActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
-        TextView title = ui.text("Scan invitation", 18, Typeface.BOLD);
+        title = ui.text(scanTitle(), 18, Typeface.BOLD);
         title.setTextColor(Color.WHITE);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
         title.setPadding(ui.dp(20), ui.dp(16), ui.dp(20), ui.dp(16));
@@ -199,12 +206,12 @@ public final class ScanInvitationActivity extends Activity {
         hint.setTextColor(Color.WHITE);
         hint.setGravity(Gravity.CENTER_HORIZONTAL);
         panel.addView(hint, UiKit.matchWrap());
-        Button cancel = ui.secondaryButton("Cancel");
-        cancel.setOnClickListener(view -> {
-            setResult(RESULT_CANCELED);
+        Button done = ui.primaryButton("Done");
+        done.setOnClickListener(view -> {
+            finished = true;
             finish();
         });
-        panel.addView(cancel, ui.topSpaced());
+        panel.addView(done, ui.topSpaced());
         root.addView(panel, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -570,7 +577,17 @@ public final class ScanInvitationActivity extends Activity {
             return;
         }
         String candidate = text.trim();
-        if (!candidate.startsWith(INVITATION_SCHEME)) {
+        // The camera reports a code many times a second while it stays in
+        // view; one already queued is acknowledged, not re-validated.
+        if (queue.contains(candidate)) {
+            long now = SystemClock.elapsedRealtime();
+            if (now - lastDuplicateAt > DUPLICATE_INTERVAL_MILLIS) {
+                lastDuplicateAt = now;
+                runOnUiThread(() -> show("Already added. Point the camera at the next code, or tap Done."));
+            }
+            return;
+        }
+        if (!candidate.startsWith(InvitationBatch.SCHEME)) {
             reject("That code is not a Queqiao invitation.");
             return;
         }
@@ -583,16 +600,39 @@ public final class ScanInvitationActivity extends Activity {
                     : "That invitation cannot be used: " + reason);
             return;
         }
-        runOnUiThread(() -> deliver(candidate));
+        // The same code stays in view for the next frames; let "Added" stand
+        // for a moment before it is acknowledged as already added.
+        lastDuplicateAt = SystemClock.elapsedRealtime();
+        runOnUiThread(() -> accept(candidate));
     }
 
-    private void deliver(String invitation) {
+    private void accept(String invitation) {
         if (finished || isFinishing()) {
             return;
         }
-        finished = true;
-        setResult(RESULT_OK, new Intent().putExtra(EXTRA_INVITATION, invitation));
-        finish();
+        if (queue.add(Collections.singletonList(invitation)) == 0) {
+            return;
+        }
+        title.setText(scanTitle());
+        show("Added " + InvitationBatch.describe(invitation).name + ". Scan the next code, or tap Done.");
+    }
+
+    private String scanTitle() {
+        int count = queue.size();
+        return count == 0 ? "Scan invitations" : count + " ready to import";
+    }
+
+    /** Shows a message, then restores the default hint unless another replaced it. */
+    private void show(String message) {
+        if (finished) {
+            return;
+        }
+        hint.setText(message);
+        hint.postDelayed(() -> {
+            if (!finished && message.contentEquals(hint.getText())) {
+                hint.setText(DEFAULT_HINT);
+            }
+        }, HINT_RESTORE_MILLIS);
     }
 
     private void reject(String message) {
@@ -601,14 +641,7 @@ public final class ScanInvitationActivity extends Activity {
             return;
         }
         lastRejectionAt = now;
-        runOnUiThread(() -> {
-            hint.setText(message);
-            hint.postDelayed(() -> {
-                if (!finished) {
-                    hint.setText(DEFAULT_HINT);
-                }
-            }, HINT_RESTORE_MILLIS);
-        });
+        runOnUiThread(() -> show(message));
     }
 
     private void showUnavailable(String message) {

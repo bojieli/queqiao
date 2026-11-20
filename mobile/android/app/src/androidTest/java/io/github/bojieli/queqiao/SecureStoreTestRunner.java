@@ -27,7 +27,12 @@ public final class SecureStoreTestRunner extends Instrumentation {
                 new NamedCheck("localNetworkRoutePolicy", this::testLocalNetworkRoutePolicy),
                 new NamedCheck("connectionProbeWireFormat", this::testConnectionProbeWireFormat),
                 new NamedCheck("vpnExclusionReadsTheDefaultNetwork", this::testVpnExclusionReadsTheDefaultNetwork),
-                new NamedCheck("listenPortCollisionIsNamed", this::testListenPortCollisionIsNamed)
+                new NamedCheck("listenPortCollisionIsNamed", this::testListenPortCollisionIsNamed),
+                new NamedCheck("invitationBatchExtractsEveryInvitation", this::testInvitationBatchExtractsEveryInvitation),
+                new NamedCheck("invitationBatchValidatesWithTheCore", this::testInvitationBatchValidatesWithTheCore),
+                new NamedCheck("invitationBatchLabelsFromThePayload", this::testInvitationBatchLabelsFromThePayload),
+                new NamedCheck("invitationBatchSummariesAndTitles", this::testInvitationBatchSummariesAndTitles),
+                new NamedCheck("invitationQueueSkipsDuplicates", this::testInvitationQueueSkipsDuplicates)
         };
         for (int index = 0; index < checks.length; index++) {
             NamedCheck check = checks[index];
@@ -47,7 +52,8 @@ public final class SecureStoreTestRunner extends Instrumentation {
         }
         Bundle result = new Bundle();
         result.putString("stream",
-                "\nOK (8 mobile storage, routing, connectivity, and protocol-boundary checks)\n");
+                "\nOK (" + checks.length
+                        + " mobile storage, routing, connectivity, invitation, and protocol-boundary checks)\n");
         finish(Activity.RESULT_OK, result);
     }
 
@@ -241,6 +247,107 @@ public final class SecureStoreTestRunner extends Instrumentation {
         Exception other = new java.io.IOException("certificate has expired");
         require(QueqiaoProxyService.listenFailure(1080, other) == other,
                 "an unrelated listener failure was rewritten");
+    }
+
+    /**
+     * A structurally valid invitation the core accepts. Nothing is enrolled by
+     * these checks, so the identifiers and token need only be well formed.
+     */
+    private static String testInvitation(String name, String endpoint, int seed) throws Exception {
+        org.json.JSONObject payload = new org.json.JSONObject();
+        payload.put("v", 1);
+        payload.put("name", name);
+        payload.put("provider", "a".repeat(32));
+        payload.put("endpoint", endpoint);
+        payload.put("gateway", "b".repeat(32));
+        payload.put("root", base64Url(filled(1)));
+        payload.put("token", base64Url(filled(seed)));
+        payload.put("expires", java.time.Instant.now()
+                .plusSeconds(3600)
+                .truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+                .toString());
+        return "queqiao://enroll/"
+                + base64Url(payload.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private static byte[] filled(int value) {
+        byte[] bytes = new byte[32];
+        java.util.Arrays.fill(bytes, (byte) value);
+        return bytes;
+    }
+
+    private static String base64Url(byte[] bytes) {
+        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    /** Mirrors InvitationBatchTests in the iOS app's InvitationScanTests.swift. */
+    private void testInvitationBatchExtractsEveryInvitation() throws Exception {
+        String first = testInvitation("provider-a", "198.51.100.1:12540", 2);
+        String second = testInvitation("provider-b", "203.0.113.9:12548", 3);
+        String text = "provider-a: " + first + "\n\n\"" + second + "\",\n" + first + "\nnot an invitation";
+        require(InvitationBatch.extract(text).equals(java.util.Arrays.asList(first, second)),
+                "one paste did not yield every invitation, in order, once");
+        require(InvitationBatch.extract("(" + first + ");[" + second + "]|").equals(
+                        java.util.Arrays.asList(first, second)),
+                "brackets, semicolons, or pipes were kept as part of an invitation");
+        require(InvitationBatch.extract("vless://example\nhttps://example.com").isEmpty(),
+                "unrelated links were taken as invitations");
+        require(InvitationBatch.extract(null).isEmpty(), "a missing text yielded an invitation");
+    }
+
+    private void testInvitationBatchValidatesWithTheCore() throws Exception {
+        String valid = testInvitation("provider-c", "198.51.100.2:12540", 4);
+        InvitationBatch.Evaluation result = InvitationBatch.evaluate(
+                valid + "\nqueqiao://enroll/not-base64!", InvitationBatch.CORE);
+        require(result.accepted.equals(java.util.Collections.singletonList(valid)),
+                "the core-valid invitation was not accepted");
+        require(result.rejected == 1, "the invalid candidate was not counted: " + result.rejected);
+    }
+
+    private void testInvitationBatchLabelsFromThePayload() throws Exception {
+        String uri = testInvitation("provider-d", "203.0.113.7:12542", 5);
+        InvitationBatch.QueuedInvitation item = InvitationBatch.describe(uri);
+        require("provider-d".equals(item.name), "the provider name was not read: " + item.name);
+        require("203.0.113.7:12542".equals(item.endpoint), "the endpoint was not read: " + item.endpoint);
+        require(uri.equals(item.uri), "the label changed the invitation");
+
+        InvitationBatch.QueuedInvitation fallback = InvitationBatch.describe("queqiao://enroll/%%%");
+        require(InvitationBatch.FALLBACK_NAME.equals(fallback.name) && fallback.endpoint.isEmpty(),
+                "an undecodable payload did not fall back to the neutral label");
+        String notObject = "queqiao://enroll/"
+                + base64Url("[1]".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        require(InvitationBatch.FALLBACK_NAME.equals(InvitationBatch.describe(notObject).name),
+                "a payload that is not an object did not fall back to the neutral label");
+    }
+
+    private void testInvitationBatchSummariesAndTitles() {
+        require("The clipboard holds no Queqiao invitation.".equals(InvitationBatch.pasteSummary(0, 0, 0)),
+                "an empty paste was not named");
+        require("Added 1 invitation.".equals(InvitationBatch.pasteSummary(1, 0, 0)),
+                "a single invitation was not named");
+        require("Added 9 invitations; 2 already queued; 1 could not be used."
+                        .equals(InvitationBatch.pasteSummary(9, 2, 1)),
+                "a mixed paste was not summarized in one sentence");
+        require("Import profile".equals(InvitationBatch.importTitle(1, false)), "single import title changed");
+        require("Import 3 profiles".equals(InvitationBatch.importTitle(3, false)), "batch import title changed");
+        require("Resume import".equals(InvitationBatch.importTitle(1, true)), "resume title changed");
+        require("Import 2 profiles".equals(InvitationBatch.importTitle(2, true)),
+                "a draft plus a queued invitation was not counted as two");
+    }
+
+    private void testInvitationQueueSkipsDuplicates() throws Exception {
+        InvitationBatch.Queue queue = new InvitationBatch.Queue();
+        String first = testInvitation("provider-a", "198.51.100.1:12540", 6);
+        String second = testInvitation("provider-c", "198.51.100.2:12540", 7);
+        require(queue.add(java.util.Arrays.asList(first, second)) == 2, "new invitations were not queued");
+        require(queue.add(java.util.Arrays.asList(second, first)) == 0, "a queued invitation was queued again");
+        java.util.List<InvitationBatch.QueuedInvitation> items = queue.snapshot();
+        require(items.size() == 2
+                        && "provider-a".equals(items.get(0).name)
+                        && "provider-c".equals(items.get(1).name),
+                "the queue lost its order or its labels");
+        require(queue.remove(first) && !queue.contains(first) && second.equals(queue.first().uri),
+                "removing an entry did not leave the next one first");
     }
 
     private void requireInvalidProbe(String encoded) throws Exception {
