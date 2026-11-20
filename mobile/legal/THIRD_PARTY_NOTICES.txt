@@ -4,7 +4,7 @@ This file is generated from mobile/runtime-dependencies.lock.
 The following modules are linked into the mobile core. Queqiao itself is MIT licensed.
 
 ================================================================================
-github.com/andybalholm/brotli@v1.0.6
+github.com/andybalholm/brotli@v1.2.7
 License: MIT
 Source: https://github.com/andybalholm/brotli
 --------------------------------------------------------------------------------
@@ -263,7 +263,7 @@ Apache License
    limitations under the License.
 
 ================================================================================
-github.com/klauspost/compress@v1.18.7
+github.com/klauspost/compress@v1.20.2
 License: BSD-3-Clause
 Source: https://github.com/klauspost/compress
 --------------------------------------------------------------------------------
