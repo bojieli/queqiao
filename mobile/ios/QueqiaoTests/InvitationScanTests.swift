@@ -65,6 +65,11 @@ final class InvitationBatchTests: XCTestCase {
         XCTAssertEqual(InvitationBatch.extract("Your invitation is \(uri)."), [uri])
     }
 
+    func testExtractUnwrapsMarkdownCodeAndEmphasis() {
+        let uri = invitation(name: "proxy-b", endpoint: "198.51.100.3:12540", seed: 9)
+        XCTAssertEqual(InvitationBatch.extract("Use `\(uri)` or **\(uri)**"), [uri])
+    }
+
     func testTypedTextErrorSaysWhetherAnythingWasRecognised() {
         XCTAssertEqual(
             InvitationTextError.noUsableInvitation(0).errorDescription,
