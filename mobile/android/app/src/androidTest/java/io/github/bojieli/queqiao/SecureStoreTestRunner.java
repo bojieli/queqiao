@@ -293,6 +293,9 @@ public final class SecureStoreTestRunner extends Instrumentation {
         require(InvitationBatch.extract("vless://example\nhttps://example.com").isEmpty(),
                 "unrelated links were taken as invitations");
         require(InvitationBatch.extract(null).isEmpty(), "a missing text yielded an invitation");
+        require(InvitationBatch.extract("Your invitation is " + first + ".").equals(
+                        java.util.Collections.singletonList(first)),
+                "the full stop ending a sentence was kept as part of the invitation");
     }
 
     private void testInvitationBatchValidatesWithTheCore() throws Exception {
@@ -328,6 +331,13 @@ public final class SecureStoreTestRunner extends Instrumentation {
         require("Added 9 invitations; 2 already queued; 1 could not be used."
                         .equals(InvitationBatch.pasteSummary(9, 2, 1)),
                 "a mixed paste was not summarized in one sentence");
+        require("The text holds no Queqiao invitation.".equals(InvitationBatch.typedTextError(0, 0, 0)),
+                "typed text without an invitation was not named");
+        require("The text holds no usable Queqiao invitation; 2 could not be used."
+                        .equals(InvitationBatch.typedTextError(0, 0, 2)),
+                "typed text with only unusable invitations was not named");
+        require("Added 1 invitation; 1 could not be used.".equals(InvitationBatch.typedTextError(1, 0, 1)),
+                "typed text with a mix did not say what was queued");
         require("Import profile".equals(InvitationBatch.importTitle(1, false)), "single import title changed");
         require("Import 3 profiles".equals(InvitationBatch.importTitle(3, false)), "batch import title changed");
         require("Resume import".equals(InvitationBatch.importTitle(1, true)), "resume title changed");

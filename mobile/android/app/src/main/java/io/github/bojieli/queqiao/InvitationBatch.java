@@ -24,10 +24,11 @@ final class InvitationBatch {
     private static final String ENROLL_PREFIX = SCHEME + "enroll/";
     /**
      * Characters that cannot occur inside an invitation URI and commonly
-     * surround one in a message, a list or a quoted line. Whitespace is
-     * handled separately.
+     * surround one in a message, a list or a quoted line. A full stop is one:
+     * neither the scheme nor base64url contains it, and prose ends with it.
+     * Whitespace is handled separately.
      */
-    private static final String SEPARATORS = "\"'<>()[]{},;|";
+    private static final String SEPARATORS = "\"'<>()[]{},;|.";
 
     private InvitationBatch() {
     }
@@ -162,6 +163,19 @@ final class InvitationBatch {
             parts.add(rejected + " could not be used");
         }
         return String.join("; ", parts) + ".";
+    }
+
+    /**
+     * Why typed text was not imported. The text stays in the field so the
+     * invitation can be corrected.
+     */
+    static String typedTextError(int added, int alreadyQueued, int rejected) {
+        if (added == 0 && alreadyQueued == 0) {
+            return rejected == 0
+                    ? "The text holds no Queqiao invitation."
+                    : "The text holds no usable Queqiao invitation; " + rejected + " could not be used.";
+        }
+        return pasteSummary(added, alreadyQueued, rejected);
     }
 
     /**

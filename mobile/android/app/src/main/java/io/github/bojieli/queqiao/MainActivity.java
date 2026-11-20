@@ -788,21 +788,20 @@ public final class MainActivity extends Activity implements TunnelHost {
     }
 
     private void startImport(ImportForm form) {
+        // Typed text is validated like a paste. If the core refuses any of it,
+        // or it holds no invitation at all, the text stays in the field with
+        // the reason and the import does not start.
         String typed = form.invitation.getText().toString();
-        if (!InvitationBatch.extract(typed).isEmpty()) {
+        if (!typed.isBlank()) {
             InvitationBatch.Evaluation result = InvitationBatch.evaluate(typed, InvitationBatch.CORE);
             int added = importQueue.add(result.accepted);
-            if (result.rejected > 0) {
-                // Keep the text so the invitation that failed can be corrected.
-                form.invitation.setError(InvitationBatch.pasteSummary(
+            if (result.accepted.isEmpty() || result.rejected > 0) {
+                form.invitation.setError(InvitationBatch.typedTextError(
                         added, result.accepted.size() - added, result.rejected));
                 renderImportForm(form);
                 return;
             }
             form.invitation.setText("");
-        } else if (!typed.isBlank()) {
-            form.invitation.setError("That is not a Queqiao invitation");
-            return;
         }
         boolean resuming = repository.hasEnrollmentDraft();
         String deviceName = form.deviceName.getText().toString().trim();
@@ -810,6 +809,7 @@ public final class MainActivity extends Activity implements TunnelHost {
             form.invitation.setError("Scan, paste, or enter an invitation");
             return;
         }
+        // A queued invitation always needs a name, resumed draft or not.
         if (importQueue.size() > 0 && deviceName.isEmpty()) {
             form.deviceName.setError("Device name is required");
             return;
@@ -851,9 +851,19 @@ public final class MainActivity extends Activity implements TunnelHost {
                         form.progress.setText(message);
                         setBusy(true, message);
                     });
+                    // The dialog's view of the draft can be stale; the store is
+                    // the authority. Replacing a draft would lose a device key
+                    // whose invitation may already be consumed.
+                    if (repository.hasEnrollmentDraft()) {
+                        throw new IllegalStateException(
+                                "An interrupted enrollment must be resumed or discarded before "
+                                        + "another invitation is imported.");
+                    }
                     Mobilecore.validateInvitation(next.uri);
                     String draft = Mobilecore.prepareEnrollment(next.uri, deviceName);
                     repository.saveEnrollmentDraft(draft);
+                    // By identity, not position: the queue is shared and can
+                    // change while the core works.
                     importQueue.remove(next.uri);
                     runOnUiThread(() -> renderImportForm(form));
                     completeEnrollmentDraft();
