@@ -57,6 +57,9 @@ struct ProfilesView: View {
                     }
                 }
             }
+            .safeAreaInset(edge: .top) {
+                ClipboardInvitationBanner()
+            }
             .navigationDestination(for: String.self) { profileID in
                 ProfileDetailView(profileID: profileID)
             }

@@ -204,3 +204,81 @@ struct ImportProfileView: View {
         )
     }
 }
+
+/// Offers to import from the clipboard when it has changed and holds text,
+/// the way other proxy apps notice a copied link. Only `hasStrings` and
+/// `changeCount` are consulted until the user taps the system paste button,
+/// so iOS shows no paste prompt and nothing is read in the background.
+struct ClipboardInvitationBanner: View {
+    @EnvironmentObject private var model: TunnelModel
+    @State private var visible = false
+    @State private var dismissedChangeCount = -1
+    @State private var note: String?
+
+    var body: some View {
+        Group {
+            if visible {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label("Copied invitations?", systemImage: "doc.on.clipboard")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Button {
+                            dismiss()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .accessibilityLabel("Dismiss")
+                    }
+                    PasteButton(payloadType: String.self) { values in
+                        Task { @MainActor in paste(values) }
+                    }
+                    .labelStyle(.titleAndIcon)
+                    if let note {
+                        Text(note)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(12)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal)
+            }
+        }
+        .onAppear(perform: refresh)
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            refresh()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIPasteboard.changedNotification)) { _ in
+            refresh()
+        }
+    }
+
+    private func refresh() {
+        let pasteboard = UIPasteboard.general
+        visible = !model.isBusy && pasteboard.hasStrings && pasteboard.changeCount != dismissedChangeCount
+        if !visible {
+            note = nil
+        }
+    }
+
+    private func dismiss() {
+        dismissedChangeCount = UIPasteboard.general.changeCount
+        visible = false
+        note = nil
+    }
+
+    private func paste(_ values: [String]) {
+        let result = InvitationBatch.evaluate(values.joined(separator: "\n"))
+        let added = model.queueInvitations(result.accepted)
+        if result.accepted.isEmpty {
+            note = InvitationBatch.pasteSummary(added: 0, alreadyQueued: 0, rejected: result.rejected)
+            return
+        }
+        dismiss()
+        if added > 0 || !model.queuedInvitations.isEmpty {
+            model.presentImporter(scanning: false)
+        }
+    }
+}
