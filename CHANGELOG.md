@@ -10,6 +10,28 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.12.1 - 2026-11-20
+
+### Fixed
+
+- A QUIC flow rescued onto its TCP fallback lane is no longer closed moments
+  after the rescue succeeds. When the QUIC lane manager handed the flow off and
+  returned, it marked replacement abandoned, and the stall watchdog treated that
+  as terminal while the stalled bytes were still being replayed on the healthy
+  TCP lane, so long-lived interactive connections such as SSH were reset with
+  "no replacement lane will be attempted" on sub-second network blips.
+  Abandonment now ends a flow only when it has no healthy lane; a lane that
+  never delivers is still bounded by the no-progress budget.
+
+### Security
+
+- Builds now use Go 1.26.11, which fixes a net/http vulnerability
+  (GO-2026-6859), and the indirect compression dependencies are upgraded to
+  github.com/andybalholm/brotli v1.2.7 (GO-2026-6888) and
+  github.com/klauspost/compress v1.20.2 (GO-2026-6865). govulncheck reported all
+  three as reachable from the mobile core; the desktop binary links the same
+  modules.
+
 ## v0.12.0 - 2026-10-26
 
 ### Fixed
