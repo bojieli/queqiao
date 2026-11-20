@@ -106,6 +106,7 @@ public final class MainActivity extends Activity implements TunnelHost {
     // in front and re-renders the queue when it returns; if the system
     // reclaimed this activity meanwhile, the dialog is rebuilt around it.
     private final InvitationBatch.Queue importQueue = InvitationBatch.Queue.SHARED;
+    private final InvitationImporter importer = InvitationImporter.SHARED;
     private ImportForm importForm;
     private boolean testingProfiles;
 
@@ -149,6 +150,17 @@ public final class MainActivity extends Activity implements TunnelHost {
         if (savedInstanceState == null) {
             handleIncomingIntent(getIntent());
         }
+        importer.setListener(importListener);
+        // A recreated activity (a rotation, say) rebuilds the import dialog
+        // the old one was showing, including a batch still running in the
+        // process-wide importer.
+        if (importForm == null && (importer.isRunning()
+                || (savedInstanceState != null && importQueue.size() > 0))) {
+            showImportDialog(null, false);
+            if (importer.isRunning()) {
+                setBusy(true, importer.status());
+            }
+        }
     }
 
     @Override
@@ -172,6 +184,10 @@ public final class MainActivity extends Activity implements TunnelHost {
 
     @Override
     protected void onDestroy() {
+        importer.clearListener(importListener);
+        if (importForm != null) {
+            importForm.dialog.dismiss();
+        }
         worker.shutdownNow();
         probePool.shutdownNow();
         super.onDestroy();
@@ -568,7 +584,7 @@ public final class MainActivity extends Activity implements TunnelHost {
                 open.pasteNote.setVisibility(View.VISIBLE);
             }
             renderImportForm(open);
-            if (startScanning && !open.importing) {
+            if (startScanning && !importer.isRunning()) {
                 startScanner();
             }
             return;
@@ -688,7 +704,7 @@ public final class MainActivity extends Activity implements TunnelHost {
             renderImportForm(form);
         });
         dialog.show();
-        if (startScanning) {
+        if (startScanning && !importer.isRunning()) {
             startScanner();
         }
     }
@@ -696,7 +712,8 @@ public final class MainActivity extends Activity implements TunnelHost {
     @SuppressLint("SetTextI18n")
     private void renderImportForm(ImportForm form) {
         boolean hasDraft = repository.hasEnrollmentDraft();
-        boolean editable = !form.importing;
+        boolean importing = importer.isRunning();
+        boolean editable = !importing;
         form.pending.setVisibility(hasDraft ? View.VISIBLE : View.GONE);
 
         List<InvitationBatch.QueuedInvitation> queued = importQueue.snapshot();
@@ -731,13 +748,20 @@ public final class MainActivity extends Activity implements TunnelHost {
         form.paste.setEnabled(editable);
         form.invitation.setEnabled(editable);
         form.deviceName.setEnabled(editable);
-        form.progress.setVisibility(form.importing ? View.VISIBLE : View.GONE);
+        if (importing && form.progress.getText().length() == 0) {
+            form.progress.setText(importer.status());
+        }
+        form.progress.setVisibility(importing ? View.VISIBLE : View.GONE);
         form.dialog.setCancelable(editable);
 
         int pendingCount = queued.size() + (hasDraft ? 1 : 0);
-        for (String typed : InvitationBatch.extract(form.invitation.getText().toString())) {
-            if (!importQueue.contains(typed)) {
-                pendingCount++;
+        // Only typed invitations the core accepts count toward the button.
+        String typed = form.invitation.getText().toString();
+        if (!typed.isBlank()) {
+            for (String invitation : InvitationBatch.evaluate(typed, InvitationBatch.CORE).accepted) {
+                if (!importQueue.contains(invitation)) {
+                    pendingCount++;
+                }
             }
         }
         Button importButton = form.dialog.getButton(AlertDialog.BUTTON_POSITIVE);
@@ -788,6 +812,10 @@ public final class MainActivity extends Activity implements TunnelHost {
     }
 
     private void startImport(ImportForm form) {
+        if (importer.isRunning()) {
+            renderImportForm(form);
+            return;
+        }
         // Typed text is validated like a paste. If the core refuses any of it,
         // or it holds no invitation at all, the text stays in the field with
         // the reason and the import does not start.
@@ -816,116 +844,94 @@ public final class MainActivity extends Activity implements TunnelHost {
         }
         form.invitation.setError(null);
         form.deviceName.setError(null);
-        form.importing = true;
-        renderImportForm(form);
-        importBatch(form, resuming, deviceName);
-    }
-
-    /**
-     * Enrolls the pending draft, if any, and then every queued invitation, one
-     * after another with the same device name. Each invitation leaves the
-     * queue only once its draft is saved, because from then on the draft --
-     * not the invitation -- is what a retry must resume; so a failure stops
-     * the batch with the failed invitation either still queued (nothing was
-     * sent) or held as the resumable draft, and the rest still queued.
-     */
-    private void importBatch(ImportForm form, boolean resuming, String deviceName) {
-        String first = resuming ? "Resuming import…" : "Importing profile…";
-        setBusy(true, first);
-        form.progress.setText(first);
-        worker.execute(() -> {
-            int imported = 0;
-            int total = importQueue.size() + (resuming ? 1 : 0);
-            try {
-                if (resuming) {
-                    completeEnrollmentDraft();
-                    imported++;
-                }
-                InvitationBatch.QueuedInvitation next;
-                while ((next = importQueue.first()) != null) {
-                    total = imported + importQueue.size();
-                    String message = total > 1
-                            ? "Importing profile " + (imported + 1) + " of " + total + "…"
-                            : "Importing profile…";
-                    runOnUiThread(() -> {
-                        form.progress.setText(message);
-                        setBusy(true, message);
-                    });
-                    // The dialog's view of the draft can be stale; the store is
-                    // the authority. Replacing a draft would lose a device key
-                    // whose invitation may already be consumed.
-                    if (repository.hasEnrollmentDraft()) {
-                        throw new IllegalStateException(
-                                "An interrupted enrollment must be resumed or discarded before "
-                                        + "another invitation is imported.");
-                    }
-                    Mobilecore.validateInvitation(next.uri);
-                    String draft = Mobilecore.prepareEnrollment(next.uri, deviceName);
-                    repository.saveEnrollmentDraft(draft);
-                    // By identity, not position: the queue is shared and can
-                    // change while the core works.
-                    importQueue.remove(next.uri);
-                    runOnUiThread(() -> renderImportForm(form));
-                    completeEnrollmentDraft();
-                    imported++;
-                }
-                int done = imported;
-                runOnUiThread(() -> {
-                    form.importing = false;
-                    form.dialog.dismiss();
-                    setBusy(false, done == 1 ? "Profile imported" : done + " profiles imported");
-                    refreshCatalog();
-                });
-            } catch (Exception exception) {
-                int done = imported;
-                int planned = total;
-                runOnUiThread(() -> {
-                    form.importing = false;
-                    renderImportForm(form);
-                    refreshCatalog();
-                });
-                showFailure(done == 0
-                        ? "Profile import failed"
-                        : "Imported " + done + " of " + planned + " profiles, then import failed", exception);
-            }
-        });
-    }
-
-    /**
-     * Sends the saved draft, stores the resulting profile, and only then
-     * discards the draft, so an interrupted exchange can be resumed.
-     */
-    private void completeEnrollmentDraft() throws Exception {
-        String draft = repository.enrollmentDraft();
-        if (draft == null) {
-            throw new GeneralSecurityException("The pending enrollment is unavailable");
+        // One batch per process: a second tap, or a recreated activity, finds
+        // the running flag set and starts nothing.
+        if (!importer.start(InvitationImporter.store(repository), importQueue, deviceName)) {
+            renderImportForm(form);
+            return;
         }
-        String profile = Mobilecore.completeEnrollment(draft);
-        repository.importProfile(profile);
-        repository.discardEnrollmentDraft();
+        String first = resuming ? "Resuming import…" : "Importing profile…";
+        form.progress.setText(first);
+        setBusy(true, first);
+        renderImportForm(form);
     }
+
+    /** Progress from the process-wide importer, delivered on the main thread. */
+    private final InvitationImporter.Listener importListener = new InvitationImporter.Listener() {
+        @Override
+        public void onImportProgress(String message) {
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
+            ImportForm form = importForm;
+            if (form != null && form.dialog.isShowing()) {
+                form.progress.setText(message);
+                renderImportForm(form);
+            }
+            setBusy(true, message);
+        }
+
+        @Override
+        public void onImportFinished(InvitationImporter.Result result) {
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
+            ImportForm form = importForm;
+            refreshCatalog();
+            if (result.failure == null) {
+                if (form != null && form.dialog.isShowing()) {
+                    form.dialog.dismiss();
+                }
+                setBusy(false, result.imported == 1
+                        ? "Profile imported"
+                        : result.imported + " profiles imported");
+                return;
+            }
+            if (form != null && form.dialog.isShowing()) {
+                renderImportForm(form);
+            }
+            showFailure(result.imported == 0
+                    ? "Profile import failed"
+                    : "Imported " + result.imported + " of " + result.total + " profiles, then import failed",
+                    result.failure);
+        }
+    };
 
     private void confirmDiscardEnrollment(ImportForm form) {
+        if (importer.isRunning()) {
+            return;
+        }
         new AlertDialog.Builder(this)
                 .setTitle("Discard pending enrollment?")
                 .setMessage(
                         "The pending device key will be deleted. The invitation may already be consumed and might not be reusable.")
                 .setNegativeButton("Cancel", null)
-                .setPositiveButton("Discard", (dialog, which) -> worker.execute(() -> {
-                    try {
-                        repository.discardEnrollmentDraft();
-                        runOnUiThread(() -> {
-                            if (importQueue.size() == 0) {
-                                form.dialog.dismiss();
-                            } else {
-                                renderImportForm(form);
-                            }
-                            refreshCatalog();
-                        });
-                    } catch (Exception exception) {
-                        showFailure("Could not discard enrollment", exception);
+                .setPositiveButton("Discard", (dialog, which) -> {
+                    // Checked again here: the draft belongs to a running batch.
+                    if (importer.isRunning()) {
+                        return;
                     }
-                }))
+                    worker.execute(() -> {
+                        try {
+                            repository.discardEnrollmentDraft();
+                            runOnUiThread(() -> {
+                                if (isFinishing() || isDestroyed()) {
+                                    return;
+                                }
+                                if (form.dialog.isShowing()) {
+                                    if (importQueue.size() == 0) {
+                                        form.dialog.dismiss();
+                                    } else {
+                                        renderImportForm(form);
+                                    }
+                                }
+                                refreshCatalog();
+                            });
+                        } catch (Exception exception) {
+                            showFailure("Could not discard enrollment", exception);
+                        }
+                    });
+                })
                 .show();
     }
 
@@ -941,7 +947,6 @@ public final class MainActivity extends Activity implements TunnelHost {
         final EditText invitation;
         final EditText deviceName;
         final TextView progress;
-        boolean importing;
 
         ImportForm(
                 AlertDialog dialog,

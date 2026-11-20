@@ -168,8 +168,12 @@ queued invitations are then enrolled one after another under one device name,
 each with its own device key and its own crash-safe draft: an invitation
 leaves the queue only once its encrypted draft is saved, so a failure leaves
 it either still queued, with nothing sent, or as the draft to resume, which is
-always enrolled first. A scan button on the Profiles screen opens the import
-dialog directly onto the camera.
+always enrolled first. A new draft is never written over a pending one. Only
+one batch runs per process, on a single process-wide thread, so recreating the
+activity (a rotation, for example) cannot start a second batch over the same
+queue and draft. A batch takes the invitations queued when Import was tapped;
+anything shared or scanned later waits for the next tap. A scan button on the
+Profiles screen opens the import dialog directly onto the camera.
 
 Queqiao does not import or export the resulting private client-profile JSON as
 a portable configuration file. That JSON contains the device identity and is

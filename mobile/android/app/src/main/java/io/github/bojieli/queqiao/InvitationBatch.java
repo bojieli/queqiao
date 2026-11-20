@@ -27,8 +27,9 @@ final class InvitationBatch {
      * surround one in a message, a list or a quoted line. A full stop is one:
      * neither the scheme nor base64url contains it, and prose ends with it.
      * Whitespace is handled separately.
+     * Backticks and asterisks come from Markdown code spans and emphasis.
      */
-    private static final String SEPARATORS = "\"'<>()[]{},;|.";
+    private static final String SEPARATORS = "\"'<>()[]{},;|.`*";
 
     private InvitationBatch() {
     }
@@ -195,7 +196,10 @@ final class InvitationBatch {
      * a bearer credential, and the crash-safe state is the encrypted draft,
      * not this queue. One process-wide instance is shared by the import
      * dialog and the scanner, so scanned codes survive either activity being
-     * recreated while the other is in front.
+     * recreated while the other is in front. Cancelling the dialog keeps the
+     * queue, as on iOS, so stepping away does not lose what was scanned; an
+     * entry leaves it when it is enrolled, when the user removes it, or when
+     * the process ends.
      */
     static final class Queue {
         static final Queue SHARED = new Queue();
