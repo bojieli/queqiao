@@ -18,8 +18,9 @@ enum InvitationBatch {
     /// Characters that cannot occur inside an invitation URI and commonly
     /// surround one in a message, a list or a quoted line. A full stop is one:
     /// neither the scheme nor base64url contains it, and prose ends with it.
+    /// So are Markdown's backtick and asterisk, which wrap a pasted code span.
     private static let separators = CharacterSet.whitespacesAndNewlines
-        .union(CharacterSet(charactersIn: "\"'<>()[]{},;|."))
+        .union(CharacterSet(charactersIn: "\"'<>()[]{},;|.`*"))
 
     /// Every `queqiao://` invitation in `text`, in order, without duplicates.
     /// A provider operator can hand over several invitations in one message --
