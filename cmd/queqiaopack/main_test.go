@@ -154,6 +154,26 @@ func TestCycloneDXIsDeterministicAndNamesTheLinkedBinary(t *testing.T) {
 	}
 }
 
+func TestCycloneDXUsesResolvedReplacement(t *testing.T) {
+	mod := linkedModule{Path: "example.com/upstream", Version: "v1.0.0", ReplacePath: "example.com/fork", ReplaceVersion: "v1.0.1", ReplaceSum: "h1:actual", LicenseID: "MIT"}
+	raw, err := renderCycloneDX(config{}, target{}, [32]byte{}, []linkedModule{mod})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bom cdxBOM
+	if err = json.Unmarshal(raw, &bom); err != nil {
+		t.Fatal(err)
+	}
+	component := bom.Components[0]
+	if component.Name != mod.ReplacePath || component.Version != mod.ReplaceVersion || component.BOMRef != "example.com/fork@v1.0.1" {
+		t.Fatalf("component: %+v", component)
+	}
+	want := []cdxProperty{{Name: "golang:original-path", Value: mod.Path}, {Name: "golang:original-version", Value: mod.Version}, {Name: "golang:module-sum", Value: mod.ReplaceSum}}
+	if !reflect.DeepEqual(component.Properties, want) {
+		t.Fatalf("source properties: %+v", component.Properties)
+	}
+}
+
 func TestThirdPartyLicenseBundleUsesExactModuleText(t *testing.T) {
 	dir := t.TempDir()
 	licenseText := []byte("permission granted\n")
