@@ -1635,6 +1635,9 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 	// Proof can finish after pool rotation. Retry only the unsent borrow,
 	// sharing the original dial deadline and the pool's singleflight dial.
 	var generation *controlQUICGeneration
+	var stream *quic.Stream
+	var proofStarted time.Time
+	var proofEpoch uint64
 	for {
 		var err error
 		generation, err = c.acquireControlQUICGeneration(dialCtx, ccfg)
@@ -1649,27 +1652,31 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 			generation.releaseBorrow()
 			return nil, err
 		}
-		c.quicMu.Lock()
-		current := c.quicGeneration == generation
-		c.quicMu.Unlock()
-		if current {
+		if !c.currentControlGeneration(generation) {
+			generation.releaseBorrow()
+			continue
+		}
+		// Use the start time so delayed buffered evidence cannot revive a
+		// path. Waiting for stream credit can outlast a second rotation.
+		generation.probeMu.Lock()
+		proofStarted, proofEpoch = time.Now(), generation.proofEpoch
+		generation.probeMu.Unlock()
+		stream, err = generation.conn.OpenStreamSync(dialCtx)
+		if err != nil {
+			generation.releaseBorrow()
+			if generation.conn.Context().Err() != nil {
+				c.retireControlQUICGeneration(generation, "queqiao pooled connection failed")
+			}
+			return nil, err
+		}
+		if dialCtx.Err() == nil && c.currentControlGeneration(generation) {
 			break
 		}
+		// QUIC has assigned a stream ID but no application bytes or OPEN
+		// have been handed to the stream. Discard both directions.
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
 		generation.releaseBorrow()
-	}
-	// A reply on a new bidirectional stream can only arrive after the peer
-	// sees that stream. Retain its creation time as a conservative lower
-	// bound on that round trip, including if its response is read much later.
-	generation.probeMu.Lock()
-	proofStarted, proofEpoch := time.Now(), generation.proofEpoch
-	generation.probeMu.Unlock()
-	stream, err := generation.conn.OpenStreamSync(dialCtx)
-	if err != nil {
-		generation.releaseBorrow()
-		if generation.conn.Context().Err() != nil {
-			c.retireControlQUICGeneration(generation, "queqiao pooled connection failed")
-		}
-		return nil, err
 	}
 	// Track how many flows share the control connection. Bulk isolation is
 	// only worth its cost when there is something to protect.
@@ -1680,6 +1687,12 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 		proofStarted: proofStarted, proofEpoch: proofEpoch,
 	}
 	return outer, nil
+}
+
+func (c *Client) currentControlGeneration(g *controlQUICGeneration) bool {
+	c.quicMu.Lock()
+	defer c.quicMu.Unlock()
+	return c.quicGeneration == g
 }
 
 func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congestionConfig) (*controlQUICGeneration, error) {

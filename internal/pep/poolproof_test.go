@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/apernet/quic-go"
+	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
@@ -416,6 +418,104 @@ func TestLatePathProofReborrowsBeforeSendingOPEN(t *testing.T) {
 		defer o.conn.Close()
 		if o.conn.(*controlPoolStreamConn).generation == old {
 			t.Fatalf("fresh stream opened on already retired g%d after proof", old.id)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverCred, clientCred := testCertificate(t)
+	serverTLS, err := identity.ServerTLSConfig(serverCred, protocol.DataALPN, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, quicConfig(flowWindows{maxStreams: 4}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				for {
+					stream, err := conn.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					go func() { _, _ = io.Copy(io.Discard, stream); _ = stream.Close() }()
+				}
+			}()
+		}
+	}()
+	c, err := NewClient(ClientConfig{ListenAddr: "127.0.0.1:0", RemoteAddr: listener.Addr().String(), Credentials: clientCred, Transport: TransportQUIC, EnableQUICPool: true, DialTimeout: time.Second, HandshakeTimeout: time.Second, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.closeQUICPool)
+	cfg := congestionConfig{kind: defaultCongestion()}
+	held, err := c.dialPooledQUICLane(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	old := held.(*controlPoolStreamConn).generation
+	var slots []*quic.Stream
+	for range 4 {
+		stream, err := old.conn.OpenStream()
+		if err != nil {
+			break
+		}
+		slots = append(slots, stream)
+	}
+	if len(slots) != 3 {
+		t.Fatalf("expected filled peer credit; got %d", len(slots))
+	}
+	// The next caller is a new borrower whose OpenStreamSync must wait.
+	type outcome struct {
+		conn streamConn
+		err  error
+	}
+	done := make(chan outcome, 1)
+	go func() { s, e := c.dialPooledQUICLane(ctx, cfg); done <- outcome{s, e} }()
+	for {
+		old.borrowMu.Lock()
+		n := old.borrowers
+		old.borrowMu.Unlock()
+		if n == 2 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	select {
+	case o := <-done:
+		t.Fatalf("borrow should be blocked: %v", o.err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	c.supersedeSilentGeneration(old, nil)
+	// Returning one slot suffices. The remaining unannounced stream IDs
+	// disappear with the old connection.
+	slots[0].CancelRead(0)
+	_ = slots[0].Close()
+	_ = held.Close()
+	select {
+	case o := <-done:
+		if o.err != nil {
+			t.Fatal(o.err)
+		}
+		defer o.conn.Close()
+		if o.conn.(*controlPoolStreamConn).generation == old {
+			t.Fatalf("old g%d re-used after blocked OpenStreamSync", old.id)
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
