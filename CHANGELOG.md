@@ -12,6 +12,8 @@ to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
 ## v0.13.0 - 2026-11-22
 
+**Publication pending.** [Candidate report](https://github.com/bojieli/queqiao/pull/150#issuecomment-7080666043)
+
 ### Added
 
 - The gateway can forward destination traffic to a trusted loopback SOCKS5

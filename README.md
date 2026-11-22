@@ -150,34 +150,33 @@ workload; see the full [comparison and methodology](docs/COMPARISON.md).
   rather than inferring it. See [which segment is at
   fault](docs/PROFILING-A-TUNNEL.md).
 
-All of it ships as a prebuilt binary. Download it below, or from the
-[latest release](https://github.com/bojieli/queqiao/releases/latest); there is no build step for normal use.
+Prebuilt binaries for the published release are listed below.
 
 ## Platform availability
 
 Every release publishes reproducible, signed binaries for six native targets.
-The links below are v0.13.0, the current release; the
-[releases page](https://github.com/bojieli/queqiao/releases/latest) always has the newest.
+The downloads below are **v0.12.2 (wire 1)**. Use the same version on the client and gateway.
+The v0.13.0 wire 2 candidate is pending publication. [Candidate report](https://github.com/bojieli/queqiao/pull/150#issuecomment-7080666043)
 
 | Platform | Status | Download |
 | --- | --- | --- |
-| macOS, Apple silicon | Desktop and gateway, ready to use | [`darwin_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_darwin_arm64_signed.zip), notarized |
-| macOS, Intel | Desktop and gateway, ready to use | [`darwin_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_darwin_amd64_signed.zip), notarized |
-| Linux, x86-64 | Desktop and gateway, ready to use | [`linux_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_linux_amd64.tar.gz) |
-| Linux, arm64 | Desktop and gateway, ready to use | [`linux_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_linux_arm64.tar.gz) |
-| Windows, x86-64 | Native target built; under testing, not production-ready | [`windows_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_windows_amd64.zip) |
-| Windows, arm64 | Native target built; under testing, not production-ready | [`windows_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_windows_arm64.zip) |
+| macOS, Apple silicon | Desktop and gateway, ready to use | [`darwin_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_darwin_arm64_signed.zip), notarized |
+| macOS, Intel | Desktop and gateway, ready to use | [`darwin_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_darwin_amd64_signed.zip), notarized |
+| Linux, x86-64 | Desktop and gateway, ready to use | [`linux_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_linux_amd64.tar.gz) |
+| Linux, arm64 | Desktop and gateway, ready to use | [`linux_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_linux_arm64.tar.gz) |
+| Windows, x86-64 | Native target built; under testing, not production-ready | [`windows_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_windows_amd64.zip) |
+| Windows, arm64 | Native target built; under testing, not production-ready | [`windows_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_windows_arm64.zip) |
 | Android and iOS | Same transport core, under testing; not yet production-ready mobile apps | -- |
 
-Check a download against its release's
-[`SHA256SUMS`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/SHA256SUMS)
-before running it. Each archive carries its own CycloneDX SBOM and the complete
+Check a signed macOS ZIP against [`SHA256SUMS.signed`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/SHA256SUMS.signed). For the other archives, use
+[`SHA256SUMS`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/SHA256SUMS)
+before running the binary. Each release includes a CycloneDX SBOM and the complete
 license text for every module linked into the binary.
 
 ## Quick start
 
 Two scripts perform a whole deployment and verify the result, one per side.
-Neither needs a Go toolchain: point them at the binary you downloaded above.
+With the v0.12.2 downloads, run the commands below from the [v0.12.2 source checkout](https://github.com/bojieli/queqiao/tree/v0.12.2). Its installers accept wire 1. The installers on `main` require wire 2 on both endpoints.
 
 On the Linux gateway, as root:
 
@@ -211,12 +210,11 @@ The client listens on `127.0.0.1:12080`, the port
 [`deploy/clash-queqiao.yaml`](deploy/clash-queqiao.yaml) already points at.
 Point an application or Clash/mihomo at that SOCKS5 endpoint.
 
-The scripts live in this repository: clone it, or copy `deploy/` beside the
-downloaded binary. From the next release they also ship inside the archives.
+The [v0.12.2 deployment guide](https://github.com/bojieli/queqiao/blob/v0.12.2/docs/DEPLOYING.md) covers the published binaries.
 
 [Choosing and placing a gateway](docs/CHOOSING-A-GATEWAY.md) is the decision
 that comes before all of this: whether a gateway will help at all, and where it
-has to sit. The [deployment guide](docs/DEPLOYING.md) is the reference for
+has to sit. The [wire 2 deployment guide](docs/DEPLOYING.md) is the reference for
 everything past this point -- what the scripts do, the hosts they do not cover, the manual
 gateway and enrollment steps for a host they do not fit, firewall and socket
 tuning, multiple users, source-interface selection, verification, upgrades, and
@@ -273,7 +271,7 @@ the same median this transport does.
 
 Queqiao is ready to use for the supported paired-gateway topology, from the
 published binaries or from source. It is a public preview, not a production-ready claim for every
-network. The v0.13.0 binaries use wire version 2. Upgrade the gateway and client together when moving from v0.12.2 (wire version 1). See the [upgrade procedure](docs/DEPLOYING.md#upgrade-an-existing-deployment). Broader independent
+network. The published v0.12.2 binaries use wire 1. The v0.13.0 candidate and the current source tree use wire 2. Upgrade both endpoints together. See the [upgrade procedure](docs/DEPLOYING.md#upgrade-an-existing-deployment). Broader independent
 field qualification, transport and security review, and mobile review remain
 open. See [current status](docs/STATUS.md) for the evidence boundary and
 [known limitations](docs/KNOWN-LIMITATIONS.md) for operational constraints.
