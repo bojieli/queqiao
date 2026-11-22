@@ -399,6 +399,8 @@ type bulkConn struct {
 	closeOnce  sync.Once
 }
 
+var errPoolRetired = errors.New("pooled connection retired before OPEN")
+
 // controlQUICGeneration owns exactly one shared connection and the packet
 // socket beneath it. Keeping ownership in one object makes generation checks
 // precise: a late failure from an old stream can retire its own generation but
@@ -424,7 +426,7 @@ type controlQUICGeneration struct {
 	liveness poolLiveness
 	// Silent retirement wakes borrowers still waiting for proof or stream credit.
 	borrowing     context.Context
-	stopBorrowing context.CancelFunc
+	stopBorrowing context.CancelCauseFunc
 }
 
 // watchLiveness samples the connection's packet counters until it closes.
@@ -468,6 +470,9 @@ func (g *controlQUICGeneration) close(reason string) {
 		return
 	}
 	g.closeOnce.Do(func() {
+		if g.stopBorrowing != nil {
+			g.stopBorrowing(context.Canceled)
+		}
 		if g.conn != nil {
 			_ = g.conn.CloseWithError(0, reason)
 		}
@@ -1496,7 +1501,7 @@ func (c *Client) openFlowMode(ctx context.Context, destination string, _ bool) (
 	}
 	if pooled, ok := lane.outer.(*controlPoolStreamConn); ok {
 		if !pooled.trackOpen(openDeadline, protocol.HeaderSize+len(payload)) {
-			return fail(errors.New("pooled connection retired before sending OPEN"))
+			return fail(errPoolRetired)
 		}
 	}
 	if err := lane.fc.Write(protocol.Frame{
@@ -1646,7 +1651,7 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 		}
 		if err = c.verifyControlPath(dialCtx, generation); err != nil {
 			generation.releaseBorrow()
-			if generation.borrowing.Err() != nil && dialCtx.Err() == nil {
+			if errors.Is(context.Cause(generation.borrowing), errPoolRetired) && dialCtx.Err() == nil {
 				continue
 			}
 			return nil, err
@@ -1667,7 +1672,7 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 		stream, err = generation.openStreamForBorrow(dialCtx)
 		if err != nil {
 			generation.releaseBorrow()
-			if generation.borrowing.Err() != nil && dialCtx.Err() == nil {
+			if errors.Is(context.Cause(generation.borrowing), errPoolRetired) && dialCtx.Err() == nil {
 				continue
 			}
 			if generation.conn.Context().Err() != nil {
@@ -1777,7 +1782,7 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
 	var generation *controlQUICGeneration
 	if err == nil {
-		borrowing, stopBorrowing := context.WithCancel(context.Background())
+		borrowing, stopBorrowing := context.WithCancelCause(conn.Context())
 		generation = &controlQUICGeneration{borrowing: borrowing, stopBorrowing: stopBorrowing,
 			id: attempt.epoch, conn: conn, packet: packet, verified: time.Now(),
 			controller: configureQUICController(conn, ccfg),
@@ -1823,7 +1828,7 @@ func (c *Client) supersedeSilentGeneration(generation *controlQUICGeneration, cc
 	}
 	c.cfg.Logger.Warn("pooled QUIC connection stopped answering; dialing a fresh one",
 		"generation", generation.id)
-	generation.stopBorrowing()
+	generation.stopBorrowing(errPoolRetired)
 	c.drainControlQUICGeneration(generation)
 	serving := c.serving.Load()
 	if ccfg != nil && serving != nil && (*serving).Err() == nil {
