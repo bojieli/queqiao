@@ -2482,7 +2482,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				lastRecoveryAttempt = now
 				flow.noteReplacementAttempt()
 				if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
-					flow.noteReplacementFailure()
+					flow.noteReplacementFailure(err)
 					if errors.Is(err, errLaneJoinRejected) {
 						// The peer answered, and its answer was that it does
 						// not hold this session. That does not change: a
@@ -2695,7 +2695,7 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 			}
 			if result.err != nil {
 				if result.replacement {
-					flow.noteReplacementFailure()
+					flow.noteReplacementFailure(result.err)
 				}
 				if manageCtx.Err() != nil || flow.doneChanClosed() {
 					return

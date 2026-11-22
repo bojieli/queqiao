@@ -178,6 +178,15 @@ at the time the flow record was written. These counters exclude bundle
 widening and rescue of a suspected lane that is still open. The gateway does
 not initiate replacements.
 
+When a client has recorded a failed zero-lane recovery, its flow completion
+record includes `lane_replacement_last_failure`. The value classifies the last
+returned QUIC round or TCP replacement error: `timeout`, `peer_rejected`,
+`peer_capacity`, `canceled`, or `other`. This lets you split counted errors
+even when the attempt timed out without its own warning. A later successful or
+pending attempt does not clear this historical observation. Older clients and
+flows with no recorded failure omit the field. The category describes the
+returned error; it does not identify which physical path caused a timeout.
+
 To compare the no-admission failures from issue #53 on a fresh client window,
 use the client's JSON-lines log. This groups flows by observable outcome and
 preserves records from older clients without counting missing counters as zero:

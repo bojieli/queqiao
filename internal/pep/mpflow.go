@@ -303,8 +303,10 @@ type multipathFlow struct {
 	// a handshake. Only the endpoint that opens replacements can tell them
 	// apart, and only while it is trying. The other endpoint reports zeroes,
 	// which is the true answer there: it opens nothing.
-	replacementAttempts atomic.Uint64
-	replacementFailures atomic.Uint64
+	replacementAttempts    atomic.Uint64
+	replacementFailureMu   sync.Mutex
+	replacementFailures    uint64
+	replacementLastFailure string
 	// Stall watchdog state. A lane is declared dead only on I/O error, which
 	// on a path losing one direction means fifteen seconds of receive silence
 	// -- while a flow with a full send window and no acknowledgements is
@@ -2311,14 +2313,21 @@ func (f *multipathFlow) noteReplacementAbandoned() { f.replacementAbandoned.Stor
 // the ordinary run of flows.
 func (f *multipathFlow) replacementLogFields() []any {
 	waits, timeouts, joined, waited := f.replacementDiagnostics()
-	return []any{
+	f.replacementFailureMu.Lock()
+	failures, lastFailure := f.replacementFailures, f.replacementLastFailure
+	f.replacementFailureMu.Unlock()
+	fields := []any{
 		"lane_replacement_waits", waits,
 		"lane_replacement_timeouts", timeouts,
 		"lane_replacement_wait", waited,
 		"lanes_joined", joined,
 		"lane_replacement_attempts", f.replacementAttempts.Load(),
-		"lane_replacement_failures", f.replacementFailures.Load(),
+		"lane_replacement_failures", failures,
 	}
+	if failures > 0 {
+		fields = append(fields, "lane_replacement_last_failure", lastFailure)
+	}
+	return fields
 }
 
 // noteReplacementAttempt records that this endpoint has begun opening a
@@ -2330,7 +2339,23 @@ func (f *multipathFlow) noteReplacementAttempt() { f.replacementAttempts.Add(1) 
 // noteReplacementFailure records that one such attempt did not produce a lane.
 // A non-failed attempt may have succeeded or may still be in flight when
 // the flow record is emitted. The peer's refusal is also a returned error.
-func (f *multipathFlow) noteReplacementFailure() { f.replacementFailures.Add(1) }
+func (f *multipathFlow) noteReplacementFailure(err error) {
+	kind := "other"
+	switch {
+	case errors.Is(err, errLaneJoinRejected):
+		kind = "peer_rejected"
+	case errors.Is(err, errLaneJoinCapacity):
+		kind = "peer_capacity"
+	case errors.Is(err, context.Canceled):
+		kind = "canceled"
+	case pooledTransportTimedOut(err):
+		kind = "timeout"
+	}
+	f.replacementFailureMu.Lock()
+	f.replacementFailures++
+	f.replacementLastFailure = kind
+	f.replacementFailureMu.Unlock()
+}
 
 // replacementDiagnostics reports what this flow's lane replacements did, for
 // the record written when a flow ends. Zero waits is the ordinary case and
