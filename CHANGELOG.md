@@ -142,6 +142,9 @@ to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
   and SBOM instead of a fixed version. Preserve LF bytes for conformance
   vectors on every platform, and establish QUIC before injecting its failure
   in the UDP association rescue regression.
+- When a severely lossy QUIC connection rotates, let pending flow opens finish
+  within their original handshake deadlines. Protect the first bytes of an open
+  or path check with bounded, congestion-controlled copies on the same stream.
 
 ## v0.12.2 - 2026-11-20
 
