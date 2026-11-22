@@ -3,7 +3,7 @@
 > [!IMPORTANT]
 > **Release level:** Public-preview source tree; no production-ready claim
 >
-> **Wire protocol:** Version 2 in v0.13.0; gateway and client require a paired upgrade from v0.12.2
+> **Wire protocol:** Version 1 in the published v0.12.2 binaries; version 2 in the v0.13.0 candidate and current source. Upgrade both endpoints together.
 > **Last reviewed:** 2026-11-22
 
 Queqiao is ready to use for its supported paired-gateway topology, from the

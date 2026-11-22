@@ -30,9 +30,12 @@ class DownloadLinkTests(unittest.TestCase):
 
     def newest_release(self):
         text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        versions = SECTION.findall(text)
-        self.assertTrue(versions, "CHANGELOG.md records no release")
-        return versions[0]
+        for section in SECTION.finditer(text):
+            # A prepared release can be held by its candidate checks. Downloads
+            # must keep pointing to the most recent published section.
+            if not text[section.end():].lstrip().startswith("**Publication pending.**"):
+                return section.group("version")
+        self.fail("CHANGELOG.md records no published release")
 
     def test_the_catalog_offers_downloads(self):
         assets = {asset for name, _, asset in self.links() if name == CATALOG}
