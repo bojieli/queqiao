@@ -62,6 +62,7 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 	var lanes int64
 	var lastMode uint32
 	var maxQueue time.Duration
+	var queueSamples int
 	var maxBrake float64
 	var lastLoss float64
 	deadline := time.After(24 * time.Second)
@@ -80,8 +81,15 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 		if s.QUICControllerMaxBandwidth > peakBandwidth {
 			peakBandwidth = s.QUICControllerMaxBandwidth
 		}
-		if q := s.QUICSmoothedRTT - s.QUICControllerMinRTT; q > maxQueue {
-			maxQueue = q
+		// The controller has no queue estimate until its minimum RTT is
+		// known. QUIC can publish its handshake RTT before that baseline;
+		// subtracting zero would misclassify the entire path RTT as a queue.
+		// Match ErasureSender.queueDelay and require real samples below.
+		if s.QUICControllerMinRTT > 0 {
+			queueSamples++
+			if q := s.QUICSmoothedRTT - s.QUICControllerMinRTT; q > maxQueue {
+				maxQueue = q
+			}
 		}
 		if s.QUICDelayBrake > maxBrake {
 			maxBrake = s.QUICDelayBrake
@@ -101,6 +109,9 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 
 	if peakPacing == 0 {
 		t.Skip("the flow never got going, so this run measured nothing")
+	}
+	if queueSamples == 0 {
+		t.Fatal("no initialized controller RTT samples; cannot characterize queue delay")
 	}
 	// The two amplifiers, recorded separately because they need separate fixes.
 	//

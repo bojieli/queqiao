@@ -43,8 +43,6 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -62,8 +60,6 @@ import (
 
 	"net/http"
 	"net/netip"
-
-	"golang.org/x/net/http2"
 
 	"github.com/bojieli/queqiao/internal/tcpinfo"
 )
@@ -1488,15 +1484,15 @@ func framesRun(remote string, sessions, count, size int, every time.Duration, lo
 // h2Serve sinks HTTP/2 request bodies, with the flow-control windows settable
 // so the same binary provides both arms of the comparison.
 func h2Serve(addr string, window int) error {
-	h2s := &http2.Server{}
+	h2s := &http.HTTP2Config{}
 	if w, ok := windowSetting(window); ok {
 		// Both windows, because they are separate. RFC 7540 6.9.2:
 		// SETTINGS_INITIAL_WINDOW_SIZE changes stream windows only, and the
 		// connection window is raised solely by WINDOW_UPDATE -- so a server
 		// that sets the first and forgets the second is capped at 64KB across
 		// every stream at once, which is the more common misconfiguration.
-		h2s.MaxUploadBufferPerStream = w
-		h2s.MaxUploadBufferPerConnection = w
+		h2s.MaxReceiveBufferPerStream = int(w)
+		h2s.MaxReceiveBufferPerConnection = int(w)
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n, _ := io.Copy(io.Discard, r.Body)
@@ -1506,27 +1502,20 @@ func h2Serve(addr string, window int) error {
 	return serveClearTextH2(addr, h2s, handler)
 }
 
-// serveClearTextH2 speaks HTTP/2 on a plain TCP listener.
-//
-// Both ends here use prior knowledge: the client dials TCP and sends the HTTP/2
-// preface without asking. That is what h2c.NewHandler exists to detect and
-// upgrade, so with prior knowledge on both sides we can hand each accepted
-// connection straight to the HTTP/2 server. Doing it this way keeps the upload
-// buffer sizes configurable, which is the whole point of these modes, without
-// depending on a package that has been deprecated.
-func serveClearTextH2(addr string, h2s *http2.Server, handler http.Handler) error {
+// serveClearTextH2 speaks prior-knowledge HTTP/2 on a plain TCP listener.
+func serveClearTextH2(addr string, config *http.HTTP2Config, handler http.Handler) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go h2s.ServeConn(conn, &http2.ServeConnOpts{Handler: handler})
+	protocols := new(http.Protocols)
+	protocols.SetUnencryptedHTTP2(true)
+	server := &http.Server{
+		Handler: handler, Protocols: protocols, HTTP2: config,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
+	return server.Serve(ln)
 }
 
 // h2Run uploads a payload over HTTP/2 and times it, reusing one connection so
@@ -1544,12 +1533,9 @@ func h2Run(remote, sizes string, repeat int, localAddr string) error {
 	if err != nil {
 		return err
 	}
-	transport := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			return d.DialContext(ctx, network, addr)
-		},
-	}
+	transport := &http.Transport{DialContext: d.DialContext, Protocols: new(http.Protocols)}
+	transport.Protocols.SetUnencryptedHTTP2(true)
+	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: 5 * time.Minute}
 	if repeat < 1 {
 		repeat = 1
@@ -1610,25 +1596,22 @@ func h2Run(remote, sizes string, repeat int, localAddr string) error {
 //
 // Terminating HTTP/2 inherits its attack surface -- HPACK decompression bombs,
 // CONTINUATION floods, stream-reset storms. This uses the hardened
-// implementation in x/net rather than parsing frames itself, and it is a
+// implementation in net/http rather than parsing frames itself, and it is a
 // measurement instrument: do not put it in front of anything untrusted.
 func h2Proxy(listen, remote string, window int, localAddr string) error {
 	d, err := dialer(localAddr)
 	if err != nil {
 		return err
 	}
-	upstream := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			return d.DialContext(ctx, network, addr)
-		},
-	}
+	upstream := &http.Transport{DialContext: d.DialContext, Protocols: new(http.Protocols)}
+	upstream.Protocols.SetUnencryptedHTTP2(true)
+	defer upstream.CloseIdleConnections()
 	client := &http.Client{Transport: upstream}
 
-	h2s := &http2.Server{}
+	h2s := &http.HTTP2Config{}
 	if w, ok := windowSetting(window); ok {
-		h2s.MaxUploadBufferPerStream = w
-		h2s.MaxUploadBufferPerConnection = w
+		h2s.MaxReceiveBufferPerStream = int(w)
+		h2s.MaxReceiveBufferPerConnection = int(w)
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		out, err := http.NewRequestWithContext(r.Context(), r.Method,

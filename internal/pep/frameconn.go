@@ -37,7 +37,7 @@ type frameConn struct {
 	control io.ReadWriteCloser
 	bulk    *coded.Path
 
-	writeMu sync.Mutex
+	writeMu contextMutex
 	// writeBuf is reused under writeMu so that every frame reaches the
 	// transport as one write without allocating per frame.
 	writeBuf []byte
@@ -332,14 +332,15 @@ func (c *frameConn) Write(f protocol.Frame) error {
 // control stream if it will not take it: correctness is not worth trading for
 // the coding.
 func (c *frameConn) writeCoded(f protocol.Frame) error {
+	return c.writeCodedContext(context.Background(), f)
+}
+func (c *frameConn) writeCodedContext(ctx context.Context, f protocol.Frame) error {
 	buf, err := protocol.AppendFrame(nil, f)
 	if err != nil {
 		return err
 	}
 	if err := c.bulk.Send(buf); err != nil {
-		c.writeMu.Lock()
-		defer c.writeMu.Unlock()
-		return c.writeLocked(f)
+		return c.writeControlContext(ctx, f)
 	}
 	return nil
 }
@@ -370,22 +371,33 @@ const frameWriteTimeout = 15 * time.Second
 // deadline; transports without that optional method retain their normal
 // behavior and are still interruptible by Close from the flow coordinator.
 func (c *frameConn) WriteContext(ctx context.Context, f protocol.Frame) error {
+	_, err := c.writeContextVia(ctx, f)
+	return err
+}
+
+// writeContextVia is WriteContext reporting whether the frame went out on a
+// substrate that recovers its own losses -- the stream, or a stream copy
+// beside a coded one. The substrate is chosen here, at the write, and not when
+// the frame was queued, so this is the only place that knows; a caller that
+// assumed the answer it was given earlier can be wrong by the time the bytes
+// reach the wire.
+func (c *frameConn) writeContextVia(ctx context.Context, f protocol.Frame) (reliable bool, err error) {
 	if c.bulkFrame(f) {
 		if err := ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
 		c.countData(f, true)
-		if err := c.writeCoded(f); err != nil {
-			return err
+		if err := c.writeCodedContext(ctx, f); err != nil {
+			return false, err
 		}
 		if !c.needsOpenSafetyCopy(f) {
-			return nil
+			return false, nil
 		}
 		c.countData(f, false)
-		return c.writeControlContext(ctx, f)
+		return true, c.writeControlContext(ctx, f)
 	}
 	c.countData(f, false)
-	return c.writeControlContext(ctx, f)
+	return true, c.writeControlContext(ctx, f)
 }
 
 func (c *frameConn) needsOpenSafetyCopy(f protocol.Frame) bool {
@@ -394,7 +406,11 @@ func (c *frameConn) needsOpenSafetyCopy(f protocol.Frame) bool {
 }
 
 func (c *frameConn) writeControlContext(ctx context.Context, f protocol.Frame) error {
-	c.writeMu.Lock()
+	ctx, cancel := context.WithTimeout(ctx, frameWriteTimeout)
+	defer cancel()
+	if err := c.writeMu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer c.writeMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -407,7 +423,18 @@ func (c *frameConn) writeControlContext(ctx context.Context, f protocol.Frame) e
 		if err := deadlineConn.SetWriteDeadline(deadline); err != nil {
 			return err
 		}
-		defer deadlineConn.SetWriteDeadline(time.Time{})
+		// Cancellation must interrupt a write even without a caller deadline.
+		interrupted := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = deadlineConn.SetWriteDeadline(time.Now())
+			close(interrupted)
+		})
+		defer func() {
+			if !stop() {
+				<-interrupted
+			}
+			_ = deadlineConn.SetWriteDeadline(time.Time{})
+		}()
 	}
 	return c.writeLocked(f)
 }

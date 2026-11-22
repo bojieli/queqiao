@@ -412,6 +412,9 @@ type peer struct {
 	client net.Addr
 	conn   *net.UDPConn
 	last   atomic.Int64
+	// blackholed drops everything to and from this source; see
+	// BlackholeSources.
+	blackholed atomic.Bool
 	// up and down are this source address's own policer, used only when the
 	// configuration asks for per-flow shaping. They deliberately do not apply
 	// loss: loss stays a property of the shared path so that per-flow shaping
@@ -587,6 +590,18 @@ func (d *direction) setLossRate(rate float64) {
 	d.inBurst = false
 }
 
+// BlackholeSources drops, from now on, everything to and from every client
+// source address the relay has already seen, while sources it has not yet seen
+// pass as before. It is the shape of a NAT rebinding or a per-port block: the
+// connections that existed are gone, and a new one from a new port works.
+func (r *Relay) BlackholeSources() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, p := range r.peers {
+		p.blackholed.Store(true)
+	}
+}
+
 // Stats returns the upstream (client to server) and downstream counters.
 func (r *Relay) Stats() (up, down Stats) { return r.upstream.stats(), r.downstream.stats() }
 
@@ -650,7 +665,7 @@ func (r *Relay) readClient() {
 			continue
 		}
 		p, err := r.peerFor(addr)
-		if err != nil {
+		if err != nil || p.blackholed.Load() {
 			continue
 		}
 		payload := make([]byte, n)
@@ -706,6 +721,9 @@ func (r *Relay) readServer(p *peer) {
 			if fatalReadError(err) {
 				return
 			}
+			continue
+		}
+		if p.blackholed.Load() {
 			continue
 		}
 		payload := make([]byte, n)

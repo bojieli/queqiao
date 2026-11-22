@@ -4,7 +4,7 @@ This file is generated from mobile/runtime-dependencies.lock.
 The following modules are linked into the mobile core. Queqiao itself is MIT licensed.
 
 ================================================================================
-github.com/andybalholm/brotli@v1.0.6
+github.com/andybalholm/brotli@v1.2.7
 License: MIT
 Source: https://github.com/andybalholm/brotli
 --------------------------------------------------------------------------------
@@ -263,7 +263,7 @@ Apache License
    limitations under the License.
 
 ================================================================================
-github.com/klauspost/compress@v1.18.7
+github.com/klauspost/compress@v1.20.2
 License: BSD-3-Clause
 Source: https://github.com/klauspost/compress
 --------------------------------------------------------------------------------
@@ -777,7 +777,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
-golang.org/x/crypto@v0.55.0
+golang.org/x/crypto@v0.57.0
 License: BSD-3-Clause
 Source: https://go.googlesource.com/crypto
 --------------------------------------------------------------------------------
@@ -876,7 +876,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
-golang.org/x/net@v0.58.0
+golang.org/x/net@v0.60.0
 License: BSD-3-Clause
 Source: https://go.googlesource.com/net
 --------------------------------------------------------------------------------
@@ -909,7 +909,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
-golang.org/x/sys@v0.47.0
+golang.org/x/sys@v0.48.0
 License: BSD-3-Clause
 Source: https://go.googlesource.com/sys
 --------------------------------------------------------------------------------

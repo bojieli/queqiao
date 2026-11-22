@@ -1009,7 +1009,24 @@ func (s *Scheduler) releaseQueuedLocked(laneID uint64, size uint64) {
 //
 // The chunk stays retained until Complete, because a lane that dies may not
 // have delivered what its transport accepted.
-func (s *Scheduler) Wrote(laneID uint64, chunk *Chunk) {
+func (s *Scheduler) Wrote(laneID uint64, chunk *Chunk) { s.wrote(laneID, chunk, nil) }
+
+// WroteAs is Wrote for a transport that knows which substrate it used, and it
+// is the one a lane writer should call.
+//
+// The attempt's reliability was recorded when the lane took the chunk, from
+// what the lane said it would do. A lane's answer can change between then and
+// the write -- the coding plan is re-chosen and the flow re-classified while
+// the chunk waits in the lane's queue -- and when it changes towards the coded
+// path the attempt is left believing it is on a stream. Such an attempt is
+// never re-offered to its own lane, so on a single-lane flow the erased chunk
+// waits for a second lane or the whole progress budget. What the wire was given
+// is the only answer that cannot be stale.
+func (s *Scheduler) WroteAs(laneID uint64, chunk *Chunk, reliable bool) {
+	s.wrote(laneID, chunk, &reliable)
+}
+
+func (s *Scheduler) wrote(laneID uint64, chunk *Chunk, reliable *bool) {
 	if chunk == nil {
 		return
 	}
@@ -1024,6 +1041,9 @@ func (s *Scheduler) Wrote(laneID uint64, chunk *Chunk) {
 			continue
 		}
 		out.attempts[i].written = true
+		if reliable != nil {
+			out.attempts[i].reliable = *reliable
+		}
 		s.releaseQueuedLocked(laneID, uint64(len(out.chunk.Data)))
 		s.ready.Broadcast()
 		return

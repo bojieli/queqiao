@@ -171,6 +171,12 @@ later stream bytes. Queqiao keeps OPEN, ACK, CLOSE, RESET, and recovery control
 on the reliable stream while selected DATA frames use coded datagrams. An ACK
 therefore does not wait inside the coded-data queue whose sender it releases.
 
+Lane-reader overflow is bounded separately from application delivery so that
+an application pause does not prevent reading reverse-direction ACKs. This
+removes an application queue dependency, not reliable-stream head-of-line
+blocking. Duplicate selective ACKs do not count as progress. Recovery attempts
+share a no-progress budget rather than renewing it at each successful JOIN.
+
 The same rule applies across contending flows. Priority queueing and reactive
 isolation keep a growing data stream from trapping new work and feedback in its
 connection congestion window.

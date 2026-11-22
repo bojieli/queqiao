@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/bojieli/queqiao/internal/identity"
-	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
 )
@@ -47,7 +46,7 @@ func TestCompleteLaneJoinMapsResetCodesToRetryPolicy(t *testing.T) {
 				}, Payload: session.ResetPayload(test.code, "refused")})
 			}()
 			client := &Client{cfg: ClientConfig{Logger: logger, HandshakeTimeout: 2 * time.Second}}
-			_, err := client.completeLaneJoin(&authenticatedLane{
+			_, err := client.completeLaneJoin(context.Background(), &authenticatedLane{
 				fc: newFrameConn(local), outer: local, sessionID: [16]byte{1}, kind: TransportQUIC, laneID: 1,
 			}, 7, 0)
 			if !errors.Is(err, test.want) {
@@ -57,45 +56,6 @@ func TestCompleteLaneJoinMapsResetCodesToRetryPolicy(t *testing.T) {
 				t.Fatalf("errors.Is(err, errLaneJoinRejected) = %t, want %t", got, test.stillRejected)
 			}
 		})
-	}
-}
-
-// A sprayed attempt learning the TCP-mode refusal must not cancel the round:
-// the answer is actionable, and only attempt zero can act on it with a TCP
-// commit. Attempt zero reporting it ends the round like any rejection --
-// there is no commit left to wait for.
-func TestTCPModeRefusalDoesNotCancelAttemptZero(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	client := &Client{cfg: ClientConfig{Logger: logger}, metrics: metrics.New()}
-	flow := newGraceTestFlow(t)
-	winner, _ := rescueTestLane(t, 2)
-	attempts := []rescueAttempt{
-		func(ctx context.Context) (*mpLane, error) {
-			// Attempt zero's TCP commit is slower than the sprayed attempts
-			// learning the same answer from the peer.
-			time.Sleep(50 * time.Millisecond)
-			return winner, nil
-		},
-		func(ctx context.Context) (*mpLane, error) { return nil, errLaneJoinTCPMode },
-	}
-	lane, _, err := client.raceRescueAttempts(context.Background(), flow, attempts)
-	if err != nil || lane != winner {
-		t.Fatalf("lane = %v, err = %v, want attempt zero's commit to win the round", lane, err)
-	}
-
-	rejected := []rescueAttempt{
-		func(ctx context.Context) (*mpLane, error) { return nil, errLaneJoinTCPMode },
-		func(ctx context.Context) (*mpLane, error) {
-			<-ctx.Done()
-			return nil, ctx.Err()
-		},
-	}
-	start := time.Now()
-	if _, _, err := client.raceRescueAttempts(context.Background(), flow, rejected); !errors.Is(err, errLaneJoinTCPMode) {
-		t.Fatalf("err = %v, want %v", err, errLaneJoinTCPMode)
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("attempt zero's own refusal took %s to end the round", elapsed)
 	}
 }
 
@@ -181,7 +141,7 @@ func TestAutoRecoveryCommitsToTCPWhenPeerSaysFlowIsOnTCP(t *testing.T) {
 	if err := flow.addLane(isolationLane(t, 0)); err != nil {
 		t.Fatal(err)
 	}
-	lane, err := rig.client.openRecoveryLane(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID)
+	lane, err := rig.client.openRescueLane(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,11 +150,9 @@ func TestAutoRecoveryCommitsToTCPWhenPeerSaysFlowIsOnTCP(t *testing.T) {
 	}
 }
 
-// One capacity answer is the ordinary loser of a rescue race, so the AUTO
-// TCP commit stays suppressed for it. When the answer repeats with no
-// successful round between, a wedged admission slot on the peer is the
-// likelier reading, and the commit stops being suppressed.
-func TestPersistentCapacityAnswerLetsAutoCommitToTCP(t *testing.T) {
+// Once the QUIC race has exhausted its candidates, AUTO can hand off to TCP
+// immediately; repeating the same capacity refusal adds no useful evidence.
+func TestCapacityAnswerLetsAutoCommitToTCPImmediately(t *testing.T) {
 	rig := newJoinTestRig(t, TransportAuto, TransportQUIC, 4)
 	// Fill the ceiling with lanes too young to evict, so every JOIN is
 	// answered with the transient capacity refusal. The ids stay clear of the
@@ -212,17 +170,12 @@ func TestPersistentCapacityAnswerLetsAutoCommitToTCP(t *testing.T) {
 	if err := flow.addLane(isolationLane(t, 0)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rig.client.openRecoveryLane(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID); !errors.Is(err, errLaneJoinCapacity) {
-		t.Fatalf("first capacity answer = %v, want %v", err, errLaneJoinCapacity)
-	}
-	flow.noteLaneCapacityRefusal()
-	flow.noteLaneCapacityRefusal()
-	lane, err := rig.client.openRecoveryLane(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID)
+	lane, err := rig.client.openRescueLane(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if lane.kind != TransportTCP {
-		t.Fatalf("recovery lane transport = %s, want TCP once the answer repeated", lane.kind)
+		t.Fatalf("recovery lane transport = %s, want immediate TCP handoff", lane.kind)
 	}
 	if !rig.serverSess.tcpMode {
 		t.Fatal("server flow did not commit to TCP")

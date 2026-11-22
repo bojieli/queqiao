@@ -9,6 +9,19 @@ them before treating a successful local test as evidence that a different
 network will behave the same way. The [project status](STATUS.md) tracks which
 qualification items are still open.
 
+- Connection recovery cannot promise success when every path is unavailable.
+  Outstanding tunnel bytes that make no acknowledgement progress for 45 seconds
+  fail explicitly, as do application writes that make no progress for 45
+  seconds. An intentionally paused consumer can therefore lose a connection
+  if it leaves data outstanding for that long; an idle connection is unaffected.
+  Protocol 1 has no explicit receiver-credit/pause message, so the remote sender
+  cannot fully distinguish consumer backpressure from a failed delivery path.
+- Control and DATA can still share a reliable transport stream. The bounded
+  ingress backlog prevents a full application event channel from blocking the
+  reader, but cannot bypass bytes missing within the underlying TCP/QUIC stream.
+  Byte-stream order also means a missing logical byte range holds up later
+  application data until recovery fills it. Backlog exhaustion is an explicit
+  flow error, not unlimited buffering or silent data loss.
 - The congestion control described in [the control
   redesign](CONTROL-REDESIGN.md) has no brake on a policed path. A policer
   drops what it cannot pass and holds nothing, so it produces loss and no
