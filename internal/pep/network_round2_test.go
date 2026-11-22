@@ -197,7 +197,8 @@ func TestRound2SlowUDPNameDoesNotBlockAnotherDestination(t *testing.T) {
 	var lookups atomic.Int32
 	entered := make(chan struct{})
 	sent := make(chan struct{}, 1)
-	forward := newUDPForwarder(ctx, socket, func(ctx context.Context, name string) ([]*net.UDPAddr, error) {
+	forward := newUDPForwarder(ctx, socket, DestinationPolicy{}, func(int) { notifyActivity(sent) })
+	forward.resolve = func(ctx context.Context, name string) ([]*net.UDPAddr, error) {
 		if name == "slow:53" {
 			if lookups.Add(1) == 1 {
 				close(entered)
@@ -206,7 +207,7 @@ func TestRound2SlowUDPNameDoesNotBlockAnotherDestination(t *testing.T) {
 			return nil, ctx.Err()
 		}
 		return []*net.UDPAddr{target.LocalAddr().(*net.UDPAddr)}, nil
-	}, func(int) { notifyActivity(sent) })
+	}
 	defer func() { cancel(); forward.wg.Wait() }()
 	forward.enqueue("slow:53", []byte("slow"))
 	<-entered

@@ -107,6 +107,12 @@ qualification items are still open.
   cannot recover datagrams in flight during path failure.
 - Automatic TCP fallback cannot bypass a network that blocks both transports
   or the selected gateway port.
+- The optional gateway SOCKS5 upstream is unauthenticated and loopback-only.
+  Queqiao sends validated IPs under the default public-only policy. Original
+  domains reach the upstream only with private destinations explicitly enabled.
+  The upstream must
+  support UDP ASSOCIATE for UDP traffic, and there is no silent direct
+  fallback.
 - `--allow-private-destinations` removes the default SSRF boundary and should
   be used only for an intentional private-access service.
 - The desktop SOCKS listener is intentionally loopback-only and has no remote

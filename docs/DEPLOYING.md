@@ -209,6 +209,57 @@ Private, loopback, link-local, multicast, and unspecified destinations are
 blocked after DNS resolution. Add `--allow-private-destinations` only when the
 service is intentionally an access proxy into a private network.
 
+### Route gateway traffic through sing-box
+
+The gateway can hand all accepted destination traffic to a SOCKS5 upstream on
+the same host, leaving sing-box to choose a direct or proxied final outbound.
+For example, route ChatGPT or another selected service through a designated
+proxy while other traffic leaves directly from the gateway. Keep those rules
+in sing-box; Queqiao provides the transport to the gateway and the handoff.
+
+Configure a sing-box SOCKS inbound on loopback with both TCP and UDP enabled,
+then add this server option:
+
+```sh
+queqiaod server \
+  --state /var/lib/queqiao/provider \
+  --listen :443 \
+  --outbound-socks5 127.0.0.1:1080
+```
+
+For the packaged systemd unit, append the same option to `QUEQIAOD_ARGS` and
+restart the service. The setting affects only application destination traffic
+leaving the gateway. Queqiao carrier, enrollment, renewal, and metrics sockets
+do not pass through it.
+
+The upstream is deliberately restricted to a literal loopback address and
+uses SOCKS5 without authentication: the unencrypted protocol is treated as a
+local process boundary, not a remote proxy transport. When it is configured,
+failure of the upstream fails the destination open; Queqiao does not silently
+bypass routing policy by falling back to a direct connection.
+
+TCP uses SOCKS5 CONNECT. Each Queqiao UDP association uses SOCKS5 UDP
+ASSOCIATE, and its TCP control connection is retained together with the UDP
+relay during Queqiao lane recovery. The sing-box inbound must therefore
+support UDP; a TCP-only inbound makes UDP association opens fail closed.
+
+With the default public-destination policy, Queqiao resolves the client's
+destination name and sends a validated IP address to the upstream for both
+TCP and UDP. Use IP-based rules in sing-box for these requests. The gateway
+must be able to resolve destination names. Each UDP destination worker reuses
+its validated addresses for up to 30 seconds.
+
+When an operator enables `--allow-private-destinations` for a private-access
+service, the upstream receives the client's original destination after gateway
+resolution. Domain rules then work for clients that supply a name, and the
+local router controls the final DNS answer. Keep the router and its DNS
+configuration under operator control.
+
+Verify TCP and UDP separately. An IP check through the client proves the final
+TCP egress; a DNS query through SOCKS5 UDP proves that sing-box's UDP inbound
+and selected outbound both work. Check the sing-box log as well as Queqiao's
+`remote flow opened` and UDP metrics before relying on the route.
+
 ## Add users and issue invitations
 
 Create a separate account for every customer or administrative boundary:

@@ -45,10 +45,10 @@ func TestCodedFallbackCountsSuccessfulSubstrate(t *testing.T) {
 func TestUDPWriterWaitHonorsCancellationAndPacketAge(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	f := newUDPForwarder(ctx, nil, nil, nil)
+	f := newUDPForwarder(ctx, nil, DestinationPolicy{}, nil)
 	f.writeGate <- struct{}{}
 	result := make(chan error, 1)
-	go func() { result <- f.writePacket(udpForwardPacket{queued: time.Now()}, nil) }()
+	go func() { result <- f.writePacket(udpForwardPacket{queued: time.Now()}, "", nil) }()
 	cancel()
 	select {
 	case err := <-result:
@@ -60,7 +60,7 @@ func TestUDPWriterWaitHonorsCancellationAndPacketAge(t *testing.T) {
 	}
 	<-f.writeGate
 	f.ctx = context.Background()
-	if err := f.writePacket(udpForwardPacket{queued: time.Now().Add(-2 * udpForwardPacketAge)}, nil); err == nil {
+	if err := f.writePacket(udpForwardPacket{queued: time.Now().Add(-2 * udpForwardPacketAge)}, "", nil); err == nil {
 		t.Fatal("expired packet sent")
 	}
 }

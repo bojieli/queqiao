@@ -20,7 +20,8 @@ type udpForwardPacket struct {
 }
 type udpForwarder struct {
 	ctx       context.Context
-	conn      *net.UDPConn
+	conn      serverUDPRelay
+	policy    DestinationPolicy
 	writeGate chan struct{}
 	resolve   func(context.Context, string) ([]*net.UDPAddr, error)
 	sent      func(int)
@@ -29,8 +30,8 @@ type udpForwarder struct {
 	wg        sync.WaitGroup
 }
 
-func newUDPForwarder(ctx context.Context, conn *net.UDPConn, resolve func(context.Context, string) ([]*net.UDPAddr, error), sent func(int)) *udpForwarder {
-	return &udpForwarder{ctx: ctx, conn: conn, writeGate: make(chan struct{}, 1), resolve: resolve, sent: sent, targets: make(map[string]chan udpForwardPacket)}
+func newUDPForwarder(ctx context.Context, conn serverUDPRelay, policy DestinationPolicy, sent func(int)) *udpForwarder {
+	return &udpForwarder{ctx: ctx, conn: conn, policy: policy, writeGate: make(chan struct{}, 1), resolve: policy.ResolveUDPAddr, sent: sent, targets: make(map[string]chan udpForwardPacket)}
 }
 
 func (f *udpForwarder) enqueue(destination string, payload []byte) bool {
@@ -114,11 +115,8 @@ func (f *udpForwarder) run(destination string, queue chan udpForwardPacket) {
 			if time.Since(packet.queued) > udpForwardPacketAge {
 				continue
 			}
-			for _, address := range addresses {
-				if err := f.writePacket(packet, address); err == nil {
-					f.sent(len(packet.payload))
-					break
-				}
+			if len(addresses) != 0 && f.writePacket(packet, destination, addresses) == nil {
+				f.sent(len(packet.payload))
 			}
 		}
 	}
@@ -127,7 +125,7 @@ func (f *udpForwarder) run(destination string, queue chan udpForwardPacket) {
 // The association shares one socket across destination workers. Own both its
 // deadline and write until cancellation cleanup finishes, so another worker
 // cannot extend a blocked write or inherit an expired deadline.
-func (f *udpForwarder) writePacket(packet udpForwardPacket, address *net.UDPAddr) error {
+func (f *udpForwarder) writePacket(packet udpForwardPacket, destination string, addresses []*net.UDPAddr) error {
 	deadline := time.Now().Add(5 * time.Second)
 	if expires := packet.queued.Add(udpForwardPacketAge); expires.Before(deadline) {
 		deadline = expires
@@ -157,6 +155,5 @@ func (f *udpForwarder) writePacket(packet udpForwardPacket, address *net.UDPAddr
 		}
 		_ = f.conn.SetWriteDeadline(time.Time{})
 	}()
-	_, err := f.conn.WriteToUDP(packet.payload, address)
-	return err
+	return f.policy.writeResolvedUDP(f.conn, packet.payload, destination, addresses)
 }

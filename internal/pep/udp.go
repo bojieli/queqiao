@@ -680,8 +680,10 @@ func runClientUDPDownlink(ctx context.Context, udpConn *net.UDPConn, fc *frameCo
 		if err != nil {
 			return err
 		}
-		// The destination is returned by the server as a numeric source address.
-		// It is encoded back into the SOCKS response below.
+		// The destination is the source address reported by the gateway relay.
+		// Direct relays return a numeric address; an upstream SOCKS5 relay may
+		// legally preserve the domain from the request. Encode either form back
+		// into the local SOCKS response.
 		var packet bytes.Buffer
 		if err := socks5.WriteUDPDatagram(&packet, destination, payload); err != nil {
 			return err
@@ -709,7 +711,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	// Claiming is best effort: if the token is unknown, spent, or expired,
 	// this is an ordinary open with a fresh socket, which is exactly the
 	// behaviour that existed before resume did.
-	var udpConn *net.UDPConn
+	var udpConn serverUDPRelay
 	resumed := false
 	if resumable && len(resume) > 0 {
 		if held := s.udpRelays.claim(resume, principal); held != nil {
@@ -717,7 +719,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		}
 	}
 	if udpConn == nil {
-		listened, err := net.ListenUDP("udp", &net.UDPAddr{})
+		listened, err := s.cfg.DestinationPolicy.OpenUDPRelay(ctx)
 		if err != nil {
 			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: flowID, Class: protocol.ClassInteractive}, Payload: session.ResetPayload(session.ResetTransport, "UDP relay unavailable")})
 			return
@@ -819,7 +821,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 
 	var counters udpCounters
 	activity := make(chan struct{}, 1)
-	forward := newUDPForwarder(assocCtx, udpConn, s.cfg.DestinationPolicy.ResolveUDPAddr, func(n int) {
+	forward := newUDPForwarder(assocCtx, udpConn, s.cfg.DestinationPolicy, func(n int) {
 		if n < 0 {
 			return
 		}
@@ -830,7 +832,6 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		cancel()
 		stopPacketReader()
 		forward.wg.Wait()
-		_ = udpConn.SetDeadline(time.Time{})
 	}()
 
 	var window packetWindow
@@ -1010,7 +1011,7 @@ func udpAddrEqual(a, b *net.UDPAddr) bool {
 
 // startUDPRelayReader returns a synchronous stop operation. A cancelled reader
 // must not steal packets from the next owner of a retained relay socket.
-func startUDPRelayReader(ctx context.Context, udpConn *net.UDPConn, packets chan<- udpDatagram, packetErr chan<- error) func() {
+func startUDPRelayReader(ctx context.Context, udpConn serverUDPRelay, packets chan<- udpDatagram, packetErr chan<- error) func() {
 	ctx, cancel := context.WithCancel(ctx)
 	var deadlineMu sync.Mutex
 	done := make(chan struct{})
@@ -1025,7 +1026,17 @@ func startUDPRelayReader(ctx context.Context, udpConn *net.UDPConn, packets chan
 			}
 			_ = udpConn.SetReadDeadline(time.Now().Add(udpReadPoll))
 			deadlineMu.Unlock()
-			n, addr, readErr := udpConn.ReadFromUDP(buf)
+			var (
+				n           int
+				addr        *net.UDPAddr
+				destination string
+				readErr     error
+			)
+			if relay, ok := udpConn.(namedUDPRelay); ok {
+				n, destination, readErr = relay.ReadFromDestination(buf)
+			} else {
+				n, addr, readErr = udpConn.ReadFromUDP(buf)
+			}
 			if readErr != nil {
 				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
 					if ctx.Err() != nil {
@@ -1042,9 +1053,12 @@ func startUDPRelayReader(ctx context.Context, udpConn *net.UDPConn, packets chan
 				packetErr <- readErr
 				return
 			}
-			destination, err := session.DestinationFromUDPAddr(addr)
-			if err != nil {
-				continue
+			if destination == "" {
+				var destinationErr error
+				destination, destinationErr = session.DestinationFromUDPAddr(addr)
+				if destinationErr != nil {
+					continue
+				}
 			}
 			select {
 			case packets <- udpDatagram{destination: destination, payload: append([]byte(nil), buf[:n]...)}:

@@ -857,8 +857,8 @@ func TestReadLaneTreatsEOFAfterRemoteResetAsProtocolTeardown(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("lane reader did not return after peer EOF")
 	}
-	if lane.closed.Load() {
-		t.Fatal("protocol reset was misclassified as a physical lane failure")
+	if !flow.doneChanClosed() || !lane.closed.Load() {
+		t.Fatal("protocol reset left the flow or lane open")
 	}
 	if got := registry.Snapshot().LaneFailures; got != 0 {
 		t.Fatalf("RESET followed by EOF exported %d lane failures", got)

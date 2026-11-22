@@ -11,8 +11,9 @@ import (
 )
 
 type DestinationPolicy struct {
-	AllowPrivate bool
-	DialTimeout  time.Duration
+	AllowPrivate   bool
+	DialTimeout    time.Duration
+	OutboundSOCKS5 string
 }
 
 var additionallyForbidden = []netip.Prefix{
@@ -44,10 +45,6 @@ var additionallyForbidden = []netip.Prefix{
 }
 
 func (p DestinationPolicy) DialContext(ctx context.Context, destination string) (net.Conn, error) {
-	host, port, err := parseDestination(destination)
-	if err != nil {
-		return nil, err
-	}
 	timeout := p.DialTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -55,33 +52,27 @@ func (p DestinationPolicy) DialContext(ctx context.Context, destination string) 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	var addresses []net.IPAddr
-	if parsed := net.ParseIP(host); parsed != nil {
-		addresses = []net.IPAddr{{IP: parsed}}
-	} else {
-		addresses, err = net.DefaultResolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			return nil, errors.New("destination resolution failed")
-		}
+	// Resolve once. Both direct and proxied public connections use those IPs.
+	addresses, err := p.ResolveUDPAddr(ctx, destination)
+	if err != nil {
+		return nil, err
 	}
-	if len(addresses) == 0 {
-		return nil, errors.New("destination did not resolve")
-	}
+	return p.dialResolvedTCP(ctx, destination, addresses, timeout)
+}
 
-	dialer := net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
-	var lastErr error
-	var candidates []string
-	for _, candidate := range addresses {
-		if !p.AllowPrivate && !publicDestinationIP(candidate.IP) {
-			lastErr = errors.New("destination address is not public")
-			continue
-		}
-		candidates = append(candidates, net.JoinHostPort(candidate.IP.String(), strconv.Itoa(port)))
+func (p DestinationPolicy) dialResolvedTCP(ctx context.Context, destination string, addresses []*net.UDPAddr, timeout time.Duration) (net.Conn, error) {
+	if p.OutboundSOCKS5 != "" && p.AllowPrivate {
+		return dialSOCKS5TCP(ctx, p.OutboundSOCKS5, destination, timeout)
 	}
-	if len(candidates) == 0 {
-		return nil, lastErr
+	dialer := net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	candidates := make([]string, 0, len(addresses))
+	for _, candidate := range addresses {
+		candidates = append(candidates, candidate.String())
 	}
 	return dialDestinationCandidates(ctx, candidates, func(ctx context.Context, address string) (net.Conn, error) {
+		if p.OutboundSOCKS5 != "" {
+			return dialSOCKS5TCP(ctx, p.OutboundSOCKS5, address, timeout)
+		}
 		return dialer.DialContext(ctx, "tcp", address)
 	})
 }
@@ -182,10 +173,23 @@ func dialDestinationSerial(ctx context.Context, addresses []string, dial func(co
 	return nil, fmt.Errorf("destination unavailable: %w", lastErr)
 }
 
-// ResolveUDPAddr validates and resolves a destination using exactly the same
-// public-address policy as TCP CONNECT. It deliberately returns a concrete
-// address: the server performs DNS resolution at the US egress and does not
-// let the client influence a later DNS rebinding or private-address hop.
+func (p DestinationPolicy) OpenUDPRelay(ctx context.Context) (serverUDPRelay, error) {
+	if p.OutboundSOCKS5 == "" {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
+	}
+	timeout := p.DialTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return openSOCKS5UDPRelay(ctx, p.OutboundSOCKS5, timeout)
+}
+
+// ResolveUDPAddr returns the concrete destination addresses permitted by the
+// gateway policy. TCP CONNECT and UDP datagrams share this check.
 func (p DestinationPolicy) ResolveUDPAddr(ctx context.Context, destination string) ([]*net.UDPAddr, error) {
 	host, port, err := parseDestination(destination)
 	if err != nil {
@@ -209,6 +213,9 @@ func (p DestinationPolicy) ResolveUDPAddr(ctx context.Context, destination strin
 	result := make([]*net.UDPAddr, 0, len(addresses))
 	for _, candidate := range addresses {
 		if !p.AllowPrivate && !publicDestinationIP(candidate.IP) {
+			if p.OutboundSOCKS5 != "" {
+				return nil, errors.New("destination address is not public")
+			}
 			continue
 		}
 		result = append(result, &net.UDPAddr{IP: append(net.IP(nil), candidate.IP...), Port: port})
