@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/apernet/quic-go"
+	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
@@ -365,5 +367,154 @@ func TestPooledConnectionFailureRetiresEvenAfterStreamEOF(t *testing.T) {
 	c.quicMu.Unlock()
 	if fresh == g || current != fresh || fresh.conn.Context().Err() != nil {
 		t.Fatal("late stream failure affected replacement generation")
+	}
+}
+
+func TestLatePathProofReborrowsBeforeSendingOPEN(t *testing.T) {
+	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+	c := rig.client
+	t.Cleanup(c.closeQUICPool)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cfg := congestionConfig{kind: defaultCongestion()}
+	held, err := c.dialPooledQUICLane(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	old := held.(*controlPoolStreamConn).generation
+	old.invalidatePathProof()
+	started, release := make(chan struct{}), make(chan struct{})
+	c.probeControlGenerationForTest = func(ctx context.Context, g *controlQUICGeneration, _ time.Duration) error {
+		if g != old {
+			return nil
+		}
+		close(started)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	type outcome struct {
+		conn streamConn
+		err  error
+	}
+	result := make(chan outcome, 1)
+	go func() { v, e := c.dialPooledQUICLane(ctx, cfg); result <- outcome{v, e} }()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	c.supersedeSilentGeneration(old, nil)
+	defer close(release)
+	select {
+	case o := <-result:
+		if o.err != nil {
+			t.Fatal(o.err)
+		}
+		defer o.conn.Close()
+		if o.conn.(*controlPoolStreamConn).generation == old {
+			t.Fatalf("fresh stream opened on already retired g%d after proof", old.id)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverCred, clientCred := testCertificate(t)
+	serverTLS, err := identity.ServerTLSConfig(serverCred, protocol.DataALPN, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, quicConfig(flowWindows{maxStreams: 4}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				for {
+					stream, err := conn.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					go func() { _, _ = io.Copy(io.Discard, stream); _ = stream.Close() }()
+				}
+			}()
+		}
+	}()
+	c, err := NewClient(ClientConfig{ListenAddr: "127.0.0.1:0", RemoteAddr: listener.Addr().String(), Credentials: clientCred, Transport: TransportQUIC, EnableQUICPool: true, DialTimeout: time.Second, HandshakeTimeout: time.Second, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.closeQUICPool)
+	cfg := congestionConfig{kind: defaultCongestion()}
+	held, err := c.dialPooledQUICLane(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	old := held.(*controlPoolStreamConn).generation
+	var slots []*quic.Stream
+	for range 4 {
+		stream, err := old.conn.OpenStream()
+		if err != nil {
+			break
+		}
+		slots = append(slots, stream)
+	}
+	if len(slots) != 3 {
+		t.Fatalf("expected filled peer credit; got %d", len(slots))
+	}
+	// The next caller is a new borrower whose OpenStreamSync must wait.
+	type outcome struct {
+		conn streamConn
+		err  error
+	}
+	done := make(chan outcome, 1)
+	go func() { s, e := c.dialPooledQUICLane(ctx, cfg); done <- outcome{s, e} }()
+	for {
+		old.borrowMu.Lock()
+		n := old.borrowers
+		old.borrowMu.Unlock()
+		if n == 2 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	select {
+	case o := <-done:
+		t.Fatalf("borrow should be blocked: %v", o.err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	c.supersedeSilentGeneration(old, nil)
+	// Deliberately withhold all old stream credit. Retirement itself must
+	// release the wait, while the already admitted sibling stays usable.
+	select {
+	case o := <-done:
+		if o.err != nil {
+			t.Fatal(o.err)
+		}
+		defer o.conn.Close()
+		if o.conn.(*controlPoolStreamConn).generation == old {
+			t.Fatalf("old g%d re-used after blocked OpenStreamSync", old.id)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 }

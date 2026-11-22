@@ -29,9 +29,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ================================================================================
-github.com/apernet/quic-go@v0.61.1-0.20260806010916-184d081eef3e
+github.com/bojieli/quic-go@v0.61.1-0.20261122151924-536371970564
 License: MIT
-Source: https://github.com/apernet/quic-go
+Source: https://github.com/bojieli/quic-go
 --------------------------------------------------------------------------------
 MIT License
 

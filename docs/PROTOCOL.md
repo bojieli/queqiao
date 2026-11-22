@@ -284,6 +284,14 @@ copy of its first frame behind OPEN on the reliable stream until OPEN_OK is
 observed. The receiver may briefly hold a bounded number of coded frames that
 arrive before their OPEN is processed.
 
+On a measured high-erasure path a sender may protect the beginning of an
+OPEN or path PROBE by letting QUIC repeat already packetized bytes on the
+same stream at offset zero. Each copy goes through normal QUIC congestion
+control. The receiver delivers the overlapping bytes once under QUIC's
+stream semantics. OPEN, OPEN_OK and their authorization and correlation
+rules stay the same. The sender still waits for the authenticated remote
+response to confirm the application exchange.
+
 ### 8.2 UDP association OPEN
 
 An OPEN payload beginning with the following exact five-byte marker creates a

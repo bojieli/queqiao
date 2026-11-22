@@ -556,7 +556,7 @@ func readLinkedModules(binaryPath string, moduleDirs map[string]string) ([]linke
 
 func moduleLicenseID(modulePath string) string {
 	switch modulePath {
-	case "github.com/andybalholm/brotli", "github.com/apernet/quic-go",
+	case "github.com/andybalholm/brotli", "github.com/apernet/quic-go", "github.com/bojieli/quic-go",
 		"github.com/skip2/go-qrcode":
 		return "MIT"
 	case "github.com/klauspost/compress", "github.com/refraction-networking/utls",
@@ -584,22 +584,21 @@ func renderCycloneDX(cfg config, target target, binarySum [sha256.Size]byte, mod
 	components := make([]cdxComponent, 0, len(modules))
 	refs := make([]string, 0, len(modules))
 	for _, module := range modules {
-		ref := module.Path + "@" + module.Version
-		properties := []cdxProperty{}
-		if module.Sum != "" {
-			properties = append(properties, cdxProperty{Name: "golang:module-sum", Value: module.Sum})
-		}
+		name, version, sum := module.Path, module.Version, module.Sum
+		var properties []cdxProperty
 		if module.ReplacePath != "" {
 			properties = append(properties,
-				cdxProperty{Name: "golang:replace-path", Value: module.ReplacePath},
-				cdxProperty{Name: "golang:replace-version", Value: module.ReplaceVersion},
+				cdxProperty{Name: "golang:original-path", Value: name},
+				cdxProperty{Name: "golang:original-version", Value: version},
 			)
-			if module.ReplaceSum != "" {
-				properties = append(properties, cdxProperty{Name: "golang:replace-sum", Value: module.ReplaceSum})
-			}
+			name, version, sum = module.ReplacePath, module.ReplaceVersion, module.ReplaceSum
 		}
+		if sum != "" {
+			properties = append(properties, cdxProperty{Name: "golang:module-sum", Value: sum})
+		}
+		ref := name + "@" + version
 		component := cdxComponent{
-			Type: "library", BOMRef: ref, Name: module.Path, Version: module.Version,
+			Type: "library", BOMRef: ref, Name: name, Version: version,
 			Properties: properties,
 		}
 		if module.LicenseID != "NOASSERTION" {

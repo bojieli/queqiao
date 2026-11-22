@@ -6,13 +6,17 @@ following Go modules:
 | Module | Version | License |
 | --- | --- | --- |
 | `github.com/andybalholm/brotli` | v1.2.7 | MIT |
-| `github.com/apernet/quic-go` | v0.61.1-0.20260806010916-184d081eef3e | MIT |
+| `github.com/bojieli/quic-go` | v0.61.1-0.20261122151924-536371970564 | MIT |
 | `github.com/klauspost/compress` | v1.20.2 | BSD-3-Clause |
 | `github.com/refraction-networking/utls` | v1.8.2 | BSD-3-Clause |
 | `github.com/skip2/go-qrcode` | v0.0.0-20200617195104-da1b6568686e | MIT |
 | `golang.org/x/crypto` | v0.57.0 | BSD-3-Clause |
 | `golang.org/x/net` | v0.60.0 | BSD-3-Clause |
 | `golang.org/x/sys` | v0.48.0 | BSD-3-Clause |
+
+The QUIC dependency is a fork of `github.com/apernet/quic-go` at
+`184d081eef3e9edd5cb7c0ddf2460c91f2e6adb1`. The pinned fork retains its
+upstream MIT license.
 
 Every release archive contains `THIRD_PARTY_LICENSES.txt` with the complete
 license text read from the exact linked module versions at packaging time. Its
