@@ -42,7 +42,7 @@ version=v0.1.0
 commit=$(git rev-parse HEAD)
 build_date=$(git show -s --format=%cI HEAD)
 GOENV=off GOEXPERIMENT= GOFIPS140=off GOFLAGS=-mod=readonly \
-  GOTOOLCHAIN=go1.25.13 GOWORK=off GOAMD64=v1 GOARM64=v8.0 \
+  GOTOOLCHAIN=go1.26.11 GOWORK=off GOAMD64=v1 GOARM64=v8.0 \
   go run ./cmd/queqiaopack \
   --version "$version" --commit "$commit" --build-date "$build_date" \
   --output dist
@@ -75,8 +75,8 @@ Then confirm that the embedded metadata matches the tag:
 cat BUILDINFO
 ```
 
-Both outputs must report `wire=1` / `wire_protocol=1`. The public protocol-1 contract
-accepts only protocol 1 and intentionally provides no compatibility or
+Both outputs must report `wire=2` / `wire_protocol=2`. The public protocol-2 contract
+accepts only protocol 2 and intentionally provides no compatibility or
 downgrade path for the removed shared-secret protocol.
 
 Validate the complete directory before executing an archive:

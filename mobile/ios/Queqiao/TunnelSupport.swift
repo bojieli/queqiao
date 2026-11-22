@@ -42,6 +42,7 @@ enum ModelError: LocalizedError {
     case emptyProviderResponse
     case routingNotApplied(String)
     case invalidBypassRoutes([String])
+    case pendingEnrollment
 
     var errorDescription: String? {
         switch self {
@@ -62,6 +63,8 @@ enum ModelError: LocalizedError {
             let listed = entries.prefix(5).joined(separator: ", ")
             let suffix = entries.count > 5 ? " and \(entries.count - 5) more" : ""
             return "Not a network address or CIDR block: \(listed)\(suffix)."
+        case .pendingEnrollment:
+            return "An interrupted enrollment must be resumed or discarded before another invitation is imported."
         }
     }
 }

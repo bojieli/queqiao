@@ -813,43 +813,9 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	}
 	packets := make(chan udpDatagram, 32)
 	packetErr := make(chan error, 1)
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		buf := make([]byte, 65535)
-		for {
-			if assocCtx.Err() != nil {
-				return
-			}
-			_ = udpConn.SetReadDeadline(time.Now().Add(udpReadPoll))
-			n, addr, readErr := udpConn.ReadFromUDP(buf)
-			if readErr != nil {
-				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
-					if assocCtx.Err() != nil {
-						packetErr <- assocCtx.Err()
-						return
-					}
-					continue
-				}
-				// As on the uplink: an unreachable peer describes one
-				// datagram, not this association.
-				if udperr.Transient(readErr) {
-					continue
-				}
-				packetErr <- readErr
-				return
-			}
-			destination, err := session.DestinationFromUDPAddr(addr)
-			if err != nil {
-				continue
-			}
-			select {
-			case packets <- udpDatagram{destination: destination, payload: append([]byte(nil), buf[:n]...)}:
-			case <-assocCtx.Done():
-				return
-			}
-		}
-	}()
+	stopPacketReader := startUDPRelayReader(assocCtx, udpConn, packets, packetErr)
+	// A retained socket must have exactly one reader. Stop and join the old
+	// worker before the earlier retention defer publishes it to a replacement.
 
 	var counters udpCounters
 	activity := make(chan struct{}, 1)
@@ -862,8 +828,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	})
 	defer func() {
 		cancel()
-		_ = udpConn.SetReadDeadline(time.Now())
-		<-readerDone
+		stopPacketReader()
 		forward.wg.Wait()
 		_ = udpConn.SetDeadline(time.Time{})
 	}()
@@ -1041,4 +1006,59 @@ func udpAddrEqual(a, b *net.UDPAddr) bool {
 		return a == b
 	}
 	return a.Port == b.Port && a.Zone == b.Zone && a.IP.Equal(b.IP)
+}
+
+// startUDPRelayReader returns a synchronous stop operation. A cancelled reader
+// must not steal packets from the next owner of a retained relay socket.
+func startUDPRelayReader(ctx context.Context, udpConn *net.UDPConn, packets chan<- udpDatagram, packetErr chan<- error) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	var deadlineMu sync.Mutex
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 65535)
+		for {
+			deadlineMu.Lock()
+			if ctx.Err() != nil {
+				deadlineMu.Unlock()
+				return
+			}
+			_ = udpConn.SetReadDeadline(time.Now().Add(udpReadPoll))
+			deadlineMu.Unlock()
+			n, addr, readErr := udpConn.ReadFromUDP(buf)
+			if readErr != nil {
+				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
+					if ctx.Err() != nil {
+						packetErr <- ctx.Err()
+						return
+					}
+					continue
+				}
+				// As on the uplink: an unreachable peer describes one
+				// datagram, not this association.
+				if udperr.Transient(readErr) {
+					continue
+				}
+				packetErr <- readErr
+				return
+			}
+			destination, err := session.DestinationFromUDPAddr(addr)
+			if err != nil {
+				continue
+			}
+			select {
+			case packets <- udpDatagram{destination: destination, payload: append([]byte(nil), buf[:n]...)}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		deadlineMu.Lock()
+		_ = udpConn.SetReadDeadline(time.Now())
+		deadlineMu.Unlock()
+		<-done
+		_ = udpConn.SetReadDeadline(time.Time{})
+	}
 }

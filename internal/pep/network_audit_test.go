@@ -33,8 +33,8 @@ func TestWriteContextCancelsWhileWaitingForWriter(t *testing.T) {
 	defer inner.Close()
 	defer peer.Close()
 	fc := newFrameConn(inner)
-	fc.writeMu <- struct{}{}
-	defer func() { <-fc.writeMu }()
+	fc.writeMu.Lock()
+	defer fc.writeMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	if err := fc.WriteContext(ctx, protocol.Frame{}); !errors.Is(err, context.DeadlineExceeded) {

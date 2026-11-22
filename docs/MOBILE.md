@@ -4,7 +4,7 @@
 > user-facing product boundary, start with [the repository README](../README.md)
 > and [known limitations](KNOWN-LIMITATIONS.md).
 
-The Android and iOS clients are under testing. They share the protocol-1 core,
+The Android and iOS clients are under testing. They share the protocol-2 core,
 but their platform-specific routing, lifecycle, store, and physical-device
 qualification remains open; do not read their source availability as a
 production-ready mobile release.
@@ -143,7 +143,15 @@ platforms; what differs is what a connection *is*.
 
 Both apps import a `queqiao://` invitation through an explicit in-app paste
 action or by scanning it as a QR code with the device camera, which is what
-`queqiaod provider invite --qr` draws in the provider's terminal. Android can
+`queqiaod provider invite --qr` draws in the provider's terminal. On iOS the
+import screen collects a batch: one paste takes every invitation on the
+clipboard, the scanner keeps reading code after code until Done, and the
+queued invitations are then enrolled one after another, each with its own
+device key and its own crash-safe draft. A scan shortcut on the Profiles
+screen opens the camera directly, and while the clipboard holds text the user
+has not dismissed the banner for, Profiles shows a paste banner; deciding that
+consults only `hasStrings` and `changeCount`. Every paste control is the system
+`PasteButton`, which reads the clipboard only when tapped. Android can
 also appear as a user-selected target for shared plain text. The camera opens
 only from the import screen and only while that screen is in front. On Android
 the frame is decoded on the device by the Go core; on iOS the detection is
@@ -157,6 +165,23 @@ scheme, while an unused invitation is a bearer credential. Enrollment remains
 crash-safe: a draft containing the newly generated device key is encrypted
 before the one-time token is sent, and an interrupted import resumes that exact
 draft.
+
+The Android import dialog collects a batch. Paste reads the clipboard only
+when tapped and takes every `queqiao://` invitation on it, a shared plain-text
+message may likewise carry several, and the scanner keeps reading code after
+code until Done; each candidate is validated by the Go core before it is
+queued. The queue lists each provider by the name and endpoint in the
+invitation's own payload and is held in memory only, never persisted. The
+queued invitations are then enrolled one after another under one device name,
+each with its own device key and its own crash-safe draft: an invitation
+leaves the queue only once its encrypted draft is saved, so a failure leaves
+it either still queued, with nothing sent, or as the draft to resume, which is
+always enrolled first. A new draft is never written over a pending one. Only
+one batch runs per process, on a single process-wide thread, so recreating the
+activity (a rotation, for example) cannot start a second batch over the same
+queue and draft. A batch takes the invitations queued when Import was tapped;
+anything shared or scanned later waits for the next tap. A scan button on the
+Profiles screen opens the import dialog directly onto the camera.
 
 Queqiao does not import or export the resulting private client-profile JSON as
 a portable configuration file. That JSON contains the device identity and is

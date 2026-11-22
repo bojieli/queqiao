@@ -1,7 +1,7 @@
 # Choosing and placing a gateway
 
 > [!NOTE]
-> **Status:** Current operational guidance for public protocol 1
+> **Status:** Current operational guidance for public protocol 2
 > **Last reviewed:** 2026-08-28
 
 Queqiao improves one segment of a path: the segment between a client and a
@@ -18,7 +18,7 @@ installing one; what follows is the question that precedes it.
 ## The transport is paired
 
 Both ends of a Queqiao session run `queqiaod`, authenticate to each other with a
-provider-pinned identity and a per-device certificate, and speak protocol 1
+provider-pinned identity and a per-device certificate, and speak protocol 2
 between them. A server operated by someone else cannot take part. This is not a
 gap in the current release: it is the assumption the control design rests on,
 since the transport measures a segment and shares one path model across the

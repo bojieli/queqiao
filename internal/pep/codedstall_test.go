@@ -51,7 +51,7 @@ func TestCodedSendStallRecoversOnExistingStream(t *testing.T) {
 	}
 	sent := <-lane.writeQ
 	// The datagram was accepted by the carrier but erased before delivery.
-	sent.onWritten()
+	sent.onWritten(false)
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() { flow.stallWatchdog(stop); close(done) }()
@@ -91,7 +91,7 @@ func TestCodedSendStallRecoversOnExistingStream(t *testing.T) {
 	if err = fc.writeContextMode(ctx, queued.frame, queued.forceReliable); err != nil {
 		t.Fatal(err)
 	}
-	queued.onWritten()
+	queued.onWritten(true)
 	frame := waitAckFrame(t, capture)
 	if lane.closed.Load() {
 		t.Fatal("recovery closed the existing lane")

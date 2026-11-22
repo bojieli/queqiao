@@ -10,6 +10,187 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.12.2 - 2026-11-20
+
+### Added
+
+- The Android app imports invitations in batches. One paste, or one shared
+  message, takes every `queqiao://` invitation in the text, the QR scanner keeps
+  reading codes until Done instead of closing after the first, and the import
+  dialog lists the queued providers and enrolls them in one go, each with its
+  own device key and crash-safe draft. A scan button on the Profiles screen
+  opens the camera directly. The clipboard is still read only when Paste is
+  tapped.
+- `queqiaod provider invite` accepts a repeatable `--path NAME=HOST:PORT` that
+  issues one invitation per route to the gateway, such as a direct address and
+  relays in front of it, in a single run. Each invitation pins the same gateway
+  and root, and the gateway records its route and answers enrollment with it, so
+  the enrolled profile keeps dialing the relay and existing clients accept it
+  unchanged. The URIs are printed one per line so a mobile app can take them in
+  one paste. Before this, an invitation whose endpoint was edited by hand to
+  point at a relay consumed its token and then failed enrollment.
+- The iOS app imports invitations in batches. One paste takes every
+  `queqiao://` invitation on the clipboard, the QR scanner keeps reading codes
+  until Done instead of closing after the first, and the import screen lists the
+  queued providers and enrolls them in one go, each with its own device key and
+  crash-safe draft. A scan button on the Profiles screen opens the camera
+  directly, and when copied text is waiting, Profiles offers a paste banner.
+  Pasting uses the system paste button, so no paste prompt appears and the
+  clipboard is never read until it is tapped.
+
+## v0.12.1 - 2026-11-20
+
+### Fixed
+
+- A QUIC flow rescued onto its TCP fallback lane is no longer closed moments
+  after the rescue succeeds. When the QUIC lane manager handed the flow off and
+  returned, it marked replacement abandoned, and the stall watchdog treated that
+  as terminal while the stalled bytes were still being replayed on the healthy
+  TCP lane, so long-lived interactive connections such as SSH were reset with
+  "no replacement lane will be attempted" on sub-second network blips.
+  Abandonment now ends a flow only when it has no healthy lane; a lane that
+  never delivers is still bounded by the no-progress budget.
+
+### Security
+
+- Builds now use Go 1.26.11, which fixes a net/http vulnerability
+  (GO-2026-6859), and the indirect compression dependencies are upgraded to
+  github.com/andybalholm/brotli v1.2.7 (GO-2026-6888) and
+  github.com/klauspost/compress v1.20.2 (GO-2026-6865). govulncheck reported all
+  three as reachable from the mobile core; the desktop binary links the same
+  modules.
+
+## v0.12.0 - 2026-10-26
+
+### Fixed
+
+- The coded path keeps reading QUIC datagrams while it decodes and while the
+  flow consuming its frames is slow. Reading and decoding shared one goroutine,
+  so either stalled the reads; QUIC then discards received datagrams beyond
+  128 after acknowledging them, which the sender never learns of and this end
+  counted as path erasure, inflating the parity the peer sent for a channel
+  that had delivered everything.
+- The coded path protects the tail of a burst once, when the producer has
+  actually paused, instead of at every momentary drain of its send queue. A
+  response relayed as many small frames was protected afresh after each of
+  them as though it ended the exchange, which spent up to three repair
+  datagrams per source symbol -- 75% of the wire for a 100 KB body on a 14%
+  erasure path, against 21% for the same body sent at once. Source symbols are
+  still sent immediately; only their tail protection waits, for one fortieth
+  of the round trip and never more than 5 ms.
+- The adaptive QUIC preference window (`--fallback-grace-rtt-factor`) now
+  scales the connection's measured round trip rather than how long the last
+  dial took. A fresh dial is a handshake and an authentication, several round
+  trips, so after any cold dial the window sat at its 30 second ceiling and
+  every request made while the pool was down waited that long for QUIC with a
+  TCP lane already established; a 200 ms path now gets 3.2 seconds.
+- What a path model remembers between connections -- its erasure rate, burst
+  factor and minimum round trip -- is forgotten after 10 minutes with nothing
+  reporting. A gateway keeps one model per client address for the life of its
+  process, so a client returning hours later was seeded with the measurements
+  of its previous visit, including a round trip floor that only ever moved
+  down.
+- The client starts accepting SOCKS connections after at most 3 seconds of
+  path measurement at startup, instead of after the measurement finishes. On a
+  gateway that was slow to answer, the measurement ran to its own 20 second
+  timeout while browser connections queued unanswered; it now continues in the
+  background and the first flows share its handshake.
+- A pooled QUIC connection that sends and hears nothing back for four round
+  trips (at least one second) stops receiving new flows, and a replacement is
+  dialed at once; if it stays silent for four times that it is closed, so the
+  flows still on it fail in seconds and are retried on the replacement.
+  Acknowledgements, which a peer never answers, are not counted as unanswered
+  sends. A connection whose path had gone away -- a NAT rebinding, a blocked
+  port -- used to carry every new request until QUIC's 15 second idle timeout,
+  so a page load in that window hung for all of it.
+- A chunk that a lane took while its data was going over the stream, but whose
+  bytes reached the wire as a coded datagram because the coding plan or the
+  flow's class changed while it waited in the lane's queue, is now re-issued
+  when that datagram is lost. Its attempt used to remember the answer the lane
+  gave when it took the chunk, so the scheduler believed it was on a stream and
+  never offered it to its own lane again: a single-lane flow then waited for a
+  second lane or its whole 45 second progress budget, which looked like a page
+  that loaded part of a response and then hung.
+
+## v0.11.0 - 2026-10-25
+
+### Added
+
+- The QUIC preference window (`--fallback-grace`) now scales with the observed
+  path round-trip time instead of being a fixed 2s, so a high-RTT or multi-hop
+  path gets a window its QUIC handshake can actually complete while a fast
+  single-hop link keeps the snappy default. `--fallback-grace-rtt-factor` and
+  `--fallback-grace-max` tune the scaling and its cap. The "QUIC preference
+  window elapsed" message is now logged at info level, so a flow riding TCP
+  because QUIC lost the race is visible instead of silent.
+- The provider manifest accepts optional per-provider `transport` ("auto",
+  "quic", or "tcp") and `fallbackGrace` fields that override the client-wide
+  flags for that provider. A provider reached through two or more relays can
+  select TCP and a bounded first-flow latency without changing the fast
+  single-hop providers in the same manifest.
+- New `queqiaod relay install` provisions relay proxies so a "CN" or "HK" hop
+  no longer needs hand-written systemd units. It renders and installs a
+  TCP+UDP forwarder (`queqiaod relay run`) for the queqiao channel, or a
+  socket-activated systemd-socket-proxyd unit for a plain TCP/VLESS leg, from
+  flags or a whole-host manifest. `relay uninstall` and `relay status` manage
+  them, and `--dry-run` prints the units without writing.
+
+### Security
+
+- Builds use Go 1.26.10, which fixes GO-2026-6809, a crypto/x509 issue that
+  distrusted compromised intermediate certificates. The previous toolchain left
+  queqiao's certificate verification affected.
+
+## v0.10.0 - 2026-10-19
+
+### Fixed
+
+- Keep reverse-direction ACKs readable when application delivery fills the
+  receive event queue, using a bounded overflow queue. Frame-write deadlines
+  now include writer-lock waits and cancellation interrupts blocked writes.
+  Repeated selective ACKs no longer reset the stall detector, and ranges beyond
+  sent data are rejected. Outstanding work shares one 45-second no-progress
+  budget across recovery attempts; blocked application writes have the same
+  budget, renewed on partial progress. Idle connections are unaffected.
+
+  Remove the extra exponential stall-rescue backoff and allow immediate AUTO
+  TCP handoff after a QUIC rescue race encounters lane-capacity refusals.
+  Suspected stalled lanes can be replaced without waiting for the young-lane
+  protection interval. Memory bounds and healthy racing-lane protection remain.
+
+  Stop and join the previous UDP relay reader before publishing its socket for
+  resumption, preventing it from consuming replies meant for the replacement.
+
+  Do not race a rescue JOIN against an unconfirmed optimistic OPEN. Remote
+  RESET and full-close cancellation bypass paused application delivery.
+- Keep ACK recovery progressing on reused, bidirectional connections. Replayed
+  DATA re-emits the cumulative ACK, new lanes receive the current ACK state,
+  and ACK writes prefer lanes that are not suspected stalled. Ordinary ACKs no
+  longer wait behind blocked application delivery. Already-delivered replay
+  ending exactly at the receive cursor no longer consumes the reassembly
+  window; segments crossing that cursor are rejected as overlaps.
+
+## v0.9.0 - 2026-10-17
+
+### Fixed
+
+- Acknowledged application messages no longer trigger lane rescue merely because
+  no response arrives within three round trips. The watchdog now requires
+  outstanding transport delivery, avoiding repeated recovery for slow origins,
+  one-way messages and quiet browser connections. Recovery races only QUIC
+  JOINs; an irreversible TCP handoff starts after the QUIC phase fails, so a
+  losing TCP attempt cannot retire the client's winning QUIC lane. Cancelling a
+  recovery attempt also interrupts its JOIN handshake instead of leaving it
+  blocked until the handshake timeout.
+  Delayed replay of already-delivered bytes after FIN is acknowledged instead
+  of aborting a completed response; data extending past FIN remains an error.
+
+### Security
+
+- Update the desktop, server, and mobile build toolchains to Go 1.26.9 and
+  upgrade golang.org/x/net to v0.60.0 with its companion dependencies to address
+  upstream security vulnerabilities.
+
 ## v0.8.0 - 2026-09-19
 
 ### Added

@@ -1,23 +1,16 @@
 # Deployment guide
 
 > [!NOTE]
-> **Status:** Current operational guide for public protocol 1
+> **Status:** Current operational guide for public protocol 2
 > **Last reviewed:** 2026-08-21
 
 This guide takes you from an empty host to a working paired deployment: a
 provider gateway, one-time user enrollment, a desktop SOCKS client, and
 Clash/mihomo integration. It also covers multi-provider clients, service
-operation, upgrades, and rollback. Protocol 1 is the only supported wire
+operation, upgrades, and rollback. Protocol 2 is the only supported wire
 protocol, so client and server must be upgraded together.
 
-**Download the binary first:** [latest release](https://github.com/bojieli/queqiao/releases/latest), or the
-per-platform links in the
-[README](../README.md#platform-availability). Every release publishes
-reproducible archives for Linux, macOS, and Windows on amd64 and arm64, so a
-normal deployment has no build step; check what you downloaded against the
-release's `SHA256SUMS` before running it. [Build from
-source](../README.md#build-from-source) only to develop or to run somewhere no
-archive covers.
+Use a gateway and client from the same wire version. The v0.12.2 release uses v1; use its tagged installers and documentation when deploying those binaries. For v2, build both endpoints from this revision or use a release whose binary reports `wire=2`. Verify downloaded archives against the release's `SHA256SUMS`. See the [release downloads](https://github.com/bojieli/queqiao/releases) and [source build instructions](../README.md#build-from-source).
 
 For a quick overview, start with the [repository README](../README.md). Use
 [known limitations](KNOWN-LIMITATIONS.md) to check whether the paired-gateway
@@ -73,7 +66,7 @@ queqiaod service install --profile "$PROFILE"
 
 Both scripts take `--dry-run`, use `--binary PATH` when you have a reviewed
 release artifact instead of a source tree, and refuse any binary that does not
-report `wire=1`.
+report `wire=2`.
 
 The one thing `install-server.sh` will not do twice is create a provider trust
 root. Re-running it against an initialized state directory stops before
@@ -113,7 +106,7 @@ sudo install -m 0755 ./queqiaod /usr/local/bin/queqiaod
 /usr/local/bin/queqiaod --version
 ```
 
-The output must contain `wire=1`. Create a dedicated account once:
+The output must contain `wire=2`. Create a dedicated account once:
 
 ```sh
 sudo useradd --system --user-group \
@@ -287,6 +280,33 @@ from their import screens; the code goes to standard error so standard output
 stays the bare URI and is still safe to pipe. A portal may capture that value
 or render it as a QR code without translating any fields. Do not render it
 through a web QR generator, which would receive the credential.
+
+A gateway reached through relays or more than one address can issue one
+invitation per route in a single run. Each `--path NAME=HOST:PORT` produces its
+own one-time invitation, labelled NAME, that dials HOST:PORT but pins this
+gateway's root, so the route decides only where the client connects, never whom
+it trusts. An empty NAME or HOST:PORT keeps the provider's own. The invitations
+are printed one per line, and the iOS app takes them all in one paste:
+
+```sh
+sudo -u queqiao /usr/local/bin/queqiaod provider invite \
+  --state /var/lib/queqiao/provider \
+  --user alice \
+  --path gateway= \
+  --path gateway-hk=relay-hk.example:12548 \
+  --path gateway-cn=relay-cn.example:12548
+```
+
+Every `--path` is checked before any token is issued, so a run with an invalid
+or repeated `--path` issues nothing; a storage failure part-way through leaves
+the invitations already printed valid. The gateway records each invitation's
+route and answers enrollment with it, so the enrolled profile keeps dialing
+that route, and clients already in the field accept it unchanged. A release
+older than the one that added `--path` cannot read provider state holding a
+path invitation record. Outstanding ones can be revoked, but a consumed one is
+kept for seven days so an interrupted enrollment can be retried, so a rollback
+past that release must wait seven days after the last enrollment through a
+path, or not use `--path` meanwhile.
 
 Audit or revoke unused invitations without printing their tokens:
 
@@ -545,36 +565,12 @@ more important than provider order.
 
 ## Upgrade an existing deployment
 
-Protocol 1 deliberately has no shared-secret or wire-compatibility mode. An old
-client cannot use a new server, and a new client cannot use an old server.
-Replacing a service on the same endpoint therefore requires a brief coordinated
-restart; existing flows cannot survive the protocol boundary.
+For a v1 to v2 upgrade, keep the current gateway and clients together until the replacement pair is ready. TCP and QUIC both reject mixed wire versions at TLS negotiation. A live connection stays on the pair that accepted it.
 
-Use this order:
-
-1. Record the old client/server versions, arguments, listener, and a known-good
-   proxy request.
-2. Copy the old binaries, service definitions, client plist, and old credential
-   files into timestamped rollback directories. Do not overwrite them.
-3. Install the protocol-1 binary under its final path without restarting the
-   old service.
-4. Create `/var/lib/queqiao/provider`, add the user, and generate an invitation
-   while the old process still owns the public port.
-5. Install the new server unit and restart the gateway. Verify protocol 1,
-   TCP and UDP listeners, and loopback metrics before touching the client.
-6. Enroll with the new CLI. Its default `--local-address auto` bypasses a host
-   TUN; specify `if:en0` when the machine has multiple physical interfaces.
-7. Atomically install the new client binary and profile-based service arguments,
-   then restart the client service.
-8. Force a SOCKS request with `--noproxy ''`, confirm server flow counters and
-   QUIC or TCP lanes, and only then delete the consumed invitation copy.
-
-Generate the provider state beside the old credential files, not on top of
-them. If the new service fails before enrollment, restore the old server unit
-and binary. If it fails after the client changes, restore both client and
-server as one rollback; mixed protocol versions will never connect. Keep the
-new provider state and enrolled profile for diagnosis or a later retry unless
-they are known to be compromised.
+1. Record the current endpoints, versions, service arguments and a successful proxy request. Back up provider state and enrolled profiles with their permissions intact.
+2. Stage the v2 gateway and client on a separate endpoint. Use the appropriate provider identity and an enrolled profile for that endpoint. Enrollment and renewal formats are unchanged. Confirm both binaries report `wire=2`.
+3. Verify a TCP request and a UDP association through the v2 pair. Move new traffic to it, keeping the v1 pair available until existing connections drain.
+4. To roll back, direct new traffic to the v1 pair. If the gateway address must be reused, schedule an interruption and switch both ends together. Restore the matching client and gateway binaries if verification fails.
 
 ## User and device lifecycle
 
@@ -639,7 +635,7 @@ without redaction.
 
 | Symptom | Action |
 |---|---|
-| `does not support Queqiao enrollment` or `rejected Queqiao protocol 1` | Confirm the invitation endpoint, client/server `wire=1`, and that no old TLS service still owns the port. |
+| `does not support Queqiao enrollment` or `rejected Queqiao protocol 2` | Confirm the invitation endpoint, client/server `wire=2`, and that no old TLS service still owns the port. |
 | `more than one physical IPv4 address is active` | Choose the intended uplink with `--local-address if:NAME`; use the same value for enroll and client. |
 | `interface … has no active IPv4 address` | Correct the interface name or connect it before retrying. The saved enrollment draft remains reusable. |
 | Enrollment reports a pinned-identity error | The URI belongs to another provider, the provider state was replaced, or traffic is intercepted. Never bypass pin verification. |

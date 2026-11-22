@@ -155,8 +155,8 @@ func serverLaneBudget(reserveControl bool) int {
 const laneJoinAdmissionTimeout = laneDeadPathDetection
 
 // Lane admission refusals are typed so the join handler can answer with the
-// reset code matching how permanent the refusal is. The client retries the
-// ceiling answer forever by design, so only the genuine ceiling may carry
+// reset code matching how permanent the refusal is. The client may retry the
+// ceiling answer or hand off to TCP, so only the genuine ceiling may carry
 // ResetFlowLimit; answers that cannot change during the flow's life must not
 // wear it.
 var (

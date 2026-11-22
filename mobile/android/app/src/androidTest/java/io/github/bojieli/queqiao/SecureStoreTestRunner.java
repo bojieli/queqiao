@@ -27,7 +27,18 @@ public final class SecureStoreTestRunner extends Instrumentation {
                 new NamedCheck("localNetworkRoutePolicy", this::testLocalNetworkRoutePolicy),
                 new NamedCheck("connectionProbeWireFormat", this::testConnectionProbeWireFormat),
                 new NamedCheck("vpnExclusionReadsTheDefaultNetwork", this::testVpnExclusionReadsTheDefaultNetwork),
-                new NamedCheck("listenPortCollisionIsNamed", this::testListenPortCollisionIsNamed)
+                new NamedCheck("listenPortCollisionIsNamed", this::testListenPortCollisionIsNamed),
+                new NamedCheck("invitationBatchExtractsEveryInvitation", this::testInvitationBatchExtractsEveryInvitation),
+                new NamedCheck("invitationBatchValidatesWithTheCore", this::testInvitationBatchValidatesWithTheCore),
+                new NamedCheck("invitationBatchLabelsFromThePayload", this::testInvitationBatchLabelsFromThePayload),
+                new NamedCheck("invitationBatchSummariesAndTitles", this::testInvitationBatchSummariesAndTitles),
+                new NamedCheck("invitationQueueSkipsDuplicates", this::testInvitationQueueSkipsDuplicates),
+                new NamedCheck("importerResumesFirstAndDequeuesAfterSave", this::testImporterResumesFirstAndDequeuesAfterSave),
+                new NamedCheck("importerNeverOverwritesADraft", this::testImporterNeverOverwritesADraft),
+                new NamedCheck("importerPrepareFailureKeepsTheInvitation", this::testImporterPrepareFailureKeepsTheInvitation),
+                new NamedCheck("importerCompleteFailureKeepsTheDraft", this::testImporterCompleteFailureKeepsTheDraft),
+                new NamedCheck("importerRequiresADeviceName", this::testImporterRequiresADeviceName),
+                new NamedCheck("importerProcessesOnlyItsSnapshot", this::testImporterProcessesOnlyItsSnapshot)
         };
         for (int index = 0; index < checks.length; index++) {
             NamedCheck check = checks[index];
@@ -47,7 +58,8 @@ public final class SecureStoreTestRunner extends Instrumentation {
         }
         Bundle result = new Bundle();
         result.putString("stream",
-                "\nOK (8 mobile storage, routing, connectivity, and protocol-boundary checks)\n");
+                "\nOK (" + checks.length
+                        + " mobile storage, routing, connectivity, invitation, and protocol-boundary checks)\n");
         finish(Activity.RESULT_OK, result);
     }
 
@@ -241,6 +253,355 @@ public final class SecureStoreTestRunner extends Instrumentation {
         Exception other = new java.io.IOException("certificate has expired");
         require(QueqiaoProxyService.listenFailure(1080, other) == other,
                 "an unrelated listener failure was rewritten");
+    }
+
+    /**
+     * A structurally valid invitation the core accepts. Nothing is enrolled by
+     * these checks, so the identifiers and token need only be well formed.
+     */
+    private static String testInvitation(String name, String endpoint, int seed) throws Exception {
+        org.json.JSONObject payload = new org.json.JSONObject();
+        payload.put("v", 1);
+        payload.put("name", name);
+        payload.put("provider", "a".repeat(32));
+        payload.put("endpoint", endpoint);
+        payload.put("gateway", "b".repeat(32));
+        payload.put("root", base64Url(filled(1)));
+        payload.put("token", base64Url(filled(seed)));
+        payload.put("expires", java.time.Instant.now()
+                .plusSeconds(3600)
+                .truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+                .toString());
+        return "queqiao://enroll/"
+                + base64Url(payload.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private static byte[] filled(int value) {
+        byte[] bytes = new byte[32];
+        java.util.Arrays.fill(bytes, (byte) value);
+        return bytes;
+    }
+
+    private static String base64Url(byte[] bytes) {
+        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    /** Mirrors InvitationBatchTests in the iOS app's InvitationScanTests.swift. */
+    private void testInvitationBatchExtractsEveryInvitation() throws Exception {
+        String first = testInvitation("provider-a", "198.51.100.1:12540", 2);
+        String second = testInvitation("provider-b", "203.0.113.9:12548", 3);
+        String text = "provider-a: " + first + "\n\n\"" + second + "\",\n" + first + "\nnot an invitation";
+        require(InvitationBatch.extract(text).equals(java.util.Arrays.asList(first, second)),
+                "one paste did not yield every invitation, in order, once");
+        require(InvitationBatch.extract("(" + first + ");[" + second + "]|").equals(
+                        java.util.Arrays.asList(first, second)),
+                "brackets, semicolons, or pipes were kept as part of an invitation");
+        require(InvitationBatch.extract("vless://example\nhttps://example.com").isEmpty(),
+                "unrelated links were taken as invitations");
+        require(InvitationBatch.extract(null).isEmpty(), "a missing text yielded an invitation");
+        require(InvitationBatch.extract("Your invitation is " + first + ".").equals(
+                        java.util.Collections.singletonList(first)),
+                "the full stop ending a sentence was kept as part of the invitation");
+        require(InvitationBatch.extract("`" + first + "` and **" + second + "**").equals(
+                        java.util.Arrays.asList(first, second)),
+                "Markdown backticks or asterisks were kept as part of an invitation");
+    }
+
+    private void testInvitationBatchValidatesWithTheCore() throws Exception {
+        String valid = testInvitation("provider-c", "198.51.100.2:12540", 4);
+        InvitationBatch.Evaluation result = InvitationBatch.evaluate(
+                valid + "\nqueqiao://enroll/not-base64!", InvitationBatch.CORE);
+        require(result.accepted.equals(java.util.Collections.singletonList(valid)),
+                "the core-valid invitation was not accepted");
+        require(result.rejected == 1, "the invalid candidate was not counted: " + result.rejected);
+    }
+
+    private void testInvitationBatchLabelsFromThePayload() throws Exception {
+        String uri = testInvitation("provider-d", "203.0.113.7:12542", 5);
+        InvitationBatch.QueuedInvitation item = InvitationBatch.describe(uri);
+        require("provider-d".equals(item.name), "the provider name was not read: " + item.name);
+        require("203.0.113.7:12542".equals(item.endpoint), "the endpoint was not read: " + item.endpoint);
+        require(uri.equals(item.uri), "the label changed the invitation");
+
+        InvitationBatch.QueuedInvitation fallback = InvitationBatch.describe("queqiao://enroll/%%%");
+        require(InvitationBatch.FALLBACK_NAME.equals(fallback.name) && fallback.endpoint.isEmpty(),
+                "an undecodable payload did not fall back to the neutral label");
+        String notObject = "queqiao://enroll/"
+                + base64Url("[1]".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        require(InvitationBatch.FALLBACK_NAME.equals(InvitationBatch.describe(notObject).name),
+                "a payload that is not an object did not fall back to the neutral label");
+    }
+
+    private void testInvitationBatchSummariesAndTitles() {
+        require("The clipboard holds no Queqiao invitation.".equals(InvitationBatch.pasteSummary(0, 0, 0)),
+                "an empty paste was not named");
+        require("Added 1 invitation.".equals(InvitationBatch.pasteSummary(1, 0, 0)),
+                "a single invitation was not named");
+        require("Added 9 invitations; 2 already queued; 1 could not be used."
+                        .equals(InvitationBatch.pasteSummary(9, 2, 1)),
+                "a mixed paste was not summarized in one sentence");
+        require("The text holds no Queqiao invitation.".equals(InvitationBatch.typedTextError(0, 0, 0)),
+                "typed text without an invitation was not named");
+        require("The text holds no usable Queqiao invitation; 2 could not be used."
+                        .equals(InvitationBatch.typedTextError(0, 0, 2)),
+                "typed text with only unusable invitations was not named");
+        require("Added 1 invitation; 1 could not be used.".equals(InvitationBatch.typedTextError(1, 0, 1)),
+                "typed text with a mix did not say what was queued");
+        require("Import profile".equals(InvitationBatch.importTitle(1, false)), "single import title changed");
+        require("Import 3 profiles".equals(InvitationBatch.importTitle(3, false)), "batch import title changed");
+        require("Resume import".equals(InvitationBatch.importTitle(1, true)), "resume title changed");
+        require("Import 2 profiles".equals(InvitationBatch.importTitle(2, true)),
+                "a draft plus a queued invitation was not counted as two");
+    }
+
+    private void testInvitationQueueSkipsDuplicates() throws Exception {
+        InvitationBatch.Queue queue = new InvitationBatch.Queue();
+        String first = testInvitation("provider-a", "198.51.100.1:12540", 6);
+        String second = testInvitation("provider-c", "198.51.100.2:12540", 7);
+        require(queue.add(java.util.Arrays.asList(first, second)) == 2, "new invitations were not queued");
+        require(queue.add(java.util.Arrays.asList(second, first)) == 0, "a queued invitation was queued again");
+        java.util.List<InvitationBatch.QueuedInvitation> items = queue.snapshot();
+        require(items.size() == 2
+                        && "provider-a".equals(items.get(0).name)
+                        && "provider-c".equals(items.get(1).name),
+                "the queue lost its order or its labels");
+        require(queue.remove(first) && !queue.contains(first) && second.equals(queue.first().uri),
+                "removing an entry did not leave the next one first");
+    }
+
+    /** An in-memory draft store that records what the import loop did, in order. */
+    private static final class FakeStore implements InvitationImporter.Store {
+        final java.util.List<String> events = new java.util.ArrayList<>();
+        final InvitationBatch.Queue queue;
+        String draft;
+
+        FakeStore(InvitationBatch.Queue queue, String draft) {
+            this.queue = queue;
+            this.draft = draft;
+        }
+
+        @Override
+        public boolean hasDraft() {
+            return draft != null;
+        }
+
+        @Override
+        public String draft() {
+            return draft;
+        }
+
+        @Override
+        public void saveDraft(String value) {
+            // The invitation must still be queued when its draft is saved.
+            String uri = value.substring("draft:".length(), value.lastIndexOf(':'));
+            events.add("save " + uri + (queue.contains(uri) ? " queued" : " dequeued"));
+            draft = value;
+        }
+
+        @Override
+        public void discardDraft() {
+            events.add("discard " + draft);
+            draft = null;
+        }
+
+        @Override
+        public void importProfile(String profile) {
+            events.add("import " + profile);
+        }
+    }
+
+    /** Stands in for the Go core; fails where told to. */
+    private static final class FakeCore implements InvitationImporter.Core {
+        final java.util.List<String> events;
+        final InvitationBatch.Queue queue;
+        String failPrepare;
+        boolean failComplete;
+        Runnable duringPrepare;
+
+        FakeCore(FakeStore store) {
+            this.events = store.events;
+            this.queue = store.queue;
+        }
+
+        @Override
+        public void validate(String invitation) {
+        }
+
+        @Override
+        public String prepare(String invitation, String deviceName) throws Exception {
+            events.add("prepare " + invitation);
+            if (duringPrepare != null) {
+                duringPrepare.run();
+            }
+            if (invitation.equals(failPrepare)) {
+                throw new java.io.IOException("prepare failed");
+            }
+            return "draft:" + invitation + ":" + deviceName;
+        }
+
+        @Override
+        public String complete(String draft) throws Exception {
+            events.add("complete " + draft);
+            if (failComplete) {
+                throw new java.io.IOException("complete failed");
+            }
+            return "profile(" + draft + ")";
+        }
+    }
+
+    private static final String INVITE_A = "queqiao://enroll/a";
+    private static final String INVITE_B = "queqiao://enroll/b";
+    private static final String INVITE_C = "queqiao://enroll/c";
+
+    private static InvitationImporter.Result runImport(
+            FakeStore store, FakeCore core, java.util.List<String> invitations, String name) {
+        return InvitationImporter.enroll(store, core, store.queue, invitations, name, message -> { });
+    }
+
+    private void testImporterResumesFirstAndDequeuesAfterSave() {
+        InvitationBatch.Queue queue = new InvitationBatch.Queue();
+        queue.add(java.util.Arrays.asList(INVITE_A, INVITE_B));
+        FakeStore store = new FakeStore(queue, "draft:old:Phone");
+        FakeCore core = new FakeCore(store);
+        InvitationImporter.Result result = runImport(store, core, java.util.Arrays.asList(INVITE_A, INVITE_B), "Phone");
+        require(result.failure == null && result.imported == 3 && result.total == 3,
+                "the batch did not import the draft and both invitations: " + result.failure);
+        require(store.events.equals(java.util.Arrays.asList(
+                        "complete draft:old:Phone", "import profile(draft:old:Phone)", "discard draft:old:Phone",
+                        "prepare " + INVITE_A, "save " + INVITE_A + " queued",
+                        "complete draft:" + INVITE_A + ":Phone",
+                        "import profile(draft:" + INVITE_A + ":Phone)", "discard draft:" + INVITE_A + ":Phone",
+                        "prepare " + INVITE_B, "save " + INVITE_B + " queued",
+                        "complete draft:" + INVITE_B + ":Phone",
+                        "import profile(draft:" + INVITE_B + ":Phone)", "discard draft:" + INVITE_B + ":Phone")),
+                "the batch did not resume first and dequeue only after each save: " + store.events);
+        require(queue.size() == 0, "an imported invitation stayed queued");
+    }
+
+    private void testImporterNeverOverwritesADraft() {
+        // A draft that cannot be completed stops the batch before any
+        // queued invitation is prepared over it.
+        InvitationBatch.Queue queue = new InvitationBatch.Queue();
+        queue.add(java.util.Collections.singletonList(INVITE_A));
+        FakeStore store = new FakeStore(queue, "draft:old:Phone");
+        FakeCore core = new FakeCore(store);
+        core.failComplete = true;
+        InvitationImporter.Result result = runImport(store, core, java.util.Collections.singletonList(INVITE_A), "Phone");
+        require(result.failure != null && "draft:old:Phone".equals(store.draft),
+                "a pending draft was replaced");
+        require(!store.events.contains("prepare " + INVITE_A) && queue.contains(INVITE_A),
+                "an invitation was prepared over a pending draft");
+
+        // The per-invitation check reads the store, not the state at start:
+        // a draft that appears mid-batch is refused, not overwritten.
+        InvitationBatch.Queue fresh = new InvitationBatch.Queue();
+        fresh.add(java.util.Collections.singletonList(INVITE_B));
+        FakeStore racing = new FakeStore(fresh, "draft:other:Phone");
+        FakeCore racingCore = new FakeCore(racing);
+        InvitationImporter.Store appearing = new InvitationImporter.Store() {
+            private boolean asked;
+
+            @Override
+            public boolean hasDraft() {
+                boolean answer = asked && racing.hasDraft();
+                asked = true;
+                return answer;
+            }
+
+            @Override
+            public String draft() {
+                return racing.draft();
+            }
+
+            @Override
+            public void saveDraft(String draft) {
+                racing.saveDraft(draft);
+            }
+
+            @Override
+            public void discardDraft() {
+                racing.discardDraft();
+            }
+
+            @Override
+            public void importProfile(String profile) {
+                racing.importProfile(profile);
+            }
+        };
+        InvitationImporter.Result guarded = InvitationImporter.enroll(
+                appearing, racingCore, fresh, java.util.Collections.singletonList(INVITE_B), "Phone", message -> { });
+        require(guarded.failure instanceof IllegalStateException
+                        && InvitationImporter.PENDING_DRAFT.equals(guarded.failure.getMessage()),
+                "a draft that appeared mid-batch was not refused: " + guarded.failure);
+        require("draft:other:Phone".equals(racing.draft) && racing.events.isEmpty() && fresh.contains(INVITE_B),
+                "a draft that appeared mid-batch was overwritten: " + racing.events);
+    }
+
+    private void testImporterPrepareFailureKeepsTheInvitation() {
+        InvitationBatch.Queue queue = new InvitationBatch.Queue();
+        queue.add(java.util.Arrays.asList(INVITE_A, INVITE_B));
+        FakeStore store = new FakeStore(queue, null);
+        FakeCore core = new FakeCore(store);
+        core.failPrepare = INVITE_A;
+        InvitationImporter.Result result = runImport(store, core, java.util.Arrays.asList(INVITE_A, INVITE_B), "Phone");
+        require(result.failure != null && result.imported == 0, "a failed prepare was not reported");
+        require(store.draft == null, "a failed prepare left a draft");
+        require(queue.contains(INVITE_A) && queue.contains(INVITE_B),
+                "a failed prepare dropped an invitation from the queue");
+        require(!store.events.contains("prepare " + INVITE_B), "the batch went on after a failure");
+    }
+
+    private void testImporterCompleteFailureKeepsTheDraft() {
+        InvitationBatch.Queue queue = new InvitationBatch.Queue();
+        queue.add(java.util.Arrays.asList(INVITE_A, INVITE_B));
+        FakeStore store = new FakeStore(queue, null);
+        FakeCore core = new FakeCore(store);
+        core.failComplete = true;
+        InvitationImporter.Result result = runImport(store, core, java.util.Arrays.asList(INVITE_A, INVITE_B), "Phone");
+        require(result.failure != null && result.imported == 0, "a failed exchange was not reported");
+        require(("draft:" + INVITE_A + ":Phone").equals(store.draft), "the failed exchange's draft was lost");
+        require(!queue.contains(INVITE_A) && queue.contains(INVITE_B),
+                "the drafted invitation stayed queued, or the next one left the queue");
+
+        core.failComplete = false;
+        InvitationImporter.Result resumed = runImport(store, core, java.util.Collections.singletonList(INVITE_B), "Phone");
+        require(resumed.failure == null && resumed.imported == 2 && store.draft == null && queue.size() == 0,
+                "the next batch did not resume the draft and then import the rest");
+    }
+
+    private void testImporterRequiresADeviceName() {
+        InvitationBatch.Queue queue = new InvitationBatch.Queue();
+        queue.add(java.util.Collections.singletonList(INVITE_A));
+        FakeStore store = new FakeStore(queue, "draft:old:Phone");
+        FakeCore core = new FakeCore(store);
+        InvitationImporter.Result result = runImport(store, core, java.util.Collections.singletonList(INVITE_A), " ");
+        require(result.failure instanceof IllegalArgumentException
+                        && InvitationImporter.NAME_REQUIRED.equals(result.failure.getMessage()),
+                "a queued invitation was imported without a device name");
+        require(store.events.isEmpty() && "draft:old:Phone".equals(store.draft) && queue.contains(INVITE_A),
+                "the batch acted before refusing the missing name");
+
+        InvitationImporter.Result resumeOnly = runImport(store, core, java.util.Collections.emptyList(), "");
+        require(resumeOnly.failure == null && resumeOnly.imported == 1,
+                "resuming a draft alone needlessly required a device name");
+    }
+
+    private void testImporterProcessesOnlyItsSnapshot() {
+        InvitationBatch.Queue queue = new InvitationBatch.Queue();
+        queue.add(java.util.Arrays.asList(INVITE_A, INVITE_B));
+        FakeStore store = new FakeStore(queue, null);
+        FakeCore core = new FakeCore(store);
+        // A share arrives mid-batch, and the user removes B meanwhile.
+        core.duringPrepare = () -> {
+            queue.add(java.util.Collections.singletonList(INVITE_C));
+            queue.remove(INVITE_B);
+        };
+        InvitationImporter.Result result = runImport(store, core, java.util.Arrays.asList(INVITE_A, INVITE_B), "Phone");
+        require(result.failure == null && result.imported == 1 && result.total == 1,
+                "the batch did not import exactly its remaining snapshot: " + result.imported + "/" + result.total);
+        require(queue.snapshot().size() == 1 && INVITE_C.equals(queue.first().uri),
+                "an invitation queued mid-batch was imported without a new tap");
+        require(!store.events.contains("prepare " + INVITE_B), "a removed invitation was imported");
     }
 
     private void requireInvalidProbe(String encoded) throws Exception {

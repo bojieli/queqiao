@@ -61,19 +61,20 @@ func (t *ackTracker) Add(ranges [][2]uint64) bool {
 	defer t.mu.Unlock()
 	changed := false
 	for _, r := range ranges {
-		if r[1] <= r[0] || r[1] <= t.cumulative {
+		if t.coveredLocked(r[0], r[1]) {
 			continue
 		}
-		changed = changed || !t.coveredLocked(r[0], r[1])
+		changed = true
 		t.ranges = append(t.ranges, r)
+	}
+	if !changed {
+		return false
 	}
 	t.mergeLocked()
 	t.compactLocked()
-	if changed {
-		t.gen++
-		t.cond.Broadcast()
-	}
-	return changed
+	t.gen++
+	t.cond.Broadcast()
+	return true
 }
 
 // mergeLocked sorts and coalesces overlapping ranges so Covered is a scan

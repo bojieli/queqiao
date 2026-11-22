@@ -6,6 +6,8 @@ import (
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
+var errReceiveBacklog = errors.New("application receive window exhausted")
+
 // Queue data within the same byte/frame ceilings used for reassembly, while
 // the lane reader continues servicing reverse-direction ACKs. Delivery still
 // acknowledges bytes only after the application accepts them.
@@ -19,7 +21,7 @@ func (f *multipathFlow) queueInbound(event inboundEvent) bool {
 	if f.inboundCount >= f.memoryLimits.maxReceiveFrames || f.inboundBytes+uint64(n) > f.memoryLimits.maxReceiveBytes || !f.receiveMemory.TryAcquire(n) {
 		f.inboundMu.Unlock()
 		select {
-		case f.ackErr <- errors.New("application receive window exhausted"):
+		case f.ackErr <- errReceiveBacklog:
 		default:
 		}
 		return false

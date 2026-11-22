@@ -286,7 +286,7 @@ func TestRound2QueuedReliableChunkCannotTurnIntoDatagram(t *testing.T) {
 		t.Fatal(err)
 	}
 	if queued.onWritten != nil {
-		queued.onWritten()
+		queued.onWritten(true)
 	}
 	frame := waitAckFrame(t, capture)
 	if string(frame.Payload) != "payload" {
