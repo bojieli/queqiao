@@ -2328,9 +2328,8 @@ func (f *multipathFlow) replacementLogFields() []any {
 func (f *multipathFlow) noteReplacementAttempt() { f.replacementAttempts.Add(1) }
 
 // noteReplacementFailure records that one such attempt did not produce a lane.
-// Attempts without failures mean the dials are still outstanding; attempts
-// equal to failures mean the path is refusing to carry a handshake; no
-// attempts at all means nothing tried.
+// A non-failed attempt may have succeeded or may still be in flight when
+// the flow record is emitted. The peer's refusal is also a returned error.
 func (f *multipathFlow) noteReplacementFailure() { f.replacementFailures.Add(1) }
 
 // replacementDiagnostics reports what this flow's lane replacements did, for

@@ -164,20 +164,44 @@ Flow completion records also carry what the flow's lane replacements did:
 `lane_replacement_waits`, `lane_replacement_timeouts`, `lane_replacement_wait`,
 and `lanes_joined`. They are written on every flow record, not only on
 failures, because a replacement that succeeded is the control case for one that
-did not. A flow that never lost its last healthy lane reports zeroes. Both
+did not. A client flow counts its initial lane in `lanes_joined`; an established flow
+with no subsequent admission reports one. Both
 endpoints use the same names, so a client record and a gateway record about the
 same failure can be read side by side.
 
 `lane_replacement_attempts` and `lane_replacement_failures` say what the
-endpoint that opens replacements actually did, and are the pair that separates
-a client pool which will not rebuild from a path which will not carry a
-handshake. No attempts means nothing was dialled; attempts equal to failures
-means every dial was made and none completed; attempts above failures means
-dials are still outstanding. They are written by both endpoints under the same
-names, and a gateway reports zeroes because it opens nothing -- the replacement
-is the client's to send. `lanes_joined` cannot answer this on its own: a dial
-whose handshake never completes never reaches lane admission, so it leaves the
-record identical to a flow where nothing was tried.
+client did after losing its last lane. A QUIC attempt counts a recovery round,
+which may race several JOINs. TCP counts each replacement it launches. A round
+that returns an error increments failures. A difference between attempts and
+failures can therefore be a successful replacement or an outstanding attempt
+at the time the flow record was written. These counters exclude bundle
+widening and rescue of a suspected lane that is still open. The gateway does
+not initiate replacements.
+
+To compare the no-admission failures from issue #53 on a fresh client window,
+use the client's JSON-lines log. This groups flows by observable outcome and
+preserves records from older clients without counting missing counters as zero:
+
+```sh
+jq -nr '
+  reduce (inputs | select(.msg == "local flow ended with error" and
+    ((.error // "") | contains("lane replacement timeout")) and
+    .lanes_joined == 1)) as $f ({};
+    (if ($f.lane_replacement_attempts == null or $f.lane_replacement_failures == null)
+     then "counters missing"
+     elif $f.lane_replacement_attempts == 0 then "no zero-lane attempt"
+     elif $f.lane_replacement_attempts == $f.lane_replacement_failures
+     then "all attempts returned errors"
+     else "inspect attempt outcomes" end) as $group |
+    .[$group] += 1)
+' client.jsonl
+```
+
+Correlate the original client records with `lane recovery unavailable` by
+`flow_id` and time window. An error can be a timeout, dial failure, or peer
+refusal; the counts alone do not identify a keepalive or path failure.
+Record build IDs, window duration, and total completed and failed flows
+alongside the groups before comparing windows.
 
 `lane_replacement_waits` counts waiters, not graces. The flow's run loop, its
 frame and control writers, and its acknowledgement loop all wait for a missing
