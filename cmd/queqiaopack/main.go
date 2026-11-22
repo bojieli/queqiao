@@ -556,7 +556,7 @@ func readLinkedModules(binaryPath string, moduleDirs map[string]string) ([]linke
 
 func moduleLicenseID(modulePath string) string {
 	switch modulePath {
-	case "github.com/andybalholm/brotli", "github.com/apernet/quic-go",
+	case "github.com/andybalholm/brotli", "github.com/apernet/quic-go", "github.com/bojieli/quic-go",
 		"github.com/skip2/go-qrcode":
 		return "MIT"
 	case "github.com/klauspost/compress", "github.com/refraction-networking/utls",

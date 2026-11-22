@@ -284,6 +284,14 @@ copy of its first frame behind OPEN on the reliable stream until OPEN_OK is
 observed. The receiver may briefly hold a bounded number of coded frames that
 arrive before their OPEN is processed.
 
+On a measured high-erasure path a sender may protect the beginning of an
+OPEN or path PROBE by letting QUIC repeat already packetized bytes on the
+same stream at offset zero. Each copy goes through normal QUIC congestion
+control. The receiver delivers the overlapping bytes once under QUIC's
+stream semantics. OPEN, OPEN_OK and their authorization and correlation
+rules stay the same. The sender still waits for the authenticated remote
+response to confirm the application exchange.
+
 ### 8.2 UDP association OPEN
 
 An OPEN payload beginning with the following exact five-byte marker creates a
@@ -466,12 +474,6 @@ Repair datagram (`kind = 1`):
 
 Transmission sequence, ESI, and RID advance independently modulo 2³². Unknown
 kinds and truncated datagrams are discarded.
-
-An implementation can send a zero-length QUIC DATAGRAM to elicit a
-transport ACK while a reliable stream exchange is pending on a measured
-lossy path. It carries no coding header, application frame, or destination.
-Receivers discard it under the rule above. A transport ACK does not
-acknowledge an OPEN or complete an application-level path check.
 
 ### 12.2 Source-symbol vector
 

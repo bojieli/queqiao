@@ -91,16 +91,18 @@ func (c *Client) verifyControlPath(ctx context.Context, g *controlQUICGeneration
 }
 
 func probeControlGeneration(ctx context.Context, g *controlQUICGeneration, budget time.Duration) error {
-	if stop := g.startLossPulse(ctx); stop != nil {
-		defer stop()
-	}
-	return probePooledQUIC(ctx, g.conn, budget)
+	return probePooledQUIC(ctx, g.conn, budget, g)
 }
 
-func probePooledQUIC(ctx context.Context, conn *quic.Conn, budget time.Duration) error {
+func probePooledQUIC(ctx context.Context, conn *quic.Conn, budget time.Duration, g *controlQUICGeneration) error {
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return err
+	}
+	if g.highErasure() {
+		if stop := g.protectPrefix(stream, protocol.HeaderSize+1); stop != nil {
+			defer stop()
+		}
 	}
 	outer := &quicStreamConn{stream: stream, conn: conn, closeConn: false}
 	defer outer.Close()
@@ -168,7 +170,7 @@ func (c *Client) verifyBulkPath(ctx context.Context, entry *bulkConn) error {
 	if c.probeBulkConnectionForTest != nil {
 		err = c.probeBulkConnectionForTest(probeCtx, entry, c.cfg.HandshakeTimeout)
 	} else {
-		err = probePooledQUIC(probeCtx, entry.conn, c.cfg.HandshakeTimeout)
+		err = probePooledQUIC(probeCtx, entry.conn, c.cfg.HandshakeTimeout, nil)
 	}
 	if err == nil {
 		c.bulkMu.Lock()
@@ -176,20 +178,6 @@ func (c *Client) verifyBulkPath(ctx context.Context, entry *bulkConn) error {
 		c.bulkMu.Unlock()
 	}
 	return err
-}
-
-const (
-	// At 50 per second these small, congestion-controlled datagrams provide
-	// fresh packet numbers for loss detection. An idle connection sends none.
-	lossPulseMaxDatagrams = 16
-	lossPulseInterval     = 20 * time.Millisecond
-	lossPulseDuration     = 320 * time.Millisecond
-	lossPulseRestart      = 400 * time.Millisecond
-)
-
-type controlLossPulse struct {
-	cancel  context.CancelFunc
-	waiters int
 }
 
 func (g *controlQUICGeneration) highErasure() bool {
@@ -200,82 +188,39 @@ func (g *controlQUICGeneration) highErasure() bool {
 	return state.Erasure >= .20 && state.ObservedSamples >= 50
 }
 
-// startLossPulse keeps one budget per authenticated connection, shared by
-// outstanding OPENs and the pre-borrow liveness proof. Transport ACKs do not
-// count as application proof. Only the normal proof echo or OPEN response does.
-func (g *controlQUICGeneration) startLossPulse(parent context.Context) func() {
-	if !g.highErasure() || parent.Err() != nil {
-		return nil
+// A generation starts with six copies and earns one every 40 ms. Even
+// simultaneous opens share that burst and rate. Account in copies before
+// scheduling: the QUIC packetizer separately charges wire bytes to congestion.
+type prefixRepairBudget struct {
+	last    time.Time
+	credits int
+}
+
+func (b *prefixRepairBudget) take(now time.Time) int {
+	const refill = 40 * time.Millisecond
+	if b.last.IsZero() {
+		b.last = now
+		b.credits = 6
+	} else if elapsed := now.Sub(b.last); elapsed >= refill {
+		earned := int(elapsed / refill)
+		b.credits = min(6, b.credits+earned)
+		b.last = b.last.Add(time.Duration(earned) * refill)
 	}
-	support := g.conn.ConnectionState().SupportsDatagrams
-	if !support.Local || !support.Remote {
+	copies := min(3, b.credits)
+	b.credits -= copies
+	return copies
+}
+
+// Caller has already observed severe outbound loss on this route.
+func (g *controlQUICGeneration) protectPrefix(stream quicBidiStream, size int) func() {
+	lane, ok := stream.(*quic.Stream)
+	if !ok {
 		return nil
 	}
 	g.probeMu.Lock()
-	pulse := g.lossPulse
-	if pulse == nil {
-		now := time.Now()
-		if now.Sub(g.lastPulse) < lossPulseRestart {
-			g.probeMu.Unlock()
-			return nil
-		}
-		ctx, cancel := context.WithTimeout(g.conn.Context(), lossPulseDuration)
-		pulse = &controlLossPulse{cancel: cancel}
-		g.lossPulse = pulse
-		g.lastPulse = now
-		go g.runLossPulse(ctx, pulse)
-	}
-	pulse.waiters++
+	copies := g.prefixBudget.take(time.Now())
 	g.probeMu.Unlock()
-
-	// The caller releases after its exchange; its own cancellation also
-	// stops waiting even if a read is still unwinding.
-	stop := context.AfterFunc(parent, func() { g.releaseLossPulse(pulse) })
-	return func() {
-		if stop() {
-			g.releaseLossPulse(pulse)
-		}
-	}
-}
-
-func (g *controlQUICGeneration) releaseLossPulse(pulse *controlLossPulse) {
-	g.probeMu.Lock()
-	defer g.probeMu.Unlock()
-	if g.lossPulse != pulse {
-		return
-	}
-	pulse.waiters--
-	if pulse.waiters == 0 {
-		pulse.cancel()
-	}
-}
-
-func (g *controlQUICGeneration) runLossPulse(ctx context.Context, pulse *controlLossPulse) {
-	defer func() {
-		g.probeMu.Lock()
-		if g.lossPulse == pulse {
-			g.lossPulse = nil
-		}
-		g.probeMu.Unlock()
-		pulse.cancel()
-	}()
-	tick := time.NewTicker(lossPulseInterval)
-	defer tick.Stop()
-	for range lossPulseMaxDatagrams {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-			if ctx.Err() != nil {
-				return
-			}
-			// SendDatagram can wait for QUIC queue space. Only this worker
-			// can wait. It retains the generation slot until it returns.
-			if err := g.conn.SendDatagram(nil); err != nil {
-				return
-			}
-		}
-	}
+	return lane.ProtectInitialPrefix(size, copies)
 }
 
 // New borrowers leave a silent generation immediately. Its original OPEN
@@ -286,18 +231,26 @@ type pendingOpen struct {
 	stop     func()
 }
 
-func (s *controlPoolStreamConn) trackOpen(deadline time.Time) {
+func (s *controlPoolStreamConn) trackOpen(deadline time.Time, size int) bool {
 	g := s.generation
-	if !g.highErasure() {
-		return
+	// Rotation detaches under this same lock. Before admission the caller
+	// can safely discard its unused stream. After admission the existing
+	// borrow owns exactly one OPEN and, on a lossy route, its drain deadline.
+	s.owner.quicMu.Lock()
+	defer s.owner.quicMu.Unlock()
+	if s.owner.quicGeneration != g || g.conn.Context().Err() != nil || g.liveness.silent(time.Now()) {
+		return false
 	}
-	stop := g.startLossPulse(g.conn.Context())
-	g.probeMu.Lock()
-	if g.pendingOpens == nil {
-		g.pendingOpens = make(map[*controlPoolStreamConn]pendingOpen)
+	if g.highErasure() {
+		stop := g.protectPrefix(s.stream, size)
+		g.probeMu.Lock()
+		if g.pendingOpens == nil {
+			g.pendingOpens = make(map[*controlPoolStreamConn]pendingOpen)
+		}
+		g.pendingOpens[s] = pendingOpen{deadline: deadline, stop: stop}
+		g.probeMu.Unlock()
 	}
-	g.pendingOpens[s] = pendingOpen{deadline, stop}
-	g.probeMu.Unlock()
+	return true
 }
 
 func (s *controlPoolStreamConn) finishOpen() {

@@ -51,7 +51,12 @@ case "$ARTIFACT" in
         done
 
         go version -m "$AUDIT_DIR/jni/arm64-v8a/libgojni.so" >"$AUDIT_DIR/buildinfo"
-        awk '$1 == "dep" && $2 != "github.com/bojieli/queqiao" && $2 != "github.com/bojieli/queqiao/mobile/core" { print $2 "@" $3 }' \
+        # Go prints a replacement on the line following its import identity.
+        awk '
+            $1 == "dep" { if (pending) print pending; pending = ""; if ($2 != "github.com/bojieli/queqiao" && $2 != "github.com/bojieli/queqiao/mobile/core") pending = $2 "@" $3 }
+            $1 == "=>" && pending { pending = $2 "@" $3 }
+            END { if (pending) print pending }
+        ' \
             "$AUDIT_DIR/buildinfo" | sort -u >"$AUDIT_DIR/actual"
         grep -Eq '^[[:space:]]*build[[:space:]]+-trimpath=true$' "$AUDIT_DIR/buildinfo" || {
             echo "Android mobile core was built without -trimpath" >&2
@@ -67,9 +72,14 @@ case "$ARTIFACT" in
         lipo "$FRAMEWORK_BINARY" -thin arm64 -output "$AUDIT_DIR/mobilecore.a"
         (cd "$AUDIT_DIR" && ar -x mobilecore.a)
         strings "$AUDIT_DIR/go.o" >"$AUDIT_DIR/buildinfo"
+        # The object contains both identities for a replaced module. Keep the
+        # actual pinned source when comparing to the reviewed lock.
+        (cd "$MOBILE_DIR/core" && go list -m -f '{{if .Replace}}{{.Path}}@{{.Version}}{{end}}' all) |
+            sed '/^$/d' >"$AUDIT_DIR/replaced"
         awk 'previous ~ /^[A-Za-z0-9.-]+\.[A-Za-z0-9.-]+\// && $0 ~ /^v[0-9]/ { print previous "@" $0 } { previous = $0 }' \
             "$AUDIT_DIR/buildinfo" |
             sed '/^github.com\/bojieli\/queqiao@/d; /^github.com\/bojieli\/queqiao\/mobile\/core@/d' |
+            awk 'FILENAME == ARGV[1] { skip[$0] = 1; next } !($0 in skip)' "$AUDIT_DIR/replaced" - |
             sort -u >"$AUDIT_DIR/actual"
         grep -Fqx -- '-trimpath=true' "$AUDIT_DIR/buildinfo" || {
             echo "iOS mobile core was built without -trimpath" >&2

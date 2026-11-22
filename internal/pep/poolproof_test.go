@@ -367,3 +367,57 @@ func TestPooledConnectionFailureRetiresEvenAfterStreamEOF(t *testing.T) {
 		t.Fatal("late stream failure affected replacement generation")
 	}
 }
+
+func TestLatePathProofReborrowsBeforeSendingOPEN(t *testing.T) {
+	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
+	c := rig.client
+	t.Cleanup(c.closeQUICPool)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cfg := congestionConfig{kind: defaultCongestion()}
+	held, err := c.dialPooledQUICLane(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	old := held.(*controlPoolStreamConn).generation
+	old.invalidatePathProof()
+	started, release := make(chan struct{}), make(chan struct{})
+	c.probeControlGenerationForTest = func(ctx context.Context, g *controlQUICGeneration, _ time.Duration) error {
+		if g != old {
+			return nil
+		}
+		close(started)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	type outcome struct {
+		conn streamConn
+		err  error
+	}
+	result := make(chan outcome, 1)
+	go func() { v, e := c.dialPooledQUICLane(ctx, cfg); result <- outcome{v, e} }()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	c.supersedeSilentGeneration(old, nil)
+	close(release)
+	select {
+	case o := <-result:
+		if o.err != nil {
+			t.Fatal(o.err)
+		}
+		defer o.conn.Close()
+		if o.conn.(*controlPoolStreamConn).generation == old {
+			t.Fatalf("fresh stream opened on already retired g%d after proof", old.id)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}

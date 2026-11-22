@@ -75,7 +75,7 @@ validate_lock_metadata "$BUILD_LOCK"
 # Go's module graph includes upstream projects' test and repository tooling.
 # Only modules reached by compiled packages can enter the application binary,
 # so derive the shipped graph from go list -deps and compare it exactly.
-go list -deps -f '{{with .Module}}{{if and .Version (ne .Path "github.com/bojieli/queqiao")}}{{.Path}}@{{.Version}}{{end}}{{end}}' . |
+go list -deps -f '{{with .Module}}{{if and .Version (ne .Path "github.com/bojieli/queqiao")}}{{with .Replace}}{{.Path}}@{{.Version}}{{else}}{{.Path}}@{{.Version}}{{end}}{{end}}{{end}}' . |
     sed '/^$/d' | sort -u >"$AUDIT_DIR/runtime.actual"
 sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$RUNTIME_LOCK" |
     cut -d '|' -f 1 | sed '/^golang.org\/x\/mobile@/d' | sort -u >"$AUDIT_DIR/runtime.expected"

@@ -1,4 +1,3 @@
-Give an outstanding authenticated flow open on a severely lossy QUIC path
-until its existing handshake deadline when the pool rotates. During a pending
-open or path check, use bounded transport probes to help QUIC recover lost
-reliable stream bytes.
+When a severely lossy QUIC connection rotates, let pending flow opens finish
+within their original handshake deadlines. Protect the first bytes of an open
+or path check with bounded, congestion-controlled copies on the same stream.

@@ -412,8 +412,7 @@ type controlQUICGeneration struct {
 	proofEpoch   uint64
 	probe        *controlPathProbe
 	lossPath     *pathmodel.PathModel
-	lossPulse    *controlLossPulse
-	lastPulse    time.Time
+	prefixBudget prefixRepairBudget
 	pendingOpens map[*controlPoolStreamConn]pendingOpen
 	id           uint64
 	conn         *quic.Conn
@@ -447,15 +446,18 @@ func (g *controlQUICGeneration) watchLiveness(onSilent func(*controlQUICGenerati
 		case now := <-ticker.C:
 			stats := g.conn.ConnectionStats()
 			g.liveness.observe(now, stats.PacketsSent, stats.PacketsReceived, stats.SmoothedRTT)
-			switch {
-			case g.liveness.dead(now) && !g.awaitingOpen(now):
-				g.close("queqiao pooled connection stopped answering")
-				return
-			case !reported && g.liveness.silent(now):
+			// Detach before considering a hard close. Admission and detach are
+			// serialized by the pool lock, so a previously admitted lossy OPEN
+			// has published its drain deadline before we inspect it here.
+			if !reported && g.liveness.silent(now) {
 				reported = true
 				if onSilent != nil {
 					onSilent(g)
 				}
+			}
+			if g.liveness.dead(now) && !g.awaitingOpen(now) {
+				g.close("queqiao pooled connection stopped answering")
+				return
 			}
 		}
 	}
@@ -1493,7 +1495,9 @@ func (c *Client) openFlowMode(ctx context.Context, destination string, _ bool) (
 		openFlags |= protocol.FlagReserveControl
 	}
 	if pooled, ok := lane.outer.(*controlPoolStreamConn); ok {
-		pooled.trackOpen(openDeadline)
+		if !pooled.trackOpen(openDeadline, protocol.HeaderSize+len(payload)) {
+			return fail(errors.New("pooled connection retired before sending OPEN"))
+		}
 	}
 	if err := lane.fc.Write(protocol.Frame{
 		Header:  protocol.Header{Version: protocol.Version, Type: protocol.TypeOpen, Flags: openFlags, SessionID: lane.sessionID, FlowID: flowID, Class: protocol.ClassNew},
@@ -1628,18 +1632,30 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 		dialCtx, cancel = context.WithTimeout(ctx, c.cfg.DialTimeout)
 		defer cancel()
 	}
-	generation, err := c.acquireControlQUICGeneration(dialCtx, ccfg)
-	if err != nil {
-		return nil, err
-	}
-	transferred := false
-	defer func() {
-		if !transferred {
-			generation.releaseBorrow()
+	// Proof can finish after pool rotation. Retry only the unsent borrow,
+	// sharing the original dial deadline and the pool's singleflight dial.
+	var generation *controlQUICGeneration
+	for {
+		var err error
+		generation, err = c.acquireControlQUICGeneration(dialCtx, ccfg)
+		if err != nil {
+			return nil, err
 		}
-	}()
-	if err := c.verifyControlPath(dialCtx, generation); err != nil {
-		return nil, err
+		if err = c.verifyControlPath(dialCtx, generation); err != nil {
+			generation.releaseBorrow()
+			return nil, err
+		}
+		if err = dialCtx.Err(); err != nil {
+			generation.releaseBorrow()
+			return nil, err
+		}
+		c.quicMu.Lock()
+		current := c.quicGeneration == generation
+		c.quicMu.Unlock()
+		if current {
+			break
+		}
+		generation.releaseBorrow()
 	}
 	// A reply on a new bidirectional stream can only arrive after the peer
 	// sees that stream. Retain its creation time as a conservative lower
@@ -1649,6 +1665,7 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 	generation.probeMu.Unlock()
 	stream, err := generation.conn.OpenStreamSync(dialCtx)
 	if err != nil {
+		generation.releaseBorrow()
 		if generation.conn.Context().Err() != nil {
 			c.retireControlQUICGeneration(generation, "queqiao pooled connection failed")
 		}
@@ -1662,7 +1679,6 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 		owner:          c, generation: generation,
 		proofStarted: proofStarted, proofEpoch: proofEpoch,
 	}
-	transferred = true
 	return outer, nil
 }
 
