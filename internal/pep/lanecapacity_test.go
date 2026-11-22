@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -318,5 +319,62 @@ func TestStallRescueRejectionClosesApplicationConnection(t *testing.T) {
 	case <-runDone:
 	case <-ctx.Done():
 		t.Fatal("terminal rescue refusal left the flow workers running")
+	}
+}
+
+// A QUIC manager with a lost unpooled lane first makes a real TCP handoff.
+// Its TCP stream remains open while the flow has unacknowledged bytes.
+// The actual watchdog and manager must negotiate a fresh stream at both ends.
+func TestSingleTCPStallAfterQUICHandoff(t *testing.T) {
+	rig := newJoinTestRig(t, TransportAuto, TransportQUIC, 1)
+	log := &progressTestLog{}
+	rig.client.cfg.Logger = slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	flow := newGraceTestFlow(t)
+	flow.stallScan = 5 * time.Millisecond
+	flow.stallGrace = 100 * time.Millisecond
+	original := isolationLane(t, 0)
+	if err := flow.addLane(original); err != nil {
+		t.Fatal(err)
+	}
+	if err := rig.serverSess.addLane(isolationLane(t, 0)); err != nil {
+		t.Fatal(err)
+	}
+	flow.closeFailedLane(original)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rig.client.manageQUICLanes(ctx, flow, rig.serverFlow.sessionID, rig.serverFlow.flowID)
+	}()
+	defer func() { cancel(); <-done; flow.closeAll() }()
+	waitTCP := func(previous *mpLane) *mpLane {
+		t.Helper()
+		deadline := time.Now().Add(8 * time.Second)
+		for time.Now().Before(deadline) {
+			lanes := flow.healthyLanes()
+			if len(lanes) == 1 && lanes[0].kind == TransportTCP && lanes[0] != previous {
+				return lanes[0]
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("single TCP lane did not become available: %s", log.String())
+		return nil
+	}
+	first := waitTCP(nil)
+	deadline := time.Now().Add(4 * time.Second)
+	for !strings.Contains(log.String(), "flow handed off to TCP fallback") {
+		if time.Now().After(deadline) {
+			t.Fatal("manager did not hand off the flow to TCP")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	flow.noteSent(0, 64)
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go flow.stallWatchdog(stopWatch)
+	next := waitTCP(first)
+	peer := rig.serverFlow.healthyLanes()
+	if !first.closed.Load() || len(peer) != 1 || peer[0].id != next.id {
+		t.Fatalf("replacement mismatch: old closed=%v client=%d peer=%v", first.closed.Load(), next.id, peer)
 	}
 }
