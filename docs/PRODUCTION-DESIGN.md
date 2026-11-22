@@ -3,8 +3,8 @@
 > [!NOTE]
 > **Status:** Current release criteria
 >
-> **Applies to:** Public protocol 1
-> **Last reviewed:** 2026-08-19
+> **Applies to:** Public protocol 2
+> **Last reviewed:** 2026-11-22
 
 Queqiao is usable as a public preview for the supported paired topology. A
 production-ready claim requires evidence for both the transport and the
@@ -46,6 +46,6 @@ multi-user security system; passing unit tests alone is not sufficient.
 
 ## Release rule
 
-Any wire change increments the version and fails closed. Because protocol 1 is
-the first public contract, it has no legacy negotiation. A future compatibility policy
+Any wire change increments the version and fails closed. Protocol 2 requires matching
+endpoints and rejects protocol 1 during TLS negotiation. A future compatibility policy
 must be designed explicitly rather than inferred from permissive parsing.
