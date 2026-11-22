@@ -22,6 +22,7 @@ import (
 	"github.com/bojieli/queqiao/internal/limiter"
 	"github.com/bojieli/queqiao/internal/memlimit"
 	"github.com/bojieli/queqiao/internal/metrics"
+	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/portmux"
 	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
@@ -403,18 +404,22 @@ type bulkConn struct {
 // precise: a late failure from an old stream can retire its own generation but
 // can never close the healthy generation which replaced it.
 type controlQUICGeneration struct {
-	borrowMu   sync.Mutex
-	borrowers  int
-	draining   bool
-	probeMu    sync.Mutex
-	verified   time.Time
-	proofEpoch uint64
-	probe      *controlPathProbe
-	id         uint64
-	conn       *quic.Conn
-	packet     net.PacketConn
-	controller wancongestion.TelemetryProvider
-	closeOnce  sync.Once
+	borrowMu     sync.Mutex
+	borrowers    int
+	draining     bool
+	probeMu      sync.Mutex
+	verified     time.Time
+	proofEpoch   uint64
+	probe        *controlPathProbe
+	lossPath     *pathmodel.PathModel
+	lossPulse    *controlLossPulse
+	lastPulse    time.Time
+	pendingOpens map[*controlPoolStreamConn]pendingOpen
+	id           uint64
+	conn         *quic.Conn
+	packet       net.PacketConn
+	controller   wancongestion.TelemetryProvider
+	closeOnce    sync.Once
 	// liveness watches for a connection that sends and hears nothing back,
 	// so new flows stop being opened on it long before QUIC's idle timeout.
 	liveness poolLiveness
@@ -443,7 +448,7 @@ func (g *controlQUICGeneration) watchLiveness(onSilent func(*controlQUICGenerati
 			stats := g.conn.ConnectionStats()
 			g.liveness.observe(now, stats.PacketsSent, stats.PacketsReceived, stats.SmoothedRTT)
 			switch {
-			case g.liveness.dead(now):
+			case g.liveness.dead(now) && !g.awaitingOpen(now):
 				g.close("queqiao pooled connection stopped answering")
 				return
 			case !reported && g.liveness.silent(now):
@@ -1487,6 +1492,9 @@ func (c *Client) openFlowMode(ctx context.Context, destination string, _ bool) (
 	if lane.reserveControl {
 		openFlags |= protocol.FlagReserveControl
 	}
+	if pooled, ok := lane.outer.(*controlPoolStreamConn); ok {
+		pooled.trackOpen(openDeadline)
+	}
 	if err := lane.fc.Write(protocol.Frame{
 		Header:  protocol.Header{Version: protocol.Version, Type: protocol.TypeOpen, Flags: openFlags, SessionID: lane.sessionID, FlowID: flowID, Class: protocol.ClassNew},
 		Payload: payload,
@@ -1723,6 +1731,7 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 		generation = &controlQUICGeneration{
 			id: attempt.epoch, conn: conn, packet: packet, verified: time.Now(),
 			controller: configureQUICController(conn, ccfg),
+			lossPath:   pathmodel.Shared(peerKey(conn)),
 		}
 		go generation.watchLiveness(func(g *controlQUICGeneration) { c.supersedeSilentGeneration(g, &ccfg) })
 	}
@@ -2148,6 +2157,7 @@ func pooledTransportTimedOut(err error) bool {
 }
 
 func (s *controlPoolStreamConn) Close() error {
+	s.finishOpen()
 	err := s.quicStreamConn.Close()
 	s.once.Do(func() {
 		if s.generation != nil {

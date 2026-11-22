@@ -22,6 +22,7 @@ func (s *controlPoolStreamConn) Read(p []byte) (int, error) {
 	n, err := s.quicStreamConn.Read(p)
 	if n > 0 {
 		s.proofOnce.Do(func() {
+			s.finishOpen()
 			g := s.generation
 			g.probeMu.Lock()
 			// A failure after this stream opened invalidates its evidence.
@@ -90,6 +91,9 @@ func (c *Client) verifyControlPath(ctx context.Context, g *controlQUICGeneration
 }
 
 func probeControlGeneration(ctx context.Context, g *controlQUICGeneration, budget time.Duration) error {
+	if stop := g.startLossPulse(ctx); stop != nil {
+		defer stop()
+	}
 	return probePooledQUIC(ctx, g.conn, budget)
 }
 
@@ -172,4 +176,149 @@ func (c *Client) verifyBulkPath(ctx context.Context, entry *bulkConn) error {
 		c.bulkMu.Unlock()
 	}
 	return err
+}
+
+const (
+	// At 50 per second these small, congestion-controlled datagrams provide
+	// fresh packet numbers for loss detection. An idle connection sends none.
+	lossPulseMaxDatagrams = 16
+	lossPulseInterval     = 20 * time.Millisecond
+	lossPulseDuration     = 320 * time.Millisecond
+	lossPulseRestart      = 400 * time.Millisecond
+)
+
+type controlLossPulse struct {
+	cancel  context.CancelFunc
+	waiters int
+}
+
+func (g *controlQUICGeneration) highErasure() bool {
+	if g == nil || g.lossPath == nil {
+		return false
+	}
+	state := g.lossPath.Current()
+	return state.Erasure >= .20 && state.ObservedSamples >= 50
+}
+
+// startLossPulse keeps one budget per authenticated connection, shared by
+// outstanding OPENs and the pre-borrow liveness proof. Transport ACKs do not
+// count as application proof. Only the normal proof echo or OPEN response does.
+func (g *controlQUICGeneration) startLossPulse(parent context.Context) func() {
+	if !g.highErasure() || parent.Err() != nil {
+		return nil
+	}
+	support := g.conn.ConnectionState().SupportsDatagrams
+	if !support.Local || !support.Remote {
+		return nil
+	}
+	g.probeMu.Lock()
+	pulse := g.lossPulse
+	if pulse == nil {
+		now := time.Now()
+		if now.Sub(g.lastPulse) < lossPulseRestart {
+			g.probeMu.Unlock()
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(g.conn.Context(), lossPulseDuration)
+		pulse = &controlLossPulse{cancel: cancel}
+		g.lossPulse = pulse
+		g.lastPulse = now
+		go g.runLossPulse(ctx, pulse)
+	}
+	pulse.waiters++
+	g.probeMu.Unlock()
+	release := func() {
+		g.probeMu.Lock()
+		defer g.probeMu.Unlock()
+		if g.lossPulse != pulse {
+			return
+		}
+		pulse.waiters--
+		if pulse.waiters == 0 {
+			pulse.cancel()
+		}
+	}
+	// The caller releases after its exchange; its own cancellation also
+	// stops waiting even if a read is still unwinding.
+	stop := context.AfterFunc(parent, release)
+	return func() {
+		if stop() {
+			release()
+		}
+	}
+}
+
+func (g *controlQUICGeneration) runLossPulse(ctx context.Context, pulse *controlLossPulse) {
+	defer func() {
+		g.probeMu.Lock()
+		if g.lossPulse == pulse {
+			g.lossPulse = nil
+		}
+		g.probeMu.Unlock()
+		pulse.cancel()
+	}()
+	tick := time.NewTicker(lossPulseInterval)
+	defer tick.Stop()
+	for range lossPulseMaxDatagrams {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			if ctx.Err() != nil {
+				return
+			}
+			// SendDatagram can wait for QUIC queue space. Only this worker
+			// can wait. It retains the generation slot until it returns.
+			if err := g.conn.SendDatagram(nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// New borrowers leave a silent generation immediately. Its original OPEN
+// cannot be retried on another stream without risking a second destination
+// connection; allow it to finish only within its existing handshake deadline.
+type pendingOpen struct {
+	deadline time.Time
+	stop     func()
+}
+
+func (s *controlPoolStreamConn) trackOpen(deadline time.Time) {
+	g := s.generation
+	if !g.highErasure() {
+		return
+	}
+	stop := g.startLossPulse(g.conn.Context())
+	g.probeMu.Lock()
+	if g.pendingOpens == nil {
+		g.pendingOpens = make(map[*controlPoolStreamConn]pendingOpen)
+	}
+	g.pendingOpens[s] = pendingOpen{deadline, stop}
+	g.probeMu.Unlock()
+}
+
+func (s *controlPoolStreamConn) finishOpen() {
+	g := s.generation
+	if g == nil {
+		return
+	}
+	g.probeMu.Lock()
+	pending := g.pendingOpens[s]
+	delete(g.pendingOpens, s)
+	g.probeMu.Unlock()
+	if pending.stop != nil {
+		pending.stop()
+	}
+}
+
+func (g *controlQUICGeneration) awaitingOpen(now time.Time) bool {
+	g.probeMu.Lock()
+	defer g.probeMu.Unlock()
+	for _, pending := range g.pendingOpens {
+		if now.Before(pending.deadline) {
+			return true
+		}
+	}
+	return false
 }

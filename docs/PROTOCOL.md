@@ -467,6 +467,12 @@ Repair datagram (`kind = 1`):
 Transmission sequence, ESI, and RID advance independently modulo 2³². Unknown
 kinds and truncated datagrams are discarded.
 
+An implementation can send a zero-length QUIC DATAGRAM to elicit a
+transport ACK while a reliable stream exchange is pending on a measured
+lossy path. It carries no coding header, application frame, or destination.
+Receivers discard it under the rule above. A transport ACK does not
+acknowledge an OPEN or complete an application-level path check.
+
 ### 12.2 Source-symbol vector
 
 Every source vector begins:
