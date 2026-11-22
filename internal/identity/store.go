@@ -830,6 +830,9 @@ func validateStoreData(data storeData) error {
 		if _, ok := data.Accounts[invitation.AccountID]; !ok {
 			return fmt.Errorf("invitation %s refers to an unknown account", id)
 		}
+		if err := (InvitationPath{Name: invitation.Name, Endpoint: invitation.Endpoint}).Validate(); err != nil {
+			return fmt.Errorf("invitation %s has an invalid route: %w", id, err)
+		}
 		digest, err := base64.RawURLEncoding.DecodeString(invitation.TokenHash)
 		if err != nil || len(digest) != sha256.Size {
 			return fmt.Errorf("invitation %s has an invalid token digest", id)

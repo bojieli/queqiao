@@ -83,6 +83,9 @@ func (p InvitationPath) Validate() error {
 		return fmt.Errorf("invalid invitation name %q", p.Name)
 	}
 	if p.Endpoint != "" {
+		if strings.ContainsFunc(p.Endpoint, unicode.IsControl) {
+			return errors.New("invalid control character in invitation endpoint")
+		}
 		if err := validateEndpoint(p.Endpoint); err != nil {
 			return err
 		}

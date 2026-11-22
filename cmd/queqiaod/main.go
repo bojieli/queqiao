@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -19,6 +20,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/metrics"
@@ -306,9 +308,19 @@ func runProvider(args []string) error {
 			}
 			accountID = account.ID
 		}
-		fmt.Println("ID\tACCOUNT_ID\tCREATED\tEXPIRES")
+		fmt.Println("ID\tACCOUNT_ID\tCREATED\tEXPIRES\tROUTE_NAME\tENDPOINT")
 		for _, invitation := range provider.Store.Invites(accountID, time.Now()) {
-			fmt.Printf("%s\t%s\t%s\t%s\n", invitation.ID, invitation.AccountID, invitation.CreatedAt, invitation.ExpiresAt)
+			name := cmp.Or(invitation.Name, provider.Metadata.Name)
+			endpoint := cmp.Or(invitation.Endpoint, provider.Metadata.Endpoint)
+			// Older provider defaults may contain control characters. Keep each
+			// invitation on one line and preserve the tab-separated columns.
+			if strings.ContainsFunc(name, unicode.IsControl) {
+				name = strconv.Quote(name)
+			}
+			if strings.ContainsFunc(endpoint, unicode.IsControl) {
+				endpoint = strconv.Quote(endpoint)
+			}
+			fmt.Printf("%s\t%s\t%s\t%s\t%s\t%s\n", invitation.ID, invitation.AccountID, invitation.CreatedAt, invitation.ExpiresAt, name, endpoint)
 		}
 		return nil
 	case "revoke-invite":
