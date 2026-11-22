@@ -199,7 +199,9 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 			if state.Share > 0 {
 				e.share.Store(uint64(state.Share))
 			}
-			e.inner.seedBandwidth(uint64(state.Seed/e.arrivalRate()), state.RoundTrip)
+			// Seed the pre-gain wire rate. The inner filter is in delivered
+			// bytes/s, and the outer pacer compensates for erasure.
+			e.inner.seedBandwidth(uint64(state.Seed*e.arrivalRate()), state.RoundTrip)
 		}
 	}
 	return e
@@ -601,7 +603,7 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		state := e.path.Report(e.id(), pathmodel.Observation{
 			Erasure: snapshot.Loss, BurstFactor: snapshot.BurstFactor,
 			ObservedSamples: float64(snapshot.Decided),
-			Delivered:       float64(e.inner.bandwidth()),
+			Delivered:       float64(e.inner.estimator.estimate()),
 			RoundTrip:       e.inner.minRoundTrip(),
 		})
 		erasure = state.Erasure

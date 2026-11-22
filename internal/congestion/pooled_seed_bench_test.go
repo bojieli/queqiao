@@ -1,11 +1,13 @@
 package congestion
 
 import (
+	"math"
+	"testing"
+	"time"
+
 	quiccongestion "github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/monotime"
 	"github.com/bojieli/queqiao/internal/pathmodel"
-	"testing"
-	"time"
 )
 
 // Hold the sibling observation fixed and capture exactly what the joining
@@ -44,6 +46,25 @@ func BenchmarkJoiningLaneSeed(b *testing.B) {
 				b.ReportMetric(pacing/probe.Seed, "wire/seed")
 				b.ReportMetric(reported/probe.Seed, "report/seed")
 			})
+		}
+	}
+}
+
+func TestJoiningSeedIsCompensatedOnceAndReportsDelivery(t *testing.T) {
+	for _, loss := range []float64{0, 0.42, 0.85, 0.99} {
+		probe := &seedObservationProbe{State: pathmodel.State{Seed: 1e6, Erasure: loss, RoundTrip: 200 * time.Millisecond}}
+		sender := NewErasureSenderOn(1200, probe)
+		wantDelivered := probe.Seed * math.Max(1-loss, erasureMinArrival)
+		if got := float64(sender.inner.estimator.estimate()); math.Abs(got-wantDelivered) > 1 {
+			t.Errorf("loss %.2f: seeded delivery %.0f, want %.0f", loss, got, wantDelivered)
+		}
+		wantPacing := probe.Seed * sender.inner.highGain
+		if got := float64(sender.bandwidth()); math.Abs(got-wantPacing) > 24 {
+			t.Errorf("loss %.2f: initial pacing %.0f, want %.0f", loss, got, wantPacing)
+		}
+		sender.OnCongestionEventEx(0, monotime.Now(), nil, []quiccongestion.LostPacketInfo{{PacketNumber: 1, BytesLost: 1200}})
+		if got := probe.observation.Delivered; math.Abs(got-wantDelivered) > 1 {
+			t.Errorf("loss %.2f: reported delivery %.0f, want %.0f", loss, got, wantDelivered)
 		}
 	}
 }

@@ -155,14 +155,13 @@ the code should be doing and were each refuted by measurement, the third by a
 measurement that was itself broken. The fourth and fifth started by measuring,
 and each found the fault somewhere none of the earlier ones had looked.
 
-**A policed path is still unbraked at 2.4x, and this design is deployed on
-one.** An earlier draft of this line said it should not be, which was the right
+**At that stage, the policed path was still unbraked at 2.4x.** An earlier draft of this line said it should not be, which was the right
 call while the delay bound was the only brake being built and the compensation
 was still feeding itself. It is shipped now because the alternative was worse
 in the case that was actually hurting users -- a downstream residual of 11%,
 against 0.16% measured on the live path after this work -- and because the
 policed overdrive was reduced by a factor of eighteen on the way. Neither of
-those makes 2.4x braked. `internal/pep/case4_test.go` holds the case open.
+those makes 2.4x braked. The pooled-rate experiment below revisits the case after replacement lanes became more frequent.
 
 ## Sequencing
 
@@ -237,7 +236,38 @@ new lane. The report includes the inner startup pacing gain even in the clean
 case. A share limits the wire pacer while the model still receives the higher
 report. The uncapped ratio at 42% erasure relative to the clean case is about
 2.97. This experiment measures rates selected by the controller. It sends no
-traffic and establishes no goodput or queueing result. A production change
-still needs alternating baseline and candidate runs on the same live path,
-with replacement-lane events, delivered bytes, queue delay and the existing
-policer characterization reported together.
+traffic and establishes no goodput or queueing result. The candidate uses the model's seed as the pre-gain wire budget and converts
+it to the inner filter's delivered rate by multiplying by arrival. It reports
+the filter estimate to the model on subsequent observations. The same
+probe then measures:
+
+| Input loss | Filter / seed | Report / seed | Wire / seed without cap | Wire / seed with 1.25× share |
+| --- | ---: | ---: | ---: | ---: |
+| 0% | 1.000 | 1.000 | 2.885 | 1.250 |
+| 42% | 0.580 | 0.580 | 2.885 | 2.155 |
+| 85% | 0.150 | 0.150 | 2.885 | 2.885 |
+
+In the end-to-end case 4 test on darwin/arm64 (250,000 B/s policer, 8 ms
+refills, 300 ms RTT, path seed 53), each of four variants ran once forward
+and once in reverse order. Peak rate here is a controller reading, in units
+of the policer's sustained rate. Packet loss is the final observed fraction.
+
+| Variant | Peak pacing (runs 1 / 2) | Peak estimate (runs 1 / 2) | Packet loss (runs 1 / 2) |
+| --- | ---: | ---: | ---: |
+| Baseline | 57,266.2 / 9,544.4 | 8,589.9 / 8,589.9 | 70.0% / 65.8% |
+| Seed conversion only | 6.4 / 2.9 | 1.8 / 2.6 | 42.1% / 41.5% |
+| Delivery report only | 27.3 / 7.0 | 8.5 / 2.2 | 39.8% / 26.3% |
+| Both | 3.6 / 3.6 | 1.3 / 1.0 | 18.2% / 13.2% |
+
+Both changes together broke the old characterization's assumption that the
+estimate always exceeds 1.4 times the sustained path rate. The test now
+bounds runaway estimates and pacing, and retains the independent bounds on
+queue growth and brake activation. The deterministic sender test checks the
+exact rate conversion without host timer jitter. A policer still induces no
+delay brake, and the sender can still pace above the sustained rate.
+
+Before merging, alternate baseline and candidate on the same live path with
+replacement-lane events. Compare delivered bytes per unit time, completion
+rate, queue delay and loss, including on a high-erasure path where a lower
+startup rate could sacrifice goodput. Local controller peaks cannot measure
+that trade-off.
