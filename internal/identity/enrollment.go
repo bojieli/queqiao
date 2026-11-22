@@ -221,7 +221,7 @@ func (s EnrollmentService) Serve(conn io.ReadWriter) (EnrollmentResult, error) {
 			errors.New("device public key is not a base64url Ed25519 key"))
 	}
 	now := time.Now()
-	account, device, certificate, err := s.Provider.Store.EnrollDevice(request.Token, request.DeviceName, ed25519.PublicKey(publicKey), now,
+	account, device, certificate, invite, err := s.Provider.Store.enrollDevice(request.Token, request.DeviceName, ed25519.PublicKey(publicKey), now,
 		func(account Account, device Device) ([]byte, error) {
 			return s.Provider.IssueDevice(account.ID, device.ID, ed25519.PublicKey(publicKey), now)
 		})
@@ -241,6 +241,15 @@ func (s EnrollmentService) Serve(conn io.ReadWriter) (EnrollmentResult, error) {
 		RootCertificate: string(encodeCertificate(s.Provider.RootCert)),
 		AccountID:       account.ID, DeviceID: device.ID,
 		DeviceCertificate: string(certificate), IssuedAt: now.UTC().Format(time.RFC3339),
+	}
+	// An invitation issued for a route answers with that route, so the
+	// client's check that the response endpoint equals the invitation's holds
+	// and its profile keeps dialing the relay it enrolled through.
+	if invite.Name != "" {
+		response.ProviderName = invite.Name
+	}
+	if invite.Endpoint != "" {
+		response.Endpoint = invite.Endpoint
 	}
 	result := EnrollmentResult{
 		Outcome: EnrollmentAccepted, AccountID: account.ID,

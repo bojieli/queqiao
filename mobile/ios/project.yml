@@ -55,6 +55,9 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.utilities
+        # Only the invitation scanner asks, and only when opened. Frames are
+        # read by the system's own detector and never stored or sent.
+        NSCameraUsageDescription: Queqiao reads a one-time invitation from a QR code. The camera image stays on this iPhone.
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UILaunchScreen: {}

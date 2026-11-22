@@ -4,8 +4,11 @@ import android.content.Intent;
 import android.net.VpnService;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
+import android.util.Log;
 
 import java.io.IOException;
+import java.util.Collections;
+import java.util.List;
 import java.util.function.BooleanSupplier;
 
 import mobilecore.Mobilecore;
@@ -20,6 +23,7 @@ import mobilecore.Session;
  */
 public final class QueqiaoVpnService extends VpnService
         implements Protector, TunnelServiceCore.Backend {
+    private static final String TAG = "QueqiaoRouting";
     static final String MODE = "tunnel";
 
     // The MTU, resolvers, and interface addresses below are declared again in
@@ -63,7 +67,19 @@ public final class QueqiaoVpnService extends VpnService
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("2606:4700:4700::1111")
                 .setBlocking(false);
-        RoutePolicy.apply(builder, profile.record.trafficPolicy);
+        RoutingConfiguration routing = profile.record.routing;
+        byte[] packedChinaSet = null;
+        List<RoutePolicy.RouteSpec> chinaDirect = Collections.emptyList();
+        try {
+            packedChinaSet = CountryRoutes.packedChinaSet(this);
+            if (routing.rulesApply() && routing.bypassChinaDirect && RoutePolicy.supportsCountryRoutes()) {
+                chinaDirect = CountryRoutes.decode(packedChinaSet);
+            }
+        } catch (IOException exception) {
+            Log.w(TAG, "The bundled country set is unavailable; Chinese addresses stay on the tunnel", exception);
+        }
+        RoutePolicy.Plan plan = RoutePolicy.apply(builder, routing, chinaDirect);
+        Log.i(TAG, "Routing: " + routing.summary() + " (" + plan.diagnosticSummary() + ")");
         if (!stillCurrent.getAsBoolean()) {
             throw new IOException("The connection was superseded before the interface was installed");
         }
@@ -77,7 +93,7 @@ public final class QueqiaoVpnService extends VpnService
         Session session = Mobilecore.newSession(observer, this);
         // Rules are installed before the session starts, so no flow is ever
         // carried under a different list than the one it was decided by.
-        DebugRoutingRules.install(this, session);
+        RoutingRules.install(session, routing, packedChinaSet);
         session.start(profile.profileJson, established.getFd(), 0, MTU, true);
         return session;
     }

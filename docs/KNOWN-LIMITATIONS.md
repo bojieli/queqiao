@@ -9,6 +9,19 @@ them before treating a successful local test as evidence that a different
 network will behave the same way. The [project status](STATUS.md) tracks which
 qualification items are still open.
 
+- Connection recovery cannot promise success when every path is unavailable.
+  Outstanding tunnel bytes that make no acknowledgement progress for 45 seconds
+  fail explicitly, as do application writes that make no progress for 45
+  seconds. An intentionally paused consumer can therefore lose a connection
+  if it leaves data outstanding for that long; an idle connection is unaffected.
+  Protocol 1 has no explicit receiver-credit/pause message, so the remote sender
+  cannot fully distinguish consumer backpressure from a failed delivery path.
+- Control and DATA can still share a reliable transport stream. The bounded
+  ingress backlog prevents a full application event channel from blocking the
+  reader, but cannot bypass bytes missing within the underlying TCP/QUIC stream.
+  Byte-stream order also means a missing logical byte range holds up later
+  application data until recovery fills it. Backlog exhaustion is an explicit
+  flow error, not unlimited buffering or silent data loss.
 - The congestion control described in [the control
   redesign](CONTROL-REDESIGN.md) has no brake on a policed path. A policer
   drops what it cannot pass and holds nothing, so it produces loss and no
@@ -101,7 +114,7 @@ qualification items are still open.
   exposing it directly to a LAN or public network.
 - A trust-root/issuer compromise requires creating a new provider state and
   re-enrolling users; device revocation is insufficient.
-- The released Android app is not a VPN and has no routing engine. It exports
+- Android export mode is not a VPN and has no routing engine. It exports
   an authenticated SOCKS5 endpoint on loopback, and the consumer client that
   owns the device tunnel supplies rules, per-app policy, and DNS. That client
   must exclude Queqiao's package from its tunnel; if it does not, Queqiao's own
@@ -110,14 +123,14 @@ qualification items are still open.
   network answers it directly — but the answer is advisory: it names a likely
   cause in the notification and in the connection test, and never blocks a
   connection, because a VPN carrying Queqiao's uplink is not by itself proof of
-  a loop. The debug build, which does carry a `VpnService`, reads the same rule
-  list as iOS from `routing-rules.conf` in its files directory — which does not
-  exist until the app writes something, so a fresh install needs `mkdir -p
-  files` under `run-as` before the push lands; see `DebugRoutingRules` for the
-  exact command. That is a development affordance and cannot ship, because the
-  released artifact declares no `BIND_VPN_SERVICE` and CI asserts it against
-  the assembled APK.
-- The iOS client is a full-device tunnel with a routing rule list: `DOMAIN`,
+  a loop.
+- The Android full tunnel edits routing only while disconnected, and a change
+  applies at the next connect: Android cannot re-plumb an established
+  `VpnService` interface the way iOS replaces its network settings. Its
+  bundled Chinese address set installs as routes on Android 13 and later only,
+  because earlier releases cannot exclude a route; a `GEOIP,CN,DIRECT` rule
+  keeps the same addresses direct there.
+- The iOS client and the Android full tunnel carry a routing rule list: `DOMAIN`,
   `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`, `GEOIP` and `DST-PORT` rules
   choosing between `PROXY`, `DIRECT` and `REJECT`, first match wins, in the
   syntax Clash, mihomo, sing-box and Shadowrocket read. A flow no rule matches
@@ -147,12 +160,11 @@ qualification items are still open.
 - iOS automatic connection rules match Wi-Fi networks by typed name. Queqiao
   never scans, so a network the user has not named is treated as untrusted, and
   a renamed network stops matching until the user updates the list.
-- Android always-on VPN is not offered at all by the released app, which
-  declares no `VpnService`. The debug tunnel keeps it disabled pending
+- Android always-on VPN is declined by the full tunnel pending
   physical-device locked boot and restart qualification.
 - Apple App Store VPN publication requires an organization developer account
   under current store rules, so iOS is source-build/self-sign only. Google
-  Play's Organization requirement is scoped to apps approved to use
-  `VpnService`, which the released Android app is not; that removes one named
-  blocker but is not a guarantee of publication, and direct distribution
+  Play's Organization requirement applies to apps approved to use
+  `VpnService`, which the released Android app now is, so a Play listing needs
+  an Organization account and Play's VPN declaration; direct distribution
   remains the supported Android path.

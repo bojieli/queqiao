@@ -22,6 +22,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Queqiao reads a one-time invitation from a QR code. The camera image stays on this iPhone.</string>
 	<key>QueqiaoKeychainAccessGroup</key>
 	<string>$(AppIdentifierPrefix)$(QUEQIAO_KEYCHAIN_SUFFIX)</string>
 	<key>QueqiaoPacketTunnelBundleIdentifier</key>

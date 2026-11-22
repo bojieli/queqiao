@@ -1,45 +1,47 @@
 # Android export mode
 
-The released Android app is not a VPN. It enrolls a device with a Queqiao
-provider, holds the identity, keeps the certificate renewed, and serves the
-gateway to the rest of the phone as one authenticated SOCKS5 endpoint on
-loopback. Whichever client the user already trusts with routing — v2rayNG,
-mihomo, sing-box — owns the tunnel, the rules, and DNS, and treats Queqiao as
-one outbound among many.
+Export mode is one of the two connection modes the Android app ships, chosen
+under **Settings → Connection mode**; the other, and the default, is the
+[full-device tunnel](#the-full-device-tunnel). In export mode the app is not a
+VPN. It enrolls a device with a Queqiao provider, holds the identity, keeps the
+certificate renewed, and serves the gateway to the rest of the phone as one
+authenticated SOCKS5 endpoint on loopback. Whichever client the user already
+trusts with routing — v2rayNG, mihomo, sing-box — owns the tunnel, the rules,
+and DNS, and treats Queqiao as one outbound among many.
 
 This follows the project's own scope rule in [Vision](VISION.md): Queqiao
 supplies the optimized paired data plane, and a larger overlay supplies
-discovery, routing, policy, and mesh coordination. A full-device Android tunnel
-put the data plane in competition with mature routing clients over rules it
-has no engine for — `mobile/core/packetstack.go` has exactly one outbound, so
-there was never anything for a routing rule to select.
-
-The full-device tunnel still exists, in the debug build only. See
-[The debug tunnel](#the-debug-tunnel).
+discovery, routing, policy, and mesh coordination. It is the mode for a user
+who already runs such a client, and everything below describes it.
 
 ## What the released app declares
 
 - `INTERNET`, `POST_NOTIFICATIONS`, `FOREGROUND_SERVICE`,
-  `FOREGROUND_SERVICE_SPECIAL_USE`, and `ACCESS_NETWORK_STATE`. The last is
-  read-only and serves one question — whether another app's VPN is carrying
-  Queqiao's own uplink — described under
+  `FOREGROUND_SERVICE_SPECIAL_USE`, `ACCESS_NETWORK_STATE`, and `CAMERA`.
+  `ACCESS_NETWORK_STATE` is read-only and serves one question — whether
+  another app's VPN is carrying Queqiao's own uplink — described under
   [the exclusion check](#first-exclude-queqiao-from-the-consumers-tunnel).
-- One service, `QueqiaoProxyService`, type `specialUse`, with a subtype
-  justification naming what it actually does: it serves a local SOCKS5 endpoint
-  for a network client the user configured, and the connection has to outlive
-  the app's foreground because that client relays through it continuously.
-- No `BIND_VPN_SERVICE`, no `android.net.VpnService` intent filter, and no
-  always-on metadata. CI asserts this against the assembled release APK with
-  `aapt2 dump xmltree`, so a stray manifest merge cannot reintroduce them
-  quietly. The same step pins the permission list above exactly: a permission
-  arriving from a merged library manifest fails the build rather than shipping,
-  and widening the list is a deliberate edit with a reason attached.
+  `CAMERA` is optional and is held only by the invitation scanner while it
+  is in front; the QR code is decoded in process by the Go core, and the
+  camera feature is declared as not required so the app installs without one.
+- Two services, both type `specialUse` and neither exported.
+  `QueqiaoProxyService` carries a subtype justification naming what it actually
+  does: it serves a local SOCKS5 endpoint for a network client the user
+  configured, and the connection has to outlive the app's foreground because
+  that client relays through it continuously. `QueqiaoVpnService` is the full
+  tunnel, protected by `BIND_VPN_SERVICE` so only the system can bind it, with
+  always-on declined.
+- CI asserts both declarations against the assembled release APK with `aapt2
+  dump xmltree`. The same step pins the permission list above exactly: a
+  permission arriving from a merged library manifest fails the build rather
+  than shipping, and widening the list is a deliberate edit with a reason
+  attached.
 
-Google Play's Organization requirement is scoped to *apps approved to use the
-`VpnService` class*, which a release build declaring no `VpnService` is not.
-That removes the one blocker known by name; it is not a promise of publication,
-because the `specialUse` justification is itself a review surface and Play has
-separate policy pages. Treat it as one obstacle removed, not as eligibility.
+Because the release build declares a `VpnService`, Google Play's Organization
+requirement for *apps approved to use the `VpnService` class* applies to it,
+as does Play's VPN declaration; direct distribution of the signed APK is
+unaffected. Export mode on its own would not have needed either, which is
+worth knowing if a Play listing ever has to ship without the tunnel.
 
 ## The endpoint
 
@@ -99,9 +101,10 @@ device authorization, protocol negotiation, and one authenticated control round
 trip, and opens no remote destination. A loop shows there as a provider that
 cannot be reached — loudly, and before any real traffic is affected.
 
-The same reasoning applies in reverse to the debug tunnel: a mode that captures
-the app's own sockets answers no to `allowsProviderTestWhileConnected`, because
-the test would then be measuring the tunnel rather than the provider.
+The debug full tunnel allows the test while connected for a different reason:
+it excludes the app's own UID from the interface it installs, so the probe
+leaves by the device's ordinary route and still measures the provider rather
+than the tunnel.
 
 ## Client configuration
 
@@ -175,29 +178,26 @@ resolves anything on the consumer's behalf.
 Certificate maintenance is independent of the packet stack and runs unchanged,
 so hourly renewal keeps working in export mode.
 
-## The debug tunnel
+## The full-device tunnel
 
-The full-device `VpnService` tunnel lives in `app/src/debug/` and nowhere else:
-`QueqiaoVpnService`, `RoutePolicy`, `VpnTunnelController`, and a manifest
-overlay that re-adds `BIND_VPN_SERVICE` and the `android.net.VpnService`
-intent filter. It is retained as the one vehicle that drives the Go packet
-stack end to end on a real device — TUN file descriptor in, TCP and UDP flows
-out — and is never published.
+The other mode is a `VpnService` tunnel: `QueqiaoVpnService`, `RoutePolicy`,
+`VpnTunnelController` and the routing model beside them. It drives the Go
+packet stack end to end — TUN file descriptor in, TCP and UDP flows out — and
+carries its own routing, the same subset as iOS: a routing mode, bypasses for
+local networks, the bundled Chinese address set and hand-entered routes, and a
+rule list with the China preset. [Mobile clients](MOBILE.md) describes it.
 
-`build.gradle` gives debug an `applicationIdSuffix ".debug"`, so both variants
-install side by side. The seam between them is `TunnelModes.java`, which exists
-once per build type and lists the modes that build offers. Keeping it a whole
-file rather than a build-config flag means the release build never compiles the
-tunnel at all, which is what makes the CI manifest assertion a check on a
-property that is already structurally true rather than the only thing holding
-it.
+`TunnelModes.java` lists the modes the app offers, and the first entry is the
+default for a new install; an install that already stored a choice keeps it.
+`build.gradle` gives debug an `applicationIdSuffix ".debug"`, so a debug and a
+release build install side by side.
 
 ## Device qualification
 
 The end-to-end check this mode needs, on hardware:
 
-1. Install the debug APK, select export mode, connect, and confirm the
-   notification shows the listen address.
+1. Install the APK, select export mode under Settings, connect, and confirm
+   the notification shows the listen address.
 2. Configure v2rayNG with Queqiao excluded from its tunnel; confirm egress
    through the gateway and that `UDP ASSOCIATE` carries UDP.
 3. Remove the exclusion and confirm the failure is loud rather than a silent

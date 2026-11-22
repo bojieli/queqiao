@@ -62,15 +62,6 @@ final class ProxyTunnelController implements TunnelController {
     }
 
     @Override
-    public boolean allowsProviderTestWhileConnected() {
-        // Queqiao holds no interface of its own here, so a provider test runs
-        // over the same path the live connection uses. That is the point: with
-        // the consumer's tunnel up and Queqiao not excluded from it, the test
-        // is what surfaces the loop.
-        return true;
-    }
-
-    @Override
     public void connect(String profileId) {
         TunnelBroadcast.connect(host.activity(), QueqiaoProxyService.class, profileId);
     }

@@ -86,6 +86,31 @@ func TestScanStallGating(t *testing.T) {
 	}
 }
 
+// A transport ACK proves delivery, not that the application owes a reply.
+// A one-way message or a slow origin must not trigger lane churn.
+func TestAcknowledgedApplicationMessageDoesNotTriggerRescue(t *testing.T) {
+	flow := newStallTestFlow(t, metrics.New())
+	flow.stallScan = time.Millisecond
+	flow.stallGrace = 20 * time.Millisecond
+	flow.observe(512, true)
+	flow.bytesUp.Add(512)
+	flow.noteSent(0, 512)
+	if err := flow.acknowledgeReplay(512, false); err != nil {
+		t.Fatal(err)
+	}
+	if flow.pendingOutbound() {
+		t.Fatal("setup has unacknowledged transport data")
+	}
+	stop := make(chan struct{})
+	defer close(stop)
+	go flow.stallWatchdog(stop)
+	select {
+	case <-flow.stallSignals():
+		t.Fatal("fully acknowledged application message triggered transport rescue")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // Demotion is not death: a suspected lane is passed over for new writes while
 // a healthier lane exists, keeps its place in the healthy set, and is fully
 // eligible again the moment it is the only thing left.

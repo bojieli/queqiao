@@ -225,29 +225,33 @@ jobs:
           lintDebug lintRelease
           assembleDebug assembleDebugAndroidTest
           assembleRelease bundleRelease
-      - name: assert the released manifest stays export-only
+      - name: assert the released manifest declares both modes and nothing more
         run: |
           set -euo pipefail
           aapt2="$ANDROID_HOME/build-tools/36.0.0/aapt2"
           apk=$(ls mobile/android/app/build/outputs/apk/release/*.apk)
           manifest=$("$aapt2" dump xmltree --file AndroidManifest.xml "$apk")
-          # Export mode is the whole point of the release build: routing policy
-          # belongs to whichever client the user already runs, and this app has
-          # no reason to hold BIND_VPN_SERVICE. The tunnel is debug-only, and
-          # nothing but this check keeps a stray manifest merge from shipping it.
-          if grep -qiE 'BIND_VPN_SERVICE|android\.net\.VpnService' <<<"$manifest"; then
-            echo "the release manifest declares a VPN service:" >&2
-            grep -inE 'BIND_VPN_SERVICE|android\.net\.VpnService' <<<"$manifest" >&2
+          # The release build ships two ways to connect: the full-device tunnel
+          # and the exported loopback endpoint. Both services have to be there,
+          # the tunnel has to be bindable by the system alone, and neither may
+          # be exported -- a stray manifest merge is what this catches.
+          grep -q 'QueqiaoVpnService' <<<"$manifest"
+          grep -q 'QueqiaoProxyService' <<<"$manifest"
+          grep -q 'android.permission.BIND_VPN_SERVICE' <<<"$manifest"
+          if grep -A12 -E 'E: service' <<<"$manifest" |
+              grep -E 'android:exported\([^)]*\)=true'; then
+            echo "a service in the release manifest is exported" >&2
             exit 1
           fi
-          grep -q 'QueqiaoProxyService' <<<"$manifest"
-          # The denylist above catches the one permission we can name today.
-          # This catches the ones we cannot: an app that routes nothing and
+          # The permission set is enumerated rather than denylisted: an app that
           # talks to one gateway has a small, enumerable set of things to ask
           # for, and anything outside it arrived by accident or by a merged
           # library manifest. Update the list deliberately, with a reason.
+          # CAMERA: ScanInvitationActivity reads a queqiao:// invitation from
+          # a QR code; the frame is decoded in process by the Go core.
           expected=$(printf '%s\n' \
             android.permission.ACCESS_NETWORK_STATE \
+            android.permission.CAMERA \
             android.permission.FOREGROUND_SERVICE \
             android.permission.FOREGROUND_SERVICE_SPECIAL_USE \
             android.permission.INTERNET \

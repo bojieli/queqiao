@@ -194,8 +194,10 @@ func (l *mpLane) sendRate() (float64, time.Duration) {
 // laneFrame is a frame queued for one lane's writer, with an optional
 // notification for when the transport has taken its bytes.
 type laneFrame struct {
-	frame     protocol.Frame
-	onWritten func()
+	frame protocol.Frame
+	// onWritten is told whether the frame went out on a substrate that
+	// recovers its own losses; see frameConn.writeContextVia.
+	onWritten func(reliable bool)
 }
 
 type inboundEvent struct {
@@ -314,6 +316,7 @@ type multipathFlow struct {
 	// no lock, and in particular never touches lanesMu while holding chunkMu
 	// or replayMu.
 	lastAckProgressNS atomic.Int64
+	inboundBacklog    inboundBacklog
 	// minRTTNS is the smallest controller minimum-RTT the flow's lanes have
 	// reported, refreshed by observeTransport. The stall threshold is three
 	// of these.
@@ -337,8 +340,9 @@ type multipathFlow struct {
 	// stallScan and stallGrace are zero in production. Tests shorten them so
 	// the watchdog can be exercised without sleeping for seconds, the same
 	// pattern as abortGrace above.
-	stallScan  time.Duration
-	stallGrace time.Duration
+	stallScan     time.Duration
+	stallGrace    time.Duration
+	progressGrace time.Duration // test override; production uses laneReplacementWait
 	// controlLaneShared reports whether another flow is currently using the
 	// pooled control connection. Nil means "no", which is what a flow on a
 	// dedicated connection should answer.
@@ -401,6 +405,11 @@ type multipathFlow struct {
 	// gapPending marks that the peer should be told what is held above a gap,
 	// which is an acknowledgement whose cumulative point has not moved.
 	gapPending atomic.Bool
+	// ACK state must be repeated after duplicate DATA or lane recovery even
+	// if the receive cursor did not move. A successful old-lane write does
+	// not prove the peer received it before that lane stopped working.
+	ackRepeatPending atomic.Bool
+	ackReplayLane    atomic.Pointer[mpLane]
 	// receivedRanges publishes what the reassembler currently holds out of
 	// order, so the acknowledgement loop can report it without touching the
 	// reassembler from another goroutine.
@@ -578,6 +587,9 @@ func (f *multipathFlow) startLane(lane *mpLane) {
 	}
 	go f.readLane(lane)
 	go f.writeLane(lane)
+	if f.ackSequence.Load() > 0 {
+		f.repeatACK(lane)
+	}
 	// A lane admitted while the flow is sending starts carrying data at once;
 	// it does not wait for anything to notice it.
 	if sched := f.scheduler.Load(); sched != nil {
@@ -616,7 +628,7 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 				return
 			}
 		}
-		err := lane.fc.WriteContext(f.ctx, frame)
+		reliable, err := lane.fc.writeContextVia(f.ctx, frame)
 		if err != nil {
 			f.failLane(lane, fmt.Errorf("lane %d write: %w", lane.id, err))
 			return
@@ -628,7 +640,7 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 		// accept more. A QUIC stream write returns only once the packer has
 		// consumed the data, so this is the transport's own congestion clock.
 		if queued.onWritten != nil {
-			queued.onWritten()
+			queued.onWritten(reliable)
 		}
 	}
 }
@@ -884,7 +896,8 @@ func (f *multipathFlow) laneCount() int {
 // The victim is the oldest evictable lane with the replacement's role, or the
 // oldest evictable lane of any role when no same-role lane exists: role
 // orders the choice but never blocks a rescue. One lane is never evictable --
-// a lane younger than minAge, whatever its state. Parallel rescue JOINs race
+// a healthy lane younger than minAge. A lane already suspected stalled
+// can be replaced immediately. Parallel rescue JOINs race
 // to this endpoint, and admission order is not the order the peer crowned its
 // winner in, so a freshly admitted lane may still be waiting on the peer's
 // decision while the racing losers it beat are still arriving; the half-open
@@ -902,7 +915,7 @@ func (f *multipathFlow) retireOldestLane(control bool, minAge time.Duration) boo
 		if lane.closed.Load() {
 			continue
 		}
-		if minAge > 0 && time.Since(lane.admitted) < minAge {
+		if minAge > 0 && time.Since(lane.admitted) < minAge && !lane.suspected.Load() {
 			continue
 		}
 		switch {
@@ -1078,21 +1091,55 @@ func (f *multipathFlow) readLaneBulk(lane *mpLane) {
 }
 
 func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool {
+	// Identity and terminal cancellation cannot wait behind application DATA.
+	if frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID {
+		select {
+		case f.ackErr <- errors.New("frame belongs to another session or flow"):
+		default:
+		}
+		return false
+	}
+	if frame.Header.Type == protocol.TypeReset {
+		err := errors.New("peer reset flow")
+		if len(frame.Payload) > 1 {
+			err = fmt.Errorf("peer reset flow: %s", string(frame.Payload[1:]))
+		}
+		select {
+		case f.ackErr <- err:
+		default:
+		}
+		f.closeAll()
+		return false
+	}
+	if frame.Header.Type == protocol.TypeClose && frame.Header.Flags&protocol.FlagCloseAbort != 0 {
+		if frame.Header.Flags&protocol.FlagFin == 0 || len(frame.Payload) != 0 || frame.Header.Flags&(protocol.FlagAckFinal|protocol.FlagAckUp|protocol.FlagAckDown) != 0 {
+			select {
+			case f.ackErr <- errors.New("invalid flow close frame"):
+			default:
+			}
+			return false
+		}
+		_ = f.acknowledgeRemoteFIN(f.ctx, frame.Header.Sequence, true)
+		f.closeAll()
+		return false
+	}
+	// Cumulative/SACK state clocks the opposite sending direction. It must
+	// not wait behind a blocked application write or a full DATA event queue.
+	// Final ACKs remain ordered with FIN and local-abort lifecycle events.
+	if frame.Header.Type == protocol.TypeAck && frame.Header.Flags&protocol.FlagAckFinal == 0 {
+		if err := f.receiveProgressACK(lane, frame); err != nil {
+			select {
+			case f.ackErr <- err:
+			default:
+			}
+			return false
+		}
+		return true
+	}
 	if frame.Header.Type == protocol.TypeData {
 		lane.recv.Add(uint64(len(frame.Payload)))
 	}
-	select {
-	case f.events <- inboundEvent{lane: lane, frame: frame}:
-		return true
-	case <-f.done:
-		// Flow teardown is independent of the client lifetime. In particular,
-		// a reader can be waiting behind a full event queue when another lane
-		// completes or aborts the flow; waiting only on f.ctx would strand that
-		// goroutine until the entire VPN stopped.
-		return false
-	case <-f.ctx.Done():
-		return false
-	}
+	return f.enqueueInbound(inboundEvent{lane: lane, frame: frame})
 }
 
 // prefersCodingOverRetransmission reports whether this flow would rather spend
@@ -1540,7 +1587,7 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 			stats.BytesSent = f.bytesUp.Load()
 			stats.BytesRead = f.bytesDown.Load()
 			stats.LaneBytes = f.laneStats()
-			return stats, fmt.Errorf("cumulative acknowledgement: %w", err)
+			return stats, fmt.Errorf("flow progress: %w", err)
 		case failure := <-f.laneErr:
 			err := failure.err
 			// Both FIN directions have already been observed. The application
@@ -1802,16 +1849,12 @@ func scanStall(pending bool, progressNS int64, now time.Time, threshold time.Dur
 // failLane: failLane learns a lane is dead from an I/O error, which on a path
 // erasing one direction takes the transport's whole idle timeout of receive
 // silence. This watchdog instead measures forward progress -- the
-// acknowledged send offset moving -- and, finding none for three round trips
-// while work is pending, demotes the current data lane and
+// acknowledged send offset moving, payload arriving -- and, finding none for
+// three round trips while work is pending, demotes the current data lane and
 // asks the lane manager for a rescue. It never fails a lane and never closes
 // anything: the suspected lane keeps receiving and is used again the moment
 // nothing healthier exists, and an acknowledgement arriving on it clears the
 // suspicion outright.
-// An acknowledged request waiting for application data is not transport work:
-// long polling, server processing and one-way traffic may all stay quiet for
-// longer than three RTTs. Receive-only outages remain the transport's job to
-// detect; application silence alone must not churn otherwise healthy lanes.
 func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 	interval := f.stallScan
 	if interval <= 0 {
@@ -1833,8 +1876,52 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		now := time.Now()
 		threshold := f.stallThreshold()
 		stalledSend := scanStall(f.pendingOutbound(), f.lastAckProgressNS.Load(), now, threshold, &sendSince)
+		// Application bytes do not imply a response: TLS, HTTP/2 control
+		// messages, uploads and slow origins can legitimately be silent after
+		// delivery. Only unacknowledged transport work justifies lane rescue.
 		if !stalledSend {
 			episode = false
+			continue
+		}
+		// Successful JOINs and incoming traffic do not establish progress for
+		// outstanding outbound bytes. Bound the entire stall, not each retry.
+		var terminal error
+		switch {
+		case f.resumeRefused.Load():
+			terminal = errResumeRefused
+		case f.replacementAbandoned.Load() && len(f.healthyLanes()) == 0:
+			// Abandonment means nothing will open another lane, not that
+			// the flow has none. A QUIC flow handed off to its TCP rescue
+			// lane is exactly that case: the manager returns, but the
+			// rescue lane is healthy and is replaying the bytes that
+			// stalled. Ending it here threw away a successful rescue a
+			// few hundred milliseconds after it landed. A lane that
+			// exists but never delivers is still ended by the
+			// no-progress budget in the next case, and waitForHealthyLane
+			// already treats a healthy lane as the answer whatever the
+			// manager has done.
+			terminal = errReplacementAbandoned
+		case now.Sub(sendSince) >= f.progressTimeout():
+			terminal = errFlowNoProgress
+		}
+		if terminal != nil {
+			if f.logger != nil {
+				f.logger.Warn("flow cannot make delivery progress", "flow_id", f.flowID, "error", terminal, "pending_for", now.Sub(sendSince))
+			}
+			select {
+			case f.ackErr <- terminal:
+			default:
+			}
+			// Also interrupt a coordinator currently waiting for lane replacement;
+			// it must not add another outage budget after this deadline expires.
+			f.closeAll()
+			return
+		}
+		// Optimistic DATA may precede OPEN_OK. A JOIN cannot rescue a session
+		// the server has not admitted yet; racing it against OPEN can turn a
+		// slow handshake into a misleading permanent "unknown session" refusal.
+		// The overall no-progress budget still bounds this initial wait.
+		if f.openConfirmationRequired.Load() {
 			continue
 		}
 		if !episode {
@@ -1950,7 +2037,7 @@ func (f *multipathFlow) enqueueFrameClass(ctx context.Context, lane *mpLane, fra
 
 // enqueueFrameWritten is enqueueFrameClass with a callback invoked once the
 // lane's transport has taken the frame's bytes.
-func (f *multipathFlow) enqueueFrameWritten(ctx context.Context, lane *mpLane, frame protocol.Frame, bulk bool, onWritten func()) error {
+func (f *multipathFlow) enqueueFrameWritten(ctx context.Context, lane *mpLane, frame protocol.Frame, bulk bool, onWritten func(reliable bool)) error {
 	if lane == nil || lane.closed.Load() {
 		return errors.New("lane is closed")
 	}
@@ -2334,6 +2421,10 @@ func (f *multipathFlow) writeControl(ctx context.Context, frame protocol.Frame, 
 }
 
 func (f *multipathFlow) writeACK(ctx context.Context, sequence uint64, direction uint16, final bool) error {
+	return f.writeACKPreferred(ctx, sequence, direction, final, nil)
+}
+
+func (f *multipathFlow) writeACKPreferred(ctx context.Context, sequence uint64, direction uint16, final bool, preferred *mpLane) error {
 	flags := direction
 	if final {
 		flags |= protocol.FlagAckFinal
@@ -2357,6 +2448,28 @@ func (f *multipathFlow) writeACK(ctx context.Context, sequence uint64, direction
 	// flow coordinator must observe the failure immediately so a replacement
 	// can be admitted and the latest ACK/FIN state replayed there.
 	lanes := f.healthyLanes()
+	// A rescue must carry ACK state on the new lane, not enqueue it on the
+	// same old transport whose missing ACK prompted the rescue. Otherwise
+	// prefer non-suspected lanes while retaining every lane as a fallback.
+	// Stable insertion uses one suspicion observation per lane, rather than
+	// a sort comparator whose ordering could change during concurrent ACKs.
+	front := 0
+	for i, lane := range lanes {
+		if lane == preferred {
+			copy(lanes[1:i+1], lanes[:i])
+			lanes[0] = lane
+			front = 1
+			break
+		}
+	}
+	for i := front; i < len(lanes); i++ {
+		lane := lanes[i]
+		if !lane.suspected.Load() {
+			copy(lanes[front+1:i+1], lanes[front:i])
+			lanes[front] = lane
+			front++
+		}
+	}
 	if len(lanes) == 0 {
 		return errors.New("no healthy lane for acknowledgement")
 	}
@@ -2435,6 +2548,12 @@ func (f *multipathFlow) acknowledgeArrival(reassembler *multipath.Reassembler, l
 		f.publishReceivedRanges(reassembler)
 		f.reportGap()
 	}
+	// DATA arrived without moving the cursor: the sender may be replaying
+	// after an ACK was lost. Repeat the cumulative point even without
+	// selective-ACK negotiation or any remaining out-of-order bytes.
+	if reassembler.NextSequence() > 0 {
+		f.repeatACK(nil)
+	}
 	return lastAck
 }
 
@@ -2445,6 +2564,22 @@ func (f *multipathFlow) reportGap() {
 		return
 	}
 	f.gapPending.Store(true)
+	select {
+	case f.ackWake <- struct{}{}:
+	default:
+	}
+}
+
+// repeatACK coalesces replay requests and optionally targets the newly
+// admitted lane. It never blocks the receive loop on transport writes.
+func (f *multipathFlow) repeatACK(lane *mpLane) {
+	if f.ackClosing.Load() {
+		return
+	}
+	if lane != nil {
+		f.ackReplayLane.Store(lane)
+	}
+	f.ackRepeatPending.Store(true)
 	select {
 	case f.ackWake <- struct{}{}:
 	default:
@@ -2510,11 +2645,14 @@ func (f *multipathFlow) ackLoop(ctx context.Context) {
 			// A gap report carries the same cumulative point as the last
 			// acknowledgement and different ranges above it, so the cumulative
 			// point cannot be what decides whether to send.
-			if sequence <= sent && !f.gapPending.Swap(false) {
+			gap := f.gapPending.Swap(false)
+			repeat := f.ackRepeatPending.Swap(false)
+			preferred := f.ackReplayLane.Swap(nil)
+			if sequence <= sent && !gap && !repeat && preferred == nil {
 				break
 			}
 			ackStart := time.Now()
-			err := f.writeACK(ctx, sequence, f.recvAckFlag, false)
+			err := f.writeACKPreferred(ctx, sequence, f.recvAckFlag, false, preferred)
 			f.ackWriteNS.Add(uint64(time.Since(ackStart)))
 			f.acksOut.Add(1)
 			if err != nil {
@@ -2538,6 +2676,7 @@ func (f *multipathFlow) ackLoop(ctx context.Context) {
 					}
 					return
 				}
+				f.ackRepeatPending.Store(true)
 				// Re-acknowledge from where the peer was last told, so the
 				// replacement lane carries the state the dead one was holding.
 				continue
@@ -2580,6 +2719,47 @@ func (f *multipathFlow) acknowledgeRemoteFIN(ctx context.Context, sequence uint6
 			return nil
 		}
 		return err
+	}
+	return nil
+}
+
+// receiveProgressACK handles only non-final ACKs. Its state is protected by
+// replayMu, ackTracker's lock, or atomics, so independent lane readers can
+// advance delivery without involving the application receive loop.
+func (f *multipathFlow) receiveProgressACK(lane *mpLane, frame protocol.Frame) error {
+	if frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID {
+		return errors.New("frame belongs to another session or flow")
+	}
+	if frame.Header.Flags&f.sendAckFlag == 0 {
+		return errors.New("acknowledgement has wrong direction")
+	}
+	var ranges [][2]uint64
+	if frame.Header.Flags&protocol.FlagAckRanges != 0 {
+		var err error
+		ranges, err = protocol.DecodeAckRanges(frame.Payload, frame.Header.Sequence)
+		if err != nil {
+			return fmt.Errorf("acknowledgement ranges: %w", err)
+		}
+	}
+	f.replayMu.Lock()
+	advances := frame.Header.Sequence > f.acked
+	highestSent := f.highestSent
+	f.replayMu.Unlock()
+	for _, r := range ranges {
+		if r[1] > highestSent {
+			return fmt.Errorf("acknowledgement range %d exceeds sent sequence %d", r[1], highestSent)
+		}
+	}
+	if err := f.acknowledgeReplay(frame.Header.Sequence, false); err != nil {
+		return err
+	}
+	f.acksIn.Add(1)
+	rangeProgress := f.ackTrack.Add(ranges)
+	if rangeProgress {
+		f.lastAckProgressNS.Store(time.Now().UnixNano())
+	}
+	if lane != nil && (advances || rangeProgress) {
+		lane.suspected.Store(false)
 	}
 	return nil
 }
@@ -2630,7 +2810,7 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 		if len(out) == 0 || f.localAbortSent.Load() {
 			return nil
 		}
-		if err := writeFull(f.inner, out); err != nil {
+		if err := f.writeApplication(out); err != nil {
 			if !expectedHalfCloseError(err) && !expectedDestinationCloseError(err) {
 				return err
 			}
@@ -2683,7 +2863,18 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 			switch frame.Header.Type {
 			case protocol.TypeData:
 				if remoteFin {
-					return errors.New("data received after flow FIN")
+					// Recovery can replay already-delivered bytes on a lane
+					// whose delivery trails the FIN on another lane. Accept
+					// only a nonempty duplicate wholly before the final offset;
+					// subtraction keeps the bounds check safe from overflow.
+					final := reassembler.NextSequence()
+					if len(frame.Payload) == 0 || frame.Header.Sequence > final || uint64(len(frame.Payload)) > final-frame.Header.Sequence {
+						return errors.New("data received after flow FIN")
+					}
+					if err := f.acknowledgeRemoteFIN(ctx, final, false); err != nil {
+						return err
+					}
+					continue
 				}
 				out, closed, err := reassembler.Insert(multipath.Segment{Sequence: frame.Header.Sequence, Payload: frame.Payload})
 				if err != nil {
@@ -2752,45 +2943,18 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 					}
 				}
 			case protocol.TypeAck:
+				if frame.Header.Flags&protocol.FlagAckFinal == 0 {
+					if err := f.receiveProgressACK(event.lane, frame); err != nil {
+						return err
+					}
+					continue
+				}
 				f.acksIn.Add(1)
 				if frame.Header.Flags&f.sendAckFlag == 0 {
 					return errors.New("acknowledgement has wrong direction")
 				}
-				// An acknowledgement carrying new delivery information --
-				// a cumulative point that moved, ranges, or the final ACK --
-				// and arriving on a suspected lane is direct proof the lane
-				// still round-trips: the peer received this flow's bytes and
-				// its answer travelled back on this lane. A bare duplicate
-				// proves nothing about delivery, so it does not clear the
-				// mark. Progress itself is recorded in acknowledgeReplay and
-				// the ranges branch below.
-				clearSuspicion := frame.Header.Flags&protocol.FlagAckFinal != 0 ||
-					frame.Header.Flags&protocol.FlagAckRanges != 0
-				if frame.Header.Flags&protocol.FlagAckFinal == 0 {
-					f.replayMu.Lock()
-					advances := frame.Header.Sequence > f.acked
-					f.replayMu.Unlock()
-					clearSuspicion = clearSuspicion || advances
-				}
-				if clearSuspicion && event.lane != nil {
+				if event.lane != nil {
 					event.lane.suspected.Store(false)
-				}
-				if frame.Header.Flags&protocol.FlagAckFinal == 0 {
-					if err := f.acknowledgeReplay(frame.Header.Sequence, false); err != nil {
-						return err
-					}
-					if frame.Header.Flags&protocol.FlagAckRanges != 0 {
-						ranges, err := protocol.DecodeAckRanges(frame.Payload, frame.Header.Sequence)
-						if err != nil {
-							return fmt.Errorf("acknowledgement ranges: %w", err)
-						}
-						f.ackTrack.Add(ranges)
-						// Ranges above the cumulative point are arrivals too:
-						// the peer has these bytes even though a gap stops
-						// the acknowledged offset from moving.
-						f.lastAckProgressNS.Store(time.Now().UnixNano())
-					}
-					continue
 				}
 				if frame.Header.Sequence == f.finSequence.Load() {
 					if err := f.acknowledgeReplay(frame.Header.Sequence, true); err != nil {

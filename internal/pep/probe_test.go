@@ -67,7 +67,9 @@ func TestClientProbeAuthenticatesProviderWithoutOpeningFlow(t *testing.T) {
 			if result.Transport != transport {
 				t.Fatalf("probe transport %q, want %q", result.Transport, transport)
 			}
-			if result.Latency <= 0 || result.Latency > 5*time.Second {
+			// A loopback exchange can finish within one clock tick, especially
+			// on Windows runners. Zero is a valid elapsed duration.
+			if result.Latency < 0 || result.Latency > 5*time.Second {
 				t.Fatalf("invalid probe latency %v", result.Latency)
 			}
 			if snapshot := serverMetrics.Snapshot(); snapshot.FlowsStarted != 0 {

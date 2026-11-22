@@ -8,6 +8,7 @@ import android.app.Service;
 import android.content.Intent;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 
 import java.security.GeneralSecurityException;
 import java.util.ArrayList;
@@ -32,6 +33,7 @@ import mobilecore.Session;
  * the Backend interface supplies.
  */
 final class TunnelServiceCore implements Observer {
+    private static final String TAG = "QueqiaoTunnel";
     /** The variant-specific half of a connection. */
     interface Backend {
         /** Mode identifier reported in every broadcast; see TunnelController.modeId. */
@@ -194,6 +196,8 @@ final class TunnelServiceCore implements Observer {
                 mainHandler.post(metricsPublisher);
             }
         } catch (Exception exception) {
+            // The UI shows a safe summary; the cause has to be findable somewhere.
+            Log.w(TAG, "The connection could not be started", exception);
             if (generation == lifecycleGeneration.get() && !stopping.get()) {
                 publishState(Mobilecore.StateFailed, safeMessage(exception), null);
                 stop("Connection failed");

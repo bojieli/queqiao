@@ -68,8 +68,10 @@ func run(args []string) error {
 		return runLogs(args[1:])
 	case "service":
 		return runService(args[1:])
+	case "relay":
+		return runRelay(args[1:])
 	default:
-		return fmt.Errorf("unknown command %q; want provider, enroll, client, service, server, doctor, segments, logs, or version", args[0])
+		return fmt.Errorf("unknown command %q; want provider, enroll, client, service, server, relay, doctor, segments, logs, or version", args[0])
 	}
 }
 
@@ -239,24 +241,48 @@ func runProvider(args []string) error {
 		state := fs.String("state", "", "provider state directory")
 		user := fs.String("user", "", "user name or ID")
 		expiresIn := fs.Duration("expires-in", 24*time.Hour, "one-time invitation lifetime (maximum 7d)")
+		showQR := fs.Bool("qr", false, "also draw the invitation as a QR code on standard error, for the mobile apps to scan")
+		var paths stringList
+		fs.Var(&paths, "path", "issue one invitation per route to this gateway, as NAME=HOST:PORT (a relay or another address); repeatable, and NAME or HOST:PORT may be empty to keep the provider's own")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if err := requireNoArguments(fs); err != nil {
 			return err
 		}
+		routes, err := parseInvitationPaths(paths)
+		if err != nil {
+			return err
+		}
 		provider, err := loadProviderRequired(*state)
 		if err != nil {
 			return err
 		}
-		uri, _, err := provider.CreateInvitation(*user, *expiresIn, time.Now())
-		if err != nil {
-			return err
+		// stdout is intentionally only the importable values, one per line,
+		// making it safe to pipe into a QR encoder or provider portal and to
+		// paste whole into a mobile app, which takes every invitation in one
+		// paste. Drawn codes go to stderr for the same reason: a terminal
+		// shows both, a pipe sees one.
+		var qrErr error
+		for _, route := range routes {
+			uri, invitation, err := provider.CreateInvitationForPath(*user, route, *expiresIn, time.Now())
+			if err != nil {
+				return err
+			}
+			if *showQR {
+				art, err := renderQRCode(uri)
+				if err != nil {
+					qrErr = err
+				} else {
+					if len(routes) > 1 {
+						fmt.Fprintf(os.Stderr, "%s (%s)\n", invitation.ProviderName, invitation.Endpoint)
+					}
+					fmt.Fprint(os.Stderr, art)
+				}
+			}
+			fmt.Println(uri)
 		}
-		// stdout is intentionally only the importable value, making it safe to
-		// pipe into a QR encoder or provider portal.
-		fmt.Println(uri)
-		return nil
+		return qrErr
 	case "list-invites":
 		fs := newFlagSet("provider list-invites")
 		state := fs.String("state", "", "provider state directory")
@@ -509,6 +535,8 @@ type runtimeOptions struct {
 	brutalBytesPerSec, adaptiveMinBytesSec, adaptiveMaxBytesSec uint64
 	aggregateBytesPerSec, interactiveReserveBytesPerSec         uint64
 	fallbackDelay, fallbackGrace, udpCooldown                   time.Duration
+	fallbackGraceMax                                            time.Duration
+	fallbackGraceRTTFactor                                      float64
 	udpFailureThreshold                                         int
 	hopPortCount                                                int
 	allowPrivate                                                bool
@@ -571,6 +599,8 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.BoolVar(&opts.waitForOpenAck, "wait-for-open-ack", false, "wait for destination confirmation before answering SOCKS")
 		fs.DurationVar(&opts.fallbackDelay, "fallback-delay", 300*time.Millisecond, "delay before preparing TCP fallback")
 		fs.DurationVar(&opts.fallbackGrace, "fallback-grace", 2*time.Second, "time a ready TCP fallback waits for QUIC")
+		fs.DurationVar(&opts.fallbackGraceMax, "fallback-grace-max", 30*time.Second, "cap on the adaptive QUIC preference window (0 = uncapped)")
+		fs.Float64Var(&opts.fallbackGraceRTTFactor, "fallback-grace-rtt-factor", 16, "scale the QUIC preference window by this multiple of the observed RTT (0 = fixed fallback-grace)")
 		fs.IntVar(&opts.udpFailureThreshold, "udp-failure-threshold", 3, "UDP failures before cooldown")
 		fs.DurationVar(&opts.udpCooldown, "udp-cooldown", 30*time.Second, "UDP cooldown after repeated failure")
 	} else {
@@ -735,7 +765,7 @@ func runClient(args []string) (returnErr error) {
 			return err
 		}
 	}
-	client, err := newRuntimeClient(profile, opts.listen, opts, logger, nil, nil, nil)
+	client, err := newRuntimeClient(profile, opts.listen, opts, logger, nil, nil, nil, "", 0)
 	if err != nil {
 		return err
 	}
@@ -1166,4 +1196,31 @@ func (r *repeatedFlag) String() string { return strings.Join(*r, ",") }
 func (r *repeatedFlag) Set(v string) error {
 	*r = append(*r, v)
 	return nil
+}
+
+// parseInvitationPaths turns repeated --path NAME=HOST:PORT values into
+// invitation routes. With none, one invitation uses the provider's own name
+// and endpoint, as before the flag existed.
+func parseInvitationPaths(values []string) ([]identity.InvitationPath, error) {
+	if len(values) == 0 {
+		return []identity.InvitationPath{{}}, nil
+	}
+	routes := make([]identity.InvitationPath, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		if seen[value] {
+			return nil, fmt.Errorf("--path %q is given twice", value)
+		}
+		seen[value] = true
+		name, endpoint, ok := strings.Cut(value, "=")
+		if !ok {
+			return nil, fmt.Errorf("--path %q: want NAME=HOST:PORT", value)
+		}
+		route := identity.InvitationPath{Name: name, Endpoint: endpoint}
+		if err := route.Validate(); err != nil {
+			return nil, fmt.Errorf("--path %q: %w", value, err)
+		}
+		routes = append(routes, route)
+	}
+	return routes, nil
 }
