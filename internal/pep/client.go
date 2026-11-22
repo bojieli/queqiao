@@ -1800,6 +1800,8 @@ type laneJoinResult struct {
 	// replacement attempt, and the result arrives too late to tell by looking
 	// at the flow: by then it may have recovered or died.
 	replacement bool
+	// stall identifies the live TCP lane named in a replacement JOIN.
+	stall *laneReplacementHint
 }
 
 // errLaneJoinRejected reports that the peer answered a lane join and refused
@@ -2577,7 +2579,7 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 	var lastFailure time.Time
 	observedLaneFailures := flow.laneFailureCount()
 
-	launch := func(replacement bool) bool {
+	launch := func(replacement bool, stall *laneReplacementHint) bool {
 		laneID, err := flow.allocateJoinID()
 		if err != nil {
 			return false
@@ -2587,9 +2589,13 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 		}
 		pending++
 		go func() {
-			lane, joinErr := c.openJoinLane(manageCtx, TransportTCP, sessionID, flowID, laneID)
+			joinCtx := manageCtx
+			if stall != nil {
+				joinCtx = context.WithValue(joinCtx, laneReplacementContextKey{}, *stall)
+			}
+			lane, joinErr := c.openJoinLane(joinCtx, TransportTCP, sessionID, flowID, laneID)
 			select {
-			case joins <- laneJoinResult{lane: lane, id: laneID, err: joinErr, replacement: replacement}:
+			case joins <- laneJoinResult{lane: lane, id: laneID, err: joinErr, replacement: replacement, stall: stall}:
 			case <-manageCtx.Done():
 				if lane != nil {
 					_ = lane.fc.Close()
@@ -2605,6 +2611,24 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 			return
 		case <-manageCtx.Done():
 			return
+		case <-flow.stallSignals():
+			// Keep the old stream available until the peer acknowledges its
+			// replacement. A stale signal can arrive after an ACK cleared the hint.
+			hint := flow.rescueHint.Load()
+			lanes := flow.healthyLanes()
+			now := time.Now()
+			if hint == nil || len(lanes) != 1 || lanes[0].kind != TransportTCP ||
+				lanes[0].id != hint.id || !lanes[0].suspected.Load() || pending != 0 ||
+				flow.openConfirmationRequired.Load() || flow.localAbortSent.Load() ||
+				(flow.finSent.Load() && flow.remoteFinSeen.Load()) ||
+				recoveryAttempts >= maxLaneRecoveryAttempts || now.Before(nextAttempt) {
+				break
+			}
+			if launch(false, hint) {
+				recoveryAttempts++
+				lastRecoveryAttempt = now
+				nextAttempt = now.Add(flow.stallThreshold())
+			}
 		case result := <-joins:
 			if pending > 0 {
 				pending--
@@ -2618,8 +2642,11 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 				}
 				if errors.Is(result.err, errLaneJoinRejected) {
 					bundleDisabled = true
-					if flow.laneCount() == 0 {
+					if result.stall != nil || flow.laneCount() == 0 {
 						flow.resumeRefused.Store(true)
+						if result.stall != nil {
+							flow.closeAll()
+						}
 						return
 					}
 					c.cfg.Logger.Debug("peer refused TCP bundle lane", "lane", result.id, "error", result.err)
@@ -2653,6 +2680,11 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 			if err := flow.addLane(result.lane); err != nil {
 				_ = result.lane.fc.Close()
 				continue
+			}
+			if result.stall != nil {
+				flow.retireLaneByID(result.stall.id)
+				flow.clearRescueReplacementSnapshot(result.stall)
+				c.metrics.LaneReplacement()
 			}
 			if flow.remoteFinSeen.Load() && flow.laneCount() > 1 {
 				// The peer has no more bytes to send. This join was launched before
@@ -2705,7 +2737,7 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 			}
 			recoveryAttempts++
 			lastRecoveryAttempt = now
-			launch(true)
+			launch(true, nil)
 			continue
 		}
 		// An accept-then-close peer must not reset the replacement budget on
@@ -2737,7 +2769,7 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 			// Widening a bundle that already has a healthy lane is not a
 			// replacement, and counting it as one would bury the flows that
 			// have nothing left in the ordinary run of bulk transfers.
-			if !launch(false) {
+			if !launch(false, nil) {
 				break
 			}
 		}
