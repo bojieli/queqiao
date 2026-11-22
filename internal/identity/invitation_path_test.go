@@ -2,6 +2,8 @@ package identity
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"net"
 	"testing"
@@ -160,5 +162,42 @@ func TestEnrollmentWithoutAPathAnswersWithTheProvider(t *testing.T) {
 	}
 	if record.Name != "" || record.Endpoint != "" {
 		t.Fatalf("a plain invitation recorded a route: %+v", record)
+	}
+}
+
+func TestConsumedInvitationRetryPreservesRoute(t *testing.T) {
+	now := time.Now()
+	provider := testProvider(t, "gateway.example:443", now)
+	account, err := provider.Store.AddAccount("alice", time.Time{}, AccountLimits{}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := InvitationPath{Name: "hk", Endpoint: "relay.example:443"}
+	record, token, err := provider.Store.CreateInviteForPath(account.ID, route, time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deviceID string
+	for i := range 2 {
+		_, device, _, got, err := provider.Store.enrollDevice(token, "phone", public, now.Add(time.Duration(i)*time.Second), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != record.ID || got.Name != route.Name || got.Endpoint != route.Endpoint || (i > 0 && device.ID != deviceID) {
+			t.Fatalf("attempt %d changed device or route: device %q, route %q %q", i, device.ID, got.Name, got.Endpoint)
+		}
+		deviceID = device.ID
+	}
+	for _, invalid := range []InvitationPath{{Name: "bad\nname"}, {Endpoint: "missing-port"}, {Endpoint: "bad\thost:443"}} {
+		corrupt := provider.Store.data.Invites[record.ID]
+		corrupt.Name, corrupt.Endpoint = invalid.Name, invalid.Endpoint
+		provider.Store.data.Invites[record.ID] = corrupt
+		if err := validateStoreData(provider.Store.data); err == nil {
+			t.Fatalf("invalid stored route accepted: %+v", invalid)
+		}
 	}
 }
