@@ -108,9 +108,9 @@ qualification items are still open.
 - Automatic TCP fallback cannot bypass a network that blocks both transports
   or the selected gateway port.
 - The optional gateway SOCKS5 upstream is unauthenticated and loopback-only.
-  Queqiao validates the gateway's current DNS answers and then preserves the
-  original domain for upstream routing, so the trusted upstream's final DNS
-  answer is a second resolution outside that initial check. The upstream must
+  Queqiao sends validated IPs under the default public-only policy. Original
+  domains reach the upstream only with private destinations explicitly enabled.
+  The upstream must
   support UDP ASSOCIATE for UDP traffic, and there is no silent direct
   fallback.
 - `--allow-private-destinations` removes the default SSRF boundary and should

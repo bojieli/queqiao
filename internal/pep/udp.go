@@ -883,18 +883,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 			if resolveErr != nil {
 				continue
 			}
-			var writeErr error
-			if relay, ok := udpConn.(namedUDPRelay); ok {
-				_ = udpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				_, writeErr = relay.WriteToDestination(payload, destination)
-			} else {
-				for _, address := range addresses {
-					_ = udpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-					if _, writeErr = udpConn.WriteToUDP(payload, address); writeErr == nil {
-						break
-					}
-				}
-			}
+			writeErr := s.cfg.DestinationPolicy.writeResolvedUDP(udpConn, payload, destination, addresses)
 			if writeErr != nil {
 				continue
 			}

@@ -250,21 +250,17 @@ ASSOCIATE, and its TCP control connection is retained together with the UDP
 relay during Queqiao lane recovery. The sing-box inbound must therefore
 support UDP; a TCP-only inbound makes UDP association opens fail closed.
 
-Queqiao resolves and validates the requested destination at the gateway before
-contacting the upstream. If every current answer passes the destination policy,
-the SOCKS5 request retains the original domain so sing-box domain rules can
-select an outbound. The trusted upstream then performs the final resolution.
-This makes the local sing-box configuration and its DNS path part of the
-destination-policy boundary: do not let an untrusted user control them, and do
-not point this option at a remote SOCKS server. A later or divergent upstream
-DNS answer cannot be compared with Queqiao's earlier validation.
-`--allow-private-destinations` still controls the initial validation and should
-be enabled only for an intentional private-access service. The gateway must
-therefore be able to resolve destination names even when sing-box uses its own
-DNS configuration; enabling private destinations does not skip that lookup.
-UDP destinations are validated for each packet, so slow gateway DNS can also
-delay an association. Domain rules require the client to supply the domain;
-a request containing only an IP does not carry the original hostname.
+With the default public-destination policy, Queqiao resolves the client's
+destination name and sends a validated IP address to the upstream for both
+TCP and UDP. Use IP-based rules in sing-box for these requests. The gateway
+must be able to resolve destination names; UDP performs this check for each
+packet.
+
+When an operator enables `--allow-private-destinations` for a private-access
+service, the upstream receives the client's original destination after gateway
+resolution. Domain rules then work for clients that supply a name, and the
+local router controls the final DNS answer. Keep the router and its DNS
+configuration under operator control.
 
 Verify TCP and UDP separately. An IP check through the client proves the final
 TCP egress; a DNS query through SOCKS5 UDP proves that sing-box's UDP inbound

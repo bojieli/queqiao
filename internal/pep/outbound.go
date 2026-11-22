@@ -30,6 +30,21 @@ type namedUDPRelay interface {
 	WriteToDestination([]byte, string) (int, error)
 }
 
+func (p DestinationPolicy) writeResolvedUDP(conn serverUDPRelay, payload []byte, destination string, addresses []*net.UDPAddr) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if relay, ok := conn.(namedUDPRelay); ok && p.AllowPrivate {
+		_, err := relay.WriteToDestination(payload, destination)
+		return err
+	}
+	var err error
+	for _, addr := range addresses {
+		if _, err = conn.WriteToUDP(payload, addr); err == nil {
+			break
+		}
+	}
+	return err
+}
+
 type socks5UDPRelay struct {
 	control *net.TCPConn
 	conn    *net.UDPConn

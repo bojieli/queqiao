@@ -233,12 +233,11 @@ The gateway normally opens TCP and UDP destinations directly. An operator may
 instead configure one unauthenticated loopback SOCKS5 upstream. TCP flows use
 CONNECT and UDP associations use UDP ASSOCIATE; the latter's TCP control
 connection is retained as part of the bounded relay so lane recovery does not
-silently destroy the upstream association. Destination policy first resolves
-and validates every current address, then preserves the original domain in the
-SOCKS request so the trusted local router can apply domain rules. The router's
-final DNS resolution is therefore part of the operator-controlled trust
-boundary. This is a local egress integration point, not another Queqiao carrier
-or a wire-protocol feature.
+silently destroy the upstream association. In public-only mode the gateway
+sends the validated destination IP to the upstream for both transports. With
+private destinations explicitly enabled, it can forward the original domain
+to the local router after gateway resolution. This option controls gateway
+egress and uses the existing Queqiao wire protocol.
 
 ## Trust boundaries
 

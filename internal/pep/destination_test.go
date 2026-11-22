@@ -93,6 +93,73 @@ func TestDestinationPolicyDialsTCPThroughSOCKS5(t *testing.T) {
 	}
 }
 
+// Use fixed resolver results and a loopback upstream so the test does not
+// depend on public DNS or open a connection to the public destination.
+func TestSOCKS5PublicPolicyPinsTCPAndUDPDestinations(t *testing.T) {
+	const requested = "service.example:443"
+	public := &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 443}
+	resolved := []*net.UDPAddr{public}
+	proxy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+	requests := make(chan socks5.Request, 1)
+	go func() {
+		conn, err := proxy.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, err := socks5.ReadRequest(conn, nil)
+		if err == nil {
+			requests <- req
+			_ = socks5.WriteReply(conn, socks5.ReplySucceeded, conn.LocalAddr())
+		}
+	}()
+	policy := DestinationPolicy{OutboundSOCKS5: proxy.Addr().String()}
+	conn, err := policy.dialResolvedTCP(context.Background(), requested, resolved, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if req := <-requests; req.Command != socks5.CommandConnect || req.Destination != public.String() {
+		t.Fatalf("public CONNECT target = %+v, want %s", req, public)
+	}
+
+	loopback := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	upstream, err := net.ListenUDP("udp4", loopback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	client, err := net.ListenUDP("udp4", loopback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	relay := &socks5UDPRelay{conn: client, relay: upstream.LocalAddr().(*net.UDPAddr)}
+	for _, tc := range []struct {
+		allowPrivate bool
+		want         string
+	}{{false, public.String()}, {true, requested}} {
+		policy.AllowPrivate = tc.allowPrivate
+		if err := policy.writeResolvedUDP(relay, []byte("test"), requested, resolved); err != nil {
+			t.Fatal(err)
+		}
+		_ = upstream.SetReadDeadline(time.Now().Add(2 * time.Second))
+		var buf [256]byte
+		n, _, err := upstream.ReadFromUDP(buf[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		packet, err := socks5.ReadUDPDatagram(buf[:n])
+		if err != nil || packet.Destination != tc.want {
+			t.Fatalf("UDP destination (allowPrivate=%v) = %q, %v; want %q", tc.allowPrivate, packet.Destination, err, tc.want)
+		}
+	}
+}
+
 func TestSOCKS5HandshakeHonorsContextCancellation(t *testing.T) {
 	proxy, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
