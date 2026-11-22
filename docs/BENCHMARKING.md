@@ -284,11 +284,14 @@ So a comparison should carry:
   check against the calibration bound below.
 
 ```sh
-# One cell of a parity sweep, against queqiao on the same seeded path.
+# A 50 Mbit/s, 200 ms path has a 1,250,000-byte BDP. At 1,200 bytes
+# of useful payload per packet this is about 1,042 packets; allow 1,536
+# in each direction and hold both windows fixed throughout this sweep.
 for parity in 1 3 6 10; do
   go run ./cmd/queqiaobench --stacks queqiao,kcptun \
       --kcptun-client ./kcptun/client --kcptun-server ./kcptun/server \
       --kcptun-mode fast3 --kcptun-datashard 10 --kcptun-parityshard "$parity" \
+      --kcptun-sndwnd 1536 --kcptun-rcvwnd 1536 \
       --rtt 200 --loss 20 --rate 50 --bytes $((16*1024*1024)) --trials 5 \
       --json "/tmp/kcptun-parity-$parity.json"
 done
