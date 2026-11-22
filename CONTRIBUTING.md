@@ -26,7 +26,7 @@ emulated benchmark.
 
 ## Development checks
 
-Use Go 1.25.13 or newer in the 1.25 line, then run:
+Use Go 1.26.9 or newer in the 1.26 line, then run:
 
 ```sh
 go test -short -timeout 20m ./...

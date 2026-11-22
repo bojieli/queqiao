@@ -86,29 +86,28 @@ func TestScanStallGating(t *testing.T) {
 	}
 }
 
-// The response gate opens when the application sent something the peer has
-// not answered, and closes on any downstream payload or either close. A flow
-// whose last send was answered is idle, not waiting.
-func TestResponseOutstandingGating(t *testing.T) {
-	flow := newStallTestFlow(t, nil)
-	if flow.responseOutstanding() {
-		t.Fatal("a flow that never sent is waiting on a response")
+// A transport ACK proves delivery, not that the application owes a reply.
+// A one-way message or a slow origin must not trigger lane churn.
+func TestAcknowledgedApplicationMessageDoesNotTriggerRescue(t *testing.T) {
+	flow := newStallTestFlow(t, metrics.New())
+	flow.stallScan = time.Millisecond
+	flow.stallGrace = 20 * time.Millisecond
+	flow.observe(512, true)
+	flow.bytesUp.Add(512)
+	flow.noteSent(0, 512)
+	if err := flow.acknowledgeReplay(512, false); err != nil {
+		t.Fatal(err)
 	}
-	flow.observe(64, true)
-	flow.bytesUp.Add(64)
-	if !flow.responseOutstanding() {
-		t.Fatal("an unanswered request did not open the response gate")
+	if flow.pendingOutbound() {
+		t.Fatal("setup has unacknowledged transport data")
 	}
-	flow.observe(128, false)
-	flow.bytesDown.Add(128)
-	if flow.responseOutstanding() {
-		t.Fatal("an answered request kept the response gate open")
-	}
-	flow.observe(64, true)
-	flow.bytesUp.Add(64)
-	flow.remoteFinSeen.Store(true)
-	if flow.responseOutstanding() {
-		t.Fatal("a flow that saw the peer's FIN is still waiting")
+	stop := make(chan struct{})
+	defer close(stop)
+	go flow.stallWatchdog(stop)
+	select {
+	case <-flow.stallSignals():
+		t.Fatal("fully acknowledged application message triggered transport rescue")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

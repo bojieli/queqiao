@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -60,14 +61,50 @@ type ClientProfile struct {
 }
 
 func (p *Provider) CreateInvitation(account string, ttl time.Duration, now time.Time) (string, Invitation, error) {
+	return p.CreateInvitationForPath(account, InvitationPath{}, ttl, now)
+}
+
+// InvitationPath names another route to the same gateway: a relay or a
+// second address in front of it. The invitation still pins this provider's
+// root and gateway, so the endpoint decides only where the client dials, never
+// whom it trusts. Empty fields keep the provider's own name and endpoint. The
+// provider stores the route with the invitation and returns it in the
+// enrollment response, which is what clients compare the invitation against
+// and build the profile from.
+type InvitationPath struct {
+	Name     string
+	Endpoint string
+}
+
+// Validate reports whether the path can be placed in an invitation.
+func (p InvitationPath) Validate() error {
+	if p.Name != strings.TrimSpace(p.Name) || len(p.Name) > 128 ||
+		strings.IndexFunc(p.Name, unicode.IsControl) >= 0 {
+		return fmt.Errorf("invalid invitation name %q", p.Name)
+	}
+	if p.Endpoint != "" {
+		if err := validateEndpoint(p.Endpoint); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CreateInvitationForPath creates a one-time invitation that dials path's
+// endpoint and is labelled with path's name. Each call consumes its own token,
+// because each enrolled profile is its own device.
+func (p *Provider) CreateInvitationForPath(account string, path InvitationPath, ttl time.Duration, now time.Time) (string, Invitation, error) {
 	if now.IsZero() {
 		now = time.Now()
+	}
+	if err := path.Validate(); err != nil {
+		return "", Invitation{}, err
 	}
 	resolved, ok := p.Store.FindAccount(account)
 	if !ok {
 		return "", Invitation{}, errors.New("unknown account")
 	}
-	record, token, err := p.Store.CreateInvite(resolved.ID, ttl, now)
+	record, token, err := p.Store.CreateInviteForPath(resolved.ID, path, ttl, now)
 	if err != nil {
 		return "", Invitation{}, err
 	}
@@ -76,6 +113,12 @@ func (p *Provider) CreateInvitation(account string, ttl time.Duration, now time.
 		ProviderID: p.Metadata.ProviderID, Endpoint: p.Metadata.Endpoint,
 		GatewayID: p.Metadata.GatewayID, RootPin: p.Metadata.RootPin,
 		Token: token, ExpiresAt: record.ExpiresAt,
+	}
+	if path.Name != "" {
+		invitation.ProviderName = path.Name
+	}
+	if path.Endpoint != "" {
+		invitation.Endpoint = path.Endpoint
 	}
 	encoded, err := invitation.URI()
 	if err != nil {

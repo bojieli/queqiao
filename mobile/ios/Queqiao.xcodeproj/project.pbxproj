@@ -12,6 +12,7 @@
 		06191DEC5E7AE0B89897BB64 /* VPNDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D1A32A7D2EA758E64DF5615 /* VPNDiagnostics.swift */; };
 		077365773929DC839BBEDF46 /* ProviderMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = B376BE6ED126E4D1515CFEEA /* ProviderMessage.swift */; };
 		07F155EAF1B380CBE528972D /* MobileCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 23BCEED68000E8B4E9606949 /* MobileCore.swift */; };
+		64AA30AD6BA87881CA94741D /* InvitationImport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 016375A3BC4A39E3EEE77FCC /* InvitationImport.swift */; };
 		171DA48D7D57A037D5DE6A5C /* TunnelModel+Probing.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACE67DE2C949D4B7DC369AA5 /* TunnelModel+Probing.swift */; };
 		178B2606193C371113D64EE4 /* TunnelNetworkSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 669F84268D925AD1EE813150 /* TunnelNetworkSettings.swift */; };
 		1C800E7E089993D5F21BCA0F /* TunnelNetworkSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 669F84268D925AD1EE813150 /* TunnelNetworkSettings.swift */; };
@@ -186,6 +187,7 @@
 		9AFF87BF9DBE60A53F395EA3 /* RoutingConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RoutingConfiguration.swift; sourceTree = "<group>"; };
 		A22BC502BF533F3ED9712923 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
 		A73080843F759E47498727DB /* RoutePlanTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RoutePlanTests.swift; sourceTree = "<group>"; };
+		016375A3BC4A39E3EEE77FCC /* InvitationImport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InvitationImport.swift; sourceTree = "<group>"; };
 		ACE67DE2C949D4B7DC369AA5 /* TunnelModel+Probing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TunnelModel+Probing.swift"; sourceTree = "<group>"; };
 		ACF108D4615B78EC678BCB68 /* CountryRoutes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CountryRoutes.swift; sourceTree = "<group>"; };
 		B177679FBC7D995ACD2B8D5E /* ProfileProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileProbe.swift; sourceTree = "<group>"; };
@@ -263,6 +265,7 @@
 				6B3358D1947A2D5AFE5A1F91 /* SettingsView.swift */,
 				D2BFAFFC99FD54DA31825F59 /* TunnelMetrics.swift */,
 				127965658AAA8DBADE524652 /* TunnelModel.swift */,
+				016375A3BC4A39E3EEE77FCC /* InvitationImport.swift */,
 				ACE67DE2C949D4B7DC369AA5 /* TunnelModel+Probing.swift */,
 				996ABCB2304649D0527D7BA4 /* TunnelModel+VPN.swift */,
 				4802E6E5533792D16DDFA25B /* TunnelSupport.swift */,
@@ -536,6 +539,7 @@
 				3727BC1350FE32A55B91D5C3 /* RoutingConfiguration.swift in Sources */,
 				4216F96A859623582815FACD /* SettingsView.swift in Sources */,
 				9BBA0ED88485C8759A3A0E22 /* TunnelMetrics.swift in Sources */,
+				64AA30AD6BA87881CA94741D /* InvitationImport.swift in Sources */,
 				171DA48D7D57A037D5DE6A5C /* TunnelModel+Probing.swift in Sources */,
 				F8514BB5053E0BFE434E1EFA /* TunnelModel+VPN.swift in Sources */,
 				8DBBCFCF8A142E6312DB5D8D /* TunnelModel.swift in Sources */,

@@ -941,14 +941,16 @@ func TestReadLaneTreatsEOFAfterRemoteResetAsProtocolTeardown(t *testing.T) {
 		_ = peer.Close()
 	}()
 
+	// RESET now bypasses application delivery, including a full event queue.
 	select {
-	case event := <-flow.events:
-		if event.frame.Header.Type != protocol.TypeReset {
-			t.Fatalf("reader delivered frame type %d, want RESET", event.frame.Header.Type)
+	case err := <-flow.ackErr:
+		if err == nil || err.Error() != "peer reset flow" {
+			t.Fatalf("unexpected RESET result: %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for peer RESET")
 	}
+
 	if err := <-writeDone; err != nil {
 		t.Fatal(err)
 	}
@@ -1074,5 +1076,74 @@ func TestInboundDeliveryBlockedByAFullQueueStopsWithTheFlow(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("inbound reader remained blocked after flow teardown")
+	}
+}
+
+// Reinjected data can arrive on a slower lane after the FIN on the winning
+// lane. Already-delivered bytes are duplicates, not a protocol violation.
+func TestLateReplayAfterRemoteFIN(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sequence uint64
+		payload  string
+		valid    bool
+	}{
+		{"full replay", 0, "reply", true},
+		{"prefix replay", 0, "rep", true},
+		{"suffix replay", 3, "ly", true},
+		{"new data", 5, "x", false},
+		{"crosses FIN", 4, "xx", false},
+		{"overflow", ^uint64(0), "xx", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inner, app := net.Pipe()
+			defer inner.Close()
+			defer app.Close()
+			outer := newAckCaptureConn(0, nil)
+			flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024, protocol.FlagAckUp, protocol.FlagAckDown, nil, nil)
+			flow.lanes[0] = &mpLane{id: 0, fc: newFrameConn(outer)}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() { result <- flow.receiveInner(ctx) }()
+			send := func(kind protocol.Type, sequence uint64, payload string, flags uint16) {
+				flow.events <- inboundEvent{frame: protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: kind, SessionID: [16]byte{1}, FlowID: 7, Sequence: sequence, Flags: flags}, Payload: []byte(payload)}}
+			}
+			send(protocol.TypeData, 0, "reply", 0)
+			_ = app.SetReadDeadline(time.Now().Add(time.Second))
+			got := make([]byte, 5)
+			if _, err := io.ReadFull(app, got); err != nil {
+				t.Fatal(err)
+			}
+			send(protocol.TypeClose, 5, "", protocol.FlagFin)
+			ack := waitAckFrame(t, outer)
+			if ack.Header.Flags&protocol.FlagAckFinal == 0 {
+				t.Fatal("missing FIN acknowledgement")
+			}
+			send(protocol.TypeData, tc.sequence, tc.payload, 0)
+			if tc.valid {
+				// The duplicate must provoke another final ACK without failing or
+				// redelivering bytes to the application.
+				ack = waitAckFrame(t, outer)
+				if ack.Header.Flags&protocol.FlagAckFinal == 0 || ack.Header.Sequence != 5 {
+					t.Fatal("missing duplicate final ACK")
+				}
+				if flow.bytesDown.Load() != 5 {
+					t.Fatal("replay delivered twice")
+				}
+				cancel()
+			}
+			select {
+			case err := <-result:
+				if tc.valid && !errors.Is(err, context.Canceled) {
+					t.Fatalf("valid replay failed: %v", err)
+				}
+				if !tc.valid && (err == nil || errors.Is(err, context.Canceled)) {
+					t.Fatalf("accepted bytes beyond FIN: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("receive did not finish")
+			}
+		})
 	}
 }

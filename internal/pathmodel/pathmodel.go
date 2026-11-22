@@ -65,6 +65,8 @@ type PathModel struct {
 	// aggregate is a windowed maximum of the summed delivered rate, which is
 	// the endpoint pair's bottleneck as measured from this side.
 	aggregate []bandwidthSample
+	// now is the clock, for tests; nil means time.Now.
+	now func() time.Time
 }
 
 type pathKnowledge struct {
@@ -73,6 +75,36 @@ type pathKnowledge struct {
 	erasureKnown    bool
 	observedSamples float64
 	roundTrip       time.Duration
+	// at is when anything last reported. Knowledge outlives its members so
+	// that a quiet path is not forgotten between connections, but it is a
+	// measurement and it ages like one: see knowledgeLifetime.
+	at time.Time
+}
+
+// knowledgeLifetime is how long the path's measurements stand with nothing
+// reporting. It is far longer than a member's idleness, because a connection
+// made a minute after the last one should start from what that one measured;
+// and it is finite, because a gateway keys this by client address and keeps it
+// for the life of its process. A client that comes back hours later -- from a
+// different network behind the same address, or the same network at a
+// different hour -- was otherwise seeded with an erasure rate and a minimum
+// round trip from the last time, the round trip being a floor that only ever
+// moves down.
+const knowledgeLifetime = 10 * time.Minute
+
+func (m *PathModel) clock() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+// expireKnowledgeLocked forgets the path's measurements once nothing has
+// reported for knowledgeLifetime.
+func (m *PathModel) expireKnowledgeLocked(now time.Time) {
+	if !m.knowledge.at.IsZero() && now.Sub(m.knowledge.at) > knowledgeLifetime {
+		m.knowledge = pathKnowledge{}
+	}
 }
 
 // Member identifies one contributor within a model. Callers allocate these
@@ -199,9 +231,11 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	if m == nil {
 		return State{}
 	}
-	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := m.clock()
+	m.expireKnowledgeLocked(now)
+	m.knowledge.at = now
 
 	entry, ok := m.members[member]
 	if !ok {
@@ -302,9 +336,10 @@ func (m *PathModel) Current() State {
 	if m == nil {
 		return State{}
 	}
-	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := m.clock()
+	m.expireKnowledgeLocked(now)
 	var state State
 	var observed, bottleneck float64
 	var erasureWeighted, burstWeighted float64
