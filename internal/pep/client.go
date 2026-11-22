@@ -422,8 +422,9 @@ type controlQUICGeneration struct {
 	// liveness watches for a connection that sends and hears nothing back,
 	// so new flows stop being opened on it long before QUIC's idle timeout.
 	liveness poolLiveness
-	// superseded records that liveness retired this generation for silence.
-	superseded atomic.Bool
+	// Silent retirement wakes borrowers still waiting for proof or stream credit.
+	borrowing     context.Context
+	stopBorrowing context.CancelFunc
 }
 
 // watchLiveness samples the connection's packet counters until it closes.
@@ -432,9 +433,8 @@ type controlQUICGeneration struct {
 // flows opened in the first second after a path dies are the ones a page load
 // is waiting on, and waiting for the next one to notice would leave them on the
 // dead connection until QUIC's idle timeout. So: once silent, the generation
-// stops taking new flows and a replacement is dialed at once; once silent for
-// twice as long, it is closed, so the flows still on it fail in seconds and
-// are retried on the replacement rather than hanging for fifteen.
+// stops taking new flows and a replacement is dialed at once. A longer
+// silence closes the old connection once any protected OPEN has drained.
 func (g *controlQUICGeneration) watchLiveness(onSilent func(*controlQUICGeneration)) {
 	ticker := time.NewTicker(poolLivenessInterval)
 	defer ticker.Stop()
@@ -1646,6 +1646,9 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 		}
 		if err = c.verifyControlPath(dialCtx, generation); err != nil {
 			generation.releaseBorrow()
+			if generation.borrowing.Err() != nil && dialCtx.Err() == nil {
+				continue
+			}
 			return nil, err
 		}
 		if err = dialCtx.Err(); err != nil {
@@ -1661,9 +1664,12 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 		generation.probeMu.Lock()
 		proofStarted, proofEpoch = time.Now(), generation.proofEpoch
 		generation.probeMu.Unlock()
-		stream, err = generation.conn.OpenStreamSync(dialCtx)
+		stream, err = generation.openStreamForBorrow(dialCtx)
 		if err != nil {
 			generation.releaseBorrow()
+			if generation.borrowing.Err() != nil && dialCtx.Err() == nil {
+				continue
+			}
 			if generation.conn.Context().Err() != nil {
 				c.retireControlQUICGeneration(generation, "queqiao pooled connection failed")
 			}
@@ -1687,6 +1693,20 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 		proofStarted: proofStarted, proofEpoch: proofEpoch,
 	}
 	return outer, nil
+}
+
+// Only stream-credit exhaustion needs an interruptible wait. The usual
+// borrow allocates its stream immediately without an extra context.
+func (g *controlQUICGeneration) openStreamForBorrow(ctx context.Context) (*quic.Stream, error) {
+	stream, err := g.conn.OpenStream()
+	if !errors.Is(err, &quic.StreamLimitReachedError{}) {
+		return stream, err
+	}
+	wait, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(g.borrowing, cancel)
+	defer stop()
+	return g.conn.OpenStreamSync(wait)
 }
 
 func (c *Client) currentControlGeneration(g *controlQUICGeneration) bool {
@@ -1757,7 +1777,8 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
 	var generation *controlQUICGeneration
 	if err == nil {
-		generation = &controlQUICGeneration{
+		borrowing, stopBorrowing := context.WithCancel(context.Background())
+		generation = &controlQUICGeneration{borrowing: borrowing, stopBorrowing: stopBorrowing,
 			id: attempt.epoch, conn: conn, packet: packet, verified: time.Now(),
 			controller: configureQUICController(conn, ccfg),
 			lossPath:   pathmodel.Shared(peerKey(conn)),
@@ -1802,7 +1823,7 @@ func (c *Client) supersedeSilentGeneration(generation *controlQUICGeneration, cc
 	}
 	c.cfg.Logger.Warn("pooled QUIC connection stopped answering; dialing a fresh one",
 		"generation", generation.id)
-	generation.superseded.Store(true)
+	generation.stopBorrowing()
 	c.drainControlQUICGeneration(generation)
 	serving := c.serving.Load()
 	if ccfg != nil && serving != nil && (*serving).Err() == nil {

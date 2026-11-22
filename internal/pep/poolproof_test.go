@@ -409,7 +409,7 @@ func TestLatePathProofReborrowsBeforeSendingOPEN(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	c.supersedeSilentGeneration(old, nil)
-	close(release)
+	defer close(release)
 	select {
 	case o := <-result:
 		if o.err != nil {
@@ -503,11 +503,8 @@ func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
 	case <-time.After(40 * time.Millisecond):
 	}
 	c.supersedeSilentGeneration(old, nil)
-	// Returning one slot suffices. The remaining unannounced stream IDs
-	// disappear with the old connection.
-	slots[0].CancelRead(0)
-	_ = slots[0].Close()
-	_ = held.Close()
+	// Deliberately withhold all old stream credit. Retirement itself must
+	// release the wait, while the already admitted sibling stays usable.
 	select {
 	case o := <-done:
 		if o.err != nil {

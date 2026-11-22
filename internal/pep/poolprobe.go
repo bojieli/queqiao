@@ -85,6 +85,8 @@ func (c *Client) verifyControlPath(ctx context.Context, g *controlQUICGeneration
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-g.borrowing.Done():
+		return g.borrowing.Err()
 	case <-pending.done:
 		return pending.err
 	}

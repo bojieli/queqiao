@@ -110,8 +110,8 @@ func TestAHealthyIdlePoolIsNotSuperseded(t *testing.T) {
 	lastClient.quicMu.Lock()
 	second := lastClient.quicGeneration
 	lastClient.quicMu.Unlock()
-	if second != first || first.superseded.Load() || first.conn.Context().Err() != nil {
+	if second != first || (first.borrowing.Err() != nil) || first.conn.Context().Err() != nil {
 		t.Fatalf("a healthy pool was replaced while idle (superseded=%v closed=%v)",
-			first.superseded.Load(), first.conn.Context().Err() != nil)
+			(first.borrowing.Err() != nil), first.conn.Context().Err() != nil)
 	}
 }
