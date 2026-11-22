@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -101,6 +102,19 @@ func dialQUICEcho(t *testing.T, packetConn net.PacketConn, serverAddr *net.UDPAd
 	return got
 }
 
+// Windows can reserve a derived port, which the server intentionally skips.
+// Exercise a real secondary socket even when an earlier candidate was skipped.
+func boundSecondary(t *testing.T, mux *portmux.ServerPortMux, ports []int) int32 {
+	t.Helper()
+	for i, port := range ports[1:] {
+		if !slices.Contains(mux.SkippedPorts(), port) {
+			return int32(i + 1)
+		}
+	}
+	t.Fatalf("no bound secondary among %v (skipped %v)", ports, mux.SkippedPorts())
+	return 0
+}
+
 // A client whose every packet goes to a secondary hop port must still
 // complete the QUIC handshake: the server mux has to feed hop-port datagrams
 // to the listener and route replies back through the same socket.
@@ -110,7 +124,7 @@ func TestQUICHandshakeViaSecondaryHopPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	primaryPort := primary.LocalAddr().(*net.UDPAddr).Port
-	ports := portmux.HopPorts("hop-itest", primaryPort, 3)
+	ports := portmux.HopPorts("hop-itest", primaryPort, 8)
 	if len(ports) < 3 {
 		t.Fatalf("want at least 3 hop ports, got %v", ports)
 	}
@@ -129,7 +143,7 @@ func TestQUICHandshakeViaSecondaryHopPort(t *testing.T) {
 	cmux := portmux.NewClientPortMux(clientConn, serverAddr, ports)
 	defer cmux.Close()
 	// Hop onto a secondary port before sending a single packet.
-	from, to := cmux.Hop(1)
+	from, to := cmux.Hop(boundSecondary(t, mux, ports))
 	if from != primaryPort || to == primaryPort {
 		t.Fatalf("unexpected hop %d -> %d", from, to)
 	}
@@ -148,7 +162,7 @@ func TestQUICConnectionSurvivesMidSessionHop(t *testing.T) {
 		t.Fatal(err)
 	}
 	primaryPort := primary.LocalAddr().(*net.UDPAddr).Port
-	ports := portmux.HopPorts("hop-itest-mid", primaryPort, 3)
+	ports := portmux.HopPorts("hop-itest-mid", primaryPort, 8)
 
 	mux, err := portmux.NewServerPortMux(primary, ports)
 	if err != nil {
@@ -178,7 +192,7 @@ func TestQUICConnectionSurvivesMidSessionHop(t *testing.T) {
 		t.Fatalf("open stream: %v", err)
 	}
 
-	cmux.Hop(2)
+	cmux.Hop(boundSecondary(t, mux, ports))
 	payload := []byte("post-hop-echo")
 	if _, err := stream.Write(payload); err != nil {
 		t.Fatalf("stream write after hop: %v", err)
