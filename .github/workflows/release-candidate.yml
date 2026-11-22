@@ -95,7 +95,20 @@ jobs:
       # configured 300 ms RTT as far as 3.8 s, changing the impairment rather
       # than testing the one requested. Windows still runs every portable test,
       # including coded-path correctness, and executes its packaged binary.
-      - run: go test -p=1 -count=1 -timeout 50m ./...
+      - name: Native tests
+        if: runner.os != 'macOS'
+        run: go test -p=1 -count=1 -timeout 50m ./...
+      # These three absolute-rate/queue/loss measurements require stable
+      # scheduling. Linux still gates all three at the original thresholds.
+      - name: Native macOS tests
+        if: runner.os == 'macOS'
+        run: go test -p=1 -count=1 -timeout 50m -skip "$MEASUREMENTS" ./...
+      - name: Record hosted macOS timing measurements
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: go test -v -p=1 -count=1 -timeout 20m -run "$MEASUREMENTS" ./internal/pathsim ./internal/baseline ./internal/pep
+    env:
+      MEASUREMENTS: '^(TestTheEmulatorReproducesTheMeasuredPath|TestRawQUICSaturatesThePath|TestCase4APolicedPathIsStillUnbraked)$'
 
   vulnerability:
     runs-on: ubuntu-24.04
