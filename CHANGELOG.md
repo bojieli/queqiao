@@ -10,6 +10,137 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.13.0 - 2026-11-22
+
+### Added
+
+- The gateway can forward destination traffic to a trusted loopback SOCKS5
+  router with `--outbound-socks5`. This lets an operator use sing-box or another
+  local router to send selected services through a designated proxy while other
+  traffic leaves directly from the gateway. TCP CONNECT and UDP ASSOCIATE use
+  validated destination IPs by default. Private-access services can forward
+  original names for domain routing. The option is disabled by default, uses
+  the existing client and wire protocol, and fails closed if the router fails.
+
+### Changed
+
+- Move explicit replacement JOINs to wire version 2 and data ALPN queqiao/2.
+  TCP and QUIC reject mixed versions during TLS negotiation. Clients and
+  gateways require paired upgrades; the protocol documentation describes
+  parallel-endpoint staging and rollback. Preserve version-1 vectors and add
+  version-2 conformance vectors.
+
+### Fixed
+
+- Validate complete ACK frames and selective ranges before advancing send state.
+  Repeated or empty selective acknowledgements no longer reset stall progress
+  or clear lane suspicion. Release the receive worker promptly when local
+  sending completes after the remote FIN.
+- Reject bulk connections whose handshake spans a system suspend before
+  publishing them into the pool, so wake-up recovery cannot reuse an old path.
+- Serialize bulk pool idle-timer ownership with borrowing, release and reset.
+  Late releases cannot rearm detached connections, and callbacks from older
+  idle periods cannot close a newly reused connection. Transport closure is
+  idempotent when reset and release race.
+- Validate expired bulk-pool connections with an authenticated, bounded path
+  probe before opening another lane. Failed exclusive entries leave the pool
+  without closing control-pool siblings; fresh handshakes and hot reuses avoid
+  extra probes. Remote proof freshness is independent of interface polling.
+- Keep the published close sequence immutable when source EOF races a full
+  application close, and treat abort acknowledgements as cancellation rather
+  than delivery credit.
+- Limit reliable-stream recovery to the bytes pending when a coded send
+  stalls. Later interactive exchanges keep coding through delayed
+  acknowledgements, and dispatched stream retries remain reliable after
+  their recovery is acknowledged.
+- When a coded data flow stops making forward progress, subsequent retries use
+  the authenticated reliable stream instead of repeatedly sending unreliable
+  coded data. This lets server-side responses recover without a client lane
+  manager.
+- Bound destination TCP dialing to two staggered candidates and share the open
+  deadline across resolved addresses. A blackholed first address no longer
+  exhausts the entire deadline while a later address is reachable. All
+  candidates remain subject to the existing public-address policy, and losing
+  sockets close without carrying application data.
+- Validate and commit replacement JOIN admission atomically so refused joins
+  cannot retire live lanes or change the flow transport mode.
+- Bound completion replay writes on resumed lanes, including retained completed
+  sessions, so a peer that stops reading cannot leave its JOIN handler stuck.
+- Prevent lane admission and activation after flow shutdown starts, and
+  preserve newer rescue replacement hints when an older recovery episode
+  completes.
+- Close JOIN lanes that complete after their manager exits, and drain failed
+  QUIC pool generations so new requests can reconnect without interrupting
+  existing sibling streams. Explicitly identify stalled lanes during rescue
+  replacement and refresh that identity across repeated stall episodes.
+- Show the route name and endpoint of outstanding invitations, and validate
+  stored invitation routes when loading provider state.
+- Honor rescue-handshake extensions of the lane replacement deadline in waits
+  that have already started. An old timer no longer fails a flow while its
+  validated replacement handshake is still within the extended grace.
+- On macOS, keep healthy proxy connections when only the other IP address
+  family changes on the bound network interface. Uplink gateway identity and
+  route notifications now follow the source address family used by the socket.
+- Bound in-flight bulk handshakes and discard cancelled pool generations. Keep
+  stream deadlines isolated from healthy sibling streams, preserve half-closed
+  response reads, and honor write budgets across coded fallback and writer
+  contention.
+- Bound optimistic OPEN completion and lane handshakes, verify stale pooled
+  paths without closing sibling streams, and try compatible gateway address
+  candidates. Restore single-lane TCP recovery, preserve actual payload
+  activity clocks, pin reliable dispatches, and make scheduler cancellation
+  reliable. Keep reverse ACK handling independent of bounded application
+  delivery, accept historical DATA copies after FIN, isolate UDP destination
+  resolution, and join relay workers before socket handoff. Detect physical
+  uplink identity and macOS route events without watching unrelated TUN
+  routes.
+- Wait for an optimistic OPEN to be confirmed before starting a speculative
+  stall-rescue JOIN while its original lane is still healthy. A JOIN that
+  overtakes OPEN can no longer turn a delayed handshake into an
+  "unknown session" failure. The existing OPEN deadline and recovery after real
+  lane loss remain in force.
+- Reuse authenticated responses on newly opened pooled streams as bounded path
+  proof, avoiding redundant probe round trips during repeated short flows while
+  retaining stale-connection validation. Buffered replies cannot refresh proof
+  beyond the stream's creation or undo a later transport failure.
+- Preserve bounded pooled-connection path proof when an older stream finishes
+  or is canceled with the normal zero code. A late stream close no longer makes
+  the next short flow pay for an unnecessary path probe; timeouts, other
+  failures, and stale proof still require validation, and failed connections
+  are retired. Distinguish a frame missing its entire payload from clean stream
+  EOF so truncated frames still invalidate path proof.
+- Discard already-delivered duplicate data without consuming receive-window
+  memory, reject partial cursor overlaps and conflicting final offsets before
+  mutating receive state, and preserve explicit budgets when defaulting limits.
+- Keep receive payloads charged while application writes block, and deliver
+  reordered chunks without allocating a second window-sized buffer. Field
+  validation now rejects truncated HTTP bodies and can enforce a known body
+  digest; absent resource measurements are no longer reported as a resource-
+  convergence pass.
+- Avoid repeatedly replacing healthy lanes while an acknowledged request waits
+  for application data. The stall watchdog now requires unacknowledged outgoing
+  work; receive-only outages remain subject to the underlying transport's
+  failure detection. AUTO recovery also stops racing QUIC JOINs against an
+  irreversible TCP handoff, which could retire the apparent QUIC winner on the
+  server. QUIC-only mode retains parallel recovery.
+- Expire cached QUIC control and bulk connections after macOS or Linux suspend
+  exceeds the transport idle budget, even when the local address is unchanged.
+  The existing uplink watcher and first pool borrower share the same reset, so
+  concurrent requests rebuild one generation rather than reuse pre-sleep paths.
+- Replace a stalled sole TCP lane with an authenticated JOIN while its old
+  stream is still open.
+- Close the application connection when stall recovery receives a permanent
+  session rejection or exhausts consecutive lane-capacity refusals. Previously
+  the lane manager exited with an unresumable flag while a stalled lane still
+  counted as healthy, leaving the application waiting for a transport timeout.
+- Serialize UDP relay writes with their shared socket deadlines and cancel
+  queued or expired writes. Count payload frames only after successful writes
+  on the substrate actually used, including coded-to-stream fallback.
+- Validate release wire identity against its packaged protocol specification
+  and SBOM instead of a fixed version. Preserve LF bytes for conformance
+  vectors on every platform, and establish QUIC before injecting its failure
+  in the UDP association rescue regression.
+
 ## v0.12.2 - 2026-11-20
 
 ### Added

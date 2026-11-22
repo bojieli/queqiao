@@ -10,7 +10,7 @@ Clash/mihomo integration. It also covers multi-provider clients, service
 operation, upgrades, and rollback. Protocol 2 is the only supported wire
 protocol, so client and server must be upgraded together.
 
-Use a gateway and client from the same wire version. The v0.12.2 release uses v1; use its tagged installers and documentation when deploying those binaries. For v2, build both endpoints from this revision or use a release whose binary reports `wire=2`. Verify downloaded archives against the release's `SHA256SUMS`. See the [release downloads](https://github.com/bojieli/queqiao/releases) and [source build instructions](../README.md#build-from-source).
+Use a gateway and client from the same wire version. The v0.12.2 release uses v1; use its tagged installers and documentation when deploying those binaries. For v2, install v0.13.0 on both endpoints and verify each binary reports `wire=2`. Verify downloaded archives against the release's `SHA256SUMS`. See the [release downloads](https://github.com/bojieli/queqiao/releases) and [source build instructions](../README.md#build-from-source).
 
 For a quick overview, start with the [repository README](../README.md). Use
 [known limitations](KNOWN-LIMITATIONS.md) to check whether the paired-gateway
