@@ -86,6 +86,46 @@ type uplinkWatchState struct {
 	interrupted bool
 }
 
+// Suspend time advances while the process cannot observe its uplink, even
+// when that uplink has exactly the same address on wake. Unlike wall time,
+// the platform clocks used here are unaffected by clock corrections.
+type suspendWatchState struct {
+	total time.Duration
+	known bool
+}
+
+func (s *suspendWatchState) observe(total time.Duration, err error) bool {
+	if err != nil || total < 0 || (s.known && total < s.total) {
+		return false
+	}
+	expired := s.known && total-s.total >= laneDeadPathDetection
+	s.total, s.known = total, true
+	return expired
+}
+
+// Both the existing uplink watcher and pool borrowers check this boundary.
+// One borrower invalidates the old epoch; concurrent borrowers then share
+// the existing singleflight dial instead of each resetting its replacement.
+func (c *Client) checkSystemResume() bool {
+	c.resumeMu.Lock()
+	defer c.resumeMu.Unlock()
+	read := c.readSuspendTime
+	if read == nil {
+		read = systemSuspendTime
+	}
+	if !c.resumeState.observe(read()) {
+		return false
+	}
+	if c.udpHealth != nil {
+		c.udpHealth.reset()
+	}
+	c.closeQUICPool()
+	if c.cfg.Logger != nil {
+		c.cfg.Logger.Info("system resumed after transport idle budget; expired QUIC pools")
+	}
+	return true
+}
+
 // observe reports whether connections belonging to the previous path must be
 // discarded. A definite unavailable interval is itself a path boundary, even
 // if the address on the other side is textually identical. Inconclusive empty
@@ -115,8 +155,13 @@ func (c *Client) watchUplink(ctx context.Context, known string) {
 			return
 		case <-ticker.C:
 		}
+		resumed := c.checkSystemResume()
 		current, unavailable := c.currentUplinkState()
 		from, changed := state.observe(current, unavailable)
+		if resumed {
+			c.prewarmPath(ctx)
+			continue
+		}
 		if !changed {
 			continue
 		}
