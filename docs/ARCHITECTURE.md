@@ -176,6 +176,28 @@ Carrier recovery attaches a new lane with JOIN. Unacknowledged byte ranges and
 close state are replayed on the replacement. A QUIC flow has one data connection
 at a time; temporary old/new lanes exist only for bounded handoff state.
 
+Lane readers process ordinary ACKs independently of application delivery. If
+that delivery fills the event channel, a bounded, memory-accounted overflow
+queue lets the reader reach ACKs later on the same stream. Overflow beyond the
+receive profile fails the flow explicitly. Duplicate DATA repeats ACK state;
+a new lane receives current ACK state even if the previous write succeeded.
+Only acknowledgements of new bytes reset the delivery-progress timer.
+
+Outstanding outbound work has a single 45-second no-progress budget across
+rescue attempts. A blocked application write also has a 45-second budget,
+renewed on partial writes. Quiet connections with no outstanding data are not
+subject to these budgets. Frame-write deadlines include waiting for another
+writer. These are local implementation policies; the protocol-1 wire format
+is unchanged.
+
+Stall rescues are paced by the RTT-based detector without an additional
+exponential retry delay. In AUTO, a completed QUIC rescue race that encounters
+a lane-capacity refusal can immediately attempt TCP. A locally suspected lane
+can be replaced at the ceiling without the normal young-lane protection;
+healthy racing JOINs retain that protection. Stall rescues wait for initial
+OPEN confirmation so they cannot overtake admission of an optimistic flow.
+Remote RESET and full-close cancellation bypass application delivery queues.
+
 In automatic mode, QUIC is preferred and TLS/TCP is a delayed fallback. Only
 differential path evidence—QUIC failing while authenticated TCP reaches the
 same endpoint—marks UDP unavailable. Once a flow hands off to TCP, it does not
@@ -188,6 +210,12 @@ controller. This is tail protection for UDP-blocked/high-loss fallback, not a
 claim that multiple connections increase a fixed shared bottleneck.
 
 ## UDP associations
+
+A retained UDP relay socket is published for resumption only after its old
+packet reader has stopped. Cancellation interrupts that reader's socket wait
+and joins it before ownership transfers, so an old association cannot consume
+replies intended for the replacement.
+
 
 SOCKS5 UDP ASSOCIATE opens one authenticated logical association. PACKET frames
 preserve each datagram boundary and carry a canonical destination. A 64-packet

@@ -134,6 +134,13 @@ type InviteRecord struct {
 	CreatedAt  string `json:"created_at"`
 	ConsumedAt string `json:"consumed_at,omitempty"`
 	DeviceID   string `json:"device_id,omitempty"`
+	// Name and Endpoint record the route an invitation was issued for, when
+	// it was issued for one (provider invite --path). Enrollment returns
+	// them in place of the provider's own, so the enrolled profile keeps
+	// dialing the route the invitation named -- a relay, say -- and clients
+	// that require the response endpoint to equal the invitation's accept it.
+	Name     string `json:"name,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`
 }
 
 type storeData struct {
@@ -448,6 +455,15 @@ func (s *Store) Accounts() []Account {
 // is appropriate and avoids creating an attacker-controlled password-hashing
 // workload on the public enrollment path.
 func (s *Store) CreateInvite(accountID string, ttl time.Duration, now time.Time) (InviteRecord, string, error) {
+	return s.CreateInviteForPath(accountID, InvitationPath{}, ttl, now)
+}
+
+// CreateInviteForPath creates an invitation that remembers the route it was
+// issued for, so enrollment can answer with that route's name and endpoint.
+func (s *Store) CreateInviteForPath(accountID string, path InvitationPath, ttl time.Duration, now time.Time) (InviteRecord, string, error) {
+	if err := path.Validate(); err != nil {
+		return InviteRecord{}, "", err
+	}
 	if ttl < time.Second || ttl > 7*24*time.Hour {
 		return InviteRecord{}, "", errors.New("invitation lifetime must be between one second and 7 days")
 	}
@@ -485,6 +501,7 @@ func (s *Store) CreateInvite(accountID string, ttl time.Duration, now time.Time)
 		ID: id, AccountID: accountID,
 		TokenHash: base64.RawURLEncoding.EncodeToString(hash[:]),
 		ExpiresAt: now.Add(ttl).UTC().Format(time.RFC3339), CreatedAt: now.UTC().Format(time.RFC3339),
+		Name: path.Name, Endpoint: path.Endpoint,
 	}
 	s.data.Invites[id] = record
 	if err := s.saveLocked(); err != nil {
@@ -499,19 +516,26 @@ func (s *Store) CreateInvite(accountID string, ttl time.Duration, now time.Time)
 // callback must not call Store methods. This ordering ensures an issuer or
 // persistence failure never consumes the user's one-time invitation.
 func (s *Store) EnrollDevice(token, deviceName string, publicKey ed25519.PublicKey, now time.Time, issue func(Account, Device) ([]byte, error)) (Account, Device, []byte, error) {
+	account, device, credential, _, err := s.enrollDevice(token, deviceName, publicKey, now, issue)
+	return account, device, credential, err
+}
+
+// enrollDevice is EnrollDevice that also returns the consumed invitation, whose
+// route the enrollment response reports.
+func (s *Store) enrollDevice(token, deviceName string, publicKey ed25519.PublicKey, now time.Time, issue func(Account, Device) ([]byte, error)) (Account, Device, []byte, InviteRecord, error) {
 	if now.IsZero() {
 		now = time.Now()
 	}
 	deviceName = strings.TrimSpace(deviceName)
 	if deviceName == "" || len(deviceName) > 128 {
-		return Account{}, Device{}, nil, errors.New("device name must contain 1-128 characters")
+		return Account{}, Device{}, nil, InviteRecord{}, errors.New("device name must contain 1-128 characters")
 	}
 	if len(publicKey) != ed25519.PublicKeySize {
-		return Account{}, Device{}, nil, errors.New("invalid device public key")
+		return Account{}, Device{}, nil, InviteRecord{}, errors.New("invalid device public key")
 	}
 	tokenBytes, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil || len(tokenBytes) != 32 {
-		return Account{}, Device{}, nil, errors.New("invalid invitation")
+		return Account{}, Device{}, nil, InviteRecord{}, errors.New("invalid invitation")
 	}
 	hash := sha256.Sum256(tokenBytes)
 	hashText := base64.RawURLEncoding.EncodeToString(hash[:])
@@ -519,12 +543,12 @@ func (s *Store) EnrollDevice(token, deviceName string, publicKey ed25519.PublicK
 
 	release, err := s.beginWrite(false)
 	if err != nil {
-		return Account{}, Device{}, nil, err
+		return Account{}, Device{}, nil, InviteRecord{}, err
 	}
 	defer release()
 	if s.pruneInvitesLocked(now) {
 		if err := s.saveLocked(); err != nil {
-			return Account{}, Device{}, nil, err
+			return Account{}, Device{}, nil, InviteRecord{}, err
 		}
 	}
 	var invite InviteRecord
@@ -537,11 +561,11 @@ func (s *Store) EnrollDevice(token, deviceName string, publicKey ed25519.PublicK
 		}
 	}
 	if !found || invite.ConsumedAt == "" && expired(invite.ExpiresAt, now) {
-		return Account{}, Device{}, nil, errors.New("invitation is invalid, expired, or already used")
+		return Account{}, Device{}, nil, InviteRecord{}, errors.New("invitation is invalid, expired, or already used")
 	}
 	account, ok := s.data.Accounts[invite.AccountID]
 	if !ok || !account.Enabled || expired(account.ExpiresAt, now) {
-		return Account{}, Device{}, nil, errors.New("invitation account is unavailable")
+		return Account{}, Device{}, nil, InviteRecord{}, errors.New("invitation account is unavailable")
 	}
 	// A response can be lost after durable consumption. Repeating the exact
 	// same enrollment key/name is idempotent and reissues only that device's
@@ -550,25 +574,25 @@ func (s *Store) EnrollDevice(token, deviceName string, publicKey ed25519.PublicK
 		device, ok := s.data.Devices[invite.DeviceID]
 		if !ok || device.AccountID != account.ID || device.Name != deviceName ||
 			subtle.ConstantTimeCompare([]byte(device.PublicKey), []byte(publicText)) != 1 {
-			return Account{}, Device{}, nil, errors.New("invitation is already used")
+			return Account{}, Device{}, nil, InviteRecord{}, errors.New("invitation is already used")
 		}
 		var credential []byte
 		if issue != nil {
 			credential, err = issue(account, device)
 			if err != nil {
-				return Account{}, Device{}, nil, err
+				return Account{}, Device{}, nil, InviteRecord{}, err
 			}
 		}
-		return account, device, credential, nil
+		return account, device, credential, invite, nil
 	}
 	for _, existing := range s.data.Devices {
 		if subtle.ConstantTimeCompare([]byte(existing.PublicKey), []byte(publicText)) == 1 {
-			return Account{}, Device{}, nil, errors.New("device key is already registered")
+			return Account{}, Device{}, nil, InviteRecord{}, errors.New("device key is already registered")
 		}
 	}
 	deviceID, err := randomID()
 	if err != nil {
-		return Account{}, Device{}, nil, err
+		return Account{}, Device{}, nil, InviteRecord{}, err
 	}
 	device := Device{
 		ID: deviceID, AccountID: account.ID, Name: deviceName, PublicKey: publicText,
@@ -578,7 +602,7 @@ func (s *Store) EnrollDevice(token, deviceName string, publicKey ed25519.PublicK
 	if issue != nil {
 		credential, err = issue(account, device)
 		if err != nil {
-			return Account{}, Device{}, nil, err
+			return Account{}, Device{}, nil, InviteRecord{}, err
 		}
 	}
 	oldInvite := invite
@@ -589,9 +613,9 @@ func (s *Store) EnrollDevice(token, deviceName string, publicKey ed25519.PublicK
 	if err := s.saveLocked(); err != nil {
 		s.data.Invites[invite.ID] = oldInvite
 		delete(s.data.Devices, device.ID)
-		return Account{}, Device{}, nil, err
+		return Account{}, Device{}, nil, InviteRecord{}, err
 	}
-	return account, device, credential, nil
+	return account, device, credential, invite, nil
 }
 
 // ConsumeInvite is the storage-only form used by administrative tooling. Live

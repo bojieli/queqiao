@@ -17,6 +17,12 @@ BASELINE = {
     # come from operator arguments and a reviewed dependency lock; exec.Command
     # passes the reference as one argument without a shell, and the 0755 output
     # directory contains deliberately public license text.
+    # The relay installer shells out to systemctl with a fixed argv slice (no
+    # shell), reads the operator-supplied manifest path it was given, and writes
+    # systemd units at the standard 0644 public-readable unit mode.
+    ("G204", "cmd/queqiaod/relay.go"): 2,
+    ("G304", "cmd/queqiaod/relay.go"): 1,
+    ("G306", "cmd/queqiaod/relay.go"): 1,
     ("G104", "mobile/tools/notices/main.go"): 3,
     ("G115", "cmd/pathprobe/main.go"): 5,
     ("G115", "cmd/queqiaobench/main.go"): 3,

@@ -118,14 +118,17 @@ Prometheus `/metrics` names. They cover:
   a round-trip aggregate frozen at a stale constant announces itself;
 - lane joins refused and account flow opens refused, each split by reason;
 - the flow-stall watchdog and its parallel rescue:
-  `queqiao_flow_stalls_detected_total` counts stall episodes (work pending
-  with no forward progress for three minimum round trips),
+  `queqiao_flow_stalls_detected_total` counts stall episodes (unacknowledged transport work pending
+  with no forward progress for three minimum round trips; application response
+  silence alone is not a stall),
   `queqiao_stall_spare_attaches_total` counts stalls where an already-healthy
   lane took over at once, `queqiao_lane_rescue_attempts_total` counts
   individual dial+JOIN attempts and
   `queqiao_lane_rescue_wins_total{attempt="N"}` which attempt of a round
   produced the lane the flow kept -- a win above zero is an independent QUIC
-  dial beating the established strategy, and
+  dial beating the shared QUIC strategy; attempt zero also counts the
+  sequential TCP fallback after the QUIC race fails. TCP JOINs never race
+  QUIC JOINs because admission immediately retires QUIC on the gateway, and
   `queqiao_lane_grace_extensions_total` counts replacement graces a gateway
   restarted because a rescue JOIN arrived while the flow was still waiting;
   and

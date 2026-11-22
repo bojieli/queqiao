@@ -53,22 +53,28 @@ func (t *ackTracker) Advance(sequence uint64) {
 }
 
 // Add records ranges the peer holds out of order.
-func (t *ackTracker) Add(ranges [][2]uint64) {
+func (t *ackTracker) Add(ranges [][2]uint64) bool {
 	if len(ranges) == 0 {
-		return
+		return false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	changed := false
 	for _, r := range ranges {
-		if r[1] <= r[0] || r[1] <= t.cumulative {
+		if t.coveredLocked(r[0], r[1]) {
 			continue
 		}
+		changed = true
 		t.ranges = append(t.ranges, r)
+	}
+	if !changed {
+		return false
 	}
 	t.mergeLocked()
 	t.compactLocked()
 	t.gen++
 	t.cond.Broadcast()
+	return true
 }
 
 // mergeLocked sorts and coalesces overlapping ranges so Covered is a scan

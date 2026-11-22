@@ -86,9 +86,11 @@ func (r *Reassembler) Insert(segment Segment) ([]byte, bool, error) {
 	if segment.Final {
 		end = segment.Sequence
 	}
-	if end < r.next || (segment.Final && segment.Sequence < r.next) {
-		// A duplicate segment is harmless if it is wholly before the receive
-		// cursor. FIN duplicates are also harmless.
+	if segment.Sequence < r.next {
+		// A replay ending at the cursor is already delivered too. Retaining
+		// it would consume window space forever: the cursor cannot return
+		// to its starting sequence. A segment crossing the cursor is an
+		// overlap, not a new out-of-order segment.
 		if end <= r.next {
 			return nil, r.Closed(), nil
 		}
