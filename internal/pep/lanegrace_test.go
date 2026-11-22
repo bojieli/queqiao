@@ -3,6 +3,7 @@ package pep
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"testing"
@@ -263,6 +264,15 @@ func TestAStaleDeadlineDoesNotDenyTheNextOutageItsGrace(t *testing.T) {
 	}
 }
 
+func replacementFields(f *multipathFlow) map[string]any {
+	raw := f.replacementLogFields()
+	out := map[string]any{}
+	for i := 0; i+1 < len(raw); i += 2 {
+		out[raw[i].(string)] = raw[i+1]
+	}
+	return out
+}
+
 // The gateway's failing flows say a replacement never arrived: 84% of its
 // lane-replacement-timeout failures ended with no replacement lane ever
 // admitted. The record could not say why, and the two reasons need different
@@ -271,38 +281,39 @@ func TestAStaleDeadlineDoesNotDenyTheNextOutageItsGrace(t *testing.T) {
 // fails never reaches addLane, so `lanes_joined` reads the same either way.
 // See issue #53.
 func TestAFlowRecordsWhetherAReplacementWasEvenAttempted(t *testing.T) {
-	fields := func(f *multipathFlow) map[string]any {
-		raw := f.replacementLogFields()
-		out := map[string]any{}
-		for i := 0; i+1 < len(raw); i += 2 {
-			out[raw[i].(string)] = raw[i+1]
-		}
-		return out
-	}
-
-	// Nothing tried: the pool never rebuilt.
+	// No replacement attempt was recorded.
 	quiet := newGraceTestFlow(t)
-	got := fields(quiet)
-	if got["lane_replacement_attempts"] != uint64(0) || got["lane_replacement_failures"] != uint64(0) {
+	got := replacementFields(quiet)
+	if got["lane_replacement_last_failure"] != nil || got["lane_replacement_attempts"] != uint64(0) || got["lane_replacement_failures"] != uint64(0) {
 		t.Fatalf("a flow that attempted nothing reports attempts=%v failures=%v",
 			got["lane_replacement_attempts"], got["lane_replacement_failures"])
 	}
 
-	// Tried and could not finish a handshake: the path will not carry one.
+	// Each completion snapshot records the last returned error category. The
+	// log must never contain the address or free text carried by the error.
 	refused := newGraceTestFlow(t)
-	for i := 0; i < 3; i++ {
+	for i, tc := range []struct {
+		err  error
+		want string
+	}{
+		{context.DeadlineExceeded, "timeout"},
+		{errLaneJoinCapacity, "peer_capacity"},
+		{errLaneJoinRejected, "peer_rejected"},
+		{context.Canceled, "canceled"},
+		{errors.New("private endpoint"), "other"},
+	} {
 		refused.noteReplacementAttempt()
-		refused.noteReplacementFailure()
-	}
-	got = fields(refused)
-	if got["lane_replacement_attempts"] != uint64(3) || got["lane_replacement_failures"] != uint64(3) {
-		t.Fatalf("three failed dials reported attempts=%v failures=%v, want 3 and 3",
-			got["lane_replacement_attempts"], got["lane_replacement_failures"])
+		refused.noteReplacementFailure(fmt.Errorf("dial: %w", tc.err))
+		got := replacementFields(refused)
+		if got["lane_replacement_attempts"] != uint64(i+1) || got["lane_replacement_failures"] != uint64(i+1) ||
+			got["lane_replacement_last_failure"] != tc.want {
+			t.Fatalf("after replacement %d: got %v, want last failure %q", i+1, got, tc.want)
+		}
 	}
 
 	// Both flows are indistinguishable by the fields that existed before: they
 	// waited for nothing and nothing joined. That is the gap being closed.
-	if fields(quiet)["lanes_joined"] != fields(refused)["lanes_joined"] {
+	if replacementFields(quiet)["lanes_joined"] != replacementFields(refused)["lanes_joined"] {
 		t.Fatal("the test no longer exercises the case the attempt counts were added for")
 	}
 
@@ -310,10 +321,29 @@ func TestAFlowRecordsWhetherAReplacementWasEvenAttempted(t *testing.T) {
 	// yet" would read as "the path refused it".
 	pending := newGraceTestFlow(t)
 	pending.noteReplacementAttempt()
-	got = fields(pending)
+	got = replacementFields(pending)
 	if got["lane_replacement_attempts"] != uint64(1) || got["lane_replacement_failures"] != uint64(0) {
 		t.Fatalf("an outstanding dial reported attempts=%v failures=%v, want 1 and 0",
 			got["lane_replacement_attempts"], got["lane_replacement_failures"])
+	}
+}
+
+func TestZeroLaneRecoveryLogsReturnedRefusal(t *testing.T) {
+	for _, transport := range []TransportKind{TransportQUIC, TransportTCP} {
+		t.Run(string(transport), func(t *testing.T) {
+			rig := newJoinTestRig(t, transport, transport, 1)
+			flow := newGraceTestFlow(t)
+			t.Cleanup(flow.closeAll)
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			// This established client lost all lanes. The gateway no longer
+			// has its session and answers the replacement JOIN with a refusal.
+			rig.client.manageLanes(ctx, flow, [16]byte{99}, flow.flowID, transport)
+			got := replacementFields(flow)
+			if got["lane_replacement_last_failure"] != "peer_rejected" || got["lane_replacement_failures"] != uint64(1) {
+				t.Fatalf("replacement completion fields = %v", got)
+			}
+		})
 	}
 }
 
