@@ -227,24 +227,26 @@ func (g *controlQUICGeneration) startLossPulse(parent context.Context) func() {
 	}
 	pulse.waiters++
 	g.probeMu.Unlock()
-	release := func() {
-		g.probeMu.Lock()
-		defer g.probeMu.Unlock()
-		if g.lossPulse != pulse {
-			return
-		}
-		pulse.waiters--
-		if pulse.waiters == 0 {
-			pulse.cancel()
-		}
-	}
+
 	// The caller releases after its exchange; its own cancellation also
 	// stops waiting even if a read is still unwinding.
-	stop := context.AfterFunc(parent, release)
+	stop := context.AfterFunc(parent, func() { g.releaseLossPulse(pulse) })
 	return func() {
 		if stop() {
-			release()
+			g.releaseLossPulse(pulse)
 		}
+	}
+}
+
+func (g *controlQUICGeneration) releaseLossPulse(pulse *controlLossPulse) {
+	g.probeMu.Lock()
+	defer g.probeMu.Unlock()
+	if g.lossPulse != pulse {
+		return
+	}
+	pulse.waiters--
+	if pulse.waiters == 0 {
+		pulse.cancel()
 	}
 }
 

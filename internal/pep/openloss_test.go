@@ -91,3 +91,40 @@ func TestPooledLossPulsesShareOneConnectionBudget(t *testing.T) {
 		t.Fatalf("unexpected application stream: %v", err)
 	}
 }
+
+func TestPoolRotationGraceEndsOnProofCloseOrDeadline(t *testing.T) {
+	deadline := time.Unix(100, 0)
+	g := &controlQUICGeneration{borrowers: 2, pendingOpens: make(map[*controlPoolStreamConn]pendingOpen)}
+	c := &Client{}
+	stream := &proofReadQUICStream{read: func(buf []byte) (int, error) { return copy(buf, "x"), nil }}
+	proved := &controlPoolStreamConn{owner: c, generation: g, quicStreamConn: &quicStreamConn{stream: stream}}
+	closing := &controlPoolStreamConn{owner: c, generation: g, quicStreamConn: &quicStreamConn{stream: &closeTrackingQUICStream{}}}
+	pulseCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pulse := &controlLossPulse{waiters: 2, cancel: cancel}
+	g.lossPulse = pulse
+	for _, lane := range []*controlPoolStreamConn{proved, closing} {
+		g.pendingOpens[lane] = pendingOpen{deadline: deadline, stop: func() { g.releaseLossPulse(pulse) }}
+	}
+	if !g.awaitingOpen(deadline.Add(-time.Nanosecond)) || g.awaitingOpen(deadline) || g.awaitingOpen(deadline.Add(time.Nanosecond)) {
+		t.Fatal("grace must end exactly at the existing deadline")
+	}
+	if _, err := proved.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.pendingOpens) != 1 || pulse.waiters != 1 || pulseCtx.Err() != nil {
+		t.Fatal("first remote response did not release only its own waiting OPEN")
+	}
+	if err := proved.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if pulse.waiters != 1 {
+		t.Fatal("close counted the already confirmed stream twice")
+	}
+	if err := closing.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.pendingOpens) != 0 || pulseCtx.Err() != context.Canceled || g.awaitingOpen(deadline.Add(-time.Second)) {
+		t.Fatal("closing last unconfirmed stream retained recovery work")
+	}
+}
