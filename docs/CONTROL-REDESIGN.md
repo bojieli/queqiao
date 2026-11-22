@@ -213,3 +213,31 @@ conservative floor, the code reads the measurement.
   "2.4x is not braked" above, and it now has a second dependant: the unmetered
   burst is guarded by a loss threshold only because nothing else can see a
   policer. Whatever answers one answers both.
+
+### Isolating the pooled seed in issue #73
+
+On commit `c6fcd8bd`, with Go 1.26.11, the following probe holds the joining
+lane's input at 1,000,000 bytes/s with a 200 ms RTT. It reads the actual
+delivery filter, the initial wire pacer and the observation reported back to
+the model on a loss event with no new delivery. Run the same probe against
+a candidate controller to isolate changes in these three quantities.
+
+```sh
+go test ./internal/congestion -run '^$' -bench '^BenchmarkJoiningLaneSeed$' -benchtime=1x
+```
+
+| Input loss | Filter / seed | Report / seed | Wire / seed without cap | Wire / seed with 1.25× share |
+| --- | ---: | ---: | ---: | ---: |
+| 0% | 1.000 | 2.885 | 2.885 | 1.250 |
+| 42% | 1.724 | 4.974 | 8.576 | 2.155 |
+| 85% | 6.667 | 19.23 | 128.2 | 8.333 |
+
+The filter already contains an erasure adjustment before any delivery on the
+new lane. The report includes the inner startup pacing gain even in the clean
+case. A share limits the wire pacer while the model still receives the higher
+report. The uncapped ratio at 42% erasure relative to the clean case is about
+2.97. This experiment measures rates selected by the controller. It sends no
+traffic and establishes no goodput or queueing result. A production change
+still needs alternating baseline and candidate runs on the same live path,
+with replacement-lane events, delivered bytes, queue delay and the existing
+policer characterization reported together.
