@@ -2,6 +2,7 @@ package portmux_test
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -214,9 +215,9 @@ func TestClientPortMuxCounters(t *testing.T) {
 
 // — HopController tests —
 
-type nopMetrics struct{ count int }
+type nopMetrics struct{ count atomic.Int64 }
 
-func (n *nopMetrics) PortHop() { n.count++ }
+func (n *nopMetrics) PortHop() { n.count.Add(1) }
 
 // — HopWalk tests —
 
@@ -272,13 +273,13 @@ func TestHopControllerWaitsForFullWindow(t *testing.T) {
 
 	// A partially filled window must not trigger, no matter how lossy it looks.
 	send(1500 * time.Millisecond)
-	if m.count != 0 {
+	if m.count.Load() != 0 {
 		t.Fatalf("hop triggered after one sample with a two-sample detect window")
 	}
 
 	// Once the window is full of zero-receive evidence, the hop fires.
 	send(2500 * time.Millisecond)
-	if m.count == 0 {
+	if m.count.Load() == 0 {
 		t.Fatal("no hop after a full window of zero-receive loss")
 	}
 }
@@ -320,7 +321,7 @@ func TestHopControllerTriggersOnLoss(t *testing.T) {
 	// cadence, plus margin.
 	time.Sleep(2600 * time.Millisecond)
 
-	if m.count == 0 {
+	if m.count.Load() == 0 {
 		t.Error("HopController did not trigger a hop despite sustained zero-receive loss")
 	}
 	if mux.CurrentPort() == serverAddr.Port {
@@ -377,8 +378,8 @@ func TestHopControllerNoHopWhenReceiving(t *testing.T) {
 	}
 	time.Sleep(400 * time.Millisecond)
 
-	if m.count > 0 {
-		t.Errorf("HopController triggered %d hops on a healthy path; want 0", m.count)
+	if m.count.Load() > 0 {
+		t.Errorf("HopController triggered %d hops on a healthy path; want 0", m.count.Load())
 	}
 	<-done
 }

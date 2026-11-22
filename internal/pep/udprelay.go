@@ -3,7 +3,6 @@ package pep
 import (
 	"crypto/rand"
 	"crypto/subtle"
-	"net"
 	"sync"
 	"time"
 
@@ -22,7 +21,7 @@ import (
 // preserved is the datagrams in flight when the lane died: those are lost, and
 // over the datagram substrate that is what a UDP packet is allowed to be.
 type retainedRelay struct {
-	conn      *net.UDPConn
+	conn      serverUDPRelay
 	expires   time.Time
 	principal identity.Principal
 }
@@ -88,7 +87,7 @@ func newUDPResumeToken() ([session.UDPResumeTokenSize]byte, error) {
 // request rather than an arbitrary victim when it is full: refusing to retain
 // degrades to today's behaviour, while evicting someone else's live relay
 // breaks an association that was working.
-func (s *udpRelayStore) retain(token [session.UDPResumeTokenSize]byte, principal identity.Principal, conn *net.UDPConn) {
+func (s *udpRelayStore) retain(token [session.UDPResumeTokenSize]byte, principal identity.Principal, conn serverUDPRelay) {
 	if s == nil || conn == nil {
 		return
 	}
@@ -141,7 +140,7 @@ func (s *udpRelayStore) sweep() {
 // The comparison is constant time. The map lookup that finds the entry is not,
 // and cannot be, but a peer that has to guess sixteen random bytes learns
 // nothing useful from either.
-func (s *udpRelayStore) claim(token []byte, principal identity.Principal) *net.UDPConn {
+func (s *udpRelayStore) claim(token []byte, principal identity.Principal) serverUDPRelay {
 	if s == nil || len(token) != session.UDPResumeTokenSize {
 		return nil
 	}

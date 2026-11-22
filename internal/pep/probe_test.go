@@ -67,8 +67,9 @@ func TestClientProbeAuthenticatesProviderWithoutOpeningFlow(t *testing.T) {
 			if result.Transport != transport {
 				t.Fatalf("probe transport %q, want %q", result.Transport, transport)
 			}
-			// A loopback exchange can finish within one clock tick, especially
-			// on Windows runners. Zero is a valid elapsed duration.
+			// A loopback round trip can finish within one clock tick. Zero is
+			// a valid measured duration; authentication and the echoed control
+			// response, not timer resolution, establish probe success.
 			if result.Latency < 0 || result.Latency > 5*time.Second {
 				t.Fatalf("invalid probe latency %v", result.Latency)
 			}

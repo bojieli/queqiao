@@ -45,7 +45,7 @@
 // independence, is what determines recovery.
 package fec
 
-// MaxRepairWindow is the widest span protocol 1 allows one repair symbol to
+// MaxRepairWindow is the widest span protocol 2 allows one repair symbol to
 // cover, and therefore the widest a receiver has to be able to solve over.
 //
 // A sliding window has no block boundary, so nothing in the format itself
@@ -126,7 +126,7 @@ func windowCoefficient(rid uint32, index int) byte {
 // reports the loss it would have reported on a bad path. That failure is
 // indistinguishable from the condition the code exists to fix, so the row has
 // to be pinned by a committed vector rather than by prose. See
-// testdata/protocol1/vectors.json.
+// testdata/protocol2/vectors.json.
 func WindowCoefficients(rid uint32, count int) []byte {
 	if count <= 0 {
 		return nil

@@ -196,7 +196,7 @@ jobs:
           output=$($binary --version)
           echo "$output"
           grep -F "commit=$COMMIT" <<<"$output"
-          grep -F "wire=1" <<<"$output"
+          grep -Eq '(^|[[:space:]])wire=2([[:space:]]|$)' <<<"$output"
       - name: Run Windows archive
         if: matrix.kind == 'windows'
         shell: pwsh
@@ -212,7 +212,7 @@ jobs:
           $output = & $binary --version
           Write-Output $output
           if ($output -notmatch [regex]::Escape("commit=$env:COMMIT")) { throw 'commit metadata mismatch' }
-          if ($output -notmatch 'wire=1') { throw 'wire metadata mismatch' }
+          if ($output -notmatch '(^|\s)wire=2(\s|$)') { throw 'wire metadata mismatch' }
 
   provenance:
     needs: [authorize, build, native-smoke]

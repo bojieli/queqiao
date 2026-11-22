@@ -16,7 +16,7 @@ for a future prototype before anyone can try it.
   bounded TCP fallback striping.
 - One-time invitations, provider-pinned identity, per-device mutual TLS,
   renewal, revocation, per-user limits, metrics, logs, packaging, and rollback.
-- Android export mode and an iOS packet tunnel using the same protocol-1 core.
+- Android export mode and an iOS packet tunnel using the same protocol-2 core.
 - An experimental second profile, `dc-long-haul`, for a long operator-owned hop
   carrying inference requests, with the path model, flow attribution, and
   live-path instruments it needs.

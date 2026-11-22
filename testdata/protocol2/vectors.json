@@ -1,0 +1,1161 @@
+{
+  "protocol": 2,
+  "note": "Frozen conformance vectors for queqiao wire protocol 2. Every credential-shaped value here is synthetic. Regenerating this file is a wire change: protocol.Version and the data ALPN must move with it.",
+  "frame_headers": {
+    "accept": [
+      {
+        "name": "open",
+        "hex": "574f02010000101112131415161718191a1b1c1d1e1f010203040506070800000000000000000000001000000000",
+        "type": 1,
+        "flags": 0,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 72623859790382856,
+        "sequence": 0,
+        "payload_len": 16,
+        "class": 0
+      },
+      {
+        "name": "open reserving the control lane",
+        "hex": "574f02010020101112131415161718191a1b1c1d1e1f000000000000000100000000000000000000001000000000",
+        "type": 1,
+        "flags": 32,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 0,
+        "payload_len": 16,
+        "class": 0
+      },
+      {
+        "name": "open ok",
+        "hex": "574f02020000101112131415161718191a1b1c1d1e1f000000000000000100000000000000000000000000000000",
+        "type": 2,
+        "flags": 0,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 0,
+        "payload_len": 0,
+        "class": 0
+      },
+      {
+        "name": "join",
+        "hex": "574f02030000101112131415161718191a1b1c1d1e1f000000000000000100000000000000000000000800000000",
+        "type": 3,
+        "flags": 0,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 0,
+        "payload_len": 8,
+        "class": 0
+      },
+      {
+        "name": "replacement join",
+        "hex": "574f02030040101112131415161718191a1b1c1d1e1f000000000000000100000000000000000000001000000000",
+        "type": 3,
+        "flags": 64,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 0,
+        "payload_len": 16,
+        "class": 0
+      },
+      {
+        "name": "interactive data",
+        "hex": "574f02040000101112131415161718191a1b1c1d1e1f00000000000000010000000000001000000004b001000000",
+        "type": 4,
+        "flags": 0,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 4096,
+        "payload_len": 1200,
+        "class": 1
+      },
+      {
+        "name": "bulk data at the payload limit",
+        "hex": "574f02040000101112131415161718191a1b1c1d1e1f000000000000000100000100000000000002000002000000",
+        "type": 4,
+        "flags": 0,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 1099511627776,
+        "payload_len": 131072,
+        "class": 2
+      },
+      {
+        "name": "cumulative ack upstream",
+        "hex": "574f02050004101112131415161718191a1b1c1d1e1f000000000000000100000000000020000000000001000000",
+        "type": 5,
+        "flags": 4,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 8192,
+        "payload_len": 0,
+        "class": 1
+      },
+      {
+        "name": "selective ack downstream",
+        "hex": "574f02050088101112131415161718191a1b1c1d1e1f000000000000000100000000000020000000002001000000",
+        "type": 5,
+        "flags": 136,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 8192,
+        "payload_len": 32,
+        "class": 1
+      },
+      {
+        "name": "final ack",
+        "hex": "574f02050006101112131415161718191a1b1c1d1e1f000000000000000100000000000020000000000001000000",
+        "type": 5,
+        "flags": 6,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 8192,
+        "payload_len": 0,
+        "class": 1
+      },
+      {
+        "name": "half close",
+        "hex": "574f02060001101112131415161718191a1b1c1d1e1f000000000000000100000000000020000000000000000000",
+        "type": 6,
+        "flags": 1,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 8192,
+        "payload_len": 0,
+        "class": 0
+      },
+      {
+        "name": "aborting close",
+        "hex": "574f02060011101112131415161718191a1b1c1d1e1f000000000000000100000000000020000000000000000000",
+        "type": 6,
+        "flags": 17,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 8192,
+        "payload_len": 0,
+        "class": 0
+      },
+      {
+        "name": "reset",
+        "hex": "574f02070000101112131415161718191a1b1c1d1e1f000000000000000100000000000000000000001400000000",
+        "type": 7,
+        "flags": 0,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 0,
+        "payload_len": 20,
+        "class": 0
+      },
+      {
+        "name": "packet",
+        "hex": "574f02080000101112131415161718191a1b1c1d1e1f000000000000000100000000000000070000004001000000",
+        "type": 8,
+        "flags": 0,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 7,
+        "payload_len": 64,
+        "class": 1
+      },
+      {
+        "name": "packet at the largest legal size",
+        "hex": "574f02080000101112131415161718191a1b1c1d1e1f00000000000000010000000000000008000100e401000000",
+        "type": 8,
+        "flags": 0,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 1,
+        "sequence": 8,
+        "payload_len": 65764,
+        "class": 1
+      },
+      {
+        "name": "probe",
+        "hex": "574f02090000101112131415161718191a1b1c1d1e1f00000000000000000000000000000063000004b000000000",
+        "type": 9,
+        "flags": 0,
+        "session_id": "101112131415161718191a1b1c1d1e1f",
+        "flow_id": 0,
+        "sequence": 99,
+        "payload_len": 1200,
+        "class": 0
+      }
+    ],
+    "reject": [
+      {
+        "name": "wrong magic",
+        "hex": "584f02040000101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000000",
+        "why": "the first two bytes are not WO"
+      },
+      {
+        "name": "version 0",
+        "hex": "574f00040000101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000000",
+        "why": "a receiver speaks exactly one wire version and refuses every other"
+      },
+      {
+        "name": "version 1",
+        "hex": "574f01040000101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000000",
+        "why": "an older version is refused rather than partially understood"
+      },
+      {
+        "name": "frame type 0",
+        "hex": "574f02000000101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000000",
+        "why": "types are 1..9; there is no zero type"
+      },
+      {
+        "name": "frame type 10",
+        "hex": "574f020a0000101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000000",
+        "why": "an unknown type is refused, never ignored"
+      },
+      {
+        "name": "class 3",
+        "hex": "574f02040000101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000803000000",
+        "why": "classes are 0..2"
+      },
+      {
+        "name": "replacement flag on data",
+        "hex": "574f02040040101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000000",
+        "why": "the replacement flag is valid only on JOIN"
+      },
+      {
+        "name": "reserved flag bit 8",
+        "hex": "574f02040100101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000000",
+        "why": "bits 8..15 are reserved and must be zero"
+      },
+      {
+        "name": "ack-ranges flag on data",
+        "hex": "574f02040080101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000000",
+        "why": "the range flag is valid only on ACK"
+      },
+      {
+        "name": "reserve-control flag on data",
+        "hex": "574f02040020101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000000",
+        "why": "the reserve flag is valid only on OPEN and JOIN"
+      },
+      {
+        "name": "reserved byte 43 set",
+        "hex": "574f02040000101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801010000",
+        "why": "the three trailing header bytes are reserved and must be zero"
+      },
+      {
+        "name": "reserved byte 44 set",
+        "hex": "574f02040000101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000100",
+        "why": "the three trailing header bytes are reserved and must be zero"
+      },
+      {
+        "name": "reserved byte 45 set",
+        "hex": "574f02040000101112131415161718191a1b1c1d1e1f000000000000000100000000000000100000000801000001",
+        "why": "the three trailing header bytes are reserved and must be zero"
+      },
+      {
+        "name": "payload one byte over the limit",
+        "hex": "574f02040000101112131415161718191a1b1c1d1e1f000000000000000100000000000000100002000101000000",
+        "why": "131073 exceeds the fixed 131072-byte payload limit"
+      },
+      {
+        "name": "payload at the 32-bit maximum",
+        "hex": "574f02040000101112131415161718191a1b1c1d1e1f00000000000000010000000000000010ffffffff01000000",
+        "why": "the length is refused before anything is allocated for it"
+      }
+    ]
+  },
+  "ack_ranges": [
+    {
+      "name": "empty range list",
+      "hex": "",
+      "cumulative": 4096
+    },
+    {
+      "name": "one range",
+      "hex": "00000000000013880000000000001770",
+      "cumulative": 4096,
+      "ranges": [
+        [
+          5000,
+          6000
+        ]
+      ]
+    },
+    {
+      "name": "three disjoint ranges",
+      "hex": "000000000000138800000000000017700000000000001b580000000000001d4c00000000000023280000000000002329",
+      "cumulative": 4096,
+      "ranges": [
+        [
+          5000,
+          6000
+        ],
+        [
+          7000,
+          7500
+        ],
+        [
+          9000,
+          9001
+        ]
+      ]
+    },
+    {
+      "name": "range list at the limit",
+      "hex": "00000000000003e8000000000000041a000000000000044c000000000000047e00000000000004b000000000000004e200000000000005140000000000000546000000000000057800000000000005aa00000000000005dc000000000000060e0000000000000640000000000000067200000000000006a400000000000006d60000000000000708000000000000073a000000000000076c000000000000079e00000000000007d0000000000000080200000000000008340000000000000866000000000000089800000000000008ca00000000000008fc000000000000092e0000000000000960000000000000099200000000000009c400000000000009f6",
+      "cumulative": 0,
+      "ranges": [
+        [
+          1000,
+          1050
+        ],
+        [
+          1100,
+          1150
+        ],
+        [
+          1200,
+          1250
+        ],
+        [
+          1300,
+          1350
+        ],
+        [
+          1400,
+          1450
+        ],
+        [
+          1500,
+          1550
+        ],
+        [
+          1600,
+          1650
+        ],
+        [
+          1700,
+          1750
+        ],
+        [
+          1800,
+          1850
+        ],
+        [
+          1900,
+          1950
+        ],
+        [
+          2000,
+          2050
+        ],
+        [
+          2100,
+          2150
+        ],
+        [
+          2200,
+          2250
+        ],
+        [
+          2300,
+          2350
+        ],
+        [
+          2400,
+          2450
+        ],
+        [
+          2500,
+          2550
+        ]
+      ]
+    },
+    {
+      "name": "range starting at the cumulative offset",
+      "hex": "00000000000010000000000000001001",
+      "cumulative": 4096,
+      "ranges": [
+        [
+          4096,
+          4097
+        ]
+      ]
+    },
+    {
+      "name": "misaligned payload",
+      "hex": "00000000000013880000000000001770ff",
+      "cumulative": 0,
+      "reject": true,
+      "why": "the payload is not a whole number of 16-byte ranges"
+    },
+    {
+      "name": "inverted range",
+      "hex": "00000000000017700000000000001388",
+      "cumulative": 0,
+      "reject": true,
+      "why": "end must be greater than start"
+    },
+    {
+      "name": "empty range",
+      "hex": "00000000000013880000000000001388",
+      "cumulative": 0,
+      "reject": true,
+      "why": "a range must cover at least one byte"
+    },
+    {
+      "name": "range behind the cumulative offset",
+      "hex": "000000000000006400000000000000c8",
+      "cumulative": 4096,
+      "reject": true,
+      "why": "a range below the cumulative point is already implied by it"
+    },
+    {
+      "name": "overlapping ranges",
+      "hex": "00000000000013880000000000001770000000000000157c0000000000001b58",
+      "cumulative": 0,
+      "reject": true,
+      "why": "ranges must be disjoint and increasing"
+    },
+    {
+      "name": "descending ranges",
+      "hex": "0000000000001b580000000000001d4c00000000000013880000000000001770",
+      "cumulative": 0,
+      "reject": true,
+      "why": "ranges must be disjoint and increasing"
+    },
+    {
+      "name": "one range past the limit",
+      "hex": "00000000000003e8000000000000041a000000000000044c000000000000047e00000000000004b000000000000004e200000000000005140000000000000546000000000000057800000000000005aa00000000000005dc000000000000060e0000000000000640000000000000067200000000000006a400000000000006d60000000000000708000000000000073a000000000000076c000000000000079e00000000000007d0000000000000080200000000000008340000000000000866000000000000089800000000000008ca00000000000008fc000000000000092e0000000000000960000000000000099200000000000009c400000000000009f60000000000000a280000000000000a5a",
+      "cumulative": 0,
+      "reject": true,
+      "why": "an acknowledgement carries at most 16 ranges"
+    }
+  ],
+  "destinations": [
+    {
+      "name": "hostname and port",
+      "input": "example.com:443",
+      "canonical": "example.com:443",
+      "hex": "6578616d706c652e636f6d3a343433"
+    },
+    {
+      "name": "surrounding whitespace is trimmed",
+      "input": "  example.com:443  ",
+      "canonical": "example.com:443",
+      "hex": "6578616d706c652e636f6d3a343433"
+    },
+    {
+      "name": "a trailing newline is whitespace and is trimmed",
+      "input": "example.com:443\n",
+      "canonical": "example.com:443",
+      "hex": "6578616d706c652e636f6d3a343433"
+    },
+    {
+      "name": "a leading-zero port is respelled",
+      "input": "example.com:00443",
+      "canonical": "example.com:443",
+      "hex": "6578616d706c652e636f6d3a343433"
+    },
+    {
+      "name": "ipv4 literal",
+      "input": "203.0.113.7:8080",
+      "canonical": "203.0.113.7:8080",
+      "hex": "3230332e302e3131332e373a38303830"
+    },
+    {
+      "name": "ipv6 literal keeps its brackets",
+      "input": "[2001:db8::1]:443",
+      "canonical": "[2001:db8::1]:443",
+      "hex": "5b323030313a6462383a3a315d3a343433"
+    },
+    {
+      "name": "ipv6 zone identifier",
+      "input": "[fe80::1%25eth0]:443",
+      "canonical": "[fe80::1%25eth0]:443",
+      "hex": "5b666538303a3a31253235657468305d3a343433"
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "reject": true,
+      "why": "a destination must name a host and a port"
+    },
+    {
+      "name": "no port",
+      "input": "example.com",
+      "reject": true,
+      "why": "the port is not optional"
+    },
+    {
+      "name": "empty host",
+      "input": ":443",
+      "reject": true,
+      "why": "a destination must name a host"
+    },
+    {
+      "name": "newline inside the host",
+      "input": "exam\nple.com:443",
+      "reject": true,
+      "why": "control characters cannot appear in a destination"
+    },
+    {
+      "name": "embedded null",
+      "input": "example.com\u0000:443",
+      "reject": true,
+      "why": "control characters cannot appear in a destination"
+    },
+    {
+      "name": "space inside the host",
+      "input": "exam ple.com:443",
+      "reject": true,
+      "why": "control characters and spaces cannot appear in a destination"
+    },
+    {
+      "name": "port zero",
+      "input": "example.com:0",
+      "reject": true,
+      "why": "port 0 does not name a service"
+    },
+    {
+      "name": "port out of range",
+      "input": "example.com:70000",
+      "reject": true,
+      "why": "a port is a 16-bit number"
+    },
+    {
+      "name": "non-numeric port",
+      "input": "example.com:https",
+      "reject": true,
+      "why": "the port is a number, not a service name"
+    },
+    {
+      "name": "over the length bound",
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:443",
+      "reject": true,
+      "why": "a destination is at most 255 bytes"
+    }
+  ],
+  "udp": {
+    "association_marker_hex": "574f554401",
+    "resume_opens": [
+      {
+        "name": "resume with a retained relay",
+        "input": "",
+        "canonical": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+        "hex": "574f554402a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+      },
+      {
+        "name": "resume asking for a fresh relay",
+        "input": "",
+        "hex": "574f554402"
+      },
+      {
+        "name": "resume marker with a short token",
+        "input": "",
+        "hex": "574f554402a0a1a2",
+        "reject": true,
+        "why": "the token is exactly 0 or 16 bytes"
+      },
+      {
+        "name": "resume marker with a long token",
+        "input": "",
+        "hex": "574f554402a0a1a2a3a4a5a6a7a8a9aaabacadaeaf00",
+        "reject": true,
+        "why": "the token is exactly 0 or 16 bytes"
+      },
+      {
+        "name": "association marker is not a resume marker",
+        "input": "",
+        "hex": "574f554401",
+        "reject": true,
+        "why": "the two markers differ in their last byte and mean different things"
+      }
+    ],
+    "resume_grants": [
+      {
+        "name": "granted the relay that was asked for",
+        "input": "",
+        "canonical": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+        "hex": "01a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+      },
+      {
+        "name": "given a fresh relay instead",
+        "input": "",
+        "canonical": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+        "hex": "00a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+      },
+      {
+        "name": "grant byte out of range",
+        "input": "",
+        "hex": "02a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+        "reject": true,
+        "why": "the first byte is 0 or 1"
+      },
+      {
+        "name": "grant with a short token",
+        "input": "",
+        "hex": "01a0a1a2a3a4a5a6a7",
+        "reject": true,
+        "why": "a grant is one byte plus a 16-byte token"
+      }
+    ],
+    "packets": [
+      {
+        "name": "small datagram to a hostname",
+        "destination": "example.com:53",
+        "payload_hex": "deadbeef",
+        "hex": "000e6578616d706c652e636f6d3a3533deadbeef"
+      },
+      {
+        "name": "datagram to an ipv6 literal",
+        "destination": "[2001:db8::1]:443",
+        "payload_hex": "010203",
+        "hex": "00115b323030313a6462383a3a315d3a343433010203"
+      },
+      {
+        "name": "empty datagram",
+        "destination": "203.0.113.7:9",
+        "payload_hex": "",
+        "hex": "000d3230332e302e3131332e373a39"
+      }
+    ],
+    "reject_packets": [
+      {
+        "name": "truncated header",
+        "hex": "00",
+        "why": "a PACKET payload is at least a two-byte destination length plus one byte"
+      },
+      {
+        "name": "zero destination length",
+        "hex": "0000aabb",
+        "why": "the destination length must be non-zero"
+      },
+      {
+        "name": "destination length past the payload",
+        "hex": "00ff6161",
+        "why": "the named destination does not fit in the payload"
+      },
+      {
+        "name": "destination longer than the bound",
+        "hex": "010061616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+        "why": "a destination is at most 255 bytes"
+      }
+    ]
+  },
+  "reset_payloads": [
+    {
+      "name": "protocol",
+      "code": 1,
+      "message": "invalid flow open",
+      "hex": "01696e76616c696420666c6f77206f70656e"
+    },
+    {
+      "name": "authentication",
+      "code": 2,
+      "message": "device is not authorized",
+      "hex": "02646576696365206973206e6f7420617574686f72697a6564"
+    },
+    {
+      "name": "destination",
+      "code": 3,
+      "message": "destination unavailable",
+      "hex": "0364657374696e6174696f6e20756e617661696c61626c65"
+    },
+    {
+      "name": "flow limit",
+      "code": 4,
+      "message": "account flow limit reached",
+      "hex": "046163636f756e7420666c6f77206c696d69742072656163686564"
+    },
+    {
+      "name": "client limit",
+      "code": 4,
+      "message": "account device limit reached",
+      "hex": "046163636f756e7420646576696365206c696d69742072656163686564"
+    },
+    {
+      "name": "transport",
+      "code": 5,
+      "message": "lane transport failed",
+      "hex": "056c616e65207472616e73706f7274206661696c6564"
+    },
+    {
+      "name": "no message",
+      "code": 1,
+      "message": "",
+      "hex": "01"
+    }
+  ],
+  "fec_coefficients": [
+    {
+      "rid": 0,
+      "count": 16,
+      "coefficients_hex": "01287cbd5c7ebeb85fc891ddc34876e6"
+    },
+    {
+      "rid": 1,
+      "count": 16,
+      "coefficients_hex": "d4280b7a3002d238462082e7cd32d574"
+    },
+    {
+      "rid": 2,
+      "count": 16,
+      "coefficients_hex": "acc633ce26ffc1c9e24a67f9ec3c7090"
+    },
+    {
+      "rid": 7,
+      "count": 32,
+      "coefficients_hex": "6fd613b8dca2f5c89a22f5800ad8ef14dfe92deb5834fe914e854e7fa575a904"
+    },
+    {
+      "rid": 255,
+      "count": 16,
+      "coefficients_hex": "7954688f2eb00278ec2aef8fffdfacba"
+    },
+    {
+      "rid": 256,
+      "count": 16,
+      "coefficients_hex": "672b7ce4cbb88e68474e3986fccfee07"
+    },
+    {
+      "rid": 65535,
+      "count": 16,
+      "coefficients_hex": "02c37fae4e5bcc2759217c8089c36014"
+    },
+    {
+      "rid": 3735928559,
+      "count": 32,
+      "coefficients_hex": "80e5ddbc6df5e456b320ceb0bf97fc07403971ddcd57f9ae824354b4c8f1668a"
+    },
+    {
+      "rid": 4294967295,
+      "count": 16,
+      "coefficients_hex": "93caf96b419ff918bcccb3f55a931574"
+    },
+    {
+      "rid": 12345,
+      "count": 256,
+      "coefficients_hex": "46a3bf325d23eece9bdd06a3869fac63928e14f246666775b012c5914c1bb9d9f9276d027df7eac376f2d06c1458cf77674fea56a179e288a8f69dfcc8e1b1eeebf6e9967c7d9348c46134d01546d3d79388b66c5d072e283c330c54fdb49a1473111186820e3d74675607ddff118a4f2d4f35c8a2e7d642e90c17c672e2d3d73189e20dc93c654a22bd40540a78fdaaee814126ac88b09dcd8f67baf8e675f4dc905a820de84218608ba46889528d8fa5d6704088ec7bde3f47281adda576a873bb767308d5de191cf06c4ceb4f9d0e9f4b0232eaf4e64542c3fc6f514491a83a0222bff77d23b0484cd9c21749efa820cde30393d9598790289b7c4b369ed8"
+    }
+  ],
+  "fec_repairs": [
+    {
+      "name": "one symbol",
+      "rid": 1,
+      "symbols_hex": [
+        "01020304"
+      ],
+      "count": 1,
+      "first": 0,
+      "vector_hex": "d4b56177"
+    },
+    {
+      "name": "four equal-length symbols",
+      "rid": 3,
+      "symbols_hex": [
+        "00112233",
+        "44556677",
+        "8899aabb",
+        "ccddeeff"
+      ],
+      "count": 4,
+      "first": 0,
+      "vector_hex": "1ccaad7b"
+    },
+    {
+      "name": "ragged symbol lengths",
+      "rid": 9,
+      "symbols_hex": [
+        "a1",
+        "b1b2b3b4b5",
+        "c1c2"
+      ],
+      "count": 3,
+      "first": 0,
+      "vector_hex": "b995c78afa"
+    },
+    {
+      "name": "a repair narrower than the window holds",
+      "rid": 11,
+      "symbols_hex": [
+        "1020",
+        "3040",
+        "5060",
+        "7080"
+      ],
+      "count": 2,
+      "first": 2,
+      "vector_hex": "fd7c"
+    },
+    {
+      "name": "a repair at the widest legal span",
+      "rid": 13,
+      "symbols_hex": [
+        "000005ff",
+        "010724fe",
+        "020e43fd",
+        "031562fc",
+        "041c81fb",
+        "0523a0fa",
+        "062abff9",
+        "0731def8",
+        "0838fdf7",
+        "093f1cf6",
+        "0a463bf5",
+        "0b4d5af4",
+        "0c5479f3",
+        "0d5b98f2",
+        "0e62b7f1",
+        "0f69d6f0",
+        "1070f5ef",
+        "117714ee",
+        "127e33ed",
+        "138552ec",
+        "148c71eb",
+        "159390ea",
+        "169aafe9",
+        "17a1cee8",
+        "18a8ede7",
+        "19af0ce6",
+        "1ab62be5",
+        "1bbd4ae4",
+        "1cc469e3",
+        "1dcb88e2",
+        "1ed2a7e1",
+        "1fd9c6e0",
+        "20e0e5df",
+        "21e704de",
+        "22ee23dd",
+        "23f542dc",
+        "24fc61db",
+        "250380da",
+        "260a9fd9",
+        "2711bed8",
+        "2818ddd7",
+        "291ffcd6",
+        "2a261bd5",
+        "2b2d3ad4",
+        "2c3459d3",
+        "2d3b78d2",
+        "2e4297d1",
+        "2f49b6d0",
+        "3050d5cf",
+        "3157f4ce",
+        "325e13cd",
+        "336532cc",
+        "346c51cb",
+        "357370ca",
+        "367a8fc9",
+        "3781aec8",
+        "3888cdc7",
+        "398fecc6",
+        "3a960bc5",
+        "3b9d2ac4",
+        "3ca449c3",
+        "3dab68c2",
+        "3eb287c1",
+        "3fb9a6c0",
+        "40c0c5bf",
+        "41c7e4be",
+        "42ce03bd",
+        "43d522bc",
+        "44dc41bb",
+        "45e360ba",
+        "46ea7fb9",
+        "47f19eb8",
+        "48f8bdb7",
+        "49ffdcb6",
+        "4a06fbb5",
+        "4b0d1ab4",
+        "4c1439b3",
+        "4d1b58b2",
+        "4e2277b1",
+        "4f2996b0",
+        "5030b5af",
+        "5137d4ae",
+        "523ef3ad",
+        "534512ac",
+        "544c31ab",
+        "555350aa",
+        "565a6fa9",
+        "57618ea8",
+        "5868ada7",
+        "596fcca6",
+        "5a76eba5",
+        "5b7d0aa4",
+        "5c8429a3",
+        "5d8b48a2",
+        "5e9267a1",
+        "5f9986a0",
+        "60a0a59f",
+        "61a7c49e",
+        "62aee39d",
+        "63b5029c",
+        "64bc219b",
+        "65c3409a",
+        "66ca5f99",
+        "67d17e98",
+        "68d89d97",
+        "69dfbc96",
+        "6ae6db95",
+        "6bedfa94",
+        "6cf41993",
+        "6dfb3892",
+        "6e025791",
+        "6f097690",
+        "7010958f",
+        "7117b48e",
+        "721ed38d",
+        "7325f28c",
+        "742c118b",
+        "7533308a",
+        "763a4f89",
+        "77416e88",
+        "78488d87",
+        "794fac86",
+        "7a56cb85",
+        "7b5dea84",
+        "7c640983",
+        "7d6b2882",
+        "7e724781",
+        "7f796680",
+        "8080857f",
+        "8187a47e",
+        "828ec37d",
+        "8395e27c",
+        "849c017b",
+        "85a3207a",
+        "86aa3f79",
+        "87b15e78",
+        "88b87d77",
+        "89bf9c76",
+        "8ac6bb75",
+        "8bcdda74",
+        "8cd4f973",
+        "8ddb1872",
+        "8ee23771",
+        "8fe95670",
+        "90f0756f",
+        "91f7946e",
+        "92feb36d",
+        "9305d26c",
+        "940cf16b",
+        "9513106a",
+        "961a2f69",
+        "97214e68",
+        "98286d67",
+        "992f8c66",
+        "9a36ab65",
+        "9b3dca64",
+        "9c44e963",
+        "9d4b0862",
+        "9e522761",
+        "9f594660",
+        "a060655f",
+        "a167845e",
+        "a26ea35d",
+        "a375c25c",
+        "a47ce15b",
+        "a583005a",
+        "a68a1f59",
+        "a7913e58",
+        "a8985d57",
+        "a99f7c56",
+        "aaa69b55",
+        "abadba54",
+        "acb4d953",
+        "adbbf852",
+        "aec21751",
+        "afc93650",
+        "b0d0554f",
+        "b1d7744e",
+        "b2de934d",
+        "b3e5b24c",
+        "b4ecd14b",
+        "b5f3f04a",
+        "b6fa0f49",
+        "b7012e48",
+        "b8084d47",
+        "b90f6c46",
+        "ba168b45",
+        "bb1daa44",
+        "bc24c943",
+        "bd2be842",
+        "be320741",
+        "bf392640",
+        "c040453f",
+        "c147643e",
+        "c24e833d",
+        "c355a23c",
+        "c45cc13b",
+        "c563e03a",
+        "c66aff39",
+        "c7711e38",
+        "c8783d37",
+        "c97f5c36",
+        "ca867b35",
+        "cb8d9a34",
+        "cc94b933",
+        "cd9bd832",
+        "cea2f731",
+        "cfa91630",
+        "d0b0352f",
+        "d1b7542e",
+        "d2be732d",
+        "d3c5922c",
+        "d4ccb12b",
+        "d5d3d02a",
+        "d6daef29",
+        "d7e10e28",
+        "d8e82d27",
+        "d9ef4c26",
+        "daf66b25",
+        "dbfd8a24",
+        "dc04a923",
+        "dd0bc822",
+        "de12e721",
+        "df190620",
+        "e020251f",
+        "e127441e",
+        "e22e631d",
+        "e335821c",
+        "e43ca11b",
+        "e543c01a",
+        "e64adf19",
+        "e751fe18",
+        "e8581d17",
+        "e95f3c16",
+        "ea665b15",
+        "eb6d7a14",
+        "ec749913",
+        "ed7bb812",
+        "ee82d711",
+        "ef89f610",
+        "f090150f",
+        "f197340e",
+        "f29e530d",
+        "f3a5720c",
+        "f4ac910b",
+        "f5b3b00a",
+        "f6bacf09",
+        "f7c1ee08",
+        "f8c80d07",
+        "f9cf2c06",
+        "fad64b05",
+        "fbdd6a04",
+        "fce48903",
+        "fdeba802",
+        "fef2c701",
+        "fff9e600"
+      ],
+      "count": 256,
+      "first": 0,
+      "vector_hex": "c637ac92"
+    }
+  ],
+  "coded_datagrams": [
+    {
+      "name": "source symbol carrying one whole frame",
+      "kind": "source",
+      "hex": "00000000000000000000080000000100000004deadbeef",
+      "frames": [
+        "deadbeef"
+      ]
+    },
+    {
+      "name": "source symbol packing two whole frames",
+      "kind": "source",
+      "hex": "000000010000000001000e0000000100000004deadbeef000000020102",
+      "frames": [
+        "deadbeef",
+        "0102"
+      ]
+    },
+    {
+      "name": "source symbol carrying nothing",
+      "kind": "source",
+      "hex": "000000020000000002000000000001"
+    },
+    {
+      "name": "source symbol, second fragment of three",
+      "kind": "source",
+      "hex": "0000002a0000000029000200010003aabb"
+    },
+    {
+      "name": "source symbol whose frame length runs past the symbol",
+      "kind": "source",
+      "hex": "00000003000000000300080000000100000040deadbeef"
+    },
+    {
+      "name": "repair over sixteen symbols",
+      "kind": "repair",
+      "hex": "0000002b01000000070000001a001011223344"
+    },
+    {
+      "name": "repair at the widest legal span",
+      "kind": "repair",
+      "hex": "0000002c010000000800000000010055"
+    },
+    {
+      "name": "repair one symbol past the legal span",
+      "kind": "repair",
+      "hex": "0000002d010000000900000000010155",
+      "reject": true,
+      "why": "a repair covers at most 256 symbols"
+    },
+    {
+      "name": "repair covering nothing",
+      "kind": "repair",
+      "hex": "0000002e010000000a00000000000055",
+      "reject": true,
+      "why": "a repair covers at least one symbol"
+    },
+    {
+      "name": "unknown datagram kind",
+      "kind": "unknown",
+      "hex": "0000002f09",
+      "reject": true,
+      "why": "kinds are 0 and 1; anything else is refused rather than ignored"
+    },
+    {
+      "name": "truncated source header",
+      "kind": "source",
+      "hex": "00000030000000",
+      "reject": true,
+      "why": "the datagram ends inside the source header"
+    },
+    {
+      "name": "truncated repair header",
+      "kind": "repair",
+      "hex": "00000031010000000b00000000",
+      "reject": true,
+      "why": "the datagram ends inside the repair header"
+    }
+  ],
+  "invitation": {
+    "uri": "queqiao://enroll/eyJ2IjoxLCJuYW1lIjoiRXhhbXBsZSBQcm92aWRlciIsInByb3ZpZGVyIjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDEiLCJlbmRwb2ludCI6ImdhdGV3YXkuZXhhbXBsZS5pbnZhbGlkOjg0NDMiLCJnYXRld2F5IjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDIiLCJyb290IjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSIsInRva2VuIjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSIsImV4cGlyZXMiOiIyMDI2LTAxLTA1VDAwOjAwOjAwWiJ9",
+    "version": 1,
+    "provider_name": "Example Provider",
+    "provider_id": "00000000000000000000000000000001",
+    "endpoint": "gateway.example.invalid:8443",
+    "gateway_id": "00000000000000000000000000000002",
+    "root_pin": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "expires_at": "2026-01-05T00:00:00Z",
+    "parsed_at": "2026-01-01T00:00:00Z"
+  },
+  "limits": {
+    "header_size": 46,
+    "version": 2,
+    "max_payload": 131072,
+    "max_ack_ranges": 16,
+    "ack_range_size": 16,
+    "max_destination_length": 255,
+    "max_udp_datagram": 65507,
+    "max_packet_payload": 65764,
+    "udp_resume_token_size": 16,
+    "max_repair_window": 256,
+    "min_decoder_width": 512,
+    "max_probe_payload": 1200,
+    "max_probe_frames": 128,
+    "max_probe_bytes": 131072,
+    "data_alpn": "queqiao/2",
+    "enroll_alpn": "queqiao-enroll/1",
+    "renew_alpn": "queqiao-renew/1"
+  }
+}

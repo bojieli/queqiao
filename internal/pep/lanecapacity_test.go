@@ -3,6 +3,7 @@ package pep
 import (
 	"context"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -14,6 +15,39 @@ import (
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
 )
+
+func TestCompletedLaneJoinCarriesReplacementHint(t *testing.T) {
+	local, remote := net.Pipe()
+	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
+	seen := make(chan protocol.Frame, 1)
+	go func() {
+		frames := newFrameConn(remote)
+		request, err := frames.Read()
+		if err != nil {
+			return
+		}
+		seen <- request
+		_ = frames.Write(protocol.Frame{Header: protocol.Header{
+			Version: protocol.Version, Type: protocol.TypeOpenOK,
+			SessionID: request.Header.SessionID, FlowID: request.Header.FlowID,
+			Class: protocol.ClassBulk,
+		}})
+	}()
+	ctx := context.WithValue(context.Background(), laneReplacementContextKey{}, laneReplacementHint{id: 0})
+	client := &Client{cfg: ClientConfig{HandshakeTimeout: time.Second}}
+	if _, err := client.completeLaneJoin(ctx, &authenticatedLane{
+		fc: newFrameConn(local), outer: local, sessionID: [16]byte{1}, kind: TransportQUIC, laneID: 9,
+	}, 7, 0); err != nil {
+		t.Fatal(err)
+	}
+	request := <-seen
+	if request.Header.Flags&protocol.FlagReplaceLane == 0 || len(request.Payload) != 16 {
+		t.Fatalf("replacement JOIN flags=%#x payload=%d, want replacement flag and 16-byte payload", request.Header.Flags, len(request.Payload))
+	}
+	if got := binary.BigEndian.Uint64(request.Payload[8:]); got != 0 {
+		t.Fatalf("replaced lane ID = %d, want the zero-numbered initial lane", got)
+	}
+}
 
 // The reset code on a refused JOIN is the peer's retry policy: capacity must
 // stay the transient answer, while the TCP-mode refusal is a permanent

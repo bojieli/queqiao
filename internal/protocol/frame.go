@@ -14,30 +14,30 @@ const (
 	// Version is the framing this build speaks, and the only thing that stops
 	// two builds that disagree from appearing to work.
 	//
-	// Version 1 is the first public wire contract. Earlier development wire
-	// numbers were never released. Every connection is authenticated by
+	// Version 2 adds explicit replacement JOINs. Version 1 peers must upgrade
+	// both endpoints before using this wire contract. Every connection is authenticated by
 	// provider-issued mutual TLS before a frame is accepted, and streams begin
 	// directly with OPEN or JOIN.
-	Version    = byte(1)
+	Version    = byte(2)
 	HeaderSize = 46
 	// DataALPN is the application protocol negotiated for the data plane. It
 	// carries the wire version because that is what makes the versioning
 	// fail-closed: there is no capability exchange to discover a disagreement
 	// after the fact, so two builds that speak different framing must fail to
 	// negotiate rather than connect and then misunderstand each other.
-	DataALPN = "queqiao/1"
-	// MaxPayload is the frame payload limit for protocol 1. It is a constant
+	DataALPN = "queqiao/2"
+	// MaxPayload is the frame payload limit for protocol 2. It is a constant
 	// of the wire, not a deployment setting: a receiver MUST accept a payload
 	// this large and MUST reject a larger one, in both directions.
 	//
 	// A configurable receive limit was the alternative, and it does not work
-	// without negotiation. Version 1 has no capability exchange, so two peers
+	// without negotiation. Version 2 has no capability exchange, so two peers
 	// configured differently are mutually unintelligible in exactly one
 	// direction, and the symptom -- a frame the sender considers legal being
 	// refused as malformed -- names neither the setting nor the peer that
 	// holds it.
 	//
-	// The value is derived rather than round. The largest frame version 1 can
+	// The value is derived rather than round. The largest frame version 2 can
 	// require is a PACKET carrying a maximum UDP datagram to a maximum-length
 	// destination: 2 + 255 + 65507 = 65764 bytes. Everything else is smaller
 	// by construction (a destination OPEN is at most 255, an ACK at most 256,
@@ -73,6 +73,11 @@ const (
 	// OPEN, lane zero begins in that role. On JOIN, the new lane replaces that
 	// role after a pooled connection generation has expired.
 	FlagReserveControl uint16 = 1 << 5
+	// FlagReplaceLane marks a JOIN as an explicit replacement for the lane ID
+	// encoded after the new lane ID in its payload. The peer can retire the
+	// old lane before applying the admission ceiling, so a stalled lane does
+	// not have to remain half-open until the transport idle timeout.
+	FlagReplaceLane uint16 = 1 << 6
 	// FlagAckRanges is valid only on ACK. The payload carries byte ranges the
 	// receiver already holds out of order, beyond the cumulative sequence.
 	//
@@ -81,7 +86,7 @@ const (
 	// its retention window has to cover the whole reorder span. Protocol v1
 	// requires both peers to understand it.
 	FlagAckRanges uint16 = 1 << 7
-	knownFlags           = FlagFin | FlagAckFinal | FlagAckUp | FlagAckDown | FlagCloseAbort | FlagReserveControl | FlagAckRanges
+	knownFlags           = FlagFin | FlagAckFinal | FlagAckUp | FlagAckDown | FlagCloseAbort | FlagReserveControl | FlagReplaceLane | FlagAckRanges
 )
 
 type Type byte
@@ -90,7 +95,8 @@ const (
 	TypeOpen Type = iota + 1
 	TypeOpenOK
 	// TypeJoin attaches an independently mutually authenticated lane to an
-	// existing flow. Its payload is exactly one non-zero big-endian lane ID.
+	// existing flow. Its payload is one non-zero big-endian lane ID, or that ID
+	// followed by the lane ID it explicitly replaces when FlagReplaceLane is set.
 	TypeJoin
 	TypeData
 	TypeAck
@@ -148,6 +154,10 @@ func (e UnsupportedVersionError) Error() string {
 
 func reserveControlFlagValid(t Type, flags uint16) bool {
 	return flags&FlagReserveControl == 0 || t == TypeOpen || t == TypeJoin
+}
+
+func replaceLaneFlagValid(t Type, flags uint16) bool {
+	return flags&FlagReplaceLane == 0 || t == TypeJoin
 }
 
 func ackRangesFlagValid(t Type, flags uint16) bool {
@@ -209,7 +219,7 @@ func (h Header) Encode(dst []byte) error {
 	if len(dst) < HeaderSize {
 		return io.ErrShortBuffer
 	}
-	if h.Version != Version || !h.Type.valid() || h.Class > ClassBulk || h.Flags&^knownFlags != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
+	if h.Version != Version || !h.Type.valid() || h.Class > ClassBulk || h.Flags&^knownFlags != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !replaceLaneFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
 		return errors.New("invalid frame header")
 	}
 	if h.PayloadLen > MaxPayload {
@@ -233,7 +243,7 @@ func (h Header) Validate() error {
 	if h.Version != Version || !h.Type.valid() || h.Class > ClassBulk {
 		return errors.New("invalid frame header")
 	}
-	if h.Flags&^knownFlags != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
+	if h.Flags&^knownFlags != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !replaceLaneFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
 		return errors.New("unknown frame flags")
 	}
 	if h.PayloadLen > MaxPayload {
@@ -278,6 +288,11 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	}
 	payload := make([]byte, h.PayloadLen)
 	if _, err := io.ReadFull(r, payload); err != nil {
+		// A header already started this frame. EOF before even the first
+		// payload byte is truncation, not a clean end between frames.
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return Frame{}, err
 	}
 	return Frame{Header: h, Payload: payload}, nil

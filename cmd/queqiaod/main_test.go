@@ -56,8 +56,29 @@ func TestClientListenerMustBeLiteralLoopback(t *testing.T) {
 
 func TestServerDefaultsUseBothTransports(t *testing.T) {
 	opts := parseRuntimeForTest(t, false)
-	if opts.listen != ":443" || opts.transport != "auto" || opts.logFile != "auto" || opts.logFormat != "json" || opts.telemetryLogInterval != 5*time.Second {
+	if opts.listen != ":443" || opts.transport != "auto" || opts.outboundSOCKS5 != "" || opts.logFile != "auto" || opts.logFormat != "json" || opts.telemetryLogInterval != 5*time.Second {
 		t.Fatalf("unexpected server defaults: %+v", opts)
+	}
+}
+
+func TestServerOutboundSOCKS5MustBeLoopback(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:1080", "127.0.0.2:2080", "[::1]:1080"} {
+		opts := parseRuntimeForTest(t, false, "--outbound-socks5", address)
+		if opts.outboundSOCKS5 != address {
+			t.Fatalf("outbound SOCKS5 = %q, want %q", opts.outboundSOCKS5, address)
+		}
+	}
+	for _, address := range []string{"localhost:1080", "0.0.0.0:1080", "192.0.2.1:1080", "127.0.0.1:0", "127.0.0.1"} {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		var opts runtimeOptions
+		bindRuntimeFlags(fs, &opts, false)
+		if err := fs.Parse([]string{"--outbound-socks5", address}); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateRuntime(opts, false); err == nil {
+			t.Errorf("unsafe SOCKS5 upstream %q accepted", address)
+		}
 	}
 }
 

@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"testing"
 )
 
@@ -19,8 +21,15 @@ func FuzzReadFrameIsBounded(f *testing.F) {
 	seed := make([]byte, HeaderSize+3)
 	seed[0], seed[1], seed[2], seed[3] = Magic0, Magic1, Version, byte(TypeData)
 	seed[38], seed[39], seed[40], seed[41] = 0, 0, 0, 3
+	f.Add([]byte{})
+	f.Add(seed[:1])
+	f.Add(seed[:HeaderSize])
+	f.Add(seed[:HeaderSize+1])
 	f.Add(seed)
 	f.Fuzz(func(t *testing.T, data []byte) {
-		_, _ = ReadFrame(bytes.NewReader(data))
+		_, err := ReadFrame(bytes.NewReader(data))
+		if len(data) != 0 && errors.Is(err, io.EOF) {
+			t.Fatal("a truncated frame was classified as clean stream EOF")
+		}
 	})
 }

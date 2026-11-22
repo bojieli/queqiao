@@ -167,7 +167,7 @@ The links below are v0.12.2, the current release; the
 | Linux, arm64 | Desktop and gateway, ready to use | [`linux_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_linux_arm64.tar.gz) |
 | Windows, x86-64 | Native target built; under testing, not production-ready | [`windows_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_windows_amd64.zip) |
 | Windows, arm64 | Native target built; under testing, not production-ready | [`windows_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_windows_arm64.zip) |
-| Android and iOS | Same protocol-1 core, under testing; not yet production-ready mobile apps | -- |
+| Android and iOS | Same transport core, under testing; not yet production-ready mobile apps | -- |
 
 Check a download against its release's
 [`SHA256SUMS`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/SHA256SUMS)
@@ -273,7 +273,7 @@ the same median this transport does.
 
 Queqiao is ready to use for the supported paired-gateway topology, from the
 published binaries or from source. It is a public preview, not a production-ready claim for every
-network. Protocol 1 is the only supported wire version; broader independent
+network. The published v0.12.2 binaries use wire version 1. Builds from this revision use wire version 2 and require a matching gateway and client. See the [upgrade procedure](docs/DEPLOYING.md#upgrade-an-existing-deployment). Broader independent
 field qualification, transport and security review, and mobile review remain
 open. See [current status](docs/STATUS.md) for the evidence boundary and
 [known limitations](docs/KNOWN-LIMITATIONS.md) for operational constraints.

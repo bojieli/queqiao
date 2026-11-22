@@ -1,7 +1,7 @@
 # NAT and middlebox field validation
 
 > [!NOTE]
-> **Status:** Current qualification matrix for public protocol 1
+> **Status:** Current qualification matrix for public protocol 2
 > **Last reviewed:** 2026-08-20
 
 This is the real-network qualification plan for the public preview. It is not

@@ -118,14 +118,16 @@ func TestFlowInitiationCostsNoRoundTripsWhenTheConnectionIsWarm(t *testing.T) {
 	// application actually repeats.
 	establishing := []time.Duration{measure(), measure()}
 	var warm []time.Duration
-	for i := 0; i < 3; i++ {
+	// Keep exchanging beyond the proof lifetime even on a fast runner. Three
+	// warm flows could all start just before the original handshake proof
+	// expired, hiding the extra probe unless race instrumentation slowed them.
+	for i := 0; i < 6; i++ {
 		warm = append(warm, measure())
 	}
 	roundTrip := 2 * oneWay
-	t.Logf("establishing %v %v; warm flows %v %v %v (round trip %v)",
+	t.Logf("establishing %v %v; warm flows %v (round trip %v)",
 		establishing[0].Round(time.Millisecond), establishing[1].Round(time.Millisecond),
-		warm[0].Round(time.Millisecond), warm[1].Round(time.Millisecond),
-		warm[2].Round(time.Millisecond), roundTrip)
+		warm, roundTrip)
 
 	for i, elapsed := range warm {
 		if elapsed > roundTrip/4 {

@@ -52,7 +52,7 @@ you choose the next document based on what you want to do.
   clearly labeled historical TUIC/Hysteria2 comparison.
 - [Architecture](ARCHITECTURE.md) — components, flow lifecycle, trust
   boundaries, resource limits, and carrier behavior.
-- [Protocol version 1](PROTOCOL.md) — the normative wire contract, framing,
+- [Protocol version 2](PROTOCOL.md) — the normative wire contract, framing,
   authentication, recovery, and conformance rules.
 - [Path characterization](PATH-CHARACTER-20260813.md) — the open-loop
   measurement that exposed the motivating path's erasure floor and congestion
@@ -80,7 +80,7 @@ you choose the next document based on what you want to do.
   case where a tuned client beats this transport.
 - [Field validation](FIELD-VALIDATION.md) — the real-network matrix for NAT,
   middleboxes, access diversity, and release qualification.
-- [Field-result index](field-results/README.md) — current protocol-1 records;
+- [Field-result index](field-results/README.md) — field evidence from the protocol-1 series;
   historical records are kept separate until they qualify the current wire.
 - [Production design criteria](PRODUCTION-DESIGN.md) — the stronger bar for a
   production-ready claim.

@@ -8,16 +8,16 @@ exact commit. Production-ready language has additional gates below.
 ## Public-preview blockers
 
 - [x] Supported topology and known limitations are documented.
-- [x] Wire protocol 1 is documented, emitted in build metadata, and rejects
+- [x] Wire protocol 2 is documented, emitted in build metadata, and rejects
   every other version with a diagnosable error.
-- [x] Every protocol-1 limit is fixed by the specification rather than by
-  configuration, and `testdata/protocol1/vectors.json` records the framing,
+- [x] Every protocol-2 limit is fixed by the specification rather than by
+  configuration, and `testdata/protocol2/vectors.json` records the framing,
   acknowledgement, destination, UDP, coding, and enrollment encodings as
   committed vectors that the test suite replays on every run.
 - [x] Security reporting instructions and residual risks are documented.
 - [ ] A pinned full-history secret scan reports zero unresolved findings for
-  the exact protocol-1 candidate commit.
-- [ ] The protocol-1 candidate history scan contains no deployed credential;
+  the exact protocol-2 candidate commit.
+- [ ] The protocol-2 candidate history scan contains no deployed credential;
   field-validation
   credentials and TLS material have been rotated independently, and rollback
   material contains no superseded secret.
@@ -27,7 +27,7 @@ exact commit. Production-ready language has additional gates below.
   binary for every target.
 - [ ] GitHub provenance attestations cover every archive, SBOM, and checksum
   manifest in the candidate artifact.
-- [ ] Downloaded protocol-1 archives pass native runtime smoke tests on Linux, macOS, and
+- [ ] Downloaded protocol-2 archives pass native runtime smoke tests on Linux, macOS, and
   Windows; unsupported native architectures are called out rather than implied.
 - [ ] Normal CI, full tests, race tests, vet, vulnerability scan, fuzz smoke,
   fallback soak, package reproducibility, and actionlint are green on the exact
@@ -35,7 +35,7 @@ exact commit. Production-ready language has additional gates below.
 - [ ] Staticcheck and a freshly reviewed gosec baseline pass on the exact candidate;
   use the historical baseline in
   [`STATIC-SECURITY-AUDIT-20260817.md`](archive/2026-08-development/STATIC-SECURITY-AUDIT-20260817.md)
-  only as a format; generate fresh evidence for protocol 1.
+  only as a format; generate fresh evidence for protocol 2.
 - [ ] Install, one-endpoint patch upgrade, coordinated incompatible-version
   refusal, and rollback evidence is attached to the candidate report.
 - [ ] `./scripts/changelog.py release --version vX.Y.Z` has assembled the
@@ -96,12 +96,12 @@ unconfigured gate looks exactly like a satisfied one.
   and high findings are fixed, and accepted lower-severity findings are public.
 - [ ] Operational monitoring, incident response, supported-version lifetime,
   and credential-rotation ownership have named maintainers.
-- [ ] An implementation outside this tree replays `testdata/protocol1/vectors.json`
-  and interoperates, so protocol 1 is demonstrated rather than only documented.
+- [ ] An implementation outside this tree replays `testdata/protocol2/vectors.json`
+  and interoperates, so protocol 2 is demonstrated rather than only documented.
 
 ## Mobile release blockers
 
-- [x] Android and iOS use the protocol-1 core with full IPv4/IPv6 TCP and UDP,
+- [x] Android and iOS use the protocol-2 core with full IPv4/IPv6 TCP and UDP,
   crash-safe enrollment, platform secure storage, automatic renewal, bounded
   packet/session queues, and pinned runtime dependencies. Android exposes that
   traffic as an authenticated SOCKS5 endpoint for a consumer routing client;
@@ -163,4 +163,4 @@ not complete or waive the production-ready section.
 
 The former wire-3 candidate is preserved only as a historical example in
 [`RELEASE-CANDIDATE-20260817.md`](archive/2026-08-development/RELEASE-CANDIDATE-20260817.md).
-A new complete candidate report is required for public protocol 1.
+A new complete candidate report is required for public protocol 2.

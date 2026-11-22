@@ -500,9 +500,9 @@ fi
 
 version_line=$("$staged_binary" version) ||
 	die "$staged_binary did not run on this host; check the build architecture"
-case $version_line in
-*wire=1*) ;;
-*) die "refusing to install a binary that does not speak protocol 1: $version_line" ;;
+case " $version_line " in
+*" wire=2 "*) ;;
+*) die "refusing to install a binary that does not speak protocol 2: $version_line" ;;
 esac
 echo "Installing $version_line ($binary_origin)."
 

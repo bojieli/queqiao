@@ -51,7 +51,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - run: go test -timeout 50m ./...
+      # Match the native/race jobs: CPU-bound FEC tests must not starve the
+      # wall-clock network emulators, including on Linux runners.
+      - run: go test -p=1 -timeout 50m ./...
       - run: go vet ./...
       - run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 -checks=all,-U1000 ./...
       - name: Gosec reviewed baseline
@@ -251,7 +253,7 @@ jobs:
           output=$($binary --version)
           echo "$output"
           grep -F "commit=${GITHUB_SHA}" <<<"$output"
-          grep -F "wire=1" <<<"$output"
+          grep -Eq '(^|[[:space:]])wire=2([[:space:]]|$)' <<<"$output"
       - name: Run Windows archive
         if: matrix.kind == 'windows'
         shell: pwsh
@@ -266,7 +268,7 @@ jobs:
           $output = & $binary --version
           Write-Output $output
           if ($output -notmatch [regex]::Escape("commit=$env:GITHUB_SHA")) { throw 'commit metadata mismatch' }
-          if ($output -notmatch 'wire=1') { throw 'wire metadata mismatch' }
+          if ($output -notmatch '(^|\s)wire=2(\s|$)') { throw 'wire metadata mismatch' }
 
   # Exercise the same keychain, Developer ID, notarization, Gatekeeper, and
   # attestation path used by the final release before an immutable tag exists.

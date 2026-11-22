@@ -53,6 +53,8 @@ class ValidateReleaseTests(unittest.TestCase):
             return "".join(f"{key}={value}\n" for key, value in values.items()).encode()
 
         self.assertEqual(MODULE.parse_buildinfo(encoded(fields)), fields)
+        upgraded = dict(fields, wire_protocol="2")
+        self.assertEqual(MODULE.parse_buildinfo(encoded(upgraded)), upgraded)
         for key, invalid in (
             ("version", "../v0.1.0"),
             ("commit", "a" * 39),
@@ -61,7 +63,9 @@ class ValidateReleaseTests(unittest.TestCase):
             ("target", "linux/../amd64"),
             ("go", "go1.25"),
             ("go", "devel go1.25.13"),
-            ("wire_protocol", "2"),
+            ("wire_protocol", "0"),
+            ("wire_protocol", "256"),
+            ("wire_protocol", "01"),
             ("binary_sha256", "b" * 63),
         ):
             changed = dict(fields)

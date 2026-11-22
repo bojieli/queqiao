@@ -310,19 +310,17 @@ func (c *frameConn) countData(f protocol.Frame, coded bool) {
 
 func (c *frameConn) Write(f protocol.Frame) error {
 	if c.bulkFrame(f) {
-		c.countData(f, true)
-		if err := c.writeCoded(f); err != nil {
+		reliable, err := c.writeCoded(context.Background(), f)
+		if err != nil || reliable {
 			return err
 		}
 		if c.needsOpenSafetyCopy(f) {
-			c.countData(f, false)
 			c.writeMu.Lock()
 			defer c.writeMu.Unlock()
 			return c.writeLocked(f)
 		}
 		return nil
 	}
-	c.countData(f, false)
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.writeLocked(f)
@@ -331,18 +329,16 @@ func (c *frameConn) Write(f protocol.Frame) error {
 // writeCoded hands a bulk frame to the coded substrate, falling back to the
 // control stream if it will not take it: correctness is not worth trading for
 // the coding.
-func (c *frameConn) writeCoded(f protocol.Frame) error {
-	return c.writeCodedContext(context.Background(), f)
-}
-func (c *frameConn) writeCodedContext(ctx context.Context, f protocol.Frame) error {
+func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame) (reliable bool, err error) {
 	buf, err := protocol.AppendFrame(nil, f)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if err := c.bulk.Send(buf); err != nil {
-		return c.writeControlContext(ctx, f)
+	if err := c.bulk.SendContext(ctx, buf); err != nil {
+		return true, c.writeControlContext(ctx, f)
 	}
-	return nil
+	c.countData(f, true)
+	return false, nil
 }
 
 func (c *frameConn) writeLocked(f protocol.Frame) error {
@@ -361,7 +357,11 @@ func (c *frameConn) writeLocked(f protocol.Frame) error {
 	if cap(buf) <= writeBufferRetain {
 		c.writeBuf = buf
 	}
-	return writeFull(c.control, buf)
+	if err := writeFull(c.control, buf); err != nil {
+		return err
+	}
+	c.countData(f, false)
+	return nil
 }
 
 const frameWriteTimeout = 15 * time.Second
@@ -371,32 +371,32 @@ const frameWriteTimeout = 15 * time.Second
 // deadline; transports without that optional method retain their normal
 // behavior and are still interruptible by Close from the flow coordinator.
 func (c *frameConn) WriteContext(ctx context.Context, f protocol.Frame) error {
-	_, err := c.writeContextVia(ctx, f)
+	return c.writeContextMode(ctx, f, false)
+}
+
+func (c *frameConn) writeContextMode(ctx context.Context, f protocol.Frame, forceReliable bool) error {
+	_, err := c.writeContextViaMode(ctx, f, forceReliable)
 	return err
 }
 
-// writeContextVia is WriteContext reporting whether the frame went out on a
-// substrate that recovers its own losses -- the stream, or a stream copy
-// beside a coded one. The substrate is chosen here, at the write, and not when
-// the frame was queued, so this is the only place that knows; a caller that
-// assumed the answer it was given earlier can be wrong by the time the bytes
-// reach the wire.
-func (c *frameConn) writeContextVia(ctx context.Context, f protocol.Frame) (reliable bool, err error) {
-	if c.bulkFrame(f) {
+func (c *frameConn) writeContextVia(ctx context.Context, f protocol.Frame) (bool, error) {
+	return c.writeContextViaMode(ctx, f, false)
+}
+
+// Report the substrate that actually accepted the frame, including reliable
+// fallback and the stream safety copy sent before OPEN confirmation.
+func (c *frameConn) writeContextViaMode(ctx context.Context, f protocol.Frame, forceReliable bool) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, frameWriteTimeout)
+	defer cancel()
+	if !forceReliable && c.bulkFrame(f) {
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		c.countData(f, true)
-		if err := c.writeCodedContext(ctx, f); err != nil {
-			return false, err
+		reliable, err := c.writeCoded(ctx, f)
+		if err != nil || reliable || !c.needsOpenSafetyCopy(f) {
+			return reliable, err
 		}
-		if !c.needsOpenSafetyCopy(f) {
-			return false, nil
-		}
-		c.countData(f, false)
-		return true, c.writeControlContext(ctx, f)
 	}
-	c.countData(f, false)
 	return true, c.writeControlContext(ctx, f)
 }
 
@@ -423,15 +423,14 @@ func (c *frameConn) writeControlContext(ctx context.Context, f protocol.Frame) e
 		if err := deadlineConn.SetWriteDeadline(deadline); err != nil {
 			return err
 		}
-		// Cancellation must interrupt a write even without a caller deadline.
-		interrupted := make(chan struct{})
+		finished := make(chan struct{})
 		stop := context.AfterFunc(ctx, func() {
 			_ = deadlineConn.SetWriteDeadline(time.Now())
-			close(interrupted)
+			close(finished)
 		})
 		defer func() {
 			if !stop() {
-				<-interrupted
+				<-finished
 			}
 			_ = deadlineConn.SetWriteDeadline(time.Time{})
 		}()

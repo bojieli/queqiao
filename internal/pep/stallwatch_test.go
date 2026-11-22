@@ -350,3 +350,41 @@ func TestParallelRescueAllAttemptsFail(t *testing.T) {
 		t.Fatalf("rescue attempts = %d, want 2", got)
 	}
 }
+
+// A JOIN can succeed without restoring data delivery. The next request in
+// the same stall episode must name the current lane, not omit the hint or
+// keep naming the lane the previous round already retired.
+func TestStallWatchdogRefreshesReplacementAfterRescue(t *testing.T) {
+	flow := newStallTestFlow(t, nil)
+	old, _ := rescueTestLane(t, 0)
+	if err := flow.addLane(old); err != nil {
+		t.Fatal(err)
+	}
+	flow.noteSent(0, 512)
+	flow.stallScan = 5 * time.Millisecond
+	flow.stallGrace = 20 * time.Millisecond
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go flow.stallWatchdog(stop)
+	select {
+	case <-flow.stallSignals():
+	case <-time.After(time.Second):
+		t.Fatal("no initial rescue request")
+	}
+	flow.rescueInFlight.Store(true)
+	flow.retireLaneByID(old.id)
+	replacement, _ := rescueTestLane(t, 1)
+	if err := flow.addLane(replacement); err != nil {
+		t.Fatal(err)
+	}
+	flow.clearRescueReplacement()
+	flow.rescueInFlight.Store(false)
+	select {
+	case <-flow.stallSignals():
+	case <-time.After(time.Second):
+		t.Fatal("no retry for the continuing stall")
+	}
+	if id, ok := flow.rescueReplacement(); !ok || id != replacement.id {
+		t.Fatalf("retry replacement = (%d, %t), want (%d, true)", id, ok, replacement.id)
+	}
+}

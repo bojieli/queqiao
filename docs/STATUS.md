@@ -35,14 +35,14 @@ limitations](KNOWN-LIMITATIONS.md) before deploying it.
 
 | Area | Current capability |
 | --- | --- |
-| Data plane | SOCKS5 TCP CONNECT and UDP ASSOCIATE; pooled QUIC streams and datagrams; authenticated TLS/TCP fallback |
+| Data plane | SOCKS5 TCP CONNECT and UDP ASSOCIATE; pooled QUIC streams and datagrams; authenticated TLS/TCP fallback; optional gateway chaining through a loopback SOCKS5 upstream |
 | WAN policy | shared endpoint-pair path model, erasure-aware control, aggregate pacing, and interactive reserve |
 | Recovery | byte-offset reassembly, range acknowledgements, bounded replay, sliding-window coding, lane replacement, and UDP relay reclamation |
 | Contention | behavioral flow state, priority queues, reactive bulk isolation, and bounded opt-in TCP fallback striping |
 | Identity | one-time invitations, provider-pinned gateway identity, per-device mutual TLS, renewal, revocation, and per-user limits |
 | Operations | bounded JSON logs, metrics, local visualizer, service examples, release packaging, SBOMs, and rollback procedure |
-| Clients | one process per provider or one process serving several providers on separate loopback SOCKS5 listeners; macOS/Linux desktop and gateway binaries published with every release; Windows targets built but under testing; Android SOCKS export and iOS packet-tunnel clients under testing, all using the protocol-1 core |
-| Conformance | committed protocol-1 vectors for framing, acknowledgement, destinations, UDP, coding, and enrollment, replayed by the test suite |
+| Clients | one process per provider or one process serving several providers on separate loopback SOCKS5 listeners; macOS/Linux desktop and gateway binaries published with every release; Windows targets built but under testing; Android SOCKS export and iOS packet-tunnel clients under testing, all using the protocol-2 core |
+| Conformance | committed protocol-2 vectors for framing, acknowledgement, destinations, UDP, coding, and enrollment, replayed by the test suite |
 | Profiles | `wan-shared-bottleneck` is the default and is what the qualification above refers to; `dc-long-haul` is experimental, covering a long hop between two regions one operator runs, and is qualified on one path |
 
 ## Evidence and open work
@@ -83,9 +83,9 @@ than a single benchmark number.
 
 ## Protocol compatibility
 
-Protocol 1 is the only supported wire protocol. A wire-incompatible change must
+Source builds use wire protocol 2. A wire-incompatible change must
 increment the version, update [the protocol specification](PROTOCOL.md), add
-fail-closed compatibility tests, and document an upgrade path. Protocol 1 has no
+fail-closed compatibility tests, and document an upgrade path. Protocol 2 has no
 silent fallback to an earlier wire or shared-secret mode.
 
 ## Help qualify the design

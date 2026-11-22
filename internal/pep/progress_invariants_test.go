@@ -261,7 +261,7 @@ func TestReceiveBacklogBudgetReleasedOnClose(t *testing.T) {
 	// the shared limit. Overflow must be an explicit error, never a wait.
 	rejected := false
 	for i := 0; i < 5; i++ {
-		if !flow.enqueueInbound(event) {
+		if !flow.queueInbound(event) {
 			rejected = true
 			break
 		}

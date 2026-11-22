@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import http.client
+import io
 import json
 import pathlib
 import secrets
@@ -58,17 +60,29 @@ def socks_connect(endpoint: tuple[str, int], destination: tuple[str, int], timeo
 
 
 def parse_https_response(response: bytes) -> tuple[int, bytes]:
-    header, separator, body = response.partition(b"\r\n\r\n")
-    if not separator:
+    if b"\r\n\r\n" not in response:
         raise RuntimeError("HTTPS response has no complete header")
-    status_line = header.split(b"\r\n", 1)[0].decode("ascii", "replace")
-    fields = status_line.split(" ", 2)
-    if len(fields) < 2 or not fields[1].isdigit():
-        raise RuntimeError(f"invalid HTTP status line {status_line!r}")
-    status = int(fields[1])
-    if not 200 <= status < 300:
-        raise RuntimeError(f"HTTPS status {status}")
-    return status, body
+
+    class ResponseSocket:
+        def makefile(self, mode):
+            return io.BytesIO(response)
+
+    try:
+        parsed = http.client.HTTPResponse(ResponseSocket())
+        parsed.begin()
+        if not 200 <= parsed.status < 300:
+            raise RuntimeError(f"HTTPS status {parsed.status}")
+        # Decode chunked transfer framing and reject truncated Content-Length
+        # bodies before counting this request as successful.
+        body = parsed.read()
+        return parsed.status, body
+    except (http.client.HTTPException, ValueError) as error:
+        raise RuntimeError(f"invalid or incomplete HTTPS response: {error}") from error
+
+
+def verify_body_hash(result: dict, expected: str | None) -> None:
+    if expected is not None and result["body_sha256"] != expected:
+        raise RuntimeError("HTTPS body SHA-256 does not match the expected fixture")
 
 
 def https_probe(
@@ -212,6 +226,7 @@ def main(arguments=None) -> int:
     parser.add_argument("--min-udp-success-rate", type=float, default=0.95)
     parser.add_argument("--min-https-success-rate", type=float, default=1.0)
     parser.add_argument("--require-final-udp-successes", type=int, default=5)
+    parser.add_argument("--expected-https-sha256", help="expected decoded body SHA-256 for a fixed fixture")
     parser.add_argument("--metrics-url")
     parser.add_argument("--pid", type=int)
     parser.add_argument("--settle-timeout", type=float, default=10)
@@ -236,6 +251,12 @@ def main(arguments=None) -> int:
         parser.error("final successes must be non-negative and max HTTPS bytes must be positive")
     if not 1 <= options.https_port <= 65535 or not options.https_path.startswith("/"):
         parser.error("HTTPS port must be between 1 and 65535 and path must start with /")
+    if options.expected_https_sha256 is not None:
+        options.expected_https_sha256 = options.expected_https_sha256.lower()
+        if len(options.expected_https_sha256) != 64 or any(
+            c not in "0123456789abcdef" for c in options.expected_https_sha256
+        ):
+            parser.error("expected HTTPS SHA-256 must contain 64 hexadecimal characters")
     if options.output_dir.exists():
         parser.error(f"output directory already exists: {options.output_dir}")
     options.output_dir.mkdir(parents=True)
@@ -249,6 +270,7 @@ def main(arguments=None) -> int:
         "dns_name": options.dns_name,
         "https_origin": f"{options.https_host}:{options.https_port}",
         "https_path": options.https_path,
+        "expected_https_sha256": options.expected_https_sha256,
         "duration_seconds": options.duration,
         "interval_seconds": options.interval,
         "https_every": options.https_every,
@@ -304,6 +326,7 @@ def main(arguments=None) -> int:
                                 options.max_https_bytes,
                             )
                         )
+                        verify_body_hash(event, options.expected_https_sha256)
                         https_successes += 1
                     except Exception as error:  # field evidence records and continues
                         event.update({"status": "failed", "error": str(error)[:500]})
@@ -365,6 +388,9 @@ def main(arguments=None) -> int:
         and https_rate >= options.min_https_success_rate
         and final_successes == final_count
     )
+    resources_checked = "file_descriptors" in start_process or any(
+        name in start_metrics for name in ("queqiao_active_flows", "queqiao_replay_bytes_in_use")
+    )
     summary = {
         "finished_utc": utc_now(),
         "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -378,7 +404,9 @@ def main(arguments=None) -> int:
         "https_success_rate": https_rate,
         "final_udp_successes": final_successes,
         "required_final_udp_successes": final_count,
-        "resources_settled": settled,
+        "resources_checked": resources_checked,
+        "body_integrity_checked": options.expected_https_sha256 is not None and https_attempts > 0,
+        "resources_settled": settled if resources_checked else None,
         "metrics_delta": {
             key: end_metrics.get(key, 0) - start_metrics.get(key, 0)
             for key in sorted(set(start_metrics) | set(end_metrics))

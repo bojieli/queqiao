@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -232,5 +233,91 @@ func TestLaneJoinRefusalCodesMatchPermanence(t *testing.T) {
 				t.Fatalf("refusal payload = %v, want reset code %d", response.Payload, test.code)
 			}
 		})
+	}
+}
+
+func TestCompletedJoinReplayHonorsCancellation(t *testing.T) {
+	for _, consumed := range []int{0, 1, 2} {
+		t.Run(fmt.Sprint(consumed), func(t *testing.T) {
+			owner := identity.Principal{ProviderID: "p", AccountID: "a", DeviceID: "d"}
+			flow := newIsolationTestFlow(t, false)
+			flow.finSent.Store(true)
+			sf := newServerFlow(flow, owner, TransportTCP, 1)
+			sf.completed.Store(true)
+			server := &Server{cfg: ServerConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, sessions: map[[16]byte]*serverFlow{flow.sessionID: sf}, metrics: metrics.New()}
+			local, remote := net.Pipe()
+			defer local.Close()
+			defer remote.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				server.handleLaneJoinOpen(ctx, local, newFrameConn(local), owner, flow.sessionID, 1, protocol.Frame{Header: protocol.Header{FlowID: flow.flowID}})
+			}()
+			reader := newFrameConn(remote)
+			for range consumed {
+				if _, err := reader.Read(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(300 * time.Millisecond):
+				t.Fatal("completion replay ignored cancellation")
+			}
+		})
+	}
+}
+
+func TestRetiredJoinReleasesHandlerAndWriterWhileFlowLives(t *testing.T) {
+	flow := newIsolationTestFlow(t, false)
+	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "device"}
+	ss := newServerFlow(flow, owner, TransportTCP, 1)
+	server := &Server{cfg: ServerConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, sessions: map[[16]byte]*serverFlow{flow.sessionID: ss}, metrics: metrics.New()}
+	for id := uint64(1); id <= 8; id++ {
+		local, remote := net.Pipe()
+		fc := newFrameConn(local)
+		returned := make(chan struct{})
+		go func() {
+			defer close(returned)
+			server.handleLaneJoinOpen(context.Background(), local, fc, owner, flow.sessionID, id, protocol.Frame{Header: protocol.Header{FlowID: flow.flowID}})
+		}()
+		_ = remote.SetReadDeadline(time.Now().Add(time.Second))
+		response, err := newFrameConn(remote).Read()
+		if err != nil || response.Header.Type != protocol.TypeOpenOK {
+			t.Fatalf("join %d failed: %v", id, err)
+		}
+		flow.lanesMu.Lock()
+		lane := flow.lanes[id]
+		flow.lanesMu.Unlock()
+		if lane == nil {
+			t.Fatal("missing admitted lane")
+		}
+		deadline := time.Now().Add(time.Second)
+		for !lane.ready.Load() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if !lane.ready.Load() {
+			t.Fatal("JOIN did not activate")
+		}
+		flow.retireLaneByID(id)
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+			t.Fatal("retired JOIN retained handler/admission slot")
+		}
+		select {
+		case <-lane.writeDone:
+		case <-time.After(time.Second):
+			t.Fatal("retired JOIN retained idle writer")
+		}
+		select {
+		case <-flow.doneChan():
+			t.Fatal("retirement ended logical flow")
+		default:
+		}
+		_ = remote.Close()
 	}
 }

@@ -1,23 +1,16 @@
 # Deployment guide
 
 > [!NOTE]
-> **Status:** Current operational guide for public protocol 1
+> **Status:** Current operational guide for public protocol 2
 > **Last reviewed:** 2026-08-21
 
 This guide takes you from an empty host to a working paired deployment: a
 provider gateway, one-time user enrollment, a desktop SOCKS client, and
 Clash/mihomo integration. It also covers multi-provider clients, service
-operation, upgrades, and rollback. Protocol 1 is the only supported wire
+operation, upgrades, and rollback. Protocol 2 is the only supported wire
 protocol, so client and server must be upgraded together.
 
-**Download the binary first:** [latest release](https://github.com/bojieli/queqiao/releases/latest), or the
-per-platform links in the
-[README](../README.md#platform-availability). Every release publishes
-reproducible archives for Linux, macOS, and Windows on amd64 and arm64, so a
-normal deployment has no build step; check what you downloaded against the
-release's `SHA256SUMS` before running it. [Build from
-source](../README.md#build-from-source) only to develop or to run somewhere no
-archive covers.
+Use a gateway and client from the same wire version. The v0.12.2 release uses v1; use its tagged installers and documentation when deploying those binaries. For v2, build both endpoints from this revision or use a release whose binary reports `wire=2`. Verify downloaded archives against the release's `SHA256SUMS`. See the [release downloads](https://github.com/bojieli/queqiao/releases) and [source build instructions](../README.md#build-from-source).
 
 For a quick overview, start with the [repository README](../README.md). Use
 [known limitations](KNOWN-LIMITATIONS.md) to check whether the paired-gateway
@@ -73,7 +66,7 @@ queqiaod service install --profile "$PROFILE"
 
 Both scripts take `--dry-run`, use `--binary PATH` when you have a reviewed
 release artifact instead of a source tree, and refuse any binary that does not
-report `wire=1`.
+report `wire=2`.
 
 The one thing `install-server.sh` will not do twice is create a provider trust
 root. Re-running it against an initialized state directory stops before
@@ -113,7 +106,7 @@ sudo install -m 0755 ./queqiaod /usr/local/bin/queqiaod
 /usr/local/bin/queqiaod --version
 ```
 
-The output must contain `wire=1`. Create a dedicated account once:
+The output must contain `wire=2`. Create a dedicated account once:
 
 ```sh
 sudo useradd --system --user-group \
@@ -215,6 +208,57 @@ nstat -az | grep -E 'UdpRcvbufErrors|ListenOverflows|ListenDrops'
 Private, loopback, link-local, multicast, and unspecified destinations are
 blocked after DNS resolution. Add `--allow-private-destinations` only when the
 service is intentionally an access proxy into a private network.
+
+### Route gateway traffic through sing-box
+
+The gateway can hand all accepted destination traffic to a SOCKS5 upstream on
+the same host, leaving sing-box to choose a direct or proxied final outbound.
+For example, route ChatGPT or another selected service through a designated
+proxy while other traffic leaves directly from the gateway. Keep those rules
+in sing-box; Queqiao provides the transport to the gateway and the handoff.
+
+Configure a sing-box SOCKS inbound on loopback with both TCP and UDP enabled,
+then add this server option:
+
+```sh
+queqiaod server \
+  --state /var/lib/queqiao/provider \
+  --listen :443 \
+  --outbound-socks5 127.0.0.1:1080
+```
+
+For the packaged systemd unit, append the same option to `QUEQIAOD_ARGS` and
+restart the service. The setting affects only application destination traffic
+leaving the gateway. Queqiao carrier, enrollment, renewal, and metrics sockets
+do not pass through it.
+
+The upstream is deliberately restricted to a literal loopback address and
+uses SOCKS5 without authentication: the unencrypted protocol is treated as a
+local process boundary, not a remote proxy transport. When it is configured,
+failure of the upstream fails the destination open; Queqiao does not silently
+bypass routing policy by falling back to a direct connection.
+
+TCP uses SOCKS5 CONNECT. Each Queqiao UDP association uses SOCKS5 UDP
+ASSOCIATE, and its TCP control connection is retained together with the UDP
+relay during Queqiao lane recovery. The sing-box inbound must therefore
+support UDP; a TCP-only inbound makes UDP association opens fail closed.
+
+With the default public-destination policy, Queqiao resolves the client's
+destination name and sends a validated IP address to the upstream for both
+TCP and UDP. Use IP-based rules in sing-box for these requests. The gateway
+must be able to resolve destination names. Each UDP destination worker reuses
+its validated addresses for up to 30 seconds.
+
+When an operator enables `--allow-private-destinations` for a private-access
+service, the upstream receives the client's original destination after gateway
+resolution. Domain rules then work for clients that supply a name, and the
+local router controls the final DNS answer. Keep the router and its DNS
+configuration under operator control.
+
+Verify TCP and UDP separately. An IP check through the client proves the final
+TCP egress; a DNS query through SOCKS5 UDP proves that sing-box's UDP inbound
+and selected outbound both work. Check the sing-box log as well as Queqiao's
+`remote flow opened` and UDP metrics before relying on the route.
 
 ## Add users and issue invitations
 
@@ -572,36 +616,12 @@ more important than provider order.
 
 ## Upgrade an existing deployment
 
-Protocol 1 deliberately has no shared-secret or wire-compatibility mode. An old
-client cannot use a new server, and a new client cannot use an old server.
-Replacing a service on the same endpoint therefore requires a brief coordinated
-restart; existing flows cannot survive the protocol boundary.
+For a v1 to v2 upgrade, keep the current gateway and clients together until the replacement pair is ready. TCP and QUIC both reject mixed wire versions at TLS negotiation. A live connection stays on the pair that accepted it.
 
-Use this order:
-
-1. Record the old client/server versions, arguments, listener, and a known-good
-   proxy request.
-2. Copy the old binaries, service definitions, client plist, and old credential
-   files into timestamped rollback directories. Do not overwrite them.
-3. Install the protocol-1 binary under its final path without restarting the
-   old service.
-4. Create `/var/lib/queqiao/provider`, add the user, and generate an invitation
-   while the old process still owns the public port.
-5. Install the new server unit and restart the gateway. Verify protocol 1,
-   TCP and UDP listeners, and loopback metrics before touching the client.
-6. Enroll with the new CLI. Its default `--local-address auto` bypasses a host
-   TUN; specify `if:en0` when the machine has multiple physical interfaces.
-7. Atomically install the new client binary and profile-based service arguments,
-   then restart the client service.
-8. Force a SOCKS request with `--noproxy ''`, confirm server flow counters and
-   QUIC or TCP lanes, and only then delete the consumed invitation copy.
-
-Generate the provider state beside the old credential files, not on top of
-them. If the new service fails before enrollment, restore the old server unit
-and binary. If it fails after the client changes, restore both client and
-server as one rollback; mixed protocol versions will never connect. Keep the
-new provider state and enrolled profile for diagnosis or a later retry unless
-they are known to be compromised.
+1. Record the current endpoints, versions, service arguments and a successful proxy request. Back up provider state and enrolled profiles with their permissions intact.
+2. Stage the v2 gateway and client on a separate endpoint. Use the appropriate provider identity and an enrolled profile for that endpoint. Enrollment and renewal formats are unchanged. Confirm both binaries report `wire=2`.
+3. Verify a TCP request and a UDP association through the v2 pair. Move new traffic to it, keeping the v1 pair available until existing connections drain.
+4. To roll back, direct new traffic to the v1 pair. If the gateway address must be reused, schedule an interruption and switch both ends together. Restore the matching client and gateway binaries if verification fails.
 
 ## User and device lifecycle
 
@@ -666,7 +686,7 @@ without redaction.
 
 | Symptom | Action |
 |---|---|
-| `does not support Queqiao enrollment` or `rejected Queqiao protocol 1` | Confirm the invitation endpoint, client/server `wire=1`, and that no old TLS service still owns the port. |
+| `does not support Queqiao enrollment` or `rejected Queqiao protocol 2` | Confirm the invitation endpoint, client/server `wire=2`, and that no old TLS service still owns the port. |
 | `more than one physical IPv4 address is active` | Choose the intended uplink with `--local-address if:NAME`; use the same value for enroll and client. |
 | `interface … has no active IPv4 address` | Correct the interface name or connect it before retrying. The saved enrollment draft remains reusable. |
 | Enrollment reports a pinned-identity error | The URI belongs to another provider, the provider state was replaced, or traffic is intercepted. Never bypass pin verification. |

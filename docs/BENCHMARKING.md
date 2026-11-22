@@ -1,7 +1,7 @@
 # Measuring this transport
 
 > [!NOTE]
-> **Status:** Current benchmark methodology for public protocol 1
+> **Status:** Current benchmark methodology for public protocol 2
 > **Last reviewed:** 2026-08-26
 
 This is the reproducibility guide for the measurement rig. It exists because the motivating

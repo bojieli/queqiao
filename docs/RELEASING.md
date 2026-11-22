@@ -75,8 +75,8 @@ Then confirm that the embedded metadata matches the tag:
 cat BUILDINFO
 ```
 
-Both outputs must report `wire=1` / `wire_protocol=1`. The public protocol-1 contract
-accepts only protocol 1 and intentionally provides no compatibility or
+Both outputs must report `wire=2` / `wire_protocol=2`. The public protocol-2 contract
+accepts only protocol 2 and intentionally provides no compatibility or
 downgrade path for the removed shared-secret protocol.
 
 Validate the complete directory before executing an archive:

@@ -3,7 +3,7 @@
 > [!NOTE]
 > **Status:** Current implementation reference
 >
-> **Applies to:** Public protocol 1
+> **Applies to:** Public protocol 2
 > **Last reviewed:** 2026-08-20
 
 This document describes the implementation behind the [How it works](../README.md#how-it-works)
@@ -48,7 +48,8 @@ provider admin CLI ── atomic authorization state ─────────
 application → SOCKS5 → unified client data path → TLS 1.3 → gateway → destination
                          │                   │                  │
                          │                   ├─ QUIC/UDP        ├─ destination policy
-                         │                   └─ TLS/TCP         └─ UDP relay store
+                         │                   └─ TLS/TCP         ├─ UDP relay store
+                         │                                      └─ optional loopback SOCKS5 upstream
                          │
                          ├─ endpoint-pair path model
                          ├─ aggregate pacing and priority
@@ -227,6 +228,16 @@ under a random single-use token. A replacement association with both the token
 and the same authenticated device principal can reclaim it, preserving the
 source address seen by the destination. At most 256 relays are retained.
 Datagrams in flight during failure are not recovered.
+
+The gateway normally opens TCP and UDP destinations directly. An operator may
+instead configure one unauthenticated loopback SOCKS5 upstream. TCP flows use
+CONNECT and UDP associations use UDP ASSOCIATE; the latter's TCP control
+connection is retained as part of the bounded relay so lane recovery does not
+silently destroy the upstream association. In public-only mode the gateway
+sends the validated destination IP to the upstream for both transports. With
+private destinations explicitly enabled, it can forward the original domain
+to the local router after gateway resolution. This option controls gateway
+egress and uses the existing Queqiao wire protocol.
 
 ## Trust boundaries
 

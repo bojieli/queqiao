@@ -28,6 +28,8 @@ func offer(t *testing.T, cfg Config, mbits float64, duration time.Duration) (del
 // first two are the path the test means to measure.
 type attribution struct {
 	sent     uint64
+	sentRate float64
+	expired  uint64
 	arrived  int
 	relayIn  uint64
 	relayOut uint64
@@ -49,6 +51,27 @@ func (a attribution) unaccounted() int {
 		missedEgress = 0
 	}
 	return missedIngress + missedEgress
+}
+
+// offerPacer bounds accumulated send credit, not just one loop's batch. Credit
+// above eight packets expires after a host pause so the next loop cannot repay
+// it as another back-to-back batch. Sequence numbers count only actual sends.
+// At 50 Mbit/s a normal 1 ms poll earns at most six packets. At the highest
+// sub-knee rate, 12 Mbit/s, eight plus an 8 ms refill's ten packets remains
+// below the policer's 22-packet bucket. A stalled relay can still bunch input;
+// this bounds sender catch-up, not the host's scheduling of the receiver.
+type offerPacer struct {
+	expired uint64
+}
+
+func (p *offerPacer) allowed(earned, sent uint64) uint64 {
+	const burst = 8
+	allowed := earned - p.expired
+	if allowed > sent+burst {
+		p.expired += allowed - sent - burst
+		allowed = sent + burst
+	}
+	return allowed
 }
 
 func offerAttributed(t *testing.T, cfg Config, mbits float64, duration time.Duration) (float64, lossmodel.Pattern, attribution) {
@@ -93,16 +116,20 @@ func offerAttributed(t *testing.T, cfg Config, mbits float64, duration time.Dura
 		}
 	}()
 
-	// A token bucket rather than a sleep per packet: at these rates the packet
-	// interval is far below the timer granularity, and sleeping per packet
-	// paces the test's scheduler instead of the traffic.
+	// Batch packets rather than sleeping per packet: at these rates the packet
+	// interval is below timer granularity. Bound accumulated credit so a host
+	// pause cannot turn a sub-knee target rate into an above-knee catch-up burst.
+	// Lost send time is not recovered or removed from the throughput denominator;
+	// target-rate shortfalls stay visible in sentRate and the rate assertions.
 	buf := make([]byte, payload)
 	perSecond := mbits * 1e6 / 8 / payload
 	start := time.Now()
 	deadline := start.Add(duration)
 	var sent uint64
+	var pacer offerPacer
 	for now := start; now.Before(deadline); now = time.Now() {
-		allowed := uint64(now.Sub(start).Seconds() * perSecond)
+		earned := uint64(now.Sub(start).Seconds() * perSecond)
+		allowed := pacer.allowed(earned, sent)
 		for sent < allowed {
 			binary.BigEndian.PutUint64(buf, sent)
 			if _, err := client.WriteTo(buf, target); err != nil {
@@ -130,7 +157,9 @@ func offerAttributed(t *testing.T, cfg Config, mbits float64, duration time.Dura
 	up, _ := relay.Stats()
 	return deliveredMbits, lossmodel.Analyze(arrived), attribution{
 		sent: sent, arrived: received,
-		relayIn: up.PacketsIn, relayOut: up.PacketsOut,
+		sentRate: float64(sent) * payload * 8 / duration.Seconds() / 1e6,
+		expired:  pacer.expired,
+		relayIn:  up.PacketsIn, relayOut: up.PacketsOut,
 		erased: up.PacketsLost, dropped: up.PacketsDropped,
 	}
 }
@@ -179,12 +208,12 @@ func TestTheEmulatorReproducesTheMeasuredPath(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("offered%.0f", test.offered), func(t *testing.T) {
 			delivered, p, where := offerAttributed(t, liveChannel(), test.offered, 4*time.Second)
-			t.Logf("offered=%.0f delivered=%.2f loss=%.1f%% P(loss|prev arrived)=%.3f "+
+			t.Logf("target=%.0f sent=%.2f delivered=%.2f loss=%.1f%% P(loss|prev arrived)=%.3f "+
 				"mean_burst=%.2f burst_factor=%.2f longest=%d",
-				test.offered, delivered, 100*p.Loss, p.LossAfterArrival,
+				test.offered, where.sentRate, delivered, 100*p.Loss, p.LossAfterArrival,
 				p.MeanBurst, p.BurstFactor, p.LongestBurst)
-			t.Logf("  of the %d sent: %d arrived, %d erased, %d tail-dropped, %d unaccounted",
-				where.sent, where.arrived, where.erased, where.dropped, where.unaccounted())
+			t.Logf("  of the %d sent: %d arrived, %d erased, %d tail-dropped, %d unaccounted; %d send allowances expired",
+				where.sent, where.arrived, where.erased, where.dropped, where.unaccounted(), where.expired)
 
 			// Loss the emulator did not cause is harness overload, and it is
 			// bursty: a full socket buffer drops a run of packets. That
