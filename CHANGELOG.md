@@ -23,6 +23,8 @@ to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
   validated destination IPs by default. Private-access services can forward
   original names for domain routing. The option is disabled by default, uses
   the existing client and wire protocol, and fails closed if the router fails.
+- Client flow completion logs classify the last failed zero-lane recovery,
+  including timeouts and peer refusals, for both QUIC and TCP.
 
 ### Changed
 
