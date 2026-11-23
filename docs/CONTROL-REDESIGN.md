@@ -394,8 +394,13 @@ of:
   request too.) This is what catches a policer whose drops are already the
   floor.
 
-When it ends, the lane takes its share and its controller leaves startup, as
-BBR would have at a full pipe. Nothing reported to the pool changes:
+When it ends, the lane takes its share, and if it has reached that share its
+controller leaves startup, as BBR would have at a full pipe. A lane that ends
+its ramp well below its share -- on the loss of a startup burst it shared with
+its siblings -- has not found a full pipe, and stays in startup under the
+share as it would have before. The first live run forced every lane out of
+startup and caught one at 0.2 MB/s: it then carried a flow's tail at 0.8 MB/s
+beside a 5 MB/s share for ten seconds, growing a quarter per eight rounds. Nothing reported to the pool changes:
 `Delivered` is still only what the lane measured, so the seed and bottleneck
 stay honest. Only the cap moves. A lane that joins an empty model has no seed
 and no share, and behaves as before.

@@ -184,6 +184,11 @@ type State struct {
 	// ObservedSamples is a lifetime high-water mark and can belong to a member
 	// that has since expired.
 	ErasureSamples float64
+	// ErasureBurst is the burst factor that belongs to Erasure, for judging
+	// its sampling noise. It equals BurstFactor for one model; a Chain takes
+	// BurstFactor as the worst of its nodes, for sizing a code, but this from
+	// the node whose erasure it took.
+	ErasureBurst float64
 	// Share is this contributor's allowance of the bottleneck in bytes per
 	// second. Zero means the contributor must not cap itself -- either because
 	// the bottleneck is not yet known, or because it is the only one here and
@@ -348,6 +353,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		// code weakest, so it is the safe one to fall back to.
 		state.BurstFactor = 1
 	}
+	state.ErasureBurst = state.BurstFactor
 	if observed > m.knowledge.observedSamples {
 		m.knowledge.observedSamples = observed
 	}
@@ -454,6 +460,7 @@ func (m *PathModel) Current() State {
 		// code weakest, so it is the safe one to fall back to.
 		state.BurstFactor = 1
 	}
+	state.ErasureBurst = state.BurstFactor
 	if observed > m.knowledge.observedSamples {
 		m.knowledge.observedSamples = observed
 	}

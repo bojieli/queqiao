@@ -548,12 +548,15 @@ func TestRegroupingIsRateLimited(t *testing.T) {
 // every joiner on a hierarchical path a floor weighted by nothing.
 func TestCombineCarriesTheSamplesBehindTheErasure(t *testing.T) {
 	out := combine([]State{
-		{Erasure: 0.10, ErasureSamples: 300},
-		{Erasure: 0.20, ErasureSamples: 8000},
-		{Erasure: 0.05, ErasureSamples: 90000},
+		{Erasure: 0.10, ErasureSamples: 300, BurstFactor: 6, ErasureBurst: 6},
+		{Erasure: 0.20, ErasureSamples: 8000, BurstFactor: 1, ErasureBurst: 1},
+		{Erasure: 0.05, ErasureSamples: 90000, BurstFactor: 1, ErasureBurst: 1},
 	})
-	if out.Erasure != 0.20 || out.ErasureSamples != 8000 {
-		t.Errorf("combined erasure %.2f on %.0f samples, want 0.20 on 8000", out.Erasure, out.ErasureSamples)
+	if out.Erasure != 0.20 || out.ErasureSamples != 8000 || out.ErasureBurst != 1 {
+		t.Errorf("combined erasure %.2f on %.0f samples, burst %.1f; want 0.20 on 8000, burst 1", out.Erasure, out.ErasureSamples, out.ErasureBurst)
+	}
+	if out.BurstFactor != 6 {
+		t.Errorf("the code-sizing burst factor %.1f, want the worst node's 6", out.BurstFactor)
 	}
 	clean := combine([]State{{ErasureSamples: 50}, {ErasureSamples: 6000}})
 	if clean.Erasure != 0 || clean.ErasureSamples != 6000 {

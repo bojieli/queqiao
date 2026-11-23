@@ -288,7 +288,7 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 			e.ramping.Store(true)
 			e.joined = true
 			e.rampFloor, e.rampFloorN = state.Erasure, state.ErasureSamples
-			e.rampBurst = math.Max(state.BurstFactor, 1)
+			e.rampBurst = math.Max(state.ErasureBurst, 1)
 			// The compensation gate judges each step by whether delivery rose
 			// since the last one. Its baseline starts at zero, and the seeded
 			// estimate is above zero without this lane having delivered
@@ -493,6 +493,14 @@ func (e *ErasureSender) poolAboveFloor() bool {
 // has changed, and the lane takes the pool's current figure as its floor and
 // earns compensation against it as any lane does.
 func (e *ErasureSender) rebaseFloor(now monotime.Time) {
+	// A lane that joined before the pool had measured enough to judge
+	// against takes the floor once it has: otherwise neither loss guard
+	// would ever run for it.
+	if e.rampFloorN < rampLossSamples && e.poolSamples >= rampLossSamples {
+		e.rampFloor = float64(e.erasure.Load()) / partsPerMillion
+		e.rampFloorN, e.rampBurst = e.poolSamples, math.Max(e.poolBurst, 1)
+		return
+	}
 	// The window has to be observed, not merely elapsed: a lane that saw the
 	// overflow once and then went quiet has no evidence about the interval it
 	// did not watch, and the estimator, which forgets by packets rather than
@@ -538,9 +546,20 @@ const rebaseGap = time.Second
 // then its only bound, and a share sized from the summed peaks of a burst of
 // lanes can be well above the path: simulated on a shallow-buffer path, that
 // held the bottleneck at twice its rate for the rest of the transfer.
+//
+// But only a lane that reached its share has found that pipe. One that ends
+// its ramp below it -- on the loss of a startup burst it shared with its
+// siblings, say -- is handed a share above what it delivers, and taking it
+// out of startup there leaves it to grow at ProbeBW's quarter per eight
+// rounds. Measured live, such a lane ended its ramp at 0.2 MB/s and carried a
+// flow's tail at 0.8 MB/s beside a 5 MB/s share for ten seconds. It stays in
+// startup, held by its share, as it would have been before the ramp existed.
 func (e *ErasureSender) endRamp() {
 	e.ramping.Store(false)
-	e.inner.fullBandwidth = true
+	share := float64(e.share.Load())
+	if share > 0 && float64(e.inner.estimator.estimate())*rampGrowth >= share {
+		e.inner.fullBandwidth = true
+	}
 }
 
 // bandwidth is the rate to put on the wire: what arrives, divided by the
@@ -945,7 +964,7 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))
 		e.share.Store(uint64(state.Share))
-		e.poolSamples, e.poolBurst = state.ErasureSamples, state.BurstFactor
+		e.poolSamples, e.poolBurst = state.ErasureSamples, state.ErasureBurst
 		e.rampGate(eventTime, acked, lost)
 	}
 	// The compensation rides on the measurement rather than on a floor biased

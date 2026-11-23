@@ -202,7 +202,7 @@ func combine(states []State) State {
 		// supplies it; among equal figures, including a measured clean
 		// floor, the best-measured one.
 		if s.Erasure > out.Erasure || (s.Erasure == out.Erasure && s.ErasureSamples > out.ErasureSamples) {
-			out.Erasure, out.ErasureSamples = s.Erasure, s.ErasureSamples
+			out.Erasure, out.ErasureSamples, out.ErasureBurst = s.Erasure, s.ErasureSamples, s.ErasureBurst
 		}
 		if s.BurstFactor > out.BurstFactor {
 			out.BurstFactor = s.BurstFactor
@@ -234,6 +234,9 @@ func combine(states []State) State {
 	}
 	if out.BurstFactor < 1 {
 		out.BurstFactor = 1
+	}
+	if out.ErasureBurst < 1 {
+		out.ErasureBurst = 1
 	}
 	// A chain that constrained nothing still seeds from whatever any node
 	// knows, because a seed is not a ceiling: starting a lane from a

@@ -213,6 +213,7 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 			var acked []quiccongestion.AckedPacketInfo
 			var lost []quiccongestion.LostPacketInfo
 			done := 0
+			var sample time.Duration
 			for _, p := range lane.pending {
 				if p.due > now {
 					break
@@ -223,9 +224,14 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 					continue
 				}
 				acked = append(acked, quiccongestion.AckedPacketInfo{PacketNumber: p.number, BytesAcked: simPacketSize, ReceivedTime: at})
-				lane.rtt.observe(p.due - p.sent)
+				sample = p.due - p.sent
 				result.delivered += simPacketSize
 				result.perSecond[int(now/time.Second)] += simPacketSize
+			}
+			// QUIC takes one round-trip sample per acknowledgement, from its
+			// largest newly acknowledged packet, not one per packet it covers.
+			if sample > 0 {
+				lane.rtt.observe(sample)
 			}
 			if done > 0 {
 				lane.pending = lane.pending[done:]
@@ -395,6 +401,7 @@ func TestAJoinerBesideALaneThatFillsThePathBacksOff(t *testing.T) {
 func joiningProbe() *seedObservationProbe {
 	return &seedObservationProbe{State: pathmodel.State{
 		Seed: 1e6, Share: 1.25e6, Erasure: 0.15, ObservedSamples: 5000, ErasureSamples: 5000, Arrival: 0.85, RoundTrip: joiningRoundTrip,
+		BurstFactor: 1, ErasureBurst: 1,
 	}}
 }
 
@@ -639,7 +646,7 @@ func TestABurstOfErasureOnABurstyFloorDoesNotEndARamp(t *testing.T) {
 		ramping bool
 	}{{1, false}, {4, true}} {
 		probe := joiningProbe()
-		probe.BurstFactor = tc.burst
+		probe.BurstFactor, probe.ErasureBurst = tc.burst, tc.burst
 		sender := NewErasureSenderOn(1200, probe)
 		closeRound(sender, 70, 30)
 		if got := sender.ramping.Load(); got != tc.ramping {
@@ -663,5 +670,40 @@ func TestAnIdleGapDoesNotRebaseTheFloor(t *testing.T) {
 	sender.rampGate(start.Add(floorRebaseAfter+time.Second), nil, nil)
 	if got := sender.rampFloor; got != 0.05 {
 		t.Fatalf("one observation either side of an idle gap rebased the floor to %.3f", got)
+	}
+}
+
+// Only a lane that reached its share has found a full pipe. One that ends its
+// ramp well below the share stays in startup, held by the share as before.
+func TestARampEndedBelowItsShareStaysInStartup(t *testing.T) {
+	for _, tc := range []struct {
+		share float64
+		left  bool
+	}{{1.25e6, true}, {5e6, false}} {
+		probe := joiningProbe()
+		probe.Share = tc.share
+		sender := NewErasureSenderOn(1200, probe)
+		sender.endRamp()
+		if got := sender.inner.fullBandwidth; got != tc.left {
+			t.Errorf("a lane at 1e6 with a %.2g share left startup: %v, want %v", tc.share, got, tc.left)
+		}
+	}
+}
+
+// A lane that joined before the pool could judge a floor takes it once the
+// pool can, so its loss guards are not off for life.
+func TestAnUnderSampledFloorMatures(t *testing.T) {
+	probe := joiningProbe()
+	probe.ErasureSamples = 10
+	sender := NewErasureSenderOn(1200, probe)
+	sender.poolSamples, sender.poolBurst = 5000, 1
+	sender.erasure.Store(uint64(0.15 * partsPerMillion))
+	sender.rampGate(base(), nil, nil)
+	if sender.rampFloorN != 5000 || sender.rampFloor != 0.15 {
+		t.Fatalf("floor %.3f on %.0f samples, want 0.15 on 5000", sender.rampFloor, sender.rampFloorN)
+	}
+	closeRound(sender, 60, 40)
+	if sender.ramping.Load() {
+		t.Fatal("against the matured floor, 40% loss did not end the ramp")
 	}
 }
