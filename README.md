@@ -155,28 +155,27 @@ Prebuilt binaries for the published release are listed below.
 ## Platform availability
 
 Every release publishes reproducible, signed binaries for six native targets.
-The downloads below are **v0.12.2 (wire 1)**. Use the same version on the client and gateway.
-The v0.13.0 wire 2 candidate is pending publication. [Candidate report](https://github.com/bojieli/queqiao/pull/150#issuecomment-7080666043)
+The downloads below are **v0.13.0 (wire 2)**. Upgrade the client and gateway together. For a staged rollout, use the [paired upgrade procedure](docs/DEPLOYING.md#upgrade-an-existing-deployment).
 
 | Platform | Status | Download |
 | --- | --- | --- |
-| macOS, Apple silicon | Desktop and gateway, ready to use | [`darwin_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_darwin_arm64_signed.zip), notarized |
-| macOS, Intel | Desktop and gateway, ready to use | [`darwin_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_darwin_amd64_signed.zip), notarized |
-| Linux, x86-64 | Desktop and gateway, ready to use | [`linux_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_linux_amd64.tar.gz) |
-| Linux, arm64 | Desktop and gateway, ready to use | [`linux_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_linux_arm64.tar.gz) |
-| Windows, x86-64 | Native target built; under testing, not production-ready | [`windows_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_windows_amd64.zip) |
-| Windows, arm64 | Native target built; under testing, not production-ready | [`windows_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/queqiaod_v0.12.2_windows_arm64.zip) |
+| macOS, Apple silicon | Desktop and gateway, ready to use | [`darwin_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_darwin_arm64_signed.zip), notarized |
+| macOS, Intel | Desktop and gateway, ready to use | [`darwin_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_darwin_amd64_signed.zip), notarized |
+| Linux, x86-64 | Desktop and gateway, ready to use | [`linux_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_linux_amd64.tar.gz) |
+| Linux, arm64 | Desktop and gateway, ready to use | [`linux_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_linux_arm64.tar.gz) |
+| Windows, x86-64 | Native target built; under testing, not production-ready | [`windows_amd64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_windows_amd64.zip) |
+| Windows, arm64 | Native target built; under testing, not production-ready | [`windows_arm64`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/queqiaod_v0.13.0_windows_arm64.zip) |
 | Android and iOS | Same transport core, under testing; not yet production-ready mobile apps | -- |
 
-Check a signed macOS ZIP against [`SHA256SUMS.signed`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/SHA256SUMS.signed). For the other archives, use
-[`SHA256SUMS`](https://github.com/bojieli/queqiao/releases/download/v0.12.2/SHA256SUMS)
+Check a signed macOS ZIP against [`SHA256SUMS.signed`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/SHA256SUMS.signed). For the other archives, use
+[`SHA256SUMS`](https://github.com/bojieli/queqiao/releases/download/v0.13.0/SHA256SUMS)
 before running the binary. Each release includes a CycloneDX SBOM and the complete
 license text for every module linked into the binary.
 
 ## Quick start
 
 Two scripts perform a whole deployment and verify the result, one per side.
-With the v0.12.2 downloads, run the commands below from the [v0.12.2 source checkout](https://github.com/bojieli/queqiao/tree/v0.12.2). Its installers accept wire 1. The installers on `main` require wire 2 on both endpoints.
+For the published downloads, run these commands from the [v0.13.0 checkout](https://github.com/bojieli/queqiao/tree/v0.13.0). Both endpoints must report `wire=2`.
 
 On the Linux gateway, as root:
 
@@ -210,7 +209,7 @@ The client listens on `127.0.0.1:12080`, the port
 [`deploy/clash-queqiao.yaml`](deploy/clash-queqiao.yaml) already points at.
 Point an application or Clash/mihomo at that SOCKS5 endpoint.
 
-The [v0.12.2 deployment guide](https://github.com/bojieli/queqiao/blob/v0.12.2/docs/DEPLOYING.md) covers the published binaries.
+The [deployment guide](docs/DEPLOYING.md) covers the published binaries.
 
 [Choosing and placing a gateway](docs/CHOOSING-A-GATEWAY.md) is the decision
 that comes before all of this: whether a gateway will help at all, and where it
@@ -271,7 +270,7 @@ the same median this transport does.
 
 Queqiao is ready to use for the supported paired-gateway topology, from the
 published binaries or from source. It is a public preview, not a production-ready claim for every
-network. The published v0.12.2 binaries use wire 1. The v0.13.0 candidate and the current source tree use wire 2. Upgrade both endpoints together. See the [upgrade procedure](docs/DEPLOYING.md#upgrade-an-existing-deployment). Broader independent
+network. The published v0.13.0 binaries use wire 2. Upgrade both endpoints together when migrating from v0.12.2 (wire 1). See the [upgrade procedure](docs/DEPLOYING.md#upgrade-an-existing-deployment). Broader independent
 field qualification, transport and security review, and mobile review remain
 open. See [current status](docs/STATUS.md) for the evidence boundary and
 [known limitations](docs/KNOWN-LIMITATIONS.md) for operational constraints.

@@ -10,9 +10,7 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
-## v0.13.0 - 2026-11-22
-
-**Publication pending.** [Candidate report](https://github.com/bojieli/queqiao/pull/150#issuecomment-7080666043)
+## v0.13.0 - 2026-11-23
 
 ### Added
 
