@@ -1,6 +1,7 @@
 package congestion
 
 import (
+	"math"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -129,6 +130,21 @@ type ErasureSender struct {
 	path   pathmodel.Model
 	share  atomic.Uint64
 	member pathmodel.Member
+
+	// ramping is whether this lane is still finding its rate, and while it is
+	// the share does not cap it. See rampGate. The rest is the gate's own
+	// state: the erasure the pool had measured when this lane joined, which is
+	// the floor its loss is judged against; the round it last judged; the
+	// delivery the last growth reached and how many rounds have passed without
+	// more; and the packets decided in the round in progress.
+	ramping       atomic.Bool
+	rampFloor     float64
+	rampFloorSet  bool
+	rampRound     uint64
+	rampDelivered float64
+	rampFlat      int
+	rampArrived   uint64
+	rampLost      uint64
 }
 
 type packetOutcome struct {
@@ -150,6 +166,27 @@ const (
 	compensationStep  = 0.9
 	erasureMinArrival = 0.15
 	partsPerMillion   = 1e6
+)
+
+const (
+	// rampGrowth and rampFlatRounds are BBR's own full-pipe test: delivery
+	// that has not grown by a quarter in three rounds has stopped following
+	// the sending rate.
+	rampGrowth     = 1.25
+	rampFlatRounds = 3
+	// rampQueueFraction is how much queue ends a ramp, as a fraction of the
+	// path's minimum round trip. It is a quarter of the delay bound's
+	// allowance: the ramp is the phase that runs past the share, so it stops
+	// at the first sign of a queue rather than at the bound.
+	rampQueueFraction = 4
+	// rampLossSamples is the fewest packets a round must decide before its
+	// loss is compared with the floor, and rampLossDeviations how far above
+	// the floor, in binomial standard deviations, it must then be. A 32-packet
+	// first flight on a 15% channel loses seven packets about one time in
+	// four; read without its noise it would end most ramps in their first
+	// round.
+	rampLossSamples    = 64
+	rampLossDeviations = 3
 )
 
 // NewErasureSender returns a controller for a path whose loss is mostly not
@@ -228,6 +265,13 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 			// to put it on the wire. So it is seeded as it is: dividing it here
 			// compensated twice (#73), and multiplying compensated zero times.
 			e.inner.seedBandwidth(uint64(state.Seed), state.RoundTrip)
+			// A lane that joins from a pooled seed starts by finding its own
+			// rate from it; see rampGate. Its loss is judged against the
+			// erasure the pool had measured, when the pool had measured any.
+			e.ramping.Store(true)
+			if state.ObservedSamples > 0 {
+				e.rampFloor, e.rampFloorSet = state.Erasure, true
+			}
 			// The compensation gate judges each step by whether delivery rose
 			// since the last one. Its baseline starts at zero, and the seeded
 			// estimate is above zero without this lane having delivered
@@ -271,12 +315,102 @@ func newErasureSender(initialPacketSize quiccongestion.ByteCount) *ErasureSender
 // estimate put four times the overshoot into one bottleneck; capping at the
 // share means the aggregate on the wire is what a single sender would have put
 // there. The burst allowance is measured against this for the same reason.
+//
+// A lane that is still ramping is not capped; see rampGate.
 func (e *ErasureSender) deliveredRate() float64 {
 	delivered := float64(e.inner.bandwidth())
-	if share := float64(e.share.Load()); share > 0 && share < delivered {
+	if share := float64(e.share.Load()); share > 0 && share < delivered && !e.ramping.Load() {
 		delivered = share
 	}
 	return delivered
+}
+
+// rampGate decides when a lane joining a shared path has found its rate, and
+// until then exempts it from its share.
+//
+// The share is a fair split of what the pool has measured, and what the pool
+// has measured is what its members delivered -- which, for a burst of lanes
+// joining a pool that has idled down to a trickle, is the trickle. A share is
+// 1.25x an even split of that, so the members together can grow the measured
+// bottleneck by a quarter per measurement. That is enough only if every
+// member is using its share. One that is not -- the pooled control connection
+// a download joins next to, a lane that has finished or stalled and not yet
+// expired -- still takes an even split, and four bulk lanes beside one idle
+// member grow by 1.25 x 4/5: not at all. Measured live, lanes on a 150 Mbit/s
+// path plateaued at a third of it for the whole of a 256 MiB transfer, with
+// the loss at the path's floor and no queue. The share was being read as a
+// ceiling on a path with nothing to protect.
+//
+// So a joining lane ramps the way a lone BBR sender does, from its seed, and
+// takes up its share only when the path shows the share has something to
+// protect. Any of three signals ends the ramp, for good:
+//
+//   - a queue: the smoothed round trip a quarter above the path's minimum;
+//   - loss above the floor: a round losing more than the erasure the pool had
+//     measured when this lane joined, by more than that round's sampling noise;
+//   - delivery that has stopped following the sending rate: BBR's own
+//     full-pipe test, three rounds without a quarter's growth in what this lane
+//     measured itself delivering.
+//
+// The first two are the path saying it is full. The third is for a path that
+// says neither -- a policer whose drops have already been measured as the
+// floor queues nothing and loses no more than it did -- but delivers no more
+// however fast it is sent into. A lane that ends its ramp has reported what
+// it reached, and the pool's share is sized from that, so it hands over to the
+// share at the rate it found rather than at the trickle.
+//
+// Nothing here reports a rate the lane did not measure. The pooled seed and
+// the bottleneck stay what was delivered (#73); only the cap moves.
+func (e *ErasureSender) rampGate(acked []quiccongestion.AckedPacketInfo, lost []quiccongestion.LostPacketInfo) {
+	if !e.ramping.Load() {
+		return
+	}
+	queue, minRTT := e.queueDelay()
+	if minRTT > 0 && queue*rampQueueFraction >= minRTT {
+		e.endRamp()
+		return
+	}
+	// Judge the round that has just closed, once per round. The inner round
+	// advances inside its own callback, after this one has run, so a change
+	// seen here is a round that ended on the previous event.
+	if round := e.inner.round; round != e.rampRound {
+		e.rampRound = round
+		decided := e.rampArrived + e.rampLost
+		if e.rampFloorSet && decided >= rampLossSamples {
+			loss := float64(e.rampLost) / float64(decided)
+			noise := rampLossDeviations * math.Sqrt(e.rampFloor*(1-e.rampFloor)/float64(decided))
+			if loss > e.rampFloor+noise {
+				e.endRamp()
+				return
+			}
+		}
+		e.rampArrived, e.rampLost = 0, 0
+		delivered := float64(e.inner.estimator.measuredEstimate())
+		if delivered >= e.rampDelivered*rampGrowth && delivered > 0 {
+			e.rampDelivered, e.rampFlat = delivered, 0
+		} else if e.rampFlat++; e.rampFlat >= rampFlatRounds {
+			e.endRamp()
+			return
+		}
+	}
+	e.rampArrived += uint64(len(acked))
+	e.rampLost += uint64(len(lost))
+}
+
+// endRamp hands the lane to its share, and its controller out of startup.
+//
+// The ramp is this lane's startup, and its end is the full pipe BBR's startup
+// is looking for. The inner controller cannot find that for itself here: a
+// lane held below its window by a share looks application-limited at every
+// acknowledgement, and startup's own exit tests skip application-limited
+// rounds, so a lane that has ever been capped stays in startup for life,
+// pacing at the startup gain over whatever it last measured. Its share is
+// then its only bound, and a share sized from the summed peaks of a burst of
+// lanes can be well above the path: simulated on a shallow-buffer path, that
+// held the bottleneck at twice its rate for the rest of the transfer.
+func (e *ErasureSender) endRamp() {
+	e.ramping.Store(false)
+	e.inner.fullBandwidth = true
 }
 
 // bandwidth is the rate to put on the wire: what arrives, divided by the
@@ -331,8 +465,18 @@ func (e *ErasureSender) compensationFor(want float64) float64 {
 		e.appliedArrival, e.deliveredAtCompensation, e.compensationRound = want, delivered, round
 		return want
 	}
-	// More compensation than is applied. Give the previous step a round to show
-	// an effect before judging it, then require that it showed one.
+	// More compensation than is applied. Not while the lane is ramping: the
+	// ramp is raising the sending rate on its own, so delivery rises whether
+	// or not the last step bought any of it, and a step judged against that
+	// would be granted for loss the ramp itself is causing. The baseline
+	// follows the ramp, so the first step after it has to beat what the ramp
+	// reached.
+	if e.ramping.Load() {
+		e.deliveredAtCompensation, e.compensationRound = delivered, round
+		return e.appliedArrival
+	}
+	// Give the previous step a round to show an effect before judging it,
+	// then require that it showed one.
 	if round == e.compensationRound {
 		return e.appliedArrival
 	}
@@ -651,6 +795,7 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))
 		e.share.Store(uint64(state.Share))
+		e.rampGate(acked, lost)
 	}
 	// The compensation rides on the measurement rather than on a floor biased
 	// low for pacing. Under-compensating is not the safe direction it looks

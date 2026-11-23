@@ -237,6 +237,17 @@ func NewPathModel() *PathModel {
 	return &PathModel{members: make(map[Member]*report)}
 }
 
+// NewPathModelClocked returns an empty model that reads the time from now
+// rather than the wall clock. It exists for simulations that run a path faster
+// than real time: membership and the bottleneck window are measured in the
+// path's time, and a simulation driving them from the wall clock would expire
+// nothing and remember everything.
+func NewPathModelClocked(now func() time.Time) *PathModel {
+	m := NewPathModel()
+	m.now = now
+	return m
+}
+
 // Report records what one lane currently believes, and returns what the
 // endpoint pair believes. floorSamples weights only established floor
 // evidence; observedSamples records measurement progress even while the floor
