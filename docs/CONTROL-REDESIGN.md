@@ -471,3 +471,30 @@ pool, untouched here, loses 0.55. And the even split itself: one bulk lane
 beside one idle member is held to 5/8 of what it delivers, which this change
 only postpones by ramping first (simulated on the high-erasure path, 0.08 of
 capacity on #146 and 0.62 here). Both are follow-ups.
+
+**Live.** Three arms -- main (`f6e6d34`), #146 (`602438b`) and this change
+(`89ced9b`) -- 12 interleaved rounds per path with the arm order rotated, each
+trial four concurrent downloads through temporary servers on the US gateway.
+Medians, with IQR where it matters:
+
+| Path | Metric | main | #146 | this |
+| --- | --- | ---: | ---: | ---: |
+| fast, ~15% floor (Beijing) | goodput, Mbit/s | 143 | 57.6 | 107 [97-136] |
+| | completed flows | 48/48 | 48/48 | 48/48 |
+| | server loss | 0.17 [0.16-0.32] | 0.162 | 0.178 |
+| | queue p90, ms | 2.2 | 0.55 | 0.81 |
+| | stalls / trial | 8 | 51 | 18 |
+| ~22% loss, ~90 Mbit/s (Mac, this night) | goodput, Mbit/s | 89 | 30 | 29 |
+| | completed flows | 42/48 | 48/48 | 47/48 |
+| | server loss | 0.31 | 0.23 | 0.22 |
+| | queue p90, ms | 35 | 2.9 | 3.1 |
+| | wire bytes / useful byte | 2.28 | 1.92 | 1.47 |
+
+On the fast path this is faster than #146 in 12 of 12 paired rounds (median
+2.1x) at the path's loss floor, and reaches 0.87x of main. The remaining gap is
+the tail of each trial: a lane that ended its ramp is in ProbeBW, and when its
+siblings' flows finish it grows into the freed capacity at a quarter per gain
+cycle, where main's lanes, which never leave startup, refill it at once. The
+Mac path ran fast that night rather than as the 20 Mbit/s high-erasure path of
+the first A/B; there neither #146 nor this change reaches main's goodput, and
+this change keeps #146's loss, queue and completion.
