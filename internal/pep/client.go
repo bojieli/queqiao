@@ -2491,6 +2491,16 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				attempt := flow.noteReplacementAttempt()
 				if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
 					flow.noteReplacementFailure(err)
+					// The flow this belongs to is the whole point of the
+					// line: a gateway record saying a flow failed with no
+					// replacement cannot be told from one where none was
+					// tried unless the attempts can be found by flow.
+					// `attempt` is the flow's replacement ordinal, so the
+					// last line logged for a flow matches the
+					// lane_replacement_attempts on its completion record.
+					// It is written for every counted failure, before the
+					// refusal below can end the manager.
+					c.logLaneRecoveryFailure(manageCtx, flowID, attempt, err)
 					if errors.Is(err, errLaneJoinRejected) {
 						// The peer answered, and its answer was that it does
 						// not hold this session. That does not change: a
@@ -2502,14 +2512,6 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 						c.cfg.Logger.Debug("peer cannot resume this association", "flow_id", flowID, "error", err)
 						return
 					}
-					// The flow this belongs to is the whole point of the
-					// line: a gateway record saying a flow failed with no
-					// replacement cannot be told from one where none was
-					// tried unless the attempts can be found by flow.
-					// `attempt` is the flow's replacement ordinal, so the
-					// last line logged for a flow matches the
-					// lane_replacement_attempts on its completion record.
-					c.logLaneRecoveryFailure(manageCtx, flowID, attempt, err)
 					if recoveryBackoff == 0 {
 						recoveryBackoff = time.Second
 					} else if recoveryBackoff < 15*time.Second {
@@ -2705,6 +2707,11 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 			if result.err != nil {
 				if result.replacement {
 					flow.noteReplacementFailure(result.err)
+					// Every counted failure gets its line, written before
+					// the refusal and shutdown paths below can return, so a
+					// rejected zero-lane join is not left with only the
+					// completion record's count.
+					c.logTCPJoinFailure(manageCtx, flowID, result, -1)
 				}
 				if manageCtx.Err() != nil || flow.doneChanClosed() {
 					return
@@ -2743,19 +2750,10 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 				if bundleFailures >= maxLaneRecoveryAttempts {
 					bundleDisabled = true
 				}
-				// Keyed the same way as the QUIC "lane recovery unavailable"
-				// line, so the attempts behind one failed flow can be found
-				// by flow_id whichever transport carried them. `attempt` is
-				// present only for a replacement of a lost last lane; a join
-				// widening a healthy bundle is not one. `failures` stays the
-				// bundle's own back-off count.
-				fields := []any{"flow_id", flowID, "lane", result.id, "replacement", result.replacement}
-				if result.replacement {
-					fields = append(fields, "attempt", result.attempt)
+				if !result.replacement {
+					// A replacement's line was written above.
+					c.logTCPJoinFailure(manageCtx, flowID, result, bundleFailures)
 				}
-				fields = append(fields, "failure_kind", replacementFailureKind(result.err),
-					"error", result.err, "failures", bundleFailures)
-				c.cfg.Logger.Warn("TCP bundle lane unavailable", fields...)
 				continue
 			}
 			if err := flow.addLane(result.lane); err != nil {
@@ -2950,19 +2948,61 @@ func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessio
 // the flow, and a round stopped because both directions finished is a flow
 // completing, not a recovery failing. It is kept at debug for the rare
 // cancellation that is neither.
+//
+// A peer refusal (session unknown, or its lane ceiling) is also written at
+// info: the handshake was carried and answered, which is the distinction the
+// measurement needs, and the gateway reports its side of it as `lane join
+// refused` at the same level.
 func (c *Client) logLaneRecoveryFailure(manageCtx context.Context, flowID, attempt uint64, err error) {
-	level := slog.LevelWarn
-	switch {
-	case errors.Is(err, context.Canceled):
-		if manageCtx.Err() != nil {
-			return
-		}
-		level = slog.LevelDebug
-	case errors.Is(err, context.DeadlineExceeded):
-		level = slog.LevelInfo
+	level, ok := laneRecoveryFailureLevel(manageCtx, err)
+	if !ok {
+		return
 	}
 	c.cfg.Logger.Log(context.Background(), level, "lane recovery unavailable", "flow_id", flowID,
 		"attempt", attempt, "failure_kind", replacementFailureKind(err), "error", err)
+}
+
+// laneRecoveryFailureLevel is the level a failed recovery join is logged at on
+// either transport, and false when it should not be logged at all.
+func laneRecoveryFailureLevel(manageCtx context.Context, err error) (slog.Level, bool) {
+	switch {
+	case errors.Is(err, context.Canceled):
+		if manageCtx.Err() != nil {
+			return 0, false
+		}
+		return slog.LevelDebug, true
+	case errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, errLaneJoinRejected), errors.Is(err, errLaneJoinCapacity):
+		return slog.LevelInfo, true
+	}
+	return slog.LevelWarn, true
+}
+
+// logTCPJoinFailure writes "TCP bundle lane unavailable", keyed the same way
+// as the QUIC "lane recovery unavailable" line so the attempts behind one
+// failed flow can be found by flow_id whichever transport carried them.
+//
+// A replacement of a lost last lane carries `attempt`, the same ordinal the
+// QUIC line uses, and is written for every counted failure at the levels
+// laneRecoveryFailureLevel gives. A join widening a healthy bundle is not a
+// replacement: it has no `attempt`, carries the bundle's own back-off count
+// as `failures`, and is written only for the failures that count against
+// that back-off, at warn as before.
+func (c *Client) logTCPJoinFailure(manageCtx context.Context, flowID uint64, result laneJoinResult, bundleFailures int) {
+	level := slog.LevelWarn
+	fields := []any{"flow_id", flowID, "lane", result.id, "replacement", result.replacement}
+	if result.replacement {
+		var ok bool
+		if level, ok = laneRecoveryFailureLevel(manageCtx, result.err); !ok {
+			return
+		}
+		fields = append(fields, "attempt", result.attempt)
+	}
+	fields = append(fields, "failure_kind", replacementFailureKind(result.err), "error", result.err)
+	if !result.replacement {
+		fields = append(fields, "failures", bundleFailures)
+	}
+	c.cfg.Logger.Log(context.Background(), level, "TCP bundle lane unavailable", fields...)
 }
 
 type laneReplacementHint struct{ id uint64 }

@@ -224,12 +224,16 @@ fails writes `msg="TCP bundle lane unavailable"`. Both carry `flow_id`,
 so the highest one logged for a flow is at most its
 `lane_replacement_attempts`. The TCP line also carries `replacement`: a join
 that widened a healthy bundle has `replacement=false` and no `attempt`, and is
-not counted in the flow record. A QUIC round that ran out of time
-(`failure_kind=timeout` from a context deadline) is written at `info`, other
-failures at `warn`. A round cancelled because the flow ended is not written,
-and any other cancellation is written only at `debug`. Clients before this
-change skipped deadline errors on the QUIC line entirely and wrote the TCP line
-without `flow_id`. An error can be a timeout, dial failure, or peer refusal;
+not counted in the flow record. Every counted failure gets a line, including
+a peer refusal that ends recovery at once. A replacement that ran out of time
+(a context deadline) or that the peer refused (`peer_rejected`,
+`peer_capacity`) is written at `info`, other failures at `warn`. A replacement
+cancelled because the flow ended is not written, and any other cancellation is
+written only at `debug`. A failed widening join is written at `warn` with the
+bundle's back-off count as `failures`, and only when it counts against that
+back-off. Clients before this change skipped deadline errors and refusals on
+the QUIC line, wrote no TCP line for refusals, and wrote the TCP line without
+`flow_id`. An error can be a timeout, dial failure, or peer refusal;
 the counts alone do not identify a keepalive or path failure. Record build IDs,
 window duration, and total completed and failed flows alongside the groups
 before comparing windows.
@@ -246,7 +250,11 @@ Python 3 and reads rotated files in any order:
 It selects `local flow ended with error` records whose error contains
 `lane replacement timeout` and whose `lanes_joined` is 1, and buckets them:
 
-- `pool never rebuilt (attempts == 0)`: the client dialled nothing.
+- `no zero-lane replacement attempted (attempts == 0)`: the client launched
+  no counted replacement after losing its last lane. This is not by itself
+  proof that the pool would not rebuild. The TCP bundle manager, for one, does
+  not launch a zero-lane replacement while a join it started earlier (for
+  example to widen the bundle) is still pending, and that join is not counted.
 - `every attempt failed (attempts == failures)`, sub-split by
   `lane_replacement_last_failure`. `timeout` is the path not carrying a
   handshake. `peer_rejected` and `peer_capacity` are handshakes that completed
@@ -256,7 +264,8 @@ It selects `local flow ended with error` records whose error contains
 - `old client (fields missing)`: a record without the attempt counters or
   without `lanes_joined`. Missing is never read as zero.
 - `inconsistent (failures > attempts)`: should be empty. Anything here is a bug
-  in the counters.
+  in the counters. It is checked first, so `attempts=0, failures=1` lands here
+  and not in the zero-attempt bucket.
 
 It counts `no replacement lane will be attempted` and
 `peer does not hold this session` failures separately, at any `lanes_joined`.

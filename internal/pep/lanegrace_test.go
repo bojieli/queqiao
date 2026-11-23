@@ -336,6 +336,10 @@ func TestZeroLaneRecoveryLogsReturnedRefusal(t *testing.T) {
 	for _, transport := range []TransportKind{TransportQUIC, TransportTCP} {
 		t.Run(string(transport), func(t *testing.T) {
 			rig := newJoinTestRig(t, transport, transport, 1)
+			// The client is not serving yet, so nothing else reads its
+			// logger while it is replaced.
+			records := &lockedRecords{}
+			rig.client.cfg.Logger = slog.New(slog.NewJSONHandler(records, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			flow := newGraceTestFlow(t)
 			t.Cleanup(flow.closeAll)
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -346,6 +350,20 @@ func TestZeroLaneRecoveryLogsReturnedRefusal(t *testing.T) {
 			got := replacementFields(flow)
 			if got["lane_replacement_last_failure"] != "peer_rejected" || got["lane_replacement_failures"] != uint64(1) {
 				t.Fatalf("replacement completion fields = %v", got)
+			}
+			// The counted refusal also has its own line, keyed by flow and
+			// attempt, even though the refusal ends the manager at once.
+			msg := "lane recovery unavailable"
+			if transport == TransportTCP {
+				msg = "TCP bundle lane unavailable"
+			}
+			lines := records.records(t, msg)
+			if len(lines) != 1 {
+				t.Fatalf("refused replacement wrote %d %q lines, want 1", len(lines), msg)
+			}
+			if r := lines[0]; r["level"] != "INFO" || r["flow_id"] != float64(flow.flowID) ||
+				r["attempt"] != float64(1) || r["failure_kind"] != "peer_rejected" {
+				t.Fatalf("refusal line = %v", r)
 			}
 		})
 	}
@@ -530,6 +548,8 @@ func TestLaneRecoveryFailureLogLevels(t *testing.T) {
 	client.logLaneRecoveryFailure(live, 7, 2, errors.New("handshake failed"))
 	client.logLaneRecoveryFailure(ended, 7, 3, context.Canceled)
 	client.logLaneRecoveryFailure(live, 7, 4, context.Canceled)
+	client.logLaneRecoveryFailure(live, 7, 5, fmt.Errorf("%w: session", errLaneJoinRejected))
+	client.logLaneRecoveryFailure(live, 7, 6, fmt.Errorf("%w: full", errLaneJoinCapacity))
 
 	got := records.records(t, "lane recovery unavailable")
 	want := []struct {
@@ -539,6 +559,8 @@ func TestLaneRecoveryFailureLogLevels(t *testing.T) {
 		{"INFO", "timeout", 1},
 		{"WARN", "other", 2},
 		{"DEBUG", "canceled", 4},
+		{"INFO", "peer_rejected", 5},
+		{"INFO", "peer_capacity", 6},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("logged %d recovery failures, want %d: %v", len(got), len(want), got)

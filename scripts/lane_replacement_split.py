@@ -17,6 +17,7 @@ the gateway never opens a replacement. They are never used for the split.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import sys
@@ -34,15 +35,39 @@ ABANDONED = "no replacement lane will be attempted"
 RESUME_REFUSED = "peer does not hold this session"
 
 # Buckets for `lane replacement timeout` with lanes_joined == 1, in report order.
-POOL_NEVER_REBUILT = "pool never rebuilt (attempts == 0)"
+NO_ATTEMPT = "no zero-lane replacement attempted (attempts == 0)"
 HANDSHAKE_NOT_CARRIED = "every attempt failed (attempts == failures)"
 DIAL_OUTSTANDING = "attempt outstanding (attempts > failures)"
 OLD_CLIENT = "old client (fields missing)"
 INCONSISTENT = "inconsistent (failures > attempts)"
-BUCKETS = (POOL_NEVER_REBUILT, HANDSHAKE_NOT_CARRIED, DIAL_OUTSTANDING, OLD_CLIENT, INCONSISTENT)
+BUCKETS = (NO_ATTEMPT, HANDSHAKE_NOT_CARRIED, DIAL_OUTSTANDING, OLD_CLIENT, INCONSISTENT)
 
 # The categories the client writes as lane_replacement_last_failure.
 FAILURE_KINDS = ("timeout", "peer_rejected", "peer_capacity", "canceled", "other")
+
+# Go's RFC 3339 output: variable fractional digits (up to nanoseconds, which
+# datetime cannot hold) and either Z or a numeric offset.
+RFC3339 = re.compile(
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})\Z", re.IGNORECASE
+)
+
+
+def parse_instant(value: Any) -> datetime.datetime | None:
+    """Parse a log timestamp to an aware UTC instant, or None."""
+    if not isinstance(value, str):
+        return None
+    match = RFC3339.match(value.strip())
+    if match is None:
+        return None
+    base, fraction, zone = match.groups()
+    micros = (fraction or "")[:6].ljust(6, "0")
+    zone = "+00:00" if zone.upper() == "Z" else zone
+    try:
+        instant = datetime.datetime.fromisoformat(f"{base}.{micros}{zone}")
+    except ValueError:
+        return None
+    return instant.astimezone(datetime.timezone.utc)
+
 
 LAST_LANE = re.compile(r"last lane failed \((.*)\): ")
 
@@ -91,16 +116,22 @@ def timeout_bucket(record: dict[str, Any]) -> tuple[str, str | None]:
     failures = counter(record, "lane_replacement_failures")
     if attempts is None or failures is None:
         return OLD_CLIENT, None
-    if attempts == 0:
-        return POOL_NEVER_REBUILT, None
+    # The invariant comes first: attempts=0 with failures=1 is a counter bug,
+    # not a flow that tried nothing.
     if failures > attempts:
         return INCONSISTENT, None
+    if attempts == 0:
+        return NO_ATTEMPT, None
     if attempts == failures:
         kind = record.get("lane_replacement_last_failure")
         if kind not in FAILURE_KINDS:
             kind = "unrecorded" if kind is None else "other"
         return HANDSHAKE_NOT_CARRIED, kind
     return DIAL_OUTSTANDING, None
+
+
+def iso(instant: datetime.datetime) -> str:
+    return instant.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def flow_key(record: dict[str, Any]) -> tuple[str, str] | None:
@@ -116,7 +147,8 @@ class Split:
         self.client_complete = 0
         self.client_failed = 0
         self.ignored_server_records = 0
-        self.times: list[str] = []
+        self.first: datetime.datetime | None = None
+        self.last: datetime.datetime | None = None
         self.buckets: Counter = Counter()
         self.handshake_kinds: Counter = Counter()
         self.deaths: dict[str, Counter] = defaultdict(Counter)
@@ -133,11 +165,15 @@ class Split:
             return
         if record.get("role") == "server":
             # A gateway log passed as a client log would make every flow look
-            # like "pool never rebuilt". Refuse to count it.
+            # like "no zero-lane replacement attempted". Refuse to count it.
             self.ignored_server_records += 1
             return
-        if isinstance(record.get("time"), str):
-            self.times.append(record["time"])
+        instant = parse_instant(record.get("time"))
+        if instant is not None:
+            if self.first is None or instant < self.first:
+                self.first = instant
+            if self.last is None or instant > self.last:
+                self.last = instant
         if msg == CLIENT_COMPLETE:
             self.client_complete += 1
             return
@@ -201,7 +237,8 @@ class Split:
 
     def report(self, with_gateway: bool) -> dict[str, Any]:
         result: dict[str, Any] = {
-            "window": {"first": min(self.times), "last": max(self.times)} if self.times else None,
+            "window": ({"first": iso(self.first), "last": iso(self.last)}
+                       if self.first is not None and self.last is not None else None),
             "client_flows": {"complete": self.client_complete, "failed": self.client_failed},
             "lane_replacement_timeout_by_lanes_joined": dict(self.timeouts_joined),
             "buckets": {b: self.buckets[b] for b in BUCKETS},

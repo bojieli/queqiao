@@ -104,7 +104,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
     def test_buckets(self):
         report = self.report()
         self.assertEqual(report["buckets"], {
-            MODULE.POOL_NEVER_REBUILT: 2,
+            MODULE.NO_ATTEMPT: 2,
             MODULE.HANDSHAKE_NOT_CARRIED: 5,
             MODULE.DIAL_OUTSTANDING: 1,
             MODULE.OLD_CLIENT: 2,
@@ -118,7 +118,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
         self.assertEqual(report["skipped_lines"], {"not json": 1, "not an object": 1})
 
     def test_missing_counters_are_not_read_as_zero(self):
-        # An old client must never land in "pool never rebuilt".
+        # An old client must never land in "no zero-lane replacement attempted".
         bucket, _ = MODULE.timeout_bucket({"lanes_joined": 1})
         self.assertEqual(bucket, MODULE.OLD_CLIENT)
         bucket, _ = MODULE.timeout_bucket({"lane_replacement_attempts": 0, "lane_replacement_failures": True})
@@ -127,6 +127,23 @@ class LaneReplacementSplitTests(unittest.TestCase):
     def test_failures_above_attempts_is_flagged(self):
         bucket, _ = MODULE.timeout_bucket({"lane_replacement_attempts": 1, "lane_replacement_failures": 2})
         self.assertEqual(bucket, MODULE.INCONSISTENT)
+        # Checked before the zero-attempt bucket, which it would otherwise hide in.
+        bucket, _ = MODULE.timeout_bucket({"lane_replacement_attempts": 0, "lane_replacement_failures": 1})
+        self.assertEqual(bucket, MODULE.INCONSISTENT)
+
+    def test_window_uses_instants_not_strings(self):
+        split = MODULE.Split()
+        for flow_id, stamp in enumerate([
+            "2026-11-20T10:00:00.5Z",              # 10:00:00.5 UTC
+            "2026-11-20T18:00:00.123456789+08:00",  # 10:00:00.123 UTC, earliest
+            "2026-11-20T05:00:01-05:00",           # 10:00:01 UTC, latest
+            "not a time",
+        ]):
+            split.add_client(client_failure(flow_id, SILENT, time=stamp))
+        self.assertEqual(split.report(False)["window"], {
+            "first": "2026-11-20T10:00:00.123456Z", "last": "2026-11-20T10:00:01.000000Z",
+        })
+        self.assertIsNone(MODULE.Split().report(False)["window"])
 
     def test_other_terminal_errors_counted_separately(self):
         report = self.report()
@@ -138,7 +155,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
 
     def test_last_lane_death_per_bucket(self):
         deaths = self.report()["last_lane_death"]
-        self.assertEqual(deaths[MODULE.POOL_NEVER_REBUILT], {"EOF": 1, "no recent network activity": 1})
+        self.assertEqual(deaths[MODULE.NO_ATTEMPT], {"EOF": 1, "no recent network activity": 1})
         self.assertEqual(deaths[MODULE.HANDSHAKE_NOT_CARRIED], {"EOF": 2, "no recent network activity": 3})
         self.assertEqual(MODULE.last_lane_death("last lane failed (read tcp: unexpected EOF): x"), "EOF")
         self.assertEqual(MODULE.last_lane_death("last lane failed (connection reset): x"), "other")
@@ -147,7 +164,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
         gateway = self.report()["gateway"]
         self.assertEqual(gateway["failure_records"], 2)
         joined = gateway["joined_by_session_and_flow"]
-        self.assertEqual(joined[MODULE.POOL_NEVER_REBUILT], {
+        self.assertEqual(joined[MODULE.NO_ATTEMPT], {
             "gateway failed, last lane: no recent network activity": 1, "no gateway failure record": 1,
         })
         self.assertEqual(joined[MODULE.HANDSHAKE_NOT_CARRIED], {
@@ -174,7 +191,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             self.assertEqual(MODULE.main([self.client, "--gateway", self.gateway]), 0)
         text = out.getvalue()
-        self.assertIn("pool never rebuilt (attempts == 0)", text)
+        self.assertIn("no zero-lane replacement attempted (attempts == 0)", text)
         self.assertIn("last_failure=peer_rejected", text)
         self.assertIn("unknown_session", text)
 
@@ -183,7 +200,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
             self.assertEqual(MODULE.main([self.client, "--json"]), 0)
         report = json.loads(out.getvalue())
         self.assertNotIn("gateway", report)
-        self.assertEqual(report["buckets"][MODULE.POOL_NEVER_REBUILT], 2)
+        self.assertEqual(report["buckets"][MODULE.NO_ATTEMPT], 2)
 
 
 if __name__ == "__main__":
