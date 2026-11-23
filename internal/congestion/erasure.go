@@ -157,6 +157,10 @@ type ErasureSender struct {
 	// poolAboveSince is when the pool's erasure last rose significantly above
 	// the floor, zero while it is not; see rebaseFloor.
 	poolAboveSince monotime.Time
+	// rampBurst is the pool's measured burst factor when this lane joined,
+	// and lastGate when the gate last ran; see aboveTheFloor and rebaseFloor.
+	rampBurst float64
+	lastGate  monotime.Time
 }
 
 type packetOutcome struct {
@@ -283,6 +287,7 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 			e.ramping.Store(true)
 			e.joined = true
 			e.rampFloor, e.rampFloorN = state.Erasure, state.ErasureSamples
+			e.rampBurst = math.Max(state.BurstFactor, 1)
 			// The compensation gate judges each step by whether delivery rose
 			// since the last one. Its baseline starts at zero, and the seeded
 			// estimate is above zero without this lane having delivered
@@ -449,7 +454,15 @@ func (e *ErasureSender) lossAboveFloor(arrived, lost uint64) bool {
 // aboveTheFloor is the two-proportion test of a loss rate measured over
 // samples packets against the floor this lane joined with.
 func (e *ErasureSender) aboveTheFloor(loss, samples float64) bool {
-	if samples < rampLossSamples || e.rampFloorN < rampLossSamples {
+	// Losses that arrive in runs are fewer independent trials than packets:
+	// a channel whose erasures come in runs of b gives about n/b of them, and
+	// a single 30-packet burst in a 100-packet round on a 15% floor would
+	// otherwise read as overflow. Both sides are deflated by the burst factor
+	// the pool had measured.
+	burst := math.Max(e.rampBurst, 1)
+	samples /= burst
+	floorN := e.rampFloorN / burst
+	if samples < rampLossSamples/burst || floorN < rampLossSamples/burst {
 		return false
 	}
 	// The normal approximation behind the test says nothing about a handful
@@ -458,8 +471,8 @@ func (e *ErasureSender) aboveTheFloor(loss, samples float64) bool {
 	if (loss-e.rampFloor)*samples < rampLossDeviations {
 		return false
 	}
-	pooled := (loss*samples + e.rampFloor*e.rampFloorN) / (samples + e.rampFloorN)
-	deviation := math.Sqrt(pooled * (1 - pooled) * (1/samples + 1/e.rampFloorN))
+	pooled := (loss*samples + e.rampFloor*floorN) / (samples + floorN)
+	deviation := math.Sqrt(pooled * (1 - pooled) * (1/samples + 1/floorN))
 	return loss-e.rampFloor > rampLossDeviations*deviation
 }
 
@@ -479,8 +492,17 @@ func (e *ErasureSender) poolAboveFloor() bool {
 // has changed, and the lane takes the pool's current figure as its floor and
 // earns compensation against it as any lane does.
 func (e *ErasureSender) rebaseFloor(now monotime.Time) {
-	if !e.poolAboveFloor() {
+	// The window has to be observed, not merely elapsed: a lane that saw the
+	// overflow once and then went quiet has no evidence about the interval it
+	// did not watch, and the estimator, which forgets by packets rather than
+	// by time, would hand it the same figure when it woke.
+	gap := !e.lastGate.IsZero() && now.Sub(e.lastGate) > rebaseGap
+	e.lastGate = now
+	if gap || !e.poolAboveFloor() {
 		e.poolAboveSince = 0
+		if gap && e.poolAboveFloor() {
+			e.poolAboveSince = now
+		}
 		return
 	}
 	if e.poolAboveSince == 0 {
@@ -490,6 +512,7 @@ func (e *ErasureSender) rebaseFloor(now monotime.Time) {
 	if now.Sub(e.poolAboveSince) >= floorRebaseAfter {
 		e.rampFloor = float64(e.erasure.Load()) / partsPerMillion
 		e.rampFloorN = e.poolSamples
+		e.rampBurst = math.Max(e.rampBurst, 1)
 		e.poolAboveSince = 0
 	}
 }
@@ -498,6 +521,10 @@ func (e *ErasureSender) rebaseFloor(now monotime.Time) {
 // (pathmodel.bottleneckWindow): the longest a share sized from an overshoot
 // can outlive it.
 const floorRebaseAfter = 10 * time.Second
+
+// rebaseGap is the longest the gate may go without running and still count
+// the time as observed.
+const rebaseGap = time.Second
 
 // endRamp hands the lane to its share, and its controller out of startup.
 //
@@ -901,6 +928,9 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		state := e.path.Report(e.id(), pathmodel.Observation{
 			Erasure: snapshot.Loss, BurstFactor: snapshot.BurstFactor,
 			ObservedSamples: float64(snapshot.Decided),
+			// What the loss figure rests on: the estimator forgets, so this
+			// stops growing where Decided does not.
+			ErasureSamples: snapshot.Samples,
 			// Only what this lane has measured itself. The estimate also
 			// holds the seed, which came from this pool; reporting it would
 			// count the pool's own figure as fresh delivery, and joins inside

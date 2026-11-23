@@ -375,8 +375,12 @@ of:
 - a round losing more than the erasure the pool had measured when the lane
   joined, by three standard deviations of the two-proportion test between
   them (`lossAboveFloor`) and by at least three packets. The floor's weight
-  is `State.ErasureSamples`, the outcomes behind the current erasure, not the
-  high-water mark `ObservedSamples`, which can belong to an expired member. Both are estimates:
+  is `State.ErasureSamples`: the outcomes the current erasure rests on, from
+  each estimator's effective (forgetting) count and carried through a
+  `Chain` from the node that supplies the erasure -- not the lifetime
+  high-water mark `ObservedSamples`, which can belong to an expired member
+  and grows without bound. Both sides are deflated by the pool's burst
+  factor, since losses in runs of b are about n/b independent trials; Both are estimates:
   a pool that has decided ten packets reports a floor of zero with nothing
   behind it, and against a fixed zero one ordinary loss would read as
   significant. Rounds, or floors, resting on fewer than 64 packets are not
@@ -414,6 +418,8 @@ only while the lanes overdrive, and the shares that let them are sized from a
 ten-second bottleneck window, so a pool still above the floor a whole window
 later is a path whose erasure changed, and the lane re-bases its floor on the
 pool's current erasure and earns compensation against it as any lane does.
+The window must be watched, not merely elapse: a gap of more than a second
+between the lane's own events restarts it.
 
 **Simulated.** `internal/congestion/joinburst_sim_test.go` runs the real
 `ErasureSender`, its own pacer, and the real `PathModel` against a

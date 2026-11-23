@@ -625,3 +625,39 @@ func TestAJoinedLanesFloorFollowsAPathWhoseErasureRose(t *testing.T) {
 		t.Fatal("against the rebased floor, a round that delivered more was refused compensation")
 	}
 }
+
+// Erasure that arrives in runs is fewer independent trials than packets. A
+// 30-packet run in a 100-packet round on a 15% floor is a burst, not
+// overflow, on a pool that measured its losses arriving in runs of four.
+func TestABurstOfErasureOnABurstyFloorDoesNotEndARamp(t *testing.T) {
+	for _, tc := range []struct {
+		burst   float64
+		ramping bool
+	}{{1, false}, {4, true}} {
+		probe := joiningProbe()
+		probe.BurstFactor = tc.burst
+		sender := NewErasureSenderOn(1200, probe)
+		closeRound(sender, 70, 30)
+		if got := sender.ramping.Load(); got != tc.ramping {
+			t.Errorf("30 of 100 lost on a 0.15 floor with burst factor %.0f: ramping %v, want %v", tc.burst, got, tc.ramping)
+		}
+	}
+}
+
+// The window before a floor is rebased has to be watched. A lane that saw
+// the pool above its floor and then went quiet for longer than the window
+// has no evidence about it, and must start the interval again.
+func TestAnIdleGapDoesNotRebaseTheFloor(t *testing.T) {
+	probe := joiningProbe()
+	probe.Erasure = 0.05
+	sender := NewErasureSenderOn(1200, probe)
+	sender.endRamp()
+	sender.poolSamples = 5000
+	sender.erasure.Store(uint64(0.30 * partsPerMillion))
+	start := base()
+	sender.rampGate(start, nil, nil)
+	sender.rampGate(start.Add(floorRebaseAfter+time.Second), nil, nil)
+	if got := sender.rampFloor; got != 0.05 {
+		t.Fatalf("one observation either side of an idle gap rebased the floor to %.3f", got)
+	}
+}

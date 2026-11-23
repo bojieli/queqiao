@@ -198,8 +198,11 @@ func (c *Chain) Current() State {
 func combine(states []State) State {
 	var out State
 	for _, s := range states {
-		if s.Erasure > out.Erasure {
-			out.Erasure = s.Erasure
+		// The samples behind the erasure travel with it, from whichever node
+		// supplies it; among equal figures, including a measured clean
+		// floor, the best-measured one.
+		if s.Erasure > out.Erasure || (s.Erasure == out.Erasure && s.ErasureSamples > out.ErasureSamples) {
+			out.Erasure, out.ErasureSamples = s.Erasure, s.ErasureSamples
 		}
 		if s.BurstFactor > out.BurstFactor {
 			out.BurstFactor = s.BurstFactor

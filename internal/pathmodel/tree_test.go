@@ -542,3 +542,28 @@ func TestRegroupingIsRateLimited(t *testing.T) {
 		t.Error("a merge happened inside the rate limit")
 	}
 }
+
+// The samples behind the erasure travel with it through the chain, from the
+// node that supplies it, a measured clean floor included. Dropping them gave
+// every joiner on a hierarchical path a floor weighted by nothing.
+func TestCombineCarriesTheSamplesBehindTheErasure(t *testing.T) {
+	out := combine([]State{
+		{Erasure: 0.10, ErasureSamples: 300},
+		{Erasure: 0.20, ErasureSamples: 8000},
+		{Erasure: 0.05, ErasureSamples: 90000},
+	})
+	if out.Erasure != 0.20 || out.ErasureSamples != 8000 {
+		t.Errorf("combined erasure %.2f on %.0f samples, want 0.20 on 8000", out.Erasure, out.ErasureSamples)
+	}
+	clean := combine([]State{{ErasureSamples: 50}, {ErasureSamples: 6000}})
+	if clean.Erasure != 0 || clean.ErasureSamples != 6000 {
+		t.Errorf("a measured clean floor combined to %.2f on %.0f samples, want 0 on 6000", clean.Erasure, clean.ErasureSamples)
+	}
+
+	ResetTree()
+	chain := SharedChain(Key{Dest: "peer-samples"})
+	state := chain.Report(1, Observation{Erasure: 0.15, BurstFactor: 1, ObservedSamples: 1e6, ErasureSamples: 8000, Delivered: 1e6})
+	if state.ErasureSamples != 8000 {
+		t.Errorf("through a chain the erasure rests on %.0f samples, want 8000", state.ErasureSamples)
+	}
+}

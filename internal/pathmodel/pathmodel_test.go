@@ -303,3 +303,13 @@ func TestErasureSamplesAreTheOnesBehindTheCurrentEstimate(t *testing.T) {
 		t.Fatalf("Members reads the model's clock: %d, want 1", got)
 	}
 }
+
+// An estimator that forgets rests its figure on fewer outcomes than it has
+// ever decided; the pool reports the former.
+func TestErasureSamplesAreTheEstimatorsEffectiveCount(t *testing.T) {
+	m := NewPathModel()
+	state := m.Report(1, Observation{Erasure: 0.15, BurstFactor: 1, ObservedSamples: 2e6, ErasureSamples: 8000, Delivered: 1e6})
+	if state.ErasureSamples != 8000 || state.ObservedSamples != 2e6 {
+		t.Fatalf("erasure samples %.0f, observed %.0f; want 8000 and 2000000", state.ErasureSamples, state.ObservedSamples)
+	}
+}

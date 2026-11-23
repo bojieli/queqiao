@@ -118,6 +118,7 @@ type report struct {
 	erasure   float64
 	burst     float64
 	observed  float64
+	effective float64
 	delivered float64
 	arrival   float64
 	roundTrip time.Duration
@@ -145,6 +146,11 @@ type Observation struct {
 	// still unknown, which is what distinguishes a measured clean path from an
 	// unmeasured one.
 	ObservedSamples float64
+	// ErasureSamples is how many outcomes Erasure itself rests on, which for
+	// an estimator that forgets is fewer than ObservedSamples: it stops
+	// growing at the estimator's memory. Zero means the same as
+	// ObservedSamples.
+	ErasureSamples float64
 	// Delivered is this contributor's delivered rate in bytes per second, and
 	// RoundTrip the smallest round trip it has seen. Delivered must be what it
 	// measured, not a rate it was seeded with: the pool sums it into the
@@ -173,9 +179,10 @@ type State struct {
 	// without giving an untrusted zero any weight in Floor.
 	ObservedSamples float64
 	// ErasureSamples is how many packet outcomes stand behind Erasure itself:
-	// the live contributors' when any has measured, or those behind the
-	// remembered value. ObservedSamples is a high-water mark and can belong to
-	// a member that has since expired.
+	// the live contributors' effective counts (Observation.ErasureSamples)
+	// when any has measured, or those behind the remembered value.
+	// ObservedSamples is a lifetime high-water mark and can belong to a member
+	// that has since expired.
 	ErasureSamples float64
 	// Share is this contributor's allowance of the bottleneck in bytes per
 	// second. Zero means the contributor must not cap itself -- either because
@@ -280,6 +287,10 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	}
 	entry.erasure, entry.burst = o.Erasure, o.BurstFactor
 	entry.observed, entry.delivered, entry.at = o.ObservedSamples, o.Delivered, now
+	entry.effective = o.ErasureSamples
+	if entry.effective <= 0 || entry.effective > o.ObservedSamples {
+		entry.effective = o.ObservedSamples
+	}
 	if o.Arrival > 0 {
 		entry.arrival = o.Arrival
 	}
@@ -288,7 +299,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	}
 
 	var state State
-	var observed, sum float64
+	var observed, effective, sum float64
 	var erasureWeighted, burstWeighted float64
 	var arrival arrivalPool
 	live := 0
@@ -305,6 +316,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		erasureWeighted += other.erasure * other.observed
 		burstWeighted += other.burst * other.observed
 		observed += other.observed
+		effective += other.effective
 		if other.roundTrip > 0 && (state.RoundTrip == 0 || other.roundTrip < state.RoundTrip) {
 			state.RoundTrip = other.roundTrip
 		}
@@ -313,8 +325,8 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		state.Erasure = erasureWeighted / observed
 		state.BurstFactor = burstWeighted / observed
 		m.knowledge.erasure, m.knowledge.burst = state.Erasure, state.BurstFactor
-		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, observed
-		state.ErasureSamples = observed
+		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, effective
+		state.ErasureSamples = effective
 	} else if m.knowledge.erasureKnown {
 		state.Erasure, state.BurstFactor = m.knowledge.erasure, m.knowledge.burst
 		state.ErasureSamples = m.knowledge.erasureSamples
@@ -385,7 +397,7 @@ func (m *PathModel) Current() State {
 	now := m.clock()
 	m.expireKnowledgeLocked(now)
 	var state State
-	var observed, bottleneck float64
+	var observed, effective, bottleneck float64
 	var erasureWeighted, burstWeighted float64
 	var arrival arrivalPool
 	live := 0
@@ -399,6 +411,7 @@ func (m *PathModel) Current() State {
 		erasureWeighted += entry.erasure * entry.observed
 		burstWeighted += entry.burst * entry.observed
 		observed += entry.observed
+		effective += entry.effective
 		if entry.roundTrip > 0 && (state.RoundTrip == 0 || entry.roundTrip < state.RoundTrip) {
 			state.RoundTrip = entry.roundTrip
 		}
@@ -407,8 +420,8 @@ func (m *PathModel) Current() State {
 		state.Erasure = erasureWeighted / observed
 		state.BurstFactor = burstWeighted / observed
 		m.knowledge.erasure, m.knowledge.burst = state.Erasure, state.BurstFactor
-		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, observed
-		state.ErasureSamples = observed
+		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, effective
+		state.ErasureSamples = effective
 	} else if m.knowledge.erasureKnown {
 		state.Erasure, state.BurstFactor = m.knowledge.erasure, m.knowledge.burst
 		state.ErasureSamples = m.knowledge.erasureSamples
