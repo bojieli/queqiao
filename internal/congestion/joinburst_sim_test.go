@@ -673,20 +673,34 @@ func TestAnIdleGapDoesNotRebaseTheFloor(t *testing.T) {
 	}
 }
 
-// Only a lane that reached its share has found a full pipe. One that ends its
-// ramp well below the share stays in startup, held by the share as before.
-func TestARampEndedBelowItsShareStaysInStartup(t *testing.T) {
-	for _, tc := range []struct {
-		share float64
-		left  bool
-	}{{1.25e6, true}, {5e6, false}} {
-		probe := joiningProbe()
-		probe.Share = tc.share
-		sender := NewErasureSenderOn(1200, probe)
-		sender.endRamp()
-		if got := sender.inner.fullBandwidth; got != tc.left {
-			t.Errorf("a lane at 1e6 with a %.2g share left startup: %v, want %v", tc.share, got, tc.left)
-		}
+// While a lane ramps, the ramp decides the full pipe. Startup's own loss exit
+// would end it on ordinary erasure: on a 23% channel every round has more
+// than the 2% and eight loss events it looks for.
+func TestStartupDoesNotEndOnErasureWhileRamping(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	if !sender.inner.startupHeld {
+		t.Fatal("a ramping lane's startup is not held")
+	}
+	sender.inner.lossEventsInRound, sender.inner.bytesLostInRound = 20, 1e6
+	sender.inner.checkFullBandwidth(tuicSendState{valid: true, bytesInFlight: 1e6})
+	if sender.inner.fullBandwidth {
+		t.Fatal("startup's loss exit ended a ramping lane's startup")
+	}
+	sender.endRamp()
+	if sender.inner.startupHeld {
+		t.Fatal("the ramp ended and startup is still held")
+	}
+}
+
+// A lane joining behind a standing queue measures its own minimum inside it,
+// so the ramp judges the queue against the pool's minimum as well.
+func TestARampSeesAQueueThatPredatesTheJoin(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	sender.inner.minRTT = 300 * time.Millisecond
+	sender.SetRTTStatsProvider(&fixedRTT{min: 300 * time.Millisecond, smoothed: 300 * time.Millisecond})
+	ackEvent(sender)
+	if sender.ramping.Load() {
+		t.Fatalf("a lane whose every sample sat %v above the pool's %v minimum is still ramping", 100*time.Millisecond, joiningRoundTrip)
 	}
 }
 

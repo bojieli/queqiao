@@ -161,7 +161,10 @@ type ErasureSender struct {
 	// and lastGate when the gate last ran; see aboveTheFloor and rebaseFloor.
 	rampBurst float64
 	poolBurst float64
-	lastGate  monotime.Time
+	// rampBaseRTT is the pool's minimum round trip when this lane joined:
+	// the baseline a queue that predates the lane is measured against.
+	rampBaseRTT time.Duration
+	lastGate    monotime.Time
 }
 
 type packetOutcome struct {
@@ -286,6 +289,8 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 			// rate from it; see rampGate. Its loss is judged against the
 			// erasure the pool had measured, when the pool had measured any.
 			e.ramping.Store(true)
+			e.inner.startupHeld = true
+			e.rampBaseRTT = state.RoundTrip
 			e.joined = true
 			e.rampFloor, e.rampFloorN = state.Erasure, state.ErasureSamples
 			e.rampBurst = math.Max(state.ErasureBurst, 1)
@@ -387,7 +392,7 @@ func (e *ErasureSender) rampGate(now monotime.Time, acked []quiccongestion.Acked
 	if !e.joined {
 		return
 	}
-	if queue, minRTT := e.queueDelay(); e.ramping.Load() && minRTT > 0 && queue*rampQueueFraction >= minRTT {
+	if queue, base := e.rampQueue(); e.ramping.Load() && base > 0 && queue*rampQueueFraction >= base {
 		e.endRamp()
 	}
 	// Judge the round that has just closed, once per round. The inner round
@@ -538,28 +543,39 @@ const rebaseGap = time.Second
 // endRamp hands the lane to its share, and its controller out of startup.
 //
 // The ramp is this lane's startup, and its end is the full pipe BBR's startup
-// is looking for. The inner controller cannot find that for itself here: a
-// lane held below its window by a share looks application-limited at every
-// acknowledgement, and startup's own exit tests skip application-limited
-// rounds, so a lane that has ever been capped stays in startup for life,
-// pacing at the startup gain over whatever it last measured. Its share is
-// then its only bound, and a share sized from the summed peaks of a burst of
-// lanes can be well above the path: simulated on a shallow-buffer path, that
-// held the bottleneck at twice its rate for the rest of the transfer.
-//
-// But only a lane that reached its share has found that pipe. One that ends
-// its ramp below it -- on the loss of a startup burst it shared with its
-// siblings, say -- is handed a share above what it delivers, and taking it
-// out of startup there leaves it to grow at ProbeBW's quarter per eight
-// rounds. Measured live, such a lane ended its ramp at 0.2 MB/s and carried a
-// flow's tail at 0.8 MB/s beside a 5 MB/s share for ten seconds. It stays in
-// startup, held by its share, as it would have been before the ramp existed.
+// is looking for: a queue, loss above the floor, or delivery that stopped
+// following. The inner controller cannot find that for itself here, for two
+// opposite reasons. While the lane ramps, its own exit would fire on the
+// wrong signal -- startup leaves at 2% loss, which an erasure channel exceeds
+// every round -- so it is held (TUICBBRSender.startupHeld): measured live,
+// lanes left startup on ordinary erasure at a fraction of their share and
+// crawled in ProbeBW. And once the share caps a lane it looks
+// application-limited at every acknowledgement, and startup's exit tests skip
+// those rounds, so it would never leave: pacing at the startup gain over its
+// last estimate, with a share sized from the summed peaks of a burst of lanes
+// as its only bound -- simulated on a shallow-buffer path, that held the
+// bottleneck dropping a third of what was sent.
 func (e *ErasureSender) endRamp() {
 	e.ramping.Store(false)
-	share := float64(e.share.Load())
-	if share > 0 && float64(e.inner.estimator.estimate())*rampGrowth >= share {
-		e.inner.fullBandwidth = true
+	e.inner.startupHeld = false
+	e.inner.fullBandwidth = true
+}
+
+// rampQueue is the queue the ramp judges: the smoothed round trip over the
+// smaller of this lane's minimum and the pool's at join. A lane joining
+// behind a standing queue measures its own minimum inside it.
+func (e *ErasureSender) rampQueue() (queue, base time.Duration) {
+	base = e.inner.minRoundTrip()
+	if e.rampBaseRTT > 0 && (base <= 0 || e.rampBaseRTT < base) {
+		base = e.rampBaseRTT
 	}
+	if base <= 0 || e.rttStats == nil || e.rttStats.SmoothedRTT() <= 0 {
+		return 0, 0
+	}
+	if smoothed := e.rttStats.SmoothedRTT(); smoothed > base {
+		return smoothed - base, base
+	}
+	return 0, base
 }
 
 // bandwidth is the rate to put on the wire: what arrives, divided by the
