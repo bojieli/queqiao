@@ -63,12 +63,20 @@ const (
 	// that has just proved hostile enough to kill a lane.
 	laneRescueHandshake = 30 * time.Second
 	// laneReplacementWait is the whole budget a flow spends with no healthy
-	// lane before it gives up. It is spent per outage rather than per wait:
-	// several call sites wait for the same missing lane, and each used to
-	// start its own copy of this grace, so a flow that was never going to be
-	// rescued burned the budget once per waiter. On the live gateway that was
-	// visible as failures clustered at 76-106 s -- two graces, not one -- for
-	// flows that had done their work in the first second. See issue #53.
+	// lane before it gives up. It is the sum of the two halves above because
+	// a replacement can only arrive after the peer has reached the same
+	// dead-lane conclusion this endpoint has -- up to one detection budget
+	// later, since the two ends notice silence independently -- and then
+	// completed a handshake on the path that killed the lane. A grace shorter
+	// than that gives up on rescues that were still on their way.
+	//
+	// It is spent per outage rather than per wait: several call sites wait
+	// for the same missing lane, and a grace per waiter would make the flow's
+	// real willingness to wait depend on how many writers happened to be
+	// blocked. Bounding it per outage is about that tail, not about what most
+	// lane-replacement-timeout failures are: re-measured on the gateway (issue
+	// #53), failing flows time out once and spend one grace, and most never
+	// have a replacement lane admitted at all.
 	laneReplacementWait = laneDeadPathDetection + laneRescueHandshake
 	// Once both FIN directions are observed, no additional application bytes
 	// can be delivered. This grace lets a healthy final ACK arrive, but bounds
@@ -2334,27 +2342,39 @@ func (f *multipathFlow) replacementLogFields() []any {
 // replacement lane for a flow that has none. It is counted at the point the
 // dial starts rather than when it finishes, because a dial that never returns
 // is exactly the case the count exists to make visible.
-func (f *multipathFlow) noteReplacementAttempt() { f.replacementAttempts.Add(1) }
+//
+// It returns the attempt's ordinal, which is what the client's per-attempt log
+// lines carry as `attempt`: the last one logged for a flow equals the
+// `lane_replacement_attempts` on its completion record.
+func (f *multipathFlow) noteReplacementAttempt() uint64 { return f.replacementAttempts.Add(1) }
 
 // noteReplacementFailure records that one such attempt did not produce a lane.
 // A non-failed attempt may have succeeded or may still be in flight when
 // the flow record is emitted. The peer's refusal is also a returned error.
 func (f *multipathFlow) noteReplacementFailure(err error) {
-	kind := "other"
-	switch {
-	case errors.Is(err, errLaneJoinRejected):
-		kind = "peer_rejected"
-	case errors.Is(err, errLaneJoinCapacity):
-		kind = "peer_capacity"
-	case errors.Is(err, context.Canceled):
-		kind = "canceled"
-	case pooledTransportTimedOut(err):
-		kind = "timeout"
-	}
+	kind := replacementFailureKind(err)
 	f.replacementFailureMu.Lock()
 	f.replacementFailures++
 	f.replacementLastFailure = kind
 	f.replacementFailureMu.Unlock()
+}
+
+// replacementFailureKind is the closed set of categories a failed replacement
+// is reported under, both in `lane_replacement_last_failure` and as
+// `failure_kind` on the per-attempt client log lines. Sharing one function is
+// what lets a log line and a completion record be counted against each other.
+func replacementFailureKind(err error) string {
+	switch {
+	case errors.Is(err, errLaneJoinRejected):
+		return "peer_rejected"
+	case errors.Is(err, errLaneJoinCapacity):
+		return "peer_capacity"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case pooledTransportTimedOut(err):
+		return "timeout"
+	}
+	return "other"
 }
 
 // replacementDiagnostics reports what this flow's lane replacements did, for

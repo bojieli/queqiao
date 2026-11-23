@@ -175,8 +175,17 @@ which may race several JOINs. TCP counts each replacement it launches. A round
 that returns an error increments failures. A difference between attempts and
 failures can therefore be a successful replacement or an outstanding attempt
 at the time the flow record was written. These counters exclude bundle
-widening and rescue of a suspected lane that is still open. The gateway does
-not initiate replacements.
+widening and rescue of a suspected lane that is still open.
+
+These two counters, and `lane_replacement_last_failure`, are client-only in
+meaning. The gateway never opens a replacement lane, so its
+`remote flow ended with error` and `remote flow complete` records always carry
+`lane_replacement_attempts=0` and `lane_replacement_failures=0`. The fields are
+written there so both endpoints share one schema, and a gateway's zero says
+nothing about whether the client tried. Do not bucket gateway records by them:
+a gateway-side split puts every failure in "nothing was attempted". The
+gateway's own fields (`lane_replacement_waits`, `_timeouts`, `_wait`,
+`lanes_joined`) do describe the gateway's side of the outage.
 
 When a client has recorded a failed zero-lane recovery, its flow completion
 record includes `lane_replacement_last_failure`. The value classifies the last
@@ -206,11 +215,60 @@ jq -nr '
 ' client.jsonl
 ```
 
-Correlate the original client records with `lane recovery unavailable` by
-`flow_id` and time window. An error can be a timeout, dial failure, or peer
-refusal; the counts alone do not identify a keepalive or path failure.
-Record build IDs, window duration, and total completed and failed flows
-alongside the groups before comparing windows.
+Correlate the original client records with the per-attempt lines by
+`flow_id` and time window. A QUIC zero-lane recovery round that returns an
+error writes `msg="lane recovery unavailable"`; a TCP replacement join that
+fails writes `msg="TCP bundle lane unavailable"`. Both carry `flow_id`,
+`attempt`, and `failure_kind`, which uses the same categories as
+`lane_replacement_last_failure`. `attempt` is the flow's replacement ordinal,
+so the highest one logged for a flow is at most its
+`lane_replacement_attempts`. The TCP line also carries `replacement`: a join
+that widened a healthy bundle has `replacement=false` and no `attempt`, and is
+not counted in the flow record. A QUIC round that ran out of time
+(`failure_kind=timeout` from a context deadline) is written at `info`, other
+failures at `warn`. A round cancelled because the flow ended is not written,
+and any other cancellation is written only at `debug`. Clients before this
+change skipped deadline errors on the QUIC line entirely and wrote the TCP line
+without `flow_id`. An error can be a timeout, dial failure, or peer refusal;
+the counts alone do not identify a keepalive or path failure. Record build IDs,
+window duration, and total completed and failed flows alongside the groups
+before comparing windows.
+
+`scripts/lane_replacement_split.py` does the same selection with the finer
+split issue #53 needs, and also reads gateway logs for context. It needs only
+Python 3 and reads rotated files in any order:
+
+```sh
+./scripts/lane_replacement_split.py client.jsonl client.jsonl.1 \
+    --gateway server.jsonl --gateway server.jsonl.1    # add --json for a machine-readable report
+```
+
+It selects `local flow ended with error` records whose error contains
+`lane replacement timeout` and whose `lanes_joined` is 1, and buckets them:
+
+- `pool never rebuilt (attempts == 0)`: the client dialled nothing.
+- `every attempt failed (attempts == failures)`, sub-split by
+  `lane_replacement_last_failure`. `timeout` is the path not carrying a
+  handshake. `peer_rejected` and `peer_capacity` are handshakes that completed
+  and were refused, and `canceled` and `other` need the per-attempt lines.
+- `attempt outstanding (attempts > failures)`: a dial had not returned when the
+  record was written. It is not a refusal.
+- `old client (fields missing)`: a record without the attempt counters or
+  without `lanes_joined`. Missing is never read as zero.
+- `inconsistent (failures > attempts)`: should be empty. Anything here is a bug
+  in the counters.
+
+It counts `no replacement lane will be attempted` and
+`peer does not hold this session` failures separately, at any `lanes_joined`.
+For every bucket it reports how the last lane died, taken from the
+`last lane failed (...)` part of the error: `EOF`, `no recent network
+activity`, `other`, or `unrecorded`. With `--gateway` it looks up each
+bucketed client failure's `remote flow ended with error` record by
+`session_id` and `flow_id`. It also tallies `lane join refused` records by
+`reason`. A refusal count is each record plus its `suppressed`, so a storm's
+tail after its last record is not included. The tool never uses the gateway's
+attempt counters. It ignores a client-message record written by
+`role=server`, and says so.
 
 `lane_replacement_waits` counts waiters, not graces. The flow's run loop, its
 frame and control writers, and its acknowledgement loop all wait for a missing
