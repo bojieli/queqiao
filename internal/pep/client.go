@@ -2635,6 +2635,13 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 	pending := 0
 	bundleFailures := 0
 	recoveryAttempts := 0
+	// stallRescues is the stall watchdog's budget, kept apart from the
+	// zero-lane one above. A rescue beside a lane that is still open is a
+	// different event from losing that lane: when they shared one counter, a
+	// flow rescued this many times in the reset window lost its last lane
+	// with nothing left to spend, and waited out its whole replacement grace
+	// without a single counted attempt (issue #53).
+	stallRescues := 0
 	var lastRecoveryAttempt time.Time
 	bundleDisabled := false
 	// bundleCapacityBlockedUntil pauses widening after the peer answers a
@@ -2692,11 +2699,11 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 				lanes[0].id != hint.id || !lanes[0].suspected.Load() || pending != 0 ||
 				flow.openConfirmationRequired.Load() || flow.localAbortSent.Load() ||
 				(flow.finSent.Load() && flow.remoteFinSeen.Load()) ||
-				recoveryAttempts >= maxLaneRecoveryAttempts || now.Before(nextAttempt) {
+				stallRescues >= maxLaneRecoveryAttempts || now.Before(nextAttempt) {
 				break
 			}
 			if launch(false, hint) {
-				recoveryAttempts++
+				stallRescues++
 				lastRecoveryAttempt = now
 				nextAttempt = now.Add(flow.stallThreshold())
 			}
@@ -2811,7 +2818,18 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 		snapshot := flow.snapshot()
 		healthy := tcpLaneCount(flow)
 		if healthy == 0 {
-			if pending != 0 || recoveryAttempts >= maxLaneRecoveryAttempts || now.Before(nextAttempt) {
+			if pending != 0 {
+				continue
+			}
+			if recoveryAttempts >= maxLaneRecoveryAttempts {
+				// As in manageQUICLanes: nothing below will open another
+				// lane, so say so and return. The deferred abandonment
+				// fails the flow now instead of leaving it to wait out a
+				// grace nothing will arrive during.
+				c.cfg.Logger.Info("lane recovery abandoned", "attempts", recoveryAttempts, "flow_id", flowID)
+				return
+			}
+			if now.Before(nextAttempt) {
 				continue
 			}
 			recoveryAttempts++
@@ -2822,8 +2840,9 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 		// An accept-then-close peer must not reset the replacement budget on
 		// every successful handshake. Only a lane that remains healthy for a
 		// sustained dwell proves recovery, matching the QUIC rescue policy.
-		if recoveryAttempts > 0 && !lastRecoveryAttempt.IsZero() && now.Sub(lastRecoveryAttempt) >= laneRecoveryResetAfter {
+		if (recoveryAttempts > 0 || stallRescues > 0) && !lastRecoveryAttempt.IsZero() && now.Sub(lastRecoveryAttempt) >= laneRecoveryResetAfter {
 			recoveryAttempts = 0
+			stallRescues = 0
 			lastRecoveryAttempt = time.Time{}
 		}
 		if flow.remoteFinSeen.Load() {
