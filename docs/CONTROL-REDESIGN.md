@@ -373,51 +373,78 @@ of:
 
 - a quarter round trip of queue (`SmoothedRTT >= 1.25 x minRTT`);
 - a round losing more than the erasure the pool had measured when the lane
-  joined, by more than three binomial standard deviations at that round's
-  packet count (rounds under 64 packets are not judged);
+  joined, by three standard deviations of the two-proportion test between
+  them (`lossAboveFloor`) and by at least three packets. Both are estimates:
+  a pool that has decided ten packets reports a floor of zero with nothing
+  behind it, and against a fixed zero one ordinary loss would read as
+  significant. Rounds, or floors, resting on fewer than 64 packets are not
+  judged;
 - three rounds without a quarter's growth in the delivery this lane measured
-  itself -- BBR's own full-pipe test, without the application-limited skip,
-  which is what catches a policer whose drops are already the floor.
+  itself, counting only rounds in which the window or the pacer held the lane
+  back -- BBR's own full-pipe test, minus the application-limited skip that
+  never let a capped lane leave startup, and minus the rounds in which a lane
+  carrying requests before its transfer was not probing anything. This is
+  what catches a policer whose drops are already the floor.
 
 When it ends, the lane takes its share and its controller leaves startup, as
-BBR would have at a full pipe. While it ramps, the compensation gate grants no
-increase: delivery is rising because the ramp raised the rate, so it is no
-evidence that compensation bought anything, and on a shallow buffer the
-overflow loss it would compensate is loss the ramp is causing. Nothing
-reported to the pool changes: `Delivered` is still only what the lane
-measured, so the seed and bottleneck stay honest. Only the cap moves. A lane
-that joins an empty model has no seed and no share, and behaves as before.
+BBR would have at a full pipe. Nothing reported to the pool changes:
+`Delivered` is still only what the lane measured, so the seed and bottleneck
+stay honest. Only the cap moves. A lane that joins an empty model has no seed
+and no share, and behaves as before.
+
+**Compensation.** The first simulation of the ramp found it filled the path
+and then held a shallow buffer dropping a third of what was sent, for the rest
+of the transfer. The ramp was not the cause; it was what let the lanes reach
+the regime in which the compensation gate fails. Overflow loss is pooled as
+erasure, the gate judges each step by a max filter that drifts up with noise,
+and it granted the overflow its compensation a step at a time, until the
+shares were paced at twice the path. So a joined lane is granted no increase
+in compensation while it ramps (delivery rises because the ramp raised the
+rate, which says nothing about the compensation), nor afterwards while its
+last round, or the pool's erasure, is significantly above the floor it joined
+with. The pool has to be read as well as the lane, because a shared tail-drop
+queue does not share its drops evenly: the lane that took its compensation
+from 0.85 to 0.43 lost at the floor itself while its siblings lost 35-50%.
+Reducing compensation is still immediate.
 
 **Simulated.** `internal/congestion/joinburst_sim_test.go` runs the real
-`ErasureSender` and `PathModel` against a packet-level bottleneck (finite FIFO
-buffer, seeded erasure after the queue, fixed propagation) on simulated time
-(`pathmodel.NewPathModelClocked`), so a run is identical on every machine.
-Four lanes join 20 ms apart beside one pool member delivering 60 kB/s. Goodput
-is a fraction of what the path delivers after erasure; caused loss is the
-fraction of sent packets the buffer dropped. 8 s runs, except where noted.
+`ErasureSender`, its own pacer, and the real `PathModel` against a
+packet-level bottleneck (finite FIFO buffer, seeded erasure after the queue,
+fixed propagation) on simulated time (`pathmodel.NewPathModelClocked`), so a
+run is identical on every machine. Four lanes join 20 ms apart beside one
+pool member delivering 60 kB/s. Goodput is a fraction of what the path
+delivers after erasure; caused loss is the fraction of sent packets the
+buffer or policer dropped. #146 is its own `erasure.go` under the same test.
+8 s runs, except where noted.
 
 | Path | #146 goodput | This goodput | #146 caused loss | This caused loss | #146 queue p90 | This queue p90 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 18 MB/s, 170 ms, 15%, 12 ms buffer | 0.09 | 0.86 | 0 | 0.39 | 0.1 ms | 11.8 ms |
-| 2.6 MB/s, 200 ms, 40%, 300 ms buffer | 0.64 | 0.91 | 0 | 0 | 162 ms | 251 ms |
-| same, 12 s | 0.68 | 0.83 | 0 | 0 | 245 ms | 250 ms |
-| 2 MB/s policer, 300 ms, 8 ms bucket | 0.27 | 0.87 | 0 | 0.19 | 0 | 0 |
-| one lane filling the 15% path, a joiner 5 s later, 85 ms buffer | 0.01 | 0.68 | 0 | 0.04 | 0 | 85 ms |
+| 18 MB/s, 170 ms, 15%, 12 ms buffer | 0.10 | 0.88 | 0 | 0.15 | 0.1 ms | 11.8 ms |
+| same, 12 s | 0.16 | 0.87 | 0 | 0.12 | 0.2 ms | 11.8 ms |
+| same, clean (0.1%) | 0.06 | 0.88 | 0 | 0.10 | 0.1 ms | 11.8 ms |
+| same, 85 ms buffer | 0.10 | 0.88 | 0 | 0.06 | 0.1 ms | 85 ms |
+| 2.6 MB/s, 200 ms, 40%, 300 ms buffer | 0.69 | 0.92 | 0 | 0 | 202 ms | 259 ms |
+| same, 12 s | 0.69 | 0.84 | 0 | 0 | 288 ms | 260 ms |
+| 2 MB/s policer, 300 ms, 8 ms bucket | 0.30 | 0.89 | 0 | 0.14 | 0 | 0 |
+| same, plus 42% erasure | 0.61 | 0.90 | 0.09 | 0.19 | 0 | 0 |
+| fast path, four lanes into an empty pool | 0.66 | 0.66 | 0.55 | 0.55 | 11.8 ms | 11.8 ms |
 
-The high-erasure deep-buffer row is the one #146 improved live (queue p90
+The last row is #146's own regime at capacity, which this change does not
+enter: no seed, so no ramp. A late joiner beside a lane already filling the
+fast path (85 ms buffer) ends its ramp 0.66 s after joining, and caused loss
+over the rest of the run is 0.045; on #146 the first lane never filled the
+path, so the comparison does not arise.
+
+The high-erasure deep-buffer rows are the path #146 improved live (queue p90
 992 ms to 168 ms). Over 8 s #146's queue reads lower only because it has not
-yet filled the path; over 12 s both arms hold the delay bound's queue, about
-245 ms, and the ramp adds none to it.
+yet filled the path; over 12 s both hold about the delay bound's queue, and
+the ramp's is the lower.
 
-**What it does not fix.** Two pool properties appear once lanes actually reach
-a shallow-buffer bottleneck, and #146 avoided them on the live fast path only by
-never getting there. The pooled bottleneck is a sum of per-lane windowed maxima,
-which overstates the aggregate when lanes peak at different times. And the
-compensation gate, judging steps by a max filter that drifts up with noise,
-grants compensation for overflow loss once that loss has been pooled as
-erasure, so the shares are paced at up to twice the path. That is the 0.39
-caused loss in the first row. #146 shows it too, and worse, on a burst into an
-empty pool (0.63 in the same simulator), and main showed it live on the fast
-path (loss 0.27 against a 0.15 floor). Both are follow-ups. So is the even split
-itself: one bulk lane beside one idle member is held to 5/8 of what it delivers,
-which this change only postpones, by ramping first.
+**What it does not fix.** The pooled bottleneck is a sum of per-lane windowed
+maxima, which overstates the aggregate when lanes peak at different times, as
+they do when they end their ramps a round or two apart. That is most of the
+0.12-0.15 caused loss left on the shallow buffer; the same burst into an empty
+pool, untouched here, loses 0.55. And the even split itself: one bulk lane
+beside one idle member is held to 5/8 of what it delivers, which this change
+only postpones by ramping first (simulated on the high-erasure path, 0.08 of
+capacity on #146 and 0.62 here). Both are follow-ups.

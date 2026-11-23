@@ -84,6 +84,36 @@ type joinBurstResult struct {
 	// queue is the bottleneck's queueing delay as seen by each packet that
 	// entered it.
 	queue []time.Duration
+	// sentPerSecond and droppedPerSecond count packets by the second they
+	// were sent in, so an interval can be judged on its own.
+	sentPerSecond, droppedPerSecond []uint64
+	// joined and rampEnded are when each lane joined and when it stopped
+	// ramping, rampEnded negative for a lane that never ramped or never
+	// stopped.
+	joined, rampEnded []time.Duration
+}
+
+// causedLossBetween is the fraction of packets sent in [from, to) seconds
+// that the bottleneck dropped.
+func (r joinBurstResult) causedLossBetween(from, to int) float64 {
+	var sent, dropped uint64
+	for i := from; i < to && i < len(r.sentPerSecond); i++ {
+		sent += r.sentPerSecond[i]
+		dropped += r.droppedPerSecond[i]
+	}
+	if sent == 0 {
+		return 0
+	}
+	return float64(dropped) / float64(sent)
+}
+
+// goodputBetween is what was delivered in [from, to) seconds, per second.
+func (r joinBurstResult) goodputBetween(from, to int) float64 {
+	var delivered float64
+	for i := from; i < to && i < len(r.perSecond); i++ {
+		delivered += r.perSecond[i]
+	}
+	return delivered / float64(to-from)
 }
 
 func (r joinBurstResult) goodput(d time.Duration) float64 { return r.delivered / d.Seconds() }
@@ -118,7 +148,6 @@ type simLane struct {
 	rtt      simRTT
 	next     quiccongestion.PacketNumber
 	inFlight quiccongestion.ByteCount
-	credit   float64
 	pending  []simPacket
 }
 
@@ -145,7 +174,10 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 	}
 
 	var result joinBurstResult
-	result.perSecond = make([]float64, int(cfg.duration/time.Second)+1)
+	seconds := int(cfg.duration/time.Second) + 1
+	result.perSecond = make([]float64, seconds)
+	result.sentPerSecond = make([]uint64, seconds)
+	result.droppedPerSecond = make([]uint64, seconds)
 	var busyUntil, refilled time.Duration
 	tokens := 0.0
 	lanes := make([]*simLane, 0, cfg.lanes)
@@ -160,9 +192,14 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 			lane.e.inner.randomState = uint64(len(lanes)+1) * 0x9e3779b97f4a7c15
 			lane.e.SetRTTStatsProvider(&lane.rtt)
 			lanes = append(lanes, lane)
+			result.joined = append(result.joined, now)
+			result.rampEnded = append(result.rampEnded, -1)
 		}
 		at := base.Add(now)
-		for _, lane := range lanes {
+		for i, lane := range lanes {
+			if result.rampEnded[i] < 0 && lane.e.rampRound > 0 && !lane.e.ramping.Load() {
+				result.rampEnded[i] = now
+			}
 			// Acknowledgements and losses that have come due.
 			var acked []quiccongestion.AckedPacketInfo
 			var lost []quiccongestion.LostPacketInfo
@@ -188,22 +225,16 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 				lane.e.OnCongestionEventEx(prior, at, acked, lost)
 			}
 
-			// Send what the pacer and the window allow. The credit is capped
-			// at a pacer's burst, or two ticks of the rate when that is more,
-			// so an idle lane does not bank a flood and a fast one is not
-			// limited by the tick.
-			rate := float64(lane.e.bandwidth())
-			lane.credit += rate * simTick.Seconds()
-			if limit := math.Max(tuicMaxBurstPackets*simPacketSize, 2*rate*simTick.Seconds()); lane.credit > limit {
-				lane.credit = limit
-			}
-			for lane.credit >= simPacketSize && lane.e.CanSend(lane.inFlight) {
-				lane.credit -= simPacketSize
+			// Send what the window and the controller's own pacer allow, as
+			// quic-go asks them: the pacer's burst allowance, including the
+			// unmetered burst, is part of what is being simulated.
+			for lane.e.CanSend(lane.inFlight) && lane.e.HasPacingBudget(at) {
 				lane.inFlight += simPacketSize
 				number := lane.next
 				lane.next++
 				lane.e.OnPacketSent(at, lane.inFlight, number, simPacketSize, true)
 				result.sent++
+				result.sentPerSecond[int(now/time.Second)]++
 
 				start := now
 				if busyUntil > start {
@@ -215,6 +246,7 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 					refilled = now
 					if tokens < simPacketSize {
 						result.dropped++
+						result.droppedPerSecond[int(now/time.Second)]++
 						p.lost, p.due = true, now+cfg.rtt
 					} else {
 						tokens -= simPacketSize
@@ -228,6 +260,7 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 					// Tail drop. It is detected with the packets around it,
 					// which is when the queue would have delivered it.
 					result.dropped++
+					result.droppedPerSecond[int(now/time.Second)]++
 					p.lost, p.due = true, start+cfg.rtt
 				} else {
 					result.queue = append(result.queue, start-now)
@@ -280,12 +313,12 @@ func TestABurstOfJoinersBesideAnIdleMemberFindsAFastPath(t *testing.T) {
 	if got := cfg.report(t, "fast path, idle pool", r); got < 0.6 {
 		t.Errorf("the lanes delivered %.2f of a path with room for all of it; the share is acting as a ceiling", got)
 	}
-	// The path's own brakes still hold the burst. This is not a tight bound:
-	// on a buffer this shallow the controller has no queue to read, and the
-	// pool's own regime at capacity -- a burst into an empty pool, which this
-	// change does not touch -- loses more (see docs/CONTROL-REDESIGN.md).
-	if got := r.causedLoss(); got > 0.5 {
-		t.Errorf("the bottleneck dropped %.2f of what was sent; the ramp is not ending", got)
+	// And it is not bought by overdriving it. A buffer this shallow gives the
+	// controller no queue to read, so loss above the floor is the only brake;
+	// the same burst into an empty pool, which this change does not touch,
+	// has the bottleneck drop 0.55 of what is sent.
+	if got := r.causedLoss(); got > 0.2 {
+		t.Errorf("the bottleneck dropped %.2f of what was sent", got)
 	}
 }
 
@@ -323,18 +356,28 @@ func TestJoinersOnAPolicerAreBounded(t *testing.T) {
 	}
 }
 
-// A lane joining a path its sibling already fills meets the queue or the loss
-// within a round or two and takes its share from there.
+// A lane joining a path its sibling already fills meets the loss or the
+// queue within a few rounds and takes its share from there. Judged on the
+// joiner and on the interval after it joined, not averaged with the five
+// seconds before it.
 func TestAJoinerBesideALaneThatFillsThePathBacksOff(t *testing.T) {
 	cfg := fastModerateErasurePath()
 	cfg.lanes, cfg.stagger, cfg.buffer = 2, 5*time.Second, cfg.rate*0.085
+	cfg.duration = 9 * time.Second
 	r := runJoinBurst(cfg)
 	cfg.report(t, "joiner beside a full lane", r)
-	if got := r.causedLoss(); got > 0.05 {
-		t.Errorf("the bottleneck dropped %.3f of what was sent", got)
+	joined, ended := r.joined[1], r.rampEnded[1]
+	t.Logf("the joiner joined at %v and stopped ramping at %v; after it joined, caused loss %.3f",
+		joined, ended, r.causedLossBetween(5, 9))
+	if ended < 0 || ended-joined > 8*cfg.rtt {
+		t.Errorf("the joiner was still ramping %v after joining a full path", ended-joined)
 	}
-	if got := r.queueP90(); got > cfg.rtt/2 {
-		t.Errorf("queue p90 %v on a %v path", got, cfg.rtt)
+	if got := r.causedLossBetween(5, 9); got > 0.1 {
+		t.Errorf("after the join the bottleneck dropped %.3f of what was sent", got)
+	}
+	// Both lanes together still use the path.
+	if got := r.goodputBetween(6, 9) / (cfg.rate * (1 - cfg.erasure)); got < 0.8 {
+		t.Errorf("after the join the lanes delivered %.2f of the path", got)
 	}
 }
 
@@ -411,24 +454,71 @@ func TestARampEndsOnLossAboveTheFloorButNotOnItsNoise(t *testing.T) {
 			t.Errorf("%d of %d lost on a 0.15 floor: ramping %v, want %v", tc.lost, tc.arrived+tc.lost, got, tc.ramping)
 		}
 	}
+	// A pool that has decided a handful of packets reports an erasure of zero
+	// with nothing behind it. One ordinary loss is not loss above that.
+	thin := joiningProbe()
+	thin.Erasure, thin.ObservedSamples = 0, 10
+	sender := NewErasureSenderOn(1200, thin)
+	closeRound(sender, 63, 1)
+	if !sender.ramping.Load() {
+		t.Error("one loss in 64 ended a ramp against a floor measured from 10 packets")
+	}
+	// Against a floor of zero that does have packets behind it, a couple of
+	// losses are too few to judge and a tenth of the round is not.
+	measured := joiningProbe()
+	measured.Erasure = 0
+	for _, tc := range []struct {
+		lost    int
+		ramping bool
+	}{{1, true}, {2, true}, {10, false}} {
+		sender := NewErasureSenderOn(1200, measured)
+		closeRound(sender, 100-tc.lost, tc.lost)
+		if got := sender.ramping.Load(); got != tc.ramping {
+			t.Errorf("%d of 100 lost on a measured clean path: ramping %v, want %v", tc.lost, got, tc.ramping)
+		}
+	}
 }
 
 func TestARampEndsWhenDeliveryStopsGrowing(t *testing.T) {
 	sender := NewErasureSenderOn(1200, joiningProbe())
 	sender.inner.estimator.measured.updateMax(1, monotime.Time(0), 1e6)
+	// The first round grows from nothing; the next three do not, and in each
+	// the controller held the lane back.
 	for round := 1; round <= rampFlatRounds+1; round++ {
 		if !sender.ramping.Load() {
-			// The first round grows from nothing; the next three do not.
-			if round != rampFlatRounds+1 {
-				t.Fatalf("the ramp ended after %d rounds, want %d without growth", round-2, rampFlatRounds)
-			}
-			return
+			t.Fatalf("the ramp ended after %d flat rounds, want %d", round-2, rampFlatRounds)
 		}
+		sender.CanSend(sender.GetCongestionWindow())
 		sender.inner.round++
 		sender.rampGate(nil, nil)
 	}
 	if sender.ramping.Load() {
 		t.Fatalf("delivery flat for %d rounds and the lane is still ramping", rampFlatRounds)
+	}
+}
+
+// A lane carrying a few requests before its bulk transfer is not probing the
+// path, and its flat rounds must not spend the ramp the transfer needs.
+func TestRequestRoundsDoNotEndARamp(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	sender.inner.estimator.measured.updateMax(1, monotime.Time(0), 1e6)
+	for round := 0; round < 4*rampFlatRounds; round++ {
+		sender.CanSend(0)
+		sender.inner.round++
+		sender.rampGate(nil, nil)
+	}
+	if !sender.ramping.Load() {
+		t.Fatal("rounds in which nothing held the lane back ended its ramp")
+	}
+	// Then the backlog arrives, the window binds, and delivery still does not
+	// grow: that is a full path.
+	for round := 0; round < rampFlatRounds; round++ {
+		sender.CanSend(sender.GetCongestionWindow())
+		sender.inner.round++
+		sender.rampGate(nil, nil)
+	}
+	if sender.ramping.Load() {
+		t.Fatal("a lane held back by its window for three flat rounds is still ramping")
 	}
 }
 
@@ -452,6 +542,30 @@ func TestCompensationIsNotEarnedDuringARamp(t *testing.T) {
 	grow()
 	if got := sender.compensationFor(0.58); got >= 1 {
 		t.Fatalf("after the ramp, a round that delivered more was refused compensation (%.3f)", got)
+	}
+}
+
+// Loss the pool measures above the erasure it had when a lane joined is the
+// burst's own overflow until shown otherwise, and the lane that is not losing
+// it is the one most likely to be causing it: simulated, a lane whose own
+// loss sat at the floor took its compensation from 0.85 to 0.43 while its
+// siblings lost 35-50%.
+func TestCompensationIsNotEarnedWhileThePoolLosesAboveItsFloor(t *testing.T) {
+	for _, tc := range []struct {
+		pooled  float64
+		granted bool
+	}{{0.15, true}, {0.30, false}} {
+		probe := joiningProbe()
+		probe.Erasure, probe.Arrival = 0.15, 1
+		sender := NewErasureSenderOn(1200, probe)
+		sender.endRamp()
+		sender.poolSamples = 5000
+		sender.erasure.Store(uint64(tc.pooled * partsPerMillion))
+		sender.inner.round++
+		sender.inner.estimator.maxFilter.updateMax(sender.inner.round, monotime.Time(0), sender.inner.estimator.estimate()*2)
+		if got := sender.compensationFor(1 - tc.pooled); (got < 1) != tc.granted {
+			t.Errorf("pool erasure %.2f on a 0.15 floor: compensation %.3f, granted %v, want %v", tc.pooled, got, got < 1, tc.granted)
+		}
 	}
 }
 

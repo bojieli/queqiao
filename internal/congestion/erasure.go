@@ -133,18 +133,28 @@ type ErasureSender struct {
 
 	// ramping is whether this lane is still finding its rate, and while it is
 	// the share does not cap it. See rampGate. The rest is the gate's own
-	// state: the erasure the pool had measured when this lane joined, which is
-	// the floor its loss is judged against; the round it last judged; the
-	// delivery the last growth reached and how many rounds have passed without
-	// more; and the packets decided in the round in progress.
+	// state: whether the controller held the lane back during the round in
+	// progress; the erasure the pool had measured when this lane joined and
+	// the packets behind it, which is the floor its loss is judged against;
+	// the round it last judged; the delivery the last growth reached and how
+	// many rounds have passed without more; and the packets decided in the
+	// round in progress.
 	ramping       atomic.Bool
+	rampLimited   atomic.Bool
 	rampFloor     float64
-	rampFloorSet  bool
+	rampFloorN    float64
 	rampRound     uint64
 	rampDelivered float64
 	rampFlat      int
 	rampArrived   uint64
 	rampLost      uint64
+	// joined is whether this lane joined from a pooled seed; aboveFloor
+	// whether its last judged round lost significantly more than the floor it
+	// joined with; and poolSamples how many packets the pool's current
+	// erasure rests on. See compensationFor.
+	joined      bool
+	aboveFloor  bool
+	poolSamples float64
 }
 
 type packetOutcome struct {
@@ -179,12 +189,12 @@ const (
 	// allowance: the ramp is the phase that runs past the share, so it stops
 	// at the first sign of a queue rather than at the bound.
 	rampQueueFraction = 4
-	// rampLossSamples is the fewest packets a round must decide before its
-	// loss is compared with the floor, and rampLossDeviations how far above
-	// the floor, in binomial standard deviations, it must then be. A 32-packet
-	// first flight on a 15% channel loses seven packets about one time in
-	// four; read without its noise it would end most ramps in their first
-	// round.
+	// rampLossSamples is the fewest packets a round, and the pool's floor,
+	// must each rest on before the one is compared with the other, and
+	// rampLossDeviations how far above the floor, in standard deviations of
+	// the difference, the round must then be. A 32-packet first flight on a
+	// 15% channel loses seven packets about one time in four; read without
+	// its noise it would end most ramps in their first round.
 	rampLossSamples    = 64
 	rampLossDeviations = 3
 )
@@ -269,9 +279,8 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 			// rate from it; see rampGate. Its loss is judged against the
 			// erasure the pool had measured, when the pool had measured any.
 			e.ramping.Store(true)
-			if state.ObservedSamples > 0 {
-				e.rampFloor, e.rampFloorSet = state.Erasure, true
-			}
+			e.joined = true
+			e.rampFloor, e.rampFloorN = state.Erasure, state.ObservedSamples
 			// The compensation gate judges each step by whether delivery rose
 			// since the last one. Its baseline starts at zero, and the seeded
 			// estimate is above zero without this lane having delivered
@@ -347,10 +356,15 @@ func (e *ErasureSender) deliveredRate() float64 {
 //
 //   - a queue: the smoothed round trip a quarter above the path's minimum;
 //   - loss above the floor: a round losing more than the erasure the pool had
-//     measured when this lane joined, by more than that round's sampling noise;
+//     measured when this lane joined, by more than the two measurements'
+//     sampling noise (lossAboveFloor);
 //   - delivery that has stopped following the sending rate: BBR's own
 //     full-pipe test, three rounds without a quarter's growth in what this lane
 //     measured itself delivering.
+//
+// The third counts only rounds in which the window or the pacer held the lane
+// back, so a lane carrying requests before its transfer keeps its ramp for
+// the transfer.
 //
 // The first two are the path saying it is full. The third is for a path that
 // says neither -- a policer whose drops have already been measured as the
@@ -362,39 +376,91 @@ func (e *ErasureSender) deliveredRate() float64 {
 // Nothing here reports a rate the lane did not measure. The pooled seed and
 // the bottleneck stay what was delivered (#73); only the cap moves.
 func (e *ErasureSender) rampGate(acked []quiccongestion.AckedPacketInfo, lost []quiccongestion.LostPacketInfo) {
-	if !e.ramping.Load() {
+	if !e.joined {
 		return
 	}
-	queue, minRTT := e.queueDelay()
-	if minRTT > 0 && queue*rampQueueFraction >= minRTT {
+	if queue, minRTT := e.queueDelay(); e.ramping.Load() && minRTT > 0 && queue*rampQueueFraction >= minRTT {
 		e.endRamp()
-		return
 	}
 	// Judge the round that has just closed, once per round. The inner round
 	// advances inside its own callback, after this one has run, so a change
-	// seen here is a round that ended on the previous event.
+	// seen here is a round that ended on the previous event. The loss is
+	// judged for as long as the lane lives, because the compensation gate
+	// reads it too.
 	if round := e.inner.round; round != e.rampRound {
 		e.rampRound = round
-		decided := e.rampArrived + e.rampLost
-		if e.rampFloorSet && decided >= rampLossSamples {
-			loss := float64(e.rampLost) / float64(decided)
-			noise := rampLossDeviations * math.Sqrt(e.rampFloor*(1-e.rampFloor)/float64(decided))
-			if loss > e.rampFloor+noise {
-				e.endRamp()
-				return
-			}
-		}
+		e.aboveFloor = e.lossAboveFloor(e.rampArrived, e.rampLost)
 		e.rampArrived, e.rampLost = 0, 0
-		delivered := float64(e.inner.estimator.measuredEstimate())
-		if delivered >= e.rampDelivered*rampGrowth && delivered > 0 {
-			e.rampDelivered, e.rampFlat = delivered, 0
-		} else if e.rampFlat++; e.rampFlat >= rampFlatRounds {
-			e.endRamp()
-			return
+		if e.ramping.Load() {
+			e.judgeRamp()
 		}
 	}
 	e.rampArrived += uint64(len(acked))
 	e.rampLost += uint64(len(lost))
+}
+
+// judgeRamp ends the ramp on a closed round that lost more than the floor,
+// or on the third that tried to send faster and delivered no more.
+func (e *ErasureSender) judgeRamp() {
+	// A round only counts as flat if the lane tried to send faster than it
+	// was allowed to. One carrying a few requests is not probing anything,
+	// and calling it flat would end the ramp before the bulk transfer it was
+	// opened for has started.
+	limited := e.rampLimited.Swap(false)
+	if e.aboveFloor {
+		e.endRamp()
+		return
+	}
+	delivered := float64(e.inner.estimator.measuredEstimate())
+	if delivered >= e.rampDelivered*rampGrowth && delivered > 0 {
+		e.rampDelivered, e.rampFlat = delivered, 0
+		return
+	}
+	if limited {
+		if e.rampFlat++; e.rampFlat >= rampFlatRounds {
+			e.endRamp()
+		}
+	}
+}
+
+// lossAboveFloor reports whether a round's loss is significantly above the
+// erasure the pool had measured when this lane joined.
+//
+// Both are estimates, so it is the two-proportion test rather than the
+// round's own binomial noise against a fixed floor: a pool that had decided
+// only a handful of packets reports an erasure of zero with nothing behind
+// it, and a fixed zero has no noise at all, so one ordinary loss would end
+// the ramp. A pool with too few packets behind its figure, or a round with
+// too few of its own, is not judged.
+func (e *ErasureSender) lossAboveFloor(arrived, lost uint64) bool {
+	decided := float64(arrived + lost)
+	if decided == 0 {
+		return false
+	}
+	return e.aboveTheFloor(float64(lost)/decided, decided)
+}
+
+// aboveTheFloor is the two-proportion test of a loss rate measured over
+// samples packets against the floor this lane joined with.
+func (e *ErasureSender) aboveTheFloor(loss, samples float64) bool {
+	if samples < rampLossSamples || e.rampFloorN < rampLossSamples {
+		return false
+	}
+	// The normal approximation behind the test says nothing about a handful
+	// of losses on a clean floor, where one loss in a hundred would read as
+	// significant; so the excess must also be that many packets.
+	if (loss-e.rampFloor)*samples < rampLossDeviations {
+		return false
+	}
+	pooled := (loss*samples + e.rampFloor*e.rampFloorN) / (samples + e.rampFloorN)
+	deviation := math.Sqrt(pooled * (1 - pooled) * (1/samples + 1/e.rampFloorN))
+	return loss-e.rampFloor > rampLossDeviations*deviation
+}
+
+// poolAboveFloor reports whether the pool's measured erasure has risen
+// significantly above what it was when this lane joined.
+func (e *ErasureSender) poolAboveFloor() bool {
+	return e.aboveTheFloor(float64(e.erasure.Load())/partsPerMillion, e.poolSamples)
 }
 
 // endRamp hands the lane to its share, and its controller out of startup.
@@ -471,7 +537,21 @@ func (e *ErasureSender) compensationFor(want float64) float64 {
 	// would be granted for loss the ramp itself is causing. The baseline
 	// follows the ramp, so the first step after it has to beat what the ramp
 	// reached.
-	if e.ramping.Load() {
+	//
+	// Nor, for a lane that joined knowing the path's erasure, while its last
+	// round, or the pool, lost significantly more than that. Compensation is
+	// for erasure, and loss above the erasure the pool had measured when the
+	// lane joined is the lanes' own overflow until shown otherwise:
+	// compensating it raises the rate that caused it. Without this a burst
+	// that filled a shallow buffer pooled its overflow as erasure, and the
+	// gate, judging by a max filter that drifts up with noise, granted the
+	// compensation for it step by step, paced the shares at up to twice the
+	// path, and held the bottleneck dropping a third of what was sent. The
+	// pool has to be read as well as the lane: a shared tail-drop queue does
+	// not share its drops evenly, and in that simulation the lane that took
+	// its compensation from 0.85 to 0.43 lost at the floor itself while its
+	// siblings lost 35-50%.
+	if e.ramping.Load() || e.aboveFloor || (e.joined && e.poolAboveFloor()) {
 		e.deliveredAtCompensation, e.compensationRound = delivered, round
 		return e.appliedArrival
 	}
@@ -691,7 +771,11 @@ func (e *ErasureSender) recordInFlight(bytesInFlight quiccongestion.ByteCount) {
 }
 
 func (e *ErasureSender) HasPacingBudget(now monotime.Time) bool {
-	return e.pacer.budget(now) >= e.inner.maxDatagramSize
+	if e.pacer.budget(now) >= e.inner.maxDatagramSize {
+		return true
+	}
+	e.rampLimited.Store(true)
+	return false
 }
 
 func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
@@ -704,7 +788,11 @@ func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 // channel what is on the wire is more than what will arrive.
 func (e *ErasureSender) CanSend(bytesInFlight quiccongestion.ByteCount) bool {
 	e.recordInFlight(bytesInFlight)
-	return bytesInFlight < e.GetCongestionWindow()
+	if bytesInFlight < e.GetCongestionWindow() {
+		return true
+	}
+	e.rampLimited.Store(true)
+	return false
 }
 
 func (e *ErasureSender) GetCongestionWindow() quiccongestion.ByteCount {
@@ -795,6 +883,7 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))
 		e.share.Store(uint64(state.Share))
+		e.poolSamples = state.ObservedSamples
 		e.rampGate(acked, lost)
 	}
 	// The compensation rides on the measurement rather than on a floor biased
