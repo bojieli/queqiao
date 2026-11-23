@@ -282,9 +282,9 @@ fault must not hide a failure to recover afterward.
 
 `lane_replacement_split.py` reads client JSON-lines logs, and optionally
 gateway logs, and splits `lane replacement timeout` failures that never had a
-replacement admitted into "no zero-lane replacement attempted", "every attempt failed" (by
-last failure category), "an attempt was still outstanding", and "too old to
-tell". It is the offline half of the issue #53 measurement and contacts
+replacement admitted into "no zero-lane replacement attempted", "every attempt
+failed" (by last failure category), "attempt outcome unrecorded", and "too old
+to tell". It is the offline half of the issue #53 measurement and contacts
 nothing. See [`docs/LOGGING.md`](../docs/LOGGING.md) for what each bucket means.
 
 ```sh

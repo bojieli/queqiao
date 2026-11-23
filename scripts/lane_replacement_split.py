@@ -36,11 +36,11 @@ RESUME_REFUSED = "peer does not hold this session"
 
 # Buckets for `lane replacement timeout` with lanes_joined == 1, in report order.
 NO_ATTEMPT = "no zero-lane replacement attempted (attempts == 0)"
-HANDSHAKE_NOT_CARRIED = "every attempt failed (attempts == failures)"
-DIAL_OUTSTANDING = "attempt outstanding (attempts > failures)"
+EVERY_ATTEMPT_FAILED = "every attempt failed (attempts == failures)"
+OUTCOME_UNRECORDED = "attempt outcome unrecorded (attempts > failures)"
 OLD_CLIENT = "old client (fields missing)"
 INCONSISTENT = "inconsistent (failures > attempts)"
-BUCKETS = (NO_ATTEMPT, HANDSHAKE_NOT_CARRIED, DIAL_OUTSTANDING, OLD_CLIENT, INCONSISTENT)
+BUCKETS = (NO_ATTEMPT, EVERY_ATTEMPT_FAILED, OUTCOME_UNRECORDED, OLD_CLIENT, INCONSISTENT)
 
 # The categories the client writes as lane_replacement_last_failure.
 FAILURE_KINDS = ("timeout", "peer_rejected", "peer_capacity", "canceled", "other")
@@ -126,8 +126,8 @@ def timeout_bucket(record: dict[str, Any]) -> tuple[str, str | None]:
         kind = record.get("lane_replacement_last_failure")
         if kind not in FAILURE_KINDS:
             kind = "unrecorded" if kind is None else "other"
-        return HANDSHAKE_NOT_CARRIED, kind
-    return DIAL_OUTSTANDING, None
+        return EVERY_ATTEMPT_FAILED, kind
+    return OUTCOME_UNRECORDED, None
 
 
 def iso(instant: datetime.datetime) -> str:
@@ -150,7 +150,7 @@ class Split:
         self.first: datetime.datetime | None = None
         self.last: datetime.datetime | None = None
         self.buckets: Counter = Counter()
-        self.handshake_kinds: Counter = Counter()
+        self.failure_kinds: Counter = Counter()
         self.deaths: dict[str, Counter] = defaultdict(Counter)
         self.timeouts_joined: Counter = Counter()  # lanes_joined value for every timeout
         self.other_terminal: Counter = Counter()
@@ -199,7 +199,7 @@ class Split:
             bucket, kind = (OLD_CLIENT, None) if joined is None else timeout_bucket(record)
             self.buckets[bucket] += 1
             if kind is not None:
-                self.handshake_kinds[kind] += 1
+                self.failure_kinds[kind] += 1
             note(bucket)
             return
         for terminal in (ABANDONED, RESUME_REFUSED):
@@ -242,7 +242,7 @@ class Split:
             "client_flows": {"complete": self.client_complete, "failed": self.client_failed},
             "lane_replacement_timeout_by_lanes_joined": dict(self.timeouts_joined),
             "buckets": {b: self.buckets[b] for b in BUCKETS},
-            "handshake_not_carried_by_last_failure": dict(self.handshake_kinds),
+            "every_attempt_failed_by_last_failure": dict(self.failure_kinds),
             "other_terminal_errors": {t: self.other_terminal[t] for t in (ABANDONED, RESUME_REFUSED)},
             "last_lane_death": {b: dict(c) for b, c in self.deaths.items()},
         }
@@ -306,11 +306,14 @@ def format_text(report: dict[str, Any]) -> str:
     for bucket in BUCKETS:
         n = buckets[bucket]
         out.append(f"  {bucket:<46} {n:6d} {percent(n, total)}")
-        if bucket == HANDSHAKE_NOT_CARRIED:
-            kinds = report["handshake_not_carried_by_last_failure"]
+        if bucket == EVERY_ATTEMPT_FAILED:
+            kinds = report["every_attempt_failed_by_last_failure"]
             for kind in (*FAILURE_KINDS, "unrecorded"):
                 if kinds.get(kind):
                     out.append(f"      last_failure={kind:<30} {kinds[kind]:6d} {percent(kinds[kind], n)}")
+            if n:
+                out.append("      only last_failure=timeout suggests the path did not carry the handshake;")
+                out.append("      peer_rejected/peer_capacity prove the peer answered it")
         if bucket in deaths:
             out.append("      last lane: " + ", ".join(f"{k}={v}" for k, v in sorted(deaths[bucket].items())))
     out.append("")

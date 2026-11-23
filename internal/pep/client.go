@@ -2964,15 +2964,19 @@ func (c *Client) logLaneRecoveryFailure(manageCtx context.Context, flowID, attem
 
 // laneRecoveryFailureLevel is the level a failed recovery join is logged at on
 // either transport, and false when it should not be logged at all.
+//
+// It is decided from the same category the line reports as failure_kind, so
+// the two cannot disagree: a TCP JOIN that runs into the socket deadline set
+// for its handshake is os.ErrDeadlineExceeded rather than a context deadline,
+// and is still a `timeout` logged at the timeout level.
 func laneRecoveryFailureLevel(manageCtx context.Context, err error) (slog.Level, bool) {
-	switch {
-	case errors.Is(err, context.Canceled):
+	switch replacementFailureKind(err) {
+	case "canceled":
 		if manageCtx.Err() != nil {
 			return 0, false
 		}
 		return slog.LevelDebug, true
-	case errors.Is(err, context.DeadlineExceeded),
-		errors.Is(err, errLaneJoinRejected), errors.Is(err, errLaneJoinCapacity):
+	case "timeout", "peer_rejected", "peer_capacity":
 		return slog.LevelInfo, true
 	}
 	return slog.LevelWarn, true

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -550,6 +551,9 @@ func TestLaneRecoveryFailureLogLevels(t *testing.T) {
 	client.logLaneRecoveryFailure(live, 7, 4, context.Canceled)
 	client.logLaneRecoveryFailure(live, 7, 5, fmt.Errorf("%w: session", errLaneJoinRejected))
 	client.logLaneRecoveryFailure(live, 7, 6, fmt.Errorf("%w: full", errLaneJoinCapacity))
+	// A JOIN that hits the handshake's socket deadline is not a context
+	// deadline, but it is reported as a timeout and logged like one.
+	client.logLaneRecoveryFailure(live, 7, 7, &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded})
 
 	got := records.records(t, "lane recovery unavailable")
 	want := []struct {
@@ -561,6 +565,7 @@ func TestLaneRecoveryFailureLogLevels(t *testing.T) {
 		{"DEBUG", "canceled", 4},
 		{"INFO", "peer_rejected", 5},
 		{"INFO", "peer_capacity", 6},
+		{"INFO", "timeout", 7},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("logged %d recovery failures, want %d: %v", len(got), len(want), got)

@@ -47,7 +47,7 @@ CLIENT = [
                    lane_replacement_last_failure="canceled"),
     client_failure(7, SILENT, lane_replacement_attempts=1, lane_replacement_failures=1,
                    lane_replacement_last_failure="something new"),
-    # A dial still outstanding when the record was written.
+    # An attempt with neither a failure nor an admitted lane: outcome unknown.
     client_failure(8, EOF_TIMEOUT, lane_replacement_attempts=2, lane_replacement_failures=1,
                    lane_replacement_last_failure="timeout"),
     # Older clients: no attempt counters; or not even lanes_joined.
@@ -105,12 +105,12 @@ class LaneReplacementSplitTests(unittest.TestCase):
         report = self.report()
         self.assertEqual(report["buckets"], {
             MODULE.NO_ATTEMPT: 2,
-            MODULE.HANDSHAKE_NOT_CARRIED: 5,
-            MODULE.DIAL_OUTSTANDING: 1,
+            MODULE.EVERY_ATTEMPT_FAILED: 5,
+            MODULE.OUTCOME_UNRECORDED: 1,
             MODULE.OLD_CLIENT: 2,
             MODULE.INCONSISTENT: 0,
         })
-        self.assertEqual(report["handshake_not_carried_by_last_failure"], {
+        self.assertEqual(report["every_attempt_failed_by_last_failure"], {
             "timeout": 1, "peer_rejected": 1, "peer_capacity": 1, "canceled": 1, "other": 1,
         })
         self.assertEqual(report["lane_replacement_timeout_by_lanes_joined"], {"1": 9, ">1": 1, "missing": 1})
@@ -156,7 +156,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
     def test_last_lane_death_per_bucket(self):
         deaths = self.report()["last_lane_death"]
         self.assertEqual(deaths[MODULE.NO_ATTEMPT], {"EOF": 1, "no recent network activity": 1})
-        self.assertEqual(deaths[MODULE.HANDSHAKE_NOT_CARRIED], {"EOF": 2, "no recent network activity": 3})
+        self.assertEqual(deaths[MODULE.EVERY_ATTEMPT_FAILED], {"EOF": 2, "no recent network activity": 3})
         self.assertEqual(MODULE.last_lane_death("last lane failed (read tcp: unexpected EOF): x"), "EOF")
         self.assertEqual(MODULE.last_lane_death("last lane failed (connection reset): x"), "other")
 
@@ -167,7 +167,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
         self.assertEqual(joined[MODULE.NO_ATTEMPT], {
             "gateway failed, last lane: no recent network activity": 1, "no gateway failure record": 1,
         })
-        self.assertEqual(joined[MODULE.HANDSHAKE_NOT_CARRIED], {
+        self.assertEqual(joined[MODULE.EVERY_ATTEMPT_FAILED], {
             "gateway failed, last lane: EOF": 1, "no gateway failure record": 4,
         })
         self.assertEqual(gateway["lane_join_refused"], {
@@ -193,6 +193,8 @@ class LaneReplacementSplitTests(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("no zero-lane replacement attempted (attempts == 0)", text)
         self.assertIn("last_failure=peer_rejected", text)
+        self.assertIn("only last_failure=timeout suggests the path did not carry the handshake", text)
+        self.assertIn("attempt outcome unrecorded (attempts > failures)", text)
         self.assertIn("unknown_session", text)
 
         out = io.StringIO()
@@ -201,6 +203,8 @@ class LaneReplacementSplitTests(unittest.TestCase):
         report = json.loads(out.getvalue())
         self.assertNotIn("gateway", report)
         self.assertEqual(report["buckets"][MODULE.NO_ATTEMPT], 2)
+        self.assertNotIn("handshake_not_carried_by_last_failure", report)
+        self.assertEqual(report["every_attempt_failed_by_last_failure"]["peer_rejected"], 1)
 
 
 if __name__ == "__main__":

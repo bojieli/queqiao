@@ -225,9 +225,9 @@ so the highest one logged for a flow is at most its
 `lane_replacement_attempts`. The TCP line also carries `replacement`: a join
 that widened a healthy bundle has `replacement=false` and no `attempt`, and is
 not counted in the flow record. Every counted failure gets a line, including
-a peer refusal that ends recovery at once. A replacement that ran out of time
-(a context deadline) or that the peer refused (`peer_rejected`,
-`peer_capacity`) is written at `info`, other failures at `warn`. A replacement
+a peer refusal that ends recovery at once. The level follows `failure_kind`: `timeout`
+(a context deadline or a socket deadline on the handshake), `peer_rejected`
+and `peer_capacity` are written at `info`, and `other` at `warn`. A replacement
 cancelled because the flow ended is not written, and any other cancellation is
 written only at `debug`. A failed widening join is written at `warn` with the
 bundle's back-off count as `failures`, and only when it counts against that
@@ -256,11 +256,16 @@ It selects `local flow ended with error` records whose error contains
   not launch a zero-lane replacement while a join it started earlier (for
   example to widen the bundle) is still pending, and that join is not counted.
 - `every attempt failed (attempts == failures)`, sub-split by
-  `lane_replacement_last_failure`. `timeout` is the path not carrying a
-  handshake. `peer_rejected` and `peer_capacity` are handshakes that completed
-  and were refused, and `canceled` and `other` need the per-attempt lines.
-- `attempt outstanding (attempts > failures)`: a dial had not returned when the
-  record was written. It is not a refusal.
+  `lane_replacement_last_failure` (`every_attempt_failed_by_last_failure` in
+  `--json`). Only `timeout` suggests the path did not carry a handshake.
+  `peer_rejected` and `peer_capacity` prove the peer answered the handshake and
+  refused it, and `canceled` and `other` need the per-attempt lines.
+- `attempt outcome unrecorded (attempts > failures)`: at least one counted
+  attempt left neither a failure nor an admitted lane. That can be a dial still
+  outstanding when the record was written. It can also be a TCP join whose
+  result was discarded because the manager stopped first, or a successful dial
+  whose lane was rejected because the flow had already ended. The outcome is
+  unknown, and it is not a refusal.
 - `old client (fields missing)`: a record without the attempt counters or
   without `lanes_joined`. Missing is never read as zero.
 - `inconsistent (failures > attempts)`: should be empty. Anything here is a bug
