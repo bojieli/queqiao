@@ -250,3 +250,40 @@ func TestPathKnowledgeExpiresWhenNothingHasReportedForLong(t *testing.T) {
 		t.Fatalf("a fresh report on an expired path got round trip %v, want its own 210ms", got.RoundTrip)
 	}
 }
+
+// A member that has measured no delivery yet reports zero. It still counts as
+// a member, so it takes its place in the split, but it must neither lower the
+// bottleneck the others measured nor be able to produce one on its own.
+func TestAZeroDeliveryReportCountsAsAMemberAndNothingMore(t *testing.T) {
+	m := NewPathModel()
+	if got := m.Report(1, Observation{Delivered: 0}); got.Seed != 0 || got.Share != 0 {
+		t.Fatalf("a model with only unmeasured members produced seed %.0f, share %.0f", got.Seed, got.Share)
+	}
+	m.Report(2, Observation{Delivered: 2e6})
+	got := m.Report(1, Observation{Delivered: 0})
+	if got.Seed != 1e6 {
+		t.Fatalf("seed %.0f, want the measured 2e6 split two ways", got.Seed)
+	}
+}
+
+// The earned compensation is pooled by sample count, ignores members that
+// have not decided, and outlives its members as path knowledge.
+func TestArrivalIsPooledBySamplesAndRemembered(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	m := NewPathModel()
+	m.now = func() time.Time { return now }
+	m.Report(1, Observation{ObservedSamples: 3000, Arrival: 0.6})
+	m.Report(2, Observation{ObservedSamples: 1000, Arrival: 1})
+	m.Report(3, Observation{ObservedSamples: 5000})
+	if got := m.Current().Arrival; got < 0.699 || got > 0.701 {
+		t.Fatalf("pooled arrival %.3f, want 0.7", got)
+	}
+	now = now.Add(time.Minute)
+	if got := m.Current().Arrival; got < 0.699 || got > 0.701 {
+		t.Fatalf("arrival after the members went quiet %.3f, want the remembered 0.7", got)
+	}
+	now = now.Add(11 * time.Minute)
+	if got := m.Current().Arrival; got != 0 {
+		t.Fatalf("arrival %.3f survived knowledgeLifetime", got)
+	}
+}

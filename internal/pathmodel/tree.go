@@ -210,6 +210,11 @@ func combine(states []State) State {
 		if s.RoundTrip > out.RoundTrip {
 			out.RoundTrip = s.RoundTrip
 		}
+		// The least compensation any node has earned: a segment that refused it
+		// is a segment where sending more did not deliver more.
+		if s.Arrival > out.Arrival {
+			out.Arrival = s.Arrival
+		}
 		// A node that has not measured enough may not be the reason a flow is
 		// capped. Without this rule the first flow to a new destination is
 		// throttled by a leaf that has seen nothing, which is the failure this

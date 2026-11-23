@@ -236,9 +236,10 @@ func TestAJoiningSenderStartsWithTheWindowItsRateImplies(t *testing.T) {
 			"with a %d-byte window, no better than an unseeded %d",
 			rate, roundTrip, seeded.GetCongestionWindow(), fresh.GetCongestionWindow())
 	}
-	// The outer window holds one RTT of the joining lane's wire budget.
-	// Each conversion to an integer byte count can round down.
-	want := quiccongestion.ByteCount(model.Current().Seed * roundTrip.Seconds())
+	// The window it should hold is a round trip of what it will put on the
+	// wire, which on an erasing path is its delivered share over the arrival
+	// rate. Each conversion to an integer byte count can round down.
+	want := quiccongestion.ByteCount(model.Current().Seed / (1 - 0.42) * roundTrip.Seconds())
 	if got := seeded.GetCongestionWindow(); got < want-3 || got > want+3 {
 		t.Errorf("window %d against a bandwidth-delay product of %d", got, want)
 	}

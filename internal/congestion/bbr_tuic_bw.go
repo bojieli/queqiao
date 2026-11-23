@@ -62,8 +62,15 @@ type tuicBandwidthEstimator struct {
 	appLimited        bool
 	endAppLimitedAt   quiccongestion.PacketNumber
 	maxFilter         tuicMinMax
-	ackedAtWindow     uint64
-	packetStates      map[quiccongestion.PacketNumber]tuicPacketState
+	// measured is the same filter fed only by this sender's own delivery
+	// samples. maxFilter also holds seeds -- a rate inherited from the shared
+	// path model, or a peak restored after idle -- which are hypotheses the
+	// sender paces from but has not observed. What it reports back to the
+	// pool must be what it observed, or a joining lane hands the pool its own
+	// seed and the pool counts it as new delivery.
+	measured      tuicMinMax
+	ackedAtWindow uint64
+	packetStates  map[quiccongestion.PacketNumber]tuicPacketState
 	// lowestState is the smallest packet number that may still be present in
 	// packetStates. Packet numbers only increase, so it turns removeObsolete
 	// from a scan of everything in flight into a walk of what is actually
@@ -110,6 +117,7 @@ func newTUICBandwidthEstimator() tuicBandwidthEstimator {
 		lastSentPacket:  quiccongestion.PacketNumber(-1),
 		endAppLimitedAt: quiccongestion.PacketNumber(-1),
 		maxFilter:       newTUICMinMax(),
+		measured:        newTUICMinMax(),
 		packetStates:    make(map[quiccongestion.PacketNumber]tuicPacketState),
 	}
 }
@@ -400,6 +408,13 @@ func (e *tuicBandwidthEstimator) onAckBatch(eventTime monotime.Time, acked []qui
 		}
 		e.maxFilter.updateMax(round, eventTime, result.maxBandwidth)
 	}
+	if result.maxBandwidth > 0 &&
+		(!result.sampleAppLimited || result.maxBandwidth > e.measured.get() || e.measured.stale(eventTime)) {
+		if result.minRTT > 0 {
+			e.measured.setRoundTrip(result.minRTT)
+		}
+		e.measured.updateMax(round, eventTime, result.maxBandwidth)
+	}
 	return result
 }
 
@@ -431,6 +446,7 @@ func (e *tuicBandwidthEstimator) onAck(now monotime.Time, bytes, round uint64, a
 		// packet numbers, and carry no event time; a zero leaves the sample on
 		// the round clock alone.
 		e.maxFilter.updateMax(round, monotime.Time(0), minUint64(sendRate, ackRate))
+		e.measured.updateMax(round, monotime.Time(0), minUint64(sendRate, ackRate))
 	}
 }
 
@@ -474,6 +490,10 @@ func (e *tuicBandwidthEstimator) bytesAckedThisWindow() uint64 {
 func (e *tuicBandwidthEstimator) endAcks() { e.ackedAtWindow = e.totalAcked }
 
 func (e *tuicBandwidthEstimator) estimate() uint64 { return e.maxFilter.get() }
+
+// measuredEstimate is the windowed maximum of this sender's own delivery
+// samples, with no seed in it; zero until the first sample arrives.
+func (e *tuicBandwidthEstimator) measuredEstimate() uint64 { return e.measured.get() }
 
 // sampleSummary is the shape of the samples the estimate is built from: how
 // many, their mean, the widest one, and the interval and delivery behind that
