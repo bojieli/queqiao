@@ -3,6 +3,7 @@ package pep
 import (
 	"io"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,19 +44,32 @@ func TestCase4APolicedPathIsBoundedNotRunaway(t *testing.T) {
 
 	payload := make([]byte, 256*1024)
 	rand.New(rand.NewSource(29)).Read(payload)
+	// echoed counts bytes as they come back and exchanges counts whole
+	// round trips, so the collapse check below can read what was delivered
+	// late in the run rather than the controller's peaks, which a sender that
+	// cleared them at startup and then stalled would still pass.
+	var echoed, exchanges atomic.Int64
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		echo := countingReader{r: conn, n: &echoed}
 		for i := 0; i < 8; i++ {
 			if _, err := conn.Write(payload); err != nil {
 				return
 			}
 			got := make([]byte, len(payload))
-			if _, err := io.ReadFull(conn, got); err != nil {
+			if _, err := io.ReadFull(echo, got); err != nil {
 				return
 			}
+			exchanges.Add(1)
 		}
 	}()
+	type progress struct {
+		at     time.Duration
+		echoed int64
+	}
+	start := time.Now()
+	samples := []progress{{0, 0}}
 
 	var peakPacing, peakBandwidth uint64
 	var lanes int64
@@ -73,6 +87,7 @@ func TestCase4APolicedPathIsBoundedNotRunaway(t *testing.T) {
 			measuring = false
 		case <-time.After(2 * time.Second):
 		}
+		samples = append(samples, progress{time.Since(start), echoed.Load()})
 		s := lastClient.Metrics().Snapshot()
 		if s.QUICControllerPacingRate > peakPacing {
 			peakPacing = s.QUICControllerPacingRate
@@ -104,6 +119,24 @@ func TestCase4APolicedPathIsBoundedNotRunaway(t *testing.T) {
 		shaped, peakPacing, float64(peakPacing)/shaped,
 		peakBandwidth, float64(peakBandwidth)/shaped,
 		maxQueue.Round(time.Millisecond), maxBrake, lastLoss, lanes, lastMode)
+	// Goodput over the later half of the run: from the first sample at or
+	// after its midpoint to its end, whether that end was the deadline or the
+	// last exchange completing.
+	end := samples[len(samples)-1]
+	mid := end
+	for _, sample := range samples {
+		if sample.at >= end.at/2 {
+			mid = sample
+			break
+		}
+	}
+	var lateGoodput float64
+	if end.at > mid.at {
+		lateGoodput = float64(end.echoed-mid.echoed) / (end.at - mid.at).Seconds()
+	}
+	t.Logf("echoed %d bytes in %d of 8 exchanges over %v; from %v on, %.0f B/s (%.2fx)",
+		end.echoed, exchanges.Load(), end.at.Round(time.Millisecond), mid.at.Round(time.Millisecond),
+		lateGoodput, lateGoodput/shaped)
 	t.Logf("queue observation: smoothed RTT %v, controller minimum %v; %d valid samples, %d pending baselines",
 		maxQueueSmoothed, maxQueueMin, validQueueSamples, pendingQueueSamples)
 	if validQueueSamples == 0 {
@@ -113,22 +146,41 @@ func TestCase4APolicedPathIsBoundedNotRunaway(t *testing.T) {
 	if peakPacing == 0 {
 		t.Skip("the flow never got going, so this run measured nothing")
 	}
-	// Measured locally over fifteen runs (docs/CONTROL-REDESIGN.md): the
-	// estimate peaked at 1.0-2.0x the policer and pacing at 3.2-7.6x, pacing
-	// being the estimate times the startup gain and any erasure compensation.
-	// The upper bounds leave headroom for scheduling noise and still fail
-	// the feedback runaway by three orders of magnitude; the lower bounds fail
-	// a sender that stalled or collapsed instead.
+	// Runaway is a property of the controller's peaks. Measured locally over
+	// 32 runs (docs/CONTROL-REDESIGN.md) the estimate peaked at 1.0-2.0x the
+	// policer and pacing at 3.1-8.6x, pacing being the estimate times the
+	// startup gain and any erasure compensation. The bounds leave headroom
+	// for scheduling noise and still fail main's runaway by three orders of
+	// magnitude.
 	estimate, pacing := float64(peakBandwidth)/shaped, float64(peakPacing)/shaped
 	if estimate > 3 || pacing > 12 {
 		t.Errorf("controller rates ran away on a %d B/s policer: estimate %.1fx, pacing %.1fx", shaped, estimate, pacing)
 	}
-	if estimate < 0.5 || pacing < 0.5 {
-		t.Errorf("controller rates collapsed on a %d B/s policer: estimate %.2fx, pacing %.2fx", shaped, estimate, pacing)
+	// Collapse is not: a sender can clear any peak threshold at startup and
+	// then stall. So it is judged by what came back over the later half of
+	// the run. The exchanges are sequential, a write and then its echo, so
+	// this never approaches the policer's rate: over 24 local runs it was
+	// 0.17-0.35x, two to three exchanges' worth. 0.1x fails a sender that
+	// finished fewer than about one and a half exchanges in that half.
+	if lateGoodput < 0.1*shaped {
+		t.Errorf("delivery collapsed on a %d B/s policer: %.0f B/s (%.2fx) echoed from %v to %v",
+			shaped, lateGoodput, lateGoodput/shaped, mid.at.Round(time.Millisecond), end.at.Round(time.Millisecond))
 	}
 	if maxQueue > 50*time.Millisecond || maxBrake > 0 {
 		t.Errorf("a policer produced %v of queue and a brake of %.4f; if it now queues, this "+
 			"is no longer the unbraked case and the design document should say so",
 			maxQueue, maxBrake)
 	}
+}
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (c countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n.Add(int64(n))
+	return n, err
 }

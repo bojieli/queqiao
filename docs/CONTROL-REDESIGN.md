@@ -258,6 +258,17 @@ it by sample count and keeps it as path knowledge, and a joiner starts its
 gate, and its pre-gate pacing, from that earned value. Anything further is
 earned round by round as before.
 
+Two details keep that from becoming a ratchet (both found in review). The
+gate judges a step by whether delivery rose since the last one, from a
+baseline of zero; a seeded joiner's estimate is above zero before it has
+delivered anything, so the first round after an ACK granted a step for the
+seed itself, the lane reported it as earned, and the next replacement
+inherited it and stepped again. The seeded estimate is now the gate's
+baseline. And while siblings have measured loss but none has decided any
+compensation (`Arrival` zero), a joiner publishes the measured erasure for
+the code but paces and sizes its window uncompensated; reading 1-Erasure
+there paced 6.7x the seed at 85% loss on nothing anyone had earned.
+
 The decision, then: **seed unscaled, report only measured delivery, inherit
 earned compensation rather than raw erasure.**
 
@@ -283,6 +294,7 @@ go test ./internal/congestion -run '^$' -bench '^BenchmarkJoiningLaneSeed$' -ben
 | This, 42% erasure | 1.000 | 0 | 4.974 / 2.155 | 4.974 / 2.155 |
 | This, 85% (floor) | 1.000 | 0 | 19.23 / 8.333 | 19.23 / 8.333 |
 | This, 42% policer (earned 1) | 1.000 | 0 | 2.885 / 1.250 | 2.885 / 1.250 |
+| This, 85% loss, nothing earned yet | 1.000 | 0 | 2.885 / 1.250 | 2.885 / 1.250 |
 
 The first draft's "2.885 everywhere" was measured before the gate. After it,
 an uncapped joiner is now at startup gain / arrival, and stays there through
@@ -304,12 +316,23 @@ in units of the policer's sustained rate, not throughput.
 | First draft (seed x arrival, report estimate) | 4 | 2.9-4.0 | 1.0-1.2 | 14.5-23.1% |
 | Unscaled seed, measured report, gate reset to none | 4 | 3.0-4.3 | 1.1-1.6 | 13.3-15.4% |
 | Unscaled seed, measured report, gate from 1-Erasure | 6 | 4.2-11.5 | 1.1-1.9 | 16.4-25.5% |
-| This (gate from earned compensation) | 15 | 3.2-7.6 | 1.0-2.0 | 13.9-22.3% |
+| Gate from earned compensation (`ec51b2b`) | 23 | 3.0-7.6 | 1.0-2.0 | 13.0-22.3% |
+| This (plus seeded gate baseline, no pacing on unearned loss) | 32 | 3.1-8.6 | 1.0-2.0 | 12.9-22.0% |
 
-The queue stayed at or under 27 ms and the delay brake at zero in every run:
-a policer is still unbraked. The test asserts the estimate within 0.5-3x and
-pacing within 0.5-12x of the policer rate, so a runaway like main's and a
-collapse both fail, and keeps the queue and brake check.
+The delay brake stayed at zero in every run: a policer is still unbraked. The
+queue stayed at or under 27 ms in every `ec51b2b` run and in 29 of the 32
+final runs; three final runs read 80-95 ms (smoothed RTT 380-397 ms against a
+300 ms minimum) and failed the queue check, none of them in an interleaved
+batch of eight runs per arm. Whether that is the change or host scheduling is
+not settled by this sample.
+
+The test asserts a peak estimate under 3x and peak pacing under 12x of the
+policer rate, which main's runaway fails by three orders of magnitude. A
+collapse is judged by delivery instead, since a sender can clear a peak at
+startup and then stall: the bytes echoed over the later half of the run must
+be at least 0.1x the policer rate. The exchanges are sequential, so this is
+far below line rate; over 24 runs it was 0.17-0.35x. The queue and brake
+check is unchanged.
 
 The gate-reset variant is the gentlest on the policer, and it is the one
 that collapses a joining lane on an erasure channel, which this test cannot
