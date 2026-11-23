@@ -603,7 +603,8 @@ func TestAJoinedLanesFloorFollowsAPathWhoseErasureRose(t *testing.T) {
 	probe.Erasure, probe.Arrival = 0.05, 1
 	sender := NewErasureSenderOn(1200, probe)
 	sender.endRamp()
-	sender.poolSamples = 5000
+	sender.rampBurst = 3
+	sender.poolSamples, sender.poolBurst = 5000, 1
 	sender.erasure.Store(uint64(0.30 * partsPerMillion))
 	grant := func() float64 {
 		sender.inner.round++
@@ -620,6 +621,9 @@ func TestAJoinedLanesFloorFollowsAPathWhoseErasureRose(t *testing.T) {
 	sender.rampGate(start.Add(floorRebaseAfter), nil, nil)
 	if got := sender.rampFloor; got != 0.30 {
 		t.Fatalf("after a whole window above it, the floor is still %.3f", got)
+	}
+	if got := sender.rampBurst; got != 1 {
+		t.Fatalf("the rebased floor kept a burst factor of %.1f", got)
 	}
 	if got := grant(); got >= 1 {
 		t.Fatal("against the rebased floor, a round that delivered more was refused compensation")

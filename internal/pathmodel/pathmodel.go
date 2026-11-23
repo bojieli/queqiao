@@ -299,7 +299,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	}
 
 	var state State
-	var observed, effective, sum float64
+	var observed, spread, sum float64
 	var erasureWeighted, burstWeighted float64
 	var arrival arrivalPool
 	live := 0
@@ -316,7 +316,9 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		erasureWeighted += other.erasure * other.observed
 		burstWeighted += other.burst * other.observed
 		observed += other.observed
-		effective += other.effective
+		if other.effective > 0 {
+			spread += other.observed * other.observed / other.effective
+		}
 		if other.roundTrip > 0 && (state.RoundTrip == 0 || other.roundTrip < state.RoundTrip) {
 			state.RoundTrip = other.roundTrip
 		}
@@ -325,6 +327,15 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		state.Erasure = erasureWeighted / observed
 		state.BurstFactor = burstWeighted / observed
 		m.knowledge.erasure, m.knowledge.burst = state.Erasure, state.BurstFactor
+		// The estimate is weighted by lifetime counts, so its precision is
+		// that of a weighted mean of members each resting on its effective
+		// count: Kish's effective sample size, (sum w)^2 / sum(w^2/n). An old
+		// lane that dominates the weights is not made more precise by the
+		// new lanes' samples beside it.
+		effective := 0.0
+		if spread > 0 {
+			effective = observed * observed / spread
+		}
 		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, effective
 		state.ErasureSamples = effective
 	} else if m.knowledge.erasureKnown {
@@ -397,7 +408,7 @@ func (m *PathModel) Current() State {
 	now := m.clock()
 	m.expireKnowledgeLocked(now)
 	var state State
-	var observed, effective, bottleneck float64
+	var observed, spread, bottleneck float64
 	var erasureWeighted, burstWeighted float64
 	var arrival arrivalPool
 	live := 0
@@ -411,7 +422,9 @@ func (m *PathModel) Current() State {
 		erasureWeighted += entry.erasure * entry.observed
 		burstWeighted += entry.burst * entry.observed
 		observed += entry.observed
-		effective += entry.effective
+		if entry.effective > 0 {
+			spread += entry.observed * entry.observed / entry.effective
+		}
 		if entry.roundTrip > 0 && (state.RoundTrip == 0 || entry.roundTrip < state.RoundTrip) {
 			state.RoundTrip = entry.roundTrip
 		}
@@ -420,6 +433,15 @@ func (m *PathModel) Current() State {
 		state.Erasure = erasureWeighted / observed
 		state.BurstFactor = burstWeighted / observed
 		m.knowledge.erasure, m.knowledge.burst = state.Erasure, state.BurstFactor
+		// The estimate is weighted by lifetime counts, so its precision is
+		// that of a weighted mean of members each resting on its effective
+		// count: Kish's effective sample size, (sum w)^2 / sum(w^2/n). An old
+		// lane that dominates the weights is not made more precise by the
+		// new lanes' samples beside it.
+		effective := 0.0
+		if spread > 0 {
+			effective = observed * observed / spread
+		}
 		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, effective
 		state.ErasureSamples = effective
 	} else if m.knowledge.erasureKnown {

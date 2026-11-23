@@ -160,6 +160,7 @@ type ErasureSender struct {
 	// rampBurst is the pool's measured burst factor when this lane joined,
 	// and lastGate when the gate last ran; see aboveTheFloor and rebaseFloor.
 	rampBurst float64
+	poolBurst float64
 	lastGate  monotime.Time
 }
 
@@ -512,7 +513,7 @@ func (e *ErasureSender) rebaseFloor(now monotime.Time) {
 	if now.Sub(e.poolAboveSince) >= floorRebaseAfter {
 		e.rampFloor = float64(e.erasure.Load()) / partsPerMillion
 		e.rampFloorN = e.poolSamples
-		e.rampBurst = math.Max(e.rampBurst, 1)
+		e.rampBurst = math.Max(e.poolBurst, 1)
 		e.poolAboveSince = 0
 	}
 }
@@ -944,7 +945,7 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))
 		e.share.Store(uint64(state.Share))
-		e.poolSamples = state.ErasureSamples
+		e.poolSamples, e.poolBurst = state.ErasureSamples, state.BurstFactor
 		e.rampGate(eventTime, acked, lost)
 	}
 	// The compensation rides on the measurement rather than on a floor biased

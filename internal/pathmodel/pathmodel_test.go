@@ -313,3 +313,14 @@ func TestErasureSamplesAreTheEstimatorsEffectiveCount(t *testing.T) {
 		t.Fatalf("erasure samples %.0f, observed %.0f; want 8000 and 2000000", state.ErasureSamples, state.ObservedSamples)
 	}
 }
+
+// An old lane that dominates the pooled erasure's weights is not made more
+// precise by new lanes' samples beside it.
+func TestErasureSamplesFollowTheWeightsBehindTheEstimate(t *testing.T) {
+	m := NewPathModel()
+	m.Report(1, Observation{Erasure: 0.15, BurstFactor: 1, ObservedSamples: 1e6, ErasureSamples: 100, Delivered: 1e6})
+	state := m.Report(2, Observation{Erasure: 0.15, BurstFactor: 1, ObservedSamples: 8000, ErasureSamples: 8000, Delivered: 1e6})
+	if state.ErasureSamples > 200 {
+		t.Fatalf("an estimate weighted 99%% by a lane resting on 100 samples claims %.0f", state.ErasureSamples)
+	}
+}
