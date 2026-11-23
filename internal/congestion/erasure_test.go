@@ -227,7 +227,8 @@ func TestAJoiningSenderStartsFromWhatIsAlreadyKnown(t *testing.T) {
 func TestAJoiningSenderStartsWithTheWindowItsRateImplies(t *testing.T) {
 	const rate, roundTrip = 2e6, 250 * time.Millisecond
 	model := pathmodel.NewPathModel()
-	model.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: rate, RoundTrip: roundTrip})
+	// A sibling on a 42% erasure channel that has earned its compensation.
+	model.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: rate, RoundTrip: roundTrip, Arrival: 0.58})
 
 	seeded := NewErasureSenderOn(1200, model)
 	fresh := NewErasureSender(1200)

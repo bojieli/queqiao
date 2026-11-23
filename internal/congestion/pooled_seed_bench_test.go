@@ -49,11 +49,12 @@ func ackEvent(e *ErasureSender) {
 
 func BenchmarkJoiningLaneSeed(b *testing.B) {
 	// earned is the compensation the siblings were allowed: on an erasure
-	// channel the arrival rate, on a policer none at all.
+	// channel the arrival rate, on a policer none at all, and zero while no
+	// sibling has decided yet.
 	for _, tc := range []struct {
 		name         string
 		loss, earned float64
-	}{{"clean", 0, 1}, {"loss42", 0.42, 0.58}, {"arrivalFloor", 0.85, erasureMinArrival}, {"policed42", 0.42, 1}} {
+	}{{"clean", 0, 1}, {"loss42", 0.42, 0.58}, {"arrivalFloor", 0.85, erasureMinArrival}, {"policed42", 0.42, 1}, {"unearned85", 0.85, 0}} {
 		for _, cap := range []struct {
 			name  string
 			share float64
@@ -197,5 +198,92 @@ func TestAJoiningLaneReportsItsOwnDeliveryOnceMeasured(t *testing.T) {
 	lossEvent(sender)
 	if got := probe.observation.Delivered; got != measured {
 		t.Fatalf("reported %.0f, want the measured %d rather than the seed", got, measured)
+	}
+}
+
+// ackedRound sends a flight and acknowledges it, losing the given fraction,
+// through the real callbacks: an ACK past the round's end is what advances the
+// inner round, and only the next event sees it, because the compensation gate
+// runs before the inner controller in OnCongestionEventEx.
+func ackedRound(e *ErasureSender, next *quiccongestion.PacketNumber, packets int, loss float64) {
+	now := monotime.Now()
+	first := *next
+	for i := 0; i < packets; i++ {
+		e.OnPacketSent(now, quiccongestion.ByteCount(i*1200), *next, 1200, true)
+		*next++
+	}
+	var acked []quiccongestion.AckedPacketInfo
+	var lost []quiccongestion.LostPacketInfo
+	for i := 0; i < packets; i++ {
+		pn := first + quiccongestion.PacketNumber(i)
+		// Spread the losses evenly through the flight rather than in one run.
+		if math.Floor(float64(i+1)*loss) > math.Floor(float64(i)*loss) {
+			lost = append(lost, quiccongestion.LostPacketInfo{PacketNumber: pn, BytesLost: 1200})
+			continue
+		}
+		acked = append(acked, quiccongestion.AckedPacketInfo{PacketNumber: pn, BytesAcked: 1200, ReceivedTime: now})
+	}
+	e.OnCongestionEventEx(quiccongestion.ByteCount(packets*1200), now, acked, lost)
+}
+
+// A joiner that inherits no compensation on a lossy path must not be granted
+// a step merely because its seeded estimate is above an uninitialised
+// baseline of zero. The step would be judged against the seed, not against
+// anything this lane delivered, and it would then be reported as earned.
+func TestAJoinerIsNotGrantedCompensationForItsOwnSeed(t *testing.T) {
+	probe := &seedObservationProbe{State: pathmodel.State{Seed: 1e6, Erasure: 0.42, Arrival: 1, RoundTrip: joiningRoundTrip}}
+	sender := NewErasureSenderOn(1200, probe)
+	sender.inner.minRTT = joiningRoundTrip
+	var pn quiccongestion.PacketNumber = 1
+	start := sender.inner.round
+	for i := 0; i < 3; i++ {
+		ackedRound(sender, &pn, 20, 0.42)
+	}
+	if sender.inner.round == start {
+		t.Fatal("the test flights did not advance the inner round")
+	}
+	if got := sender.appliedArrival; got < 1 {
+		t.Fatalf("a joiner that delivered no more than its seed was granted compensation to %.3f", got)
+	}
+	if got := probe.observation.Arrival; got < 1 {
+		t.Fatalf("and reported %.3f as earned", got)
+	}
+}
+
+// Successive replacements on a path that refused compensation must not
+// ratchet it up between them, each inheriting the last one's unearned step.
+func TestReplacementLanesDoNotRatchetRefusedCompensation(t *testing.T) {
+	const sibling = pathmodel.Member(1 << 62)
+	model := pathmodel.NewPathModel()
+	model.Report(sibling, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 10, Delivered: 2e6, RoundTrip: joiningRoundTrip, Arrival: 1})
+	for join := 1; join <= 5; join++ {
+		sender := NewErasureSenderOn(1200, model)
+		sender.inner.minRTT = joiningRoundTrip
+		var pn quiccongestion.PacketNumber = 1
+		for i := 0; i < 3; i++ {
+			ackedRound(sender, &pn, 100, 0.42)
+		}
+		if got := model.Current().Arrival; got < 0.999 {
+			t.Fatalf("after replacement %d the pooled earned arrival is %.3f on a path that refused compensation", join, got)
+		}
+	}
+}
+
+// Siblings that have measured loss but not yet decided any compensation give
+// a joiner nothing to inherit. It reports the measured erasure, which sizes
+// the code, but paces and sizes its window uncompensated.
+func TestAJoinerWithNothingEarnedPacesUncompensated(t *testing.T) {
+	probe := &seedObservationProbe{State: pathmodel.State{Seed: 1e6, Erasure: 0.85, RoundTrip: joiningRoundTrip}}
+	sender := NewErasureSenderOn(1200, probe)
+	want := probe.Seed * sender.inner.highGain
+	if got := float64(sender.bandwidth()); math.Abs(got-want) > want*1e-4 {
+		t.Errorf("paces %.0f (%.2fx seed) with nothing earned, want the uncompensated %.0f", got, got/probe.Seed, want)
+	}
+	window := quiccongestion.ByteCount(probe.Seed * joiningRoundTrip.Seconds())
+	if got := sender.GetCongestionWindow(); got < window-3 || got > window+3 {
+		t.Errorf("window %d, want the uncompensated %d", got, window)
+	}
+	if got := sender.Telemetry().Erasure; math.Abs(got-0.85) > 1e-6 {
+		t.Errorf("published erasure %.3f, want the measured 0.85", got)
 	}
 }
