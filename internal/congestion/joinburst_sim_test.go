@@ -185,17 +185,26 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 		if cfg.idle > 0 && now%(100*time.Millisecond) == 0 {
 			reportIdle()
 		}
+		at := base.Add(now)
 		if len(lanes) < cfg.lanes && now >= time.Duration(len(lanes))*cfg.stagger {
 			lane := &simLane{e: NewErasureSenderOn(simPacketSize, model), next: 1}
 			// The gain cycle's phase is drawn from the clock; fix it so the run
 			// is reproducible.
 			lane.e.inner.randomState = uint64(len(lanes)+1) * 0x9e3779b97f4a7c15
 			lane.e.SetRTTStatsProvider(&lane.rtt)
+			// The seed was stamped with the wall clock; restamp it with the
+			// simulated one, or a lane joining seconds into a run starts with
+			// a seed that already looks stale.
+			if seed := lane.e.inner.estimator.maxFilter.get(); seed > 0 {
+				filter := newTUICMinMax()
+				filter.setRoundTrip(cfg.rtt)
+				filter.updateMax(lane.e.inner.round, at, seed)
+				lane.e.inner.estimator.maxFilter = filter
+			}
 			lanes = append(lanes, lane)
 			result.joined = append(result.joined, now)
 			result.rampEnded = append(result.rampEnded, -1)
 		}
-		at := base.Add(now)
 		for i, lane := range lanes {
 			if result.rampEnded[i] < 0 && lane.e.rampRound > 0 && !lane.e.ramping.Load() {
 				result.rampEnded[i] = now
@@ -385,7 +394,7 @@ func TestAJoinerBesideALaneThatFillsThePathBacksOff(t *testing.T) {
 
 func joiningProbe() *seedObservationProbe {
 	return &seedObservationProbe{State: pathmodel.State{
-		Seed: 1e6, Share: 1.25e6, Erasure: 0.15, ObservedSamples: 5000, Arrival: 0.85, RoundTrip: joiningRoundTrip,
+		Seed: 1e6, Share: 1.25e6, Erasure: 0.15, ObservedSamples: 5000, ErasureSamples: 5000, Arrival: 0.85, RoundTrip: joiningRoundTrip,
 	}}
 }
 
@@ -431,10 +440,10 @@ func TestARampEndsAtAQuarterRoundTripOfQueue(t *testing.T) {
 // closeRound hands the gate one round's outcomes and then the event that
 // closes it, with delivery still growing so that only the loss is judged.
 func closeRound(e *ErasureSender, arrived, lost int) {
-	e.rampGate(make([]quiccongestion.AckedPacketInfo, arrived), make([]quiccongestion.LostPacketInfo, lost))
+	e.rampGate(base(), make([]quiccongestion.AckedPacketInfo, arrived), make([]quiccongestion.LostPacketInfo, lost))
 	e.inner.round++
 	e.inner.estimator.measured.updateMax(e.inner.round, monotime.Time(0), uint64(e.rampDelivered*rampGrowth)+1)
-	e.rampGate(nil, nil)
+	e.rampGate(base(), nil, nil)
 }
 
 func TestARampEndsOnLossAboveTheFloorButNotOnItsNoise(t *testing.T) {
@@ -456,8 +465,10 @@ func TestARampEndsOnLossAboveTheFloorButNotOnItsNoise(t *testing.T) {
 	}
 	// A pool that has decided a handful of packets reports an erasure of zero
 	// with nothing behind it. One ordinary loss is not loss above that.
+	// The high-water mark of what the pool ever observed may belong to a
+	// member that has expired; it is not what stands behind this figure.
 	thin := joiningProbe()
-	thin.Erasure, thin.ObservedSamples = 0, 10
+	thin.Erasure, thin.ErasureSamples = 0, 10
 	sender := NewErasureSenderOn(1200, thin)
 	closeRound(sender, 63, 1)
 	if !sender.ramping.Load() {
@@ -483,39 +494,46 @@ func TestARampEndsWhenDeliveryStopsGrowing(t *testing.T) {
 	sender := NewErasureSenderOn(1200, joiningProbe())
 	sender.inner.estimator.measured.updateMax(1, monotime.Time(0), 1e6)
 	// The first round grows from nothing; the next three do not, and in each
-	// the controller held the lane back.
+	// the lane had its window in flight.
 	for round := 1; round <= rampFlatRounds+1; round++ {
 		if !sender.ramping.Load() {
 			t.Fatalf("the ramp ended after %d flat rounds, want %d", round-2, rampFlatRounds)
 		}
-		sender.CanSend(sender.GetCongestionWindow())
+		sendAt(sender, sender.GetCongestionWindow())
 		sender.inner.round++
-		sender.rampGate(nil, nil)
+		sender.rampGate(base(), nil, nil)
 	}
 	if sender.ramping.Load() {
 		t.Fatalf("delivery flat for %d rounds and the lane is still ramping", rampFlatRounds)
 	}
 }
 
+// sendAt records one packet sent with inFlight on the wire.
+func sendAt(e *ErasureSender, inFlight quiccongestion.ByteCount) {
+	e.OnPacketSent(monotime.Now(), inFlight, quiccongestion.PacketNumber(e.inner.round+1)*1000, 1200, true)
+}
+
 // A lane carrying a few requests before its bulk transfer is not probing the
-// path, and its flat rounds must not spend the ramp the transfer needs.
+// path, and its flat rounds must not spend the ramp the transfer needs --
+// even when the last packet of each request exhausts the pacer, which is
+// why the evidence is what was in flight rather than a refused poll.
 func TestRequestRoundsDoNotEndARamp(t *testing.T) {
 	sender := NewErasureSenderOn(1200, joiningProbe())
 	sender.inner.estimator.measured.updateMax(1, monotime.Time(0), 1e6)
 	for round := 0; round < 4*rampFlatRounds; round++ {
-		sender.CanSend(0)
+		sendAt(sender, 1200)
 		sender.inner.round++
-		sender.rampGate(nil, nil)
+		sender.rampGate(base(), nil, nil)
 	}
 	if !sender.ramping.Load() {
 		t.Fatal("rounds in which nothing held the lane back ended its ramp")
 	}
-	// Then the backlog arrives, the window binds, and delivery still does not
-	// grow: that is a full path.
+	// Then the backlog arrives, half the window and more is in flight, and
+	// delivery still does not grow: that is a full path.
 	for round := 0; round < rampFlatRounds; round++ {
-		sender.CanSend(sender.GetCongestionWindow())
+		sendAt(sender, sender.GetCongestionWindow())
 		sender.inner.round++
-		sender.rampGate(nil, nil)
+		sender.rampGate(base(), nil, nil)
 	}
 	if sender.ramping.Load() {
 		t.Fatal("a lane held back by its window for three flat rounds is still ramping")
@@ -575,4 +593,35 @@ func mbps(xs []float64) []string {
 		out[i] = fmt.Sprintf("%.1f", x/1e6)
 	}
 	return out
+}
+
+// The floor a lane joined with is not forever. Loss the pool measures above
+// it earns no compensation until shown otherwise, and a whole bottleneck
+// window of it shows otherwise: the path's erasure has changed.
+func TestAJoinedLanesFloorFollowsAPathWhoseErasureRose(t *testing.T) {
+	probe := joiningProbe()
+	probe.Erasure, probe.Arrival = 0.05, 1
+	sender := NewErasureSenderOn(1200, probe)
+	sender.endRamp()
+	sender.poolSamples = 5000
+	sender.erasure.Store(uint64(0.30 * partsPerMillion))
+	grant := func() float64 {
+		sender.inner.round++
+		sender.inner.estimator.maxFilter.updateMax(sender.inner.round, monotime.Time(0), sender.inner.estimator.estimate()*2)
+		return sender.compensationFor(0.70)
+	}
+	start := base()
+	for at := start; at.Sub(start) < floorRebaseAfter; at = at.Add(time.Second) {
+		sender.rampGate(at, nil, nil)
+		if got := grant(); got != 1 {
+			t.Fatalf("%v after the pool rose above the floor, compensation was granted (%.3f)", at.Sub(start), got)
+		}
+	}
+	sender.rampGate(start.Add(floorRebaseAfter), nil, nil)
+	if got := sender.rampFloor; got != 0.30 {
+		t.Fatalf("after a whole window above it, the floor is still %.3f", got)
+	}
+	if got := grant(); got >= 1 {
+		t.Fatal("against the rebased floor, a round that delivered more was refused compensation")
+	}
 }

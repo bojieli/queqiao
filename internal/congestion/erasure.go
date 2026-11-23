@@ -133,14 +133,13 @@ type ErasureSender struct {
 
 	// ramping is whether this lane is still finding its rate, and while it is
 	// the share does not cap it. See rampGate. The rest is the gate's own
-	// state: whether the controller held the lane back during the round in
-	// progress; the erasure the pool had measured when this lane joined and
+	// state: the most this lane had in flight during the round in progress; the erasure the pool had measured when this lane joined and
 	// the packets behind it, which is the floor its loss is judged against;
 	// the round it last judged; the delivery the last growth reached and how
 	// many rounds have passed without more; and the packets decided in the
 	// round in progress.
 	ramping       atomic.Bool
-	rampLimited   atomic.Bool
+	rampPeak      quiccongestion.ByteCount
 	rampFloor     float64
 	rampFloorN    float64
 	rampRound     uint64
@@ -155,6 +154,9 @@ type ErasureSender struct {
 	joined      bool
 	aboveFloor  bool
 	poolSamples float64
+	// poolAboveSince is when the pool's erasure last rose significantly above
+	// the floor, zero while it is not; see rebaseFloor.
+	poolAboveSince monotime.Time
 }
 
 type packetOutcome struct {
@@ -280,7 +282,7 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 			// erasure the pool had measured, when the pool had measured any.
 			e.ramping.Store(true)
 			e.joined = true
-			e.rampFloor, e.rampFloorN = state.Erasure, state.ObservedSamples
+			e.rampFloor, e.rampFloorN = state.Erasure, state.ErasureSamples
 			// The compensation gate judges each step by whether delivery rose
 			// since the last one. Its baseline starts at zero, and the seeded
 			// estimate is above zero without this lane having delivered
@@ -375,7 +377,7 @@ func (e *ErasureSender) deliveredRate() float64 {
 //
 // Nothing here reports a rate the lane did not measure. The pooled seed and
 // the bottleneck stay what was delivered (#73); only the cap moves.
-func (e *ErasureSender) rampGate(acked []quiccongestion.AckedPacketInfo, lost []quiccongestion.LostPacketInfo) {
+func (e *ErasureSender) rampGate(now monotime.Time, acked []quiccongestion.AckedPacketInfo, lost []quiccongestion.LostPacketInfo) {
 	if !e.joined {
 		return
 	}
@@ -394,7 +396,9 @@ func (e *ErasureSender) rampGate(acked []quiccongestion.AckedPacketInfo, lost []
 		if e.ramping.Load() {
 			e.judgeRamp()
 		}
+		e.rampPeak = 0
 	}
+	e.rebaseFloor(now)
 	e.rampArrived += uint64(len(acked))
 	e.rampLost += uint64(len(lost))
 }
@@ -402,11 +406,13 @@ func (e *ErasureSender) rampGate(acked []quiccongestion.AckedPacketInfo, lost []
 // judgeRamp ends the ramp on a closed round that lost more than the floor,
 // or on the third that tried to send faster and delivered no more.
 func (e *ErasureSender) judgeRamp() {
-	// A round only counts as flat if the lane tried to send faster than it
-	// was allowed to. One carrying a few requests is not probing anything,
-	// and calling it flat would end the ramp before the bulk transfer it was
-	// opened for has started.
-	limited := e.rampLimited.Swap(false)
+	// A round only counts as flat if the lane was sending as if it had a
+	// backlog: at some point half its window in flight. One carrying a few
+	// requests is not probing anything, and calling it flat would end the
+	// ramp before the bulk transfer it was opened for has started. A refused
+	// pacing or window poll is not that evidence: quic-go polls after the
+	// last packet of a request as readily as in the middle of a transfer.
+	limited := 2*e.rampPeak >= e.GetCongestionWindow()
 	if e.aboveFloor {
 		e.endRamp()
 		return
@@ -462,6 +468,36 @@ func (e *ErasureSender) aboveTheFloor(loss, samples float64) bool {
 func (e *ErasureSender) poolAboveFloor() bool {
 	return e.aboveTheFloor(float64(e.erasure.Load())/partsPerMillion, e.poolSamples)
 }
+
+// rebaseFloor makes the floor this lane joined with expire.
+//
+// Loss the pool measures above it is treated as the lanes' own overflow, and
+// earns no compensation, until shown otherwise. What shows otherwise is time:
+// overflow lasts only while the lanes overdrive, and the shares that let them
+// are sized from a bottleneck window that turns over in bottleneckWindow. A
+// pool still above the floor a whole window later is a path whose erasure
+// has changed, and the lane takes the pool's current figure as its floor and
+// earns compensation against it as any lane does.
+func (e *ErasureSender) rebaseFloor(now monotime.Time) {
+	if !e.poolAboveFloor() {
+		e.poolAboveSince = 0
+		return
+	}
+	if e.poolAboveSince == 0 {
+		e.poolAboveSince = now
+		return
+	}
+	if now.Sub(e.poolAboveSince) >= floorRebaseAfter {
+		e.rampFloor = float64(e.erasure.Load()) / partsPerMillion
+		e.rampFloorN = e.poolSamples
+		e.poolAboveSince = 0
+	}
+}
+
+// floorRebaseAfter is the pooled bottleneck's own window
+// (pathmodel.bottleneckWindow): the longest a share sized from an overshoot
+// can outlive it.
+const floorRebaseAfter = 10 * time.Second
 
 // endRamp hands the lane to its share, and its controller out of startup.
 //
@@ -771,15 +807,14 @@ func (e *ErasureSender) recordInFlight(bytesInFlight quiccongestion.ByteCount) {
 }
 
 func (e *ErasureSender) HasPacingBudget(now monotime.Time) bool {
-	if e.pacer.budget(now) >= e.inner.maxDatagramSize {
-		return true
-	}
-	e.rampLimited.Store(true)
-	return false
+	return e.pacer.budget(now) >= e.inner.maxDatagramSize
 }
 
 func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
 	e.pacer.sentPacket(sentTime, bytes)
+	if bytesInFlight > e.rampPeak {
+		e.rampPeak = bytesInFlight
+	}
 	e.inner.OnPacketSent(sentTime, bytesInFlight, number, bytes, retransmittable)
 }
 
@@ -788,11 +823,7 @@ func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 // channel what is on the wire is more than what will arrive.
 func (e *ErasureSender) CanSend(bytesInFlight quiccongestion.ByteCount) bool {
 	e.recordInFlight(bytesInFlight)
-	if bytesInFlight < e.GetCongestionWindow() {
-		return true
-	}
-	e.rampLimited.Store(true)
-	return false
+	return bytesInFlight < e.GetCongestionWindow()
 }
 
 func (e *ErasureSender) GetCongestionWindow() quiccongestion.ByteCount {
@@ -883,8 +914,8 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))
 		e.share.Store(uint64(state.Share))
-		e.poolSamples = state.ObservedSamples
-		e.rampGate(acked, lost)
+		e.poolSamples = state.ErasureSamples
+		e.rampGate(eventTime, acked, lost)
 	}
 	// The compensation rides on the measurement rather than on a floor biased
 	// low for pacing. Under-compensating is not the safe direction it looks

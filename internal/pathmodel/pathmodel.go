@@ -73,6 +73,7 @@ type pathKnowledge struct {
 	erasure         float64
 	burst           float64
 	erasureKnown    bool
+	erasureSamples  float64
 	observedSamples float64
 	roundTrip       time.Duration
 	// arrival is the pooled earned compensation; see State.Arrival.
@@ -171,6 +172,11 @@ type State struct {
 	// floor. It distinguishes a measured clean path from an unmeasured one
 	// without giving an untrusted zero any weight in Floor.
 	ObservedSamples float64
+	// ErasureSamples is how many packet outcomes stand behind Erasure itself:
+	// the live contributors' when any has measured, or those behind the
+	// remembered value. ObservedSamples is a high-water mark and can belong to
+	// a member that has since expired.
+	ErasureSamples float64
 	// Share is this contributor's allowance of the bottleneck in bytes per
 	// second. Zero means the contributor must not cap itself -- either because
 	// the bottleneck is not yet known, or because it is the only one here and
@@ -307,9 +313,11 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		state.Erasure = erasureWeighted / observed
 		state.BurstFactor = burstWeighted / observed
 		m.knowledge.erasure, m.knowledge.burst = state.Erasure, state.BurstFactor
-		m.knowledge.erasureKnown = true
+		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, observed
+		state.ErasureSamples = observed
 	} else if m.knowledge.erasureKnown {
 		state.Erasure, state.BurstFactor = m.knowledge.erasure, m.knowledge.burst
+		state.ErasureSamples = m.knowledge.erasureSamples
 	}
 	if state.BurstFactor < 1 {
 		// A burst factor below one is not a channel, it is an unmeasured or
@@ -399,9 +407,11 @@ func (m *PathModel) Current() State {
 		state.Erasure = erasureWeighted / observed
 		state.BurstFactor = burstWeighted / observed
 		m.knowledge.erasure, m.knowledge.burst = state.Erasure, state.BurstFactor
-		m.knowledge.erasureKnown = true
+		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, observed
+		state.ErasureSamples = observed
 	} else if m.knowledge.erasureKnown {
 		state.Erasure, state.BurstFactor = m.knowledge.erasure, m.knowledge.burst
+		state.ErasureSamples = m.knowledge.erasureSamples
 	}
 	if state.BurstFactor < 1 {
 		// A burst factor below one is not a channel, it is an unmeasured or
@@ -472,7 +482,9 @@ func (m *PathModel) Members() int {
 	if m == nil {
 		return 0
 	}
-	now := time.Now()
+	m.mu.Lock()
+	now := m.clock()
+	m.mu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	live := 0

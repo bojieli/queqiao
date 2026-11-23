@@ -374,17 +374,21 @@ of:
 - a quarter round trip of queue (`SmoothedRTT >= 1.25 x minRTT`);
 - a round losing more than the erasure the pool had measured when the lane
   joined, by three standard deviations of the two-proportion test between
-  them (`lossAboveFloor`) and by at least three packets. Both are estimates:
+  them (`lossAboveFloor`) and by at least three packets. The floor's weight
+  is `State.ErasureSamples`, the outcomes behind the current erasure, not the
+  high-water mark `ObservedSamples`, which can belong to an expired member. Both are estimates:
   a pool that has decided ten packets reports a floor of zero with nothing
   behind it, and against a fixed zero one ordinary loss would read as
   significant. Rounds, or floors, resting on fewer than 64 packets are not
   judged;
 - three rounds without a quarter's growth in the delivery this lane measured
-  itself, counting only rounds in which the window or the pacer held the lane
-  back -- BBR's own full-pipe test, minus the application-limited skip that
+  itself, counting only rounds in which it had at least half its window in
+  flight -- BBR's own full-pipe test, minus the application-limited skip that
   never let a capped lane leave startup, and minus the rounds in which a lane
-  carrying requests before its transfer was not probing anything. This is
-  what catches a policer whose drops are already the floor.
+  carrying requests before its transfer was not probing anything. (A refused
+  pacing poll is not that evidence: quic-go polls after the last packet of a
+  request too.) This is what catches a policer whose drops are already the
+  floor.
 
 When it ends, the lane takes its share and its controller leaves startup, as
 BBR would have at a full pipe. Nothing reported to the pool changes:
@@ -405,7 +409,11 @@ last round, or the pool's erasure, is significantly above the floor it joined
 with. The pool has to be read as well as the lane, because a shared tail-drop
 queue does not share its drops evenly: the lane that took its compensation
 from 0.85 to 0.43 lost at the floor itself while its siblings lost 35-50%.
-Reducing compensation is still immediate.
+Reducing compensation is still immediate. The veto expires: overflow lasts
+only while the lanes overdrive, and the shares that let them are sized from a
+ten-second bottleneck window, so a pool still above the floor a whole window
+later is a path whose erasure changed, and the lane re-bases its floor on the
+pool's current erasure and earns compensation against it as any lane does.
 
 **Simulated.** `internal/congestion/joinburst_sim_test.go` runs the real
 `ErasureSender`, its own pacer, and the real `PathModel` against a
@@ -421,6 +429,7 @@ buffer or policer dropped. #146 is its own `erasure.go` under the same test.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 18 MB/s, 170 ms, 15%, 12 ms buffer | 0.10 | 0.88 | 0 | 0.15 | 0.1 ms | 11.8 ms |
 | same, 12 s | 0.16 | 0.87 | 0 | 0.12 | 0.2 ms | 11.8 ms |
+| same, 20 s (after 10 s: caused loss 0.011) | | 0.91 | | 0.07 | | 11.7 ms |
 | same, clean (0.1%) | 0.06 | 0.88 | 0 | 0.10 | 0.1 ms | 11.8 ms |
 | same, 85 ms buffer | 0.10 | 0.88 | 0 | 0.06 | 0.1 ms | 85 ms |
 | 2.6 MB/s, 200 ms, 40%, 300 ms buffer | 0.69 | 0.92 | 0 | 0 | 202 ms | 259 ms |
@@ -431,8 +440,8 @@ buffer or policer dropped. #146 is its own `erasure.go` under the same test.
 
 The last row is #146's own regime at capacity, which this change does not
 enter: no seed, so no ramp. A late joiner beside a lane already filling the
-fast path (85 ms buffer) ends its ramp 0.66 s after joining, and caused loss
-over the rest of the run is 0.045; on #146 the first lane never filled the
+fast path (85 ms buffer) ends its ramp 0.49 s after joining, and caused loss
+over the rest of the run is under 0.001; on #146 the first lane never filled the
 path, so the comparison does not arise.
 
 The high-erasure deep-buffer rows are the path #146 improved live (queue p90
@@ -443,7 +452,8 @@ the ramp's is the lower.
 **What it does not fix.** The pooled bottleneck is a sum of per-lane windowed
 maxima, which overstates the aggregate when lanes peak at different times, as
 they do when they end their ramps a round or two apart. That is most of the
-0.12-0.15 caused loss left on the shallow buffer; the same burst into an empty
+0.12-0.15 caused loss left on the shallow buffer, concentrated in the seconds
+after the ramps end and gone once the windows turn over; the same burst into an empty
 pool, untouched here, loses 0.55. And the even split itself: one bulk lane
 beside one idle member is held to 5/8 of what it delivers, which this change
 only postpones by ramping first (simulated on the high-erasure path, 0.08 of

@@ -287,3 +287,19 @@ func TestArrivalIsPooledBySamplesAndRemembered(t *testing.T) {
 		t.Fatalf("arrival %.3f survived knowledgeLifetime", got)
 	}
 }
+
+// The samples behind the erasure are the ones behind it now, not the most the
+// path ever observed: those may belong to a member that has expired.
+func TestErasureSamplesAreTheOnesBehindTheCurrentEstimate(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Erasure: 0.1, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6})
+	now = now.Add(2 * memberIdle)
+	state := m.Report(2, Observation{Erasure: 0, BurstFactor: 1, ObservedSamples: 10, Delivered: 1e6})
+	if state.ObservedSamples != 5000 || state.ErasureSamples != 10 {
+		t.Fatalf("observed %.0f, erasure samples %.0f; want 5000 and 10", state.ObservedSamples, state.ErasureSamples)
+	}
+	if got := m.Members(); got != 1 {
+		t.Fatalf("Members reads the model's clock: %d, want 1", got)
+	}
+}
