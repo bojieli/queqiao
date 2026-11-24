@@ -360,6 +360,10 @@ class StallRelay:
 # --- SOCKS5 -----------------------------------------------------------------
 
 
+class IntegrityError(RuntimeError):
+    """Bytes arrived, but not the bytes that were sent."""
+
+
 def recv_exact(conn, length):
     data = bytearray()
     while len(data) < length:
@@ -403,7 +407,9 @@ def download(proxy_port, destinations, size, timeout, on_progress=None):
                 on_progress(received)
     elapsed = time.monotonic() - started
     if received != size or digest.hexdigest() != expected_digest(size):
-        raise RuntimeError(f"downloaded {received} of {size} bytes, digest match {digest.hexdigest() == expected_digest(size)}")
+        if received == size:
+            raise IntegrityError(f"downloaded {size} bytes that do not match what was sent")
+        raise RuntimeError(f"download ended at {received} of {size} bytes")
     return {"bytes": received, "seconds": round(elapsed, 3), "mbit_per_second": round(size * 8 / elapsed / 1e6, 1)}
 
 
@@ -424,7 +430,7 @@ def upload(proxy_port, destinations, size, timeout, on_progress=None):
         (count,) = struct.unpack("!Q", recv_exact(conn, 8))
     elapsed = time.monotonic() - started
     if count != size:
-        raise RuntimeError(f"destination received {count} of {size} bytes")
+        raise IntegrityError(f"destination received {count} of {size} bytes")
     return {"bytes": count, "seconds": round(elapsed, 3), "mbit_per_second": round(size * 8 / elapsed / 1e6, 1)}
 
 
@@ -475,12 +481,18 @@ def udp_dns(proxy_port, destinations, timeout, attempts=5):
 # --- binaries and processes -------------------------------------------------
 
 
-def build(repo, output_dir, old_ref):
+def build_new(repo, output_dir):
     binaries = output_dir / "bin"
-    binaries.mkdir(parents=True)
+    binaries.mkdir(parents=True, exist_ok=True)
     new = binaries / "queqiaod-new"
     log("building the current tree")
     subprocess.run(["go", "build", "-o", str(new), "./cmd/queqiaod"], cwd=repo, check=True)
+    return new
+
+
+def build_old(repo, output_dir, old_ref):
+    binaries = output_dir / "bin"
+    binaries.mkdir(parents=True, exist_ok=True)
     old = binaries / "queqiaod-old"
     source = pathlib.Path(tempfile.mkdtemp(prefix="queqiao-old-")) / "src"
     log(f"building {old_ref} in a temporary worktree")
@@ -490,7 +502,7 @@ def build(repo, output_dir, old_ref):
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(source)], cwd=repo, check=False, capture_output=True)
         shutil.rmtree(source.parent, ignore_errors=True)
-    return old, new
+    return old
 
 
 def version_of(binary):
@@ -625,8 +637,12 @@ def negotiated_wires(client, gateway):
     return sorted(wires)
 
 
-def lane_joins(gateway):
-    return sum(1 for record in gateway.process.records() if record.get("msg") == "lane joined")
+def lane_joins(gateway, carrier=None):
+    """Lane JOINs the gateway admitted, optionally only on one carrier."""
+    return sum(
+        1 for record in gateway.process.records()
+        if record.get("msg") == "lane joined" and (carrier is None or record.get("transport") == carrier)
+    )
 
 
 # --- the matrix --------------------------------------------------------------
@@ -643,35 +659,43 @@ PAIRINGS = (
 )
 
 
-def disrupted_transfer(client, gateway, destinations, transport, disrupt, args):
+def disrupted_transfer(client, gateway, destinations, direction, carrier, disrupt, args):
     """A transfer disrupted partway through, which a lane JOIN must rescue.
 
-    A failure is returned rather than raised, so it can be compared with what
-    the released build does against its own gateway.
+    The JOIN must be admitted after the disruption and on carrier, the one the
+    rescue is supposed to use. A failure is returned rather than raised, with
+    the phase it happened in, so it can be compared with what the released
+    build does against its own gateway: only a failure to be rescued is ever
+    excused, never one before the disruption or a corrupted transfer.
     """
-    joins_before = lane_joins(gateway)
-    applied = []
+    applied = {}
 
     def at(progress):
         if not applied and progress >= args.stall_after_mib << 20:
+            applied["joins"] = lane_joins(gateway, carrier)
             disrupt()
-            applied.append(time.monotonic())
+            applied["at"] = time.monotonic()
 
     size = args.stall_mib << 20
-    direction = "download" if transport == "quic" else "upload"
+    outcome = {"direction": direction, "carrier": carrier}
     try:
         if direction == "download":
-            outcome = download(client.socks, destinations, size, args.timeout, at)
+            outcome.update(download(client.socks, destinations, size, args.timeout, at))
         else:
-            outcome = upload(client.socks, destinations, size, args.timeout, at)
+            outcome.update(upload(client.socks, destinations, size, args.timeout, at))
         if not applied:
-            raise RuntimeError("the transfer finished before the disruption was applied")
-        outcome["lane_joins"] = lane_joins(gateway) - joins_before
+            outcome.update(phase="setup", error="the transfer finished before the disruption was applied")
+            return outcome
+        outcome["lane_joins"] = lane_joins(gateway, carrier) - applied["joins"]
         if outcome["lane_joins"] < 1:
-            raise RuntimeError("the disrupted flow completed without a lane joining it")
+            outcome.update(phase="rescue", error=f"the flow completed without a {carrier} lane joining it after the disruption")
+    except IntegrityError as error:
+        outcome.update(phase="integrity", error=str(error))
     except Exception as error:  # noqa: BLE001 - compared with the baseline
-        outcome = {"error": f"{type(error).__name__}: {error}", "lane_joins": lane_joins(gateway) - joins_before}
-    outcome["direction"] = direction
+        outcome["phase"] = "rescue" if applied else "setup"
+        outcome["error"] = f"{type(error).__name__}: {error}"
+        if applied:
+            outcome["lane_joins"] = lane_joins(gateway, carrier) - applied["joins"]
     return outcome
 
 
@@ -688,11 +712,14 @@ def run_case(name, client_bin, gateway, destinations, transport, args, work):
         log(f"  {name} {transport}: download {checks['download']}")
         checks["udp_dns"] = udp_dns(client.socks, destinations, timeout)
         log(f"  {name} {transport}: UDP DNS {checks['udp_dns']}")
+        # A stalled QUIC flow is a download; a TCP one an upload, because only
+        # a client with bytes it cannot send rescues a lone TCP lane.
+        direction = "download" if transport == "quic" else "upload"
         disruptions = [("stall", gateway.relay.freeze)]
         if transport == "tcp":
             disruptions.append(("lane_cut", gateway.relay.cut))
         for check, disrupt in disruptions:
-            checks[check] = disrupted_transfer(client, gateway, destinations, transport, disrupt, args)
+            checks[check] = disrupted_transfer(client, gateway, destinations, direction, transport, disrupt, args)
             log(f"  {name} {transport}: {check} {checks[check]}")
         result["wires"] = negotiated_wires(client, gateway)
         if transport == "quic":
@@ -701,7 +728,7 @@ def run_case(name, client_bin, gateway, destinations, transport, args, work):
             auto = Client(client_bin, gateway, work / "auto", "auto")
             clients.append(auto)
             try:
-                checks["tcp_handoff"] = disrupted_transfer(auto, gateway, destinations, "quic", gateway.relay.block_udp, args)
+                checks["tcp_handoff"] = disrupted_transfer(auto, gateway, destinations, "download", "tcp", gateway.relay.block_udp, args)
             finally:
                 gateway.relay.unblock_udp()
             log(f"  {name} {transport}: tcp_handoff {checks['tcp_handoff']}")
@@ -735,11 +762,20 @@ def judge(results):
             outcome = item["checks"].get(check)
             if outcome is None or "error" not in outcome:
                 continue
-            if item["pairing"] == "old-client/old-gateway":
+            if item["pairing"] == "old-client/old-gateway" and outcome.get("phase") == "rescue":
                 outcome["baseline"] = "v0.12.1 client limitation"
                 continue
             reference = baseline.get(item["transport"], {}).get("checks", {}).get(check)
-            if item["pairing"].startswith("old-client/") and reference is not None and "error" in reference:
+            # Only a rescue the old client never achieved against its own
+            # gateway either is excused: same phase, and no more JOINs than
+            # it got there. Setup and integrity failures are never excused.
+            if (
+                item["pairing"].startswith("old-client/")
+                and outcome.get("phase") == "rescue"
+                and reference is not None
+                and reference.get("phase") == "rescue"
+                and outcome.get("lane_joins", 0) <= reference.get("lane_joins", 0)
+            ):
                 outcome["baseline"] = "fails identically against the v0.12.1 gateway"
                 continue
             item["ok"] = False
@@ -762,15 +798,19 @@ def main(arguments=None):
 
     repo = pathlib.Path(__file__).resolve().parent.parent
     output = args.output_dir.resolve()
+    names = [name for name in args.pairings.split(",") if name]
+    known = {pairing[0] for pairing in PAIRINGS}
+    unknown = sorted(set(names) - known)
+    if not names or unknown:
+        parser.error(f"--pairings must name some of {sorted(known)}; unknown: {unknown}")
+    transports = [item for item in args.transports.split(",") if item]
+    if not transports or not set(transports) <= {"tcp", "quic"}:
+        parser.error("--transports must be a non-empty subset of tcp,quic")
     if output.exists():
         parser.error(f"output directory already exists: {output}")
     output.mkdir(parents=True)
-    if args.old_binary and args.new_binary:
-        old, new = args.old_binary.resolve(), args.new_binary.resolve()
-    else:
-        old, new = build(repo, output, args.old_ref)
-        old = args.old_binary.resolve() if args.old_binary else old
-        new = args.new_binary.resolve() if args.new_binary else new
+    new = args.new_binary.resolve() if args.new_binary else build_new(repo, output)
+    old = args.old_binary.resolve() if args.old_binary else build_old(repo, output, args.old_ref)
     binaries = {"old": old, "new": new}
     versions = {kind: version_of(path) for kind, path in binaries.items()}
     for kind, text in versions.items():
@@ -781,7 +821,7 @@ def main(arguments=None):
     destinations = Destinations(args.download_mib << 20)
     results = []
     try:
-        selected = set(args.pairings.split(","))
+        selected = set(names)
         for name, client_kind, gateway_kind, want_wire in PAIRINGS:
             if name not in selected:
                 continue
@@ -790,7 +830,7 @@ def main(arguments=None):
             work.mkdir()
             gateway = Gateway(binaries[gateway_kind], work, gateway_kind)
             try:
-                for transport in args.transports.split(","):
+                for transport in transports:
                     result = run_case(name, binaries[client_kind], gateway, destinations, transport, args, work / transport)
                     result["expected_wire"] = want_wire
                     # Neither v0.12.1 end reports its wire; it has only one.
@@ -819,7 +859,7 @@ def main(arguments=None):
             return "-"
         if "error" in outcome:
             return "baseline-fail" if "baseline" in outcome else "FAIL"
-        return f"{outcome['direction']} {outcome['seconds']}s j={outcome['lane_joins']}"
+        return f"{outcome['carrier']} {outcome['seconds']}s j={outcome['lane_joins']}"
 
     print(f"{'pairing':<24} {'carrier':<7} {'wire':<4} {'download Mb/s':<13} {'udp dns':<8} {'stall':<20} {'lane cut':<20} {'tcp handoff':<20} result")
     for item in results:
@@ -839,6 +879,9 @@ def main(arguments=None):
             if "baseline" in outcome:
                 print(f"note: {item['pairing']} {item['transport']} {check}: {outcome['baseline']} ({outcome['error']})")
     failed = [item for item in results if not item["ok"]]
+    if not results:
+        print("no case ran")
+        return 1
     return 1 if failed else 0
 
 
