@@ -2393,6 +2393,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 					// The suspect lane still counts as healthy locally, so no
 					// replacement waiter will observe this flag. Close the flow
 					// to release the application on this terminal peer answer.
+					flow.noteRefusalCause(err)
 					flow.resumeRefused.Store(true)
 					c.cfg.Logger.Debug("peer cannot resume this association", "flow_id", flowID, "error", err)
 					flow.closeAll()

@@ -291,6 +291,7 @@ type multipathFlow struct {
 	// clock could not be read. Sampled at most once a second.
 	peerSuspendTotal atomic.Int64
 	peerSampledAt    atomic.Int64 // monotonic nanoseconds since started
+	peerSampledWall  atomic.Int64 // wall-clock nanoseconds at that sample
 	// suspendClock reads the cumulative suspend time; nil reads the system's.
 	suspendClock func() (time.Duration, error)
 	// capacityRefusals counts consecutive rescue rounds the peer answered

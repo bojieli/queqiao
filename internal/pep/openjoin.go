@@ -102,15 +102,26 @@ func (f *multipathFlow) readSuspendTotal() int64 {
 }
 
 func (f *multipathFlow) samplePeerSuspend() {
+	now := time.Now()
 	f.peerSuspendTotal.Store(f.readSuspendTotal())
-	f.peerSampledAt.Store(int64(time.Since(f.started)))
+	f.peerSampledAt.Store(int64(now.Sub(f.started)))
+	f.peerSampledWall.Store(now.UnixNano())
 }
 
 // notePeerHeard records that a frame arrived from the peer. The suspend clock
-// is read at most once a second: a sleep shorter than that is far below the
-// minute that matters here.
+// is read at most once a second of awake time -- a sleep shorter than that is
+// far below the minute that matters here -- and at once on the first frame
+// after a sleep. Awake time alone would miss that one: the monotonic clock
+// does not run while the host sleeps, so the first frame after waking can
+// fall inside the same second as the last one before it, and it is the
+// evidence that the session survived the sleep. The wall clock does run, so
+// wall time having moved further than awake time is the cheap signal that a
+// sleep came between (a wall-clock step only costs an extra sample).
 func (f *multipathFlow) notePeerHeard() {
-	if time.Since(f.started)-time.Duration(f.peerSampledAt.Load()) < time.Second {
+	now := time.Now()
+	awake := now.Sub(f.started) - time.Duration(f.peerSampledAt.Load())
+	wall := time.Duration(now.UnixNano() - f.peerSampledWall.Load())
+	if awake < time.Second && wall-awake < time.Second {
 		return
 	}
 	f.samplePeerSuspend()

@@ -842,6 +842,9 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	destinationDialStarted := time.Now()
 	destinationConn, err := s.cfg.DestinationPolicy.DialContext(ctx, destination)
 	if err != nil {
+		// Waiting JOINs learn of the failure first: the RESET below goes to
+		// the OPEN's own stream, which may be the one that is blocked.
+		settlePending()
 		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetDestination, "destination unavailable")})
 		s.cfg.Logger.Debug("destination dial failed", "error", err)
 		return
@@ -888,13 +891,13 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	}()
 	if err := fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}}); err != nil {
 		// The stream that carried OPEN died while the destination was being
-		// dialled. With a replacement JOIN already waiting, that is a lost
-		// lane, not a failed flow: the flow runs and the JOIN, whose own
-		// OPEN_OK tells the client the session exists, replaces the lane.
-		// With none waiting it is more likely a transport candidate the
-		// client raced and abandoned, which no JOIN will ever name, so the
-		// flow is closed rather than held for a replacement grace.
-		if !s.pendingHasWaiter(pending) {
+		// dialled. If a JOIN has asked to rescue it -- waiting now, or told
+		// "session pending" and due to retry -- that is a lost lane, not a
+		// failed flow: the flow runs for its replacement grace and the JOIN,
+		// whose own OPEN_OK tells the client the session exists, replaces the
+		// lane. If no JOIN ever named it, it is more likely a transport
+		// candidate the client raced and abandoned, so it is closed.
+		if !s.pendingRescueRequested(pending) {
 			flow.closeAll()
 			return
 		}
@@ -1437,6 +1440,10 @@ type pendingSession struct {
 	admitted bool
 	// waiters counts JOINs waiting on this OPEN; tests synchronize on it.
 	waiters atomic.Int32
+	// rescueRequested records that a matching JOIN found this OPEN, even if
+	// its own wait has since ended with "session pending" and its client is
+	// backing off before asking again.
+	rescueRequested atomic.Bool
 }
 
 type pendingOutcome int
@@ -1506,15 +1513,19 @@ func (s *Server) lookupLiveOrPending(id [16]byte, flowID uint64, principal ident
 		return s.sessions[id], nil
 	}
 	pending.waiters.Add(1)
+	pending.rescueRequested.Store(true)
 	return s.sessions[id], pending
 }
 
-// pendingHasWaiter decides, under the lock JOINs register under, whether a
-// JOIN is waiting to rescue this OPEN.
-func (s *Server) pendingHasWaiter(pending *pendingSession) bool {
+// pendingRescueRequested decides, under the lock JOINs register under,
+// whether a client has asked to rescue this OPEN: a JOIN is waiting on it now,
+// or one found it, was told "session pending", and will retry. The flow is
+// then kept for one replacement grace, the same bounded window any lost lane
+// gets; an OPEN no JOIN ever named is not kept.
+func (s *Server) pendingRescueRequested(pending *pendingSession) bool {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
-	return pending.waiters.Load() > 0
+	return pending.waiters.Load() > 0 || pending.rescueRequested.Load()
 }
 
 // awaitPendingSession waits, bounded, for a pending OPEN to be decided. Only a

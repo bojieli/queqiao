@@ -632,7 +632,10 @@ func TestCompleteLaneJoinMapsSessionPendingApartFromCapacity(t *testing.T) {
 }
 
 // A JOIN that found the pending OPEN is its waiter from that moment, and the
-// OPEN's keep-or-close decision sees it; one that has given up is not.
+// OPEN's keep-or-close decision sees it. Once its wait ends with "session
+// pending" it is no longer a waiter, but the rescue it asked for still
+// counts: its client is backing off and will ask again. An OPEN no matching
+// JOIN ever found is not kept.
 func TestPendingWaitersAreCountedFromLookupUntilTheWaitEnds(t *testing.T) {
 	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "owner"}
 	saved := pendingJoinWait
@@ -645,17 +648,161 @@ func TestPendingWaitersAreCountedFromLookupUntilTheWaitEnds(t *testing.T) {
 	if _, got := server.lookupLiveOrPending(sessionID, 4, owner); got != nil {
 		t.Fatal("a JOIN naming another flow was given the pending OPEN")
 	}
-	if server.pendingHasWaiter(pending) {
-		t.Fatal("a JOIN for another flow counts as a waiter")
+	if server.pendingRescueRequested(pending) {
+		t.Fatal("a JOIN for another flow requested a rescue")
 	}
 	_, got := server.lookupLiveOrPending(sessionID, 3, owner)
-	if !server.pendingHasWaiter(pending) {
+	if got.waiters.Load() != 1 || !server.pendingRescueRequested(pending) {
 		t.Fatal("a JOIN that found the OPEN is not yet its waiter")
 	}
 	if outcome := server.awaitPendingSession(context.Background(), got); outcome != pendingStillDialling {
 		t.Fatalf("outcome = %v", outcome)
 	}
-	if server.pendingHasWaiter(pending) {
+	if got.waiters.Load() != 0 {
 		t.Fatal("a JOIN that gave up still counts as a waiter")
+	}
+	if !server.pendingRescueRequested(pending) {
+		t.Fatal("the rescue a timed-out JOIN asked for was forgotten before its retry")
+	}
+}
+
+// Issue #159 review: the OPEN's stream dies during a slow dial; the client's
+// JOIN waits, is told "session pending", and backs off. The dial then
+// succeeds while no JOIN is waiting. The flow must still be there for the
+// retry the gateway asked for, rather than closed with a permanent refusal.
+func TestJoinRetriedAfterSessionPendingFindsTheFlow(t *testing.T) {
+	saved := pendingJoinWait
+	pendingJoinWait = 100 * time.Millisecond
+	t.Cleanup(func() { pendingJoinWait = saved })
+	release := make(chan struct{})
+	certificate, roots := testCertificate(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, ChunkSize: 4 * 1024, Logger: logger,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true, OutboundSOCKS5: heldSOCKS5(t, release)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, ChunkSize: 4 * 1024, Logger: logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.ServePacketConn(ctx, packetConn) }()
+
+	sessionID, err := session.NewSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const flowID = 78
+	payload, err := session.EncodeDestination("127.0.0.1:9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	openLane, err := client.dialJoinLane(ctx, TransportQUIC, sessionID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := openLane.fc.Write(protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeOpen, SessionID: sessionID, FlowID: flowID, Class: protocol.ClassNew,
+	}, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	var pending *pendingSession
+	for deadline := time.Now().Add(5 * time.Second); pending == nil; {
+		if pending = pendingFor(server, sessionID); pending == nil {
+			if time.Now().After(deadline) {
+				t.Fatal("the OPEN never became pending")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	_ = openLane.fc.Close()
+	_ = openLane.outer.Close()
+
+	join := func(laneID uint64) (*mpLane, error) {
+		joinCtx := context.WithValue(ctx, laneReplacementContextKey{}, laneReplacementHint{id: 0})
+		lane, err := client.dialJoinLane(joinCtx, TransportQUIC, sessionID, laneID)
+		if err != nil {
+			return nil, err
+		}
+		return client.completeLaneJoin(joinCtx, lane, flowID, 0)
+	}
+	// The first JOIN outlasts the gateway's wait and is told to retry.
+	if _, err := join(1); !errors.Is(err, errLaneJoinPending) {
+		t.Fatalf("JOIN during the slow dial = %v, want session pending", err)
+	}
+	if pending.waiters.Load() != 0 {
+		t.Fatal("the timed-out JOIN is still waiting")
+	}
+	// The dial completes while nobody is waiting; the OPEN_OK write fails.
+	close(release)
+	for deadline := time.Now().Add(5 * time.Second); pendingFor(server, sessionID) != nil; {
+		if time.Now().After(deadline) {
+			t.Fatal("the OPEN never settled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The retry finds a live flow and carries data.
+	lane, err := join(2)
+	if err != nil {
+		t.Fatalf("retried JOIN after session pending: %v", err)
+	}
+	defer lane.fc.Close()
+	if err := lane.fc.Write(protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeData, SessionID: sessionID, FlowID: flowID, Class: protocol.ClassInteractive,
+	}, Payload: []byte("ping")}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		frame, err := lane.fc.Read()
+		if err != nil {
+			t.Fatalf("replacement lane closed: %v", err)
+		}
+		if frame.Header.Type == protocol.TypeReset {
+			t.Fatalf("flow reset: %q", frame.Payload)
+		}
+		if frame.Header.Type == protocol.TypeData {
+			if string(frame.Payload) != "ping" {
+				t.Fatalf("echo = %q", frame.Payload)
+			}
+			return
+		}
+	}
+}
+
+// The first frame after a sleep is evidence the session survived it, even
+// when it arrives within a second of awake time of the previous frame.
+func TestFirstFrameAfterWakeRefreshesTheSuspendBaseline(t *testing.T) {
+	flow := newIsolationTestFlow(t, false)
+	clock := &fakeSuspendClock{}
+	flow.suspendClock = clock.read
+	flow.samplePeerSuspend()
+	// Awake time barely moves; a frame now is throttled away.
+	flow.notePeerHeard()
+	// The host sleeps 390 s: the suspend clock and the wall clock advance,
+	// the monotonic clock does not.
+	clock.total.Add(int64(390 * time.Second))
+	flow.peerSampledWall.Add(-int64(390 * time.Second))
+	if got := flow.suspendedFor(); got != 390*time.Second {
+		t.Fatalf("suspendedFor before a frame = %v", got)
+	}
+	flow.notePeerHeard()
+	if got := flow.suspendedFor(); got != 0 {
+		t.Fatalf("a frame right after waking left %v of sleep on the record", got)
+	}
+	// Without a sleep in between, the throttle still holds.
+	clock.total.Add(int64(5 * time.Second))
+	flow.notePeerHeard()
+	if got := flow.suspendedFor(); got != 5*time.Second {
+		t.Fatalf("throttled sample = %v, want the clock unread", got)
 	}
 }
