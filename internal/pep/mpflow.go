@@ -1570,9 +1570,15 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 	// A RESET closes every lane, and the path that notices first -- a lane
 	// failure waiting for its replacement, say -- may return its own error
 	// without ever reading the RESET's. The RESET is why the flow ended.
-	if err != nil && !errors.Is(err, errPeerReset) {
-		if reset := f.peerResetErr.Load(); reset != nil {
+	if reset := f.peerResetErr.Load(); reset != nil && !errors.Is(err, errPeerReset) {
+		switch {
+		case err != nil:
 			err = fmt.Errorf("%w (then %v)", *reset, err)
+		case !f.finSent.Load() || !f.remoteFinSeen.Load():
+			// The workers took their ordinary exits once the RESET closed
+			// the lanes, but the flow had not finished both ways: the RESET
+			// is how it ended.
+			err = *reset
 		}
 	}
 	return stats, err
