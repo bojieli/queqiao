@@ -247,7 +247,7 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 				if l.plan.stop > 0 && now >= l.plan.stop {
 					continue
 				}
-				fl, fn := l.e.floor()
+				fl, fn, _ := l.e.floor()
 				line += fmt.Sprintf(" %d:arr=%.2f fl=%.2f/%.0f conf=%v ramp=%v above=%v sh=%.1f est=%.1f;", i, l.e.arrivalRate(), fl, fn, l.e.ownConfirmed, l.e.ramping.Load(), l.e.aboveFloor, l.e.Share()/1e6, float64(l.e.inner.estimator.estimate())/1e6)
 			}
 			fmt.Println(line)
@@ -282,7 +282,7 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 						fmt.Printf("%v lane %d rearm share=%.0f measured=%d alone=%v\n", now, i, lane.e.Share(), lane.e.inner.estimator.measuredEstimate(), lane.e.departed)
 					}
 				} else if !ramping && simTrace {
-					fl, fn := lane.e.floor()
+					fl, fn, _ := lane.e.floor()
 					fmt.Printf("%v lane %d ramp end above=%v floor=%.3f/%.0f own=%.3f pool=%.3f srtt=%v min=%v arrival=%.3f measured=%d\n", now, i, lane.e.aboveFloor, fl, fn, lane.e.ownFloor, lane.e.rampFloor, lane.rtt.smoothed, lane.e.inner.minRTT, lane.e.arrivalRate(), lane.e.inner.estimator.measuredEstimate())
 				}
 				lane.wasRamping = ramping
@@ -540,7 +540,7 @@ func TestARampEndsAtAQuarterRoundTripOfQueue(t *testing.T) {
 // rather than being judged against one: 64 packets losing lost of them, or as
 // many more as the burst factor deflates them by.
 func primeOwnFloor(e *ErasureSender, lost int) {
-	scale := int(math.Ceil(math.Max(e.rampBurst, 1)))
+	scale := int(math.Ceil(e.laneBurst()))
 	closeRound(e, (64-lost)*scale, lost*scale)
 	if e.ownFloorN == 0 {
 		panic("the first round did not gather the lane's own floor")
@@ -986,7 +986,7 @@ func TestAStaleFloorGivesWayToTheLanesOwnRounds(t *testing.T) {
 	if !sender.ramping.Load() {
 		t.Fatal("a round losing what the lane's own first round lost ended its ramp")
 	}
-	if floor, _ := sender.floor(); math.Abs(floor-0.22) > 0.01 {
+	if floor, _, _ := sender.floor(); math.Abs(floor-0.22) > 0.01 {
 		t.Fatalf("the floor is %.3f, want the lane's own 0.22", floor)
 	}
 	// Loss that does rise with the rate still ends it.
@@ -1009,7 +1009,7 @@ func TestAFirstFlightIntoAFullQueueIsNotAFloor(t *testing.T) {
 	if sender.ownConfirmed {
 		t.Fatal("a round that delivered no more confirmed a 94% floor")
 	}
-	if floor, _ := sender.floor(); floor != 0.15 {
+	if floor, _, _ := sender.floor(); floor != 0.15 {
 		t.Fatalf("judged against %.3f, want the pool's 0.15", floor)
 	}
 }
@@ -1162,7 +1162,7 @@ func TestAThinPoolDoesNotMakeAFirstFlightAFloor(t *testing.T) {
 	probe.ErasureSamples = 10
 	sender := NewErasureSenderOn(1200, probe)
 	closeRound(sender, 4, 60)
-	if floor, n := sender.floor(); n >= rampLossSamples {
+	if floor, n, _ := sender.floor(); n >= rampLossSamples {
 		t.Fatalf("over a thin pool, the lane judges against %.3f on %.0f samples: its own unconfirmed first flight", floor, n)
 	}
 	// The joiner's first flight lost 90% of 1,000 packets; one sibling lost
@@ -1290,7 +1290,7 @@ func TestAConfirmedFloorOverAThinPoolCanRebase(t *testing.T) {
 	for at := start; at.Sub(start) <= floorRebaseAfter; at = at.Add(500 * time.Millisecond) {
 		sender.rampGate(at, acked, lost)
 	}
-	if floor, _ := sender.floor(); math.Abs(floor-0.30) > 0.001 {
+	if floor, _, _ := sender.floor(); math.Abs(floor-0.30) > 0.001 {
 		t.Fatalf("after a measured window above it, the floor is still %.3f", floor)
 	}
 }
@@ -1427,5 +1427,35 @@ func TestARoundIsDeflatedByTheLanesOwnBurstFactor(t *testing.T) {
 	closeRound(sender, 140, 60)
 	if !sender.ramping.Load() {
 		t.Fatal("60 of 200 lost in runs of 8 -- 25 trials -- ended the ramp")
+	}
+}
+
+// Telemetry reports the rate the pacer uses. A lane held at its share paces
+// at the share, and anything sized from its reported rate -- a QUIC lane's
+// admission is -- must see that, not the uncapped estimate.
+func TestTelemetryReportsTheCappedPacingRate(t *testing.T) {
+	probe := joiningProbe()
+	probe.Share = 200_000
+	sender := NewErasureSenderOn(1200, probe)
+	sender.endRamp()
+	passGate(sender)
+	if uncapped := float64(sender.inner.bandwidth()) / sender.arrivalRate(); uncapped <= 1.5*200_000 {
+		t.Fatalf("setup: the uncapped rate %.0f is not well above the share", uncapped)
+	}
+	if got := sender.Telemetry().PacingRate; got != uint64(sender.bandwidth()) {
+		t.Fatalf("telemetry reports pacing %d, the pacer uses %d", got, sender.bandwidth())
+	}
+}
+
+// A lane's own rounds are deflated by its own burst factor, not the pool's:
+// a 256-packet round lost in runs of 16 is sixteen trials, not 256, and does
+// not confirm a floor however well it matches.
+func TestALanesOwnBurstsDecideItsConfirmation(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe()) // pool burst 1
+	closeRound(sender, 48, 16)
+	sender.selfSamples, sender.selfBurst = 1000, 16
+	closeRound(sender, 192, 64)
+	if sender.ownConfirmed {
+		t.Fatal("a round of 256 packets lost in runs of 16 confirmed the lane's floor")
 	}
 }

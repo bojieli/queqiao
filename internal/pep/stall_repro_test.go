@@ -134,20 +134,18 @@ func TestFourDownloadsOnAFastLossyPath(t *testing.T) {
 
 	// Warm the pool with one small exchange, as the control connection does,
 	// then let it idle the way the live pool did between trials.
-	download := func(n int) (time.Duration, error) {
+	download := func(n int) (int64, error) {
 		conn, err := trySocksDial(socks, dest, 120*time.Second)
 		if err != nil {
 			return 0, err
 		}
 		defer conn.Close()
-		start := time.Now()
 		var hdr [8]byte
 		binary.BigEndian.PutUint64(hdr[:], uint64(n))
 		if _, err := conn.Write(hdr[:]); err != nil {
 			return 0, err
 		}
-		_, err = io.CopyN(io.Discard, conn, int64(n))
-		return time.Since(start), err
+		return io.CopyN(io.Discard, conn, int64(n))
 	}
 	if _, err := download(64 << 10); err != nil {
 		t.Fatal(err)
@@ -158,11 +156,12 @@ func TestFourDownloadsOnAFastLossyPath(t *testing.T) {
 	t.Logf("REPRO start %s", start.UTC().Format(time.RFC3339Nano))
 	var wg sync.WaitGroup
 	errs := make([]error, flows)
+	got := make([]int64, flows)
 	for i := 0; i < flows; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = download(size)
+			got[i], errs[i] = download(size)
 		}(i)
 	}
 	wg.Wait()
@@ -174,7 +173,12 @@ func TestFourDownloadsOnAFastLossyPath(t *testing.T) {
 			ok++
 		}
 	}
-	useful := float64(flows * size)
+	// What arrived, not what was asked for: a failed transfer's bytes are
+	// all it delivered.
+	useful := 0.0
+	for _, n := range got {
+		useful += float64(n)
+	}
 	sent := float64(after.QUICBytesSent - before.QUICBytesSent)
 	pk := float64(after.QUICPacketsSent - before.QUICPacketsSent)
 	lost := float64(after.QUICLossObservedPackets - before.QUICLossObservedPackets)

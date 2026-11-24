@@ -95,6 +95,10 @@ type ErasureSender struct {
 	// by its own queue from one that simply measured less.
 	delayBrake atomic.Uint64
 
+	// pacing is the rate the pacer last put on the wire, after the share and
+	// the delay brake, published for Telemetry.
+	pacing atomic.Uint64
+
 	// arrival is the last computed arrival rate, published for the pacer and
 	// the congestion window, which run outside the callback that computes it.
 	arrival atomic.Uint64 // arrival rate in parts per million
@@ -170,6 +174,7 @@ type ErasureSender struct {
 	// floor. windowArrived/windowLost are this lane's own outcomes since the
 	// pool rose above the floor; see rebaseFloor.
 	ownFloor, ownFloorN       float64
+	ownBurst                  float64
 	ownArrived, ownLost       uint64
 	ownRoundMax               uint64
 	ownConfirmed              bool
@@ -492,9 +497,21 @@ func (e *ErasureSender) gatherOwnFloor(arrived, lost uint64) {
 		e.ownRoundMax = arrived + lost
 	}
 	decided := float64(e.ownArrived + e.ownLost)
-	if decided >= rampLossSamples*math.Max(e.rampBurst, 1) {
-		e.ownFloor, e.ownFloorN = float64(e.ownLost)/decided, decided
+	if burst := e.laneBurst(); decided >= rampLossSamples*burst {
+		e.ownFloor, e.ownFloorN, e.ownBurst = float64(e.ownLost)/decided, decided, burst
 	}
+}
+
+// laneBurst is the burst factor this lane's own outcomes are deflated by: its
+// own measured one once its estimator has enough behind it, the pool's until
+// then. A floor and the rounds judged against it may come from channels with
+// different runs, and counting a run of sixteen as sixteen trials is how an
+// overflow could pass for erasure.
+func (e *ErasureSender) laneBurst() float64 {
+	if e.selfSamples >= rampLossSamples && e.selfBurst > 0 {
+		return math.Max(e.selfBurst, 1)
+	}
+	return math.Max(e.rampBurst, 1)
 }
 
 // confirmOwnFloor accepts the lane's own floor once a round sent at a higher
@@ -526,8 +543,7 @@ func (e *ErasureSender) confirmOwnFloor(arrived, lost uint64) (pending bool) {
 	if e.ownConfirmed || decided == 0 {
 		return false
 	}
-	burst := math.Max(e.rampBurst, 1)
-	n, m := decided/burst, e.ownFloorN/burst
+	n, m := decided/e.laneBurst(), e.ownFloorN/math.Max(e.ownBurst, 1)
 	loss := float64(lost) / decided
 	pooled := (loss*n + e.ownFloor*m) / (n + m)
 	deviation := math.Sqrt(pooled * (1 - pooled) * (1/n + 1/m))
@@ -564,12 +580,12 @@ func (e *ErasureSender) confirmOwnFloor(arrived, lost uint64) (pending bool) {
 // first rounds were lucky is not let off by them. An own floor that is not
 // confirmed is not used at all, even where the pool has too little to judge
 // by: it may be a first flight's overflow (see confirmOwnFloor).
-func (e *ErasureSender) floor() (rate, samples float64) {
+func (e *ErasureSender) floor() (rate, samples, burst float64) {
 	poolJudged := e.rampFloorN >= rampLossSamples
 	if e.ownConfirmed && (!poolJudged || e.ownFloor > e.rampFloor) {
-		return e.ownFloor, e.ownFloorN
+		return e.ownFloor, e.ownFloorN, math.Max(e.ownBurst, 1)
 	}
-	return e.rampFloor, e.rampFloorN
+	return e.rampFloor, e.rampFloorN, math.Max(e.rampBurst, 1)
 }
 
 // judgeRamp ends the ramp on a closed round that lost more than the floor,
@@ -633,11 +649,7 @@ func (e *ErasureSender) lossAboveFloor(arrived, lost uint64) bool {
 	}
 	// The lane's own burst factor once its estimator has enough behind it
 	// to have one, the inherited one until then.
-	burst := e.rampBurst
-	if e.selfSamples >= rampLossSamples && e.selfBurst > 0 {
-		burst = e.selfBurst
-	}
-	return e.aboveTheFloor(float64(lost)/decided, decided, burst)
+	return e.aboveTheFloor(float64(lost)/decided, decided, e.laneBurst())
 }
 
 // aboveTheFloor is the two-proportion test of a loss rate measured over
@@ -651,8 +663,7 @@ func (e *ErasureSender) aboveTheFloor(loss, samples, burst float64) bool {
 	// factor: the floor by the one measured with it, the figure under test
 	// by the one it was measured with.
 	burst = math.Max(burst, 1)
-	floorBurst := math.Max(e.rampBurst, 1)
-	floor, floorN := e.floor()
+	floor, floorN, floorBurst := e.floor()
 	samples /= burst
 	floorN /= floorBurst
 	if samples < rampLossSamples/burst || floorN < rampLossSamples/floorBurst {
@@ -1389,6 +1400,8 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 
 	e.passed.Add(uint64(len(lost)))
 	e.inner.OnCongestionEventEx(priorInFlight, eventTime, acked, lost)
+	// What the pacer will use, published for readers outside this goroutine.
+	e.pacing.Store(uint64(e.bandwidth()))
 }
 
 func (e *ErasureSender) OnRetransmissionTimeout(retransmitted bool) {
@@ -1431,6 +1444,13 @@ func (e *ErasureSender) Telemetry() ControllerTelemetry {
 	t.DelayBrake = float64(e.delayBrake.Load()) / partsPerMillion
 	arrival := e.arrivalRate()
 	t.PacingRate = uint64(float64(t.PacingRate) / arrival)
+	// The rate the pacer uses, after the share and the delay brake, once the
+	// controller has run: the inner rate over the arrival is what it would
+	// send uncapped, and a lane admitted against that (quicLaneOutstanding)
+	// could take on several times what it sends in a round trip.
+	if pacing := e.pacing.Load(); pacing > 0 {
+		t.PacingRate = pacing
+	}
 	t.CongestionWindow = uint64(float64(t.CongestionWindow) / arrival)
 	return t
 }
