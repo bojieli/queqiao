@@ -190,14 +190,16 @@ gateway's own fields (`lane_replacement_waits`, `_timeouts`, `_wait`,
 When a client has recorded a failed zero-lane recovery, its flow completion
 record includes `lane_replacement_last_failure`. The value classifies the last
 returned QUIC round or TCP replacement error: `timeout`, `peer_rejected`,
-`peer_capacity`, `open_unadmitted`, `open_failed`, `canceled`, or `other`.
+`peer_capacity`, `open_unadmitted`, `open_failed`, `open_pending`, `canceled`, or `other`.
 `open_unadmitted` is a join refused as an unknown session while the flow's own
 OPEN was still unconfirmed: the gateway never admitted the session, so nothing
 was lost. A flow
 that still fails this way ends with `peer never admitted this flow's open`
 rather than `peer does not hold this session`. `open_failed` is a join the
 gateway held for a pending OPEN that then failed, usually an unreachable
-destination. A refusal of a flow the client host slept through for longer
+destination; the flow then fails with `peer could not open this flow`.
+`open_pending` is a join the gateway held for a pending OPEN that was still
+dialling after five seconds; it is retried. A refusal of a flow the client host slept through for longer
 than a gateway holds a silent flow (its lane-loss detection plus its
 replacement grace, one minute) ends the flow with `peer dropped this session
 while this host was suspended`: the gateway ended it correctly, and it is not
@@ -239,7 +241,8 @@ that widened a healthy bundle has `replacement=false` and no `attempt`, and is
 not counted in the flow record. Every counted failure gets a line, including
 a peer refusal that ends recovery at once. The level follows `failure_kind`: `timeout`
 (a context deadline or a socket deadline on the handshake), `peer_rejected`,
-`peer_capacity`, `open_unadmitted` and `open_failed` are written at `info`, and
+`peer_capacity`, `open_unadmitted`, `open_failed` and `open_pending` are
+written at `info`, and
 `other` at `warn`. A replacement
 cancelled because the flow ended is not written, and any other cancellation is
 written only at `debug`. A failed widening join is written at `warn` with the
@@ -351,8 +354,9 @@ as a session the gateway had dropped.
 
 A gateway also remembers, for two minutes, every session it has held. A join
 for one of those is refused with `reason=session_ended` (answer `unknown
-session: session ended`); `unknown_session` now means a session it has no
-record of. An OPEN for a session it remembers ending is refused, so a late copy
+session: session ended`), but only for the device and flow that held it;
+anyone else gets `unknown_session`, which otherwise means a session the gateway
+has no record of. An OPEN for a session it remembers ending is refused, so a late copy
 of an OPEN cannot reach the destination twice.
 
 A gateway that refuses a flow open because of the opening account's own limits

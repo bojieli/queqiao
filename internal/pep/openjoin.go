@@ -31,6 +31,18 @@ var errLaneJoinOpenUnadmitted = fmt.Errorf("%w: flow open was never admitted", e
 // reopened.
 var errLaneJoinOpenFailed = fmt.Errorf("%w: flow open failed", errLaneJoinRejected)
 
+// errLaneJoinPending is the gateway still dialling the destination of the
+// OPEN this JOIN names. It is transient, and unlike the lane ceiling it says
+// nothing against trying the same JOIN again shortly.
+var errLaneJoinPending = errors.New("lane join refused: session still opening")
+
+// sessionPendingAnswer is the gateway's text for that refusal.
+const sessionPendingAnswer = "session pending"
+
+// errOpenFailed ends a flow whose OPEN the gateway saw fail, as a JOIN that
+// waited on it was told.
+var errOpenFailed = errors.New("peer could not open this flow")
+
 // errOpenNotAdmitted ends a flow whose OPEN the peer never admitted. It is reported apart from errResumeRefused,
 // whose session the peer did hold and dropped.
 var errOpenNotAdmitted = errors.New("peer never admitted this flow's open")
@@ -44,8 +56,12 @@ const sessionEndedAnswer = "session ended"
 // and it ended.
 func classifyUnadmittedRefusal(flow *multipathFlow, err error) error {
 	if err == nil || !flow.openConfirmationRequired.Load() || !errors.Is(err, errLaneJoinRejected) ||
-		errors.Is(err, errLaneJoinTCPMode) || errors.Is(err, errLaneJoinOpenFailed) || errors.Is(err, errLaneJoinOpenUnadmitted) ||
-		strings.Contains(err.Error(), sessionEndedAnswer) {
+		errors.Is(err, errLaneJoinTCPMode) || errors.Is(err, errLaneJoinOpenFailed) || errors.Is(err, errLaneJoinOpenUnadmitted) {
+		return err
+	}
+	// Only the plain "unknown session" answer says the session is not
+	// there; other protocol refusals are about the JOIN itself.
+	if text := err.Error(); !strings.Contains(text, "unknown session") || strings.Contains(text, sessionEndedAnswer) {
 		return err
 	}
 	return fmt.Errorf("%w (%w)", errLaneJoinOpenUnadmitted, err)
@@ -68,9 +84,12 @@ const suspendedSessionHold = laneDeadPathDetection + laneReplacementWait
 
 // notePeerHeard stamps the arrival of a frame from the peer.
 func (f *multipathFlow) notePeerHeard() {
-	now := time.Now()
-	f.lastPeerWall.Store(now.UnixNano())
-	f.lastPeerMono.Store(int64(now.Sub(f.started)))
+	f.peerClockOffset.Store(f.clockOffset(time.Now()))
+}
+
+// clockOffset is the wall clock minus the monotonic time since started.
+func (f *multipathFlow) clockOffset(now time.Time) int64 {
+	return now.UnixNano() - int64(now.Sub(f.started))
 }
 
 // suspendedFor is how long this host was suspended since the peer was last
@@ -84,10 +103,7 @@ func (f *multipathFlow) suspendedFor() time.Duration {
 	if f.started.IsZero() {
 		return 0
 	}
-	now := time.Now()
-	wall := time.Duration(now.UnixNano() - f.lastPeerWall.Load())
-	mono := now.Sub(f.started) - time.Duration(f.lastPeerMono.Load())
-	if gap := wall - mono; gap > 0 {
+	if gap := time.Duration(f.clockOffset(time.Now()) - f.peerClockOffset.Load()); gap > 0 {
 		return gap
 	}
 	return 0
@@ -96,6 +112,9 @@ func (f *multipathFlow) suspendedFor() time.Duration {
 // resumeRefusal is the error a flow fails with once the peer has refused to
 // resume it.
 func (f *multipathFlow) resumeRefusal() error {
+	if f.openFailed.Load() {
+		return errOpenFailed
+	}
 	if f.openUnadmitted.Load() {
 		return errOpenNotAdmitted
 	}
@@ -109,8 +128,20 @@ func (f *multipathFlow) resumeRefusal() error {
 // The JOIN's OPEN_OK proves the session exists, and the OPEN's own may never
 // come: the stream that would carry it can be the one that died.
 func (f *multipathFlow) confirmOpenByJoin() {
-	if f.openConfirmationRequired.Load() {
+	f.openConfirmMu.Lock()
+	defer f.openConfirmMu.Unlock()
+	if f.openConfirmationRequired.CompareAndSwap(true, false) {
 		f.openConfirmedByJoin.Store(true)
-		f.openConfirmationRequired.Store(false)
+	}
+}
+
+// noteRefusalCause records what a terminal JOIN refusal said about the
+// flow's OPEN, for the error the flow then fails with.
+func (f *multipathFlow) noteRefusalCause(err error) {
+	switch {
+	case errors.Is(err, errLaneJoinOpenFailed):
+		f.openFailed.Store(true)
+	case errors.Is(err, errLaneJoinOpenUnadmitted):
+		f.openUnadmitted.Store(true)
 	}
 }

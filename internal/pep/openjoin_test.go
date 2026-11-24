@@ -105,7 +105,12 @@ func TestJoinOnFailedOpenGetsDestinationRefusal(t *testing.T) {
 	sessionID := [16]byte{8}
 	pending, _ := server.beginPendingSession(sessionID, 3, owner)
 	response := joinPendingSession(server, owner, sessionID, 3)
-	time.Sleep(20 * time.Millisecond)
+	for deadline := time.Now().Add(2 * time.Second); pending.waiters.Load() == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("JOIN never waited on the pending OPEN")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	server.endPendingSession(sessionID, pending)
 	frame, ok := <-response
 	if !ok || frame.Header.Type != protocol.TypeReset || resetCode(frame.Payload) != session.ResetDestination {
@@ -221,9 +226,7 @@ func TestRefusalAfterLongSuspendIsReportedAsExpiry(t *testing.T) {
 		t.Fatalf("refusal without a suspend = %v", err)
 	}
 	heardAgo := func(d time.Duration) {
-		now := time.Now()
-		flow.lastPeerWall.Store(now.Add(-d).UnixNano())
-		flow.lastPeerMono.Store(int64(now.Sub(flow.started)))
+		flow.peerClockOffset.Store(flow.clockOffset(time.Now()) - int64(d))
 	}
 	heardAgo(30 * time.Second)
 	if err := flow.resumeRefusal(); !errors.Is(err, errResumeRefused) {
@@ -263,7 +266,7 @@ func TestEndedSessionsExpireAndStayBounded(t *testing.T) {
 	var ended endedSessions
 	start := time.Now()
 	id := [16]byte{3}
-	ended.add(id, start)
+	ended.add(id, 1, identity.Principal{}, start)
 	if !ended.contains(id, start.Add(endedSessionMemory-time.Second)) || ended.contains(id, start.Add(endedSessionMemory)) {
 		t.Fatal("ended session not remembered for exactly the memory")
 	}
@@ -271,9 +274,9 @@ func TestEndedSessionsExpireAndStayBounded(t *testing.T) {
 		var other [16]byte
 		other[0], other[1], other[2] = byte(i), byte(i>>8), byte(i>>16)
 		other[15] = 1
-		ended.add(other, start)
+		ended.add(other, 1, identity.Principal{}, start)
 	}
-	if got := len(ended.expires); got > endedSessionCapacity {
+	if got := len(ended.entries); got > endedSessionCapacity {
 		t.Fatalf("memory holds %d sessions, bound is %d", got, endedSessionCapacity)
 	}
 }
@@ -299,6 +302,18 @@ func TestEndedSessionIsNotNeverHeld(t *testing.T) {
 	}
 	if _, ok := server.beginPendingSession(flow.sessionID, flow.flowID, owner); ok {
 		t.Fatal("an OPEN for an ended session was admitted")
+	}
+	// Another device, or another flow, learns nothing about the session.
+	other := owner
+	other.DeviceID = "other"
+	for _, join := range []struct {
+		who  identity.Principal
+		flow uint64
+	}{{other, flow.flowID}, {owner, flow.flowID + 1}} {
+		answer := <-joinPendingSession(server, join.who, flow.sessionID, join.flow)
+		if strings.Contains(string(answer.Payload), sessionEndedAnswer) {
+			t.Fatalf("a JOIN by %s for flow %d was told the session ended", join.who.DeviceID, join.flow)
+		}
 	}
 	never := <-joinPendingSession(server, owner, [16]byte{0xee}, 1)
 	if strings.Contains(string(never.Payload), sessionEndedAnswer) {
@@ -514,5 +529,53 @@ func TestJoinWaitsForOpenOKEvenOnceRegistered(t *testing.T) {
 	server.endPendingSession(flow.sessionID, pending)
 	if frame, ok := <-response; !ok || frame.Header.Type != protocol.TypeOpenOK {
 		t.Fatalf("JOIN after settlement answered %+v", frame.Header)
+	}
+}
+
+func TestOpenRefusalsKeepTheirMeaning(t *testing.T) {
+	flow := newIsolationTestFlow(t, false)
+	flow.requireOpenConfirmation()
+	// Only "unknown session" says the session is not there.
+	for _, other := range []error{
+		fmt.Errorf("%w: invalid control lane replacement", errLaneJoinRejected),
+		errLaneJoinRejected,
+	} {
+		if errors.Is(classifyUnadmittedRefusal(flow, other), errLaneJoinOpenUnadmitted) {
+			t.Fatalf("%v was blamed on the open", other)
+		}
+	}
+	if !errors.Is(classifyUnadmittedRefusal(flow, fmt.Errorf("%w: unknown session", errLaneJoinRejected)), errLaneJoinOpenUnadmitted) {
+		t.Fatal("unknown session before OPEN_OK was not classified")
+	}
+	// A failed OPEN is what the flow fails with.
+	flow.noteRefusalCause(errLaneJoinOpenFailed)
+	flow.resumeRefused.Store(true)
+	if err := flow.resumeRefusal(); !errors.Is(err, errOpenFailed) {
+		t.Fatalf("failed open ended the flow with %v", err)
+	}
+	if kind := replacementFailureKind(errLaneJoinPending); kind != "open_pending" {
+		t.Fatalf("pending kind = %q", kind)
+	}
+}
+
+// "session pending" is not the lane ceiling: a client must not stop trying.
+func TestCompleteLaneJoinMapsSessionPendingApartFromCapacity(t *testing.T) {
+	client := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), HandshakeTimeout: time.Second}}
+	local, remote := net.Pipe()
+	defer remote.Close()
+	sessionID := [16]byte{6}
+	go func() {
+		fc := newFrameConn(remote)
+		if _, err := fc.Read(); err != nil {
+			return
+		}
+		_ = fc.Write(protocol.Frame{Header: protocol.Header{
+			Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: 3, Class: protocol.ClassBulk,
+		}, Payload: session.ResetPayload(session.ResetFlowLimit, sessionPendingAnswer)})
+	}()
+	lane := &authenticatedLane{fc: newFrameConn(local), outer: local, sessionID: sessionID, laneID: 1, kind: TransportQUIC}
+	_, err := client.completeLaneJoin(context.Background(), lane, 3, 0)
+	if !errors.Is(err, errLaneJoinPending) || errors.Is(err, errLaneJoinCapacity) || errors.Is(err, errLaneJoinRejected) {
+		t.Fatalf("session pending = %v", err)
 	}
 }

@@ -63,6 +63,7 @@ CLIENT = [
     client_failure(16, "last lane failed (lane 0: EOF): peer never admitted this flow's open"),
     # Route C: the gateway expired the session while the client host slept.
     client_failure(17, "last lane failed (lane 0: EOF): peer dropped this session while this host was suspended"),
+    client_failure(18, "last lane failed (lane 0: EOF): peer could not open this flow"),
     # Unrelated failure and an ordinary completion: controls.
     client_failure(14, "destination refused"),
     {"time": "2026-11-20T10:00:15Z", "msg": "local flow complete", "role": "client",
@@ -118,7 +119,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
             "timeout": 1, "peer_rejected": 1, "peer_capacity": 1, "canceled": 1, "other": 1,
         })
         self.assertEqual(report["lane_replacement_timeout_by_lanes_joined"], {"1": 9, ">1": 1, "missing": 1})
-        self.assertEqual(report["client_flows"], {"complete": 1, "failed": 16})
+        self.assertEqual(report["client_flows"], {"complete": 1, "failed": 17})
         self.assertEqual(report["skipped_lines"], {"not json": 1, "not an object": 1})
 
     def test_missing_counters_are_not_read_as_zero(self):
@@ -153,7 +154,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
         report = self.report()
         self.assertEqual(report["other_terminal_errors"], {
             MODULE.ABANDONED: 1, MODULE.RESUME_REFUSED: 1, MODULE.OPEN_NOT_ADMITTED: 1,
-            MODULE.SUSPENDED_EXPIRY: 1,
+            MODULE.SUSPENDED_EXPIRY: 1, MODULE.OPEN_FAILED: 1,
         })
         self.assertEqual(report["last_lane_death"][MODULE.ABANDONED], {"EOF": 1})
         self.assertEqual(report["last_lane_death"][MODULE.RESUME_REFUSED], {"unrecorded": 1})

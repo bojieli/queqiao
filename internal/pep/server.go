@@ -1070,7 +1070,7 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		case pendingStillDialling:
 			// Transient, and said with the code the peer already retries on:
 			// the session exists and is only slow to finish opening.
-			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinSessionPending, session.ResetFlowLimit, "session pending")
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinSessionPending, session.ResetFlowLimit, sessionPendingAnswer)
 			return
 		case pendingFailed:
 			// The OPEN this JOIN waited on failed, and the stream that carried
@@ -1087,7 +1087,7 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		// replacement grace discovering this answer and then fail the flow.
 		// The refusals below are kept apart because they send the operator
 		// to different places.
-		if s.ended.contains(sessionID, time.Now()) {
+		if s.ended.heldBy(sessionID, open.Header.FlowID, principal, time.Now()) {
 			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinSessionEnded, session.ResetProtocol, "unknown session: "+sessionEndedAnswer)
 			return
 		}
@@ -1401,7 +1401,7 @@ func (s *Server) unregisterSession(id [16]byte, flow *serverFlow) {
 	s.sessionsMu.Lock()
 	if s.sessions[id] == flow {
 		delete(s.sessions, id)
-		s.ended.add(id, time.Now())
+		s.ended.add(id, flow.flow.flowID, flow.principal, time.Now())
 	}
 	s.sessionsMu.Unlock()
 }
@@ -1415,8 +1415,11 @@ type pendingSession struct {
 	flowID    uint64
 	principal identity.Principal
 	// done is closed once the OPEN has either registered its session or
-	// failed.
-	done chan struct{}
+	// failed; admitted, written before, says which.
+	done     chan struct{}
+	admitted bool
+	// waiters counts JOINs waiting on this OPEN; tests synchronize on it.
+	waiters atomic.Int32
 }
 
 type pendingOutcome int
@@ -1458,10 +1461,14 @@ func (s *Server) endPendingSession(id [16]byte, pending *pendingSession) {
 	if s.pending[id] == pending {
 		delete(s.pending, id)
 	}
-	if s.sessions[id] == nil {
+	// The outcome is recorded before any waiter wakes: a flow admitted and
+	// already gone by the time a waiter looks is an ended session, not a
+	// failed OPEN.
+	pending.admitted = s.sessions[id] != nil
+	if !pending.admitted {
 		// An OPEN that failed is a session this gateway did hold, however
 		// briefly: it must not later be answered as never seen.
-		s.ended.add(id, time.Now())
+		s.ended.add(id, pending.flowID, pending.principal, time.Now())
 	}
 	s.sessionsMu.Unlock()
 	close(pending.done)
@@ -1484,6 +1491,7 @@ func (s *Server) awaitPendingSession(ctx context.Context, pending *pendingSessio
 	}
 	timer := time.NewTimer(pendingJoinWait)
 	defer timer.Stop()
+	pending.waiters.Add(1)
 	select {
 	case <-pending.done:
 	case <-timer.C:
@@ -1491,7 +1499,7 @@ func (s *Server) awaitPendingSession(ctx context.Context, pending *pendingSessio
 	case <-ctx.Done():
 		return pendingStillDialling
 	}
-	if s.lookupSession(id) == nil {
+	if !pending.admitted {
 		return pendingFailed
 	}
 	return pendingAdmitted

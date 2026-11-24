@@ -273,15 +273,21 @@ type multipathFlow struct {
 	// to lose. The flow then fails with errOpenNotAdmitted, which a reader
 	// of the logs must not count with sessions the peer dropped.
 	openUnadmitted atomic.Bool
+	// openFailed narrows resumeRefused the other way: the gateway held the
+	// JOIN for this flow's OPEN and saw that OPEN fail.
+	openFailed atomic.Bool
+	// openConfirmMu makes the OPEN's own OPEN_OK and a JOIN's confirmation
+	// one transition, so only the loser of the two may be accepted late.
+	openConfirmMu sync.Mutex
 	// openConfirmedByJoin records that a JOIN's OPEN_OK confirmed the flow
 	// before the OPEN's own did (issue #159).
 	openConfirmedByJoin atomic.Bool
-	// lastPeerWall and lastPeerMono are when a frame last arrived from the
-	// peer, in wall-clock nanoseconds and in monotonic time since started.
-	// Their difference against now is how long this host slept since the peer
-	// was last heard from.
-	lastPeerWall atomic.Int64
-	lastPeerMono atomic.Int64
+	// peerClockOffset is, at the last frame from the peer, the wall clock in
+	// nanoseconds minus the monotonic time since started. The same difference
+	// taken now grows by exactly how long this host slept since then. One
+	// value, so a reader never pairs one sample's wall time with another's
+	// monotonic time.
+	peerClockOffset atomic.Int64
 	// capacityRefusals counts consecutive rescue rounds the peer answered
 	// with its lane-admission ceiling. One answer is the ordinary loser of a
 	// rescue race; several in a row with no successful round between them are
@@ -521,7 +527,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 	f.idleTimeout = defaultFlowIdleTimeout
 	f.maxLifetime = defaultFlowMaxLifetime
 	f.lastActivity.Store(f.started.UnixNano())
-	f.lastPeerWall.Store(f.started.UnixNano())
+	f.peerClockOffset.Store(f.started.UnixNano())
 	f.telemetryID = nextTelemetryID.Add(1)
 	f.class.Store(uint32(protocol.ClassNew))
 	f.ackTrack = newAckTracker()
@@ -2390,6 +2396,8 @@ func replacementFailureKind(err error) string {
 		return "open_unadmitted"
 	case errors.Is(err, errLaneJoinOpenFailed):
 		return "open_failed"
+	case errors.Is(err, errLaneJoinPending):
+		return "open_pending"
 	case errors.Is(err, errLaneJoinRejected):
 		return "peer_rejected"
 	case errors.Is(err, errLaneJoinCapacity):

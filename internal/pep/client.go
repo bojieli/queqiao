@@ -1973,6 +1973,9 @@ func (c *Client) completeLaneJoin(ctx context.Context, lane *authenticatedLane, 
 		if len(response.Payload) > 1 {
 			switch session.ResetCode(response.Payload[0]) {
 			case session.ResetFlowLimit:
+				if string(response.Payload[1:]) == sessionPendingAnswer {
+					return nil, errLaneJoinPending
+				}
 				return nil, fmt.Errorf("%w: %s", errLaneJoinCapacity, string(response.Payload[1:]))
 			case session.ResetTransport:
 				return nil, fmt.Errorf("%w: %s", errLaneJoinTCPMode, string(response.Payload[1:]))
@@ -2512,9 +2515,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 						// Retrying it spends the flow's whole replacement
 						// grace learning the same thing, so record the refusal
 						// and let the flow fail now.
-						if errors.Is(err, errLaneJoinOpenUnadmitted) {
-							flow.openUnadmitted.Store(true)
-						}
+						flow.noteRefusalCause(err)
 						flow.resumeRefused.Store(true)
 						c.cfg.Logger.Debug("peer cannot resume this association", "flow_id", flowID, "error", err)
 						return
@@ -2734,9 +2735,7 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 				if errors.Is(result.err, errLaneJoinRejected) {
 					bundleDisabled = true
 					if result.stall != nil || flow.laneCount() == 0 {
-						if errors.Is(result.err, errLaneJoinOpenUnadmitted) {
-							flow.openUnadmitted.Store(true)
-						}
+						flow.noteRefusalCause(result.err)
 						flow.resumeRefused.Store(true)
 						if result.stall != nil {
 							flow.closeAll()
@@ -3007,7 +3006,7 @@ func laneRecoveryFailureLevel(manageCtx context.Context, err error) (slog.Level,
 			return 0, false
 		}
 		return slog.LevelDebug, true
-	case "timeout", "peer_rejected", "peer_capacity", "open_unadmitted", "open_failed":
+	case "timeout", "peer_rejected", "peer_capacity", "open_unadmitted", "open_failed", "open_pending":
 		return slog.LevelInfo, true
 	}
 	return slog.LevelWarn, true
