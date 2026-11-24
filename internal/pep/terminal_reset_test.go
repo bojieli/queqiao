@@ -173,6 +173,7 @@ func TestTerminalResetReasonKeepsAddressesOffTheWire(t *testing.T) {
 		{errors.Join(errors.New("last lane failed (lane 0: read udp 192.0.2.1:1->192.0.2.2:2: timeout)"), errLaneReplacementTimeout), session.ResetTransport, "flow ended: lane replacement timeout"},
 		{errReplacementAbandoned, session.ResetTransport, "flow ended: lane replacement timeout"},
 		{errFlowLifetime, session.ResetTransport, "flow ended: lifetime exceeded"},
+		{errAuthorizationRevoked, session.ResetAuthentication, "flow ended: authorization revoked"},
 		{errors.New("read tcp 192.0.2.1:1->192.0.2.2:2: i/o timeout"), session.ResetTransport, "flow ended with error"},
 	}
 	for _, c := range cases {
@@ -183,5 +184,68 @@ func TestTerminalResetReasonKeepsAddressesOffTheWire(t *testing.T) {
 		if strings.Contains(reason, "192.0.2") {
 			t.Errorf("reason %q carries an address", reason)
 		}
+	}
+}
+
+// A flow whose two FINs have both been seen is complete as far as the gateway
+// is concerned, and keeps a tombstone for the final ACK. It must not be turned
+// into a failure by a RESET, even when a timeout wins the race to close it.
+func TestCompletedFlowIsNotReset(t *testing.T) {
+	inner, application := net.Pipe()
+	defer application.Close()
+	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024,
+		protocol.FlagAckDown, protocol.FlagAckUp, nil, metrics.New())
+	flow.resetOnFailure = true
+	outer, peer := net.Pipe()
+	defer peer.Close()
+	if err := flow.addLane(&mpLane{id: 0, kind: TransportQUIC, fc: newFrameConn(outer)}); err != nil {
+		t.Fatal(err)
+	}
+	flow.finSent.Store(true)
+	flow.remoteFinSeen.Store(true)
+	sawReset := make(chan bool, 1)
+	go func() {
+		frame, err := protocol.ReadFrame(peer)
+		sawReset <- err == nil && frame.Header.Type == protocol.TypeReset
+	}()
+	flow.failClose(errFlowLifetime)
+	if <-sawReset {
+		t.Fatal("a flow with both FINs was reset")
+	}
+}
+
+// Once a failing flow has chosen the lanes it will RESET, no replacement may
+// join: it would be closed without one.
+func TestFailingFlowAdmitsNoLaneWhileResetting(t *testing.T) {
+	inner, application := net.Pipe()
+	defer application.Close()
+	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024,
+		protocol.FlagAckDown, protocol.FlagAckUp, nil, metrics.New())
+	flow.resetOnFailure = true
+	outer, peer := net.Pipe()
+	defer peer.Close()
+	if err := flow.addLane(&mpLane{id: 0, kind: TransportQUIC, fc: newFrameConn(outer)}); err != nil {
+		t.Fatal(err)
+	}
+	// The peer never reads, so the RESET write blocks for the whole bound.
+	done := make(chan struct{})
+	go func() {
+		flow.resetLanes(errFlowLifetime)
+		close(done)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for !flow.terminating.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	late, latePeer := net.Pipe()
+	defer late.Close()
+	defer latePeer.Close()
+	if err := flow.addLane(&mpLane{id: 1, kind: TransportQUIC, fc: newFrameConn(late)}); !errors.Is(err, errLaneFlowClosed) {
+		t.Fatalf("lane admitted during the RESET: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RESET to a peer that never reads was not bounded")
 	}
 }

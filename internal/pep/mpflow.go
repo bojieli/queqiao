@@ -100,6 +100,9 @@ var (
 	errFlowIdleTimeout       = errors.New("flow idle timeout")
 	errFlowLifetime          = errors.New("flow lifetime exceeded")
 	errLocalApplicationClose = errors.New("local application closed")
+	// errAuthorizationRevoked ends a gateway flow whose device or account
+	// stopped being authorized while it was open.
+	errAuthorizationRevoked = errors.New("authorization revoked")
 )
 
 type mpLane struct {
@@ -371,7 +374,12 @@ type multipathFlow struct {
 	resetOnFailure bool
 	// peerReset records that the peer ended the flow with RESET, so this end
 	// does not answer it with one of its own.
-	peerReset       atomic.Bool
+	peerReset atomic.Bool
+	// terminating is set, under lanesMu, when a failing flow takes the
+	// snapshot of lanes it will RESET. No lane is admitted after it, so a
+	// replacement cannot slip in between the RESET and the close and be
+	// closed without one.
+	terminating     atomic.Bool
 	started         time.Time
 	completionGrace time.Duration
 	// Tests shorten the bounded drain after a proven application close.
@@ -547,7 +555,7 @@ func (f *multipathFlow) validateLaneLocked(lane *mpLane) error {
 	if lane == nil || lane.fc == nil {
 		return errors.New("invalid lane")
 	}
-	if f.finished.Load() || f.doneChanClosed() {
+	if f.finished.Load() || f.terminating.Load() || f.doneChanClosed() {
 		return errLaneFlowClosed
 	}
 	if _, exists := f.lanes[lane.id]; exists {
@@ -597,7 +605,7 @@ func (f *multipathFlow) activateLane(lane *mpLane) error {
 	defer f.lanesMu.Unlock()
 	current := f.lanes[lane.id]
 	closed := lane.closed.Load()
-	if current != lane || closed || f.finished.Load() || f.doneChanClosed() {
+	if current != lane || closed || f.finished.Load() || f.terminating.Load() || f.doneChanClosed() {
 		return errors.New("staged lane is no longer available")
 	}
 	if !lane.ready.CompareAndSwap(false, true) {
@@ -3431,7 +3439,14 @@ func (f *multipathFlow) resetLanes(err error) {
 	if !f.resetOnFailure || f.peerReset.Load() || f.finished.Load() {
 		return
 	}
+	// Both directions have finished, which the gateway counts as a completed
+	// flow: it keeps a tombstone so a JOIN can still fetch the final ACK. A
+	// RESET would turn that recoverable close into a failure.
+	if f.finSent.Load() && f.remoteFinSeen.Load() {
+		return
+	}
 	f.lanesMu.Lock()
+	f.terminating.Store(true)
 	lanes := make([]*mpLane, 0, len(f.lanes))
 	for _, lane := range f.lanes {
 		if lane.fc != nil && !lane.closed.Load() {
@@ -3459,7 +3474,18 @@ func (f *multipathFlow) resetLanes(err error) {
 			_ = lane.fc.writeControlContext(ctx, frame)
 		}(lane)
 	}
-	wg.Wait()
+	// A stream without write deadlines cannot be interrupted by the context,
+	// only by closing it, and closing is what the caller does next. So the
+	// bound is enforced here rather than trusted to the writers.
+	written := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(written)
+	}()
+	select {
+	case <-written:
+	case <-ctx.Done():
+	}
 }
 
 // terminalResetReason names why a flow failed in words fit for the peer. The
@@ -3477,6 +3503,8 @@ func terminalResetReason(err error) (session.ResetCode, string) {
 		return session.ResetTransport, "flow ended: idle timeout"
 	case errors.Is(err, errFlowLifetime):
 		return session.ResetTransport, "flow ended: lifetime exceeded"
+	case errors.Is(err, errAuthorizationRevoked):
+		return session.ResetAuthentication, "flow ended: authorization revoked"
 	case expectedDestinationCloseError(err):
 		return session.ResetDestination, "flow ended: destination closed"
 	default:

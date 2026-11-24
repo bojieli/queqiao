@@ -1317,7 +1317,7 @@ func (s *Server) watchAuthorization(ctx context.Context, flow *serverFlow) {
 		select {
 		case <-ticker.C:
 			if _, err := s.cfg.Credentials.Store.Authorize(flow.principal, time.Now()); err != nil {
-				flow.flow.closeAll()
+				flow.flow.failClose(errAuthorizationRevoked)
 				return
 			}
 		case <-flow.flow.doneChan():
