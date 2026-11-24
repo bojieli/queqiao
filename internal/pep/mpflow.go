@@ -229,13 +229,16 @@ type multipathFlow struct {
 	inner          net.Conn
 	sessionID      [16]byte
 	flowID         uint64
-	chunkSize      int
-	budget         *limiter.Budget
-	metrics        *metrics.Registry
-	logger         *slog.Logger
-	memoryLimits   flowMemoryLimits
-	sendMemory     *memlimit.Budget
-	receiveMemory  *memlimit.Budget
+	// wire is the version the flow's first lane negotiated, and the one
+	// every later lane of the flow must speak. Zero means the preferred one.
+	wire          byte
+	chunkSize     int
+	budget        *limiter.Budget
+	metrics       *metrics.Registry
+	logger        *slog.Logger
+	memoryLimits  flowMemoryLimits
+	sendMemory    *memlimit.Budget
+	receiveMemory *memlimit.Budget
 
 	sendAckFlag uint16
 	recvAckFlag uint16

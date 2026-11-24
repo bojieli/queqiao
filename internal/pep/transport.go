@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,10 +35,85 @@ const (
 	TransportAuto TransportKind = "auto"
 )
 
-// defaultALPN is the data plane's negotiated protocol. It lives with the
-// wire version in internal/protocol, because bumping one without the other is
-// the failure the pairing exists to prevent.
+// defaultALPN is the data plane's preferred protocol. It lives with the wire
+// version in internal/protocol, because bumping one without the other is the
+// failure the pairing exists to prevent.
 const defaultALPN = protocol.DataALPN
+
+// parseWireVersions reads a comma-separated list of wire versions, such as
+// "2,1", keeping its order. Every entry must be a version this build speaks,
+// and none may repeat.
+func parseWireVersions(spec string) ([]byte, error) {
+	var out []byte
+	for _, field := range strings.Split(spec, ",") {
+		field = strings.TrimSpace(field)
+		parsed, err := strconv.ParseUint(field, 10, 8)
+		version := byte(parsed)
+		if err != nil || !protocol.Supported(version) {
+			return nil, fmt.Errorf("unsupported wire version %q (this build speaks %s)", field, formatWireVersions(protocol.SupportedVersions()))
+		}
+		if slices.Contains(out, version) {
+			return nil, fmt.Errorf("wire version %d is listed twice", version)
+		}
+		out = append(out, version)
+	}
+	return out, nil
+}
+
+// ParseWireVersions is parseWireVersions for the command line.
+func ParseWireVersions(spec string) ([]byte, error) { return parseWireVersions(spec) }
+
+// formatWireVersions renders versions as the comma-separated list the flags
+// take and --version prints.
+func formatWireVersions(versions []byte) string {
+	parts := make([]string, len(versions))
+	for i, v := range versions {
+		parts[i] = strconv.Itoa(int(v))
+	}
+	return strings.Join(parts, ",")
+}
+
+// FormatWireVersions is formatWireVersions for the command line.
+func FormatWireVersions(versions []byte) string { return formatWireVersions(versions) }
+
+// resolveWireVersions validates a configured version list and returns it in
+// the given order, or every version this build speaks, most preferred first,
+// when none was configured.
+func resolveWireVersions(configured []byte) ([]byte, error) {
+	if len(configured) == 0 {
+		return protocol.SupportedVersions(), nil
+	}
+	out := make([]byte, 0, len(configured))
+	for _, v := range configured {
+		if !protocol.Supported(v) {
+			return nil, fmt.Errorf("unsupported wire version %d (this build speaks %s)", v, formatWireVersions(protocol.SupportedVersions()))
+		}
+		if slices.Contains(out, v) {
+			return nil, fmt.Errorf("wire version %d is listed twice", v)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+func wireALPNs(versions []byte) []string {
+	alpns := make([]string, len(versions))
+	for i, v := range versions {
+		alpns[i] = protocol.ALPN(v)
+	}
+	return alpns
+}
+
+// checkNegotiatedWire maps the ALPN a data connection negotiated to its wire
+// version, refusing one that the local end did not offer. TLS already refuses
+// a protocol nobody offered; this also refuses a peer that negotiated none.
+func checkNegotiatedWire(alpn string, offered []byte) (byte, bool) {
+	wire, ok := protocol.VersionForALPN(alpn)
+	if !ok || !slices.Contains(offered, wire) {
+		return 0, false
+	}
+	return wire, true
+}
 
 const (
 	defaultAdaptiveMinBytesPerSec = 64 * 1024
@@ -416,11 +493,23 @@ func (c *quicStreamConn) Close() error {
 	return err
 }
 
-func tlsClientConfig(credentials identity.ClientCredentials) (*tls.Config, error) {
-	return identity.ClientTLSConfig(credentials, defaultALPN)
+func tlsClientConfig(credentials identity.ClientCredentials, wires []byte) (*tls.Config, error) {
+	if len(wires) == 0 {
+		wires = protocol.SupportedVersions()
+	}
+	return identity.ClientTLSConfigProtocols(credentials, wireALPNs(wires))
 }
 
-func dialTCP(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error) (streamConn, error) {
+// negotiatedWire reports the version the lane's QUIC connection negotiated.
+// Every stream on a connection shares it.
+func (c *quicStreamConn) negotiatedWire() (byte, bool) {
+	if c == nil || c.conn == nil {
+		return 0, false
+	}
+	return protocol.VersionForALPN(c.conn.ConnectionState().TLS.NegotiatedProtocol)
+}
+
+func dialTCP(ctx context.Context, remote string, credentials identity.ClientCredentials, wires []byte, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error) (streamConn, error) {
 	var localAddr net.Addr
 	composed := control
 	// LocalAddr and Control apply to the connection this dialer makes, never to
@@ -439,7 +528,7 @@ func dialTCP(ctx context.Context, remote string, credentials identity.ClientCred
 		composed = composeSocketControls(netbind.InterfaceControl(result.InterfaceName), control)
 		resolver = netbind.ResolverForResult(result, control)
 	}
-	tlsConfig, err := tlsClientConfig(credentials)
+	tlsConfig, err := tlsClientConfig(credentials, wires)
 	if err != nil {
 		return nil, err
 	}
@@ -454,12 +543,12 @@ func dialTCP(ctx context.Context, remote string, credentials identity.ClientCred
 		Config: tlsConfig,
 	}).DialContext(ctx, "tcp", remote)
 	if err != nil {
-		return nil, explainDataHandshakeError(remote, "TCP", err)
+		return nil, explainDataHandshakeError(remote, "TCP", wires, err)
 	}
 	tlsConn := conn.(*tls.Conn)
-	if tlsConn.ConnectionState().NegotiatedProtocol != defaultALPN {
+	if _, ok := checkNegotiatedWire(tlsConn.ConnectionState().NegotiatedProtocol, offeredWires(wires)); !ok {
 		_ = tlsConn.Close()
-		return nil, fmt.Errorf("gateway %q did not negotiate Queqiao protocol %d over TCP; check that the endpoint and server version match", remote, protocol.Version)
+		return nil, fmt.Errorf("gateway %q did not negotiate Queqiao protocol %s over TCP; check that the endpoint and server version match", remote, formatWireVersions(offeredWires(wires)))
 	}
 	return tlsConn, nil
 }
@@ -620,8 +709,8 @@ func quicConfig(windows flowWindows) *quic.Config {
 	}
 }
 
-func dialQUIC(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), ccfg congestionConfig, windows flowWindows, hop hopDialConfig) (streamConn, error) {
-	conn, packetConn, err := dialQUICConnection(ctx, remote, credentials, dialTimeout, localAddress, control, observeTransientWrite, windows, hop)
+func dialQUIC(ctx context.Context, remote string, credentials identity.ClientCredentials, wires []byte, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), ccfg congestionConfig, windows flowWindows, hop hopDialConfig) (streamConn, error) {
+	conn, packetConn, err := dialQUICConnection(ctx, remote, credentials, wires, dialTimeout, localAddress, control, observeTransientWrite, windows, hop)
 	if err != nil {
 		return nil, err
 	}
@@ -751,14 +840,14 @@ func transientRouteWriteError(err error) bool {
 // monitor for the per-port blocking pattern caused by GFW and trigger port
 // hops reactively. The mux's context is cancelled when the PacketConn is
 // closed, which stops the goroutine.
-func dialQUICConnection(ctx context.Context, remote string, credentials identity.ClientCredentials, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), windows flowWindows, hop hopDialConfig) (*quic.Conn, net.PacketConn, error) {
+func dialQUICConnection(ctx context.Context, remote string, credentials identity.ClientCredentials, wires []byte, dialTimeout time.Duration, localAddress string, control func(string, string, syscall.RawConn) error, observeTransientWrite func(error), windows flowWindows, hop hopDialConfig) (*quic.Conn, net.PacketConn, error) {
 	dialCtx := ctx
 	var cancel context.CancelFunc
 	if dialTimeout > 0 {
 		dialCtx, cancel = context.WithTimeout(ctx, dialTimeout)
 		defer cancel()
 	}
-	tlsCfg, err := tlsClientConfig(credentials)
+	tlsCfg, err := tlsClientConfig(credentials, wires)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -888,17 +977,28 @@ func dialQUICAddress(dialCtx context.Context, remote string, remoteAddr *net.UDP
 		packetConn = mux
 	}
 	packetConn = tolerateTransientRouteErrors(packetConn, observeTransientWrite)
+	offered := make([]byte, 0, len(tlsCfg.NextProtos))
+	for _, alpn := range tlsCfg.NextProtos {
+		if v, ok := protocol.VersionForALPN(alpn); ok {
+			offered = append(offered, v)
+		}
+	}
 	conn, err := quic.Dial(dialCtx, packetConn, remoteAddr, tlsCfg, quicConfig(windows))
 	if err != nil {
 		_ = packetConn.Close()
-		return nil, nil, explainDataHandshakeError(remote, "QUIC", err)
+		return nil, nil, explainDataHandshakeError(remote, "QUIC", offered, err)
+	}
+	if _, ok := checkNegotiatedWire(conn.ConnectionState().TLS.NegotiatedProtocol, offered); !ok {
+		_ = conn.CloseWithError(0, "queqiao protocol not negotiated")
+		_ = packetConn.Close()
+		return nil, nil, fmt.Errorf("gateway %q did not negotiate Queqiao protocol %s over QUIC; check that the endpoint and server version match", remote, formatWireVersions(offered))
 	}
 	return conn, packetConn, nil
 }
 
-func explainDataHandshakeError(remote, transport string, err error) error {
+func explainDataHandshakeError(remote, transport string, wires []byte, err error) error {
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no application protocol") {
-		return fmt.Errorf("gateway %q rejected Queqiao protocol %d over %s; the endpoint may still run an incompatible development server or another TLS service: %w", remote, protocol.Version, transport, err)
+		return fmt.Errorf("gateway %q rejected Queqiao protocol %s over %s; the endpoint may run a gateway that accepts none of these wire versions, an incompatible development server, or another TLS service: %w", remote, formatWireVersions(offeredWires(wires)), transport, err)
 	}
 	return err
 }
@@ -1122,6 +1222,13 @@ func acceptQUICStream(ctx context.Context, conn *quic.Conn, controller wanconges
 		stream: stream, conn: conn, controller: controller,
 		closeConn: false, bulk: connBulkPath(conn, 0),
 	}, nil
+}
+
+func offeredWires(wires []byte) []byte {
+	if len(wires) == 0 {
+		return protocol.SupportedVersions()
+	}
+	return wires
 }
 
 func transportError(kind TransportKind, err error) error {

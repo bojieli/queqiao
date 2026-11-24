@@ -230,7 +230,7 @@ func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtim
 		FlowIdleTimeout: opts.flowIdleTimeout, FlowMaxLifetime: opts.flowMaxLifetime,
 		MaxSessions: opts.maxSessions, SessionLimit: sessionLimit, MaxPendingOpens: opts.maxPendingOpens, Transport: pep.TransportKind(transport),
 		TCPFallbackLanes: opts.tcpFallbackLanes, EnableQUICPool: opts.quicPool,
-		WaitForOpenAcknowledgement: opts.waitForOpenAck, UDPOnStream: opts.udpOnStream,
+		WaitForOpenAcknowledgement: opts.waitForOpenAck, UDPOnStream: opts.udpOnStream, WireVersions: mustWireVersions(opts.wireVersions),
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,

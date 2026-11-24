@@ -155,7 +155,14 @@ type ClientConfig struct {
 	// where the QUIC connection negotiated datagrams. It is the control for
 	// measuring the datagram substrate against the one it replaced, and both
 	// endpoints must be set the same way for the comparison to mean anything.
-	UDPOnStream                   bool
+	UDPOnStream bool
+	// WireVersions lists the data-plane wire versions this client offers, in
+	// its order of preference. Empty offers every version this build speaks,
+	// newest first. The gateway chooses among them, so a client reaches a
+	// gateway of either generation; a single version pins every connection to
+	// it. Whatever a flow's first lane negotiates, every lane that later joins
+	// the flow speaks too.
+	WireVersions                  []byte
 	Congestion                    CongestionControlKind
 	BrutalBytesPerSec             uint64
 	AdaptiveMinBytesSec           uint64
@@ -401,6 +408,19 @@ type bulkConn struct {
 
 var errPoolRetired = errors.New("pooled connection retired before OPEN")
 
+// wire is the version the bulk connection negotiated.
+func (b *bulkConn) wire() byte {
+	wire, _ := protocol.VersionForALPN(b.conn.ConnectionState().TLS.NegotiatedProtocol)
+	return wire
+}
+
+// bulkConnFits reports whether a bulk connection can carry a lane for the
+// flow ctx dials for: one pinned to a version takes only a connection of it.
+func bulkConnFits(ctx context.Context, entry *bulkConn) bool {
+	wire, pinned := pinnedWire(ctx)
+	return !pinned || entry.wire() == wire
+}
+
 // controlQUICGeneration owns exactly one shared connection and the packet
 // socket beneath it. Keeping ownership in one object makes generation checks
 // precise: a late failure from an old stream can retire its own generation but
@@ -540,6 +560,16 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 10 * time.Second
 	}
+	if len(cfg.WireVersions) == 0 {
+		if forced := testClientWires.Load(); forced != nil {
+			cfg.WireVersions = *forced
+		}
+	}
+	wires, err := resolveWireVersions(cfg.WireVersions)
+	if err != nil {
+		return nil, fmt.Errorf("offered wire versions: %w", err)
+	}
+	cfg.WireVersions = wires
 	if cfg.HandshakeTimeout <= 0 {
 		// Long enough for the first connection to an erasing path. The QUIC
 		// handshake alone takes about five seconds at 42% loss -- its packets
@@ -993,6 +1023,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	c.cfg.Logger.Debug("local flow opened", "transport", flow.kind, "duration", time.Since(flowOpenStarted))
 	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
 	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
+	flowSession.wire = flow.fc.wire
 	c.declareClass(ctx, inner, flowSession)
 	flowSession.ackRanges.Store(true)
 	flowSession.idleTimeout = c.cfg.FlowIdleTimeout
@@ -1565,6 +1596,49 @@ func encodeLaneReplacement(laneID, replacedLaneID uint64) []byte {
 	return payload[:]
 }
 
+// testClientWires is nil in production. Package tests set it to replay
+// end-to-end scenarios with clients that offer only some versions.
+var testClientWires atomic.Pointer[[]byte]
+
+// pinnedWireKey carries the wire version of the flow a dial is for.
+type pinnedWireKey struct{}
+
+// errPinnedWireMismatch is a lane whose connection negotiated a wire version
+// other than the one its flow was opened on.
+var errPinnedWireMismatch = errors.New("lane negotiated a different wire version from its flow")
+
+// withPinnedWire marks ctx as dialing for a flow on wire version wire. Zero
+// leaves it unpinned.
+func withPinnedWire(ctx context.Context, wire byte) context.Context {
+	if wire == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, pinnedWireKey{}, wire)
+}
+
+func pinnedWire(ctx context.Context) (byte, bool) {
+	wire, ok := ctx.Value(pinnedWireKey{}).(byte)
+	return wire, ok
+}
+
+// dialWires is what a dedicated dial offers: the flow's version alone when it
+// is for an existing flow, or every configured version for a new one. Offering
+// only the pinned version is what keeps a flow from straddling two versions,
+// and it is the gateway that would refuse the JOIN otherwise.
+func (c *Client) dialWires(ctx context.Context) []byte {
+	if wire, ok := pinnedWire(ctx); ok {
+		return []byte{wire}
+	}
+	return c.cfg.WireVersions
+}
+
+func checkPinnedWire(ctx context.Context, fc *frameConn) error {
+	if wire, ok := pinnedWire(ctx); ok && fc.wire != wire {
+		return fmt.Errorf("%w: flow speaks %d, connection %d", errPinnedWireMismatch, wire, fc.wire)
+	}
+	return nil
+}
+
 func (c *Client) dialAuthenticatedLane(ctx context.Context, kind TransportKind) (*authenticatedLane, error) {
 	sessionID, err := session.NewSessionID()
 	if err != nil {
@@ -1592,7 +1666,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 	reserveControl := false
 	switch kind {
 	case TransportTCP:
-		outer, err = dialTCP(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl)
+		outer, err = dialTCP(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.dialWires(ctx), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl)
 	case TransportQUIC:
 		ccfg := congestionConfig{
 			hierarchicalPath: c.cfg.Profile.HierarchicalPath,
@@ -1604,7 +1678,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 			outer, err = c.dialPooledQUICLane(ctx, ccfg)
 			reserveControl = true
 		} else {
-			outer, err = dialQUIC(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, ccfg, c.windows(), c.hopDialConfig())
+			outer, err = dialQUIC(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.dialWires(ctx), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, ccfg, c.windows(), c.hopDialConfig())
 		}
 	default:
 		return nil, fmt.Errorf("cannot dial transport %q", kind)
@@ -1617,8 +1691,14 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 	_ = outer.SetDeadline(time.Now().Add(handshakeBound(outer, c.cfg.HandshakeTimeout)))
 	fc := newFrameConnLimited(outer, c.memoryLimits.frameReadBuffer, c.memoryLimits.eventQueue)
 	fc.setPacketsOnStream(c.cfg.UDPOnStream)
+	if err := checkPinnedWire(ctx, fc); err != nil {
+		// Only a pooled connection, negotiated before this flow pinned its
+		// version, can disagree; a dedicated dial offered nothing else.
+		_ = fc.Close()
+		return nil, transportError(kind, err)
+	}
 	_ = outer.SetDeadline(time.Time{})
-	c.cfg.Logger.Debug("outer lane authenticated", "transport", kind, "dial_duration", outerReady.Sub(dialStarted), "pooled", pooled)
+	c.cfg.Logger.Debug("outer lane authenticated", "transport", kind, "wire", fc.wire, "dial_duration", outerReady.Sub(dialStarted), "pooled", pooled)
 	return &authenticatedLane{
 		fc: fc, outer: outer, sessionID: sessionID, kind: kind, laneID: laneID,
 		reserveControl: reserveControl,
@@ -1779,7 +1859,7 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 }
 
 func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDial, ccfg congestionConfig) {
-	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
+	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.WireVersions, c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
 	var generation *controlQUICGeneration
 	if err == nil {
 		borrowing, stopBorrowing := context.WithCancelCause(conn.Context())
@@ -1965,7 +2045,11 @@ func (c *Client) completeLaneJoin(ctx context.Context, lane *authenticatedLane, 
 	_, finishHandshake := bindHandshake(ctx, lane.outer, handshakeBound(lane.outer, c.cfg.HandshakeTimeout))
 	defer finishHandshake()
 	payload := encodeLaneID(lane.laneID)
-	if hint, ok := ctx.Value(laneReplacementContextKey{}).(laneReplacementHint); ok {
+	// A version-1 gateway predates the explicit replacement, so on that wire
+	// the same rescue is a plain JOIN: the gateway admits it by its own lane
+	// rules (TCP handoff, or retiring a lane the transport has declared dead)
+	// exactly as a v0.12 client's rescue was admitted.
+	if hint, ok := ctx.Value(laneReplacementContextKey{}).(laneReplacementHint); ok && protocol.HasReplaceLane(lane.fc.wire) {
 		flags |= protocol.FlagReplaceLane
 		payload = encodeLaneReplacement(lane.laneID, hint.id)
 	}
@@ -2031,6 +2115,12 @@ func (c *Client) openPooledJoinLane(ctx context.Context, sessionID [16]byte, flo
 	}
 	fc := newFrameConnLimited(outer, c.memoryLimits.frameReadBuffer, c.memoryLimits.eventQueue)
 	fc.setPacketsOnStream(c.cfg.UDPOnStream)
+	if err := checkPinnedWire(ctx, fc); err != nil {
+		// The caller falls back to a dedicated lane offering only the
+		// flow's version.
+		_ = fc.Close()
+		return nil, err
+	}
 	lane, err := c.completeLaneJoin(ctx, &authenticatedLane{
 		fc: fc, outer: outer, sessionID: sessionID, kind: TransportQUIC, laneID: laneID,
 	}, flowID, 0)
@@ -2093,16 +2183,32 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 	}
 	c.bulkConns = live
 	for _, entry := range c.bulkConns {
-		if !entry.busy && entry.conn.Context().Err() == nil {
+		if !entry.busy && entry.conn.Context().Err() == nil && bulkConnFits(ctx, entry) {
 			entry.busy = true
 			entry.stopIdleLocked()
 			c.bulkMu.Unlock()
 			return entry, nil
 		}
 	}
+	var retired *bulkConn
 	if len(c.bulkConns)+len(c.bulkDials) >= c.maxBulkConns() {
-		c.bulkMu.Unlock()
-		return nil, errBulkConnectionLimit
+		// An idle connection of another wire version is the one slot that
+		// can be given back: closing it keeps the budget a budget, where
+		// leaving it would send this flow to a dedicated dial outside it.
+		evicted := -1
+		for i, entry := range c.bulkConns {
+			if !entry.busy && !bulkConnFits(ctx, entry) {
+				evicted = i
+				break
+			}
+		}
+		if evicted < 0 {
+			c.bulkMu.Unlock()
+			return nil, errBulkConnectionLimit
+		}
+		retired = c.bulkConns[evicted]
+		retired.stopIdleLocked()
+		c.bulkConns = append(c.bulkConns[:evicted:evicted], c.bulkConns[evicted+1:]...)
 	}
 	epoch := c.bulkEpoch
 	dialCtx, cancel := context.WithCancel(ctx)
@@ -2113,6 +2219,9 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 	token := new(byte)
 	c.bulkDials[token] = cancel
 	c.bulkMu.Unlock()
+	if retired != nil {
+		retired.close("queqiao bulk pool wire version")
+	}
 
 	entry, err := c.dialBulkConn(dialCtx)
 	// A successful handshake can span system sleep. Expire its old epoch
@@ -2163,7 +2272,9 @@ func (c *Client) bulkConnCount() int {
 
 func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 	started := time.Now()
-	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
+	// A bulk connection is dialed for one flow's lane, so it offers that
+	// flow's version; it is reused only by flows of the same version.
+	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.dialWires(ctx), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -2332,6 +2443,9 @@ func bulkLaneBudget(reserveControl bool) (bulk, controlReserve int) {
 }
 
 func (c *Client) manageLanes(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64, initialKind TransportKind) {
+	// Everything below dials for this one flow, so it all speaks the flow's
+	// version.
+	ctx = withPinnedWire(ctx, flow.wire)
 	if initialKind == TransportTCP {
 		c.manageTCPBundle(ctx, flow, sessionID, flowID)
 		return

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,24 +16,24 @@ import (
 	"github.com/bojieli/queqiao/internal/session"
 )
 
-var update = flag.Bool("update", false, "rewrite the committed protocol-2 vectors from this build")
+var update = flag.Bool("update", false, "rewrite the committed vectors of the preferred wire version from this build")
 
 // vectorPath is deliberately outside this package. The vectors describe the
 // protocol, not this package's tests, and a second implementation should be
 // able to find them without reading Go.
-func vectorPath() string {
-	return filepath.Join("..", "..", "testdata", "protocol2", "vectors.json")
+func vectorPath(wire byte) string {
+	return filepath.Join("..", "..", "testdata", fmt.Sprintf("protocol%d", wire), "vectors.json")
 }
 
-func loadVectors(t *testing.T) File {
+func loadVectors(t *testing.T, wire byte) File {
 	t.Helper()
-	raw, err := os.ReadFile(vectorPath())
+	raw, err := os.ReadFile(vectorPath(wire))
 	if err != nil {
-		t.Fatalf("read protocol-2 vectors: %v", err)
+		t.Fatalf("read protocol-%d vectors: %v", wire, err)
 	}
 	var f File
 	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatalf("parse protocol-2 vectors: %v", err)
+		t.Fatalf("parse protocol-%d vectors: %v", wire, err)
 	}
 	return f
 }
@@ -45,40 +46,52 @@ func loadVectors(t *testing.T) File {
 // wire break. Failing here means either this build changed the wire, in which
 // case the protocol version has to move with it, or the file was edited by
 // hand, in which case one of the two is wrong.
-func TestVectorsAreCurrent(t *testing.T) {
-	encoded, err := json.MarshalIndent(generate(t), "", "  ")
+//
+// Protocol 1 is checked the same way but is never rewritten: it is the wire
+// that v0.12 peers speak, so the frozen file is what this build's version-1
+// codec has to keep producing. A difference there is always a regression.
+func TestVectorsAreCurrent(t *testing.T) { forEachWire(t, testVectorsAreCurrent) }
+
+func testVectorsAreCurrent(t *testing.T, wire byte) {
+	encoded, err := json.MarshalIndent(generate(t, wire), "", "  ")
 	if err != nil {
 		t.Fatal(err)
 	}
 	encoded = append(encoded, '\n')
-	if *update {
-		if err := os.WriteFile(vectorPath(), encoded, 0o644); err != nil {
+	if *update && wire == protocol.Version {
+		if err := os.WriteFile(vectorPath(wire), encoded, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		t.Log("protocol-2 vectors rewritten")
+		t.Logf("protocol-%d vectors rewritten", wire)
 		return
 	}
-	committed, err := os.ReadFile(vectorPath())
+	committed, err := os.ReadFile(vectorPath(wire))
 	if err != nil {
-		t.Fatalf("read protocol-2 vectors: %v", err)
+		t.Fatalf("read protocol-%d vectors: %v", wire, err)
 	}
-	if string(committed) != string(encoded) {
-		t.Fatalf("this build no longer produces the committed protocol-2 vectors.\n"+
-			"If the wire genuinely changed, protocol.Version must change with it and the\n"+
-			"data ALPN with that. If it did not, this is a regression. Only once one of\n"+
-			"those two is true, run:\n    go test ./internal/conformance -update\n"+
-			"committed %d bytes, this build %d bytes", len(committed), len(encoded))
+	if string(committed) == string(encoded) {
+		return
 	}
+	if wire != protocol.Version {
+		t.Fatalf("this build no longer produces the frozen protocol-%d vectors.\n"+
+			"Version %d is still spoken to deployed peers, so its framing must not move.\n"+
+			"committed %d bytes, this build %d bytes", wire, wire, len(committed), len(encoded))
+	}
+	t.Fatalf("this build no longer produces the committed protocol-%d vectors.\n"+
+		"If the wire genuinely changed, protocol.Version must change with it and the\n"+
+		"data ALPN with that. If it did not, this is a regression. Only once one of\n"+
+		"those two is true, run:\n    go test ./internal/conformance -update\n"+
+		"committed %d bytes, this build %d bytes", wire, len(committed), len(encoded))
 }
 
-func generate(t *testing.T) File {
+func generate(t *testing.T, wire byte) File {
 	t.Helper()
 	return File{
-		Protocol: int(protocol.Version),
-		Note: "Frozen conformance vectors for queqiao wire protocol 2. Every credential-shaped " +
+		Protocol: int(wire),
+		Note: fmt.Sprintf("Frozen conformance vectors for queqiao wire protocol %d. Every credential-shaped ", wire) +
 			"value here is synthetic. Regenerating this file is a wire change: protocol.Version " +
 			"and the data ALPN must move with it.",
-		FrameHeaders:    frameHeaderVectors(t),
+		FrameHeaders:    frameHeaderVectors(t, wire),
 		AckRanges:       ackRangeVectors(t),
 		Destinations:    destinationVectors(t),
 		UDP:             udpVectors(t),
@@ -87,7 +100,7 @@ func generate(t *testing.T) File {
 		FECRepairs:      repairVectors(t),
 		CodedDatagrams:  datagramVectors(),
 		Invitation:      invitationVector(t),
-		Limits:          limitVector(),
+		Limits:          limitVector(wire),
 	}
 }
 
@@ -108,32 +121,35 @@ func encodeHeader(t *testing.T, h protocol.Header) string {
 	return hex.EncodeToString(raw)
 }
 
-func frameHeaderVectors(t *testing.T) FrameHeaderVectors {
+func frameHeaderVectors(t *testing.T, wire byte) FrameHeaderVectors {
 	t.Helper()
 	sid := vectorSession()
 	accepted := []struct {
 		name string
 		h    protocol.Header
 	}{
-		{"open", protocol.Header{Version: protocol.Version, Type: protocol.TypeOpen, SessionID: sid, FlowID: 0x0102030405060708, PayloadLen: 16, Class: protocol.ClassNew}},
-		{"open reserving the control lane", protocol.Header{Version: protocol.Version, Type: protocol.TypeOpen, Flags: protocol.FlagReserveControl, SessionID: sid, FlowID: 1, PayloadLen: 16, Class: protocol.ClassNew}},
-		{"open ok", protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sid, FlowID: 1, Class: protocol.ClassNew}},
-		{"join", protocol.Header{Version: protocol.Version, Type: protocol.TypeJoin, SessionID: sid, FlowID: 1, PayloadLen: 8, Class: protocol.ClassNew}},
-		{"replacement join", protocol.Header{Version: protocol.Version, Type: protocol.TypeJoin, Flags: protocol.FlagReplaceLane, SessionID: sid, FlowID: 1, PayloadLen: 16, Class: protocol.ClassNew}},
-		{"interactive data", protocol.Header{Version: protocol.Version, Type: protocol.TypeData, SessionID: sid, FlowID: 1, Sequence: 4096, PayloadLen: 1200, Class: protocol.ClassInteractive}},
-		{"bulk data at the payload limit", protocol.Header{Version: protocol.Version, Type: protocol.TypeData, SessionID: sid, FlowID: 1, Sequence: 1 << 40, PayloadLen: protocol.MaxPayload, Class: protocol.ClassBulk}},
-		{"cumulative ack upstream", protocol.Header{Version: protocol.Version, Type: protocol.TypeAck, Flags: protocol.FlagAckUp, SessionID: sid, FlowID: 1, Sequence: 8192, Class: protocol.ClassInteractive}},
-		{"selective ack downstream", protocol.Header{Version: protocol.Version, Type: protocol.TypeAck, Flags: protocol.FlagAckDown | protocol.FlagAckRanges, SessionID: sid, FlowID: 1, Sequence: 8192, PayloadLen: 32, Class: protocol.ClassInteractive}},
-		{"final ack", protocol.Header{Version: protocol.Version, Type: protocol.TypeAck, Flags: protocol.FlagAckUp | protocol.FlagAckFinal, SessionID: sid, FlowID: 1, Sequence: 8192, Class: protocol.ClassInteractive}},
-		{"half close", protocol.Header{Version: protocol.Version, Type: protocol.TypeClose, Flags: protocol.FlagFin, SessionID: sid, FlowID: 1, Sequence: 8192, Class: protocol.ClassNew}},
-		{"aborting close", protocol.Header{Version: protocol.Version, Type: protocol.TypeClose, Flags: protocol.FlagFin | protocol.FlagCloseAbort, SessionID: sid, FlowID: 1, Sequence: 8192, Class: protocol.ClassNew}},
-		{"reset", protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sid, FlowID: 1, PayloadLen: 20, Class: protocol.ClassNew}},
-		{"packet", protocol.Header{Version: protocol.Version, Type: protocol.TypePacket, SessionID: sid, FlowID: 1, Sequence: 7, PayloadLen: 64, Class: protocol.ClassInteractive}},
-		{"packet at the largest legal size", protocol.Header{Version: protocol.Version, Type: protocol.TypePacket, SessionID: sid, FlowID: 1, Sequence: 8, PayloadLen: session.MaxPacketPayload, Class: protocol.ClassInteractive}},
-		{"probe", protocol.Header{Version: protocol.Version, Type: protocol.TypeProbe, SessionID: sid, FlowID: 0, Sequence: 99, PayloadLen: protocol.MaxProbePayload, Class: protocol.ClassNew}},
+		{"open", protocol.Header{Version: wire, Type: protocol.TypeOpen, SessionID: sid, FlowID: 0x0102030405060708, PayloadLen: 16, Class: protocol.ClassNew}},
+		{"open reserving the control lane", protocol.Header{Version: wire, Type: protocol.TypeOpen, Flags: protocol.FlagReserveControl, SessionID: sid, FlowID: 1, PayloadLen: 16, Class: protocol.ClassNew}},
+		{"open ok", protocol.Header{Version: wire, Type: protocol.TypeOpenOK, SessionID: sid, FlowID: 1, Class: protocol.ClassNew}},
+		{"join", protocol.Header{Version: wire, Type: protocol.TypeJoin, SessionID: sid, FlowID: 1, PayloadLen: 8, Class: protocol.ClassNew}},
+		{"replacement join", protocol.Header{Version: wire, Type: protocol.TypeJoin, Flags: protocol.FlagReplaceLane, SessionID: sid, FlowID: 1, PayloadLen: 16, Class: protocol.ClassNew}},
+		{"interactive data", protocol.Header{Version: wire, Type: protocol.TypeData, SessionID: sid, FlowID: 1, Sequence: 4096, PayloadLen: 1200, Class: protocol.ClassInteractive}},
+		{"bulk data at the payload limit", protocol.Header{Version: wire, Type: protocol.TypeData, SessionID: sid, FlowID: 1, Sequence: 1 << 40, PayloadLen: protocol.MaxPayload, Class: protocol.ClassBulk}},
+		{"cumulative ack upstream", protocol.Header{Version: wire, Type: protocol.TypeAck, Flags: protocol.FlagAckUp, SessionID: sid, FlowID: 1, Sequence: 8192, Class: protocol.ClassInteractive}},
+		{"selective ack downstream", protocol.Header{Version: wire, Type: protocol.TypeAck, Flags: protocol.FlagAckDown | protocol.FlagAckRanges, SessionID: sid, FlowID: 1, Sequence: 8192, PayloadLen: 32, Class: protocol.ClassInteractive}},
+		{"final ack", protocol.Header{Version: wire, Type: protocol.TypeAck, Flags: protocol.FlagAckUp | protocol.FlagAckFinal, SessionID: sid, FlowID: 1, Sequence: 8192, Class: protocol.ClassInteractive}},
+		{"half close", protocol.Header{Version: wire, Type: protocol.TypeClose, Flags: protocol.FlagFin, SessionID: sid, FlowID: 1, Sequence: 8192, Class: protocol.ClassNew}},
+		{"aborting close", protocol.Header{Version: wire, Type: protocol.TypeClose, Flags: protocol.FlagFin | protocol.FlagCloseAbort, SessionID: sid, FlowID: 1, Sequence: 8192, Class: protocol.ClassNew}},
+		{"reset", protocol.Header{Version: wire, Type: protocol.TypeReset, SessionID: sid, FlowID: 1, PayloadLen: 20, Class: protocol.ClassNew}},
+		{"packet", protocol.Header{Version: wire, Type: protocol.TypePacket, SessionID: sid, FlowID: 1, Sequence: 7, PayloadLen: 64, Class: protocol.ClassInteractive}},
+		{"packet at the largest legal size", protocol.Header{Version: wire, Type: protocol.TypePacket, SessionID: sid, FlowID: 1, Sequence: 8, PayloadLen: session.MaxPacketPayload, Class: protocol.ClassInteractive}},
+		{"probe", protocol.Header{Version: wire, Type: protocol.TypeProbe, SessionID: sid, FlowID: 0, Sequence: 99, PayloadLen: protocol.MaxProbePayload, Class: protocol.ClassNew}},
 	}
 	out := FrameHeaderVectors{}
 	for _, a := range accepted {
+		if a.h.Flags&protocol.FlagReplaceLane != 0 && !protocol.HasReplaceLane(wire) {
+			continue
+		}
 		out.Accept = append(out.Accept, FrameHeaderVector{
 			Name: a.name, Hex: encodeHeader(t, a.h),
 			Type: int(a.h.Type), Flags: int(a.h.Flags),
@@ -145,7 +161,7 @@ func frameHeaderVectors(t *testing.T) FrameHeaderVectors {
 
 	// The refusals are built by mutating one legal header, so each differs
 	// from a header this build accepts in exactly the field under test.
-	base := protocol.Header{Version: protocol.Version, Type: protocol.TypeData, SessionID: sid, FlowID: 1, Sequence: 16, PayloadLen: 8, Class: protocol.ClassInteractive}
+	base := protocol.Header{Version: wire, Type: protocol.TypeData, SessionID: sid, FlowID: 1, Sequence: 16, PayloadLen: 8, Class: protocol.ClassInteractive}
 	mutate := func(f func(raw []byte)) string {
 		raw := make([]byte, protocol.HeaderSize)
 		if err := base.Encode(raw); err != nil {
@@ -154,14 +170,28 @@ func frameHeaderVectors(t *testing.T) FrameHeaderVectors {
 		f(raw)
 		return hex.EncodeToString(raw)
 	}
+	// The two entries that differ by version are the ones the versions
+	// disagree about: which other version byte is refused, and what bit 6 is.
+	otherVersion := func(wire byte) RejectVector {
+		if wire == 1 {
+			return RejectVector{"version 2", mutate(func(raw []byte) { raw[2] = 2 }), "a future version is refused rather than partially understood"}
+		}
+		return RejectVector{"version 1", mutate(func(raw []byte) { raw[2] = 1 }), "an older version is refused rather than partially understood"}
+	}
+	bit6 := func(wire byte, mutated string) RejectVector {
+		if !protocol.HasReplaceLane(wire) {
+			return RejectVector{"reserved flag bit 6", mutated, "bit 6 is reserved and must be zero"}
+		}
+		return RejectVector{"replacement flag on data", mutated, "the replacement flag is valid only on JOIN"}
+	}
 	out.Reject = []RejectVector{
 		{"wrong magic", mutate(func(raw []byte) { raw[0] = 'X' }), "the first two bytes are not WO"},
 		{"version 0", mutate(func(raw []byte) { raw[2] = 0 }), "a receiver speaks exactly one wire version and refuses every other"},
-		{"version 1", mutate(func(raw []byte) { raw[2] = 1 }), "an older version is refused rather than partially understood"},
+		otherVersion(wire),
 		{"frame type 0", mutate(func(raw []byte) { raw[3] = 0 }), "types are 1..9; there is no zero type"},
 		{"frame type 10", mutate(func(raw []byte) { raw[3] = 10 }), "an unknown type is refused, never ignored"},
 		{"class 3", mutate(func(raw []byte) { raw[42] = 3 }), "classes are 0..2"},
-		{"replacement flag on data", mutate(func(raw []byte) { raw[5] |= 1 << 6 }), "the replacement flag is valid only on JOIN"},
+		bit6(wire, mutate(func(raw []byte) { raw[5] |= 1 << 6 })),
 		{"reserved flag bit 8", mutate(func(raw []byte) { raw[4] |= 1 << 0 }), "bits 8..15 are reserved and must be zero"},
 		{"ack-ranges flag on data", mutate(func(raw []byte) { raw[5] |= byte(protocol.FlagAckRanges) }), "the range flag is valid only on ACK"},
 		{"reserve-control flag on data", mutate(func(raw []byte) { raw[5] |= byte(protocol.FlagReserveControl) }), "the reserve flag is valid only on OPEN and JOIN"},
@@ -523,10 +553,10 @@ func invitationVector(t *testing.T) InvitationVector {
 	}
 }
 
-func limitVector() LimitVector {
+func limitVector(wire byte) LimitVector {
 	return LimitVector{
 		HeaderSize:           protocol.HeaderSize,
-		Version:              int(protocol.Version),
+		Version:              int(wire),
 		MaxPayload:           protocol.MaxPayload,
 		MaxAckRanges:         protocol.MaxAckRanges,
 		AckRangeSize:         protocol.AckRangeSize,
@@ -539,7 +569,7 @@ func limitVector() LimitVector {
 		MaxProbePayload:      protocol.MaxProbePayload,
 		MaxProbeFrames:       protocol.MaxProbeFrames,
 		MaxProbeBytes:        protocol.MaxProbeBytes,
-		DataALPN:             protocol.DataALPN,
+		DataALPN:             protocol.ALPN(wire),
 		EnrollALPN:           identity.EnrollmentALPN,
 		RenewALPN:            identity.RenewalALPN,
 	}

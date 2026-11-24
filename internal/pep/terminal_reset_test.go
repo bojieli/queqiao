@@ -39,8 +39,9 @@ func TestFailingGatewayFlowResetsEveryOpenLane(t *testing.T) {
 	got := make(chan protocol.Frame, len(peers))
 	for _, peer := range peers {
 		go func(peer net.Conn) {
+			reader := newFrameConn(peer)
 			for {
-				frame, err := protocol.ReadFrame(peer)
+				frame, err := reader.Read()
 				if err != nil {
 					return
 				}
@@ -91,7 +92,7 @@ func TestFailingClientFlowDoesNotSendReset(t *testing.T) {
 	sawReset := make(chan bool, 1)
 	go func() {
 		for {
-			frame, err := protocol.ReadFrame(peer)
+			frame, err := protocol.ReadFrameVersion(peer, defaultFrameWire())
 			if err != nil {
 				sawReset <- false
 				return
@@ -204,7 +205,7 @@ func TestCompletedFlowIsNotReset(t *testing.T) {
 	flow.remoteFinSeen.Store(true)
 	sawReset := make(chan bool, 1)
 	go func() {
-		frame, err := protocol.ReadFrame(peer)
+		frame, err := protocol.ReadFrameVersion(peer, defaultFrameWire())
 		sawReset <- err == nil && frame.Header.Type == protocol.TypeReset
 	}()
 	flow.failClose(errFlowLifetime)
@@ -282,7 +283,7 @@ func TestStagedLaneGetsAPermanentReset(t *testing.T) {
 	}
 	got := make(chan protocol.Frame, 1)
 	go func() {
-		frame, err := protocol.ReadFrame(peer)
+		frame, err := newFrameConn(peer).Read()
 		if err == nil {
 			got <- frame
 		}

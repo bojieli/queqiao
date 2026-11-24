@@ -8,10 +8,17 @@ exact commit. Production-ready language has additional gates below.
 ## Public-preview blockers
 
 - [x] Supported topology and known limitations are documented.
-- [x] Wire protocol 2 is documented, emitted in build metadata, and rejects
-  every other version with a diagnosable error.
+- [x] Wire protocols 1 and 2 are documented and emitted in build metadata
+  (`wire=2 wire_accept=1,2`); a connection negotiates one of them by ALPN, and
+  a peer offering no accepted version is refused at TLS negotiation with a
+  diagnosable error.
+- [ ] `./scripts/wire_interop.py` passes on the exact candidate with
+  `--old-ref v0.12.1` and `--old-ref v0.12.2`: an old client against the
+  candidate gateway and the candidate client against an old gateway, over TCP and QUIC, with a large download, UDP DNS, and a
+  forced stall.
 - [x] Every protocol-2 limit is fixed by the specification rather than by
-  configuration, and `testdata/protocol2/vectors.json` records the framing,
+  configuration, and `testdata/protocol2/vectors.json` (with the frozen
+  `testdata/protocol1/vectors.json` beside it) records the framing,
   acknowledgement, destination, UDP, coding, and enrollment encodings as
   committed vectors that the test suite replays on every run.
 - [x] Security reporting instructions and residual risks are documented.
@@ -36,8 +43,9 @@ exact commit. Production-ready language has additional gates below.
   use the historical baseline in
   [`STATIC-SECURITY-AUDIT-20260817.md`](archive/2026-08-development/STATIC-SECURITY-AUDIT-20260817.md)
   only as a format; generate fresh evidence for protocol 2.
-- [ ] Install, one-endpoint patch upgrade, coordinated incompatible-version
-  refusal, and rollback evidence is attached to the candidate report.
+- [ ] Install, one-endpoint patch upgrade, gateway-first mixed-version upgrade,
+  refusal of a peer sharing no wire version, and rollback evidence is attached
+  to the candidate report.
 - [ ] `./scripts/changelog.py release --version vX.Y.Z` has assembled the
   pending [`changelog.d/`](../changelog.d/) entries into a dated section, the
   section has been read as prose, and `changelog.d/` is empty on the candidate

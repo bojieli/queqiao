@@ -163,6 +163,34 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  # Real binaries of the last version-1 release against this candidate, both
+  # ways, over TCP and QUIC on loopback. The in-process tests replay version 1
+  # with this tree's code on both ends; this is the check against what is
+  # actually deployed.
+  wire-interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      # v0.12.1 is the release the dual-version work was designed against and
+      # v0.12.2 the last one to speak only version 1.
+      - run: ./scripts/wire_interop.py --old-ref v0.12.1 --output-dir wire-interop/v0.12.1
+      - run: ./scripts/wire_interop.py --old-ref v0.12.2 --output-dir wire-interop/v0.12.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: candidate-wire-interop-${{ github.run_id }}
+          path: |
+            wire-interop/*/results.json
+            wire-interop/**/*.log
+          if-no-files-found: warn
+          retention-days: 30
+
   history-secret-scan:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -344,7 +372,7 @@ jobs:
 
   candidate-summary:
     if: always()
-    needs: [ci-evidence, full, native-test, vulnerability, fuzz, fallback-soak, history-secret-scan, package, native-smoke, macos-signing, provenance]
+    needs: [ci-evidence, full, native-test, vulnerability, fuzz, fallback-soak, wire-interop, history-secret-scan, package, native-smoke, macos-signing, provenance]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every available gate
@@ -355,6 +383,7 @@ jobs:
           VULN: ${{ needs.vulnerability.result }}
           FUZZ: ${{ needs.fuzz.result }}
           SOAK: ${{ needs.fallback-soak.result }}
+          WIRE_INTEROP: ${{ needs.wire-interop.result }}
           HISTORY: ${{ needs.history-secret-scan.result }}
           PACKAGE: ${{ needs.package.result }}
           NATIVE: ${{ needs.native-smoke.result }}
@@ -364,7 +393,7 @@ jobs:
           CANDIDATE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          for result in "$CI_EVIDENCE" "$FULL" "$NATIVE_TEST" "$VULN" "$FUZZ" "$SOAK" "$HISTORY" "$PACKAGE" "$NATIVE" "$MACOS_SIGNING"; do
+          for result in "$CI_EVIDENCE" "$FULL" "$NATIVE_TEST" "$VULN" "$FUZZ" "$SOAK" "$WIRE_INTEROP" "$HISTORY" "$PACKAGE" "$NATIVE" "$MACOS_SIGNING"; do
             test "$result" = success
           done
           if test "$VISIBILITY" = public; then

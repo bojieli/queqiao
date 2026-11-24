@@ -1,16 +1,20 @@
 # Deployment guide
 
 > [!NOTE]
-> **Status:** Current operational guide for public protocol 2
-> **Last reviewed:** 2026-08-21
+> **Status:** Current operational guide for public protocols 1 and 2
+> **Last reviewed:** 2026-11-24
 
 This guide takes you from an empty host to a working paired deployment: a
 provider gateway, one-time user enrollment, a desktop SOCKS client, and
 Clash/mihomo integration. It also covers multi-provider clients, service
-operation, upgrades, and rollback. Protocol 2 is the only supported wire
-protocol, so client and server must be upgraded together.
+operation, upgrades, and rollback. A gateway accepts wire versions 1 and 2 and
+a client offers both, preferring 2, so gateways and clients are upgraded
+independently: gateways first, clients when convenient.
 
-Use a gateway and client from the same wire version. For v0.13.0, verify that both binaries report `wire=2`. When upgrading from v0.12.2, follow the [paired upgrade procedure](#upgrade-an-existing-deployment). For existing wire 1 endpoints see the [v0.12.2 installation guide](https://github.com/bojieli/queqiao/blob/v0.12.2/docs/DEPLOYING.md). Verify downloaded archives against the release's `SHA256SUMS`. See the [release downloads](https://github.com/bojieli/queqiao/releases) and [source build instructions](../README.md#build-from-source).
+Verify that a binary reports `wire=2 wire_accept=1,2`: it prefers version 2 and
+also speaks version 1. Such a gateway serves v0.12.x clients on version 1, and
+such a client works against a v0.12.x gateway. v0.13.0 alone spoke version 2
+only; see [upgrading](#upgrade-an-existing-deployment). Verify downloaded archives against the release's `SHA256SUMS`. See the [release downloads](https://github.com/bojieli/queqiao/releases) and [source build instructions](../README.md#build-from-source).
 
 For a quick overview, start with the [repository README](../README.md). Use
 [known limitations](KNOWN-LIMITATIONS.md) to check whether the paired-gateway
@@ -66,7 +70,7 @@ queqiaod service install --profile "$PROFILE"
 
 Both scripts take `--dry-run`, use `--binary PATH` when you have a reviewed
 release artifact instead of a source tree, and refuse any binary that does not
-report `wire=2`.
+report `wire=2` (current builds print `wire=2 wire_accept=1,2`).
 
 The one thing `install-server.sh` will not do twice is create a provider trust
 root. Re-running it against an initialized state directory stops before
@@ -106,7 +110,8 @@ sudo install -m 0755 ./queqiaod /usr/local/bin/queqiaod
 /usr/local/bin/queqiaod --version
 ```
 
-The output must contain `wire=2`. Create a dedicated account once:
+The output must contain `wire=2` and `wire_accept=1,2`. Create a dedicated
+account once:
 
 ```sh
 sudo useradd --system --user-group \
@@ -616,12 +621,42 @@ more important than provider order.
 
 ## Upgrade an existing deployment
 
-For a v1 to v2 upgrade, keep the current gateway and clients together until the replacement pair is ready. TCP and QUIC both reject mixed wire versions at TLS negotiation. A live connection stays on the pair that accepted it.
+Upgrade gateways first, then clients at their own pace. No coordinated cutover
+is needed: every connection negotiates its wire version by ALPN, the gateway
+choosing the newest one both ends speak. A gateway accepting `--accept-wire 1,2`
+(the default) serves v0.12.x clients on version 1 and current clients on
+version 2 side by side. A current client (`--wire-versions 2,1`, the default)
+also works against a gateway still on v0.12.x, on version 1. Provider state,
+invitations, profiles, enrollment, and renewal are unchanged, so no client is
+re-enrolled.
 
-1. Record the current endpoints, versions, service arguments and a successful proxy request. Back up provider state and enrolled profiles with their permissions intact.
-2. Stage the v2 gateway and client on a separate endpoint. Use the appropriate provider identity and an enrolled profile for that endpoint. Enrollment and renewal formats are unchanged. Confirm both binaries report `wire=2`.
-3. Verify a TCP request and a UDP association through the v2 pair. Move new traffic to it, keeping the v1 pair available until existing connections drain.
-4. To roll back, direct new traffic to the v1 pair. If the gateway address must be reused, schedule an interruption and switch both ends together. Restore the matching client and gateway binaries if verification fails.
+1. Record the current endpoints, versions, service arguments and a successful
+   proxy request. Back up provider state and enrolled profiles with their
+   permissions intact.
+2. Replace the gateway binary and restart it. Confirm it reports
+   `wire=2 wire_accept=1,2`. Restarting a gateway ends the flows it carries,
+   as any gateway restart does; clients reconnect on their own.
+3. Verify a TCP request and a UDP association from an existing v0.12.x client.
+   On the gateway, `queqiao_data_connections_total{wire="1"}` counts its
+   connections.
+4. Upgrade clients whenever convenient. Their connections move to version 2,
+   visible as `queqiao_data_connections_total{wire="2"}` and
+   `queqiao_wire_active_flows{wire="2"}`. The gateway log's `remote flow opened`
+   and `remote flow complete` records carry each flow's `wire`.
+5. To roll back either end, reinstall its previous binary; the other end
+   negotiates whatever the rolled-back one speaks. A v0.13.0 gateway or client
+   speaks version 2 only, so do not roll back to v0.13.0 while v0.12.x peers
+   remain.
+
+Once no client needs version 1, a gateway can stop accepting it with
+`--accept-wire 2`; a remaining v0.12.x client then fails at TLS negotiation with
+`no application protocol`.
+
+A flow keeps the version it opened on. A lane that tries to join a flow on the
+other version is refused (`lane join refused`, reason `wire_mismatch`); a
+current client never does this, so a non-zero
+`queqiao_lane_join_refused_total{reason="wire_mismatch"}` means a peer that
+disagrees about the wire.
 
 ## User and device lifecycle
 
@@ -686,7 +721,7 @@ without redaction.
 
 | Symptom | Action |
 |---|---|
-| `does not support Queqiao enrollment` or `rejected Queqiao protocol 2` | Confirm the invitation endpoint, client/server `wire=2`, and that no old TLS service still owns the port. |
+| `does not support Queqiao enrollment` or `rejected Queqiao protocol 2,1` | Confirm the invitation endpoint, that the gateway's `--accept-wire` includes a version in the client's `--wire-versions`, and that no old TLS service still owns the port. A v0.13.0 gateway rejects v0.12.x clients; upgrade it. |
 | `more than one physical IPv4 address is active` | Choose the intended uplink with `--local-address if:NAME`; use the same value for enroll and client. |
 | `interface … has no active IPv4 address` | Correct the interface name or connect it before retrying. The saved enrollment draft remains reusable. |
 | Enrollment reports a pinned-identity error | The URI belongs to another provider, the provider state was replaced, or traffic is intercepted. Never bypass pin verification. |
