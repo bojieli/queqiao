@@ -649,8 +649,8 @@ interval that the buffer or policer dropped.
 | late joiner beside a full lane, 85 ms buffer (5-9 s) | 0.02 / 0 | 0.98 / 0.038 | 1.00 / 0.023 |
 | **new:** stale floor (0.15 inherited, 0.22 real), nothing earned; 11.25 MB/s, 180 ms, 50 ms buffer, 12 s | 0.14 / 0 | 0.42 / 0 | 0.85 / 0.035 |
 | **new:** tail -- three of four lanes finish by 4 s; fast path (6-14 s) | 0.04 / 0 | 0.27 / 0 | 0.93 / 0.111 |
-| **new:** rescue churn -- two lanes plus one joining every 0.5 s for 1.5 s; lossy path | 0.10 / 0 | 0.78 / 0.048 | 0.85 / 0.111 |
-| **new:** requests then bulk -- 4 packets a round trip for 2 s (3-10 s) | 0.11 / 0 | 0.95 / 0.082 | 0.97 / 0.181 |
+| **new:** rescue churn -- two lanes plus one joining every 0.5 s for 1.5 s; lossy path | 0.10 / 0 | 0.78 / 0.048 | 0.86 / 0.078 |
+| **new:** requests then bulk -- 4 packets a round trip for 2 s (3-10 s) | 0.11 / 0 | 0.95 / 0.082 | 0.94 / 0.166 |
 
 Each cell is goodput / caused loss. Queue p90 is unchanged by this change
 where both arms fill the path (11.8 ms on the 12 ms buffer, 84 ms on the 85 ms
@@ -659,14 +659,59 @@ against 36 ms for the shipped ramp, which never filled that path, and 188 ms
 for #146.
 
 The cost is caused loss on shallow buffers: 0.13 rather than 0.07 on the fast
-path, and 0.18 rather than 0.08 after a request phase. It is the
+path, and 0.17 rather than 0.08 after a request phase. It is the
 compensation: on a 15% channel the lanes now pace 1/0.85 of their share, as
 the ramp's first simulation did when its idle member was credited with that
 compensation (0.15 caused loss there). In the tail the last lane is alone and
 uncapped, as any first flow is, and a single lane alone on that 12 ms buffer
 has the bottleneck drop 0.24 of what it sends from ProbeBW's probes; the
-refill costs 0.11. The churn scenario's 0.11 is the pool's own erasure
-settling near 0.28 on a 0.22 channel: rescue joiners take that inflated
+refill costs 0.11. The churn scenario's 0.08 is mostly the pool's own
+erasure settling above the 0.22 channel: rescue joiners take that inflated
 figure as their floor at join, as before. All are bounded and inside the
 scenarios' limits; whether they show live is what the A/B below is for.
+
+**Live, after the follow-ups.** The same three-arm harness: main (`0e71930`,
+with #156 and #158), #146 with main merged (`f46ae58`), and this change
+(`d448e5d`), each a temporary server on the US server with identical flags
+and an unmodified build; 12 interleaved rounds per path with the arm order
+rotated; each trial four concurrent downloads (16 MiB each from the Mac, 64
+MiB each from the Beijing host). Run 2026-11-24 07:37-08:35 UTC, a Beijing
+afternoon, when both paths were lossy: the Mac path lost 35-50% at about 20
+Mbit/s -- the high-erasure path of the first #146 A/B, not the fast one of
+the second -- and the Beijing host's path ran at 50-120 Mbit/s, below the
+previous night's 143, with about 12% loss and a standing queue of tens of
+milliseconds in every arm. Medians, with the paired per-round ratio as a
+geometric mean and its 95% bootstrap interval:
+
+| Path | Metric | main | #146 | this |
+| --- | --- | ---: | ---: | ---: |
+| Mac (35-50% loss, ~20 Mbit/s) | goodput, Mbit/s | 9.85 | 18.9 | **18.1** |
+| | completed flows | 45/48 | 48/48 | 48/48 |
+| | server loss | 0.51 | 0.46 | **0.35** |
+| | wire bytes / useful byte | 3.29 | 2.66 | 2.27 |
+| | queue p90, ms | 1,870 | 264 | **167** |
+| | this / main, paired | | | 1.70 [1.30-2.17], faster 11/12 |
+| Beijing host (~12% loss) | goodput, Mbit/s | 77.2 | 46.0 | **72.4** |
+| | completed flows | 48/48 | 48/48 | 48/48 |
+| | server loss | 0.125 | 0.122 | 0.125 |
+| | queue p90, ms | 71 | 75 | 73 |
+| | stalls / trial | 12 | 54 | 38 |
+| | wire bytes / useful byte | 1.22 | 1.60 | 1.63 |
+| | this / main, paired | | | 0.87 [0.64-1.16], faster 4/12 |
+| | this / #146, paired | | | 1.49 [1.11-2.02], faster 8/12 |
+
+On the lossy Mac path this change is well above main and at #146's goodput
+(this/#146 0.94 [0.85-1.03]) with the least loss, the least wire overhead and
+the shortest queue of the three. On the Beijing host it recovers most of what
+#146 lost (1.49x #146) at main's loss and queue, but parity with main is not
+shown: the paired point estimate is 0.87 and this change was faster in 4 of 12
+rounds, though the interval includes parity on a path whose main arm alone
+ranged from 50 to 118 Mbit/s. It still carries #146's higher stall count and
+wire overhead there (38 stalls a trial against main's 12; 1.63 wire bytes per
+useful byte against 1.22), which points at the stall-rescue path rather than
+the ramp. A first run of the same campaign, on an earlier commit, was stopped in
+its second round: the Beijing host's resolver had failed every lookup of the
+server's name, and review round 5 had since changed the code. The profiles
+were switched to the server's address and the campaign re-run from the start
+on the final commit.
 
