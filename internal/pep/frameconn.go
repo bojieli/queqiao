@@ -254,9 +254,9 @@ func (c *frameConn) codingBulk() bool { return c.bulk != nil && c.bulk.Coding() 
 // are read by ReadBulk, because merging two substrates into one call means
 // giving one of them the other's semantics.
 func (c *frameConn) Read() (protocol.Frame, error) {
-	f, err := protocol.ReadFrameVersion(c.reader, c.wire)
+	f, err := protocol.ReadFrameVersion(c.reader, c.wireVersion())
 	if err == nil {
-		observeTestFrame(c.wire, f)
+		observeTestFrame(c.wireVersion(), f)
 	}
 	return f, err
 }
@@ -268,7 +268,7 @@ func (c *frameConn) Read() (protocol.Frame, error) {
 // connection: one stream of them carries every flow multiplexed on it, so a
 // reader per lane would consume frames belonging to other flows.
 func (c *frameConn) bulkFrames(flowID uint64) <-chan protocol.Frame {
-	demux := connBulkDemux(c.bulk, c.bulkQueueFrames, c.wire)
+	demux := connBulkDemux(c.bulk, c.bulkQueueFrames, c.wireVersion())
 	if demux == nil {
 		return nil
 	}
@@ -276,7 +276,7 @@ func (c *frameConn) bulkFrames(flowID uint64) <-chan protocol.Frame {
 }
 
 func (c *frameConn) releaseBulk(flowID uint64) {
-	if demux := connBulkDemux(c.bulk, c.bulkQueueFrames, c.wire); demux != nil {
+	if demux := connBulkDemux(c.bulk, c.bulkQueueFrames, c.wireVersion()); demux != nil {
 		demux.release(flowID)
 	}
 }
@@ -344,7 +344,7 @@ func (c *frameConn) Write(f protocol.Frame) error {
 // control stream if it will not take it: correctness is not worth trading for
 // the coding.
 func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame) (reliable bool, err error) {
-	f.Header.Version = c.wire
+	f.Header.Version = c.wireVersion()
 	buf, err := protocol.AppendFrame(nil, f)
 	if err != nil {
 		return false, err
@@ -359,7 +359,7 @@ func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame) (reliable 
 func (c *frameConn) writeLocked(f protocol.Frame) error {
 	// Callers build frames with the preferred version; the connection decides
 	// which one is actually on the wire.
-	f.Header.Version = c.wire
+	f.Header.Version = c.wireVersion()
 	buf, err := protocol.AppendFrame(c.writeBuf[:0], f)
 	if err != nil {
 		return err
@@ -477,6 +477,15 @@ func observeTestFrame(wire byte, f protocol.Frame) {
 	if observe := testFrameObserver.Load(); observe != nil {
 		(*observe)(wire, f)
 	}
+}
+
+// wireVersion is the lane's version; a frameConn built without a constructor
+// speaks the preferred one.
+func (c *frameConn) wireVersion() byte {
+	if c.wire == 0 {
+		return protocol.Version
+	}
+	return c.wire
 }
 
 // negotiatedWire reports the wire version a lane's transport negotiated, when

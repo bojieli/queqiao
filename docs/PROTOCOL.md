@@ -18,7 +18,7 @@ adds one thing: the `REPLACE_LANE` JOIN flag and its replacement lane ID
 substrate are identical in both versions, apart from the version byte itself.
 
 A build speaks both. Each data connection negotiates exactly one version by
-ALPN (§2.2) and keeps it for its life; every frame on it carries that version
+ALPN (§2.3) and keeps it for its life; every frame on it carries that version
 byte. A gateway accepts both versions by default and a client offers both,
 preferring 2, so gateways can be upgraded ahead of their clients and clients
 move at their own pace. A client of this build also works against a gateway
