@@ -418,6 +418,8 @@ def download(proxy_port, destinations, size, timeout, on_progress=None):
                 break
             digest.update(part)
             received += len(part)
+            if received > size:
+                raise IntegrityError(f"download delivered more than the {size} bytes sent")
             if on_progress is not None:
                 on_progress(received)
     elapsed = time.monotonic() - started
@@ -617,11 +619,15 @@ class Client:
         self.binary, self.work = binary, work
         work.mkdir(parents=True, exist_ok=True)
         self.profile = work / "profile.json"
-        subprocess.run(
+        enrolled = subprocess.run(
             [str(binary), "enroll", "--invite", gateway.invite(), "--profile", str(self.profile),
              "--device-name", f"interop-{transport}", "--local-address", "127.0.0.1", "--timeout", "30s"],
-            check=True, capture_output=True, text=True,
+            capture_output=True, text=True,
         )
+        if enrolled.returncode != 0:
+            # The command line carries a live invitation; report without it.
+            detail = re.sub(r"queqiao://enroll/\S+", "queqiao://enroll/<redacted>", enrolled.stderr.strip())
+            raise RuntimeError(f"enrollment exited with {enrolled.returncode}: {detail[-300:]}")
         self.socks, self.metrics = free_port(), free_port()
         # One TCP lane: a stalled striped bundle is a lane-failure case, and
         # the stall watchdog rescues a lone lane.
@@ -649,6 +655,20 @@ def negotiated_wires(client, gateway):
         if metrics.get(f'queqiao_data_connections_total{{wire="{version}"}}', 0) > 0:
             wires.add(version)
     return sorted(wires)
+
+
+def join_refusals(gateway):
+    """JOINs the gateway answered with a RESET, as either generation logs them."""
+    return sum(1 for record in gateway.process.records() if record.get("msg") == "lane join refused")
+
+
+def failure_kind(error):
+    """What a failed transfer looked like from the application's side."""
+    if isinstance(error, socket.timeout):
+        return "timeout"
+    if isinstance(error, (ConnectionError, EOFError, BrokenPipeError)):
+        return "closed"
+    return "short"
 
 
 def lane_joins(gateway, carrier=None):
@@ -687,6 +707,7 @@ def disrupted_transfer(client, gateway, destinations, direction, carrier, disrup
     def at(progress):
         if not applied and progress >= args.stall_after_mib << 20:
             applied["joins"] = lane_joins(gateway, carrier)
+            applied["refusals"] = join_refusals(gateway)
             disrupt()
             applied["at"] = time.monotonic()
 
@@ -702,15 +723,18 @@ def disrupted_transfer(client, gateway, destinations, direction, carrier, disrup
             outcome.update(phase="setup", error="the transfer finished before the disruption was applied")
             return outcome
         outcome["lane_joins"] = lane_joins(gateway, carrier) - applied["joins"]
+        outcome["join_refusals"] = join_refusals(gateway) - applied["refusals"]
         if outcome["lane_joins"] < 1:
-            outcome.update(phase="rescue", error=f"the flow completed without a {carrier} lane joining it after the disruption")
+            outcome.update(phase="rescue", kind="unrescued", error=f"the flow completed without a {carrier} lane joining it after the disruption")
     except IntegrityError as error:
         outcome.update(phase="integrity", error=str(error))
     except Exception as error:  # noqa: BLE001 - compared with the baseline
         outcome["phase"] = "rescue" if applied else "setup"
+        outcome["kind"] = failure_kind(error)
         outcome["error"] = f"{type(error).__name__}: {error}"
         if applied:
             outcome["lane_joins"] = lane_joins(gateway, carrier) - applied["joins"]
+            outcome["join_refusals"] = join_refusals(gateway) - applied["refusals"]
     return outcome
 
 
@@ -783,14 +807,17 @@ def judge(results, old_ref):
             reference = baseline.get(item["transport"], {}).get("checks", {}).get(check)
             # Only a rescue the old client never achieved against its own
             # gateway either is excused: same phase, the transfer ending the
-            # same way, and no more JOINs than it got there. Setup and integrity failures are never excused.
+            # same way, and neither more JOINs admitted nor more refused than
+            # there. A JOIN the new gateway refuses is never excused. Setup and integrity failures are never excused.
             if (
                 item["pairing"].startswith("old-client/")
                 and outcome.get("phase") == "rescue"
                 and reference is not None
                 and reference.get("phase") == "rescue"
                 and outcome.get("completed") == reference.get("completed")
+                and outcome.get("kind") == reference.get("kind")
                 and outcome.get("lane_joins", 0) <= reference.get("lane_joins", 0)
+                and outcome.get("join_refusals", 0) <= reference.get("join_refusals", 0)
             ):
                 outcome["baseline"] = f"fails identically against the {old_ref} gateway"
                 continue
@@ -859,7 +886,7 @@ def main(arguments=None):
     finally:
         destinations.close()
 
-    judge(results, args.old_ref if not args.old_binary else str(args.old_binary))
+    judge(results, args.old_ref if not args.old_binary else "supplied old build's")
     summary = {
         "format": "queqiao-wire-interop-v1",
         "finished_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

@@ -61,7 +61,7 @@ func TestJoinDuringDestinationDialWaitsForTheSession(t *testing.T) {
 	server, registry := pendingTestServer()
 	flow := newIsolationTestFlow(t, false)
 	flow.lanes[0] = isolationLane(t, 0)
-	pending, ok := server.beginPendingSession(flow.sessionID, flow.flowID, owner)
+	pending, ok := server.beginPendingSession(flow.sessionID, flow.flowID, owner, defaultFrameWire())
 	if !ok {
 		t.Fatal("pending session refused")
 	}
@@ -96,7 +96,7 @@ func TestJoinOnSlowDialGetsTransientRefusal(t *testing.T) {
 	t.Cleanup(func() { pendingJoinWait = saved })
 	server, registry := pendingTestServer()
 	sessionID := [16]byte{7}
-	pending, _ := server.beginPendingSession(sessionID, 3, owner)
+	pending, _ := server.beginPendingSession(sessionID, 3, owner, defaultFrameWire())
 	defer server.endPendingSession(sessionID, pending)
 	frame, ok := <-joinPendingSession(server, owner, sessionID, 3)
 	if !ok || frame.Header.Type != protocol.TypeReset || resetCode(frame.Payload) != session.ResetFlowLimit {
@@ -111,7 +111,7 @@ func TestJoinOnFailedOpenGetsDestinationRefusal(t *testing.T) {
 	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "owner"}
 	server, registry := pendingTestServer()
 	sessionID := [16]byte{8}
-	pending, _ := server.beginPendingSession(sessionID, 3, owner)
+	pending, _ := server.beginPendingSession(sessionID, 3, owner, defaultFrameWire())
 	response := joinPendingSession(server, owner, sessionID, 3)
 	for deadline := time.Now().Add(2 * time.Second); pending.waiters.Load() == 0; {
 		if time.Now().After(deadline) {
@@ -142,7 +142,7 @@ func TestPendingSessionDoesNotHoldOtherJoins(t *testing.T) {
 	other.DeviceID = "other"
 	server, registry := pendingTestServer()
 	sessionID := [16]byte{9}
-	pending, _ := server.beginPendingSession(sessionID, 3, owner)
+	pending, _ := server.beginPendingSession(sessionID, 3, owner, defaultFrameWire())
 	defer server.endPendingSession(sessionID, pending)
 	for _, join := range []struct {
 		who  identity.Principal
@@ -160,7 +160,7 @@ func TestPendingSessionDoesNotHoldOtherJoins(t *testing.T) {
 	if got := registry.Snapshot().LaneJoinRefusals[metrics.LaneJoinUnknownSession]; got != 2 {
 		t.Fatalf("unknown_session = %d, want 2", got)
 	}
-	if _, ok := server.beginPendingSession(sessionID, 3, owner); ok {
+	if _, ok := server.beginPendingSession(sessionID, 3, owner, defaultFrameWire()); ok {
 		t.Fatal("a second OPEN for a pending session was accepted")
 	}
 }
@@ -329,7 +329,7 @@ func TestEndedSessionIsNotNeverHeld(t *testing.T) {
 	if got := registry.Snapshot().LaneJoinRefusals[metrics.LaneJoinSessionEnded]; got != 1 {
 		t.Fatalf("session_ended = %d, want 1", got)
 	}
-	if _, ok := server.beginPendingSession(flow.sessionID, flow.flowID, owner); ok {
+	if _, ok := server.beginPendingSession(flow.sessionID, flow.flowID, owner, defaultFrameWire()); ok {
 		t.Fatal("an OPEN for an ended session was admitted")
 	}
 	// Another device, or another flow, learns nothing about the session.
@@ -553,7 +553,7 @@ func TestJoinWaitsForOpenOKEvenOnceRegistered(t *testing.T) {
 	server, _ := pendingTestServer()
 	flow := newIsolationTestFlow(t, false)
 	flow.lanes[0] = isolationLane(t, 0)
-	pending, _ := server.beginPendingSession(flow.sessionID, flow.flowID, owner)
+	pending, _ := server.beginPendingSession(flow.sessionID, flow.flowID, owner, defaultFrameWire())
 	if !server.registerSession(flow.sessionID, newServerFlow(flow, owner, TransportQUIC, 4)) {
 		t.Fatal("register failed")
 	}
@@ -643,15 +643,15 @@ func TestPendingWaitersAreCountedFromLookupUntilTheWaitEnds(t *testing.T) {
 	t.Cleanup(func() { pendingJoinWait = saved })
 	server, _ := pendingTestServer()
 	sessionID := [16]byte{4}
-	pending, _ := server.beginPendingSession(sessionID, 3, owner)
+	pending, _ := server.beginPendingSession(sessionID, 3, owner, defaultFrameWire())
 	defer server.endPendingSession(sessionID, pending)
-	if _, got := server.lookupLiveOrPending(sessionID, 4, owner); got != nil {
+	if _, got, _ := server.lookupLiveOrPending(sessionID, 4, owner, defaultFrameWire()); got != nil {
 		t.Fatal("a JOIN naming another flow was given the pending OPEN")
 	}
 	if server.pendingRescueRequested(pending) {
 		t.Fatal("a JOIN for another flow requested a rescue")
 	}
-	_, got := server.lookupLiveOrPending(sessionID, 3, owner)
+	_, got, _ := server.lookupLiveOrPending(sessionID, 3, owner, defaultFrameWire())
 	if got.waiters.Load() != 1 || !server.pendingRescueRequested(pending) {
 		t.Fatal("a JOIN that found the OPEN is not yet its waiter")
 	}

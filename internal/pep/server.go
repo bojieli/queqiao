@@ -869,7 +869,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	// DATA, and may need a replacement lane, as soon as its OPEN is written;
 	// a JOIN that overtook a slow dial used to find no session and get the
 	// permanent "unknown session" answer for a flow that was about to exist.
-	pending, ok := s.beginPendingSession(sessionID, open.Header.FlowID, principal)
+	pending, ok := s.beginPendingSession(sessionID, open.Header.FlowID, principal, fc.wire)
 	if !ok {
 		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetFlowLimit, "session already exists")})
 		return
@@ -1126,7 +1126,11 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinInvalidIdentity, session.ResetProtocol, "invalid lane join identity")
 		return
 	}
-	serverSession, pending := s.lookupLiveOrPending(sessionID, open.Header.FlowID, principal)
+	serverSession, pending, wrongWire := s.lookupLiveOrPending(sessionID, open.Header.FlowID, principal, fc.wire)
+	if wrongWire {
+		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinWireMismatch, session.ResetProtocol, wireMismatchAnswer)
+		return
+	}
 	// A matching pending OPEN takes precedence even once its session is in
 	// the table: until its OPEN_OK is written, a JOIN admitted now could
 	// retire the OPEN's lane under it.
@@ -1497,6 +1501,9 @@ var pendingJoinWait = 5 * time.Second
 type pendingSession struct {
 	flowID    uint64
 	principal identity.Principal
+	// wire is the version the OPEN negotiated, so a JOIN of another version
+	// is refused before it can wait on, or ask to rescue, this OPEN.
+	wire byte
 	// done is closed once the OPEN has either registered its session or
 	// failed; admitted, written before, says which.
 	done     chan struct{}
@@ -1521,7 +1528,7 @@ const (
 // beginPendingSession announces a session whose OPEN is being dialled. It
 // refuses an identifier that is already pending or live, which is what
 // registerSession would have answered after the dial.
-func (s *Server) beginPendingSession(id [16]byte, flowID uint64, principal identity.Principal) (*pendingSession, bool) {
+func (s *Server) beginPendingSession(id [16]byte, flowID uint64, principal identity.Principal, wire byte) (*pendingSession, bool) {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
 	if _, exists := s.sessions[id]; exists {
@@ -1535,7 +1542,7 @@ func (s *Server) beginPendingSession(id [16]byte, flowID uint64, principal ident
 		// the destination a second time.
 		return nil, false
 	}
-	pending := &pendingSession{flowID: flowID, principal: principal, done: make(chan struct{})}
+	pending := &pendingSession{flowID: flowID, principal: principal, wire: wire, done: make(chan struct{})}
 	if s.pending == nil {
 		s.pending = make(map[[16]byte]*pendingSession)
 	}
@@ -1568,16 +1575,23 @@ func (s *Server) endPendingSession(id [16]byte, pending *pendingSession) {
 // it, and that JOIN is counted as its waiter here, under the same lock the
 // OPEN takes to decide whether a waiter is there to rescue it. The caller
 // must then call awaitPendingSession, which uncounts it.
-func (s *Server) lookupLiveOrPending(id [16]byte, flowID uint64, principal identity.Principal) (*serverFlow, *pendingSession) {
+//
+// wrongWire reports a pending OPEN of this device and flow that negotiated a
+// different wire version: the JOIN is neither counted nor allowed to mark the
+// OPEN as one a client wants rescued.
+func (s *Server) lookupLiveOrPending(id [16]byte, flowID uint64, principal identity.Principal, wire byte) (live *serverFlow, pending *pendingSession, wrongWire bool) {
 	s.sessionsMu.RLock()
 	defer s.sessionsMu.RUnlock()
-	pending := s.pending[id]
+	pending = s.pending[id]
 	if pending == nil || pending.flowID != flowID || !samePrincipal(pending.principal, principal) {
-		return s.sessions[id], nil
+		return s.sessions[id], nil, false
+	}
+	if pending.wire != 0 && pending.wire != wire {
+		return s.sessions[id], nil, true
 	}
 	pending.waiters.Add(1)
 	pending.rescueRequested.Store(true)
-	return s.sessions[id], pending
+	return s.sessions[id], pending, false
 }
 
 // pendingRescueRequested decides, under the lock JOINs register under,

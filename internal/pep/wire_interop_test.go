@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
@@ -673,4 +674,27 @@ func TestPinnedFlowDialsOnlyItsVersion(t *testing.T) {
 	}
 	client.releaseBulkConn(v1, false)
 	client.closeBulkQUICPool("test done")
+}
+
+// TestAJoinOfTheOtherVersionCannotClaimAPendingOpen covers the window before
+// a flow exists: a JOIN of the other version for an OPEN still dialling its
+// destination is refused at once as a version mismatch, without waiting on
+// the OPEN or marking it as one a client asked to rescue.
+func TestAJoinOfTheOtherVersionCannotClaimAPendingOpen(t *testing.T) {
+	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "owner"}
+	server, registry := pendingTestServer()
+	sessionID := [16]byte{8}
+	pending, _ := server.beginPendingSession(sessionID, 3, owner, 1)
+	defer server.endPendingSession(sessionID, pending)
+	frame, ok := <-joinPendingSession(server, owner, sessionID, 3)
+	if !ok || frame.Header.Type != protocol.TypeReset || resetCode(frame.Payload) != session.ResetProtocol ||
+		string(frame.Payload[1:]) != wireMismatchAnswer {
+		t.Fatalf("a v2 JOIN for a pending v1 OPEN got %+v %q", frame.Header, frame.Payload)
+	}
+	if pending.rescueRequested.Load() || pending.waiters.Load() != 0 {
+		t.Fatal("a JOIN of the other version registered as the pending OPEN's rescuer")
+	}
+	if got := registry.Snapshot().LaneJoinRefusals[metrics.LaneJoinWireMismatch]; got != 1 {
+		t.Fatalf("wire_mismatch = %d, want 1", got)
+	}
 }
