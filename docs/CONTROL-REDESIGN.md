@@ -589,6 +589,15 @@ earlier for the same reason (#160 item 3).
   and an under-sampled floor matures only from what the siblings measured:
   the pool now publishes the weight behind its erasure
   (`State.ErasureWeight`), so a lane takes its own report back out exactly.
+- The siblings' evidence is exact: their effective sample count is
+  recomputed with the lane's own term taken out of the pool's Kish sums (it
+  is not additive), and their erasure uses the pool's figure at full
+  precision rather than the published parts per million, whose rounding the
+  subtraction magnifies beside a long-lived lane. A lane with a confirmed
+  own floor over a thin pool can still have that floor expire by the timed
+  re-base.
+- ProbeRTT's held-down rounds are not ramp evidence: they neither count as
+  flat nor act on a pending re-arm, which waits for the probe to end.
 - A round counts as probing (for the flat-delivery exit, and as a backlog for
   re-arming) when half of the smaller of the window and the pacing rate over
   a round trip was in flight. The window alone missed a pacer-bound lane

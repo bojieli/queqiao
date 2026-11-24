@@ -196,7 +196,7 @@ type ErasureSender struct {
 	// the pool -- the part of the pool's erasure that is not independent
 	// evidence about its rounds -- and poolWeight the observations the
 	// pool's figure is weighted by. See siblingsErasure.
-	selfSamples, selfLoss, selfObserved, poolWeight float64
+	selfSamples, selfLoss, selfObserved, poolWeight, poolErasure float64
 }
 
 type packetOutcome struct {
@@ -571,6 +571,12 @@ func (e *ErasureSender) judgeRamp(arrived, lost uint64) {
 		e.endRamp()
 		return
 	}
+	// A ProbeRTT round holds the window down on purpose, and its delivery
+	// says nothing about whether the path is full: three such rounds fit in
+	// one probe on a short path.
+	if e.inner.mode == tuicBbrProbeRTT {
+		return
+	}
 	delivered := float64(e.inner.estimator.measuredEstimate())
 	if delivered >= e.rampDelivered*rampGrowth && delivered > 0 {
 		// Delivery rose with the rate and the loss did not: the round is
@@ -663,8 +669,15 @@ func (e *ErasureSender) rebaseFloor(now monotime.Time) {
 	if e.rampFloorN < rampLossSamples {
 		if floor, samples, ok := e.siblingsErasure(); ok && samples >= rampLossSamples {
 			e.rampFloor, e.rampFloorN, e.rampBurst = floor, samples, math.Max(e.poolBurst, 1)
+			return
 		}
-		return
+		// A lane with a confirmed floor of its own has something to judge
+		// the pool against, and its floor must be able to expire like any
+		// other: a lane that outlives the siblings it joined beside would
+		// otherwise keep its veto however long the path's erasure has risen.
+		if !e.ownConfirmed {
+			return
+		}
 	}
 	// The window has to be observed, not merely elapsed: a lane that saw the
 	// overflow once and then went quiet has no evidence about the interval it
@@ -726,8 +739,10 @@ func (e *ErasureSender) siblingsErasure() (erasure, samples float64, ok bool) {
 		return 0, 0, false
 	}
 	samples = weight * weight / spread
-	pooled := float64(e.erasure.Load()) / partsPerMillion
-	erasure = (pooled*e.poolWeight - e.selfLoss*e.selfObserved) / weight
+	// The pool's figure at full precision: the subtraction scales its
+	// rounding by poolWeight/weight, which for a long-lived lane beside a
+	// new sibling turns a part per million into points of loss.
+	erasure = (e.poolErasure*e.poolWeight - e.selfLoss*e.selfObserved) / weight
 	return math.Min(math.Max(erasure, 0), 1), samples, true
 }
 
@@ -847,7 +862,9 @@ func (e *ErasureSender) maybeRearm() {
 	} else {
 		e.departed, e.lastShare = false, share
 	}
-	if e.inner.round < e.rearmAfter || !e.backlogged() {
+	// Not while ProbeRTT holds the window down on purpose: filling a probe
+	// window is not demand, and the departure waits for the probe to end.
+	if e.inner.round < e.rearmAfter || e.inner.mode == tuicBbrProbeRTT || !e.backlogged() {
 		return
 	}
 	delivered := float64(e.inner.estimator.measuredEstimate())
@@ -1320,7 +1337,7 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		e.share.Store(uint64(state.Share))
 		e.poolSamples, e.poolBurst = state.ErasureSamples, state.ErasureBurst
 		e.selfSamples, e.selfLoss, e.selfObserved = snapshot.Samples, snapshot.Loss, float64(snapshot.Decided)
-		e.poolWeight = state.ErasureWeight
+		e.poolWeight, e.poolErasure = state.ErasureWeight, state.Erasure
 		e.poolRTT = state.LeafRoundTrip
 		e.rampGate(eventTime, acked, lost)
 	}

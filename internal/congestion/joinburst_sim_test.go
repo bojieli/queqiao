@@ -821,6 +821,7 @@ func TestAnUnderSampledFloorMatures(t *testing.T) {
 	probe.ErasureSamples = 10
 	sender := NewErasureSenderOn(1200, probe)
 	sender.poolSamples, sender.poolWeight, sender.poolBurst = 5000, 5000, 1
+	sender.poolErasure = 0.15
 	sender.erasure.Store(uint64(0.15 * partsPerMillion))
 	sender.rampGate(base(), nil, nil)
 	if sender.rampFloorN != 5000 || sender.rampFloor != 0.15 {
@@ -1167,13 +1168,13 @@ func TestAThinPoolDoesNotMakeAFirstFlightAFloor(t *testing.T) {
 	// none of 100. The pool reads 0.82.
 	sender.selfLoss, sender.selfObserved, sender.selfSamples = 0.9, 1000, 1000
 	sender.poolWeight, sender.poolSamples, sender.poolBurst = 1100, 1040, 1
-	sender.erasure.Store(818182)
+	sender.poolErasure = 0.9 * 1000 / 1100
 	sender.rampGate(base(), nil, nil)
 	if sender.rampFloorN >= rampLossSamples {
 		t.Fatalf("the floor matured to %.3f on %.0f samples, 1,000 of them this lane's own", sender.rampFloor, sender.rampFloorN)
 	}
 	sender.poolWeight, sender.poolSamples = 1200, 1100
-	sender.erasure.Store(750000)
+	sender.poolErasure = 0.9 * 1000 / 1200
 	sender.rampGate(base(), nil, nil)
 	if sender.rampFloorN < rampLossSamples || sender.rampFloor > 0.01 {
 		t.Fatalf("from 200 clean sibling outcomes the floor matured to %.3f on %.0f, want 0", sender.rampFloor, sender.rampFloorN)
@@ -1241,8 +1242,7 @@ func TestSiblingSamplesAreRecomputedNotSubtracted(t *testing.T) {
 	state := m.Report(2, pathmodel.Observation{Erasure: 0.1, BurstFactor: 1, ObservedSamples: 100, ErasureSamples: 100, Delivered: 1e6})
 	sender := NewErasureSenderOn(1200, joiningProbe())
 	sender.selfLoss, sender.selfObserved, sender.selfSamples = 0.5, 100000, 1000
-	sender.poolWeight, sender.poolSamples = state.ErasureWeight, state.ErasureSamples
-	sender.erasure.Store(uint64(state.Erasure * partsPerMillion))
+	sender.poolWeight, sender.poolSamples, sender.poolErasure = state.ErasureWeight, state.ErasureSamples, state.Erasure
 	erasure, samples, ok := sender.siblingsErasure()
 	if !ok || math.Abs(samples-100) > 1 || math.Abs(erasure-0.1) > 0.001 {
 		t.Fatalf("siblings: erasure %.3f on %.1f samples (ok %v); want 0.1 on 100", erasure, samples, ok)
@@ -1266,5 +1266,86 @@ func TestALaneLeftAloneRightAfterItsRampEnds(t *testing.T) {
 	}
 	if !sender.ramping.Load() {
 		t.Fatal("left alone before its first round at the cap, the lane never ramped again")
+	}
+}
+
+// A lane that confirmed its own floor over a thin pool, and outlived the
+// siblings that could have matured the pool's, still has its floor expire
+// after a measured window above it.
+func TestAConfirmedFloorOverAThinPoolCanRebase(t *testing.T) {
+	probe := joiningProbe()
+	probe.ErasureSamples = 10
+	sender := NewErasureSenderOn(1200, probe)
+	closeRound(sender, 60, 4)
+	closeRound(sender, 188, 12)
+	if !sender.ownConfirmed {
+		t.Fatal("setup: the lane did not confirm its own floor")
+	}
+	sender.endRamp()
+	sender.poolSamples, sender.poolBurst = 5000, 1
+	sender.erasure.Store(uint64(0.30 * partsPerMillion))
+	acked, lost := make([]quiccongestion.AckedPacketInfo, 70), make([]quiccongestion.LostPacketInfo, 30)
+	start := base()
+	for at := start; at.Sub(start) <= floorRebaseAfter; at = at.Add(500 * time.Millisecond) {
+		sender.rampGate(at, acked, lost)
+	}
+	if floor, _ := sender.floor(); math.Abs(floor-0.30) > 0.001 {
+		t.Fatalf("after a measured window above it, the floor is still %.3f", floor)
+	}
+}
+
+// ProbeRTT holds the window down on purpose. Its rounds are not flat rounds,
+// and a lane left alone during one re-arms after it, not inside it.
+func TestProbeRTTRoundsAreNotRampEvidence(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	primeOwnFloor(sender, 10)
+	sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
+	sender.inner.mode = tuicBbrProbeRTT
+	for round := 0; round < 2*rampFlatRounds; round++ {
+		sendAt(sender, sender.GetCongestionWindow())
+		sender.inner.round++
+		sender.rampGate(base(), nil, nil)
+	}
+	if !sender.ramping.Load() {
+		t.Fatal("ProbeRTT's held-down rounds ended a ramp as flat")
+	}
+
+	sender = NewErasureSenderOn(1200, joiningProbe())
+	sender.inner.minRTT = joiningRoundTrip
+	sender.SetRTTStatsProvider(&fixedRTT{min: joiningRoundTrip, smoothed: joiningRoundTrip})
+	sender.endRamp()
+	sender.inner.mode = tuicBbrProbeRTT
+	sender.share.Store(0)
+	closeRound := func() {
+		sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
+		sendAt(sender, sender.GetCongestionWindow())
+		sender.inner.round++
+		sender.rampGate(base(), nil, nil)
+	}
+	for sender.inner.round <= sender.rearmAfter+2 {
+		closeRound()
+	}
+	if sender.ramping.Load() || !sender.departed {
+		t.Fatalf("inside ProbeRTT: ramping %v, departure pending %v; want false, true", sender.ramping.Load(), sender.departed)
+	}
+	sender.inner.mode = tuicBbrProbeBW
+	closeRound()
+	if !sender.ramping.Load() {
+		t.Fatal("after ProbeRTT the pending departure did not re-arm the lane")
+	}
+}
+
+// The siblings' erasure is taken from the pool's figure at full precision; a
+// long-lived lane's weight would otherwise magnify the published figure's
+// rounding into points of loss.
+func TestSiblingErasureIsExactBesideALongLivedLane(t *testing.T) {
+	m := pathmodel.NewPathModel()
+	m.Report(1, pathmodel.Observation{Erasure: 0.2000004, BurstFactor: 1, ObservedSamples: 1e7, ErasureSamples: 8000, Delivered: 1e6})
+	state := m.Report(2, pathmodel.Observation{Erasure: 0.15, BurstFactor: 1, ObservedSamples: 100, ErasureSamples: 100, Delivered: 1e6})
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	sender.selfLoss, sender.selfObserved, sender.selfSamples = 0.2000004, 1e7, 8000
+	sender.poolWeight, sender.poolSamples, sender.poolErasure = state.ErasureWeight, state.ErasureSamples, state.Erasure
+	if erasure, _, ok := sender.siblingsErasure(); !ok || math.Abs(erasure-0.15) > 0.001 {
+		t.Fatalf("the sibling's erasure reads %.4f (ok %v), want 0.15", erasure, ok)
 	}
 }
