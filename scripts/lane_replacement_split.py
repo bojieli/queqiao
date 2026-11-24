@@ -75,9 +75,10 @@ def parse_instant(value: Any) -> datetime.datetime | None:
     zone = "+00:00" if zone.upper() == "Z" else zone
     try:
         instant = datetime.datetime.fromisoformat(f"{base}.{micros}{zone}")
-    except ValueError:
+        # An offset can carry the instant outside datetime's range in UTC.
+        return instant.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    return instant.astimezone(datetime.timezone.utc)
 
 
 LAST_LANE = re.compile(r"last lane failed \((.*)\): ")
@@ -153,7 +154,10 @@ def flow_key(record: dict[str, Any]) -> tuple[str, str] | None:
 
 
 class Split:
-    def __init__(self) -> None:
+    def __init__(self, collect_members: bool = False) -> None:
+        # Session/flow keys per bucket are read only by gateway_join(), so a
+        # client-only run does not hold one for every bucketed failure.
+        self.collect_members = collect_members
         self.skipped: Counter = Counter()
         self.client_complete = 0
         self.client_failed = 0
@@ -172,19 +176,19 @@ class Split:
 
     def add_client(self, record: dict[str, Any]) -> None:
         msg = record.get("msg")
+        server = record.get("role") == "server"
+        if not server:
+            # The window is the span the client input observed, over every
+            # record with a time and not only the flow records counted below:
+            # a day of logs with one failed flow is a day, not an instant.
+            self.observe(parse_instant(record.get("time")))
         if msg not in (CLIENT_FAILURE, CLIENT_COMPLETE):
             return
-        if record.get("role") == "server":
+        if server:
             # A gateway log passed as a client log would make every flow look
             # like "no zero-lane replacement attempted". Refuse to count it.
             self.ignored_server_records += 1
             return
-        instant = parse_instant(record.get("time"))
-        if instant is not None:
-            if self.first is None or instant < self.first:
-                self.first = instant
-            if self.last is None or instant > self.last:
-                self.last = instant
         if msg == CLIENT_COMPLETE:
             self.client_complete += 1
             return
@@ -196,7 +200,7 @@ class Split:
 
         def note(bucket: str) -> None:
             self.deaths[bucket][death] += 1
-            if key is not None:
+            if key is not None and self.collect_members:
                 self.members[bucket].append(key)
 
         if TIMEOUT in error:
@@ -218,6 +222,14 @@ class Split:
                 self.other_terminal[terminal] += 1
                 note(terminal)
                 return
+
+    def observe(self, instant: datetime.datetime | None) -> None:
+        if instant is None:
+            return
+        if self.first is None or instant < self.first:
+            self.first = instant
+        if self.last is None or instant > self.last:
+            self.last = instant
 
     def add_gateway(self, record: dict[str, Any]) -> None:
         msg = record.get("msg")
@@ -277,7 +289,7 @@ def open_input(path: str) -> TextIO:
 
 
 def analyse(client_paths: list[str], gateway_paths: list[str]) -> Split:
-    split = Split()
+    split = Split(collect_members=bool(gateway_paths))
     for path in client_paths:
         with open_input(path) as stream:
             for record in read_records(stream, split.skipped):
