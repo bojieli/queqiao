@@ -837,6 +837,9 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow.maxLifetime = s.cfg.FlowMaxLifetime
 	flow.reserveControlLane = open.Header.Flags&protocol.FlagReserveControl != 0
 	flow.controlLaneShared = auth.shared
+	// A flow that fails here is gone for good: tell the client on every lane
+	// so it does not spend a JOIN discovering that (issue #159).
+	flow.resetOnFailure = true
 	initialKind := transportKindForConn(conn)
 	serverSession := newServerFlow(flow, principal, initialKind, s.cfg.TCPFallbackLanes)
 	if err := serverSession.addLane(&mpLane{

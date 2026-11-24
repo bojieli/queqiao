@@ -18,6 +18,7 @@ import (
 	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/multipath"
 	"github.com/bojieli/queqiao/internal/protocol"
+	"github.com/bojieli/queqiao/internal/session"
 	"github.com/bojieli/queqiao/internal/stripe"
 )
 
@@ -363,8 +364,16 @@ type multipathFlow struct {
 	// pooled control connection. Nil means "no", which is what a flow on a
 	// dedicated connection should answer.
 	controlLaneShared func() bool
-	started           time.Time
-	completionGrace   time.Duration
+	// resetOnFailure makes a failed flow tell its peer before it closes: a
+	// RESET goes out on every lane still open. The gateway sets it. Without
+	// it the peer sees only the streams end, takes that for a path failure,
+	// and asks to JOIN a session that is already gone.
+	resetOnFailure bool
+	// peerReset records that the peer ended the flow with RESET, so this end
+	// does not answer it with one of its own.
+	peerReset       atomic.Bool
+	started         time.Time
+	completionGrace time.Duration
 	// Tests shorten the bounded drain after a proven application close.
 	abortDrainGrace time.Duration
 	bytesUp         atomic.Uint64
@@ -1154,6 +1163,7 @@ func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool 
 		return false
 	}
 	if frame.Header.Type == protocol.TypeReset {
+		f.peerReset.Store(true)
 		err := errors.New("peer reset flow")
 		if len(frame.Payload) > 1 {
 			err = fmt.Errorf("peer reset flow: %s", string(frame.Payload[1:]))
@@ -1624,7 +1634,7 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 					// sibling worker before tearing down the physical lanes. Otherwise
 					// a blocked application read can outlive the logical flow.
 					cancelRun()
-					f.closeAll()
+					f.failClose(err)
 					stats.Ended = time.Now()
 					stats.BytesSent = f.bytesUp.Load()
 					stats.BytesRead = f.bytesDown.Load()
@@ -1640,7 +1650,7 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 				f.metrics.FlowTimeout()
 			}
 			cancelRun()
-			f.closeAll()
+			f.failClose(err)
 			stats.Ended = time.Now()
 			stats.BytesSent = f.bytesUp.Load()
 			stats.BytesRead = f.bytesDown.Load()
@@ -1651,7 +1661,11 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 				continue
 			}
 			cancelRun()
-			f.closeAll()
+			if errors.Is(err, errLocalApplicationClose) {
+				f.closeAll()
+			} else {
+				f.failClose(err)
+			}
 			stats.Ended = time.Now()
 			stats.BytesSent = f.bytesUp.Load()
 			stats.BytesRead = f.bytesDown.Load()
@@ -1701,7 +1715,7 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 					err = fmt.Errorf("lane failed (%v), replay failed: %w", err, replayErr)
 				}
 			}
-			f.closeAll()
+			f.failClose(err)
 			stats.Ended = time.Now()
 			stats.BytesSent = f.bytesUp.Load()
 			stats.BytesRead = f.bytesDown.Load()
@@ -1709,7 +1723,7 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 			return stats, err
 		case <-ctx.Done():
 			cancelRun()
-			f.closeAll()
+			f.failClose(ctx.Err())
 			stats.Ended = time.Now()
 			stats.BytesSent = f.bytesUp.Load()
 			stats.BytesRead = f.bytesDown.Load()
@@ -2007,7 +2021,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			}
 			// Also interrupt a coordinator currently waiting for lane replacement;
 			// it must not add another outage budget after this deadline expires.
-			f.closeAll()
+			f.failClose(terminal)
 			return
 		}
 		// Optimistic DATA may precede OPEN_OK. A JOIN cannot rescue a session
@@ -3142,6 +3156,7 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 				f.openAckPending = false
 				f.confirmOpen()
 			case protocol.TypeReset:
+				f.peerReset.Store(true)
 				if len(frame.Payload) > 1 {
 					return fmt.Errorf("peer reset flow: %s", string(frame.Payload[1:]))
 				}
@@ -3395,6 +3410,78 @@ func (f *multipathFlow) dataSubstrates() (coded, stream uint64) {
 		stream += s
 	}
 	return coded, stream
+}
+
+// terminalResetWait bounds how long a failing flow spends telling its peer.
+// The RESET is a courtesy that saves the peer a JOIN round trip and a
+// misleading "unknown session" answer; it must not hold up the teardown of a
+// flow that is already failing, so a lane that cannot take it at once is
+// simply closed.
+const terminalResetWait = 250 * time.Millisecond
+
+// failClose ends a flow that failed. On an endpoint with resetOnFailure set it
+// first sends RESET on every lane still open, so the peer learns the session is
+// gone instead of seeing a stream end it would treat as a dead path.
+func (f *multipathFlow) failClose(err error) {
+	f.resetLanes(err)
+	f.closeAll()
+}
+
+func (f *multipathFlow) resetLanes(err error) {
+	if !f.resetOnFailure || f.peerReset.Load() || f.finished.Load() {
+		return
+	}
+	f.lanesMu.Lock()
+	lanes := make([]*mpLane, 0, len(f.lanes))
+	for _, lane := range f.lanes {
+		if lane.fc != nil && !lane.closed.Load() {
+			lanes = append(lanes, lane)
+		}
+	}
+	f.lanesMu.Unlock()
+	if len(lanes) == 0 {
+		return
+	}
+	code, reason := terminalResetReason(err)
+	frame := protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeReset, SessionID: f.sessionID,
+		FlowID: f.flowID, Class: protocol.ClassNew,
+	}, Payload: session.ResetPayload(code, reason)}
+	ctx, cancel := context.WithTimeout(context.Background(), terminalResetWait)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, lane := range lanes {
+		wg.Add(1)
+		go func(lane *mpLane) {
+			defer wg.Done()
+			// The reliable stream, never the coded datagrams: a RESET that
+			// can be lost is no better than none.
+			_ = lane.fc.writeControlContext(ctx, frame)
+		}(lane)
+	}
+	wg.Wait()
+}
+
+// terminalResetReason names why a flow failed in words fit for the peer. The
+// error itself can carry addresses of this host or of the destination, so only
+// its class goes on the wire.
+func terminalResetReason(err error) (session.ResetCode, string) {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return session.ResetTransport, "flow ended: gateway shutting down"
+	case errors.Is(err, errFlowNoProgress):
+		return session.ResetTransport, "flow ended: no delivery progress"
+	case errors.Is(err, errLaneReplacementTimeout), errors.Is(err, errReplacementAbandoned):
+		return session.ResetTransport, "flow ended: lane replacement timeout"
+	case errors.Is(err, errFlowIdleTimeout):
+		return session.ResetTransport, "flow ended: idle timeout"
+	case errors.Is(err, errFlowLifetime):
+		return session.ResetTransport, "flow ended: lifetime exceeded"
+	case expectedDestinationCloseError(err):
+		return session.ResetDestination, "flow ended: destination closed"
+	default:
+		return session.ResetTransport, "flow ended with error"
+	}
 }
 
 func (f *multipathFlow) closeAll() {
