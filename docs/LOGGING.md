@@ -284,6 +284,12 @@ tail after its last record is not included. The tool never uses the gateway's
 attempt counters. It ignores a client-message record written by
 `role=server`, and says so.
 
+The report's `window` is the observation window of the client input: the
+earliest and latest parseable `time` over every client record, not only the
+flow records it counts, and it skips `role=server` records. Reports from
+before this change gave the span of the terminal flow records alone, so a long
+log with one failed flow showed a zero-length window.
+
 `lane_replacement_waits` counts waiters, not graces. The flow's run loop, its
 frame and control writers, and its acknowledgement loop all wait for a missing
 lane, so a lane that dies with writes in flight leaves several of them waiting

@@ -145,6 +145,33 @@ class LaneReplacementSplitTests(unittest.TestCase):
         })
         self.assertIsNone(MODULE.Split().report(False)["window"])
 
+    def test_window_spans_every_client_record(self):
+        # One failed flow in a longer log: the window is what the input
+        # observed, not the span of its terminal flow records (issue #157).
+        split = MODULE.Split()
+        split.add_client({"time": "2026-11-20T00:00:00Z", "msg": "client started", "role": "client"})
+        split.add_client(client_failure(1, SILENT, time="2026-11-20T12:00:00Z"))
+        split.add_client({"time": "2026-11-20T23:59:59Z", "msg": "lane recovery unavailable", "flow_id": 1})
+        split.add_client({"msg": "no time field"})
+        split.add_client({"time": "garbage", "msg": "unparseable time"})
+        # A gateway record in client input is set aside, window included.
+        split.add_client({"time": "2026-11-21T06:00:00Z", "msg": "lane join refused", "role": "server"})
+        split.add_client(dict(CLIENT[0], time="2026-11-21T07:00:00Z", role="server"))
+        self.assertEqual(split.report(False)["window"], {
+            "first": "2026-11-20T00:00:00.000000Z", "last": "2026-11-20T23:59:59.000000Z",
+        })
+        self.assertEqual(split.report(False)["client_flows"], {"complete": 0, "failed": 1})
+        self.assertEqual(split.ignored_server_records, 1)
+
+    def test_members_collected_only_with_gateway_input(self):
+        client_only = MODULE.analyse([self.client], [])
+        self.assertEqual(sum(client_only.buckets.values()), 10)
+        self.assertEqual(dict(client_only.members), {})
+        self.assertNotIn("gateway", client_only.report(with_gateway=False))
+        with_gateway = MODULE.analyse([self.client], [self.gateway])
+        self.assertEqual(len(with_gateway.members[MODULE.NO_ATTEMPT]), 2)
+        self.assertEqual(len(with_gateway.members[MODULE.EVERY_ATTEMPT_FAILED]), 5)
+
     def test_other_terminal_errors_counted_separately(self):
         report = self.report()
         self.assertEqual(report["other_terminal_errors"], {

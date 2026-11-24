@@ -1948,6 +1948,19 @@ func (c *Client) openControlPoolJoinLane(ctx context.Context, sessionID [16]byte
 	return c.completeLaneJoin(ctx, lane, flowID, protocol.FlagReserveControl)
 }
 
+// laneJoinIOError reports a JOIN write or read that failed after the join's
+// context ended as that context's error, with the I/O error as its cause.
+// bindHandshake interrupts a blocked handshake on cancellation by moving the
+// socket deadline to now, so the I/O error alone is an i/o timeout and would
+// be counted and logged as a `timeout` for a flow that had already ended. A
+// handshake that runs out its own budget on a live context stays a timeout.
+func laneJoinIOError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("%w: %w", ctxErr, err)
+	}
+	return err
+}
+
 func (c *Client) completeLaneJoin(ctx context.Context, lane *authenticatedLane, flowID uint64, flags uint16) (*mpLane, error) {
 	_, finishHandshake := bindHandshake(ctx, lane.outer, handshakeBound(lane.outer, c.cfg.HandshakeTimeout))
 	defer finishHandshake()
@@ -1961,12 +1974,12 @@ func (c *Client) completeLaneJoin(ctx context.Context, lane *authenticatedLane, 
 		SessionID: lane.sessionID, FlowID: flowID, Class: protocol.ClassBulk,
 	}, Payload: payload}); err != nil {
 		_ = lane.fc.Close()
-		return nil, err
+		return nil, laneJoinIOError(ctx, err)
 	}
 	response, err := lane.fc.Read()
 	if err != nil {
 		_ = lane.fc.Close()
-		return nil, err
+		return nil, laneJoinIOError(ctx, err)
 	}
 	if response.Header.Type == protocol.TypeReset && response.Header.SessionID == lane.sessionID && response.Header.FlowID == flowID {
 		_ = lane.fc.Close()
