@@ -557,7 +557,11 @@ func (e *ErasureSender) confirmOwnFloor(arrived, lost uint64) (pending bool) {
 	}
 	e.ownConfirmed = true
 	e.ownFloor = (e.ownFloor*e.ownFloorN + float64(lost)) / (e.ownFloorN + decided)
+	// The confirmed floor rests on the independent trials of both, n + m,
+	// which the burst factor stored with it has to reproduce: the rounds may
+	// have lost in runs of different lengths.
 	e.ownFloorN += decided
+	e.ownBurst = e.ownFloorN / (n + m)
 	return false
 }
 

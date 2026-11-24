@@ -11,7 +11,7 @@ using the path. On a fast path with moderate erasure this restores the
 goodput the honest pooled seed had cost, and on a lossy path it no longer
 decays to a third of capacity.
 
-A QUIC lane no longer takes on more than it can send in two of its own round
+A QUIC lane no longer takes on more than it can deliver in four of its own round
 trips, so a slow lane stops holding chunks long enough for them to be copied
 to another lane; and rescue lanes left idle after a stall no longer each take
 a share of the path from the lanes carrying data.

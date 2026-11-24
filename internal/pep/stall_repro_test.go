@@ -90,8 +90,14 @@ func TestFourDownloadsOnAFastLossyPath(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	clientLogger := logger
 	if dir := os.Getenv("REPRO_LOG"); dir != "" {
-		sf, _ := os.Create(dir + "/server.jsonl")
-		cf, _ := os.Create(dir + "/client.jsonl")
+		sf, err := os.Create(dir + "/server.jsonl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cf, err := os.Create(dir + "/client.jsonl")
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer sf.Close()
 		defer cf.Close()
 		logger = slog.New(slog.NewJSONHandler(sf, nil))

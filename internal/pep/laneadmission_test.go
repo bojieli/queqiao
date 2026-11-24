@@ -14,7 +14,7 @@ import (
 // on taking chunks at the rate the fast lanes freed them. Measured live, 1.2
 // to 1.5 MB sat behind a lane pacing 0.7 to 1 MB/s; each chunk outlived the
 // reissue deadline before it left and was copied to another lane. A QUIC lane
-// may now commit what it can send in two of its own round trips.
+// may now commit what it can deliver in four of its own round trips.
 func TestASlowQUICLaneCommitsOnlyWhatItsRateCarries(t *testing.T) {
 	local, remote := net.Pipe()
 	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
@@ -30,10 +30,10 @@ func TestASlowQUICLaneCommitsOnlyWhatItsRateCarries(t *testing.T) {
 	flow.lanes[slow.id], flow.lanes[fast.id] = slow, fast
 	admission := &laneAdmission{flow: flow}
 
-	if got, want := admission.Outstanding(slow.id, 0), 400_000; got != want {
-		t.Fatalf("a QUIC lane pacing 1 MB/s at 200 ms may commit %d bytes, want two round trips' worth, %d", got, want)
+	if got, want := admission.Outstanding(slow.id, 0), 800_000; got != want {
+		t.Fatalf("a QUIC lane pacing 1 MB/s at 200 ms may commit %d bytes, want four round trips' worth, %d", got, want)
 	}
-	if got, want := admission.Outstanding(fast.id, 0), 20_000_000; got != want {
+	if got, want := admission.Outstanding(fast.id, 0), 40_000_000; got != want {
 		t.Fatalf("a QUIC lane pacing 50 MB/s at 200 ms may commit %d bytes, want %d", got, want)
 	}
 	// A lane with nothing to size a bound from is not bounded here.
@@ -59,7 +59,7 @@ func TestASlowQUICLaneCommitsOnlyWhatItsRateCarries(t *testing.T) {
 		controller:  wancongestion.ControllerTelemetry{PacingRate: 2_000_000, Erasure: 0.5},
 	}})}
 	flow.lanes[lossy.id] = lossy
-	if got, want := admission.Outstanding(lossy.id, 0), 400_000; got != want {
+	if got, want := admission.Outstanding(lossy.id, 0), 800_000; got != want {
 		t.Fatalf("a lane pacing 2 MB/s over 50%% erasure may commit %d payload bytes, want %d", got, want)
 	}
 }

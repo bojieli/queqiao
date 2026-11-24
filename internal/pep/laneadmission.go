@@ -33,7 +33,7 @@ const (
 	// laneOutstandingRounds and minLaneOutstandingBytes size a QUIC lane's
 	// commitment; see quicLaneOutstanding. The floor is a few chunks, so a
 	// lane whose estimate is still a trickle can grow it.
-	laneOutstandingRounds   = 2
+	laneOutstandingRounds   = 4
 	minLaneOutstandingBytes = 4 * defaultChunkSize
 )
 
@@ -69,7 +69,12 @@ func (w *laneAdmission) Outstanding(laneID uint64, _ uint64) int {
 // quicLaneOutstanding bounds what a QUIC lane may hold unacknowledged by what
 // it can deliver in laneOutstandingRounds round trips at its own pacing rate
 // (net of the erasure its controller compensates for, since what it holds is
-// payload): one in flight, one waiting behind it.
+// payload). Four is what a chunk's residency on this path comes to -- from
+// the lane taking it to the peer acknowledging it, a median of 3.5 round
+// trips in the live traces: one queued behind what is in flight, one in
+// flight, and the receiver's delivery and acknowledgement. Bounded at two, a
+// lane held at its share could not keep its own rate busy: emulated, four
+// downloads fell from 0.92x main's goodput to 0.86x.
 //
 // Admission otherwise counts only what the lane's writer has not yet handed to
 // the transport, and a QUIC stream takes a write as soon as its buffer has

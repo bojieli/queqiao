@@ -496,3 +496,20 @@ func TestAJoinersShareFollowsTheBoundedSplit(t *testing.T) {
 		t.Fatalf("seed %.0f, want the split over every member, %.0f", state.Seed, want)
 	}
 }
+
+// Whether a lane is busy is judged against what the members reporting now
+// deliver, between them: rescue lanes that have gone silent but not yet
+// expired do not lower the bar until the control connection clears it.
+func TestSilentRescueLanesDoNotMakeTheControlLaneBusy(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	for member := Member(10); member < 18; member++ {
+		m.Report(member, Observation{Delivered: 0, ObservedSamples: 100, RoundTrip: 200 * time.Millisecond})
+	}
+	now = now.Add(2 * time.Second)
+	m.Report(2, Observation{Delivered: 40e3, ObservedSamples: 100, RoundTrip: 200 * time.Millisecond})
+	state := m.Report(1, Observation{Delivered: 1e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	if state.Share != 0 {
+		t.Fatalf("the only busy lane beside a control lane and eight silent rescue lanes is capped at %.0f", state.Share)
+	}
+}

@@ -752,13 +752,22 @@ trials per arm; stalls counted in trials only):
 
 **Changes.**
 
-- A QUIC lane may hold unacknowledged no more than it can send in two of its
-  own round trips at its own pacing rate, with a floor of four chunks
-  (`quicLaneOutstanding`, through the per-lane `Outstanding` admission that
-  TCP striping already used). A slow lane carries what it can and leaves the
-  rest ready for lanes that can carry it sooner.
+- A QUIC lane may hold unacknowledged no more than it can deliver in four of
+  its own round trips at the rate its pacer actually uses (after the share
+  and the delay brake, net of erasure compensation), with a floor of four
+  chunks (`quicLaneOutstanding`, through the per-lane `Outstanding`
+  admission that TCP striping already used). Four is a chunk's residency on
+  this path, median 3.5 round trips from a lane taking it to the peer
+  acknowledging it; at two, a share-capped lane could not keep its own rate
+  busy (emulated, 0.86x main against 0.92x). A slow lane carries what it can
+  and leaves the rest ready for lanes that can carry it sooner. Lane
+  telemetry now reports that effective pacing rate, which is what a trace
+  should have shown all along.
 - The pool's share is split between its busy members and at most one that is
-  not (`pathmodel.Report`). One idle member's split is kept: it is the brake
+  not (`pathmodel.Report`, and `Current` for a joining lane, which the coded
+  path sizes its window from); only the sole busy member itself goes
+  uncapped, and whether a member is busy is judged against what the members
+  reporting now deliver. One idle member's split is kept: it is the brake
   that holds a burst's shares, sized from summed peaks, to what was
   delivered, and every simulated scenario still passes with it. Seeds still
   split over every member.

@@ -1470,3 +1470,19 @@ func TestTheSiblingFloorCarriesTheSiblingsBursts(t *testing.T) {
 		t.Fatalf("siblings losing independently beside a joiner losing in runs of 16: burst %.2f, want 1", got)
 	}
 }
+
+// A confirmed floor rests on the independent trials of both rounds behind
+// it, and its stored burst factor reproduces that count.
+func TestAConfirmedFloorKeepsItsIndependentTrials(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	closeRound(sender, 48, 16) // 64 packets, burst 1: 64 trials
+	sender.selfSamples, sender.selfBurst = 2000, 16
+	sender.ownRoundMax = 400
+	closeRound(sender, 1536, 512) // 2048 packets in runs of 16: 128 trials
+	if !sender.ownConfirmed {
+		t.Fatal("setup: the floor was not confirmed")
+	}
+	if got := sender.ownFloorN / sender.ownBurst; math.Abs(got-192) > 0.5 {
+		t.Fatalf("the confirmed floor counts as %.0f independent trials, want 64 + 128", got)
+	}
+}
