@@ -190,7 +190,19 @@ gateway's own fields (`lane_replacement_waits`, `_timeouts`, `_wait`,
 When a client has recorded a failed zero-lane recovery, its flow completion
 record includes `lane_replacement_last_failure`. The value classifies the last
 returned QUIC round or TCP replacement error: `timeout`, `peer_rejected`,
-`peer_capacity`, `canceled`, or `other`. This lets you split counted errors
+`peer_capacity`, `open_unadmitted`, `open_failed`, `canceled`, or `other`.
+`open_unadmitted` is a join refused as an unknown session while the flow's own
+OPEN was still unconfirmed: the gateway never admitted the session, so nothing
+was lost. A flow
+that still fails this way ends with `peer never admitted this flow's open`
+rather than `peer does not hold this session`. `open_failed` is a join the
+gateway held for a pending OPEN that then failed, usually an unreachable
+destination. A refusal of a flow the client host slept through for longer
+than a gateway holds a silent flow (its lane-loss detection plus its
+replacement grace, one minute) ends the flow with `peer dropped this session
+while this host was suspended`: the gateway ended it correctly, and it is not
+a lost session. The completion record then carries `host_suspended`, the sleep
+that `duration`, which is monotonic, leaves out. This lets you split counted errors
 even when the attempt timed out without its own warning. A later successful or
 pending attempt does not clear this historical observation. Older clients and
 flows with no recorded failure omit the field. The category describes the
@@ -226,8 +238,9 @@ so the highest one logged for a flow is at most its
 that widened a healthy bundle has `replacement=false` and no `attempt`, and is
 not counted in the flow record. Every counted failure gets a line, including
 a peer refusal that ends recovery at once. The level follows `failure_kind`: `timeout`
-(a context deadline or a socket deadline on the handshake), `peer_rejected`
-and `peer_capacity` are written at `info`, and `other` at `warn`. A replacement
+(a context deadline or a socket deadline on the handshake), `peer_rejected`,
+`peer_capacity`, `open_unadmitted` and `open_failed` are written at `info`, and
+`other` at `warn`. A replacement
 cancelled because the flow ended is not written, and any other cancellation is
 written only at `debug`. A failed widening join is written at `warn` with the
 bundle's back-off count as `failures`, and only when it counts against that
@@ -328,6 +341,19 @@ are the peer's to choose, so a map keyed by them is memory a peer sizes -- and
 each record carries how many refusals of that reason it stands for in
 `suppressed`. The matching counters are `queqiao_lane_join_refused_total` by
 reason.
+
+A join that names a session whose OPEN has arrived but is still dialling its
+destination is not refused: it waits, up to five seconds, for the OPEN to be
+decided. If the dial is still running after that, the refusal is
+`reason=session_pending`, which the client retries. If the OPEN failed, it is
+`reason=open_failed`. Before this, both were `unknown_session`, the same answer
+as a session the gateway had dropped.
+
+A gateway also remembers, for two minutes, every session it has held. A join
+for one of those is refused with `reason=session_ended` (answer `unknown
+session: session ended`); `unknown_session` now means a session it has no
+record of. An OPEN for a session it remembers ending is refused, so a late copy
+of an OPEN cannot reach the destination twice.
 
 A gateway that refuses a flow open because of the opening account's own limits
 writes `msg="account flow open refused"` at `warn`, naming the `reason` --

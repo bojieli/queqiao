@@ -1976,6 +1976,8 @@ func (c *Client) completeLaneJoin(ctx context.Context, lane *authenticatedLane, 
 				return nil, fmt.Errorf("%w: %s", errLaneJoinCapacity, string(response.Payload[1:]))
 			case session.ResetTransport:
 				return nil, fmt.Errorf("%w: %s", errLaneJoinTCPMode, string(response.Payload[1:]))
+			case session.ResetDestination:
+				return nil, fmt.Errorf("%w: %s", errLaneJoinOpenFailed, string(response.Payload[1:]))
 			}
 			return nil, fmt.Errorf("%w: %s", errLaneJoinRejected, string(response.Payload[1:]))
 		}
@@ -2456,6 +2458,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 							_ = result.lane.fc.Close()
 							break
 						}
+						flow.confirmOpenByJoin()
 						isolated = true
 						if controlReserve > 0 && flow.laneCount() == controlReserve+1 {
 							// The flow's first bulk lane is what moves it off
@@ -2490,6 +2493,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				lastRecoveryAttempt = now
 				attempt := flow.noteReplacementAttempt()
 				if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
+					err = classifyUnadmittedRefusal(flow, err)
 					flow.noteReplacementFailure(err)
 					// The flow this belongs to is the whole point of the
 					// line: a gateway record saying a flow failed with no
@@ -2508,6 +2512,9 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 						// Retrying it spends the flow's whole replacement
 						// grace learning the same thing, so record the refusal
 						// and let the flow fail now.
+						if errors.Is(err, errLaneJoinOpenUnadmitted) {
+							flow.openUnadmitted.Store(true)
+						}
 						flow.resumeRefused.Store(true)
 						c.cfg.Logger.Debug("peer cannot resume this association", "flow_id", flowID, "error", err)
 						return
@@ -2711,6 +2718,7 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 			if pending > 0 {
 				pending--
 			}
+			result.err = classifyUnadmittedRefusal(flow, result.err)
 			if result.err != nil {
 				if result.replacement {
 					flow.noteReplacementFailure(result.err)
@@ -2726,6 +2734,9 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 				if errors.Is(result.err, errLaneJoinRejected) {
 					bundleDisabled = true
 					if result.stall != nil || flow.laneCount() == 0 {
+						if errors.Is(result.err, errLaneJoinOpenUnadmitted) {
+							flow.openUnadmitted.Store(true)
+						}
 						flow.resumeRefused.Store(true)
 						if result.stall != nil {
 							flow.closeAll()
@@ -2767,6 +2778,7 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 				_ = result.lane.fc.Close()
 				continue
 			}
+			flow.confirmOpenByJoin()
 			if result.stall != nil {
 				flow.retireLaneByID(result.stall.id)
 				flow.clearRescueReplacementSnapshot(result.stall)
@@ -2995,7 +3007,7 @@ func laneRecoveryFailureLevel(manageCtx context.Context, err error) (slog.Level,
 			return 0, false
 		}
 		return slog.LevelDebug, true
-	case "timeout", "peer_rejected", "peer_capacity":
+	case "timeout", "peer_rejected", "peer_capacity", "open_unadmitted", "open_failed":
 		return slog.LevelInfo, true
 	}
 	return slog.LevelWarn, true
@@ -3237,6 +3249,7 @@ func (c *Client) installRecoveryLane(flow *multipathFlow, lane *mpLane) error {
 		_ = lane.fc.Close()
 		return err
 	}
+	flow.confirmOpenByJoin()
 	if lane.kind == TransportTCP {
 		// The server committed the handoff at JOIN admission. Count it
 		// locally only after its acknowledged lane is installed.

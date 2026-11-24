@@ -268,6 +268,20 @@ type multipathFlow struct {
 	// does not know this session. That answer is permanent, so it ends the
 	// replacement grace rather than being retried.
 	resumeRefused atomic.Bool
+	// openUnadmitted narrows resumeRefused: the refusal came while this
+	// flow's OPEN was still unconfirmed, so the peer never had the session
+	// to lose. The flow then fails with errOpenNotAdmitted, which a reader
+	// of the logs must not count with sessions the peer dropped.
+	openUnadmitted atomic.Bool
+	// openConfirmedByJoin records that a JOIN's OPEN_OK confirmed the flow
+	// before the OPEN's own did (issue #159).
+	openConfirmedByJoin atomic.Bool
+	// lastPeerWall and lastPeerMono are when a frame last arrived from the
+	// peer, in wall-clock nanoseconds and in monotonic time since started.
+	// Their difference against now is how long this host slept since the peer
+	// was last heard from.
+	lastPeerWall atomic.Int64
+	lastPeerMono atomic.Int64
 	// capacityRefusals counts consecutive rescue rounds the peer answered
 	// with its lane-admission ceiling. One answer is the ordinary loser of a
 	// rescue race; several in a row with no successful round between them are
@@ -507,6 +521,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 	f.idleTimeout = defaultFlowIdleTimeout
 	f.maxLifetime = defaultFlowMaxLifetime
 	f.lastActivity.Store(f.started.UnixNano())
+	f.lastPeerWall.Store(f.started.UnixNano())
 	f.telemetryID = nextTelemetryID.Add(1)
 	f.class.Store(uint32(protocol.ClassNew))
 	f.ackTrack = newAckTracker()
@@ -1153,6 +1168,7 @@ func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool 
 		}
 		return false
 	}
+	f.notePeerHeard()
 	if frame.Header.Type == protocol.TypeReset {
 		err := errors.New("peer reset flow")
 		if len(frame.Payload) > 1 {
@@ -1981,7 +1997,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		var terminal error
 		switch {
 		case f.resumeRefused.Load():
-			terminal = errResumeRefused
+			terminal = f.resumeRefusal()
 		case f.replacementAbandoned.Load() && len(f.healthyLanes()) == 0:
 			// Abandonment means nothing will open another lane, not that
 			// the flow has none. A QUIC flow handed off to its TCP rescue
@@ -2335,6 +2351,11 @@ func (f *multipathFlow) replacementLogFields() []any {
 	if failures > 0 {
 		fields = append(fields, "lane_replacement_last_failure", lastFailure)
 	}
+	if suspended := f.suspendedFor(); suspended >= time.Second {
+		// `duration` is monotonic and leaves a host's sleep out; this is
+		// what it left out.
+		fields = append(fields, "host_suspended", suspended)
+	}
 	return fields
 }
 
@@ -2365,6 +2386,10 @@ func (f *multipathFlow) noteReplacementFailure(err error) {
 // what lets a log line and a completion record be counted against each other.
 func replacementFailureKind(err error) string {
 	switch {
+	case errors.Is(err, errLaneJoinOpenUnadmitted):
+		return "open_unadmitted"
+	case errors.Is(err, errLaneJoinOpenFailed):
+		return "open_failed"
 	case errors.Is(err, errLaneJoinRejected):
 		return "peer_rejected"
 	case errors.Is(err, errLaneJoinCapacity):
@@ -2391,7 +2416,7 @@ func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Dur
 		return nil
 	}
 	if f.resumeRefused.Load() {
-		return errResumeRefused
+		return f.resumeRefusal()
 	}
 	if f.replacementAbandoned.Load() {
 		return errReplacementAbandoned
@@ -2440,7 +2465,7 @@ func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Dur
 			// learning nothing. Measured under 35% correlated loss, where
 			// the handshake itself often fails, this was 45 seconds of
 			// silence per lost flow.
-			return errResumeRefused
+			return f.resumeRefusal()
 		}
 		if f.replacementAbandoned.Load() {
 			// The refusal above is the answer this flow gets when a rescue

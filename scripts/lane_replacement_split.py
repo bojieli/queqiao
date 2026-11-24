@@ -33,6 +33,14 @@ JOIN_REFUSED = "lane join refused"
 TIMEOUT = "lane replacement timeout"
 ABANDONED = "no replacement lane will be attempted"
 RESUME_REFUSED = "peer does not hold this session"
+# Issue #159: a JOIN refused before the flow's OPEN was confirmed is not a
+# session the gateway dropped -- it never admitted one -- and the client now
+# ends such a flow with its own error so the two are counted apart.
+OPEN_NOT_ADMITTED = "peer never admitted this flow's open"
+# A session the gateway expired, correctly, while the client host slept for
+# longer than the gateway holds a silent flow.
+SUSPENDED_EXPIRY = "peer dropped this session while this host was suspended"
+TERMINALS = (ABANDONED, RESUME_REFUSED, OPEN_NOT_ADMITTED, SUSPENDED_EXPIRY)
 
 # Buckets for `lane replacement timeout` with lanes_joined == 1, in report order.
 NO_ATTEMPT = "no zero-lane replacement attempted (attempts == 0)"
@@ -43,7 +51,7 @@ INCONSISTENT = "inconsistent (failures > attempts)"
 BUCKETS = (NO_ATTEMPT, EVERY_ATTEMPT_FAILED, OUTCOME_UNRECORDED, OLD_CLIENT, INCONSISTENT)
 
 # The categories the client writes as lane_replacement_last_failure.
-FAILURE_KINDS = ("timeout", "peer_rejected", "peer_capacity", "canceled", "other")
+FAILURE_KINDS = ("timeout", "peer_rejected", "peer_capacity", "open_unadmitted", "open_failed", "canceled", "other")
 
 # Go's RFC 3339 output: variable fractional digits (up to nanoseconds, which
 # datetime cannot hold) and either Z or a numeric offset.
@@ -202,7 +210,7 @@ class Split:
                 self.failure_kinds[kind] += 1
             note(bucket)
             return
-        for terminal in (ABANDONED, RESUME_REFUSED):
+        for terminal in TERMINALS:
             if terminal in error:
                 self.other_terminal[terminal] += 1
                 note(terminal)
@@ -243,7 +251,7 @@ class Split:
             "lane_replacement_timeout_by_lanes_joined": dict(self.timeouts_joined),
             "buckets": {b: self.buckets[b] for b in BUCKETS},
             "every_attempt_failed_by_last_failure": dict(self.failure_kinds),
-            "other_terminal_errors": {t: self.other_terminal[t] for t in (ABANDONED, RESUME_REFUSED)},
+            "other_terminal_errors": {t: self.other_terminal[t] for t in TERMINALS},
             "last_lane_death": {b: dict(c) for b, c in self.deaths.items()},
         }
         if self.ignored_server_records:

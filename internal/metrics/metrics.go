@@ -159,6 +159,17 @@ const (
 	// LaneJoinLaneUnavailable is a join refused by this endpoint's own
 	// admission ceiling rather than by anything about the peer.
 	LaneJoinLaneUnavailable
+	// LaneJoinSessionPending is a join for a session whose OPEN has arrived
+	// but is still dialling its destination after the join waited as long as
+	// it may. The answer is transient: the peer retries.
+	LaneJoinSessionPending
+	// LaneJoinOpenFailed is a join that waited on a session's OPEN and saw
+	// that OPEN fail, its destination unreachable or the session refused.
+	LaneJoinOpenFailed
+	// LaneJoinSessionEnded is a join for a session this endpoint held
+	// recently and has since ended. LaneJoinUnknownSession is now one it
+	// has no record of at all.
+	LaneJoinSessionEnded
 	// LaneJoinReasons is how many reasons there are.
 	LaneJoinReasons
 )
@@ -176,6 +187,9 @@ var laneJoinRefusalNames = [LaneJoinReasons]string{
 	LaneJoinPrincipalMismatch:         "principal_mismatch",
 	LaneJoinInvalidControlReplacement: "invalid_control_replacement",
 	LaneJoinLaneUnavailable:           "lane_unavailable",
+	LaneJoinSessionPending:            "session_pending",
+	LaneJoinOpenFailed:                "open_failed",
+	LaneJoinSessionEnded:              "session_ended",
 }
 
 // String is the stable label and log value for a refusal reason.
