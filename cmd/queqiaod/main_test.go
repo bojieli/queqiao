@@ -217,6 +217,31 @@ func TestPerformanceSnapshotIsMachineReadable(t *testing.T) {
 	}
 }
 
+// Every lane-join refusal reason is in the flat snapshot. A reason missing
+// from it vanishes from log-based totals, and refusals reclassified out of
+// unknown_session (issue #159) would look like refusals stopping.
+func TestPerformanceSnapshotCarriesEveryLaneJoinRefusal(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	registry := metrics.New()
+	for reason := metrics.LaneJoinRefusal(0); reason < metrics.LaneJoinReasons; reason++ {
+		for range int(reason) + 1 {
+			registry.LaneJoinRefused(reason)
+		}
+	}
+	logPerformanceSnapshot(logger, registry.Snapshot(), 5*time.Second)
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &record); err != nil {
+		t.Fatal(err)
+	}
+	for reason := metrics.LaneJoinRefusal(0); reason < metrics.LaneJoinReasons; reason++ {
+		key := "queqiao_lane_join_refused_" + reason.String() + "_total"
+		if got, want := record[key], float64(int(reason)+1); got != want {
+			t.Errorf("%s = %#v, want %v", key, got, want)
+		}
+	}
+}
+
 func TestRuntimeConfigurationLogsRoleSpecificControls(t *testing.T) {
 	for _, test := range []struct {
 		role   string
