@@ -1671,8 +1671,9 @@ func (f *multipathFlow) runFlow(ctx context.Context) (FlowStats, error) {
 					// Once the bounded remote-FIN drain above is exhausted, stop the
 					// sibling worker before tearing down the physical lanes. Otherwise
 					// a blocked application read can outlive the logical flow.
+					f.resetLanes(err)
 					cancelRun()
-					f.failClose(err)
+					f.closeAll()
 					stats.Ended = time.Now()
 					stats.BytesSent = f.bytesUp.Load()
 					stats.BytesRead = f.bytesDown.Load()
@@ -1687,8 +1688,9 @@ func (f *multipathFlow) runFlow(ctx context.Context) (FlowStats, error) {
 			if f.metrics != nil {
 				f.metrics.FlowTimeout()
 			}
+			f.resetLanes(err)
 			cancelRun()
-			f.failClose(err)
+			f.closeAll()
 			stats.Ended = time.Now()
 			stats.BytesSent = f.bytesUp.Load()
 			stats.BytesRead = f.bytesDown.Load()
@@ -1698,12 +1700,11 @@ func (f *multipathFlow) runFlow(ctx context.Context) (FlowStats, error) {
 			if err == nil {
 				continue
 			}
-			cancelRun()
-			if errors.Is(err, errLocalApplicationClose) {
-				f.closeAll()
-			} else {
-				f.failClose(err)
+			if !errors.Is(err, errLocalApplicationClose) {
+				f.resetLanes(err)
 			}
+			cancelRun()
+			f.closeAll()
 			stats.Ended = time.Now()
 			stats.BytesSent = f.bytesUp.Load()
 			stats.BytesRead = f.bytesDown.Load()
@@ -1760,8 +1761,9 @@ func (f *multipathFlow) runFlow(ctx context.Context) (FlowStats, error) {
 			stats.LaneBytes = f.laneStats()
 			return stats, err
 		case <-ctx.Done():
+			f.resetLanes(ctx.Err())
 			cancelRun()
-			f.failClose(ctx.Err())
+			f.closeAll()
 			stats.Ended = time.Now()
 			stats.BytesSent = f.bytesUp.Load()
 			stats.BytesRead = f.bytesDown.Load()
