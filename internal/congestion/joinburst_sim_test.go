@@ -1459,3 +1459,14 @@ func TestALanesOwnBurstsDecideItsConfirmation(t *testing.T) {
 		t.Fatal("a round of 256 packets lost in runs of 16 confirmed the lane's floor")
 	}
 }
+
+// The siblings-only floor describes the siblings' observations throughout,
+// their burst factor included.
+func TestTheSiblingFloorCarriesTheSiblingsBursts(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	sender.selfObserved, sender.selfBurst = 9000, 16
+	sender.poolWeight, sender.poolBurst = 10000, (16*9000+1*1000)/10000.0
+	if got := sender.siblingsBurst(); math.Abs(got-1) > 1e-9 {
+		t.Fatalf("siblings losing independently beside a joiner losing in runs of 16: burst %.2f, want 1", got)
+	}
+}

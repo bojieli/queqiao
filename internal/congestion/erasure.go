@@ -703,7 +703,7 @@ func (e *ErasureSender) rebaseFloor(now monotime.Time) {
 	// may be overflow -- as soon as its reports had filled the pool.
 	if e.rampFloorN < rampLossSamples {
 		if floor, samples, ok := e.siblingsErasure(); ok && samples >= rampLossSamples {
-			e.rampFloor, e.rampFloorN, e.rampBurst = floor, samples, math.Max(e.poolBurst, 1)
+			e.rampFloor, e.rampFloorN, e.rampBurst = floor, samples, e.siblingsBurst()
 			return
 		}
 		// A lane with a confirmed floor of its own has something to judge
@@ -779,6 +779,19 @@ func (e *ErasureSender) siblingsErasure() (erasure, samples float64, ok bool) {
 	// new sibling turns a part per million into points of loss.
 	erasure = (e.poolErasure*e.poolWeight - e.selfLoss*e.selfObserved) / weight
 	return math.Min(math.Max(erasure, 0), 1), samples, true
+}
+
+// siblingsBurst is the pool's burst factor with this lane's report taken out,
+// weighted as the erasure is, so the floor siblingsErasure gives and the
+// runs its samples are deflated by describe the same observations: a bursty
+// joiner dominating the weights would otherwise discount its siblings'
+// independent losses as if they came in its runs.
+func (e *ErasureSender) siblingsBurst() float64 {
+	weight := e.poolWeight - e.selfObserved
+	if weight <= 0 {
+		return math.Max(e.poolBurst, 1)
+	}
+	return math.Max((e.poolBurst*e.poolWeight-e.selfBurst*e.selfObserved)/weight, 1)
 }
 
 // floorRebaseAfter is the pooled bottleneck's own window

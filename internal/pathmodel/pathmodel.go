@@ -404,7 +404,10 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	}
 	m.aggregate = kept
 
-	busy := m.busyLocked(now, state.RoundTrip, live)
+	busy, even := m.busyLocked(now, state.RoundTrip, live)
+	// Whether the reporter is itself one of the busy members: alone on the
+	// path is a statement about the reporter, not about the count.
+	reporterBusy := even > 0 && entry.delivered >= busyFraction*even
 	state.LeafRoundTrip = state.RoundTrip
 	if live > 0 && bottleneck > 0 {
 		state.Seed = bottleneck / float64(live)
@@ -434,8 +437,14 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		// each to a fraction of what it delivered, and the bottleneck walked
 		// down: emulated, four downloads reached 0.75x main's goodput, and
 		// 0.95x with the split bounded.
-		if live > 1 && busy > 1 {
-			state.Share = shareProbeGain * bottleneck / float64(busy+min(live-busy, 1))
+		//
+		// Only the sole busy member goes uncapped. A member beside it that is
+		// not busy -- a lane that slowed, or one about to start -- keeps a
+		// share: the path is the busy one's, not its, and uncapped it would
+		// read the vanished cap as being left alone and ramp into a path its
+		// sibling still fills.
+		if live > 1 && !(busy == 1 && reporterBusy) {
+			state.Share = splitShare(bottleneck, busy, live)
 		}
 	}
 	return state
@@ -486,9 +495,9 @@ func activeWindow(roundTrip time.Duration) time.Duration {
 // joiners on a lossy path seed from it, and took their caused loss from 0.04
 // to 0.2. What busy decides is only whether there is a cap at all: with one
 // busy member there is nothing to compound.
-func (m *PathModel) busyLocked(now time.Time, roundTrip time.Duration, split int) (busy int) {
+func (m *PathModel) busyLocked(now time.Time, roundTrip time.Duration, split int) (busy int, even float64) {
 	if split <= 0 {
-		return 0
+		return 0, 0
 	}
 	// Each member by its own round trip where it has one: at a shared egress
 	// a long-haul lane acknowledged in bursts once a round trip is not gone
@@ -503,15 +512,15 @@ func (m *PathModel) busyLocked(now time.Time, roundTrip time.Duration, split int
 		}
 	}
 	if current <= 0 {
-		return 0
+		return 0, 0
 	}
-	even := current / float64(split)
+	even = current / float64(split)
 	for _, r := range m.members {
 		if active(r) && r.delivered >= busyFraction*even {
 			busy++
 		}
 	}
-	return busy
+	return busy, even
 }
 
 // Current is what the model already knows, without contributing to it: the
@@ -593,7 +602,7 @@ func (m *PathModel) Current() State {
 			bottleneck = sample.rate
 		}
 	}
-	busy := m.busyLocked(now, state.RoundTrip, live+1)
+	busy, _ := m.busyLocked(now, state.RoundTrip, live+1)
 	state.LeafRoundTrip = state.RoundTrip
 	if bottleneck > 0 {
 		// The joining lane counts too, or the first thing it does is take a
@@ -604,11 +613,20 @@ func (m *PathModel) Current() State {
 		// the last occupant delivered is how a fresh connection inherits a
 		// dead one's collapse. So is one joining beside members that are
 		// not using the path (see Report).
+		// The joining lane is counted as busy: it joins to carry something.
 		if live > 0 && busy > 0 {
-			state.Share = shareProbeGain * state.Seed
+			state.Share = splitShare(bottleneck, busy+1, live+1)
 		}
 	}
 	return state
+}
+
+// splitShare is a member's share of the bottleneck: shareProbeGain times an
+// even split between the busy members and at most one that is not (see
+// Report). Current uses it for a joining lane, and the coded path sizes its
+// window from that, so both have to describe the same split.
+func splitShare(bottleneck float64, busy, live int) float64 {
+	return shareProbeGain * bottleneck / float64(max(busy+min(live-busy, 1), 1))
 }
 
 // arrivalPool pools the members' earned compensation by their sample counts,

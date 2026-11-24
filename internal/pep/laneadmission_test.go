@@ -51,4 +51,15 @@ func TestASlowQUICLaneCommitsOnlyWhatItsRateCarries(t *testing.T) {
 	if got := admission.Outstanding(trickle.id, 0); got != minLaneOutstandingBytes {
 		t.Fatalf("a lane pacing a trickle may commit %d, want the floor %d", got, minLaneOutstandingBytes)
 	}
+	// The scheduler counts payload, and a lane compensating for erasure
+	// puts more on the wire than arrives: at 50% erasure, 2 MB/s of pacing
+	// is 1 MB/s of payload.
+	lossy := &mpLane{id: 5, kind: TransportQUIC, fc: newFrameConn(&statsConn{stats: laneTransportStats{
+		smoothedRTT: 200 * time.Millisecond,
+		controller:  wancongestion.ControllerTelemetry{PacingRate: 2_000_000, Erasure: 0.5},
+	}})}
+	flow.lanes[lossy.id] = lossy
+	if got, want := admission.Outstanding(lossy.id, 0), 400_000; got != want {
+		t.Fatalf("a lane pacing 2 MB/s over 50%% erasure may commit %d payload bytes, want %d", got, want)
+	}
 }

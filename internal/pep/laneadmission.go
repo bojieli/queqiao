@@ -63,12 +63,13 @@ func (w *laneAdmission) Outstanding(laneID uint64, _ uint64) int {
 	if w.flow.tcpStriping.Load() && lane.kind == TransportTCP {
 		return tcpStripingOutstandingBytes
 	}
-	return quicLaneOutstanding(lane.sendRate())
+	return quicLaneOutstanding(lane.payloadRate())
 }
 
 // quicLaneOutstanding bounds what a QUIC lane may hold unacknowledged by what
-// it can put through in laneOutstandingRounds round trips at its own pacing
-// rate: one in flight, one waiting behind it.
+// it can deliver in laneOutstandingRounds round trips at its own pacing rate
+// (net of the erasure its controller compensates for, since what it holds is
+// payload): one in flight, one waiting behind it.
 //
 // Admission otherwise counts only what the lane's writer has not yet handed to
 // the transport, and a QUIC stream takes a write as soon as its buffer has

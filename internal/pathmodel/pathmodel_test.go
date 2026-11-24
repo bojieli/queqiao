@@ -456,3 +456,43 @@ func TestAQuietMembersLastRateIsNotSummedIntoTheBottleneck(t *testing.T) {
 		t.Fatalf("the bottleneck still holds a quiet member's rate: seed %.0f, want 2000000", state.Seed)
 	}
 }
+
+// Only the sole busy member goes uncapped. A lane beside it that has slowed
+// keeps a share: uncapped, it would read the vanished cap as being left alone
+// and ramp into a path its sibling still fills.
+func TestOnlyTheSoleBusyMemberIsUncapped(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	m.Report(2, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	slowed := m.Report(2, Observation{Delivered: 100e3, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	if slowed.Share == 0 {
+		t.Fatal("a lane that slowed beside a busy sibling lost its cap")
+	}
+	if busy := m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond}); busy.Share != 0 {
+		t.Fatalf("the only busy member is capped at %.0f", busy.Share)
+	}
+}
+
+// A lane about to join takes the same split the members report: the coded
+// path sizes its window from Current's share, and a share that still divided
+// by every idle rescue lane would size it for a policy the lanes no longer
+// follow.
+func TestAJoinersShareFollowsTheBoundedSplit(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	for member := Member(10); member < 15; member++ {
+		m.Report(member, Observation{Delivered: 60e3, ObservedSamples: 100, RoundTrip: 200 * time.Millisecond})
+	}
+	for member := Member(1); member <= 4; member++ {
+		m.Report(member, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	}
+	bottleneck := 4*6e6 + 5*60e3
+	state := m.Current()
+	if want := shareProbeGain * bottleneck / 6; math.Abs(state.Share-want) > 1 {
+		t.Fatalf("a joiner beside four busy lanes and five idle ones: share %.0f, want %.0f (five busy with it, plus one idle)", state.Share, want)
+	}
+	if want := bottleneck / 10; math.Abs(state.Seed-want) > 1 {
+		t.Fatalf("seed %.0f, want the split over every member, %.0f", state.Seed, want)
+	}
+}
