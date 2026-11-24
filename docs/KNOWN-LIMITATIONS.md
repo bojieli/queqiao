@@ -76,16 +76,18 @@ qualification items are still open.
   public resource outside the operator's authority.
 - No complete multi-network protocol-1 field campaign has been published yet;
   performance on unmeasured paths is not guaranteed.
-- The frame payload limit is a constant of protocol 2 rather than a deployment
-  setting, so a gateway cannot be configured to accept less than the wire
-  requires. Version 2 negotiates no capabilities, and a private receive limit
+- The frame payload limit is a constant of both wire versions rather than a
+  deployment setting, so a gateway cannot be configured to accept less than the
+  wire requires. The wire negotiates nothing but its version, and a private receive limit
   would fail one direction of traffic without naming the setting or the peer
   holding it. The former `--max-payload` flag is removed; `--chunk-size`
   remains, because what a sender chooses to emit is a local choice.
 - The committed conformance vectors are replayed only against this
   implementation. They pin the wire and make a silent divergence loud, but no
   independent implementation has been checked against them yet, so protocol 2
-  is documented rather than demonstrated interoperable.
+  is documented rather than demonstrated interoperable. Protocol 1 is
+  additionally checked against the released v0.12.1 binaries by
+  `scripts/wire_interop.py`.
 - Metrics have no authentication; bind them to loopback or protect them.
 - Provider state is an online high-value secret. Queqiao does not yet integrate
   a hardware security module or operating-system keychain for issuer keys.
@@ -175,6 +177,11 @@ qualification items are still open.
   an Organization account and Play's VPN declaration; direct distribution
   remains the supported Android path.
 
-Wire version 2 requires paired upgrades. It rejects version 1 at data ALPN
-negotiation and does not provide an in-place, mixed-version rolling upgrade.
-See [the protocol upgrade procedure](PROTOCOL.md) for parallel-endpoint staging.
+Gateways and clients negotiate wire version 1 or 2 per connection, so they
+upgrade independently, gateways first. Two limits remain. A flow keeps the
+version it opened on: a gateway restart, which ends its flows anyway, is the
+only point at which a client's flows change version. And v0.13.0 speaks
+version 2 only, so a v0.13.0 gateway still refuses v0.12.x clients; replace it
+rather than mixing it with them. See
+[the version negotiation](PROTOCOL.md#23-wire-version-negotiation) and
+[upgrading](DEPLOYING.md#upgrade-an-existing-deployment).
