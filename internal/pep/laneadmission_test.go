@@ -48,15 +48,20 @@ func TestASlowQUICLaneCommitsOnlyWhatItsRateCarries(t *testing.T) {
 		controller:  wancongestion.ControllerTelemetry{PacingRate: 10_000},
 	}})}
 	flow.lanes[trickle.id] = trickle
-	if got := admission.Outstanding(trickle.id, 0); got != minLaneOutstandingBytes {
-		t.Fatalf("a lane pacing a trickle may commit %d, want the floor %d", got, minLaneOutstandingBytes)
+	if got, want := admission.Outstanding(trickle.id, 0), laneOutstandingChunks*flow.chunkSize; got != want {
+		t.Fatalf("a lane pacing a trickle may commit %d, want the floor %d", got, want)
+	}
+	flow.chunkSize = 128 << 10
+	if got, want := admission.Outstanding(trickle.id, 0), laneOutstandingChunks*(128<<10); got != want {
+		t.Fatalf("with 128 KiB chunks the floor is %d, want %d chunks' worth, %d", got, laneOutstandingChunks, want)
 	}
 	// The scheduler counts payload, and a lane compensating for erasure
-	// puts more on the wire than arrives: at 50% erasure, 2 MB/s of pacing
-	// is 1 MB/s of payload.
+	// puts more on the wire than arrives: losing half its own packets, 2 MB/s
+	// of pacing is 1 MB/s of payload -- whatever the pool's erasure says,
+	// which can be another destination's.
 	lossy := &mpLane{id: 5, kind: TransportQUIC, fc: newFrameConn(&statsConn{stats: laneTransportStats{
-		smoothedRTT: 200 * time.Millisecond,
-		controller:  wancongestion.ControllerTelemetry{PacingRate: 2_000_000, Erasure: 0.5},
+		smoothedRTT: 200 * time.Millisecond, packetsSent: 1000,
+		controller: wancongestion.ControllerTelemetry{PacingRate: 2_000_000, Erasure: 0.1, PacketsLostObserved: 500},
 	}})}
 	flow.lanes[lossy.id] = lossy
 	if got, want := admission.Outstanding(lossy.id, 0), 800_000; got != want {

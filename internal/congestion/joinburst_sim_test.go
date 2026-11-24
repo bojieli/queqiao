@@ -1486,3 +1486,33 @@ func TestAConfirmedFloorKeepsItsIndependentTrials(t *testing.T) {
 		t.Fatalf("the confirmed floor counts as %.0f independent trials, want 64 + 128", got)
 	}
 }
+
+// A lane left alone does not ramp into a queue its departed sibling left
+// draining: the ramp would end on it at its first event, after a flight sent
+// into it at the startup gain. The departure waits for the queue to go.
+func TestALaneLeftAloneWaitsOutAStandingQueue(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	sender.inner.minRTT = joiningRoundTrip
+	rtt := &fixedRTT{min: joiningRoundTrip, smoothed: joiningRoundTrip + joiningRoundTrip/2}
+	sender.SetRTTStatsProvider(rtt)
+	sender.endRamp()
+	sender.inner.mode = tuicBbrProbeBW
+	sender.share.Store(0)
+	closeRound := func() {
+		sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
+		sendAt(sender, sender.GetCongestionWindow())
+		sender.inner.round++
+		sender.rampGate(base(), nil, nil)
+	}
+	for sender.inner.round <= sender.rearmAfter+2 {
+		closeRound()
+	}
+	if sender.ramping.Load() || !sender.departed {
+		t.Fatalf("with half a round trip of queue: ramping %v, departure pending %v; want false, true", sender.ramping.Load(), sender.departed)
+	}
+	rtt.smoothed = joiningRoundTrip
+	closeRound()
+	if !sender.ramping.Load() {
+		t.Fatal("the queue drained and the pending departure did not re-arm the lane")
+	}
+}

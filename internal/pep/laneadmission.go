@@ -30,11 +30,12 @@ const (
 	// measured 200-250 ms fallback path and keeps BBR application-fed while
 	// leaving ready chunks for every other lane.
 	tcpStripingOutstandingBytes = 1024 * 1024
-	// laneOutstandingRounds and minLaneOutstandingBytes size a QUIC lane's
-	// commitment; see quicLaneOutstanding. The floor is a few chunks, so a
-	// lane whose estimate is still a trickle can grow it.
-	laneOutstandingRounds   = 4
-	minLaneOutstandingBytes = 4 * defaultChunkSize
+	// laneOutstandingRounds and laneOutstandingChunks size a QUIC lane's
+	// commitment; see quicLaneOutstanding. The floor is a few of the flow's
+	// chunks, so a lane whose estimate is still a trickle is not reduced to
+	// stop-and-wait and can grow it.
+	laneOutstandingRounds = 4
+	laneOutstandingChunks = 4
 )
 
 // laneAdmission answers the scheduler's admission questions for one flow.
@@ -63,7 +64,8 @@ func (w *laneAdmission) Outstanding(laneID uint64, _ uint64) int {
 	if w.flow.tcpStriping.Load() && lane.kind == TransportTCP {
 		return tcpStripingOutstandingBytes
 	}
-	return quicLaneOutstanding(lane.payloadRate())
+	rate, rtt := lane.payloadRate()
+	return quicLaneOutstanding(rate, rtt, w.flow.chunkSize)
 }
 
 // quicLaneOutstanding bounds what a QUIC lane may hold unacknowledged by what
@@ -92,13 +94,16 @@ func (w *laneAdmission) Outstanding(laneID uint64, _ uint64) int {
 // the rest ready for lanes that can carry it sooner.
 //
 // No bound while the lane has no rate or round trip to size one from.
-func quicLaneOutstanding(pacing float64, rtt time.Duration) int {
+func quicLaneOutstanding(pacing float64, rtt time.Duration, chunk int) int {
 	if pacing <= 0 || rtt <= 0 {
 		return 0
 	}
+	if chunk <= 0 {
+		chunk = defaultChunkSize
+	}
 	bound := int(pacing * rtt.Seconds() * laneOutstandingRounds)
-	if bound < minLaneOutstandingBytes {
-		return minLaneOutstandingBytes
+	if floor := laneOutstandingChunks * chunk; bound < floor {
+		return floor
 	}
 	return bound
 }

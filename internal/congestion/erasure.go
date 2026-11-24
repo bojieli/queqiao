@@ -926,7 +926,29 @@ func (e *ErasureSender) maybeRearm() {
 	if share := float64(e.share.Load()); !e.departed && share < rampRearmShare*delivered {
 		return
 	}
+	// Not into a queue the ramp would end on at its first event: a sibling
+	// that departs while its queue is still draining leaves the room, not
+	// yet the path. The departure stays pending until the queue is gone.
+	if queue, base := e.queueAgainst(e.poolRTT); base > 0 && queue*rampQueueFraction >= base {
+		return
+	}
 	e.rearm(delivered)
+}
+
+// queueAgainst is the smoothed round trip's excess over the smaller of this
+// lane's minimum and the given baseline; see rampQueue.
+func (e *ErasureSender) queueAgainst(baseline time.Duration) (queue, base time.Duration) {
+	base = e.inner.minRoundTrip()
+	if baseline > 0 && (base <= 0 || baseline < base) {
+		base = baseline
+	}
+	if base <= 0 || e.rttStats == nil || e.rttStats.SmoothedRTT() <= 0 {
+		return 0, 0
+	}
+	if smoothed := e.rttStats.SmoothedRTT(); smoothed > base {
+		return smoothed - base, base
+	}
+	return 0, base
 }
 
 // backlogged reports whether the round just closed had at some point half of
