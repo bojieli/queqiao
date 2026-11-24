@@ -18,6 +18,7 @@ import (
 	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/multipath"
 	"github.com/bojieli/queqiao/internal/protocol"
+	"github.com/bojieli/queqiao/internal/session"
 	"github.com/bojieli/queqiao/internal/stripe"
 )
 
@@ -268,6 +269,31 @@ type multipathFlow struct {
 	// does not know this session. That answer is permanent, so it ends the
 	// replacement grace rather than being retried.
 	resumeRefused atomic.Bool
+	// openUnconfirmed narrows resumeRefused: the refusal came while this
+	// flow's OPEN was still unconfirmed, so the peer never had the session
+	// to lose. The flow then fails with errOpenUnconfirmed, which a reader
+	// of the logs must not count with sessions the peer dropped.
+	openUnconfirmed atomic.Bool
+	// openFailed narrows resumeRefused the other way: the gateway held the
+	// JOIN for this flow's OPEN and saw that OPEN fail.
+	openFailed atomic.Bool
+	// sessionAbsent records that the terminal refusal said the session is
+	// not there, which is the only refusal a long sleep can explain.
+	sessionAbsent atomic.Bool
+	// openConfirmMu makes the OPEN's own OPEN_OK and a JOIN's confirmation
+	// one transition, so only the loser of the two may be accepted late.
+	openConfirmMu sync.Mutex
+	// openConfirmedByJoin records that a JOIN's OPEN_OK confirmed the flow
+	// before the OPEN's own did (issue #159).
+	openConfirmedByJoin atomic.Bool
+	// peerSuspendTotal is the host's cumulative suspend time, as the system
+	// suspend clock read it when the peer was last heard from; -1 when that
+	// clock could not be read. Sampled at most once a second.
+	peerSuspendTotal atomic.Int64
+	peerSampledAt    atomic.Int64 // monotonic nanoseconds since started
+	peerSampledWall  atomic.Int64 // wall-clock nanoseconds at that sample
+	// suspendClock reads the cumulative suspend time; nil reads the system's.
+	suspendClock func() (time.Duration, error)
 	// capacityRefusals counts consecutive rescue rounds the peer answered
 	// with its lane-admission ceiling. One answer is the ordinary loser of a
 	// rescue race; several in a row with no successful round between them are
@@ -363,8 +389,27 @@ type multipathFlow struct {
 	// pooled control connection. Nil means "no", which is what a flow on a
 	// dedicated connection should answer.
 	controlLaneShared func() bool
-	started           time.Time
-	completionGrace   time.Duration
+	// resetOnFailure makes a failed flow tell its peer before it closes: a
+	// RESET goes out on every lane still open. The gateway sets it. Without
+	// it the peer sees only the streams end, takes that for a path failure,
+	// and asks to JOIN a session that is already gone.
+	resetOnFailure bool
+	// peerReset records that the peer ended the flow with RESET, so this end
+	// does not answer it with one of its own. peerResetErr is that RESET as
+	// an error: it is the reason the flow ended, whichever teardown path
+	// happens to return first.
+	peerReset    atomic.Bool
+	peerResetErr atomic.Pointer[error]
+	// resetOnce gives one failing path the whole RESET broadcast; a second
+	// one waits for it rather than racing it or closing under it.
+	resetOnce sync.Once
+	// terminating is set, under lanesMu, when a failing flow takes the
+	// snapshot of lanes it will RESET. No lane is admitted after it, so a
+	// replacement cannot slip in between the RESET and the close and be
+	// closed without one.
+	terminating     atomic.Bool
+	started         time.Time
+	completionGrace time.Duration
 	// Tests shorten the bounded drain after a proven application close.
 	abortDrainGrace time.Duration
 	bytesUp         atomic.Uint64
@@ -507,6 +552,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 	f.idleTimeout = defaultFlowIdleTimeout
 	f.maxLifetime = defaultFlowMaxLifetime
 	f.lastActivity.Store(f.started.UnixNano())
+	f.samplePeerSuspend()
 	f.telemetryID = nextTelemetryID.Add(1)
 	f.class.Store(uint32(protocol.ClassNew))
 	f.ackTrack = newAckTracker()
@@ -538,7 +584,7 @@ func (f *multipathFlow) validateLaneLocked(lane *mpLane) error {
 	if lane == nil || lane.fc == nil {
 		return errors.New("invalid lane")
 	}
-	if f.finished.Load() || f.doneChanClosed() {
+	if f.finished.Load() || f.terminating.Load() || f.doneChanClosed() {
 		return errLaneFlowClosed
 	}
 	if _, exists := f.lanes[lane.id]; exists {
@@ -588,7 +634,7 @@ func (f *multipathFlow) activateLane(lane *mpLane) error {
 	defer f.lanesMu.Unlock()
 	current := f.lanes[lane.id]
 	closed := lane.closed.Load()
-	if current != lane || closed || f.finished.Load() || f.doneChanClosed() {
+	if current != lane || closed || f.finished.Load() || f.terminating.Load() || f.doneChanClosed() {
 		return errors.New("staged lane is no longer available")
 	}
 	if !lane.ready.CompareAndSwap(false, true) {
@@ -1153,11 +1199,9 @@ func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool 
 		}
 		return false
 	}
+	f.notePeerHeard()
 	if frame.Header.Type == protocol.TypeReset {
-		err := errors.New("peer reset flow")
-		if len(frame.Payload) > 1 {
-			err = fmt.Errorf("peer reset flow: %s", string(frame.Payload[1:]))
-		}
+		err := f.notePeerReset(frame)
 		select {
 		case f.ackErr <- err:
 		default:
@@ -1332,7 +1376,9 @@ func (f *multipathFlow) closeFailedLane(lane *mpLane) bool {
 // reportLaneFailure exports and coordinates a lane already transitioned by
 // closeFailedLane.
 func (f *multipathFlow) reportLaneFailure(lane *mpLane, err error) {
-	if f.finished.Load() {
+	// A failing flow's peer closes its lanes on the first RESET it reads,
+	// possibly while the others are still being written: expected teardown.
+	if f.finished.Load() || f.terminating.Load() {
 		return
 	}
 	// Once both FIN directions are observed, a peer closing an outer lane is
@@ -1533,7 +1579,41 @@ func (f *multipathFlow) isolateFromControlLane(control *mpLane) bool {
 	return f.controlLaneShared()
 }
 
+// errPeerReset is the peer ending the flow with RESET.
+var errPeerReset = errors.New("peer reset flow")
+
+// notePeerReset records an incoming RESET before anything wakes the workers,
+// so the reason it carries is what the flow ends with.
+func (f *multipathFlow) notePeerReset(frame protocol.Frame) error {
+	err := errPeerReset
+	if len(frame.Payload) > 1 {
+		err = fmt.Errorf("%w: %s", errPeerReset, string(frame.Payload[1:]))
+	}
+	f.peerResetErr.CompareAndSwap(nil, &err)
+	f.peerReset.Store(true)
+	return err
+}
+
 func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
+	stats, err := f.runFlow(ctx)
+	// A RESET closes every lane, and the path that notices first -- a lane
+	// failure waiting for its replacement, say -- may return its own error
+	// without ever reading the RESET's. The RESET is why the flow ended.
+	if reset := f.peerResetErr.Load(); reset != nil && !errors.Is(err, errPeerReset) {
+		switch {
+		case err != nil:
+			err = fmt.Errorf("%w (then %v)", *reset, err)
+		case !f.finSent.Load() || !f.remoteFinSeen.Load():
+			// The workers took their ordinary exits once the RESET closed
+			// the lanes, but the flow had not finished both ways: the RESET
+			// is how it ended.
+			err = *reset
+		}
+	}
+	return stats, err
+}
+
+func (f *multipathFlow) runFlow(ctx context.Context) (FlowStats, error) {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	ackCtx, cancelACKs := context.WithCancel(runCtx)
@@ -1623,6 +1703,7 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 					// Once the bounded remote-FIN drain above is exhausted, stop the
 					// sibling worker before tearing down the physical lanes. Otherwise
 					// a blocked application read can outlive the logical flow.
+					f.resetLanes(err)
 					cancelRun()
 					f.closeAll()
 					stats.Ended = time.Now()
@@ -1639,6 +1720,7 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 			if f.metrics != nil {
 				f.metrics.FlowTimeout()
 			}
+			f.resetLanes(err)
 			cancelRun()
 			f.closeAll()
 			stats.Ended = time.Now()
@@ -1649,6 +1731,9 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 		case err := <-f.ackErr:
 			if err == nil {
 				continue
+			}
+			if !errors.Is(err, errLocalApplicationClose) {
+				f.resetLanes(err)
 			}
 			cancelRun()
 			f.closeAll()
@@ -1701,13 +1786,14 @@ func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
 					err = fmt.Errorf("lane failed (%v), replay failed: %w", err, replayErr)
 				}
 			}
-			f.closeAll()
+			f.failClose(err)
 			stats.Ended = time.Now()
 			stats.BytesSent = f.bytesUp.Load()
 			stats.BytesRead = f.bytesDown.Load()
 			stats.LaneBytes = f.laneStats()
 			return stats, err
 		case <-ctx.Done():
+			f.resetLanes(ctx.Err())
 			cancelRun()
 			f.closeAll()
 			stats.Ended = time.Now()
@@ -1981,7 +2067,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		var terminal error
 		switch {
 		case f.resumeRefused.Load():
-			terminal = errResumeRefused
+			terminal = f.resumeRefusal()
 		case f.replacementAbandoned.Load() && len(f.healthyLanes()) == 0:
 			// Abandonment means nothing will open another lane, not that
 			// the flow has none. A QUIC flow handed off to its TCP rescue
@@ -2007,7 +2093,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			}
 			// Also interrupt a coordinator currently waiting for lane replacement;
 			// it must not add another outage budget after this deadline expires.
-			f.closeAll()
+			f.failClose(terminal)
 			return
 		}
 		// Optimistic DATA may precede OPEN_OK. A JOIN cannot rescue a session
@@ -2335,6 +2421,11 @@ func (f *multipathFlow) replacementLogFields() []any {
 	if failures > 0 {
 		fields = append(fields, "lane_replacement_last_failure", lastFailure)
 	}
+	if suspended := f.suspendedFor(); suspended >= time.Second {
+		// `duration` is monotonic and leaves a host's sleep out; this is
+		// what it left out.
+		fields = append(fields, "host_suspended", suspended)
+	}
 	return fields
 }
 
@@ -2365,6 +2456,12 @@ func (f *multipathFlow) noteReplacementFailure(err error) {
 // what lets a log line and a completion record be counted against each other.
 func replacementFailureKind(err error) string {
 	switch {
+	case errors.Is(err, errLaneJoinOpenUnconfirmed):
+		return "open_unconfirmed"
+	case errors.Is(err, errLaneJoinOpenFailed):
+		return "open_failed"
+	case errors.Is(err, errLaneJoinPending):
+		return "open_pending"
 	case errors.Is(err, errLaneJoinRejected):
 		return "peer_rejected"
 	case errors.Is(err, errLaneJoinCapacity):
@@ -2391,7 +2488,7 @@ func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Dur
 		return nil
 	}
 	if f.resumeRefused.Load() {
-		return errResumeRefused
+		return f.resumeRefusal()
 	}
 	if f.replacementAbandoned.Load() {
 		return errReplacementAbandoned
@@ -2440,7 +2537,7 @@ func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Dur
 			// learning nothing. Measured under 35% correlated loss, where
 			// the handshake itself often fails, this was 45 seconds of
 			// silence per lost flow.
-			return errResumeRefused
+			return f.resumeRefusal()
 		}
 		if f.replacementAbandoned.Load() {
 			// The refusal above is the answer this flow gets when a rescue
@@ -3142,10 +3239,7 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 				f.openAckPending = false
 				f.confirmOpen()
 			case protocol.TypeReset:
-				if len(frame.Payload) > 1 {
-					return fmt.Errorf("peer reset flow: %s", string(frame.Payload[1:]))
-				}
-				return errors.New("peer reset flow")
+				return f.notePeerReset(frame)
 			default:
 				return fmt.Errorf("unexpected flow frame type %d", frame.Header.Type)
 			}
@@ -3395,6 +3489,114 @@ func (f *multipathFlow) dataSubstrates() (coded, stream uint64) {
 		stream += s
 	}
 	return coded, stream
+}
+
+// terminalResetWait bounds how long a failing flow spends telling its peer.
+// The RESET is a courtesy that saves the peer a JOIN round trip and a
+// misleading "unknown session" answer; it must not hold up the teardown of a
+// flow that is already failing, so a lane that cannot take it at once is
+// simply closed.
+const terminalResetWait = 250 * time.Millisecond
+
+// failClose ends a flow that failed. On an endpoint with resetOnFailure set it
+// first sends RESET on every lane still open, so the peer learns the session is
+// gone instead of seeing a stream end it would treat as a dead path.
+func (f *multipathFlow) failClose(err error) {
+	f.resetLanes(err)
+	f.closeAll()
+}
+
+func (f *multipathFlow) resetLanes(err error) {
+	if !f.resetOnFailure {
+		return
+	}
+	f.resetOnce.Do(func() { f.broadcastReset(err) })
+}
+
+func (f *multipathFlow) broadcastReset(err error) {
+	if f.peerReset.Load() || f.finished.Load() {
+		return
+	}
+	// Both directions have finished, which the gateway counts as a completed
+	// flow: it keeps a tombstone so a JOIN can still fetch the final ACK. A
+	// RESET would turn that recoverable close into a failure.
+	if f.finSent.Load() && f.remoteFinSeen.Load() {
+		return
+	}
+	f.lanesMu.Lock()
+	f.terminating.Store(true)
+	lanes := make([]*mpLane, 0, len(f.lanes))
+	for _, lane := range f.lanes {
+		if lane.fc != nil && !lane.closed.Load() {
+			lanes = append(lanes, lane)
+		}
+	}
+	f.lanesMu.Unlock()
+	if len(lanes) == 0 {
+		return
+	}
+	code, reason := terminalResetReason(err)
+	frame := protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeReset, SessionID: f.sessionID,
+		FlowID: f.flowID, Class: protocol.ClassNew,
+	}, Payload: session.ResetPayload(code, reason)}
+	// A staged JOIN may or may not have had its OPEN_OK written yet. If not,
+	// its peer reads the RESET as the JOIN's answer, so there it carries the
+	// protocol code, the permanent refusal, never the transport code a client
+	// takes as "switch to TCP". Written either way, so no acknowledged JOIN is
+	// closed without one.
+	stagedFrame := frame
+	stagedFrame.Payload = session.ResetPayload(session.ResetProtocol, reason)
+	ctx, cancel := context.WithTimeout(context.Background(), terminalResetWait)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, lane := range lanes {
+		wg.Add(1)
+		go func(lane *mpLane) {
+			defer wg.Done()
+			// The reliable stream, never the coded datagrams: a RESET that
+			// can be lost is no better than none.
+			out := frame
+			if lane.staged && !lane.ready.Load() {
+				out = stagedFrame
+			}
+			_ = lane.fc.writeControlContext(ctx, out)
+		}(lane)
+	}
+	// A stream without write deadlines cannot be interrupted by the context,
+	// only by closing it, and closing is what the caller does next. So the
+	// bound is enforced here rather than trusted to the writers.
+	written := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(written)
+	}()
+	select {
+	case <-written:
+	case <-ctx.Done():
+	}
+}
+
+// terminalResetReason names why a flow failed in words fit for the peer. The
+// error itself can carry addresses of this host or of the destination, so only
+// its class goes on the wire.
+func terminalResetReason(err error) (session.ResetCode, string) {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return session.ResetTransport, "flow ended: gateway shutting down"
+	case errors.Is(err, errFlowNoProgress):
+		return session.ResetTransport, "flow ended: no delivery progress"
+	case errors.Is(err, errLaneReplacementTimeout), errors.Is(err, errReplacementAbandoned):
+		return session.ResetTransport, "flow ended: lane replacement timeout"
+	case errors.Is(err, errFlowIdleTimeout):
+		return session.ResetTransport, "flow ended: idle timeout"
+	case errors.Is(err, errFlowLifetime):
+		return session.ResetTransport, "flow ended: lifetime exceeded"
+	case expectedDestinationCloseError(err):
+		return session.ResetDestination, "flow ended: destination closed"
+	default:
+		return session.ResetTransport, "flow ended with error"
+	}
 }
 
 func (f *multipathFlow) closeAll() {

@@ -82,12 +82,19 @@ type ServerConfig struct {
 }
 
 type Server struct {
-	cfg              ServerConfig
-	semaphore        chan struct{}
-	connections      chan struct{}
-	enrollments      chan struct{}
-	sessionsMu       sync.RWMutex
-	sessions         map[[16]byte]*serverFlow
+	cfg         ServerConfig
+	semaphore   chan struct{}
+	connections chan struct{}
+	enrollments chan struct{}
+	sessionsMu  sync.RWMutex
+	sessions    map[[16]byte]*serverFlow
+	// pending holds sessions whose OPEN has arrived but whose destination is
+	// still being dialled. A JOIN for one of them waits for the OPEN to be
+	// decided instead of being told the session does not exist (issue #159).
+	pending map[[16]byte]*pendingSession
+	// ended remembers, for a while, the sessions this gateway has held, so
+	// a JOIN for one is told it ended rather than that it was never seen.
+	ended            endedSessions
 	accountMu        sync.Mutex
 	accountUsage     map[string]*accountUsage
 	maxObservedLanes atomic.Int64
@@ -343,6 +350,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		connections:  make(chan struct{}, cfg.MaxSessions),
 		enrollments:  make(chan struct{}, min(cfg.MaxSessions, 64)),
 		sessions:     make(map[[16]byte]*serverFlow),
+		pending:      make(map[[16]byte]*pendingSession),
 		accountUsage: make(map[string]*accountUsage),
 		budget:       budget,
 		metrics:      cfg.Metrics,
@@ -820,9 +828,23 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetDestination, "destination unavailable")})
 		return
 	}
+	// The session is announced before the dial, not after it. A client sends
+	// DATA, and may need a replacement lane, as soon as its OPEN is written;
+	// a JOIN that overtook a slow dial used to find no session and get the
+	// permanent "unknown session" answer for a flow that was about to exist.
+	pending, ok := s.beginPendingSession(sessionID, open.Header.FlowID, principal)
+	if !ok {
+		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetFlowLimit, "session already exists")})
+		return
+	}
+	settlePending := sync.OnceFunc(func() { s.endPendingSession(sessionID, pending) })
+	defer settlePending()
 	destinationDialStarted := time.Now()
 	destinationConn, err := s.cfg.DestinationPolicy.DialContext(ctx, destination)
 	if err != nil {
+		// Waiting JOINs learn of the failure first: the RESET below goes to
+		// the OPEN's own stream, which may be the one that is blocked.
+		settlePending()
 		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetDestination, "destination unavailable")})
 		s.cfg.Logger.Debug("destination dial failed", "error", err)
 		return
@@ -837,17 +859,23 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow.maxLifetime = s.cfg.FlowMaxLifetime
 	flow.reserveControlLane = open.Header.Flags&protocol.FlagReserveControl != 0
 	flow.controlLaneShared = auth.shared
+	// A flow that fails here is gone for good: tell the client on every lane
+	// so it does not spend a JOIN discovering that (issue #159).
+	flow.resetOnFailure = true
 	initialKind := transportKindForConn(conn)
 	serverSession := newServerFlow(flow, principal, initialKind, s.cfg.TCPFallbackLanes)
-	if err := serverSession.addLane(&mpLane{
+	openLane := &mpLane{
 		id: laneID, kind: initialKind, fc: fc, writeHook: s.cfg.testLaneWriteHook,
 		control: flow.reserveControlLane && initialKind == TransportQUIC,
-	}); err != nil {
+	}
+	if err := serverSession.addLane(openLane); err != nil {
 		flow.closeAll()
 		return
 	}
 	s.observeLanes(serverSession.flow.laneCount())
-	if !s.registerSession(sessionID, serverSession) {
+	registeredOK := s.registerSession(sessionID, serverSession)
+	if !registeredOK {
+		settlePending()
 		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetFlowLimit, "session already exists")})
 		flow.closeAll()
 		return
@@ -862,9 +890,22 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		}
 	}()
 	if err := fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}}); err != nil {
-		flow.closeAll()
-		return
+		// The stream that carried OPEN died while the destination was being
+		// dialled. If a JOIN has asked to rescue it -- waiting now, or told
+		// "session pending" and due to retry -- that is a lost lane, not a
+		// failed flow: the flow runs for its replacement grace and the JOIN,
+		// whose own OPEN_OK tells the client the session exists, replaces the
+		// lane. If no JOIN ever named it, it is more likely a transport
+		// candidate the client raced and abandoned, so it is closed.
+		if !s.pendingRescueRequested(pending) {
+			flow.closeAll()
+			return
+		}
+		flow.failLane(openLane, fmt.Errorf("lane %d: write flow open acknowledgement: %w", laneID, err))
 	}
+	// JOINs waiting on this OPEN are released only now: earlier, one could
+	// retire the OPEN's lane before its OPEN_OK went out.
+	settlePending()
 	_ = conn.SetDeadline(time.Time{})
 	s.metrics.FlowStarted()
 	stats, err := flow.run(ctx)
@@ -1030,14 +1071,43 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinInvalidIdentity, session.ResetProtocol, "invalid lane join identity")
 		return
 	}
-	serverSession := s.lookupSession(sessionID)
+	serverSession, pending := s.lookupLiveOrPending(sessionID, open.Header.FlowID, principal)
+	// A matching pending OPEN takes precedence even once its session is in
+	// the table: until its OPEN_OK is written, a JOIN admitted now could
+	// retire the OPEN's lane under it.
+	if serverSession == nil || pending != nil {
+		switch outcome := s.awaitPendingSession(ctx, pending); outcome {
+		case pendingAdmitted:
+			serverSession = s.lookupSession(sessionID)
+		case pendingStillDialling:
+			// Transient, and said with the code the peer already retries on:
+			// the session exists and is only slow to finish opening.
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinSessionPending, session.ResetFlowLimit, sessionPendingAnswer)
+			return
+		case pendingFailed:
+			// The OPEN this JOIN waited on failed, and the stream that carried
+			// it has said why. The destination code tells the peer the same:
+			// whatever it does next, it must not resume or reopen this flow.
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinOpenFailed, session.ResetDestination, "pending open failed")
+			return
+		}
+	}
 	switch {
 	case serverSession == nil:
 		// A rescue arriving after the session is gone is the failure mode that
 		// matters most on a lossy path: the peer will spend its whole
 		// replacement grace discovering this answer and then fail the flow.
-		// The three refusals below are kept apart because they send the
-		// operator to different places.
+		// The refusals below are kept apart because they send the operator
+		// to different places.
+		if held, openFailed := s.ended.heldBy(sessionID, open.Header.FlowID, principal, time.Now()); held && openFailed {
+			// The OPEN failed before this JOIN arrived; say so, as a JOIN
+			// that had waited on it would have been told.
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinOpenFailed, session.ResetDestination, "pending open failed")
+			return
+		} else if held {
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinSessionEnded, session.ResetProtocol, "unknown session: "+sessionEndedAnswer)
+			return
+		}
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinUnknownSession, session.ResetProtocol, "unknown session")
 		return
 	case serverSession.flow.flowID != open.Header.FlowID:
@@ -1314,6 +1384,9 @@ func (s *Server) watchAuthorization(ctx context.Context, flow *serverFlow) {
 		select {
 		case <-ticker.C:
 			if _, err := s.cfg.Credentials.Store.Authorize(flow.principal, time.Now()); err != nil {
+				// No RESET here: the broadcast's bounded wait would leave
+				// data the scheduler already holds moving to a revoked
+				// device. Its replacement JOIN is refused at authorization.
 				flow.flow.closeAll()
 				return
 			}
@@ -1348,8 +1421,140 @@ func (s *Server) unregisterSession(id [16]byte, flow *serverFlow) {
 	s.sessionsMu.Lock()
 	if s.sessions[id] == flow {
 		delete(s.sessions, id)
+		s.ended.add(id, flow.flow.flowID, flow.principal, time.Now())
 	}
 	s.sessionsMu.Unlock()
+}
+
+// pendingJoinWait bounds how long a JOIN waits for its session's OPEN to
+// finish dialling. It is shorter than a client's join handshake, so the peer
+// hears the transient "session pending" rather than timing out on its own.
+var pendingJoinWait = 5 * time.Second
+
+type pendingSession struct {
+	flowID    uint64
+	principal identity.Principal
+	// done is closed once the OPEN has either registered its session or
+	// failed; admitted, written before, says which.
+	done     chan struct{}
+	admitted bool
+	// waiters counts JOINs waiting on this OPEN; tests synchronize on it.
+	waiters atomic.Int32
+	// rescueRequested records that a matching JOIN found this OPEN, even if
+	// its own wait has since ended with "session pending" and its client is
+	// backing off before asking again.
+	rescueRequested atomic.Bool
+}
+
+type pendingOutcome int
+
+const (
+	pendingNone pendingOutcome = iota
+	pendingAdmitted
+	pendingStillDialling
+	pendingFailed
+)
+
+// beginPendingSession announces a session whose OPEN is being dialled. It
+// refuses an identifier that is already pending or live, which is what
+// registerSession would have answered after the dial.
+func (s *Server) beginPendingSession(id [16]byte, flowID uint64, principal identity.Principal) (*pendingSession, bool) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	if _, exists := s.sessions[id]; exists {
+		return nil, false
+	}
+	if _, exists := s.pending[id]; exists {
+		return nil, false
+	}
+	if s.ended.contains(id, time.Now()) {
+		// A late copy of an OPEN whose session already ended must not reach
+		// the destination a second time.
+		return nil, false
+	}
+	pending := &pendingSession{flowID: flowID, principal: principal, done: make(chan struct{})}
+	if s.pending == nil {
+		s.pending = make(map[[16]byte]*pendingSession)
+	}
+	s.pending[id] = pending
+	return pending, true
+}
+
+func (s *Server) endPendingSession(id [16]byte, pending *pendingSession) {
+	s.sessionsMu.Lock()
+	if s.pending[id] == pending {
+		delete(s.pending, id)
+	}
+	// The outcome is recorded before any waiter wakes: a flow admitted and
+	// already gone by the time a waiter looks is an ended session, not a
+	// failed OPEN.
+	pending.admitted = s.sessions[id] != nil
+	if !pending.admitted {
+		// An OPEN that failed is a session this gateway did hold, however
+		// briefly: it must not later be answered as never seen.
+		s.ended.addFailedOpen(id, pending.flowID, pending.principal, time.Now())
+	}
+	s.sessionsMu.Unlock()
+	close(pending.done)
+}
+
+// lookupLiveOrPending reads the session table and the pending OPENs in one
+// snapshot, so an OPEN registering in between cannot make a JOIN miss both.
+//
+// A pending OPEN is returned only to the JOIN of the device and flow that sent
+// it, and that JOIN is counted as its waiter here, under the same lock the
+// OPEN takes to decide whether a waiter is there to rescue it. The caller
+// must then call awaitPendingSession, which uncounts it.
+func (s *Server) lookupLiveOrPending(id [16]byte, flowID uint64, principal identity.Principal) (*serverFlow, *pendingSession) {
+	s.sessionsMu.RLock()
+	defer s.sessionsMu.RUnlock()
+	pending := s.pending[id]
+	if pending == nil || pending.flowID != flowID || !samePrincipal(pending.principal, principal) {
+		return s.sessions[id], nil
+	}
+	pending.waiters.Add(1)
+	pending.rescueRequested.Store(true)
+	return s.sessions[id], pending
+}
+
+// pendingRescueRequested decides, under the lock JOINs register under,
+// whether a client has asked to rescue this OPEN: a JOIN is waiting on it now,
+// or one found it, was told "session pending", and will retry. The flow is
+// then kept for one replacement grace, the same bounded window any lost lane
+// gets; an OPEN no JOIN ever named is not kept.
+func (s *Server) pendingRescueRequested(pending *pendingSession) bool {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	return pending.waiters.Load() > 0 || pending.rescueRequested.Load()
+}
+
+// awaitPendingSession waits, bounded, for a pending OPEN to be decided. Only a
+// JOIN naming the same flow from the same device waits; anything else is
+// answered from the session table as before.
+func (s *Server) awaitPendingSession(ctx context.Context, pending *pendingSession) pendingOutcome {
+	if pending == nil {
+		return pendingNone
+	}
+	defer pending.waiters.Add(-1)
+	// The JOIN's stream carries the server's handshake deadline, and the
+	// refusal must still be written inside it.
+	wait := pendingJoinWait
+	if bound := s.cfg.HandshakeTimeout / 2; bound > 0 && bound < wait {
+		wait = bound
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-pending.done:
+	case <-timer.C:
+		return pendingStillDialling
+	case <-ctx.Done():
+		return pendingStillDialling
+	}
+	if !pending.admitted {
+		return pendingFailed
+	}
+	return pendingAdmitted
 }
 
 func (s *Server) observeLanes(count int) {
