@@ -373,8 +373,14 @@ type multipathFlow struct {
 	// and asks to JOIN a session that is already gone.
 	resetOnFailure bool
 	// peerReset records that the peer ended the flow with RESET, so this end
-	// does not answer it with one of its own.
-	peerReset atomic.Bool
+	// does not answer it with one of its own. peerResetErr is that RESET as
+	// an error: it is the reason the flow ended, whichever teardown path
+	// happens to return first.
+	peerReset    atomic.Bool
+	peerResetErr atomic.Pointer[error]
+	// resetOnce gives one failing path the whole RESET broadcast; a second
+	// one waits for it rather than racing it or closing under it.
+	resetOnce sync.Once
 	// terminating is set, under lanesMu, when a failing flow takes the
 	// snapshot of lanes it will RESET. No lane is admitted after it, so a
 	// replacement cannot slip in between the RESET and the close and be
@@ -1171,11 +1177,7 @@ func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool 
 		return false
 	}
 	if frame.Header.Type == protocol.TypeReset {
-		f.peerReset.Store(true)
-		err := errors.New("peer reset flow")
-		if len(frame.Payload) > 1 {
-			err = fmt.Errorf("peer reset flow: %s", string(frame.Payload[1:]))
-		}
+		err := f.notePeerReset(frame)
 		select {
 		case f.ackErr <- err:
 		default:
@@ -1551,7 +1553,35 @@ func (f *multipathFlow) isolateFromControlLane(control *mpLane) bool {
 	return f.controlLaneShared()
 }
 
+// errPeerReset is the peer ending the flow with RESET.
+var errPeerReset = errors.New("peer reset flow")
+
+// notePeerReset records an incoming RESET before anything wakes the workers,
+// so the reason it carries is what the flow ends with.
+func (f *multipathFlow) notePeerReset(frame protocol.Frame) error {
+	err := errPeerReset
+	if len(frame.Payload) > 1 {
+		err = fmt.Errorf("%w: %s", errPeerReset, string(frame.Payload[1:]))
+	}
+	f.peerResetErr.CompareAndSwap(nil, &err)
+	f.peerReset.Store(true)
+	return err
+}
+
 func (f *multipathFlow) run(ctx context.Context) (FlowStats, error) {
+	stats, err := f.runFlow(ctx)
+	// A RESET closes every lane, and the path that notices first -- a lane
+	// failure waiting for its replacement, say -- may return its own error
+	// without ever reading the RESET's. The RESET is why the flow ended.
+	if err != nil && !errors.Is(err, errPeerReset) {
+		if reset := f.peerResetErr.Load(); reset != nil {
+			err = fmt.Errorf("%w (then %v)", *reset, err)
+		}
+	}
+	return stats, err
+}
+
+func (f *multipathFlow) runFlow(ctx context.Context) (FlowStats, error) {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	ackCtx, cancelACKs := context.WithCancel(runCtx)
@@ -3164,11 +3194,7 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 				f.openAckPending = false
 				f.confirmOpen()
 			case protocol.TypeReset:
-				f.peerReset.Store(true)
-				if len(frame.Payload) > 1 {
-					return fmt.Errorf("peer reset flow: %s", string(frame.Payload[1:]))
-				}
-				return errors.New("peer reset flow")
+				return f.notePeerReset(frame)
 			default:
 				return fmt.Errorf("unexpected flow frame type %d", frame.Header.Type)
 			}
@@ -3436,7 +3462,14 @@ func (f *multipathFlow) failClose(err error) {
 }
 
 func (f *multipathFlow) resetLanes(err error) {
-	if !f.resetOnFailure || f.peerReset.Load() || f.finished.Load() {
+	if !f.resetOnFailure {
+		return
+	}
+	f.resetOnce.Do(func() { f.broadcastReset(err) })
+}
+
+func (f *multipathFlow) broadcastReset(err error) {
+	if f.peerReset.Load() || f.finished.Load() {
 		return
 	}
 	// Both directions have finished, which the gateway counts as a completed
@@ -3449,7 +3482,11 @@ func (f *multipathFlow) resetLanes(err error) {
 	f.terminating.Store(true)
 	lanes := make([]*mpLane, 0, len(f.lanes))
 	for _, lane := range f.lanes {
-		if lane.fc != nil && !lane.closed.Load() {
+		// A staged JOIN has not had its OPEN_OK yet, so its peer would read
+		// a RESET as the answer to the JOIN rather than as the end of the
+		// flow. It is closed with the rest, and its peer's next JOIN finds
+		// no session.
+		if lane.fc != nil && !lane.closed.Load() && (!lane.staged || lane.ready.Load()) {
 			lanes = append(lanes, lane)
 		}
 	}

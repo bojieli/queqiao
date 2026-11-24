@@ -249,3 +249,44 @@ func TestFailingFlowAdmitsNoLaneWhileResetting(t *testing.T) {
 		t.Fatal("RESET to a peer that never reads was not bounded")
 	}
 }
+
+// Whatever teardown path returns first, a flow the peer reset ends with the
+// peer's reason.
+func TestPeerResetReasonWinsOverTheTeardownError(t *testing.T) {
+	inner, application := net.Pipe()
+	defer application.Close()
+	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024,
+		protocol.FlagAckUp, protocol.FlagAckDown, nil, metrics.New())
+	flow.idleTimeout = 20 * time.Millisecond
+	flow.maxLifetime = time.Minute
+	flow.stallWatchdogDisabled = true
+	flow.notePeerReset(protocol.Frame{Payload: session.ResetPayload(session.ResetTransport, "flow ended: idle timeout")})
+	_, err := flow.run(context.Background())
+	if !errors.Is(err, errPeerReset) || !strings.HasPrefix(err.Error(), "peer reset flow: flow ended: idle timeout") {
+		t.Fatalf("flow error = %v, want the peer's RESET first", err)
+	}
+}
+
+// A staged JOIN has not been answered yet; a RESET on it would be read as the
+// JOIN's refusal, so it gets none.
+func TestStagedLaneIsNotReset(t *testing.T) {
+	inner, application := net.Pipe()
+	defer application.Close()
+	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024,
+		protocol.FlagAckDown, protocol.FlagAckUp, nil, metrics.New())
+	flow.resetOnFailure = true
+	outer, peer := net.Pipe()
+	defer peer.Close()
+	if err := flow.addLane(&mpLane{id: 1, kind: TransportQUIC, fc: newFrameConn(outer), staged: true}); err != nil {
+		t.Fatal(err)
+	}
+	sawReset := make(chan bool, 1)
+	go func() {
+		frame, err := protocol.ReadFrame(peer)
+		sawReset <- err == nil && frame.Header.Type == protocol.TypeReset
+	}()
+	flow.failClose(errFlowLifetime)
+	if <-sawReset {
+		t.Fatal("a staged JOIN lane was sent RESET")
+	}
+}

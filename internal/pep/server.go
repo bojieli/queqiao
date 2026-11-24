@@ -1317,6 +1317,9 @@ func (s *Server) watchAuthorization(ctx context.Context, flow *serverFlow) {
 		select {
 		case <-ticker.C:
 			if _, err := s.cfg.Credentials.Store.Authorize(flow.principal, time.Now()); err != nil {
+				// Stop forwarding at once; telling the peer is best effort
+				// and must not keep a revoked flow's traffic moving.
+				_ = flow.flow.inner.Close()
 				flow.flow.failClose(errAuthorizationRevoked)
 				return
 			}
