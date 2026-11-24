@@ -21,10 +21,12 @@ import (
 // may have taken it -- and nothing on the wire today lets the client prove
 // otherwise, so a replay could deliver a request twice.
 
-// errLaneJoinOpenUnadmitted is a JOIN refused as an unknown session while the
-// flow's own OPEN was still unconfirmed. It is a permanent refusal of the JOIN,
-// but not evidence that a session was lost: the peer never had one.
-var errLaneJoinOpenUnadmitted = fmt.Errorf("%w: flow open was never admitted", errLaneJoinRejected)
+// errLaneJoinOpenUnconfirmed is a JOIN refused as an unknown session while the
+// flow's own OPEN was still unconfirmed. It is a permanent refusal of the JOIN.
+// It does not establish what became of the OPEN: most often it never arrived,
+// but a gateway can also admit an OPEN and lose the session -- by restarting,
+// say -- before the acknowledgement reaches the client.
+var errLaneJoinOpenUnconfirmed = fmt.Errorf("%w: flow open was never confirmed", errLaneJoinRejected)
 
 // errLaneJoinOpenFailed is a JOIN the gateway held for a pending OPEN that
 // then failed, such as an unreachable destination. Nothing can be resumed or
@@ -43,20 +45,21 @@ const sessionPendingAnswer = "session pending"
 // waited on it was told.
 var errOpenFailed = errors.New("peer could not open this flow")
 
-// errOpenNotAdmitted ends a flow whose OPEN the peer never admitted. It is reported apart from errResumeRefused,
-// whose session the peer did hold and dropped.
-var errOpenNotAdmitted = errors.New("peer never admitted this flow's open")
+// errOpenUnconfirmed ends a flow whose session the peer refused before the
+// client ever saw its OPEN confirmed. It is reported apart from
+// errResumeRefused, a session the client knows the peer held and dropped.
+var errOpenUnconfirmed = errors.New("peer refused this flow before confirming its open")
 
 // sessionEndedAnswer is how a gateway that held a session says it has ended.
 const sessionEndedAnswer = "session ended"
 
-// classifyUnadmittedRefusal marks a plain session refusal that arrived before
+// classifyUnconfirmedRefusal marks a plain session refusal that arrived before
 // OPEN_OK. A refusal with a code of its own -- capacity, TCP mode, a failed
 // open -- keeps its meaning, and so does a gateway saying it held the session
 // and it ended.
-func classifyUnadmittedRefusal(flow *multipathFlow, err error) error {
+func classifyUnconfirmedRefusal(flow *multipathFlow, err error) error {
 	if err == nil || !flow.openConfirmationRequired.Load() || !errors.Is(err, errLaneJoinRejected) ||
-		errors.Is(err, errLaneJoinTCPMode) || errors.Is(err, errLaneJoinOpenFailed) || errors.Is(err, errLaneJoinOpenUnadmitted) {
+		errors.Is(err, errLaneJoinTCPMode) || errors.Is(err, errLaneJoinOpenFailed) || errors.Is(err, errLaneJoinOpenUnconfirmed) {
 		return err
 	}
 	// Only the plain "unknown session" answer says the session is not
@@ -64,7 +67,7 @@ func classifyUnadmittedRefusal(flow *multipathFlow, err error) error {
 	if text := err.Error(); !strings.Contains(text, "unknown session") || strings.Contains(text, sessionEndedAnswer) {
 		return err
 	}
-	return fmt.Errorf("%w (%w)", errLaneJoinOpenUnadmitted, err)
+	return fmt.Errorf("%w (%w)", errLaneJoinOpenUnconfirmed, err)
 }
 
 // errSessionExpiredWhileSuspended ends a flow whose session the peer dropped
@@ -82,31 +85,47 @@ var errSessionExpiredWhileSuspended = errors.New("peer dropped this session whil
 // to sessions that may be gone.
 const suspendedSessionHold = laneDeadPathDetection + laneReplacementWait
 
-// notePeerHeard stamps the arrival of a frame from the peer.
-func (f *multipathFlow) notePeerHeard() {
-	f.peerClockOffset.Store(f.clockOffset(time.Now()))
+// readSuspendTotal reads the host's cumulative suspend time from the system
+// suspend clock (boot time minus monotonic time on Linux and Android, the raw
+// clocks on Darwin). It ignores wall-clock corrections, and where no such
+// clock exists it reads zero, so a sleep is never inferred.
+func (f *multipathFlow) readSuspendTotal() int64 {
+	read := f.suspendClock
+	if read == nil {
+		read = systemSuspendTime
+	}
+	total, err := read()
+	if err != nil || total < 0 {
+		return -1
+	}
+	return int64(total)
 }
 
-// clockOffset is the wall clock minus the monotonic time since started.
-func (f *multipathFlow) clockOffset(now time.Time) int64 {
-	return now.UnixNano() - int64(now.Sub(f.started))
+func (f *multipathFlow) samplePeerSuspend() {
+	f.peerSuspendTotal.Store(f.readSuspendTotal())
+	f.peerSampledAt.Store(int64(time.Since(f.started)))
+}
+
+// notePeerHeard records that a frame arrived from the peer. The suspend clock
+// is read at most once a second: a sleep shorter than that is far below the
+// minute that matters here.
+func (f *multipathFlow) notePeerHeard() {
+	if time.Since(f.started)-time.Duration(f.peerSampledAt.Load()) < time.Second {
+		return
+	}
+	f.samplePeerSuspend()
 }
 
 // suspendedFor is how long this host was suspended since the peer was last
-// heard from. Wall-clock time keeps running while a host sleeps and the
-// monotonic clock that time.Since reads does not, on Linux, Android, macOS and
-// iOS alike, so their difference over that interval is the sleep. Sleeps
-// before the peer was last heard from are left out: the peer evidently still
-// held the session after them. A wall clock stepped backwards reads as none,
-// and one stepped forwards by more than a minute reads as a sleep.
+// heard from. Sleeps before that are left out: the peer evidently still held
+// the session after them.
 func (f *multipathFlow) suspendedFor() time.Duration {
-	if f.started.IsZero() {
+	then := f.peerSuspendTotal.Load()
+	now := f.readSuspendTotal()
+	if then < 0 || now < 0 || now <= then {
 		return 0
 	}
-	if gap := time.Duration(f.clockOffset(time.Now()) - f.peerClockOffset.Load()); gap > 0 {
-		return gap
-	}
-	return 0
+	return time.Duration(now - then)
 }
 
 // resumeRefusal is the error a flow fails with once the peer has refused to
@@ -115,8 +134,8 @@ func (f *multipathFlow) resumeRefusal() error {
 	if f.openFailed.Load() {
 		return errOpenFailed
 	}
-	if f.openUnadmitted.Load() {
-		return errOpenNotAdmitted
+	if f.openUnconfirmed.Load() {
+		return errOpenUnconfirmed
 	}
 	if f.sessionAbsent.Load() && f.suspendedFor() >= suspendedSessionHold {
 		return errSessionExpiredWhileSuspended
@@ -131,7 +150,7 @@ func (f *multipathFlow) resumeRefusal() error {
 // Every admitted JOIN calls it, confirmed open or not: the JOIN's answer is
 // also the peer heard from, which is what a later sleep is measured against.
 func (f *multipathFlow) confirmOpenByJoin() {
-	f.notePeerHeard()
+	f.samplePeerSuspend()
 	f.openConfirmMu.Lock()
 	defer f.openConfirmMu.Unlock()
 	if f.openConfirmationRequired.CompareAndSwap(true, false) {
@@ -148,7 +167,7 @@ func (f *multipathFlow) noteRefusalCause(err error) {
 	switch {
 	case errors.Is(err, errLaneJoinOpenFailed):
 		f.openFailed.Store(true)
-	case errors.Is(err, errLaneJoinOpenUnadmitted):
-		f.openUnadmitted.Store(true)
+	case errors.Is(err, errLaneJoinOpenUnconfirmed):
+		f.openUnconfirmed.Store(true)
 	}
 }

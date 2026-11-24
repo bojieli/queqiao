@@ -34,15 +34,16 @@ TIMEOUT = "lane replacement timeout"
 ABANDONED = "no replacement lane will be attempted"
 RESUME_REFUSED = "peer does not hold this session"
 # Issue #159: a JOIN refused before the flow's OPEN was confirmed is not a
-# session the gateway dropped -- it never admitted one -- and the client now
-# ends such a flow with its own error so the two are counted apart.
-OPEN_NOT_ADMITTED = "peer never admitted this flow's open"
+# session the client knows the gateway held -- usually the OPEN never arrived --
+# and the client ends such a flow with its own error so the two are counted
+# apart.
+OPEN_UNCONFIRMED = "peer refused this flow before confirming its open"
 # A session the gateway expired, correctly, while the client host slept for
 # longer than the gateway holds a silent flow.
 SUSPENDED_EXPIRY = "peer dropped this session while this host was suspended"
 # A JOIN that waited on the flow's pending OPEN and saw it fail.
 OPEN_FAILED = "peer could not open this flow"
-TERMINALS = (ABANDONED, RESUME_REFUSED, OPEN_NOT_ADMITTED, SUSPENDED_EXPIRY, OPEN_FAILED)
+TERMINALS = (ABANDONED, RESUME_REFUSED, OPEN_UNCONFIRMED, SUSPENDED_EXPIRY, OPEN_FAILED)
 
 # Buckets for `lane replacement timeout` with lanes_joined == 1, in report order.
 NO_ATTEMPT = "no zero-lane replacement attempted (attempts == 0)"
@@ -53,7 +54,7 @@ INCONSISTENT = "inconsistent (failures > attempts)"
 BUCKETS = (NO_ATTEMPT, EVERY_ATTEMPT_FAILED, OUTCOME_UNRECORDED, OLD_CLIENT, INCONSISTENT)
 
 # The categories the client writes as lane_replacement_last_failure.
-FAILURE_KINDS = ("timeout", "peer_rejected", "peer_capacity", "open_unadmitted", "open_failed", "open_pending", "canceled", "other")
+FAILURE_KINDS = ("timeout", "peer_rejected", "peer_capacity", "open_unconfirmed", "open_failed", "open_pending", "canceled", "other")
 
 # Go's RFC 3339 output: variable fractional digits (up to nanoseconds, which
 # datetime cannot hold) and either Z or a numeric offset.

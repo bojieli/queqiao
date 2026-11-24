@@ -891,7 +891,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		// With none waiting it is more likely a transport candidate the
 		// client raced and abandoned, which no JOIN will ever name, so the
 		// flow is closed rather than held for a replacement grace.
-		if pending.waiters.Load() == 0 {
+		if !s.pendingHasWaiter(pending) {
 			flow.closeAll()
 			return
 		}
@@ -1065,12 +1065,12 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinInvalidIdentity, session.ResetProtocol, "invalid lane join identity")
 		return
 	}
-	serverSession, pending := s.lookupLiveOrPending(sessionID)
+	serverSession, pending := s.lookupLiveOrPending(sessionID, open.Header.FlowID, principal)
 	// A matching pending OPEN takes precedence even once its session is in
 	// the table: until its OPEN_OK is written, a JOIN admitted now could
 	// retire the OPEN's lane under it.
 	if serverSession == nil || pending != nil {
-		switch outcome := s.awaitPendingSession(ctx, pending, sessionID, open.Header.FlowID, principal); outcome {
+		switch outcome := s.awaitPendingSession(ctx, pending); outcome {
 		case pendingAdmitted:
 			serverSession = s.lookupSession(sessionID)
 		case pendingStillDialling:
@@ -1487,22 +1487,46 @@ func (s *Server) endPendingSession(id [16]byte, pending *pendingSession) {
 
 // lookupLiveOrPending reads the session table and the pending OPENs in one
 // snapshot, so an OPEN registering in between cannot make a JOIN miss both.
-func (s *Server) lookupLiveOrPending(id [16]byte) (*serverFlow, *pendingSession) {
+//
+// A pending OPEN is returned only to the JOIN of the device and flow that sent
+// it, and that JOIN is counted as its waiter here, under the same lock the
+// OPEN takes to decide whether a waiter is there to rescue it. The caller
+// must then call awaitPendingSession, which uncounts it.
+func (s *Server) lookupLiveOrPending(id [16]byte, flowID uint64, principal identity.Principal) (*serverFlow, *pendingSession) {
 	s.sessionsMu.RLock()
 	defer s.sessionsMu.RUnlock()
-	return s.sessions[id], s.pending[id]
+	pending := s.pending[id]
+	if pending == nil || pending.flowID != flowID || !samePrincipal(pending.principal, principal) {
+		return s.sessions[id], nil
+	}
+	pending.waiters.Add(1)
+	return s.sessions[id], pending
+}
+
+// pendingHasWaiter decides, under the lock JOINs register under, whether a
+// JOIN is waiting to rescue this OPEN.
+func (s *Server) pendingHasWaiter(pending *pendingSession) bool {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	return pending.waiters.Load() > 0
 }
 
 // awaitPendingSession waits, bounded, for a pending OPEN to be decided. Only a
 // JOIN naming the same flow from the same device waits; anything else is
 // answered from the session table as before.
-func (s *Server) awaitPendingSession(ctx context.Context, pending *pendingSession, id [16]byte, flowID uint64, principal identity.Principal) pendingOutcome {
-	if pending == nil || pending.flowID != flowID || !samePrincipal(pending.principal, principal) {
+func (s *Server) awaitPendingSession(ctx context.Context, pending *pendingSession) pendingOutcome {
+	if pending == nil {
 		return pendingNone
 	}
-	timer := time.NewTimer(pendingJoinWait)
+	defer pending.waiters.Add(-1)
+	// The JOIN's stream carries the server's handshake deadline, and the
+	// refusal must still be written inside it.
+	wait := pendingJoinWait
+	if bound := s.cfg.HandshakeTimeout / 2; bound > 0 && bound < wait {
+		wait = bound
+	}
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
-	pending.waiters.Add(1)
 	select {
 	case <-pending.done:
 	case <-timer.C:

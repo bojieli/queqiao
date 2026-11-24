@@ -190,11 +190,12 @@ gateway's own fields (`lane_replacement_waits`, `_timeouts`, `_wait`,
 When a client has recorded a failed zero-lane recovery, its flow completion
 record includes `lane_replacement_last_failure`. The value classifies the last
 returned QUIC round or TCP replacement error: `timeout`, `peer_rejected`,
-`peer_capacity`, `open_unadmitted`, `open_failed`, `open_pending`, `canceled`, or `other`.
-`open_unadmitted` is a join refused as an unknown session while the flow's own
-OPEN was still unconfirmed: the gateway never admitted the session, so nothing
-was lost. A flow
-that still fails this way ends with `peer never admitted this flow's open`
+`peer_capacity`, `open_unconfirmed`, `open_failed`, `open_pending`, `canceled`, or `other`.
+`open_unconfirmed` is a join refused as an unknown session while the flow's own
+OPEN was still unconfirmed: usually the OPEN never reached the gateway, though
+the client cannot rule out a gateway that admitted it and then lost the
+session, for instance by restarting. A flow
+that still fails this way ends with `peer refused this flow before confirming its open`
 rather than `peer does not hold this session`. `open_failed` is a join the
 gateway held for a pending OPEN that then failed, usually an unreachable
 destination; the flow then fails with `peer could not open this flow`.
@@ -203,8 +204,11 @@ dialling after five seconds; it is retried. A refusal of a flow the client host 
 than a gateway holds a silent flow (its lane-loss detection plus its
 replacement grace, one minute) ends the flow with `peer dropped this session
 while this host was suspended`: the gateway ended it correctly, and it is not
-a lost session. The completion record then carries `host_suspended`, the sleep
-that `duration`, which is monotonic, leaves out. This lets you split counted errors
+a lost session. The sleep is read from the system suspend clock since the
+peer was last heard from, so a wall-clock correction is never taken for one;
+platforms without that clock never report it. The completion record then
+carries `host_suspended`, the sleep that `duration`, which is monotonic,
+leaves out. This lets you split counted errors
 even when the attempt timed out without its own warning. A later successful or
 pending attempt does not clear this historical observation. Older clients and
 flows with no recorded failure omit the field. The category describes the
@@ -241,7 +245,7 @@ that widened a healthy bundle has `replacement=false` and no `attempt`, and is
 not counted in the flow record. Every counted failure gets a line, including
 a peer refusal that ends recovery at once. The level follows `failure_kind`: `timeout`
 (a context deadline or a socket deadline on the handshake), `peer_rejected`,
-`peer_capacity`, `open_unadmitted`, `open_failed` and `open_pending` are
+`peer_capacity`, `open_unconfirmed`, `open_failed` and `open_pending` are
 written at `info`, and
 `other` at `warn`. A replacement
 cancelled because the flow ended is not written, and any other cancellation is

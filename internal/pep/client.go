@@ -2496,7 +2496,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				lastRecoveryAttempt = now
 				attempt := flow.noteReplacementAttempt()
 				if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
-					err = classifyUnadmittedRefusal(flow, err)
+					err = classifyUnconfirmedRefusal(flow, err)
 					flow.noteReplacementFailure(err)
 					// The flow this belongs to is the whole point of the
 					// line: a gateway record saying a flow failed with no
@@ -2719,7 +2719,7 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 			if pending > 0 {
 				pending--
 			}
-			result.err = classifyUnadmittedRefusal(flow, result.err)
+			result.err = classifyUnconfirmedRefusal(flow, result.err)
 			if result.err != nil {
 				if result.replacement {
 					flow.noteReplacementFailure(result.err)
@@ -3006,7 +3006,7 @@ func laneRecoveryFailureLevel(manageCtx context.Context, err error) (slog.Level,
 			return 0, false
 		}
 		return slog.LevelDebug, true
-	case "timeout", "peer_rejected", "peer_capacity", "open_unadmitted", "open_failed", "open_pending":
+	case "timeout", "peer_rejected", "peer_capacity", "open_unconfirmed", "open_failed", "open_pending":
 		return slog.LevelInfo, true
 	}
 	return slog.LevelWarn, true

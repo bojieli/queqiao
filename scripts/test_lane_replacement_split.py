@@ -60,7 +60,7 @@ CLIENT = [
     client_failure(12, "last lane failed (EOF): no replacement lane will be attempted"),
     client_failure(13, "peer does not hold this session"),
     # Issue #159: refused before OPEN_OK, counted apart from a lost session.
-    client_failure(16, "last lane failed (lane 0: EOF): peer never admitted this flow's open"),
+    client_failure(16, "last lane failed (lane 0: EOF): peer refused this flow before confirming its open"),
     # Route C: the gateway expired the session while the client host slept.
     client_failure(17, "last lane failed (lane 0: EOF): peer dropped this session while this host was suspended"),
     client_failure(18, "last lane failed (lane 0: EOF): peer could not open this flow"),
@@ -153,7 +153,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
     def test_other_terminal_errors_counted_separately(self):
         report = self.report()
         self.assertEqual(report["other_terminal_errors"], {
-            MODULE.ABANDONED: 1, MODULE.RESUME_REFUSED: 1, MODULE.OPEN_NOT_ADMITTED: 1,
+            MODULE.ABANDONED: 1, MODULE.RESUME_REFUSED: 1, MODULE.OPEN_UNCONFIRMED: 1,
             MODULE.SUSPENDED_EXPIRY: 1, MODULE.OPEN_FAILED: 1,
         })
         self.assertEqual(report["last_lane_death"][MODULE.ABANDONED], {"EOF": 1})

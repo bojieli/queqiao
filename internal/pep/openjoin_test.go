@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,13 @@ import (
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
 )
+
+// pendingFor peeks at a pending OPEN without registering as its waiter.
+func pendingFor(server *Server, id [16]byte) *pendingSession {
+	server.sessionsMu.RLock()
+	defer server.sessionsMu.RUnlock()
+	return server.pending[id]
+}
 
 func pendingTestServer() (*Server, *metrics.Registry) {
 	registry := metrics.New()
@@ -163,15 +171,15 @@ func TestJoinRefusalBeforeOpenOKIsItsOwnKind(t *testing.T) {
 	refused = errors.Join(errLaneJoinRejected, refused)
 
 	flow.requireOpenConfirmation()
-	err := classifyUnadmittedRefusal(flow, refused)
-	if !errors.Is(err, errLaneJoinOpenUnadmitted) || !errors.Is(err, errLaneJoinRejected) {
+	err := classifyUnconfirmedRefusal(flow, refused)
+	if !errors.Is(err, errLaneJoinOpenUnconfirmed) || !errors.Is(err, errLaneJoinRejected) {
 		t.Fatalf("unconfirmed refusal = %v", err)
 	}
-	if kind := replacementFailureKind(err); kind != "open_unadmitted" {
+	if kind := replacementFailureKind(err); kind != "open_unconfirmed" {
 		t.Fatalf("kind = %q", kind)
 	}
 	for _, keep := range []error{errLaneJoinCapacity, errLaneJoinTCPMode, errLaneJoinOpenFailed, context.DeadlineExceeded} {
-		if got := classifyUnadmittedRefusal(flow, keep); got != keep {
+		if got := classifyUnconfirmedRefusal(flow, keep); got != keep {
 			t.Fatalf("%v reclassified as %v", keep, got)
 		}
 	}
@@ -180,7 +188,7 @@ func TestJoinRefusalBeforeOpenOKIsItsOwnKind(t *testing.T) {
 	}
 
 	flow.confirmOpen()
-	if got := classifyUnadmittedRefusal(flow, refused); errors.Is(got, errLaneJoinOpenUnadmitted) {
+	if got := classifyUnconfirmedRefusal(flow, refused); errors.Is(got, errLaneJoinOpenUnconfirmed) {
 		t.Fatal("a refusal after OPEN_OK was blamed on the open")
 	}
 	if kind := replacementFailureKind(refused); kind != "peer_rejected" {
@@ -191,9 +199,9 @@ func TestJoinRefusalBeforeOpenOKIsItsOwnKind(t *testing.T) {
 	if err := flow.resumeRefusal(); !errors.Is(err, errResumeRefused) {
 		t.Fatalf("resume refusal = %v", err)
 	}
-	flow.openUnadmitted.Store(true)
-	if err := flow.resumeRefusal(); !errors.Is(err, errOpenNotAdmitted) || errors.Is(err, errResumeRefused) {
-		t.Fatalf("unadmitted refusal = %v", err)
+	flow.openUnconfirmed.Store(true)
+	if err := flow.resumeRefusal(); !errors.Is(err, errOpenUnconfirmed) || errors.Is(err, errResumeRefused) {
+		t.Fatalf("unconfirmed refusal = %v", err)
 	}
 }
 
@@ -221,8 +229,26 @@ func TestCompleteLaneJoinMapsDestinationResetToOpenFailed(t *testing.T) {
 // Issue #159, route C: a client host asleep for longer than the gateway holds
 // a silent flow comes back to sessions the gateway has, correctly, ended. The
 // refusal that follows is reported as that, not as a session the gateway lost.
+// fakeSuspendClock is a system suspend clock a test advances by hand.
+type fakeSuspendClock struct{ total atomic.Int64 }
+
+func (c *fakeSuspendClock) read() (time.Duration, error) { return time.Duration(c.total.Load()), nil }
+
+// sleepFlow gives a flow a fake suspend clock and returns a function that
+// records the peer as heard from now and then sleeps the host for d.
+func sleepFlow(flow *multipathFlow) func(d time.Duration) {
+	clock := &fakeSuspendClock{}
+	flow.suspendClock = clock.read
+	flow.samplePeerSuspend()
+	return func(d time.Duration) {
+		flow.samplePeerSuspend()
+		clock.total.Add(int64(d))
+	}
+}
+
 func TestRefusalAfterLongSuspendIsReportedAsExpiry(t *testing.T) {
 	flow := newIsolationTestFlow(t, false)
+	heardThenSlept := sleepFlow(flow)
 	flow.resumeRefused.Store(true)
 	flow.noteRefusalCause(fmt.Errorf("%w: unknown session", errLaneJoinRejected))
 	if got := flow.suspendedFor(); got >= time.Second {
@@ -231,15 +257,12 @@ func TestRefusalAfterLongSuspendIsReportedAsExpiry(t *testing.T) {
 	if err := flow.resumeRefusal(); !errors.Is(err, errResumeRefused) {
 		t.Fatalf("refusal without a suspend = %v", err)
 	}
-	heardAgo := func(d time.Duration) {
-		flow.peerClockOffset.Store(flow.clockOffset(time.Now()) - int64(d))
-	}
-	heardAgo(30 * time.Second)
+	heardThenSlept(30 * time.Second)
 	if err := flow.resumeRefusal(); !errors.Is(err, errResumeRefused) {
 		t.Fatalf("a suspend the gateway outlasts = %v", err)
 	}
-	heardAgo(390 * time.Second)
-	if got := flow.suspendedFor(); got < 389*time.Second || got > 391*time.Second {
+	heardThenSlept(390 * time.Second)
+	if got := flow.suspendedFor(); got != 390*time.Second {
 		t.Fatalf("suspendedFor = %v, want about 390s", got)
 	}
 	if err := flow.resumeRefusal(); !errors.Is(err, errSessionExpiredWhileSuspended) {
@@ -256,15 +279,15 @@ func TestRefusalAfterLongSuspendIsReportedAsExpiry(t *testing.T) {
 		t.Fatalf("completion record does not carry the suspension: %v", fields)
 	}
 	// Hearing from the peer after waking is proof the sleep cost nothing.
-	flow.notePeerHeard()
+	flow.samplePeerSuspend()
 	if err := flow.resumeRefusal(); !errors.Is(err, errResumeRefused) {
 		t.Fatalf("refusal after the peer was heard again = %v", err)
 	}
-	heardAgo(390 * time.Second)
-	// An unadmitted open is still that, whatever the clock did.
-	flow.openUnadmitted.Store(true)
-	if err := flow.resumeRefusal(); !errors.Is(err, errOpenNotAdmitted) {
-		t.Fatalf("unadmitted refusal after suspend = %v", err)
+	heardThenSlept(390 * time.Second)
+	// An unconfirmed open is still that, whatever the clock did.
+	flow.openUnconfirmed.Store(true)
+	if err := flow.resumeRefusal(); !errors.Is(err, errOpenUnconfirmed) {
+		t.Fatalf("unconfirmed refusal after suspend = %v", err)
 	}
 }
 
@@ -330,7 +353,7 @@ func TestEndedSessionIsNotNeverHeld(t *testing.T) {
 	unconfirmed := newIsolationTestFlow(t, false)
 	unconfirmed.requireOpenConfirmation()
 	ended := fmt.Errorf("%w: unknown session: %s", errLaneJoinRejected, sessionEndedAnswer)
-	if errors.Is(classifyUnadmittedRefusal(unconfirmed, ended), errLaneJoinOpenUnadmitted) {
+	if errors.Is(classifyUnconfirmedRefusal(unconfirmed, ended), errLaneJoinOpenUnconfirmed) {
 		t.Fatal("a session-ended answer was blamed on the open")
 	}
 }
@@ -458,7 +481,7 @@ func TestOpenLaneLostDuringDialIsRescuedByJoin(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		_, pending := server.lookupLiveOrPending(sessionID)
+		pending := pendingFor(server, sessionID)
 		if pending != nil {
 			break
 		}
@@ -482,7 +505,7 @@ func TestOpenLaneLostDuringDialIsRescuedByJoin(t *testing.T) {
 		joined <- err
 	}()
 	for waitDeadline := time.Now().Add(5 * time.Second); ; {
-		if _, pending := server.lookupLiveOrPending(sessionID); pending != nil && pending.waiters.Load() > 0 {
+		if pending := pendingFor(server, sessionID); pending != nil && pending.waiters.Load() > 0 {
 			break
 		}
 		if time.Now().After(waitDeadline) {
@@ -554,17 +577,17 @@ func TestOpenRefusalsKeepTheirMeaning(t *testing.T) {
 		fmt.Errorf("%w: invalid control lane replacement", errLaneJoinRejected),
 		errLaneJoinRejected,
 	} {
-		if errors.Is(classifyUnadmittedRefusal(flow, other), errLaneJoinOpenUnadmitted) {
+		if errors.Is(classifyUnconfirmedRefusal(flow, other), errLaneJoinOpenUnconfirmed) {
 			t.Fatalf("%v was blamed on the open", other)
 		}
 	}
-	if !errors.Is(classifyUnadmittedRefusal(flow, fmt.Errorf("%w: unknown session", errLaneJoinRejected)), errLaneJoinOpenUnadmitted) {
+	if !errors.Is(classifyUnconfirmedRefusal(flow, fmt.Errorf("%w: unknown session", errLaneJoinRejected)), errLaneJoinOpenUnconfirmed) {
 		t.Fatal("unknown session before OPEN_OK was not classified")
 	}
 	// A refusal that does not say the session is absent is never blamed on
 	// a sleep.
 	asleep := newIsolationTestFlow(t, false)
-	asleep.peerClockOffset.Store(asleep.clockOffset(time.Now()) - int64(10*time.Minute))
+	sleepFlow(asleep)(10 * time.Minute)
 	asleep.resumeRefused.Store(true)
 	asleep.noteRefusalCause(errLaneJoinTCPMode)
 	if err := asleep.resumeRefusal(); errors.Is(err, errSessionExpiredWhileSuspended) {
@@ -605,5 +628,34 @@ func TestCompleteLaneJoinMapsSessionPendingApartFromCapacity(t *testing.T) {
 	_, err := client.completeLaneJoin(context.Background(), lane, 3, 0)
 	if !errors.Is(err, errLaneJoinPending) || errors.Is(err, errLaneJoinCapacity) || errors.Is(err, errLaneJoinRejected) {
 		t.Fatalf("session pending = %v", err)
+	}
+}
+
+// A JOIN that found the pending OPEN is its waiter from that moment, and the
+// OPEN's keep-or-close decision sees it; one that has given up is not.
+func TestPendingWaitersAreCountedFromLookupUntilTheWaitEnds(t *testing.T) {
+	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "owner"}
+	saved := pendingJoinWait
+	pendingJoinWait = 20 * time.Millisecond
+	t.Cleanup(func() { pendingJoinWait = saved })
+	server, _ := pendingTestServer()
+	sessionID := [16]byte{4}
+	pending, _ := server.beginPendingSession(sessionID, 3, owner)
+	defer server.endPendingSession(sessionID, pending)
+	if _, got := server.lookupLiveOrPending(sessionID, 4, owner); got != nil {
+		t.Fatal("a JOIN naming another flow was given the pending OPEN")
+	}
+	if server.pendingHasWaiter(pending) {
+		t.Fatal("a JOIN for another flow counts as a waiter")
+	}
+	_, got := server.lookupLiveOrPending(sessionID, 3, owner)
+	if !server.pendingHasWaiter(pending) {
+		t.Fatal("a JOIN that found the OPEN is not yet its waiter")
+	}
+	if outcome := server.awaitPendingSession(context.Background(), got); outcome != pendingStillDialling {
+		t.Fatalf("outcome = %v", outcome)
+	}
+	if server.pendingHasWaiter(pending) {
+		t.Fatal("a JOIN that gave up still counts as a waiter")
 	}
 }

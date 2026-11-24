@@ -268,11 +268,11 @@ type multipathFlow struct {
 	// does not know this session. That answer is permanent, so it ends the
 	// replacement grace rather than being retried.
 	resumeRefused atomic.Bool
-	// openUnadmitted narrows resumeRefused: the refusal came while this
+	// openUnconfirmed narrows resumeRefused: the refusal came while this
 	// flow's OPEN was still unconfirmed, so the peer never had the session
-	// to lose. The flow then fails with errOpenNotAdmitted, which a reader
+	// to lose. The flow then fails with errOpenUnconfirmed, which a reader
 	// of the logs must not count with sessions the peer dropped.
-	openUnadmitted atomic.Bool
+	openUnconfirmed atomic.Bool
 	// openFailed narrows resumeRefused the other way: the gateway held the
 	// JOIN for this flow's OPEN and saw that OPEN fail.
 	openFailed atomic.Bool
@@ -285,12 +285,13 @@ type multipathFlow struct {
 	// openConfirmedByJoin records that a JOIN's OPEN_OK confirmed the flow
 	// before the OPEN's own did (issue #159).
 	openConfirmedByJoin atomic.Bool
-	// peerClockOffset is, at the last frame from the peer, the wall clock in
-	// nanoseconds minus the monotonic time since started. The same difference
-	// taken now grows by exactly how long this host slept since then. One
-	// value, so a reader never pairs one sample's wall time with another's
-	// monotonic time.
-	peerClockOffset atomic.Int64
+	// peerSuspendTotal is the host's cumulative suspend time, as the system
+	// suspend clock read it when the peer was last heard from; -1 when that
+	// clock could not be read. Sampled at most once a second.
+	peerSuspendTotal atomic.Int64
+	peerSampledAt    atomic.Int64 // monotonic nanoseconds since started
+	// suspendClock reads the cumulative suspend time; nil reads the system's.
+	suspendClock func() (time.Duration, error)
 	// capacityRefusals counts consecutive rescue rounds the peer answered
 	// with its lane-admission ceiling. One answer is the ordinary loser of a
 	// rescue race; several in a row with no successful round between them are
@@ -530,7 +531,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 	f.idleTimeout = defaultFlowIdleTimeout
 	f.maxLifetime = defaultFlowMaxLifetime
 	f.lastActivity.Store(f.started.UnixNano())
-	f.peerClockOffset.Store(f.started.UnixNano())
+	f.samplePeerSuspend()
 	f.telemetryID = nextTelemetryID.Add(1)
 	f.class.Store(uint32(protocol.ClassNew))
 	f.ackTrack = newAckTracker()
@@ -2395,8 +2396,8 @@ func (f *multipathFlow) noteReplacementFailure(err error) {
 // what lets a log line and a completion record be counted against each other.
 func replacementFailureKind(err error) string {
 	switch {
-	case errors.Is(err, errLaneJoinOpenUnadmitted):
-		return "open_unadmitted"
+	case errors.Is(err, errLaneJoinOpenUnconfirmed):
+		return "open_unconfirmed"
 	case errors.Is(err, errLaneJoinOpenFailed):
 		return "open_failed"
 	case errors.Is(err, errLaneJoinPending):
