@@ -201,9 +201,7 @@ func (r *freezeRelay) serveTCP(listener net.Listener) {
 					if r.dead(gen) {
 						// Stop reading: the sender's window fills and the
 						// lane goes silent, as on a black-holed path.
-						select {
-						case <-r.closed:
-						}
+						<-r.closed
 						_ = dst.Close()
 						_ = src.Close()
 						return
