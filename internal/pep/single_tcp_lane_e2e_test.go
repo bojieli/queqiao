@@ -403,8 +403,12 @@ func TestSingleTCPLaneEOFWithUnreachableGatewayDialsUntilTheGraceEnds(t *testing
 	if attempts < 2 || failures < 2 {
 		t.Fatalf("flow record shows attempts=%v failures=%v, want repeated dials through the grace: %v", attempts, failures, record)
 	}
-	if int(proxy.refusedCount()) < int(failures) {
-		t.Fatalf("proxy refused %d dials but the flow counted %v failures", proxy.refusedCount(), failures)
+	// The record and the proxy saw the same dials: each one refused was a
+	// counted attempt, and each counted failure was one refused, except
+	// that the last attempt may still have been in flight when the record
+	// was written.
+	if refused := float64(proxy.refusedCount()); attempts < refused || failures > refused || failures < refused-1 {
+		t.Fatalf("proxy refused %v dials, flow counted %v attempts and %v failures", refused, attempts, failures)
 	}
 	// Still dialling well into the grace, not two early tries and then a
 	// silent wait for the deadline. The backoff caps at 15 s, so a client
