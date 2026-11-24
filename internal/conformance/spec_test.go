@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bojieli/queqiao/internal/protocol"
 )
 
 // TestTheSpecificationStatesTheLimitsThisBuildEnforces exists because two of
@@ -26,7 +28,7 @@ func TestTheSpecificationStatesTheLimitsThisBuildEnforces(t *testing.T) {
 		t.Fatalf("read the wire specification: %v", err)
 	}
 	spec := string(raw)
-	limits := limitVector()
+	limits := limitVector(protocol.Version)
 
 	for _, tc := range []struct {
 		what  string
@@ -43,6 +45,7 @@ func TestTheSpecificationStatesTheLimitsThisBuildEnforces(t *testing.T) {
 		{"probe frame limit", fmt.Sprint(limits.MaxProbeFrames)},
 		{"probe byte limit", fmt.Sprint(limits.MaxProbeBytes)},
 		{"data ALPN", limits.DataALPN},
+		{"version-1 data ALPN", protocol.ALPN(1)},
 		{"enrollment ALPN", limits.EnrollALPN},
 		{"renewal ALPN", limits.RenewALPN},
 	} {
@@ -52,8 +55,10 @@ func TestTheSpecificationStatesTheLimitsThisBuildEnforces(t *testing.T) {
 	}
 
 	// The vectors are only normative if the specification says they are.
-	if !strings.Contains(spec, "testdata/protocol2/vectors.json") {
-		t.Error("docs/PROTOCOL.md does not point at the conformance vectors")
+	for _, wire := range wires {
+		if path := fmt.Sprintf("testdata/protocol%d/vectors.json", wire); !strings.Contains(spec, path) {
+			t.Errorf("docs/PROTOCOL.md does not point at the conformance vectors %s", path)
+		}
 	}
 
 	// The configurable payload limit is gone from the build. A document that
@@ -61,7 +66,7 @@ func TestTheSpecificationStatesTheLimitsThisBuildEnforces(t *testing.T) {
 	// which is the failure mode this whole package is about.
 	for _, forbidden := range []string{"MAY configure a smaller limit", "max-payload"} {
 		if strings.Contains(spec, forbidden) {
-			t.Errorf("docs/PROTOCOL.md still describes %q, which version 2 does not have", forbidden)
+			t.Errorf("docs/PROTOCOL.md still describes %q, which neither wire version has", forbidden)
 		}
 	}
 }

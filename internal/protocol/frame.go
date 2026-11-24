@@ -11,33 +11,39 @@ import (
 const (
 	Magic0 = byte('W')
 	Magic1 = byte('O')
-	// Version is the framing this build speaks, and the only thing that stops
-	// two builds that disagree from appearing to work.
+	// Version is the wire version this build prefers. It is what a fresh
+	// connection negotiates whenever both ends support it.
 	//
-	// Version 2 adds explicit replacement JOINs. Version 1 peers must upgrade
-	// both endpoints before using this wire contract. Every connection is authenticated by
-	// provider-issued mutual TLS before a frame is accepted, and streams begin
-	// directly with OPEN or JOIN.
+	// Version 2 adds explicit replacement JOINs (FlagReplaceLane). Version 1 is
+	// the first public wire contract and is still spoken, so that gateways can
+	// be upgraded ahead of the clients they serve. The version is negotiated
+	// once per connection by ALPN, never by a frame: every connection is
+	// authenticated by provider-issued mutual TLS before a frame is accepted,
+	// and streams begin directly with OPEN or JOIN.
 	Version    = byte(2)
 	HeaderSize = 46
-	// DataALPN is the application protocol negotiated for the data plane. It
-	// carries the wire version because that is what makes the versioning
+	// MinVersion is the oldest wire version this build still speaks.
+	MinVersion = byte(1)
+	// DataALPN is the application protocol of the preferred version. ALPN
+	// carries the wire version because that is what keeps the versioning
 	// fail-closed: there is no capability exchange to discover a disagreement
-	// after the fact, so two builds that speak different framing must fail to
-	// negotiate rather than connect and then misunderstand each other.
+	// after the fact, so two builds that share no version must fail to
+	// negotiate rather than connect and then misunderstand each other. A build
+	// that speaks several versions offers one ALPN per version, and the
+	// negotiated one fixes the framing of every frame on that connection.
 	DataALPN = "queqiao/2"
-	// MaxPayload is the frame payload limit for protocol 2. It is a constant
+	// MaxPayload is the frame payload limit for protocols 1 and 2. It is a constant
 	// of the wire, not a deployment setting: a receiver MUST accept a payload
 	// this large and MUST reject a larger one, in both directions.
 	//
 	// A configurable receive limit was the alternative, and it does not work
-	// without negotiation. Version 2 has no capability exchange, so two peers
+	// without negotiation. The wire has no capability exchange, so two peers
 	// configured differently are mutually unintelligible in exactly one
 	// direction, and the symptom -- a frame the sender considers legal being
 	// refused as malformed -- names neither the setting nor the peer that
 	// holds it.
 	//
-	// The value is derived rather than round. The largest frame version 2 can
+	// The value is derived rather than round. The largest frame either version can
 	// require is a PACKET carrying a maximum UDP datagram to a maximum-length
 	// destination: 2 + 255 + 65507 = 65764 bytes. Everything else is smaller
 	// by construction (a destination OPEN is at most 255, an ACK at most 256,
@@ -77,6 +83,10 @@ const (
 	// encoded after the new lane ID in its payload. The peer can retire the
 	// old lane before applying the admission ceiling, so a stalled lane does
 	// not have to remain half-open until the transport idle timeout.
+	//
+	// It exists only from wire version 2. On version 1 bit 6 is reserved, so a
+	// version-1 receiver refuses it as an unknown flag and a sender never
+	// encodes it there.
 	FlagReplaceLane uint16 = 1 << 6
 	// FlagAckRanges is valid only on ACK. The payload carries byte ranges the
 	// receiver already holds out of order, beyond the cumulative sequence.
@@ -86,8 +96,41 @@ const (
 	// its retention window has to cover the whole reorder span. Protocol v1
 	// requires both peers to understand it.
 	FlagAckRanges uint16 = 1 << 7
-	knownFlags           = FlagFin | FlagAckFinal | FlagAckUp | FlagAckDown | FlagCloseAbort | FlagReserveControl | FlagReplaceLane | FlagAckRanges
+	knownFlagsV1         = FlagFin | FlagAckFinal | FlagAckUp | FlagAckDown | FlagCloseAbort | FlagReserveControl | FlagAckRanges
+	knownFlags           = knownFlagsV1 | FlagReplaceLane
 )
+
+// SupportedVersions lists every wire version this build speaks, most
+// preferred first. It is the order a gateway negotiates in.
+func SupportedVersions() []byte { return []byte{2, 1} }
+
+// Supported reports whether this build speaks wire version v.
+func Supported(v byte) bool { return v >= MinVersion && v <= Version }
+
+// ALPN is the data-plane application protocol that negotiates wire version v.
+func ALPN(v byte) string { return fmt.Sprintf("queqiao/%d", v) }
+
+// VersionForALPN maps a negotiated data-plane ALPN back to its wire version.
+// It reports false for anything this build does not speak, including the
+// enrollment and renewal protocols.
+func VersionForALPN(alpn string) (byte, bool) {
+	for _, v := range SupportedVersions() {
+		if alpn == ALPN(v) {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+// HasReplaceLane reports whether wire version v carries FlagReplaceLane.
+func HasReplaceLane(v byte) bool { return v >= 2 }
+
+func knownFlagsFor(v byte) uint16 {
+	if HasReplaceLane(v) {
+		return knownFlags
+	}
+	return knownFlagsV1
+}
 
 type Type byte
 
@@ -139,17 +182,17 @@ type Frame struct {
 	Payload []byte
 }
 
-// UnsupportedVersionError identifies a peer that speaks a different wire
-// protocol. Keep this distinct from malformed headers: operators need to know
-// that a coordinated client/server upgrade is required, rather than chase a
-// network or credential failure.
+// UnsupportedVersionError identifies a frame whose version byte is not the
+// version this connection negotiated. Keep this distinct from malformed
+// headers: operators need to know the two ends disagree about the wire,
+// rather than chase a network or credential failure.
 type UnsupportedVersionError struct {
 	Peer  byte
 	Local byte
 }
 
 func (e UnsupportedVersionError) Error() string {
-	return fmt.Sprintf("unsupported wire version %d (this build speaks %d)", e.Peer, e.Local)
+	return fmt.Sprintf("unsupported wire version %d (this connection speaks %d)", e.Peer, e.Local)
 }
 
 func reserveControlFlagValid(t Type, flags uint16) bool {
@@ -219,7 +262,7 @@ func (h Header) Encode(dst []byte) error {
 	if len(dst) < HeaderSize {
 		return io.ErrShortBuffer
 	}
-	if h.Version != Version || !h.Type.valid() || h.Class > ClassBulk || h.Flags&^knownFlags != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !replaceLaneFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
+	if !Supported(h.Version) || !h.Type.valid() || h.Class > ClassBulk || h.Flags&^knownFlagsFor(h.Version) != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !replaceLaneFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
 		return errors.New("invalid frame header")
 	}
 	if h.PayloadLen > MaxPayload {
@@ -236,14 +279,14 @@ func (h Header) Encode(dst []byte) error {
 	return nil
 }
 
-// Validate checks a decoded header against the version-1 rules. Keeping this
-// separate from Encode makes it possible for callers to validate a decoded
-// frame before handing it to a flow state machine.
+// Validate checks a decoded header against the rules of the version it
+// carries. Keeping this separate from Encode makes it possible for callers to
+// validate a decoded frame before handing it to a flow state machine.
 func (h Header) Validate() error {
-	if h.Version != Version || !h.Type.valid() || h.Class > ClassBulk {
+	if !Supported(h.Version) || !h.Type.valid() || h.Class > ClassBulk {
 		return errors.New("invalid frame header")
 	}
-	if h.Flags&^knownFlags != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !replaceLaneFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
+	if h.Flags&^knownFlagsFor(h.Version) != 0 || !reserveControlFlagValid(h.Type, h.Flags) || !replaceLaneFlagValid(h.Type, h.Flags) || !ackRangesFlagValid(h.Type, h.Flags) {
 		return errors.New("unknown frame flags")
 	}
 	if h.PayloadLen > MaxPayload {
@@ -252,15 +295,25 @@ func (h Header) Validate() error {
 	return nil
 }
 
-func DecodeHeader(src []byte) (Header, error) {
+// DecodeHeader decodes a header of the preferred wire version.
+func DecodeHeader(src []byte) (Header, error) { return DecodeHeaderVersion(src, Version) }
+
+// DecodeHeaderVersion decodes a header on a connection that negotiated wire
+// version wire. A header carrying any other version byte is refused, even one
+// this build could speak on another connection: the version is fixed per
+// connection at the handshake, and a frame that disagrees is a peer that does.
+func DecodeHeaderVersion(src []byte, wire byte) (Header, error) {
 	if len(src) < HeaderSize {
 		return Header{}, io.ErrUnexpectedEOF
 	}
 	if src[0] != Magic0 || src[1] != Magic1 {
 		return Header{}, errors.New("invalid frame magic")
 	}
-	if src[2] != Version {
-		return Header{}, UnsupportedVersionError{Peer: src[2], Local: Version}
+	if !Supported(wire) {
+		return Header{}, UnsupportedVersionError{Peer: src[2], Local: wire}
+	}
+	if src[2] != wire {
+		return Header{}, UnsupportedVersionError{Peer: src[2], Local: wire}
 	}
 	h := Header{
 		Version: src[2], Type: Type(src[3]), Flags: binary.BigEndian.Uint16(src[4:6]),
@@ -277,12 +330,16 @@ func DecodeHeader(src []byte) (Header, error) {
 	return h, nil
 }
 
-func ReadFrame(r io.Reader) (Frame, error) {
+// ReadFrame reads one frame of the preferred wire version.
+func ReadFrame(r io.Reader) (Frame, error) { return ReadFrameVersion(r, Version) }
+
+// ReadFrameVersion reads one frame on a connection that negotiated wire.
+func ReadFrameVersion(r io.Reader, wire byte) (Frame, error) {
 	var raw [HeaderSize]byte
 	if _, err := io.ReadFull(r, raw[:]); err != nil {
 		return Frame{}, err
 	}
-	h, err := DecodeHeader(raw[:])
+	h, err := DecodeHeaderVersion(raw[:], wire)
 	if err != nil {
 		return Frame{}, err
 	}
@@ -307,11 +364,14 @@ func ReadFrame(r io.Reader) (Frame, error) {
 //
 // It is an error for the slice to hold anything after the frame: the caller
 // framed it, so a trailing byte means the framing disagrees with the parse.
-func ParseFrame(b []byte) (Frame, error) {
+func ParseFrame(b []byte) (Frame, error) { return ParseFrameVersion(b, Version) }
+
+// ParseFrameVersion is ParseFrame on a connection that negotiated wire.
+func ParseFrameVersion(b []byte, wire byte) (Frame, error) {
 	if len(b) < HeaderSize {
 		return Frame{}, io.ErrUnexpectedEOF
 	}
-	h, err := DecodeHeader(b[:HeaderSize])
+	h, err := DecodeHeaderVersion(b[:HeaderSize], wire)
 	if err != nil {
 		return Frame{}, err
 	}

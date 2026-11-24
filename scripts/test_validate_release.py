@@ -45,7 +45,8 @@ class ValidateReleaseTests(unittest.TestCase):
             "build_date": "2026-08-19T04:00:00Z",
             "target": "linux/amd64",
             "go": "go1.25.13",
-            "wire_protocol": "1",
+            "wire_protocol": "2",
+            "wire_accept": "1,2",
             "binary_sha256": "b" * 64,
         }
 
@@ -53,8 +54,8 @@ class ValidateReleaseTests(unittest.TestCase):
             return "".join(f"{key}={value}\n" for key, value in values.items()).encode()
 
         self.assertEqual(MODULE.parse_buildinfo(encoded(fields)), fields)
-        upgraded = dict(fields, wire_protocol="2")
-        self.assertEqual(MODULE.parse_buildinfo(encoded(upgraded)), upgraded)
+        single = dict(fields, wire_protocol="1", wire_accept="1")
+        self.assertEqual(MODULE.parse_buildinfo(encoded(single)), single)
         for key, invalid in (
             ("version", "../v0.1.0"),
             ("commit", "a" * 39),
@@ -66,6 +67,14 @@ class ValidateReleaseTests(unittest.TestCase):
             ("wire_protocol", "0"),
             ("wire_protocol", "256"),
             ("wire_protocol", "01"),
+            ("wire_protocol", "1"),
+            ("wire_accept", "2,1"),
+            ("wire_accept", "1,1,2"),
+            ("wire_accept", "1,"),
+            ("wire_accept", "0,2"),
+            ("wire_accept", "1 2"),
+            ("wire_accept", "1,256"),
+            ("wire_accept", "1"),
             ("binary_sha256", "b" * 63),
         ):
             changed = dict(fields)
@@ -81,7 +90,8 @@ class ValidateReleaseTests(unittest.TestCase):
                 "build_date": "2026-08-19T04:00:00Z",
                 "target": target,
                 "go": "go1.25.13",
-                "wire_protocol": "1",
+                "wire_protocol": "2",
+                "wire_accept": "1,2",
             }
             for target in sorted(MODULE.EXPECTED_TARGETS)
         ]
@@ -102,6 +112,11 @@ class ValidateReleaseTests(unittest.TestCase):
         mixed[-1]["commit"] = "b" * 40
         with self.assertRaisesRegex(ValueError, "provenance identity"):
             MODULE.validate_release_cohort(mixed)
+
+        narrower = [dict(item) for item in buildinfos]
+        narrower[-1]["wire_accept"] = "2"
+        with self.assertRaisesRegex(ValueError, "provenance identity"):
+            MODULE.validate_release_cohort(narrower)
 
         with self.assertRaisesRegex(ValueError, "canonical release subset"):
             MODULE.validate_release_cohort(linux, {"plan9/amd64"})

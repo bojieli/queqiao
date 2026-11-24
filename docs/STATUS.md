@@ -3,8 +3,8 @@
 > [!IMPORTANT]
 > **Release level:** Public-preview source tree; no production-ready claim
 >
-> **Wire protocol:** Version 2 in v0.13.0. Upgrade both endpoints together when migrating from wire 1.
-> **Last reviewed:** 2026-11-23
+> **Wire protocol:** Version 2 only in v0.13.0. The source tree negotiates versions 1 and 2 per connection, so gateways upgrade first and v0.12.x clients keep working.
+> **Last reviewed:** 2026-11-24
 
 Queqiao is ready to use for its supported paired-gateway topology, from the
 binaries published with every release or from source. It is not a universal acceleration layer and it does not promise the

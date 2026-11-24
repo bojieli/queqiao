@@ -138,7 +138,7 @@ func TestQUICConnectionSurvivesATransientLocalRouteOutage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientTLS, err := tlsClientConfig(clientCredentials)
+	clientTLS, err := tlsClientConfig(clientCredentials, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestQUICConnectionClosesWhenItsBoundSourceDisappears(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientTLS, err := tlsClientConfig(clientCredentials)
+	clientTLS, err := tlsClientConfig(clientCredentials, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,13 +425,13 @@ func TestALPNFailureExplainsEndpointOrVersionMismatch(t *testing.T) {
 	if defaultALPN != "queqiao/2" {
 		t.Fatalf("data ALPN = %q, want replacement JOIN protocol ALPN", defaultALPN)
 	}
-	err := explainDataHandshakeError("gateway.example:443", "TCP", errors.New("remote error: tls: no application protocol"))
+	err := explainDataHandshakeError("gateway.example:443", "TCP", []byte{2, 1}, errors.New("remote error: tls: no application protocol"))
 	message := err.Error()
 	if !strings.Contains(message, "protocol 2") || !strings.Contains(message, "gateway.example:443") || !strings.Contains(message, "incompatible") {
 		t.Fatalf("unhelpful ALPN error: %v", err)
 	}
 	original := errors.New("connection refused")
-	if got := explainDataHandshakeError("gateway.example:443", "TCP", original); got != original {
+	if got := explainDataHandshakeError("gateway.example:443", "TCP", nil, original); got != original {
 		t.Fatalf("non-ALPN error was replaced: %v", got)
 	}
 }

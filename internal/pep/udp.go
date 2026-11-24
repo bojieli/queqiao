@@ -837,6 +837,8 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	var window packetWindow
 	var replySequence uint64
 	s.metrics.FlowStarted()
+	s.metrics.WireFlowStarted(fc.wire)
+	defer s.metrics.WireFlowFinished(fc.wire)
 	idleTimer := time.NewTimer(s.cfg.FlowIdleTimeout)
 	lifetimeTimer := time.NewTimer(s.cfg.FlowMaxLifetime)
 	authorizationTicker := time.NewTicker(time.Second)
@@ -977,7 +979,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	}
 done:
 	if endErr != nil && failed {
-		s.cfg.Logger.Debug("UDP association ended", "error", endErr)
+		s.cfg.Logger.Debug("UDP association ended", "error", endErr, "wire", fc.wire)
 	}
 	s.metrics.FlowFinished(counters.up.Load(), counters.down.Load(), failed)
 	_ = conn.Close()

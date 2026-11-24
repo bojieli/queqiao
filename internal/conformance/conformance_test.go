@@ -3,6 +3,7 @@ package conformance
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,6 +12,18 @@ import (
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
 )
+
+// wires are the versions whose frozen vectors this build replays. Version 1
+// is not history: this build still speaks it to peers that negotiate it, so
+// its vectors are held to the same byte-for-byte standard as the current one.
+var wires = []byte{1, 2}
+
+func forEachWire(t *testing.T, test func(*testing.T, byte)) {
+	t.Helper()
+	for _, wire := range wires {
+		t.Run(fmt.Sprintf("protocol%d", wire), func(t *testing.T) { test(t, wire) })
+	}
+}
 
 func decodeHex(t *testing.T, name, s string) []byte {
 	t.Helper()
@@ -26,10 +39,12 @@ func decodeHex(t *testing.T, name, s string) []byte {
 // one reads the numbers those bytes were derived from, so a limit that moved
 // without the vectors moving fails here rather than as a confusing byte
 // mismatch three sections down.
-func TestLimitsMatchTheVectors(t *testing.T) {
-	got, want := limitVector(), loadVectors(t).Limits
+func TestLimitsMatchTheVectors(t *testing.T) { forEachWire(t, testLimitsMatchTheVectors) }
+
+func testLimitsMatchTheVectors(t *testing.T, wire byte) {
+	got, want := limitVector(wire), loadVectors(t, wire).Limits
 	if got != want {
-		t.Fatalf("protocol 2 limits changed.\n build: %+v\nvector: %+v", got, want)
+		t.Fatalf("protocol limits changed.\n build: %+v\nvector: %+v", got, want)
 	}
 	// The relationship that motivates the payload limit, stated rather than
 	// assumed: a receiver that cannot hold the largest legal PACKET cannot
@@ -49,20 +64,22 @@ func TestLimitsMatchTheVectors(t *testing.T) {
 	}
 }
 
-func TestFrameHeaderVectors(t *testing.T) {
-	vectors := loadVectors(t)
-	if vectors.Protocol != int(protocol.Version) {
-		t.Fatalf("vectors describe protocol %d, this build speaks %d", vectors.Protocol, protocol.Version)
+func TestFrameHeaderVectors(t *testing.T) { forEachWire(t, testFrameHeaderVectors) }
+
+func testFrameHeaderVectors(t *testing.T, wire byte) {
+	vectors := loadVectors(t, wire)
+	if vectors.Protocol != int(wire) || !protocol.Supported(wire) {
+		t.Fatalf("vectors describe protocol %d, replayed as %d", vectors.Protocol, wire)
 	}
 	for _, v := range vectors.FrameHeaders.Accept {
 		t.Run("accept/"+v.Name, func(t *testing.T) {
 			raw := decodeHex(t, v.Name, v.Hex)
 			if len(raw) != protocol.HeaderSize {
-				t.Fatalf("header is %d bytes, protocol 2 headers are %d", len(raw), protocol.HeaderSize)
+				t.Fatalf("header is %d bytes, this protocol headers are %d", len(raw), protocol.HeaderSize)
 			}
-			h, err := protocol.DecodeHeader(raw)
+			h, err := protocol.DecodeHeaderVersion(raw, wire)
 			if err != nil {
-				t.Fatalf("a header protocol 2 requires was refused: %v", err)
+				t.Fatalf("a header this protocol requires was refused: %v", err)
 			}
 			if int(h.Type) != v.Type || int(h.Flags) != v.Flags || h.FlowID != v.FlowID ||
 				h.Sequence != v.Sequence || h.PayloadLen != v.PayloadLen || int(h.Class) != v.Class {
@@ -85,21 +102,23 @@ func TestFrameHeaderVectors(t *testing.T) {
 	}
 	for _, v := range vectors.FrameHeaders.Reject {
 		t.Run("reject/"+v.Name, func(t *testing.T) {
-			if _, err := protocol.DecodeHeader(decodeHex(t, v.Name, v.Hex)); err == nil {
-				t.Fatalf("accepted a header protocol 2 forbids (%s)", v.Why)
+			if _, err := protocol.DecodeHeaderVersion(decodeHex(t, v.Name, v.Hex), wire); err == nil {
+				t.Fatalf("accepted a header this protocol forbids (%s)", v.Why)
 			}
 		})
 	}
 }
 
-func TestAckRangeVectors(t *testing.T) {
-	for _, v := range loadVectors(t).AckRanges {
+func TestAckRangeVectors(t *testing.T) { forEachWire(t, testAckRangeVectors) }
+
+func testAckRangeVectors(t *testing.T, wire byte) {
+	for _, v := range loadVectors(t, wire).AckRanges {
 		t.Run(v.Name, func(t *testing.T) {
 			payload := decodeHex(t, v.Name, v.Hex)
 			got, err := protocol.DecodeAckRanges(payload, v.Cumulative)
 			if v.Reject {
 				if err == nil {
-					t.Fatalf("accepted an acknowledgement protocol 2 forbids (%s)", v.Why)
+					t.Fatalf("accepted an acknowledgement this protocol forbids (%s)", v.Why)
 				}
 				return
 			}
@@ -128,13 +147,15 @@ func TestAckRangeVectors(t *testing.T) {
 	}
 }
 
-func TestDestinationVectors(t *testing.T) {
-	for _, v := range loadVectors(t).Destinations {
+func TestDestinationVectors(t *testing.T) { forEachWire(t, testDestinationVectors) }
+
+func testDestinationVectors(t *testing.T, wire byte) {
+	for _, v := range loadVectors(t, wire).Destinations {
 		t.Run(v.Name, func(t *testing.T) {
 			encoded, err := session.EncodeDestination(v.Input)
 			if v.Reject {
 				if err == nil {
-					t.Fatalf("accepted a destination protocol 2 forbids (%s)", v.Why)
+					t.Fatalf("accepted a destination this protocol forbids (%s)", v.Why)
 				}
 				return
 			}
@@ -161,8 +182,10 @@ func TestDestinationVectors(t *testing.T) {
 	}
 }
 
-func TestUDPVectors(t *testing.T) {
-	v := loadVectors(t).UDP
+func TestUDPVectors(t *testing.T) { forEachWire(t, testUDPVectors) }
+
+func testUDPVectors(t *testing.T, wire byte) {
+	v := loadVectors(t, wire).UDP
 
 	if got := hex.EncodeToString(session.UDPAssociationMarker); got != v.AssociationMarkerHex {
 		t.Fatalf("association marker %s, vector is %s", got, v.AssociationMarkerHex)
@@ -174,7 +197,7 @@ func TestUDPVectors(t *testing.T) {
 			token, ok := session.DecodeUDPResumeOpen(payload)
 			if o.Reject {
 				if ok {
-					t.Fatalf("accepted a resume open protocol 2 forbids (%s)", o.Why)
+					t.Fatalf("accepted a resume open this protocol forbids (%s)", o.Why)
 				}
 				return
 			}
@@ -193,7 +216,7 @@ func TestUDPVectors(t *testing.T) {
 			_, token, ok := session.DecodeUDPResumeGrant(payload)
 			if g.Reject {
 				if ok {
-					t.Fatalf("accepted a resume grant protocol 2 forbids (%s)", g.Why)
+					t.Fatalf("accepted a resume grant this protocol forbids (%s)", g.Why)
 				}
 				return
 			}
@@ -230,14 +253,16 @@ func TestUDPVectors(t *testing.T) {
 	for _, r := range v.RejectPackets {
 		t.Run("reject-packet/"+r.Name, func(t *testing.T) {
 			if _, _, err := session.DecodeUDPPacket(decodeHex(t, r.Name, r.Hex)); err == nil {
-				t.Fatalf("accepted a packet protocol 2 forbids (%s)", r.Why)
+				t.Fatalf("accepted a packet this protocol forbids (%s)", r.Why)
 			}
 		})
 	}
 }
 
-func TestResetVectors(t *testing.T) {
-	for _, v := range loadVectors(t).ResetPayloads {
+func TestResetVectors(t *testing.T) { forEachWire(t, testResetVectors) }
+
+func testResetVectors(t *testing.T, wire byte) {
+	for _, v := range loadVectors(t, wire).ResetPayloads {
 		t.Run(v.Name, func(t *testing.T) {
 			want := decodeHex(t, v.Name, v.Hex)
 			got := session.ResetPayload(session.ResetCode(v.Code), v.Message)
@@ -258,8 +283,10 @@ func TestResetVectors(t *testing.T) {
 // on both ends and never sent, so an implementation that computes it
 // differently is not detectably wrong on the wire: its repairs arrive intact
 // and simply fail to solve, which is what a lossy path looks like.
-func TestCoefficientVectors(t *testing.T) {
-	for _, v := range loadVectors(t).FECCoefficients {
+func TestCoefficientVectors(t *testing.T) { forEachWire(t, testCoefficientVectors) }
+
+func testCoefficientVectors(t *testing.T, wire byte) {
+	for _, v := range loadVectors(t, wire).FECCoefficients {
 		t.Run(v.Name(), func(t *testing.T) {
 			want := decodeHex(t, v.Name(), v.CoefficientsHex)
 			got := fec.WindowCoefficients(v.RID, v.Count)
@@ -279,8 +306,10 @@ func TestCoefficientVectors(t *testing.T) {
 // erasing a symbol and requiring the repair to bring it back. The second half
 // is what catches a field arithmetic error that the coefficient row alone
 // would not.
-func TestRepairVectors(t *testing.T) {
-	for _, v := range loadVectors(t).FECRepairs {
+func TestRepairVectors(t *testing.T) { forEachWire(t, testRepairVectors) }
+
+func testRepairVectors(t *testing.T, wire byte) {
+	for _, v := range loadVectors(t, wire).FECRepairs {
 		t.Run(v.Name, func(t *testing.T) {
 			symbols := make([][]byte, 0, len(v.SymbolsHex))
 			for _, s := range v.SymbolsHex {
@@ -350,8 +379,10 @@ func indexOfESI(t *testing.T, esis []uint32, esi uint32) int {
 	return -1
 }
 
-func TestInvitationVector(t *testing.T) {
-	v := loadVectors(t).Invitation
+func TestInvitationVector(t *testing.T) { forEachWire(t, testInvitationVector) }
+
+func testInvitationVector(t *testing.T, wire byte) {
+	v := loadVectors(t, wire).Invitation
 	at, err := time.Parse(time.RFC3339, v.ParsedAt)
 	if err != nil {
 		t.Fatalf("vector has an unparseable validation instant: %v", err)
