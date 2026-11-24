@@ -154,6 +154,7 @@ class LaneReplacementSplitTests(unittest.TestCase):
         split.add_client({"time": "2026-11-20T23:59:59Z", "msg": "lane recovery unavailable", "flow_id": 1})
         split.add_client({"msg": "no time field"})
         split.add_client({"time": "garbage", "msg": "unparseable time"})
+        split.add_client({"time": "0001-01-01T00:00:00+01:00", "msg": "before year 1 in UTC"})
         # A gateway record in client input is set aside, window included.
         split.add_client({"time": "2026-11-21T06:00:00Z", "msg": "lane join refused", "role": "server"})
         split.add_client(dict(CLIENT[0], time="2026-11-21T07:00:00Z", role="server"))

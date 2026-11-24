@@ -1973,13 +1973,19 @@ func (c *Client) completeLaneJoin(ctx context.Context, lane *authenticatedLane, 
 		Version: protocol.Version, Type: protocol.TypeJoin, Flags: flags,
 		SessionID: lane.sessionID, FlowID: flowID, Class: protocol.ClassBulk,
 	}, Payload: payload}); err != nil {
+		// Classify before closing: a cancellation that lands while the
+		// lane closes must not turn a live handshake timeout into one.
+		err = laneJoinIOError(ctx, err)
 		_ = lane.fc.Close()
-		return nil, laneJoinIOError(ctx, err)
+		return nil, err
 	}
 	response, err := lane.fc.Read()
 	if err != nil {
+		// Classify before closing: a cancellation that lands while the
+		// lane closes must not turn a live handshake timeout into one.
+		err = laneJoinIOError(ctx, err)
 		_ = lane.fc.Close()
-		return nil, laneJoinIOError(ctx, err)
+		return nil, err
 	}
 	if response.Header.Type == protocol.TypeReset && response.Header.SessionID == lane.sessionID && response.Header.FlowID == flowID {
 		_ = lane.fc.Close()

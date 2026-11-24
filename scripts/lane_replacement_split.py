@@ -64,9 +64,10 @@ def parse_instant(value: Any) -> datetime.datetime | None:
     zone = "+00:00" if zone.upper() == "Z" else zone
     try:
         instant = datetime.datetime.fromisoformat(f"{base}.{micros}{zone}")
-    except ValueError:
+        # An offset can carry the instant outside datetime's range in UTC.
+        return instant.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    return instant.astimezone(datetime.timezone.utc)
 
 
 LAST_LANE = re.compile(r"last lane failed \((.*)\): ")
