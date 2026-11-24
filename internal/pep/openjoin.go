@@ -118,7 +118,7 @@ func (f *multipathFlow) resumeRefusal() error {
 	if f.openUnadmitted.Load() {
 		return errOpenNotAdmitted
 	}
-	if f.suspendedFor() >= suspendedSessionHold {
+	if f.sessionAbsent.Load() && f.suspendedFor() >= suspendedSessionHold {
 		return errSessionExpiredWhileSuspended
 	}
 	return errResumeRefused
@@ -127,7 +127,11 @@ func (f *multipathFlow) resumeRefusal() error {
 // confirmOpenByJoin treats an admitted JOIN as the flow's open confirmation.
 // The JOIN's OPEN_OK proves the session exists, and the OPEN's own may never
 // come: the stream that would carry it can be the one that died.
+//
+// Every admitted JOIN calls it, confirmed open or not: the JOIN's answer is
+// also the peer heard from, which is what a later sleep is measured against.
 func (f *multipathFlow) confirmOpenByJoin() {
+	f.notePeerHeard()
 	f.openConfirmMu.Lock()
 	defer f.openConfirmMu.Unlock()
 	if f.openConfirmationRequired.CompareAndSwap(true, false) {
@@ -138,6 +142,9 @@ func (f *multipathFlow) confirmOpenByJoin() {
 // noteRefusalCause records what a terminal JOIN refusal said about the
 // flow's OPEN, for the error the flow then fails with.
 func (f *multipathFlow) noteRefusalCause(err error) {
+	if strings.Contains(err.Error(), "unknown session") {
+		f.sessionAbsent.Store(true)
+	}
 	switch {
 	case errors.Is(err, errLaneJoinOpenFailed):
 		f.openFailed.Store(true)

@@ -885,10 +885,16 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	}()
 	if err := fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeOpenOK, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}}); err != nil {
 		// The stream that carried OPEN died while the destination was being
-		// dialled, which is the moment a client sends a replacement JOIN.
-		// That is a lost lane, not a failed flow: the flow runs and waits
-		// for the replacement like for any other lane, and the JOIN's own
-		// OPEN_OK tells the client the session exists.
+		// dialled. With a replacement JOIN already waiting, that is a lost
+		// lane, not a failed flow: the flow runs and the JOIN, whose own
+		// OPEN_OK tells the client the session exists, replaces the lane.
+		// With none waiting it is more likely a transport candidate the
+		// client raced and abandoned, which no JOIN will ever name, so the
+		// flow is closed rather than held for a replacement grace.
+		if pending.waiters.Load() == 0 {
+			flow.closeAll()
+			return
+		}
 		flow.failLane(openLane, fmt.Errorf("lane %d: write flow open acknowledgement: %w", laneID, err))
 	}
 	// JOINs waiting on this OPEN are released only now: earlier, one could
@@ -1087,7 +1093,12 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		// replacement grace discovering this answer and then fail the flow.
 		// The refusals below are kept apart because they send the operator
 		// to different places.
-		if s.ended.heldBy(sessionID, open.Header.FlowID, principal, time.Now()) {
+		if held, openFailed := s.ended.heldBy(sessionID, open.Header.FlowID, principal, time.Now()); held && openFailed {
+			// The OPEN failed before this JOIN arrived; say so, as a JOIN
+			// that had waited on it would have been told.
+			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinOpenFailed, session.ResetDestination, "pending open failed")
+			return
+		} else if held {
 			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinSessionEnded, session.ResetProtocol, "unknown session: "+sessionEndedAnswer)
 			return
 		}
@@ -1468,7 +1479,7 @@ func (s *Server) endPendingSession(id [16]byte, pending *pendingSession) {
 	if !pending.admitted {
 		// An OPEN that failed is a session this gateway did hold, however
 		// briefly: it must not later be answered as never seen.
-		s.ended.add(id, pending.flowID, pending.principal, time.Now())
+		s.ended.addFailedOpen(id, pending.flowID, pending.principal, time.Now())
 	}
 	s.sessionsMu.Unlock()
 	close(pending.done)

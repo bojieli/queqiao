@@ -276,6 +276,9 @@ type multipathFlow struct {
 	// openFailed narrows resumeRefused the other way: the gateway held the
 	// JOIN for this flow's OPEN and saw that OPEN fail.
 	openFailed atomic.Bool
+	// sessionAbsent records that the terminal refusal said the session is
+	// not there, which is the only refusal a long sleep can explain.
+	sessionAbsent atomic.Bool
 	// openConfirmMu makes the OPEN's own OPEN_OK and a JOIN's confirmation
 	// one transition, so only the loser of the two may be accepted late.
 	openConfirmMu sync.Mutex

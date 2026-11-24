@@ -116,8 +116,13 @@ func TestJoinOnFailedOpenGetsDestinationRefusal(t *testing.T) {
 	if !ok || frame.Header.Type != protocol.TypeReset || resetCode(frame.Payload) != session.ResetDestination {
 		t.Fatalf("failed open answered %+v %q, want the destination RESET", frame.Header, frame.Payload)
 	}
-	if got := registry.Snapshot().LaneJoinRefusals[metrics.LaneJoinOpenFailed]; got != 1 {
-		t.Fatalf("open_failed = %d, want 1", got)
+	// A JOIN arriving after the failure is told the same, not "ended".
+	late, ok := <-joinPendingSession(server, owner, sessionID, 3)
+	if !ok || resetCode(late.Payload) != session.ResetDestination {
+		t.Fatalf("late JOIN for a failed open answered %q", late.Payload)
+	}
+	if got := registry.Snapshot().LaneJoinRefusals[metrics.LaneJoinOpenFailed]; got != 2 {
+		t.Fatalf("open_failed = %d, want 2", got)
 	}
 }
 
@@ -219,6 +224,7 @@ func TestCompleteLaneJoinMapsDestinationResetToOpenFailed(t *testing.T) {
 func TestRefusalAfterLongSuspendIsReportedAsExpiry(t *testing.T) {
 	flow := newIsolationTestFlow(t, false)
 	flow.resumeRefused.Store(true)
+	flow.noteRefusalCause(fmt.Errorf("%w: unknown session", errLaneJoinRejected))
 	if got := flow.suspendedFor(); got >= time.Second {
 		t.Fatalf("a flow that never slept reports %v suspended", got)
 	}
@@ -475,7 +481,15 @@ func TestOpenLaneLostDuringDialIsRescuedByJoin(t *testing.T) {
 		}
 		joined <- err
 	}()
-	time.Sleep(200 * time.Millisecond)
+	for waitDeadline := time.Now().Add(5 * time.Second); ; {
+		if _, pending := server.lookupLiveOrPending(sessionID); pending != nil && pending.waiters.Load() > 0 {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			t.Fatal("the JOIN never waited on the pending OPEN")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	close(release)
 	select {
 	case err := <-joined:
@@ -546,6 +560,20 @@ func TestOpenRefusalsKeepTheirMeaning(t *testing.T) {
 	}
 	if !errors.Is(classifyUnadmittedRefusal(flow, fmt.Errorf("%w: unknown session", errLaneJoinRejected)), errLaneJoinOpenUnadmitted) {
 		t.Fatal("unknown session before OPEN_OK was not classified")
+	}
+	// A refusal that does not say the session is absent is never blamed on
+	// a sleep.
+	asleep := newIsolationTestFlow(t, false)
+	asleep.peerClockOffset.Store(asleep.clockOffset(time.Now()) - int64(10*time.Minute))
+	asleep.resumeRefused.Store(true)
+	asleep.noteRefusalCause(errLaneJoinTCPMode)
+	if err := asleep.resumeRefusal(); errors.Is(err, errSessionExpiredWhileSuspended) {
+		t.Fatal("a TCP-mode refusal after a sleep was blamed on the sleep")
+	}
+	asleep.confirmOpenByJoin()
+	asleep.noteRefusalCause(fmt.Errorf("%w: unknown session", errLaneJoinRejected))
+	if err := asleep.resumeRefusal(); errors.Is(err, errSessionExpiredWhileSuspended) {
+		t.Fatal("a sleep was blamed although a JOIN was admitted after it")
 	}
 	// A failed OPEN is what the flow fails with.
 	flow.noteRefusalCause(errLaneJoinOpenFailed)
