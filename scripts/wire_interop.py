@@ -127,6 +127,7 @@ class Destinations:
         self.download_bytes = download_bytes
         self.stopping = threading.Event()
         self.download = self._listen(self._serve_download)
+        self.uploads = {}
         self.sink = self._listen(self._serve_sink)
         self.dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.dns.bind(("127.0.0.1", 0))
@@ -173,20 +174,32 @@ class Destinations:
                 return
 
     def _serve_sink(self, conn):
-        # Answers with what it received: the count and its digest.
+        # Answers with what it received: the count and its digest. It also
+        # keeps both under the upload's tag, so an upload whose answer never
+        # makes it back can still be checked for what it delivered.
         with conn:
             total = 0
             digest = hashlib.sha256()
             try:
+                tag = recv_exact(conn, 16)
+                record = self.uploads.setdefault(tag, {"bytes": 0, "digest": digest})
                 while True:
                     part = conn.recv(1 << 16)
                     if not part:
                         break
                     total += len(part)
                     digest.update(part)
+                    record["bytes"] = total
                 conn.sendall(struct.pack("!Q", total) + digest.digest())
-            except OSError:
+            except (OSError, EOFError):
                 return
+
+    def received(self, tag):
+        """What the sink has received under tag: (bytes, sha256 hex)."""
+        record = self.uploads.get(tag)
+        if record is None:
+            return 0, hashlib.sha256().hexdigest()
+        return record["bytes"], record["digest"].copy().hexdigest()
 
     def _serve_dns(self):
         while not self.stopping.is_set():
@@ -454,15 +467,25 @@ def upload(proxy_port, destinations, size, timeout, on_progress=None):
     started = time.monotonic()
     conn = socks_connect(proxy_port, destinations.sink.getsockname()[1], timeout)
     conn.settimeout(timeout)
+    tag = secrets.token_bytes(16)
     sent = 0
-    with conn:
-        for piece in stream_chunks(size):
-            conn.sendall(piece)
-            sent += len(piece)
-            if on_progress is not None:
-                on_progress(sent)
-        conn.shutdown(socket.SHUT_WR)
-        answer = recv_exact(conn, 8 + 32)
+    try:
+        with conn:
+            conn.sendall(tag)
+            for piece in stream_chunks(size):
+                conn.sendall(piece)
+                sent += len(piece)
+                if on_progress is not None:
+                    on_progress(sent)
+            conn.shutdown(socket.SHUT_WR)
+            answer = recv_exact(conn, 8 + 32)
+    except (OSError, EOFError):
+        # The answer did not come back; what reached the sink still must be
+        # exactly a prefix of what was sent.
+        delivered, digest = destinations.received(tag)
+        if digest != expected_digest(delivered):
+            raise IntegrityError(f"the {delivered} bytes delivered before the upload failed do not match what was sent")
+        raise
     elapsed = time.monotonic() - started
     (count,) = struct.unpack("!Q", answer[:8])
     if count != size or answer[8:].hex() != expected_digest(size):
@@ -582,12 +605,16 @@ def runtime_flags(log_path, metrics_port):
     ]
 
 
+class HarnessError(RuntimeError):
+    """The harness could not observe what it needed; never excused."""
+
+
 def scrape(metrics_port):
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5) as response:
             text = response.read().decode()
-    except OSError:
-        return {}
+    except OSError as error:
+        raise HarnessError(f"metrics on port {metrics_port} unavailable: {error}") from error
     values = {}
     for line in text.splitlines():
         if line.startswith("#") or " " not in line:
@@ -617,7 +644,11 @@ class Gateway:
              "--transport", "auto", "--allow-private-destinations", *runtime_flags(work / "gateway.log", self.metrics)],
             work / "gateway.log",
         )
-        wait_for_tcp(self.port, 30, self.process.process)
+        try:
+            wait_for_tcp(self.port, 30, self.process.process)
+        except Exception:
+            self.stop()
+            raise
 
     def invite(self):
         out = subprocess.run(
@@ -658,7 +689,11 @@ class Client:
              "--no-auto-renew", *runtime_flags(work / "client.log", self.metrics)],
             work / "client.log",
         )
-        wait_for_tcp(self.socks, 30, self.process.process)
+        try:
+            wait_for_tcp(self.socks, 30, self.process.process)
+        except Exception:
+            self.stop()
+            raise
 
     def stop(self):
         self.process.stop()
@@ -670,7 +705,10 @@ def negotiated_wires(client, gateway):
     for record in client.process.records():
         if record.get("msg") == "outer lane authenticated" and "wire" in record:
             wires.add(int(record["wire"]))
-    metrics = scrape(gateway.metrics)
+    try:
+        metrics = scrape(gateway.metrics)
+    except HarnessError:
+        metrics = {}
     for version in (1, 2):
         if metrics.get(f'queqiao_data_connections_total{{wire="{version}"}}', 0) > 0:
             wires.add(version)
@@ -691,6 +729,8 @@ def join_refusals(gateway):
         match = REFUSAL.match(name)
         if match:
             counts[match.group(1)] = int(value)
+    if not counts:
+        raise HarnessError("the gateway exports no lane-join refusal counters")
     return counts
 
 
@@ -707,12 +747,32 @@ def failure_kind(error):
     return "short"
 
 
-def lane_joins(gateway, carrier=None):
-    """Lane JOINs the gateway admitted, optionally only on one carrier."""
-    return sum(
-        1 for record in gateway.process.records()
-        if record.get("msg") == "lane joined" and (carrier is None or record.get("transport") == carrier)
-    )
+LOG_TIME = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)$")
+
+
+def record_time(record):
+    """A log record's timestamp as epoch seconds, or None."""
+    match = LOG_TIME.match(str(record.get("time", "")))
+    if match is None:
+        return None
+    base, fraction, zone = match.groups()
+    zone = "+00:00" if zone == "Z" else zone
+    stamp = datetime.datetime.fromisoformat(base + zone).timestamp()
+    return stamp + (float("0" + fraction) if fraction else 0.0)
+
+
+def lane_joins(gateway, carrier=None, since=None):
+    """Lane JOINs the gateway admitted, on one carrier and after a moment."""
+    count = 0
+    for record in gateway.process.records():
+        if record.get("msg") != "lane joined" or (carrier is not None and record.get("transport") != carrier):
+            continue
+        if since is not None:
+            stamp = record_time(record)
+            if stamp is None or stamp < since:
+                continue
+        count += 1
+    return count
 
 
 # --- the matrix --------------------------------------------------------------
@@ -742,12 +802,13 @@ def disrupted_transfer(client, gateway, destinations, direction, carrier, disrup
 
     def at(progress):
         if not applied and progress >= args.stall_after_mib << 20:
-            # Counted once the relay has changed state, so a JOIN admitted
-            # before the disruption is never credited as its rescue.
-            disrupt()
-            applied["at"] = time.monotonic()
-            applied["joins"] = lane_joins(gateway, carrier)
+            # The boundary is taken before the relay changes state: JOINs
+            # are credited by their own timestamps from then on, so neither
+            # one admitted before the disruption nor a fast rescue admitted
+            # during it is miscounted.
             applied["refusals"] = join_refusals(gateway)
+            applied["since"] = time.time()
+            disrupt()
 
     size = args.stall_mib << 20
     outcome = {"direction": direction, "carrier": carrier, "completed": False}
@@ -760,18 +821,20 @@ def disrupted_transfer(client, gateway, destinations, direction, carrier, disrup
         if not applied:
             outcome.update(phase="setup", error="the transfer finished before the disruption was applied")
             return outcome
-        outcome["lane_joins"] = lane_joins(gateway, carrier) - applied["joins"]
+        outcome["lane_joins"] = lane_joins(gateway, carrier, applied["since"])
         outcome["join_refusals"] = refusal_delta(join_refusals(gateway), applied["refusals"])
         if outcome["lane_joins"] < 1:
             outcome.update(phase="rescue", kind="unrescued", error=f"the flow completed without a {carrier} lane joining it after the disruption")
     except IntegrityError as error:
         outcome.update(phase="integrity", error=str(error))
+    except HarnessError as error:
+        outcome.update(phase="harness", error=str(error))
     except Exception as error:  # noqa: BLE001 - compared with the baseline
         outcome["phase"] = "rescue" if applied else "setup"
         outcome["kind"] = failure_kind(error)
         outcome["error"] = f"{type(error).__name__}: {error}"
         if applied:
-            outcome["lane_joins"] = lane_joins(gateway, carrier) - applied["joins"]
+            outcome["lane_joins"] = lane_joins(gateway, carrier, applied["since"])
             outcome["join_refusals"] = refusal_delta(join_refusals(gateway), applied["refusals"])
     return outcome
 
