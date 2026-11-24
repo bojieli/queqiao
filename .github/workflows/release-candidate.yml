@@ -108,7 +108,7 @@ jobs:
         continue-on-error: true
         run: go test -v -p=1 -count=1 -timeout 20m -run "$MEASUREMENTS" ./internal/pathsim ./internal/baseline ./internal/pep
     env:
-      MEASUREMENTS: '^(TestTheEmulatorReproducesTheMeasuredPath|TestRawQUICSaturatesThePath|TestCase4APolicedPathIsStillUnbraked)$'
+      MEASUREMENTS: '^(TestTheEmulatorReproducesTheMeasuredPath|TestRawQUICSaturatesThePath|TestCase4APolicedPathIsBoundedNotRunaway)$'
 
   vulnerability:
     runs-on: ubuntu-24.04

@@ -175,8 +175,8 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 		// expensive part, and a lane opened to replace one that died would
 		// otherwise pay it again on a path nothing has forgotten.
 		//
-		// What is seeded is the delivered rate, compensated for the erasure --
-		// which is what this sender puts on the wire to deliver it. BBR sizes
+		// What is seeded is the delivered rate; the erasure compensation is
+		// applied on top of it, as for any other estimate. BBR sizes
 		// both its pacing and its window from that one number, so seeding it
 		// moves both; seeding a pacing rate alone leaves the window at the
 		// initial one and the pacer waiting on it.
@@ -186,20 +186,57 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 		// seed only. Sharing one number for the two used to mean that the
 		// only lane on a path capped itself at whatever the last one managed.
 		state := path.Current()
-		// The measured erasure is path knowledge, so a replacement lane paces
-		// from it rather than rediscovering it. On a channel that erases 42% of
-		// packets that rediscovery is expensive -- it is the same ramp that
-		// costs a loss-based controller the path in the first place -- and a
-		// lane opened because its predecessor died would pay it every time.
+		// The measured erasure is path knowledge, so a replacement lane
+		// publishes it, and its code is sized from it, rather than
+		// rediscovering it.
+		//
+		// It is not paced from. The loss alone does not say whether sending
+		// more would deliver more, and a policer's loss is as high as an
+		// erasure channel's. Pacing and the window are compensated only by
+		// what the siblings earned, below, and stay uncompensated until some
+		// sibling has decided -- at 85% loss, reading 1-Erasure instead paced
+		// 6.7x the seed on nothing anyone had earned.
 		if state.Erasure > 0 {
-			e.arrival.Store(uint64((1 - state.Erasure) * partsPerMillion))
 			e.erasure.Store(uint64(state.Erasure * partsPerMillion))
+		}
+		// The compensation its siblings have earned is path knowledge too, and
+		// it is where this lane's compensation gate starts. Starting the gate
+		// at none, as a lone sender does, threw the knowledge away at the
+		// first loss after the round trip was measured: a lane joining at the
+		// arrival floor then paced at 0.43x its share, delivered 0.065x of it,
+		// and stayed there, because the seeded estimate was the bar the next
+		// step had to clear.
+		//
+		// It is the earned compensation and not 1-Erasure. The two agree on an
+		// erasure channel, where sending more did deliver more. On a policer
+		// they do not: the loss is high and the siblings were refused the
+		// compensation. A joiner that took 1/arrival from the raw loss
+		// instead peaked at 11.5x the emulated policer's rate in
+		// internal/pep/case4_test.go, against 8.6x taking the earned value.
+		// Further compensation is still earned round by round, as for any
+		// lane.
+		if state.Arrival > 0 {
+			e.arrival.Store(uint64(state.Arrival * partsPerMillion))
+			e.appliedArrival = e.arrivalRate()
 		}
 		if state.Seed > 0 {
 			if state.Share > 0 {
 				e.share.Store(uint64(state.Share))
 			}
-			e.inner.seedBandwidth(uint64(state.Seed/e.arrivalRate()), state.RoundTrip)
+			// The seed is the pooled delivered rate, the inner filter is a
+			// delivered rate, and bandwidth() divides by the arrival rate once
+			// to put it on the wire. So it is seeded as it is: dividing it here
+			// compensated twice (#73), and multiplying compensated zero times.
+			e.inner.seedBandwidth(uint64(state.Seed), state.RoundTrip)
+			// The compensation gate judges each step by whether delivery rose
+			// since the last one. Its baseline starts at zero, and the seeded
+			// estimate is above zero without this lane having delivered
+			// anything, so the first round would grant a step for the seed
+			// itself -- and the lane would report that step as earned, for the
+			// next replacement to inherit and step again. The seed is the
+			// baseline: a step needs delivery above it.
+			e.deliveredAtCompensation = float64(e.inner.estimator.estimate())
+			e.compensationRound = e.inner.round
 		}
 	}
 	return e
@@ -601,8 +638,15 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		state := e.path.Report(e.id(), pathmodel.Observation{
 			Erasure: snapshot.Loss, BurstFactor: snapshot.BurstFactor,
 			ObservedSamples: float64(snapshot.Decided),
-			Delivered:       float64(e.inner.bandwidth()),
-			RoundTrip:       e.inner.minRoundTrip(),
+			// Only what this lane has measured itself. The estimate also
+			// holds the seed, which came from this pool; reporting it would
+			// count the pool's own figure as fresh delivery, and joins inside
+			// the bottleneck window would inflate it one seed at a time. Zero
+			// until the first sample still counts the lane as a member.
+			Delivered: float64(e.inner.estimator.measuredEstimate()),
+			RoundTrip: e.inner.minRoundTrip(),
+			// What the gate has accepted so far, zero before it has run.
+			Arrival: e.appliedArrival,
 		})
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))

@@ -227,7 +227,8 @@ func TestAJoiningSenderStartsFromWhatIsAlreadyKnown(t *testing.T) {
 func TestAJoiningSenderStartsWithTheWindowItsRateImplies(t *testing.T) {
 	const rate, roundTrip = 2e6, 250 * time.Millisecond
 	model := pathmodel.NewPathModel()
-	model.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: rate, RoundTrip: roundTrip})
+	// A sibling on a 42% erasure channel that has earned its compensation.
+	model.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: rate, RoundTrip: roundTrip, Arrival: 0.58})
 
 	seeded := NewErasureSenderOn(1200, model)
 	fresh := NewErasureSender(1200)
@@ -237,9 +238,10 @@ func TestAJoiningSenderStartsWithTheWindowItsRateImplies(t *testing.T) {
 			rate, roundTrip, seeded.GetCongestionWindow(), fresh.GetCongestionWindow())
 	}
 	// The window it should hold is a round trip of what it will put on the
-	// wire, which on an erasing path is more than what arrives.
-	want := quiccongestion.ByteCount(rate / (1 - 0.42) * roundTrip.Seconds())
-	if got := seeded.GetCongestionWindow(); got < want/2 || got > want*2 {
+	// wire, which on an erasing path is its delivered share over the arrival
+	// rate. Each conversion to an integer byte count can round down.
+	want := quiccongestion.ByteCount(model.Current().Seed / (1 - 0.42) * roundTrip.Seconds())
+	if got := seeded.GetCongestionWindow(); got < want-3 || got > want+3 {
 		t.Errorf("window %d against a bandwidth-delay product of %d", got, want)
 	}
 

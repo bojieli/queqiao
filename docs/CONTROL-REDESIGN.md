@@ -155,14 +155,15 @@ the code should be doing and were each refuted by measurement, the third by a
 measurement that was itself broken. The fourth and fifth started by measuring,
 and each found the fault somewhere none of the earlier ones had looked.
 
-**A policed path is still unbraked at 2.4x, and this design is deployed on
-one.** An earlier draft of this line said it should not be, which was the right
+**At that stage, the policed path was still unbraked at 2.4x.** An earlier
+draft of this line said it should not be, which was the right
 call while the delay bound was the only brake being built and the compensation
 was still feeding itself. It is shipped now because the alternative was worse
 in the case that was actually hurting users -- a downstream residual of 11%,
 against 0.16% measured on the live path after this work -- and because the
 policed overdrive was reduced by a factor of eighteen on the way. Neither of
-those makes 2.4x braked. `internal/pep/case4_test.go` holds the case open.
+those makes 2.4x braked. The pooled-seed work below (#73) revisits the case
+after replacement lanes became more frequent; the path is still unbraked.
 
 ## Sequencing
 
@@ -213,3 +214,128 @@ conservative floor, the code reads the measurement.
   "2.4x is not braked" above, and it now has a second dependant: the unmetered
   burst is guarded by a loss threshold only because nothing else can see a
   policer. Whatever answers one answers both.
+
+### The pooled seed and pooled delivery (#73)
+
+Three quantities meet when a lane joins a path its siblings have mapped, and
+all three are in delivered bytes per second except the last:
+
+- `State.Seed` is the pooled bottleneck split across the lanes, computed from
+  what the lanes report as `Observation.Delivered`.
+- The inner BBR filter (`seedBandwidth`, then the max filter) is a delivered
+  rate.
+- `ErasureSender.bandwidth()` divides the inner rate by the arrival rate once,
+  which is what turns a delivered rate into a wire rate.
+
+So the consistent seed is `State.Seed` as it is. Main divided it by the arrival
+rate (compensation applied twice, the 1/arrival^2 of the issue); the first
+draft of this fix multiplied by it (compensation applied zero times). The issue
+derived "multiply" while lanes still reported their pacing rate as
+`Delivered`, which is no longer true.
+
+Two further faults sat behind the conversion.
+
+**Seed echo.** The inner estimate contains the seed, so a lane that had
+delivered nothing reported its seed back as delivery and the pool counted its
+own figure twice. With one lane established at B on a clean path, four joins
+inside the ten-second bottleneck window took the pooled bottleneck to 1.5B,
+2.0B, 2.5B and 3.0B. The estimator now keeps a second max filter fed only by
+its own delivery samples, and that is what is reported: zero until the lane
+has a sample, which still counts it as a member of the split but adds nothing
+to the bottleneck. The same filter also keeps a peak restored by
+`restartFromIdle` out of the pool.
+
+**Compensation reset at the gate.** A joiner inherited the pooled erasure as
+its arrival rate, but the compensation gate started at none, as a lone sender
+does, and the first loss after the round trip was measured set it to none.
+At the arrival floor the joiner then paced at 0.43x its seed and delivered
+0.065x of it, and stayed there, because the seeded estimate was the bar the
+next compensation step had to clear. Starting the gate at 1-Erasure fixes that
+on an erasure channel and overdrives a policer, whose loss is high but whose
+lanes were refused the compensation (below). So lanes now report the
+compensation their gate has accepted (`Observation.Arrival`), the model pools
+it by sample count and keeps it as path knowledge, and a joiner starts its
+gate, and its pre-gate pacing, from that earned value. Anything further is
+earned round by round as before.
+
+Two details keep that from becoming a ratchet (both found in review). The
+gate judges a step by whether delivery rose since the last one, from a
+baseline of zero; a seeded joiner's estimate is above zero before it has
+delivered anything, so the first round after an ACK granted a step for the
+seed itself, the lane reported it as earned, and the next replacement
+inherited it and stepped again. The seeded estimate is now the gate's
+baseline. And while siblings have measured loss but none has decided any
+compensation (`Arrival` zero), a joiner publishes the measured erasure for
+the code but paces and sizes its window uncompensated; reading 1-Erasure
+there paced 6.7x the seed at 85% loss on nothing anyone had earned.
+
+The decision, then: **seed unscaled, report only measured delivery, inherit
+earned compensation rather than raw erasure.**
+
+#### Probe
+
+On `a6642134` with Go 1.27.3 on darwin/arm64, a fixed sibling state of
+Seed = 1,000,000 B/s and 200 ms RTT, read before any delivery (`wire`), after
+one loss event (`report`) and after the sender has its own minimum round trip
+and one more loss event, so the compensation gate has run (`gated wire`).
+`earned` is the arrival the siblings had been allowed: the arrival rate on an
+erasure channel, 1 on a policer.
+
+```sh
+go test ./internal/congestion -run '^$' -bench '^BenchmarkJoiningLaneSeed$' -benchtime=200x
+```
+
+| Path | Filter / seed | Report / seed | Wire / seed (uncapped / 1.25x share) | Gated wire / seed (uncapped / share) |
+| --- | ---: | ---: | ---: | ---: |
+| First draft, clean | 1.000 | 1.000 | 2.885 / 1.250 | 2.885 / 1.250 |
+| First draft, 42% | 0.580 | 0.580 | 2.885 / 2.155 | 1.673 / 1.250 |
+| First draft, 85% (floor) | 0.150 | 0.150 | 2.885 / 2.885 | 0.433 / 0.433 |
+| This, clean | 1.000 | 0 | 2.885 / 1.250 | 2.885 / 1.250 |
+| This, 42% erasure | 1.000 | 0 | 4.974 / 2.155 | 4.974 / 2.155 |
+| This, 85% (floor) | 1.000 | 0 | 19.23 / 8.333 | 19.23 / 8.333 |
+| This, 42% policer (earned 1) | 1.000 | 0 | 2.885 / 1.250 | 2.885 / 1.250 |
+| This, 85% loss, nothing earned yet | 1.000 | 0 | 2.885 / 1.250 | 2.885 / 1.250 |
+
+The first draft's "2.885 everywhere" was measured before the gate. After it,
+an uncapped joiner is now at startup gain / arrival, and stays there through
+the gate. The share still caps it at 1.25 seeds of delivery.
+
+The seed-echo test (`TestJoiningLanesDoNotEchoTheirSeedIntoThePool`, one lane
+at B and four joins) went from 1.5B, 2.0B, 2.5B, 3.0B to B after every join.
+
+#### Policer (case 4)
+
+`TestCase4APolicedPathIsBoundedNotRunaway`, formerly
+`TestCase4APolicedPathIsStillUnbraked`: 250,000 B/s token bucket refilled
+every 8 ms, 300 ms RTT, path seed 53, same host. Peaks are controller readings
+in units of the policer's sustained rate, not throughput.
+
+| Variant | Runs | Peak pacing | Peak estimate | Final loss |
+| --- | ---: | ---: | ---: | ---: |
+| Main (from the first draft's notes) | 2 | 9,544-57,266 | 8,590 | 65.8-70.0% |
+| First draft (seed x arrival, report estimate) | 4 | 2.9-4.0 | 1.0-1.2 | 14.5-23.1% |
+| Unscaled seed, measured report, gate reset to none | 4 | 3.0-4.3 | 1.1-1.6 | 13.3-15.4% |
+| Unscaled seed, measured report, gate from 1-Erasure | 6 | 4.2-11.5 | 1.1-1.9 | 16.4-25.5% |
+| Gate from earned compensation (`ec51b2b`) | 23 | 3.0-7.6 | 1.0-2.0 | 13.0-22.3% |
+| This (plus seeded gate baseline, no pacing on unearned loss) | 32 | 3.1-8.6 | 1.0-2.0 | 12.9-22.0% |
+
+The delay brake stayed at zero in every run: a policer is still unbraked. The
+queue stayed at or under 27 ms in every `ec51b2b` run and in 29 of the 32
+final runs; three final runs read 80-95 ms (smoothed RTT 380-397 ms against a
+300 ms minimum) and failed the queue check, none of them in an interleaved
+batch of eight runs per arm. Whether that is the change or host scheduling is
+not settled by this sample.
+
+The test asserts a peak estimate under 3x and peak pacing under 12x of the
+policer rate, which main's runaway fails by three orders of magnitude. A
+collapse is judged by delivery instead, since a sender can clear a peak at
+startup and then stall: the bytes echoed over the later half of the run must
+be at least 0.1x the policer rate. The exchanges are sequential, so this is
+far below line rate; over 24 runs it was 0.17-0.35x. The queue and brake
+check is unchanged.
+
+The gate-reset variant is the gentlest on the policer, and it is the one
+that collapses a joining lane on an erasure channel, which this test cannot
+see. That trade-off, and whether the higher starting rate on a high-erasure
+link pays for itself in goodput, is what the live-path A/B in the pull request
+has to settle.

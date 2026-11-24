@@ -75,6 +75,8 @@ type pathKnowledge struct {
 	erasureKnown    bool
 	observedSamples float64
 	roundTrip       time.Duration
+	// arrival is the pooled earned compensation; see State.Arrival.
+	arrival float64
 	// at is when anything last reported. Knowledge outlives its members so
 	// that a quiet path is not forgotten between connections, but it is a
 	// measurement and it ages like one: see knowledgeLifetime.
@@ -116,6 +118,7 @@ type report struct {
 	burst     float64
 	observed  float64
 	delivered float64
+	arrival   float64
 	roundTrip time.Duration
 	at        time.Time
 }
@@ -142,9 +145,17 @@ type Observation struct {
 	// unmeasured one.
 	ObservedSamples float64
 	// Delivered is this contributor's delivered rate in bytes per second, and
-	// RoundTrip the smallest round trip it has seen.
+	// RoundTrip the smallest round trip it has seen. Delivered must be what it
+	// measured, not a rate it was seeded with: the pool sums it into the
+	// bottleneck, and a seed came from that bottleneck in the first place.
+	// Zero is a valid report and still counts the contributor as a member.
 	Delivered float64
 	RoundTrip time.Duration
+	// Arrival is the arrival rate this contributor's erasure compensation has
+	// been allowed to assume -- the compensation it has earned by showing
+	// that sending more delivered more, 1 for none. Zero means it has not
+	// decided yet and contributes nothing.
+	Arrival float64
 }
 
 // State is what an endpoint pair has been measured to do, from the point of
@@ -179,6 +190,14 @@ type State struct {
 	// RoundTrip is the path's minimum round trip, which is the smallest any
 	// lane has seen: a larger one is that lane's queueing, not the path.
 	RoundTrip time.Duration
+	// Arrival is the erasure compensation the contributors have earned,
+	// pooled by their sample counts, or zero when none has decided. It is not
+	// 1-Erasure: on an erasure channel the two converge, but on a policer the
+	// loss is high and the compensation was refused because sending more
+	// delivered nothing. A joining lane starts from this, so it neither
+	// relearns an erasure channel's compensation nor assumes one a policer
+	// never paid out.
+	Arrival float64
 }
 
 type bandwidthSample struct {
@@ -244,6 +263,9 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	}
 	entry.erasure, entry.burst = o.Erasure, o.BurstFactor
 	entry.observed, entry.delivered, entry.at = o.ObservedSamples, o.Delivered, now
+	if o.Arrival > 0 {
+		entry.arrival = o.Arrival
+	}
 	if o.RoundTrip > 0 {
 		entry.roundTrip = o.RoundTrip
 	}
@@ -251,6 +273,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	var state State
 	var observed, sum float64
 	var erasureWeighted, burstWeighted float64
+	var arrival arrivalPool
 	live := 0
 	for key, other := range m.members {
 		if now.Sub(other.at) > memberIdle {
@@ -258,6 +281,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 			continue
 		}
 		live++
+		arrival.add(other)
 		sum += other.delivered
 		// A lane with few samples should not move the pooled estimate much,
 		// which is also what lets a new lane join without disturbing it.
@@ -286,6 +310,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		m.knowledge.observedSamples = observed
 	}
 	state.ObservedSamples = m.knowledge.observedSamples
+	state.Arrival = arrival.resolve(&m.knowledge)
 	if state.RoundTrip > 0 && (m.knowledge.roundTrip == 0 || state.RoundTrip < m.knowledge.roundTrip) {
 		m.knowledge.roundTrip = state.RoundTrip
 	} else if state.RoundTrip == 0 {
@@ -343,6 +368,7 @@ func (m *PathModel) Current() State {
 	var state State
 	var observed, bottleneck float64
 	var erasureWeighted, burstWeighted float64
+	var arrival arrivalPool
 	live := 0
 	for key, entry := range m.members {
 		if now.Sub(entry.at) > memberIdle {
@@ -350,6 +376,7 @@ func (m *PathModel) Current() State {
 			continue
 		}
 		live++
+		arrival.add(entry)
 		erasureWeighted += entry.erasure * entry.observed
 		burstWeighted += entry.burst * entry.observed
 		observed += entry.observed
@@ -375,6 +402,7 @@ func (m *PathModel) Current() State {
 		m.knowledge.observedSamples = observed
 	}
 	state.ObservedSamples = m.knowledge.observedSamples
+	state.Arrival = arrival.resolve(&m.knowledge)
 	if state.RoundTrip > 0 && (m.knowledge.roundTrip == 0 || state.RoundTrip < m.knowledge.roundTrip) {
 		m.knowledge.roundTrip = state.RoundTrip
 	} else if state.RoundTrip == 0 {
@@ -398,6 +426,34 @@ func (m *PathModel) Current() State {
 		}
 	}
 	return state
+}
+
+// arrivalPool pools the members' earned compensation by their sample counts,
+// the same weighting the erasure uses, so a lane that has just joined does not
+// move it. A member that reported an arrival with no samples behind it still
+// counts, at a token weight, rather than being ignored.
+type arrivalPool struct{ weighted, weight float64 }
+
+func (p *arrivalPool) add(r *report) {
+	if r.arrival <= 0 {
+		return
+	}
+	w := r.observed
+	if w < 1 {
+		w = 1
+	}
+	p.weighted += r.arrival * w
+	p.weight += w
+}
+
+// resolve is the pooled value, remembered as path knowledge so a lane that
+// replaces one that has gone quiet still inherits it, or what was remembered
+// when no live member has decided.
+func (p *arrivalPool) resolve(k *pathKnowledge) float64 {
+	if p.weight > 0 {
+		k.arrival = p.weighted / p.weight
+	}
+	return k.arrival
 }
 
 // Members is how many contributors are currently reporting.
