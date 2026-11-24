@@ -257,7 +257,8 @@ func TestSingleTCPLaneEOFWhileIdleRecoversEndToEnd(t *testing.T) {
 	if attempts := recordCount(t, record, "lane_replacement_attempts"); attempts < 1 {
 		t.Fatalf("flow record shows %v zero-lane replacement attempts, want at least one: %v", attempts, record)
 	}
-	if joined := recordCount(t, record, "lanes_joined"); joined < 1 {
+	// The initial lane counts as joined too.
+	if joined := recordCount(t, record, "lanes_joined"); joined < 2 {
 		t.Fatalf("flow record shows %v lanes joined, want the replacement: %v", joined, record)
 	}
 	if timeouts := recordCount(t, record, "lane_replacement_timeouts"); timeouts != 0 {
@@ -340,7 +341,7 @@ func TestSingleTCPLaneEOFRetriesThroughUnreachableGateway(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	proxy.setDown(false)
+	refused := proxy.setDown(false)
 
 	waitForGatewayLaneReplaced(t, session, lane, 20*time.Second)
 	echoRoundTrip(t, conn, []byte("after the path came back"), 10*time.Second)
@@ -350,9 +351,10 @@ func TestSingleTCPLaneEOFRetriesThroughUnreachableGateway(t *testing.T) {
 	if attempts := recordCount(t, record, "lane_replacement_attempts"); attempts < 2 {
 		t.Fatalf("flow record shows %v zero-lane replacement attempts, want the failed ones and the one that landed: %v", attempts, record)
 	}
+	// Every dial the proxy refused was a replacement this flow counted.
 	failures := recordCount(t, record, "lane_replacement_failures")
-	if failures < 1 {
-		t.Fatalf("flow record shows %v replacement failures through an unreachable gateway: %v", failures, record)
+	if failures < float64(refused) {
+		t.Fatalf("flow record shows %v replacement failures for %d refused dials: %v", failures, refused, record)
 	}
 	// The dial that got through is an attempt that did not fail.
 	if attempts := recordCount(t, record, "lane_replacement_attempts"); attempts < failures+1 {
@@ -404,6 +406,12 @@ func TestSingleTCPLaneEOFWithUnreachableGatewayDialsUntilTheGraceEnds(t *testing
 	if int(proxy.refusedCount()) < int(failures) {
 		t.Fatalf("proxy refused %d dials but the flow counted %v failures", proxy.refusedCount(), failures)
 	}
+	// Still dialling well into the grace, not two early tries and then a
+	// silent wait for the deadline. The backoff caps at 15 s, so a client
+	// that keeps trying dials again after the 20 s mark.
+	if last := proxy.lastRefusal().Sub(downAt); last < 20*time.Second {
+		t.Fatalf("last replacement dial came %v after the path dropped, want retries past 20s of the %v grace", last, laneReplacementWait)
+	}
 }
 
 func isClosedConnError(err error) bool {
@@ -417,6 +425,7 @@ type switchableProxy struct {
 	mu      sync.Mutex
 	down    bool
 	refused int
+	lastAt  time.Time
 	conns   map[net.Conn]struct{}
 }
 
@@ -440,6 +449,7 @@ func (p *switchableProxy) start(t *testing.T, target string) string {
 			p.mu.Lock()
 			if p.down {
 				p.refused++
+				p.lastAt = time.Now()
 				p.mu.Unlock()
 				_ = inbound.Close()
 				continue
@@ -476,9 +486,12 @@ func (p *switchableProxy) start(t *testing.T, target string) string {
 	return listener.Addr().String()
 }
 
-func (p *switchableProxy) setDown(down bool) {
+// setDown switches the proxy and returns how many connections it had refused
+// up to that point.
+func (p *switchableProxy) setDown(down bool) int {
 	p.mu.Lock()
 	p.down = down
+	refused := p.refused
 	var cut []net.Conn
 	if down {
 		for conn := range p.conns {
@@ -489,6 +502,13 @@ func (p *switchableProxy) setDown(down bool) {
 	for _, conn := range cut {
 		_ = conn.Close()
 	}
+	return refused
+}
+
+func (p *switchableProxy) lastRefusal() time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastAt
 }
 
 func (p *switchableProxy) refusedCount() int {
