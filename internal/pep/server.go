@@ -856,6 +856,9 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow.maxLifetime = s.cfg.FlowMaxLifetime
 	flow.reserveControlLane = open.Header.Flags&protocol.FlagReserveControl != 0
 	flow.controlLaneShared = auth.shared
+	// A flow that fails here is gone for good: tell the client on every lane
+	// so it does not spend a JOIN discovering that (issue #159).
+	flow.resetOnFailure = true
 	initialKind := transportKindForConn(conn)
 	serverSession := newServerFlow(flow, principal, initialKind, s.cfg.TCPFallbackLanes)
 	openLane := &mpLane{
@@ -1378,6 +1381,9 @@ func (s *Server) watchAuthorization(ctx context.Context, flow *serverFlow) {
 		select {
 		case <-ticker.C:
 			if _, err := s.cfg.Credentials.Store.Authorize(flow.principal, time.Now()); err != nil {
+				// No RESET here: the broadcast's bounded wait would leave
+				// data the scheduler already holds moving to a revoked
+				// device. Its replacement JOIN is refused at authorization.
 				flow.flow.closeAll()
 				return
 			}
