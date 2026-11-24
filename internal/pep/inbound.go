@@ -105,7 +105,18 @@ func (f *multipathFlow) forwardInbound() {
 }
 
 func (f *multipathFlow) acceptOpenConfirmation(frame protocol.Frame) error {
-	if frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID || len(frame.Payload) != 0 || !f.openConfirmationRequired.CompareAndSwap(true, false) {
+	if frame.Header.SessionID != f.sessionID || frame.Header.FlowID != f.flowID || len(frame.Payload) != 0 {
+		return errors.New("unexpected flow open acknowledgement")
+	}
+	f.openConfirmMu.Lock()
+	defer f.openConfirmMu.Unlock()
+	if !f.openConfirmationRequired.CompareAndSwap(true, false) {
+		// A JOIN's acknowledgement already proved the session exists; the
+		// OPEN's own OPEN_OK can still arrive afterwards on a stream that
+		// survived, and is no protocol violation.
+		if f.openConfirmedByJoin.CompareAndSwap(true, false) {
+			return nil
+		}
 		return errors.New("unexpected flow open acknowledgement")
 	}
 	return nil
