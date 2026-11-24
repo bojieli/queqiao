@@ -30,6 +30,11 @@ const (
 	// measured 200-250 ms fallback path and keeps BBR application-fed while
 	// leaving ready chunks for every other lane.
 	tcpStripingOutstandingBytes = 1024 * 1024
+	// laneOutstandingRounds and minLaneOutstandingBytes size a QUIC lane's
+	// commitment; see quicLaneOutstanding. The floor is a few chunks, so a
+	// lane whose estimate is still a trickle can grow it.
+	laneOutstandingRounds   = 2
+	minLaneOutstandingBytes = 4 * defaultChunkSize
 )
 
 // laneAdmission answers the scheduler's admission questions for one flow.
@@ -51,14 +56,45 @@ func (w *laneAdmission) Lane(laneID uint64, _ uint64) int {
 }
 
 func (w *laneAdmission) Outstanding(laneID uint64, _ uint64) int {
-	if !w.flow.tcpStriping.Load() {
-		return 0
-	}
 	lane := w.flow.laneByID(laneID)
-	if lane == nil || lane.kind != TransportTCP {
+	if lane == nil {
 		return 0
 	}
-	return tcpStripingOutstandingBytes
+	if w.flow.tcpStriping.Load() && lane.kind == TransportTCP {
+		return tcpStripingOutstandingBytes
+	}
+	return quicLaneOutstanding(lane.sendRate())
+}
+
+// quicLaneOutstanding bounds what a QUIC lane may hold unacknowledged by what
+// it can put through in laneOutstandingRounds round trips at its own pacing
+// rate: one in flight, one waiting behind it.
+//
+// Admission otherwise counts only what the lane's writer has not yet handed to
+// the transport, and a QUIC stream takes a write as soon as its buffer has
+// room, so a lane's commitment was bounded by nothing short of the flow's
+// memory. A lane paced well below the others -- capped at its pool share, or a
+// spare that had carried nothing and is still at a cold estimate -- went on
+// taking chunks at the rate the fast lanes freed them and sent them at its own:
+// measured live, 1.2-1.5 MB queued behind a lane pacing 0.7-1 MB/s, so a chunk
+// taken there waited one to two seconds before it left. Every one of them
+// outlived the two-round-trip reissue deadline and was copied to another lane,
+// which is where four in ten chunks on the fast path were going twice; and the
+// receiver's contiguous point waited on that lane, so no acknowledgement moved
+// for three round trips and the stall watchdog demoted the lanes that were
+// working. Bounded by its own rate, a slow lane carries what it can and leaves
+// the rest ready for lanes that can carry it sooner.
+//
+// No bound while the lane has no rate or round trip to size one from.
+func quicLaneOutstanding(pacing float64, rtt time.Duration) int {
+	if pacing <= 0 || rtt <= 0 {
+		return 0
+	}
+	bound := int(pacing * rtt.Seconds() * laneOutstandingRounds)
+	if bound < minLaneOutstandingBytes {
+		return minLaneOutstandingBytes
+	}
+	return bound
 }
 
 // Total is zero: independent TCP congestion controllers must not be coupled by

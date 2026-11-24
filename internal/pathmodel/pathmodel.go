@@ -332,7 +332,13 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		}
 		live++
 		arrival.add(other)
-		sum += other.delivered
+		// The bottleneck sample is what the members deliver now: a member
+		// that stopped reporting -- a finished flow, a rescue lane that went
+		// quiet -- still carries its last rate until it expires, and summed
+		// with the lanes now using the path it is a peak nobody is delivering.
+		if other.reporting(now, m.knowledge.roundTrip) {
+			sum += other.delivered
+		}
 		// A lane with few samples should not move the pooled estimate much,
 		// which is also what lets a new lane join without disturbing it.
 		erasureWeighted += other.erasure * other.observed
@@ -415,11 +421,33 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		// was held to 5/8 of what it delivered, then 5/8 of that as the
 		// window turned over: the last download of a burst, its siblings
 		// finished, crawled at a quarter of a path it had to itself.
+		//
+		// The split is between the busy members and at most one that is not.
+		// One idle member's split is the brake a burst needs: four lanes
+		// beside it are held to what they delivered, which is what keeps
+		// shares sized from summed peaks off a shallow buffer (handing it to
+		// the busy lanes raised a simulated burst's caused loss from 0.11 to
+		// 0.29). Every further idle member was a further split taken from the
+		// lanes using the path. Each stall rescue leaves one behind -- a lane
+		// that carried a few chunks and stays connected -- so on the fast
+		// lossy path the pool counted twice the lanes carrying data, held
+		// each to a fraction of what it delivered, and the bottleneck walked
+		// down: emulated, four downloads reached 0.75x main's goodput, and
+		// 0.95x with the split bounded.
 		if live > 1 && busy > 1 {
-			state.Share = shareProbeGain * state.Seed
+			state.Share = shareProbeGain * bottleneck / float64(busy+min(live-busy, 1))
 		}
 	}
 	return state
+}
+
+// reporting reports whether a member has reported within activeWindow of its
+// own round trip, or of the node's when it has none.
+func (r *report) reporting(now time.Time, roundTrip time.Duration) bool {
+	if r.roundTrip > 0 {
+		roundTrip = r.roundTrip
+	}
+	return now.Sub(r.at) <= activeWindow(roundTrip)
 }
 
 // activeWindow is how recently a member must have reported to count as
@@ -466,11 +494,7 @@ func (m *PathModel) busyLocked(now time.Time, roundTrip time.Duration, split int
 	// a long-haul lane acknowledged in bursts once a round trip is not gone
 	// between them because a short-haul one is faster.
 	active := func(r *report) bool {
-		window := activeWindow(roundTrip)
-		if r.roundTrip > 0 {
-			window = activeWindow(r.roundTrip)
-		}
-		return now.Sub(r.at) <= window
+		return r.reporting(now, roundTrip)
 	}
 	current := 0.0
 	for _, r := range m.members {

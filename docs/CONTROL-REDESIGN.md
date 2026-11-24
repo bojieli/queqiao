@@ -715,3 +715,77 @@ server's name, and review round 5 had since changed the code. The profiles
 were switched to the server's address and the campaign re-run from the start
 on the final commit.
 
+### Stalls and wire overhead on the fast lossy path
+
+The live A/B above left this change at 0.87x main on the Beijing host with 38
+stall detections a trial against main's 12, and 1.63 wire bytes per useful
+byte against 1.22. From the server lane traces of that run (Beijing host, 12
+trials per arm; stalls counted in trials only):
+
+- **Where the extra wire bytes come from.** Not loss: dividing wire per useful
+  byte by what the path's loss alone explains, 1/(1-loss), leaves 1.07 for
+  main, 1.37 for #146 and 1.44 here. Not the code: the coded datagram path
+  carried a few hundred source symbols per trial; bulk rides QUIC streams.
+  Scheduler re-issues: 43% of chunks re-issued here and 45% on #146, against
+  4% on main. A chunk on a QUIC lane is a reliable attempt, and its only
+  re-issue is a speculative copy on another lane once two round trips have
+  passed since a lane took it -- so copies follow the flow's data lane
+  moving, and each move copies what the old lane was still holding (median
+  5.2 MB per flow at a stall here, 1.2 MB on main).
+- **What the stalls are.** 93% fired with data in flight and the lane's QUIC
+  connection still being acknowledged (hundreds of packets received in every
+  stall window, all arms): the flow's own acknowledgements had stopped, not
+  the transport. 54% fired on lanes still in startup (#146: 83%; main: 38%).
+  After a stall the flow's data moved to a lane pacing a third as fast
+  (median 0.33 of the stalled lane here, 0.32 on #146, 0.73 on main), and
+  the flow's acknowledgements stayed silent for a median 1.96 thresholds
+  around it (#146: 3.12; main: 1.11).
+- **Why the lanes it moved to were slow.** Two things the honest pool exposed
+  that main's inflated shares hid. A QUIC lane's admission counted only what
+  its writer had not yet handed to the transport, and a QUIC stream takes a
+  write as soon as its buffer has room, so a lane paced well below the others
+  went on taking chunks at the rate the fast lanes freed them -- 1.2-1.5 MB
+  queued behind lanes pacing 0.7-1 MB/s -- and every one of them outlived the
+  re-issue deadline before it left. And every stall rescue leaves a lane
+  behind that carried a few chunks and stays connected; the even split counts
+  it, so the more a flow stalled, the smaller every data lane's share.
+
+**Changes.**
+
+- A QUIC lane may hold unacknowledged no more than it can send in two of its
+  own round trips at its own pacing rate, with a floor of four chunks
+  (`quicLaneOutstanding`, through the per-lane `Outstanding` admission that
+  TCP striping already used). A slow lane carries what it can and leaves the
+  rest ready for lanes that can carry it sooner.
+- The pool's share is split between its busy members and at most one that is
+  not (`pathmodel.Report`). One idle member's split is kept: it is the brake
+  that holds a burst's shares, sized from summed peaks, to what was
+  delivered, and every simulated scenario still passes with it. Seeds still
+  split over every member.
+- The bottleneck sample sums only members that are still reporting: a lane
+  that stopped keeps its last rate until it expires, and summed with the lanes
+  still sending it is a peak nobody delivers (#160 item 2, for that case).
+
+Tried and dropped, for no measurable gain: keeping a live suspected lane as
+the data lane when the spare is much slower; re-basing a ramping lane's
+startup pacing after rounds that were not backlogged; splitting the share
+between busy members only (it fails four simulated scenarios on caused loss,
+0.21-0.26).
+
+**Reproduced.** `TestFourDownloadsOnAFastLossyPath` (opt-in) runs the real
+client and server across `pathsim` at 25 MB/s, 220 ms, a 1.75 MB buffer, 12%
+erasure in bursts of three, and 40 ms of delay wander -- without the wander
+and the bursts it reproduced neither the gap nor the stalls. Four concurrent
+32 MiB downloads, five seeds per build, all builds run side by side; means:
+
+| Build | goodput, Mbit/s | stalls | excess wire |
+| --- | ---: | ---: | ---: |
+| main | 64.1 | 16 | 1.30 |
+| this change before the fixes | 48.4 | 21 | 1.37 |
+| with the split and bottleneck fix only | 61.5 | 24 | 1.31 |
+| with both fixes | 60.7 | 17 | 1.20 |
+
+Single runs varied by tens of percent (main 36-95 Mbit/s over the same five
+seeds), so this ranks the builds and does not measure them; the live A/B
+below is the measurement.
+

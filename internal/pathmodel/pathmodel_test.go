@@ -413,3 +413,46 @@ func TestASharedCapacityDropKeepsTheCap(t *testing.T) {
 		t.Fatal("both lanes cut to a fifth of the peak, still reporting, and the cap came off")
 	}
 }
+
+// Every stall rescue leaves a lane behind that carried a few chunks and stays
+// connected. One idle member keeps its split, as the brake against summed
+// peaks; more do not take a share of a path they are not using.
+func TestIdleRescueLanesDoNotDiluteTheShare(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	for member := Member(10); member < 15; member++ {
+		m.Report(member, Observation{Delivered: 60e3, ObservedSamples: 100, RoundTrip: 200 * time.Millisecond})
+	}
+	var state State
+	for member := Member(1); member <= 4; member++ {
+		state = m.Report(member, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	}
+	bottleneck := 4*6e6 + 5*60e3
+	if want := shareProbeGain * bottleneck / 5; math.Abs(state.Share-want) > 1 {
+		t.Fatalf("four busy lanes beside five idle ones: share %.0f, want %.0f (busy plus one idle)", state.Share, want)
+	}
+	if want := bottleneck / 9; math.Abs(state.Seed-want) > 1 {
+		t.Fatalf("the seed %.0f no longer splits over every member (%.0f)", state.Seed, want)
+	}
+}
+
+// The bottleneck sample is what the members deliver now. A member that has
+// stopped reporting keeps its last rate until it expires, and summed beside
+// the lanes still sending it is a peak nobody delivers.
+func TestAQuietMembersLastRateIsNotSummedIntoTheBottleneck(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 10e6, ObservedSamples: 1000, RoundTrip: 100 * time.Millisecond})
+	m.Report(2, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 100 * time.Millisecond})
+	var state State
+	for step := 0; step < 23; step++ {
+		now = now.Add(500 * time.Millisecond)
+		state = m.Report(2, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 100 * time.Millisecond})
+	}
+	// Eleven and a half seconds on: the samples taken while member 1 was still
+	// sending have aged out of the window, and those taken since did not
+	// count it.
+	if state.Seed > 2e6+1 {
+		t.Fatalf("the bottleneck still holds a quiet member's rate: seed %.0f, want 2000000", state.Seed)
+	}
+}
