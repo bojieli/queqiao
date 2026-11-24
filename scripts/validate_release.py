@@ -99,6 +99,7 @@ BUILDINFO_KEYS = {
     "target",
     "go",
     "wire_protocol",
+    "wire_accept",
     "binary_sha256",
 }
 
@@ -211,6 +212,16 @@ def parse_buildinfo(data: bytes) -> dict[str, str]:
     wire = result["wire_protocol"]
     if re.fullmatch(r"[1-9][0-9]{0,2}", wire) is None or int(wire) > 255:
         raise ValueError("BUILDINFO wire protocol is not a positive version byte")
+    # wire_accept is every version the binary negotiates, ascending; the
+    # preferred wire_protocol is the newest of them.
+    accept = result["wire_accept"]
+    if re.fullmatch(r"[1-9][0-9]{0,2}(,[1-9][0-9]{0,2})*", accept) is None:
+        raise ValueError("BUILDINFO accepted wire versions are not a version list")
+    versions = [int(item) for item in accept.split(",")]
+    if any(item > 255 for item in versions) or versions != sorted(set(versions)):
+        raise ValueError("BUILDINFO accepted wire versions are not ascending version bytes")
+    if versions[-1] != int(wire):
+        raise ValueError("BUILDINFO wire protocol is not the newest accepted version")
     if CHECKSUM.fullmatch(result["binary_sha256"]) is None:
         raise ValueError("BUILDINFO binary hash is invalid")
     return result
@@ -267,10 +278,16 @@ def validate_sbom(
     declared_wire = re.search(r"\*\*Wire version byte:\*\* `([0-9]+)`", spec)
     if declared_wire is None or declared_wire.group(1) != buildinfo["wire_protocol"]:
         raise ValueError(f"{archive_name}: protocol specification disagrees with BUILDINFO")
+    declared_accept = re.search(r"\*\*Accepted wire versions:\*\* `([0-9,]+)`", spec)
+    if declared_accept is None or declared_accept.group(1) != buildinfo["wire_accept"]:
+        raise ValueError(
+            f"{archive_name}: protocol specification's accepted versions disagree with BUILDINFO"
+        )
     for sbom_key, build_key in (
         ("queqiao:commit", "commit"),
         ("queqiao:target", "target"),
         ("queqiao:wire-protocol", "wire_protocol"),
+        ("queqiao:wire-accept", "wire_accept"),
         ("queqiao:go-version", "go"),
     ):
         if component_properties.get(sbom_key) != buildinfo.get(build_key):
@@ -425,7 +442,7 @@ def validate_release_cohort(
             f"missing={sorted(expected_targets - set(targets))} "
             f"unexpected={sorted(set(targets) - expected_targets)}"
         )
-    identity_fields = ("version", "commit", "build_date", "go", "wire_protocol")
+    identity_fields = ("version", "commit", "build_date", "go", "wire_protocol", "wire_accept")
     identities = {tuple(item[field] for field in identity_fields) for item in buildinfos}
     if len(identities) != 1:
         raise ValueError("release targets do not share one provenance identity")

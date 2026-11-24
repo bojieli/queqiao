@@ -370,8 +370,8 @@ func buildTarget(ctx context.Context, repoRoot, tempDir, resultDir string, cfg c
 		name: "BUILDINFO",
 		mode: 0o644,
 		data: []byte(fmt.Sprintf(
-			"version=%s\ncommit=%s\nbuild_date=%s\ntarget=%s\ngo=%s\nwire_protocol=%d\nbinary_sha256=%x\n",
-			cfg.version, cfg.commit, cfg.buildDate.Format(time.RFC3339), target, runtime.Version(), protocol.Version, binarySum,
+			"version=%s\ncommit=%s\nbuild_date=%s\ntarget=%s\ngo=%s\nwire_protocol=%d\nwire_accept=%s\nbinary_sha256=%x\n",
+			cfg.version, cfg.commit, cfg.buildDate.Format(time.RFC3339), target, runtime.Version(), protocol.Version, wireAccept(), binarySum,
 		)),
 	})
 	sort.Slice(files, func(i, j int) bool { return files[i].name < files[j].name })
@@ -567,6 +567,19 @@ func moduleLicenseID(modulePath string) string {
 	}
 }
 
+// wireAccept is every wire version the packaged binary can negotiate,
+// ascending and comma-separated, as `queqiaod --version` prints it.
+// wire_protocol stays the preferred version on its own line, so a check that
+// reads only that keeps working.
+func wireAccept() string {
+	versions := protocol.SupportedVersions()
+	parts := make([]string, 0, len(versions))
+	for i := len(versions) - 1; i >= 0; i-- {
+		parts = append(parts, fmt.Sprint(versions[i]))
+	}
+	return strings.Join(parts, ",")
+}
+
 func renderCycloneDX(cfg config, target target, binarySum [sha256.Size]byte, modules []linkedModule) ([]byte, error) {
 	rootRef := fmt.Sprintf("queqiaod@%s:%s", cfg.version, target)
 	root := cdxComponent{
@@ -578,6 +591,7 @@ func renderCycloneDX(cfg config, target target, binarySum [sha256.Size]byte, mod
 			{Name: "queqiao:commit", Value: cfg.commit},
 			{Name: "queqiao:target", Value: target.String()},
 			{Name: "queqiao:wire-protocol", Value: fmt.Sprint(protocol.Version)},
+			{Name: "queqiao:wire-accept", Value: wireAccept()},
 			{Name: "queqiao:go-version", Value: runtime.Version()},
 		},
 	}
