@@ -167,11 +167,14 @@ because GitHub tests a synthetic merge commit for that event.
 The workflow uploads candidate archives and evidence but cannot create a tag or
 GitHub Release.
 
-The candidate also runs `scripts/wire_interop.py`, which builds v0.12.1 from
-its tag and runs real binaries against the candidate on loopback: a v0.12.1
-client through the candidate gateway and the candidate client through a v0.12.1
-gateway, each over TCP and QUIC, with a large download, a UDP DNS query, and a
-forced stall. It is the only check of the old wire against code that was
+The candidate also runs `scripts/wire_interop.py`, once each against v0.12.1
+and v0.12.2, the last releases that speak only version 1. It builds the old
+release from its tag and runs real binaries against the candidate on loopback:
+the old client through the candidate gateway and the candidate client through
+the old gateway, each over TCP and QUIC, with a large download, a UDP DNS
+query, a forced stall, a TCP lane cut, and a QUIC-to-TCP handoff. A disruption
+the old client cannot survive against its own gateway either is reported as
+its limitation, not the candidate's. It is the only check of the old wire against code that was
 actually released, so a candidate whose gateway rejects something a deployed
 v0.12 client sends fails here rather than in the field. Run it locally with:
 

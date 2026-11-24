@@ -408,6 +408,19 @@ type bulkConn struct {
 
 var errPoolRetired = errors.New("pooled connection retired before OPEN")
 
+// wire is the version the bulk connection negotiated.
+func (b *bulkConn) wire() byte {
+	wire, _ := protocol.VersionForALPN(b.conn.ConnectionState().TLS.NegotiatedProtocol)
+	return wire
+}
+
+// bulkConnFits reports whether a bulk connection can carry a lane for the
+// flow ctx dials for: one pinned to a version takes only a connection of it.
+func bulkConnFits(ctx context.Context, entry *bulkConn) bool {
+	wire, pinned := pinnedWire(ctx)
+	return !pinned || entry.wire() == wire
+}
+
 // controlQUICGeneration owns exactly one shared connection and the packet
 // socket beneath it. Keeping ownership in one object makes generation checks
 // precise: a late failure from an old stream can retire its own generation but
@@ -2170,16 +2183,32 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 	}
 	c.bulkConns = live
 	for _, entry := range c.bulkConns {
-		if !entry.busy && entry.conn.Context().Err() == nil {
+		if !entry.busy && entry.conn.Context().Err() == nil && bulkConnFits(ctx, entry) {
 			entry.busy = true
 			entry.stopIdleLocked()
 			c.bulkMu.Unlock()
 			return entry, nil
 		}
 	}
+	var retired *bulkConn
 	if len(c.bulkConns)+len(c.bulkDials) >= c.maxBulkConns() {
-		c.bulkMu.Unlock()
-		return nil, errBulkConnectionLimit
+		// An idle connection of another wire version is the one slot that
+		// can be given back: closing it keeps the budget a budget, where
+		// leaving it would send this flow to a dedicated dial outside it.
+		evicted := -1
+		for i, entry := range c.bulkConns {
+			if !entry.busy && !bulkConnFits(ctx, entry) {
+				evicted = i
+				break
+			}
+		}
+		if evicted < 0 {
+			c.bulkMu.Unlock()
+			return nil, errBulkConnectionLimit
+		}
+		retired = c.bulkConns[evicted]
+		retired.stopIdleLocked()
+		c.bulkConns = append(c.bulkConns[:evicted:evicted], c.bulkConns[evicted+1:]...)
 	}
 	epoch := c.bulkEpoch
 	dialCtx, cancel := context.WithCancel(ctx)
@@ -2190,6 +2219,9 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 	token := new(byte)
 	c.bulkDials[token] = cancel
 	c.bulkMu.Unlock()
+	if retired != nil {
+		retired.close("queqiao bulk pool wire version")
+	}
 
 	entry, err := c.dialBulkConn(dialCtx)
 	// A successful handshake can span system sleep. Expire its old epoch
@@ -2240,7 +2272,9 @@ func (c *Client) bulkConnCount() int {
 
 func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 	started := time.Now()
-	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.WireVersions, c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
+	// A bulk connection is dialed for one flow's lane, so it offers that
+	// flow's version; it is reused only by flows of the same version.
+	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.dialWires(ctx), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
 	if err != nil {
 		return nil, err
 	}

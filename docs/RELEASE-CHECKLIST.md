@@ -12,9 +12,9 @@ exact commit. Production-ready language has additional gates below.
   (`wire=2 wire_accept=1,2`); a connection negotiates one of them by ALPN, and
   a peer offering no accepted version is refused at TLS negotiation with a
   diagnosable error.
-- [ ] `./scripts/wire_interop.py` passes on the exact candidate: a v0.12.1
-  client against the candidate gateway and the candidate client against a
-  v0.12.1 gateway, over TCP and QUIC, with a large download, UDP DNS, and a
+- [ ] `./scripts/wire_interop.py` passes on the exact candidate with
+  `--old-ref v0.12.1` and `--old-ref v0.12.2`: an old client against the
+  candidate gateway and the candidate client against an old gateway, over TCP and QUIC, with a large download, UDP DNS, and a
   forced stall.
 - [x] Every protocol-2 limit is fixed by the specification rather than by
   configuration, and `testdata/protocol2/vectors.json` (with the frozen

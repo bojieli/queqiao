@@ -47,7 +47,25 @@ import time
 import urllib.request
 
 DEFAULT_OLD_REF = "v0.12.1"
-DOWNLOAD_PATTERN = bytes(range(256)) * 256
+CHUNK = 64 * 1024
+
+
+def chunk_at(index):
+    """The test stream's 64 KiB chunk number index.
+
+    Every chunk carries its own position, so a lost, duplicated, or reordered
+    chunk changes the digest even when the length comes out right.
+    """
+    return (struct.pack("!Q", index) + b"queqiao!") * (CHUNK // 16)
+
+
+def stream_chunks(size):
+    index = 0
+    while size > 0:
+        piece = chunk_at(index)[: min(CHUNK, size)]
+        yield piece
+        size -= len(piece)
+        index += 1
 DNS_NAME = "interop.test"
 DNS_ANSWER = "192.0.2.53"
 
@@ -134,11 +152,8 @@ class Destinations:
                     if not part:
                         return
                     header += part
-                remaining = int(header)
-                while remaining > 0:
-                    chunk = DOWNLOAD_PATTERN[: min(len(DOWNLOAD_PATTERN), remaining)]
+                for chunk in stream_chunks(int(header)):
                     conn.sendall(chunk)
-                    remaining -= len(chunk)
                 conn.shutdown(socket.SHUT_WR)
                 conn.settimeout(10)
                 while conn.recv(65536):
@@ -147,15 +162,18 @@ class Destinations:
                 return
 
     def _serve_sink(self, conn):
+        # Answers with what it received: the count and its digest.
         with conn:
             total = 0
+            digest = hashlib.sha256()
             try:
                 while True:
                     part = conn.recv(1 << 16)
                     if not part:
                         break
                     total += len(part)
-                conn.sendall(struct.pack("!Q", total))
+                    digest.update(part)
+                conn.sendall(struct.pack("!Q", total) + digest.digest())
             except OSError:
                 return
 
@@ -191,11 +209,8 @@ class Destinations:
 
 def expected_digest(size):
     digest = hashlib.sha256()
-    remaining = size
-    while remaining > 0:
-        chunk = DOWNLOAD_PATTERN[: min(len(DOWNLOAD_PATTERN), remaining)]
+    for chunk in stream_chunks(size):
         digest.update(chunk)
-        remaining -= len(chunk)
     return digest.hexdigest()
 
 
@@ -417,20 +432,19 @@ def upload(proxy_port, destinations, size, timeout, on_progress=None):
     started = time.monotonic()
     conn = socks_connect(proxy_port, destinations.sink.getsockname()[1], timeout)
     conn.settimeout(timeout)
-    chunk = DOWNLOAD_PATTERN
     sent = 0
     with conn:
-        while sent < size:
-            piece = chunk[: min(len(chunk), size - sent)]
+        for piece in stream_chunks(size):
             conn.sendall(piece)
             sent += len(piece)
             if on_progress is not None:
                 on_progress(sent)
         conn.shutdown(socket.SHUT_WR)
-        (count,) = struct.unpack("!Q", recv_exact(conn, 8))
+        answer = recv_exact(conn, 8 + 32)
     elapsed = time.monotonic() - started
-    if count != size:
-        raise IntegrityError(f"destination received {count} of {size} bytes")
+    (count,) = struct.unpack("!Q", answer[:8])
+    if count != size or answer[8:].hex() != expected_digest(size):
+        raise IntegrityError(f"destination received {count} of {size} bytes, digest match {answer[8:].hex() == expected_digest(size)}")
     return {"bytes": count, "seconds": round(elapsed, 3), "mbit_per_second": round(size * 8 / elapsed / 1e6, 1)}
 
 
@@ -677,12 +691,13 @@ def disrupted_transfer(client, gateway, destinations, direction, carrier, disrup
             applied["at"] = time.monotonic()
 
     size = args.stall_mib << 20
-    outcome = {"direction": direction, "carrier": carrier}
+    outcome = {"direction": direction, "carrier": carrier, "completed": False}
     try:
         if direction == "download":
             outcome.update(download(client.socks, destinations, size, args.timeout, at))
         else:
             outcome.update(upload(client.socks, destinations, size, args.timeout, at))
+        outcome["completed"] = True
         if not applied:
             outcome.update(phase="setup", error="the transfer finished before the disruption was applied")
             return outcome
@@ -747,7 +762,7 @@ def run_case(name, client_bin, gateway, destinations, transport, args, work):
 DISRUPTIONS = ("stall", "lane_cut", "tcp_handoff")
 
 
-def judge(results):
+def judge(results, old_ref):
     """Fail a disrupted transfer unless the released build fails it too.
 
     The new gateway is held to the old client's own baseline: a rescue the old
@@ -763,20 +778,21 @@ def judge(results):
             if outcome is None or "error" not in outcome:
                 continue
             if item["pairing"] == "old-client/old-gateway" and outcome.get("phase") == "rescue":
-                outcome["baseline"] = "v0.12.1 client limitation"
+                outcome["baseline"] = f"{old_ref} client limitation"
                 continue
             reference = baseline.get(item["transport"], {}).get("checks", {}).get(check)
             # Only a rescue the old client never achieved against its own
-            # gateway either is excused: same phase, and no more JOINs than
-            # it got there. Setup and integrity failures are never excused.
+            # gateway either is excused: same phase, the transfer ending the
+            # same way, and no more JOINs than it got there. Setup and integrity failures are never excused.
             if (
                 item["pairing"].startswith("old-client/")
                 and outcome.get("phase") == "rescue"
                 and reference is not None
                 and reference.get("phase") == "rescue"
+                and outcome.get("completed") == reference.get("completed")
                 and outcome.get("lane_joins", 0) <= reference.get("lane_joins", 0)
             ):
-                outcome["baseline"] = "fails identically against the v0.12.1 gateway"
+                outcome["baseline"] = f"fails identically against the {old_ref} gateway"
                 continue
             item["ok"] = False
             item["error"] = f"{check}: {outcome['error']}"
@@ -843,7 +859,7 @@ def main(arguments=None):
     finally:
         destinations.close()
 
-    judge(results)
+    judge(results, args.old_ref if not args.old_binary else str(args.old_binary))
     summary = {
         "format": "queqiao-wire-interop-v1",
         "finished_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

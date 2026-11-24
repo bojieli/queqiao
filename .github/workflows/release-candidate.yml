@@ -169,7 +169,7 @@ jobs:
   # actually deployed.
   wire-interop:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -177,15 +177,18 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - run: ./scripts/wire_interop.py --output-dir wire-interop
+      # v0.12.1 is the release the dual-version work was designed against and
+      # v0.12.2 the last one to speak only version 1.
+      - run: ./scripts/wire_interop.py --old-ref v0.12.1 --output-dir wire-interop/v0.12.1
+      - run: ./scripts/wire_interop.py --old-ref v0.12.2 --output-dir wire-interop/v0.12.2
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: candidate-wire-interop-${{ github.run_id }}
           path: |
-            wire-interop/results.json
-            wire-interop/*/*.log
+            wire-interop/*/results.json
             wire-interop/*/*/*.log
+            wire-interop/*/*/*/*.log
           if-no-files-found: warn
           retention-days: 30
 

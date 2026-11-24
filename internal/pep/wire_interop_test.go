@@ -644,4 +644,33 @@ func TestPinnedFlowDialsOnlyItsVersion(t *testing.T) {
 	if _, err := client.dialLaneMode(pinned, TransportQUIC, [16]byte{3}, 4, true); err == nil || !strings.Contains(err.Error(), errPinnedWireMismatch.Error()) {
 		t.Fatalf("a version-1 flow borrowed a version-2 pooled lane: %v", err)
 	}
+
+	// The bulk pool lends a connection only to flows of its version, and a
+	// pinned flow's dial stays inside the pool's budget: with the one slot
+	// held by an idle connection of the other version, that connection is
+	// retired to make room rather than the budget being exceeded.
+	client.memoryLimits.maxBulkConnections = 1
+	v2, err := client.reserveBulkConn(withPinnedWire(ctx, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v2.wire() != 2 {
+		t.Fatalf("a bulk connection for a version-2 flow speaks %d", v2.wire())
+	}
+	client.releaseBulkConn(v2, false)
+	v1, err := client.reserveBulkConn(pinned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1 == v2 || v1.wire() != 1 {
+		t.Fatalf("a version-1 flow got bulk connection %p speaking %d (the version-2 one is %p)", v1, v1.wire(), v2)
+	}
+	if n := client.bulkConnCount(); n != 1 {
+		t.Fatalf("bulk pool holds %d connections with a budget of 1", n)
+	}
+	if v2.conn.Context().Err() == nil {
+		t.Fatal("the idle version-2 bulk connection was not retired to make room")
+	}
+	client.releaseBulkConn(v1, false)
+	client.closeBulkQUICPool("test done")
 }

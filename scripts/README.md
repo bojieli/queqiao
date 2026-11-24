@@ -231,7 +231,8 @@ the output directory:
 ./scripts/wire_interop.py --output-dir /tmp/queqiao-wire-interop
 ```
 
-`--old-binary` and `--new-binary` reuse existing builds. Nothing listens beyond
+`--old-ref v0.12.2` tests the other version-1 release, as the candidate gate
+does; `--old-binary` and `--new-binary` reuse existing builds. Nothing listens beyond
 127.0.0.1. The release-candidate workflow runs it on every candidate.
 
 `field_soak.py` is the long-duration real-path harness. It keeps one SOCKS5 UDP
