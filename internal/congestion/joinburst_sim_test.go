@@ -1349,3 +1349,58 @@ func TestSiblingErasureIsExactBesideALongLivedLane(t *testing.T) {
 		t.Fatalf("the sibling's erasure reads %.4f (ok %v), want 0.15", erasure, ok)
 	}
 }
+
+// Rounds that grow gradually -- less than twice the first rounds' packets --
+// at the loss the first rounds showed are a confirmation pending, not loss
+// above an inherited floor.
+func TestGradualGrowthAtAConstantLossKeepsTheRamp(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe()) // floor 0.15 on 5000
+	closeRound(sender, 60, 40)
+	closeRound(sender, 78, 52)
+	if !sender.ramping.Load() {
+		t.Fatal("a round that grew 30% at the first round's 40% loss ended the ramp against the inherited 15%")
+	}
+	closeRound(sender, 120, 80)
+	if !sender.ownConfirmed || !sender.ramping.Load() {
+		t.Fatalf("at twice the packets and the same loss: confirmed %v, ramping %v", sender.ownConfirmed, sender.ramping.Load())
+	}
+	// A round that did not grow is judged against the floor as before.
+	sender = NewErasureSenderOn(1200, joiningProbe())
+	closeRound(sender, 60, 40)
+	sender.rampGate(base(), make([]quiccongestion.AckedPacketInfo, 78), make([]quiccongestion.LostPacketInfo, 52))
+	sender.inner.round++
+	sender.rampGate(base(), nil, nil)
+	if sender.ramping.Load() {
+		t.Fatal("a round at 40% loss that delivered no more did not end the ramp against a 15% floor")
+	}
+}
+
+// Confirmation needs enough independent trials after the burst deflation.
+func TestConfirmationCountsIndependentTrials(t *testing.T) {
+	probe := joiningProbe()
+	probe.BurstFactor, probe.ErasureBurst = 16, 16
+	sender := NewErasureSenderOn(1200, probe)
+	for !(sender.ownFloorN > 0) {
+		closeRound(sender, 3, 1)
+	}
+	closeRound(sender, 1500, 500)
+	if sender.ownConfirmed {
+		t.Fatalf("confirmed on %.0f independent trials", 2000/16.0)
+	}
+}
+
+// The pool's figure is deflated by the pool's burst factor, the floor by its
+// own: long loss runs in the pool now are fewer trials than packets.
+func TestThePoolIsJudgedByItsOwnBurstFactor(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe()) // 0.15 on 5000, burst 1
+	sender.endRamp()
+	sender.erasure.Store(uint64(0.25 * partsPerMillion))
+	sender.poolSamples, sender.poolBurst = 400, 1
+	if !sender.poolAboveFloor() {
+		t.Fatal("setup: 0.25 on 400 independent samples is not above 0.15")
+	}
+	sender.poolBurst = 20
+	if sender.poolAboveFloor() {
+		t.Fatal("0.25 on 400 packets lost in runs of 20 read as above the floor")
+	}
+}

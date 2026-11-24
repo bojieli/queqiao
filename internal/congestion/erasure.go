@@ -458,10 +458,11 @@ func (e *ErasureSender) rampGate(now monotime.Time, acked []quiccongestion.Acked
 			e.gatherOwnFloor(arrived, lost)
 			e.aboveFloor = false
 		} else {
+			pending := false
 			if e.ramping.Load() && e.rampDelivered > 0 && float64(e.inner.estimator.measuredEstimate()) >= e.rampDelivered*rampGrowth {
-				e.confirmOwnFloor(arrived, lost)
+				pending = e.confirmOwnFloor(arrived, lost)
 			}
-			e.aboveFloor = e.lossAboveFloor(arrived, lost)
+			e.aboveFloor = !pending && e.lossAboveFloor(arrived, lost)
 		}
 		if e.ramping.Load() {
 			e.judgeRamp(arrived, lost)
@@ -509,25 +510,36 @@ func (e *ErasureSender) gatherOwnFloor(arrived, lost uint64) {
 // both. A lane wedged behind a full queue loses as much at every rate too,
 // but delivers no more for sending more; one confirmed a floor of 0.97 before
 // delivery growth was required.
-func (e *ErasureSender) confirmOwnFloor(arrived, lost uint64) {
+//
+// It reports whether the confirmation is pending: the round grew and lost
+// what the first rounds did, but is not yet the evidence that confirms them
+// -- too few independent samples, or less than twice the packets. Such a
+// round is not judged against the pool's floor either: a joiner whose rounds
+// grew by 30% at a constant 40% loss over an inherited 15% floor would
+// otherwise end its ramp before any round was large enough to confirm what
+// it was showing.
+func (e *ErasureSender) confirmOwnFloor(arrived, lost uint64) (pending bool) {
 	decided := float64(arrived + lost)
-	if e.ownConfirmed || decided < 2*float64(e.ownRoundMax) {
-		return
+	if e.ownConfirmed || decided == 0 {
+		return false
 	}
 	burst := math.Max(e.rampBurst, 1)
 	n, m := decided/burst, e.ownFloorN/burst
-	if n < rampLossSamples/burst {
-		return
-	}
 	loss := float64(lost) / decided
 	pooled := (loss*n + e.ownFloor*m) / (n + m)
 	deviation := math.Sqrt(pooled * (1 - pooled) * (1/n + 1/m))
 	if math.Abs(loss-e.ownFloor) > rampConfirmDeviations*deviation {
-		return
+		return false
+	}
+	// Enough independent trials, counted after the burst deflation -- a
+	// 64-packet round on a channel losing in runs of 16 is four trials.
+	if n < rampLossSamples || decided < 2*float64(e.ownRoundMax) {
+		return true
 	}
 	e.ownConfirmed = true
 	e.ownFloor = (e.ownFloor*e.ownFloorN + float64(lost)) / (e.ownFloorN + decided)
 	e.ownFloorN += decided
+	return false
 }
 
 // floor is the erasure this lane's loss is judged against, and the packets
@@ -616,22 +628,25 @@ func (e *ErasureSender) lossAboveFloor(arrived, lost uint64) bool {
 	if decided == 0 {
 		return false
 	}
-	return e.aboveTheFloor(float64(lost)/decided, decided)
+	return e.aboveTheFloor(float64(lost)/decided, decided, e.rampBurst)
 }
 
 // aboveTheFloor is the two-proportion test of a loss rate measured over
-// samples packets against the floor this lane joined with.
-func (e *ErasureSender) aboveTheFloor(loss, samples float64) bool {
+// samples packets, whose losses arrive in runs of burst, against the floor
+// this lane judges by.
+func (e *ErasureSender) aboveTheFloor(loss, samples, burst float64) bool {
 	// Losses that arrive in runs are fewer independent trials than packets:
 	// a channel whose erasures come in runs of b gives about n/b of them, and
 	// a single 30-packet burst in a 100-packet round on a 15% floor would
-	// otherwise read as overflow. Both sides are deflated by the burst factor
-	// the pool had measured.
-	burst := math.Max(e.rampBurst, 1)
+	// otherwise read as overflow. Each side is deflated by its own burst
+	// factor: the floor by the one measured with it, the figure under test
+	// by the one it was measured with.
+	burst = math.Max(burst, 1)
+	floorBurst := math.Max(e.rampBurst, 1)
 	floor, floorN := e.floor()
 	samples /= burst
-	floorN /= burst
-	if samples < rampLossSamples/burst || floorN < rampLossSamples/burst {
+	floorN /= floorBurst
+	if samples < rampLossSamples/burst || floorN < rampLossSamples/floorBurst {
 		return false
 	}
 	// The normal approximation behind the test says nothing about a handful
@@ -648,7 +663,7 @@ func (e *ErasureSender) aboveTheFloor(loss, samples float64) bool {
 // poolAboveFloor reports whether the pool's measured erasure has risen
 // significantly above what it was when this lane joined.
 func (e *ErasureSender) poolAboveFloor() bool {
-	return e.aboveTheFloor(float64(e.erasure.Load())/partsPerMillion, e.poolSamples)
+	return e.aboveTheFloor(float64(e.erasure.Load())/partsPerMillion, e.poolSamples, e.poolBurst)
 }
 
 // rebaseFloor makes the floor this lane joined with expire.

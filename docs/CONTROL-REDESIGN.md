@@ -596,6 +596,16 @@ earlier for the same reason (#160 item 3).
   subtraction magnifies beside a long-lived lane. A lane with a confirmed
   own floor over a thin pool can still have that floor expire by the timed
   re-base.
+- A growing ramp round that loses what the lane's first rounds lost, but is
+  not yet the evidence that confirms them (fewer than 64 independent trials
+  after burst deflation, or less than twice the packets of any first round),
+  is a confirmation pending and is not judged against the pool's floor: a
+  joiner growing 30% a round at a constant 40% over an inherited 15% would
+  otherwise end its ramp before it could confirm what it was showing.
+- Each side of a floor test is deflated by its own burst factor (the
+  floor's, and the pool's or the round's), and a member counts as active by
+  its own round trip, not the node's minimum, so a long-haul lane beside a
+  short-haul one is not taken for gone between acknowledgements.
 - ProbeRTT's held-down rounds are not ramp evidence: they neither count as
   flat nor act on a pending re-arm, which waits for the probe to end.
 - A round counts as probing (for the flat-delivery exit, and as a backlog for

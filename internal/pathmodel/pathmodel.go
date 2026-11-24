@@ -438,7 +438,7 @@ func activeWindow(roundTrip time.Duration) time.Duration {
 }
 
 // busyLocked counts the busy members: those that reported within
-// activeWindow and delivered at least busyFraction of the bottleneck split
+// activeWindow of their own round trip and delivered at least busyFraction of the bottleneck split
 // evenly split ways. A finished lane stops counting within a few round trips,
 // long before it expires from the model.
 //
@@ -455,9 +455,15 @@ func (m *PathModel) busyLocked(now time.Time, roundTrip time.Duration, bottlenec
 	if split <= 0 || bottleneck <= 0 {
 		return 0
 	}
-	window := activeWindow(roundTrip)
 	even := bottleneck / float64(split)
 	for _, r := range m.members {
+		// Each member by its own round trip where it has one: at a shared
+		// egress a long-haul lane acknowledged in bursts once a round trip
+		// is not gone between them because a short-haul one is faster.
+		window := activeWindow(roundTrip)
+		if r.roundTrip > 0 {
+			window = activeWindow(r.roundTrip)
+		}
 		if now.Sub(r.at) <= window && r.delivered >= busyFraction*even {
 			busy++
 		}

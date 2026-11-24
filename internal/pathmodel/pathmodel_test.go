@@ -383,3 +383,17 @@ func TestErasureWeightIsTheObservationsBehindIt(t *testing.T) {
 		t.Fatalf("with member 1 taken out, the erasure is %.3f, want member 2's 0", others)
 	}
 }
+
+// Each member is judged active by its own round trip: a long-haul lane
+// acknowledged once a round trip is not gone between acknowledgements
+// because a short-haul member sets the node's minimum.
+func TestALongHaulMemberIsActiveByItsOwnRoundTrip(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 800 * time.Millisecond})
+	now = now.Add(600 * time.Millisecond)
+	state := m.Report(2, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 30 * time.Millisecond})
+	if state.Share == 0 {
+		t.Fatal("a long-haul lane 600 ms into its 800 ms round trip was taken for gone")
+	}
+}
