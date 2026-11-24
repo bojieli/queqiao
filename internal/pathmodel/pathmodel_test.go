@@ -397,3 +397,19 @@ func TestALongHaulMemberIsActiveByItsOwnRoundTrip(t *testing.T) {
 		t.Fatal("a long-haul lane 600 ms into its 800 ms round trip was taken for gone")
 	}
 }
+
+// A shared drop in capacity is not every sibling leaving: lanes that all
+// deliver a fifth of the bottleneck's peak, reporting each round, are still
+// busy and still capped.
+func TestASharedCapacityDropKeepsTheCap(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 10e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	m.Report(2, Observation{Delivered: 10e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	now = now.Add(100 * time.Millisecond)
+	m.Report(1, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	state := m.Report(2, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	if state.Share == 0 {
+		t.Fatal("both lanes cut to a fifth of the peak, still reporting, and the cap came off")
+	}
+}

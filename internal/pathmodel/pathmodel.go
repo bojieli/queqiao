@@ -398,7 +398,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	}
 	m.aggregate = kept
 
-	busy := m.busyLocked(now, state.RoundTrip, bottleneck, live)
+	busy := m.busyLocked(now, state.RoundTrip, live)
 	state.LeafRoundTrip = state.RoundTrip
 	if live > 0 && bottleneck > 0 {
 		state.Seed = bottleneck / float64(live)
@@ -438,9 +438,16 @@ func activeWindow(roundTrip time.Duration) time.Duration {
 }
 
 // busyLocked counts the busy members: those that reported within
-// activeWindow of their own round trip and delivered at least busyFraction of the bottleneck split
-// evenly split ways. A finished lane stops counting within a few round trips,
-// long before it expires from the model.
+// activeWindow of their own round trip and deliver at least busyFraction of
+// an even split ways of what the active members deliver now. A finished lane
+// stops counting within a few round trips, long before it expires from the
+// model.
+//
+// Busy is judged against current delivery, not against the bottleneck the
+// shares are sized from: that is a ten-second peak, and when a policer or a
+// narrower route cut every lane to a fifth of it, every lane fell below a
+// quarter of the peak's split while still reporting each round, the caps came
+// off, and every lane read the change as its siblings leaving.
 //
 // It does not change the split. Every live member, busy, quiet or not, still
 // takes an even split when there is a cap: the split is also what brakes a
@@ -451,20 +458,32 @@ func activeWindow(roundTrip time.Duration) time.Duration {
 // joiners on a lossy path seed from it, and took their caused loss from 0.04
 // to 0.2. What busy decides is only whether there is a cap at all: with one
 // busy member there is nothing to compound.
-func (m *PathModel) busyLocked(now time.Time, roundTrip time.Duration, bottleneck float64, split int) (busy int) {
-	if split <= 0 || bottleneck <= 0 {
+func (m *PathModel) busyLocked(now time.Time, roundTrip time.Duration, split int) (busy int) {
+	if split <= 0 {
 		return 0
 	}
-	even := bottleneck / float64(split)
-	for _, r := range m.members {
-		// Each member by its own round trip where it has one: at a shared
-		// egress a long-haul lane acknowledged in bursts once a round trip
-		// is not gone between them because a short-haul one is faster.
+	// Each member by its own round trip where it has one: at a shared egress
+	// a long-haul lane acknowledged in bursts once a round trip is not gone
+	// between them because a short-haul one is faster.
+	active := func(r *report) bool {
 		window := activeWindow(roundTrip)
 		if r.roundTrip > 0 {
 			window = activeWindow(r.roundTrip)
 		}
-		if now.Sub(r.at) <= window && r.delivered >= busyFraction*even {
+		return now.Sub(r.at) <= window
+	}
+	current := 0.0
+	for _, r := range m.members {
+		if active(r) {
+			current += r.delivered
+		}
+	}
+	if current <= 0 {
+		return 0
+	}
+	even := current / float64(split)
+	for _, r := range m.members {
+		if active(r) && r.delivered >= busyFraction*even {
 			busy++
 		}
 	}
@@ -550,7 +569,7 @@ func (m *PathModel) Current() State {
 			bottleneck = sample.rate
 		}
 	}
-	busy := m.busyLocked(now, state.RoundTrip, bottleneck, live+1)
+	busy := m.busyLocked(now, state.RoundTrip, live+1)
 	state.LeafRoundTrip = state.RoundTrip
 	if bottleneck > 0 {
 		// The joining lane counts too, or the first thing it does is take a

@@ -197,6 +197,9 @@ type ErasureSender struct {
 	// evidence about its rounds -- and poolWeight the observations the
 	// pool's figure is weighted by. See siblingsErasure.
 	selfSamples, selfLoss, selfObserved, poolWeight, poolErasure float64
+	// selfBurst is this lane's own measured burst factor, what its rounds'
+	// losses are deflated by; the floor keeps the one measured with it.
+	selfBurst float64
 }
 
 type packetOutcome struct {
@@ -628,7 +631,13 @@ func (e *ErasureSender) lossAboveFloor(arrived, lost uint64) bool {
 	if decided == 0 {
 		return false
 	}
-	return e.aboveTheFloor(float64(lost)/decided, decided, e.rampBurst)
+	// The lane's own burst factor once its estimator has enough behind it
+	// to have one, the inherited one until then.
+	burst := e.rampBurst
+	if e.selfSamples >= rampLossSamples && e.selfBurst > 0 {
+		burst = e.selfBurst
+	}
+	return e.aboveTheFloor(float64(lost)/decided, decided, burst)
 }
 
 // aboveTheFloor is the two-proportion test of a loss rate measured over
@@ -1352,6 +1361,7 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		e.share.Store(uint64(state.Share))
 		e.poolSamples, e.poolBurst = state.ErasureSamples, state.ErasureBurst
 		e.selfSamples, e.selfLoss, e.selfObserved = snapshot.Samples, snapshot.Loss, float64(snapshot.Decided)
+		e.selfBurst = snapshot.BurstFactor
 		e.poolWeight, e.poolErasure = state.ErasureWeight, state.Erasure
 		e.poolRTT = state.LeafRoundTrip
 		e.rampGate(eventTime, acked, lost)

@@ -757,6 +757,7 @@ func TestABurstOfErasureOnABurstyFloorDoesNotEndARamp(t *testing.T) {
 		probe := joiningProbe()
 		probe.BurstFactor, probe.ErasureBurst = tc.burst, tc.burst
 		sender := NewErasureSenderOn(1200, probe)
+		sender.selfSamples, sender.selfBurst = 1000, tc.burst
 		primeOwnFloor(sender, 10)
 		closeRound(sender, 70, 30)
 		if got := sender.ramping.Load(); got != tc.ramping {
@@ -1375,17 +1376,28 @@ func TestGradualGrowthAtAConstantLossKeepsTheRamp(t *testing.T) {
 	}
 }
 
-// Confirmation needs enough independent trials after the burst deflation.
+// Confirmation needs enough independent trials after the burst deflation: on
+// a channel losing in runs of 16, a round of 1,000 packets is 62 trials and
+// does not confirm, one of 1,040 is 65 and does.
 func TestConfirmationCountsIndependentTrials(t *testing.T) {
-	probe := joiningProbe()
-	probe.BurstFactor, probe.ErasureBurst = 16, 16
-	sender := NewErasureSenderOn(1200, probe)
-	for !(sender.ownFloorN > 0) {
-		closeRound(sender, 3, 1)
-	}
-	closeRound(sender, 1500, 500)
-	if sender.ownConfirmed {
-		t.Fatalf("confirmed on %.0f independent trials", 2000/16.0)
+	for _, tc := range []struct {
+		packets   int
+		confirmed bool
+	}{{1000, false}, {1040, true}} {
+		probe := joiningProbe()
+		probe.BurstFactor, probe.ErasureBurst = 16, 16
+		sender := NewErasureSenderOn(1200, probe)
+		// The first rounds: 16 x 64 packets at 25%, gathered in one round so
+		// that the synthetic delivery stays bounded.
+		closeRound(sender, 768, 256)
+		if sender.ownFloorN == 0 {
+			t.Fatal("setup: the first round did not gather the own floor")
+		}
+		sender.ownRoundMax = 400 // twice is below either round under test
+		closeRound(sender, tc.packets*3/4, tc.packets/4)
+		if sender.ownConfirmed != tc.confirmed {
+			t.Errorf("%d packets in runs of 16 at the first rounds' loss: confirmed %v, want %v", tc.packets, sender.ownConfirmed, tc.confirmed)
+		}
 	}
 }
 
@@ -1402,5 +1414,18 @@ func TestThePoolIsJudgedByItsOwnBurstFactor(t *testing.T) {
 	sender.poolBurst = 20
 	if sender.poolAboveFloor() {
 		t.Fatal("0.25 on 400 packets lost in runs of 20 read as above the floor")
+	}
+}
+
+// A lane's rounds are deflated by the burstiness it measures itself, not the
+// floor's: a lane inheriting an independent-loss floor that now loses in long
+// runs is seeing a burst, not overflow.
+func TestARoundIsDeflatedByTheLanesOwnBurstFactor(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe()) // floor 0.15, burst 1
+	sender.selfSamples, sender.selfBurst = 1000, 8
+	primeOwnFloor(sender, 10)
+	closeRound(sender, 140, 60)
+	if !sender.ramping.Load() {
+		t.Fatal("60 of 200 lost in runs of 8 -- 25 trials -- ended the ramp")
 	}
 }

@@ -569,8 +569,12 @@ the even split holds the last lane at 5/8 of what it delivers, then 5/8 of
 that as the bottleneck window turns over (#160 item 3); and the finished
 lanes still count as members for five seconds. So a share is imposed only
 when at least two members are *busy* (`pathmodel.busyLocked`): reported
-within `activeWindow` -- four round trips, at least 500 ms -- and delivering at
-least a quarter of an even split. With one busy member there is nothing to
+within `activeWindow` of their own round trip -- four round trips, at least
+500 ms -- and delivering at least a quarter of an even split of what the
+active members deliver *now*. Judged against the ten-second bottleneck peak
+instead, a shared drop in capacity -- a policer cutting every lane to a
+fifth -- left every lane below a quarter of the peak's split while still
+reporting, took every cap off and read to each lane as its siblings leaving. With one busy member there is nothing to
 compound, which is the reason a lone member already went uncapped; and a
 finished lane stops being busy within a second rather than expiring after
 five. The split itself does not move.
@@ -603,7 +607,8 @@ earlier for the same reason (#160 item 3).
   joiner growing 30% a round at a constant 40% over an inherited 15% would
   otherwise end its ramp before it could confirm what it was showing.
 - Each side of a floor test is deflated by its own burst factor (the
-  floor's, and the pool's or the round's), and a member counts as active by
+  floor's, and the pool's, or for a lane's own round the lane's own once it
+  has measured one), and a member counts as active by
   its own round trip, not the node's minimum, so a long-haul lane beside a
   short-haul one is not taken for gone between acknowledgements.
 - ProbeRTT's held-down rounds are not ramp evidence: they neither count as
