@@ -1,11 +1,15 @@
 package pep
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,10 +158,11 @@ func TestAFlowRecordsWhatItsLaneReplacementsDid(t *testing.T) {
 // The grace is what a flow is prepared to wait for a lane that is not there.
 // It was being spent per waiter rather than per outage: run, the frame and
 // control writers and the acknowledgement loop all wait for the same missing
-// lane, so a flow that was never going to be rescued paid the whole grace
-// once for each of them. The live gateway showed it as failures clustered at
-// 76-106 s against a 45 s grace -- two of them, for flows that had finished
-// their work in the first second. See issue #53.
+// lane, so a flow that was never going to be rescued could pay the whole
+// grace once for each of them. Issue #53 first attributed its 76-106 s
+// failure cluster to this; the re-measurement withdrew that (failing flows
+// time out once, and the cluster is idle time plus one grace), but bounding
+// an outage to one grace still bounds the small tail that did wait longer.
 func TestOneOutageSpendsOneGraceHoweverManyWaitersItHas(t *testing.T) {
 	flow := newGraceTestFlow(t)
 	const grace = 300 * time.Millisecond
@@ -332,6 +337,10 @@ func TestZeroLaneRecoveryLogsReturnedRefusal(t *testing.T) {
 	for _, transport := range []TransportKind{TransportQUIC, TransportTCP} {
 		t.Run(string(transport), func(t *testing.T) {
 			rig := newJoinTestRig(t, transport, transport, 1)
+			// The client is not serving yet, so nothing else reads its
+			// logger while it is replaced.
+			records := &lockedRecords{}
+			rig.client.cfg.Logger = slog.New(slog.NewJSONHandler(records, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			flow := newGraceTestFlow(t)
 			t.Cleanup(flow.closeAll)
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -342,6 +351,20 @@ func TestZeroLaneRecoveryLogsReturnedRefusal(t *testing.T) {
 			got := replacementFields(flow)
 			if got["lane_replacement_last_failure"] != "peer_rejected" || got["lane_replacement_failures"] != uint64(1) {
 				t.Fatalf("replacement completion fields = %v", got)
+			}
+			// The counted refusal also has its own line, keyed by flow and
+			// attempt, even though the refusal ends the manager at once.
+			msg := "lane recovery unavailable"
+			if transport == TransportTCP {
+				msg = "TCP bundle lane unavailable"
+			}
+			lines := records.records(t, msg)
+			if len(lines) != 1 {
+				t.Fatalf("refused replacement wrote %d %q lines, want 1", len(lines), msg)
+			}
+			if r := lines[0]; r["level"] != "INFO" || r["flow_id"] != float64(flow.flowID) ||
+				r["attempt"] != float64(1) || r["failure_kind"] != "peer_rejected" {
+				t.Fatalf("refusal line = %v", r)
 			}
 		})
 	}
@@ -474,5 +497,131 @@ func TestLaneJoinDuringGraceExtendsTheBudget(t *testing.T) {
 			t.Fatal("the admitted lane never ended the outage")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// lockedRecords is a JSON log sink a test can read while the code under test
+// may still be writing from another goroutine.
+type lockedRecords struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (r *lockedRecords) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.Write(p)
+}
+
+func (r *lockedRecords) records(t *testing.T, msg string) []map[string]any {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []map[string]any
+	for _, line := range bytes.Split(r.buf.Bytes(), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("log line is not JSON: %q: %v", line, err)
+		}
+		if record["msg"] == msg {
+			out = append(out, record)
+		}
+	}
+	return out
+}
+
+// A zero-lane recovery round that ran out of time is the "path will not carry
+// a handshake" case issue #53 needs to count per attempt. It used to be
+// skipped entirely, leaving only the last-failure category on the flow
+// record. It is now written, keyed by flow and attempt, below warn; a round
+// cancelled because the flow ended stays out of the log.
+func TestLaneRecoveryFailureLogLevels(t *testing.T) {
+	records := &lockedRecords{}
+	client := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewJSONHandler(records, &slog.HandlerOptions{Level: slog.LevelDebug}))}}
+	live := context.Background()
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	client.logLaneRecoveryFailure(live, 7, 1, fmt.Errorf("dial: %w", context.DeadlineExceeded))
+	client.logLaneRecoveryFailure(live, 7, 2, errors.New("handshake failed"))
+	client.logLaneRecoveryFailure(ended, 7, 3, context.Canceled)
+	client.logLaneRecoveryFailure(live, 7, 4, context.Canceled)
+	client.logLaneRecoveryFailure(live, 7, 5, fmt.Errorf("%w: session", errLaneJoinRejected))
+	client.logLaneRecoveryFailure(live, 7, 6, fmt.Errorf("%w: full", errLaneJoinCapacity))
+	// A JOIN that hits the handshake's socket deadline is not a context
+	// deadline, but it is reported as a timeout and logged like one.
+	client.logLaneRecoveryFailure(live, 7, 7, &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded})
+
+	got := records.records(t, "lane recovery unavailable")
+	want := []struct {
+		level, kind string
+		attempt     float64
+	}{
+		{"INFO", "timeout", 1},
+		{"WARN", "other", 2},
+		{"DEBUG", "canceled", 4},
+		{"INFO", "peer_rejected", 5},
+		{"INFO", "peer_capacity", 6},
+		{"INFO", "timeout", 7},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("logged %d recovery failures, want %d: %v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		r := got[i]
+		if r["level"] != w.level || r["failure_kind"] != w.kind || r["attempt"] != w.attempt || r["flow_id"] != float64(7) {
+			t.Fatalf("record %d = %v, want level %s kind %s attempt %v flow_id 7", i, r, w.level, w.kind, w.attempt)
+		}
+	}
+}
+
+// The TCP failure line has to be findable by flow the same way the QUIC one
+// is, or the attempts behind a TCP-carried failure cannot be lined up with
+// its completion record.
+func TestTCPReplacementFailureLogNamesFlowAndAttempt(t *testing.T) {
+	_, roots := testCertificate(t)
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := closed.Addr().String()
+	_ = closed.Close()
+
+	records := &lockedRecords{}
+	client, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: remote,
+		Credentials: roots, Transport: TransportTCP,
+		DialTimeout: time.Second, HandshakeTimeout: time.Second,
+		Logger: slog.New(slog.NewJSONHandler(records, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := newGraceTestFlow(t)
+	t.Cleanup(flow.closeAll)
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	client.manageLanes(ctx, flow, [16]byte{98}, flow.flowID, TransportTCP)
+
+	got := records.records(t, "TCP bundle lane unavailable")
+	if len(got) == 0 {
+		t.Fatal("a refused TCP replacement wrote no failure line")
+	}
+	attempts := flow.replacementAttempts.Load()
+	for i, r := range got {
+		if r["flow_id"] != float64(flow.flowID) || r["replacement"] != true || r["attempt"] != float64(i+1) {
+			t.Fatalf("record %d = %v, want flow_id %d, replacement, attempt %d", i, r, flow.flowID, i+1)
+		}
+		if r["failure_kind"] == nil {
+			t.Fatalf("record %d has no failure_kind: %v", i, r)
+		}
+	}
+	// Every logged attempt was counted; one launched just before the manager
+	// stopped may have been counted without returning.
+	if uint64(len(got)) > attempts || attempts > uint64(len(got))+1 {
+		t.Fatalf("logged %d failed attempts against lane_replacement_attempts %d", len(got), attempts)
 	}
 }
