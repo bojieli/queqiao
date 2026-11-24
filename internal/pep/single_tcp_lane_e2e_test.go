@@ -152,6 +152,25 @@ func (r *singleTCPRig) onlyServerSession(t *testing.T) ([16]byte, *serverFlow, *
 	return [16]byte{}, nil, nil
 }
 
+// waitIdle waits until the gateway's side of the flow has nothing sent and
+// unacknowledged, so the lane that ends next is an idle flow's lane rather
+// than one with data in flight.
+func waitIdle(t *testing.T, session *serverFlow) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for session.flow.pendingOutbound() {
+		if time.Now().After(deadline) {
+			t.Fatal("gateway flow never became idle")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// And stays idle a moment, as the measured flows had.
+	time.Sleep(100 * time.Millisecond)
+	if session.flow.pendingOutbound() {
+		t.Fatal("gateway flow did not stay idle")
+	}
+}
+
 // waitForGatewayLaneReplaced waits for the gateway session to hold a healthy
 // TCP lane other than the one that was closed.
 func waitForGatewayLaneReplaced(t *testing.T, session *serverFlow, closed *mpLane, within time.Duration) {
@@ -210,7 +229,7 @@ func TestSingleTCPLaneEOFWhileIdleRecoversEndToEnd(t *testing.T) {
 	_, session, lane := rig.onlyServerSession(t)
 	// Let the flow go idle: everything is delivered and acknowledged, and
 	// nothing is waiting on the lane when it ends.
-	time.Sleep(300 * time.Millisecond)
+	waitIdle(t, session)
 	if err := lane.fc.Close(); err != nil && !isClosedConnError(err) {
 		t.Fatal(err)
 	}
@@ -257,7 +276,7 @@ func TestSingleTCPLaneEOFWithRefusedReplacementFailsPromptly(t *testing.T) {
 	echoRoundTrip(t, conn, []byte("before the gateway forgets"), 5*time.Second)
 
 	id, session, lane := rig.onlyServerSession(t)
-	time.Sleep(300 * time.Millisecond)
+	waitIdle(t, session)
 	// A gateway restart is the measured case: the session is gone, and the
 	// lane carrying it ends.
 	rig.server.unregisterSession(id, session)
@@ -308,7 +327,7 @@ func TestSingleTCPLaneEOFRetriesThroughUnreachableGateway(t *testing.T) {
 	echoRoundTrip(t, conn, []byte("before the path drops"), 5*time.Second)
 
 	_, session, lane := rig.onlyServerSession(t)
-	time.Sleep(300 * time.Millisecond)
+	waitIdle(t, session)
 	// Cut every connection through the proxy, the flow's lane included, and
 	// refuse new ones: the client sees its lane end and every replacement
 	// dial fail.
@@ -331,8 +350,13 @@ func TestSingleTCPLaneEOFRetriesThroughUnreachableGateway(t *testing.T) {
 	if attempts := recordCount(t, record, "lane_replacement_attempts"); attempts < 2 {
 		t.Fatalf("flow record shows %v zero-lane replacement attempts, want the failed ones and the one that landed: %v", attempts, record)
 	}
-	if failures := recordCount(t, record, "lane_replacement_failures"); failures < 1 {
+	failures := recordCount(t, record, "lane_replacement_failures")
+	if failures < 1 {
 		t.Fatalf("flow record shows %v replacement failures through an unreachable gateway: %v", failures, record)
+	}
+	// The dial that got through is an attempt that did not fail.
+	if attempts := recordCount(t, record, "lane_replacement_attempts"); attempts < failures+1 {
+		t.Fatalf("flow record shows %v attempts for %v failures and one success: %v", attempts, failures, record)
 	}
 	if timeouts := recordCount(t, record, "lane_replacement_timeouts"); timeouts != 0 {
 		t.Fatalf("recovered flow timed out a replacement wait: %v", record)
@@ -352,8 +376,8 @@ func TestSingleTCPLaneEOFWithUnreachableGatewayDialsUntilTheGraceEnds(t *testing
 	conn := dialTestSOCKS(t, rig.clientAddr, rig.echoAddr)
 	defer conn.Close()
 	echoRoundTrip(t, conn, []byte("before the path drops for good"), 5*time.Second)
-	rig.onlyServerSession(t)
-	time.Sleep(300 * time.Millisecond)
+	_, session, _ := rig.onlyServerSession(t)
+	waitIdle(t, session)
 	proxy.setDown(true)
 	downAt := time.Now()
 
@@ -361,11 +385,16 @@ func TestSingleTCPLaneEOFWithUnreachableGatewayDialsUntilTheGraceEnds(t *testing
 	_, _ = io.Copy(io.Discard, conn)
 	record := rig.flowRecord(t, 30*time.Second)
 	elapsed := time.Since(downAt)
-	if elapsed > laneReplacementWait+15*time.Second {
+	// The gateway may come back at any point in the grace, so the flow must
+	// not be given up before it ends.
+	if elapsed < laneReplacementWait-time.Second || elapsed > laneReplacementWait+15*time.Second {
 		t.Fatalf("unreachable flow ended after %v, want about the %v grace", elapsed, laneReplacementWait)
 	}
 	if record["msg"] != "local flow ended with error" {
 		t.Fatalf("flow with an unreachable gateway did not fail: %v", record)
+	}
+	if errText, _ := record["error"].(string); !strings.Contains(errText, errLaneReplacementTimeout.Error()) {
+		t.Fatalf("unreachable flow failed with %q, want the grace to expire", errText)
 	}
 	attempts := recordCount(t, record, "lane_replacement_attempts")
 	failures := recordCount(t, record, "lane_replacement_failures")
