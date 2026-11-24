@@ -3,6 +3,7 @@ package pep
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -36,6 +37,10 @@ import (
 type frameConn struct {
 	control io.ReadWriteCloser
 	bulk    *coded.Path
+	// wire is the version this lane's connection negotiated by ALPN. It is
+	// fixed for the life of the connection: every frame written is stamped
+	// with it, on either substrate, and every frame read must carry it.
+	wire byte
 
 	writeMu contextMutex
 	// writeBuf is reused under writeMu so that every frame reaches the
@@ -143,6 +148,10 @@ func newSplitFrameConnSized(control io.ReadWriteCloser, bulk *coded.Path, readBu
 }
 
 func newSplitFrameConnLimited(control io.ReadWriteCloser, bulk *coded.Path, readBuffer, bulkQueueFrames int) *frameConn {
+	wire, ok := negotiatedWire(control)
+	if !ok {
+		wire = defaultFrameWire()
+	}
 	if readBuffer < 512 || readBuffer > frameReadBuffer {
 		readBuffer = frameReadBuffer
 	}
@@ -152,6 +161,7 @@ func newSplitFrameConnLimited(control io.ReadWriteCloser, bulk *coded.Path, read
 	return &frameConn{
 		control:         control,
 		bulk:            bulk,
+		wire:            wire,
 		reader:          bufio.NewReaderSize(control, readBuffer),
 		bulkQueueFrames: bulkQueueFrames,
 		done:            make(chan struct{}),
@@ -244,7 +254,11 @@ func (c *frameConn) codingBulk() bool { return c.bulk != nil && c.bulk.Coding() 
 // are read by ReadBulk, because merging two substrates into one call means
 // giving one of them the other's semantics.
 func (c *frameConn) Read() (protocol.Frame, error) {
-	return protocol.ReadFrame(c.reader)
+	f, err := protocol.ReadFrameVersion(c.reader, c.wire)
+	if err == nil {
+		observeTestFrame(c.wire, f)
+	}
+	return f, err
 }
 
 // bulkFrames claims this lane's flow's share of the connection's coded
@@ -254,7 +268,7 @@ func (c *frameConn) Read() (protocol.Frame, error) {
 // connection: one stream of them carries every flow multiplexed on it, so a
 // reader per lane would consume frames belonging to other flows.
 func (c *frameConn) bulkFrames(flowID uint64) <-chan protocol.Frame {
-	demux := connBulkDemux(c.bulk, c.bulkQueueFrames)
+	demux := connBulkDemux(c.bulk, c.bulkQueueFrames, c.wire)
 	if demux == nil {
 		return nil
 	}
@@ -262,7 +276,7 @@ func (c *frameConn) bulkFrames(flowID uint64) <-chan protocol.Frame {
 }
 
 func (c *frameConn) releaseBulk(flowID uint64) {
-	if demux := connBulkDemux(c.bulk, c.bulkQueueFrames); demux != nil {
+	if demux := connBulkDemux(c.bulk, c.bulkQueueFrames, c.wire); demux != nil {
 		demux.release(flowID)
 	}
 }
@@ -330,6 +344,7 @@ func (c *frameConn) Write(f protocol.Frame) error {
 // control stream if it will not take it: correctness is not worth trading for
 // the coding.
 func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame) (reliable bool, err error) {
+	f.Header.Version = c.wire
 	buf, err := protocol.AppendFrame(nil, f)
 	if err != nil {
 		return false, err
@@ -342,6 +357,9 @@ func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame) (reliable 
 }
 
 func (c *frameConn) writeLocked(f protocol.Frame) error {
+	// Callers build frames with the preferred version; the connection decides
+	// which one is actually on the wire.
+	f.Header.Version = c.wire
 	buf, err := protocol.AppendFrame(c.writeBuf[:0], f)
 	if err != nil {
 		return err
@@ -436,6 +454,42 @@ func (c *frameConn) writeControlContext(ctx context.Context, f protocol.Frame) e
 		}()
 	}
 	return c.writeLocked(f)
+}
+
+// testFrameWire and testFrameObserver are nil in production. Package tests use
+// them to replay end-to-end scenarios with every lane on one wire version and
+// to inspect every frame a lane accepts.
+var (
+	testFrameWire     atomic.Uint32
+	testFrameObserver atomic.Pointer[func(wire byte, f protocol.Frame)]
+)
+
+// defaultFrameWire is the version of a lane whose transport negotiates none,
+// which outside tests is only ever the preferred one.
+func defaultFrameWire() byte {
+	if forced := byte(testFrameWire.Load()); forced != 0 {
+		return forced
+	}
+	return protocol.Version
+}
+
+func observeTestFrame(wire byte, f protocol.Frame) {
+	if observe := testFrameObserver.Load(); observe != nil {
+		(*observe)(wire, f)
+	}
+}
+
+// negotiatedWire reports the wire version a lane's transport negotiated, when
+// the transport is one that negotiates. Test transports that do not keep the
+// preferred version.
+func negotiatedWire(conn any) (byte, bool) {
+	switch c := conn.(type) {
+	case interface{ negotiatedWire() (byte, bool) }:
+		return c.negotiatedWire()
+	case interface{ ConnectionState() tls.ConnectionState }:
+		return protocol.VersionForALPN(c.ConnectionState().NegotiatedProtocol)
+	}
+	return 0, false
 }
 
 // transport is the substrate a lane's statistics come from. It is the control

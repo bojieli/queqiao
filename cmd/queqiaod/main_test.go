@@ -272,3 +272,28 @@ func TestRuntimeConfigurationLogsRoleSpecificControls(t *testing.T) {
 		})
 	}
 }
+
+func TestWireVersionFlags(t *testing.T) {
+	if got := parseRuntimeForTest(t, false).wireVersions; got != "1,2" {
+		t.Fatalf("--accept-wire defaults to %q, want 1,2", got)
+	}
+	if got := parseRuntimeForTest(t, true).wireVersions; got != "2,1" {
+		t.Fatalf("--wire-versions defaults to %q, want 2,1", got)
+	}
+	if got := parseRuntimeForTest(t, false, "--accept-wire", "2").wireVersions; got != "2" {
+		t.Fatalf("--accept-wire 2 parsed as %q", got)
+	}
+	for _, client := range []bool{false, true} {
+		for _, bad := range []string{"3", "1,1", "", "x"} {
+			opts := parseRuntimeForTest(t, client)
+			opts.wireVersions = bad
+			if err := validateRuntime(opts, client); err == nil {
+				t.Errorf("client=%v accepted wire versions %q", client, bad)
+			}
+		}
+	}
+	// release.yml and validate_release.py match `wire=2` as its own token.
+	if wireAccept() != "1,2" {
+		t.Fatalf("wire_accept = %q, want 1,2", wireAccept())
+	}
+}
