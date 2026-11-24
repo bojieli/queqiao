@@ -164,8 +164,15 @@ func waitIdle(t *testing.T, session *serverFlow) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	// And stays idle a moment, as the measured flows had.
-	time.Sleep(100 * time.Millisecond)
+	// The other direction: the gateway has received the client's bytes (it
+	// echoed them) and schedules their acknowledgement, which its ACK loop
+	// holds for at most ackCoalesceDelay before writing it to the lane. Ten
+	// of those is ample on loopback for the client to have it, and is the
+	// short stretch of idleness the measured flows had before the cut.
+	if session.flow.ackSequence.Load() == 0 {
+		t.Fatal("gateway never acknowledged the client's bytes")
+	}
+	time.Sleep(10 * ackCoalesceDelay)
 	if session.flow.pendingOutbound() {
 		t.Fatal("gateway flow did not stay idle")
 	}
@@ -305,8 +312,11 @@ func TestSingleTCPLaneEOFWithRefusedReplacementFailsPromptly(t *testing.T) {
 	if strings.Contains(errText, errLaneReplacementTimeout.Error()) {
 		t.Fatalf("refused flow failed by timing out its grace: %q", errText)
 	}
-	if attempts := recordCount(t, record, "lane_replacement_attempts"); attempts < 1 {
-		t.Fatalf("flow record shows %v zero-lane replacement attempts, want at least one: %v", attempts, record)
+	// One replacement, refused, and no retry: the refusal is the answer.
+	attempts := recordCount(t, record, "lane_replacement_attempts")
+	failures := recordCount(t, record, "lane_replacement_failures")
+	if attempts != 1 || failures != 1 {
+		t.Fatalf("flow record shows attempts=%v failures=%v, want exactly one refused replacement: %v", attempts, failures, record)
 	}
 	if record["lane_replacement_last_failure"] != "peer_rejected" {
 		t.Fatalf("last replacement failure = %v, want peer_rejected: %v", record["lane_replacement_last_failure"], record)
