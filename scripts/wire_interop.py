@@ -657,9 +657,25 @@ def negotiated_wires(client, gateway):
     return sorted(wires)
 
 
+REFUSAL = re.compile(r'^queqiao_lane_join_refused_total\{reason="([a-z_]+)"\}$')
+
+
 def join_refusals(gateway):
-    """JOINs the gateway answered with a RESET, as either generation logs them."""
-    return sum(1 for record in gateway.process.records() if record.get("msg") == "lane join refused")
+    """JOINs the gateway answered with a RESET, by reason.
+
+    Read from the counters both generations export, not from the refusal log,
+    which is rate limited per reason.
+    """
+    counts = {}
+    for name, value in scrape(gateway.metrics).items():
+        match = REFUSAL.match(name)
+        if match:
+            counts[match.group(1)] = int(value)
+    return counts
+
+
+def refusal_delta(after, before):
+    return {reason: after[reason] - before.get(reason, 0) for reason in after if after[reason] != before.get(reason, 0)}
 
 
 def failure_kind(error):
@@ -723,7 +739,7 @@ def disrupted_transfer(client, gateway, destinations, direction, carrier, disrup
             outcome.update(phase="setup", error="the transfer finished before the disruption was applied")
             return outcome
         outcome["lane_joins"] = lane_joins(gateway, carrier) - applied["joins"]
-        outcome["join_refusals"] = join_refusals(gateway) - applied["refusals"]
+        outcome["join_refusals"] = refusal_delta(join_refusals(gateway), applied["refusals"])
         if outcome["lane_joins"] < 1:
             outcome.update(phase="rescue", kind="unrescued", error=f"the flow completed without a {carrier} lane joining it after the disruption")
     except IntegrityError as error:
@@ -734,7 +750,7 @@ def disrupted_transfer(client, gateway, destinations, direction, carrier, disrup
         outcome["error"] = f"{type(error).__name__}: {error}"
         if applied:
             outcome["lane_joins"] = lane_joins(gateway, carrier) - applied["joins"]
-            outcome["join_refusals"] = join_refusals(gateway) - applied["refusals"]
+            outcome["join_refusals"] = refusal_delta(join_refusals(gateway), applied["refusals"])
     return outcome
 
 
@@ -807,8 +823,8 @@ def judge(results, old_ref):
             reference = baseline.get(item["transport"], {}).get("checks", {}).get(check)
             # Only a rescue the old client never achieved against its own
             # gateway either is excused: same phase, the transfer ending the
-            # same way, and neither more JOINs admitted nor more refused than
-            # there. A JOIN the new gateway refuses is never excused. Setup and integrity failures are never excused.
+            # same way, as many JOINs admitted, and the same refusals by
+            # reason. Any difference in what the gateway did is not excused. Setup and integrity failures are never excused.
             if (
                 item["pairing"].startswith("old-client/")
                 and outcome.get("phase") == "rescue"
@@ -816,8 +832,8 @@ def judge(results, old_ref):
                 and reference.get("phase") == "rescue"
                 and outcome.get("completed") == reference.get("completed")
                 and outcome.get("kind") == reference.get("kind")
-                and outcome.get("lane_joins", 0) <= reference.get("lane_joins", 0)
-                and outcome.get("join_refusals", 0) <= reference.get("join_refusals", 0)
+                and outcome.get("lane_joins", 0) == reference.get("lane_joins", 0)
+                and outcome.get("join_refusals", {}) == reference.get("join_refusals", {})
             ):
                 outcome["baseline"] = f"fails identically against the {old_ref} gateway"
                 continue

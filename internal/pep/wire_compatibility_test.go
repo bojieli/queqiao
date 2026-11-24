@@ -2,6 +2,7 @@ package pep
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -30,14 +31,16 @@ func wireGateway(t *testing.T, ctx context.Context, carrier TransportKind, accep
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The wait for shutdown is registered only once a listener runs, so a
+	// failed bind reports itself instead of hanging the cleanup.
 	done := make(chan struct{})
-	t.Cleanup(func() { <-done })
 	if carrier == TransportTCP {
 		listener, err := net.Listen("tcp4", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
 		go func() { defer close(done); _ = server.ServeListener(ctx, listener) }()
+		t.Cleanup(func() { <-done })
 		return listener.Addr().String()
 	}
 	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
@@ -45,6 +48,7 @@ func wireGateway(t *testing.T, ctx context.Context, carrier TransportKind, accep
 		t.Fatal(err)
 	}
 	go func() { defer close(done); _ = server.ServePacketConn(ctx, packetConn) }()
+	t.Cleanup(func() { <-done })
 	return packetConn.LocalAddr().String()
 }
 
@@ -162,9 +166,16 @@ func TestAFrameOfTheOtherVersionIsRefusedOnANegotiatedLane(t *testing.T) {
 				if _, err := outer.Write(raw); err != nil {
 					t.Fatal(err)
 				}
+				// The gateway must end the lane: a close or a stream reset,
+				// not silence until the local deadline.
 				var buf [1]byte
-				if n, err := outer.Read(buf[:]); err == nil || n != 0 {
+				n, err := outer.Read(buf[:])
+				if err == nil || n != 0 {
 					t.Fatalf("a v%d frame on a v%d lane was answered (%d bytes, %v)", other, negotiated, n, err)
+				}
+				var timeout net.Error
+				if errors.As(err, &timeout) && timeout.Timeout() {
+					t.Fatalf("the gateway left a v%d frame on a v%d lane unanswered and open: %v", other, negotiated, err)
 				}
 			})
 		}

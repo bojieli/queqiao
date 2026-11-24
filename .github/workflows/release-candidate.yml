@@ -187,8 +187,7 @@ jobs:
           name: candidate-wire-interop-${{ github.run_id }}
           path: |
             wire-interop/*/results.json
-            wire-interop/*/*/*.log
-            wire-interop/*/*/*/*.log
+            wire-interop/**/*.log
           if-no-files-found: warn
           retention-days: 30
 
