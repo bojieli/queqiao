@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +45,23 @@ func main() {
 	}
 }
 
+// wireAccept is every wire version this build speaks, ascending: the form
+// --version, the runtime log, and BUILDINFO all print.
+func wireAccept() string {
+	versions := protocol.SupportedVersions()
+	slices.Reverse(versions)
+	return pep.FormatWireVersions(versions)
+}
+
+// mustWireVersions parses a list validateRuntime has already accepted.
+func mustWireVersions(spec string) []byte {
+	versions, err := pep.ParseWireVersions(spec)
+	if err != nil {
+		panic(err)
+	}
+	return versions
+}
+
 func run(args []string) error {
 	if len(args) == 0 {
 		return errors.New("a command is required: provider, enroll, client, service, server, doctor, segments, logs, or version")
@@ -53,7 +71,10 @@ func run(args []string) error {
 		if len(args) != 1 {
 			return errors.New("version takes no arguments")
 		}
-		fmt.Printf("queqiaod %s commit=%s built=%s go=%s wire=%d\n", version, commit, buildDate, goVersion(), protocol.Version)
+		// wire is the preferred version, kept as its own token because release
+		// checks match it exactly; wire_accept is every version this build
+		// can negotiate.
+		fmt.Printf("queqiaod %s commit=%s built=%s go=%s wire=%d wire_accept=%s\n", version, commit, buildDate, goVersion(), protocol.Version, wireAccept())
 		return nil
 	case "provider":
 		return runProvider(args[1:])
@@ -560,6 +581,9 @@ type runtimeOptions struct {
 	logMaxBackups                                               int
 	telemetryLogInterval                                        time.Duration
 	metricsListen                                               string
+	// wireVersions is --accept-wire on a gateway and --wire-versions on a
+	// client: the data-plane wire versions accepted or offered.
+	wireVersions string
 }
 
 func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
@@ -616,7 +640,12 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.Float64Var(&opts.fallbackGraceRTTFactor, "fallback-grace-rtt-factor", 16, "scale the QUIC preference window by this multiple of the observed RTT (0 = fixed fallback-grace)")
 		fs.IntVar(&opts.udpFailureThreshold, "udp-failure-threshold", 3, "UDP failures before cooldown")
 		fs.DurationVar(&opts.udpCooldown, "udp-cooldown", 30*time.Second, "UDP cooldown after repeated failure")
+		fs.StringVar(&opts.wireVersions, "wire-versions", pep.FormatWireVersions(protocol.SupportedVersions()), "data-plane wire versions to offer, most preferred first; the gateway chooses among them")
 	} else {
+		// Ascending, as a set: the gateway negotiates newest first regardless.
+		accepted := protocol.SupportedVersions()
+		slices.Reverse(accepted)
+		fs.StringVar(&opts.wireVersions, "accept-wire", pep.FormatWireVersions(accepted), "data-plane wire versions to accept; the newest one a client offers is negotiated")
 		fs.StringVar(&opts.tcpCongestion, "tcp-congestion", "system", "server TCP congestion controller")
 		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this gateway serves: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.BoolVar(&opts.allowPrivate, "allow-private-destinations", false, "allow private and link-local destinations")
@@ -637,6 +666,13 @@ func resolveProfile(opts *runtimeOptions) error {
 }
 
 func validateRuntime(opts runtimeOptions, client bool) error {
+	if _, err := pep.ParseWireVersions(opts.wireVersions); err != nil {
+		flagName := "--accept-wire"
+		if client {
+			flagName = "--wire-versions"
+		}
+		return fmt.Errorf("%s: %w", flagName, err)
+	}
 	if opts.listen == "" || opts.maxSessions < 1 || opts.maxSessions > 1<<16 {
 		return errors.New("listen address and max-sessions (1-65536) are required")
 	}
@@ -854,7 +890,7 @@ func runServer(args []string) (returnErr error) {
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
 		Logger: logger, UDPOnStream: opts.udpOnStream, Profile: serverProfile,
-		HopPortCount: opts.hopPortCount,
+		HopPortCount: opts.hopPortCount, AcceptWire: mustWireVersions(opts.wireVersions),
 	})
 	if err != nil {
 		return err
@@ -952,7 +988,8 @@ func openRuntimeLogger(opts runtimeOptions, role string) (*slog.Logger, *operlog
 		"log_file", path, "log_format", opts.logFormat, "log_level", opts.logLevel,
 		"log_max_size_mib", opts.logMaxSizeMiB, "log_max_backups", opts.logMaxBackups,
 		"telemetry_interval", opts.telemetryLogInterval,
-		"version", version, "commit", commit, "wire_protocol", protocol.Version)
+		"version", version, "commit", commit, "wire_protocol", protocol.Version,
+		"wire_accept", wireAccept())
 	return logger, sink, nil
 }
 
@@ -970,6 +1007,7 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.Int("chunk_size_bytes", opts.chunkSize),
 		slog.Int("tcp_fallback_lanes", opts.tcpFallbackLanes),
 		slog.Bool("udp_on_stream", opts.udpOnStream),
+		slog.String("wire_versions", opts.wireVersions),
 		slog.Duration("dial_timeout", opts.dialTimeout),
 		slog.Duration("handshake_timeout", opts.handshakeTimeout),
 		slog.Duration("flow_idle_timeout", opts.flowIdleTimeout),
@@ -1132,6 +1170,12 @@ func logPerformanceSnapshot(logger *slog.Logger, s metrics.Snapshot, interval ti
 		slog.Uint64("queqiao_lane_join_refused_session_pending_total", s.LaneJoinRefusals[metrics.LaneJoinSessionPending]),
 		slog.Uint64("queqiao_lane_join_refused_open_failed_total", s.LaneJoinRefusals[metrics.LaneJoinOpenFailed]),
 		slog.Uint64("queqiao_lane_join_refused_session_ended_total", s.LaneJoinRefusals[metrics.LaneJoinSessionEnded]),
+		slog.Uint64("queqiao_lane_join_refused_wire_mismatch_total", s.LaneJoinRefusals[metrics.LaneJoinWireMismatch]),
+		// Per negotiated wire version, matching the labelled /metrics series.
+		slog.Uint64("queqiao_data_connections_wire_1_total", s.DataConnections[0]),
+		slog.Uint64("queqiao_data_connections_wire_2_total", s.DataConnections[1]),
+		slog.Int64("queqiao_wire_active_flows_wire_1", s.WireActiveFlows[0]),
+		slog.Int64("queqiao_wire_active_flows_wire_2", s.WireActiveFlows[1]),
 		slog.Uint64("queqiao_class_transitions_0_total", s.ClassTransitions[0]),
 		slog.Uint64("queqiao_class_transitions_1_total", s.ClassTransitions[1]),
 		slog.Uint64("queqiao_class_transitions_2_total", s.ClassTransitions[2]),

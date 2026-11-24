@@ -75,9 +75,13 @@ Then confirm that the embedded metadata matches the tag:
 cat BUILDINFO
 ```
 
-Both outputs must report `wire=2` / `wire_protocol=2`. The public protocol-2 contract
-accepts only protocol 2 and intentionally provides no compatibility or
-downgrade path for the removed shared-secret protocol.
+Both outputs must report the preferred version, `wire=2` / `wire_protocol=2`,
+and every version the build negotiates, `wire_accept=1,2`. Protocol 1 is the
+v0.12.x wire and is negotiated by ALPN beside protocol 2; there is still no
+compatibility or downgrade path for the removed shared-secret protocol.
+`validate_release.py` requires `wire_accept` to be ascending, to end at
+`wire_protocol`, and to match the SBOM and the `Accepted wire versions` line of
+`docs/PROTOCOL.md`.
 
 Validate the complete directory before executing an archive:
 
@@ -88,7 +92,7 @@ Validate the complete directory before executing an archive:
 The validator checks the complete six-target matrix and its shared provenance,
 checksum coverage, archive paths and modes, build metadata, binary hashes,
 internal/external SBOM identity, dependency/license coverage, and the wire
-version.
+versions.
 
 ## Atomic Unix installation
 
@@ -162,6 +166,21 @@ manifest, and retains them as non-publishing evidence. Pull-request CI does not 
 because GitHub tests a synthetic merge commit for that event.
 The workflow uploads candidate archives and evidence but cannot create a tag or
 GitHub Release.
+
+The candidate also runs `scripts/wire_interop.py`, once each against v0.12.1
+and v0.12.2, the last releases that speak only version 1. It builds the old
+release from its tag and runs real binaries against the candidate on loopback:
+the old client through the candidate gateway and the candidate client through
+the old gateway, each over TCP and QUIC, with a large download, a UDP DNS
+query, a forced stall, a TCP lane cut, and a QUIC-to-TCP handoff. A disruption
+the old client cannot survive against its own gateway either is reported as
+its limitation, not the candidate's. It is the only check of the old wire against code that was
+actually released, so a candidate whose gateway rejects something a deployed
+v0.12 client sends fails here rather than in the field. Run it locally with:
+
+```sh
+./scripts/wire_interop.py --output-dir /tmp/wire-interop
+```
 
 The current Go vulnerability database also reports GO-2026-5932 at module
 scope because `golang.org/x/crypto` contains the unmaintained `openpgp` package.

@@ -1,27 +1,30 @@
-# Queqiao protocol version 2
+# Queqiao protocol versions 1 and 2
 
 > [!IMPORTANT]
-> **Status:** Explicit replacement JOIN wire contract
+> **Status:** Explicit replacement JOIN wire contract, negotiated per connection
 >
 > **Wire version byte:** `2`
 >
-> **Data ALPN:** `queqiao/2`
+> **Accepted wire versions:** `1,2`
 >
-> **Compatibility:** Version 2 only; mismatches fail closed
-> **Last reviewed:** 2026-09-27
+> **Data ALPN:** `queqiao/2` (preferred), `queqiao/1`
+>
+> **Compatibility:** Version negotiated by ALPN; no common version fails closed
+> **Last reviewed:** 2026-11-24
 
-This document specifies wire version 2. It adds the `REPLACE_LANE` JOIN flag
-and replacement lane ID. Wire version 1 remains archived in
-`testdata/protocol1/vectors.json`; it is not accepted by this build.
+This document specifies wire version 2 and the version 1 it extends. Version 2
+adds one thing: the `REPLACE_LANE` JOIN flag and its replacement lane ID
+(§6, §10). Every other frame, flag, payload, reset code, and the coded datagram
+substrate are identical in both versions, apart from the version byte itself.
 
-**Upgrade:** upgrade clients and gateways as a pair. Version 1 (`queqiao/1`)
-and version 2 (`queqiao/2`) MUST refuse one another during TLS negotiation,
-on both TCP and QUIC, before OPEN or destination dialing. There is no automatic
-downgrade or dual-version listener. To preserve active traffic, keep the old
-pair running, bring up a version-2 gateway on a separate endpoint and a paired
-client, verify that path, then move traffic. Keep the old pair available for
-rollback until existing flows drain. Invitation, enrollment, renewal, and
-coded datagram formats are unchanged.
+A build speaks both. Each data connection negotiates exactly one version by
+ALPN (§2.3) and keeps it for its life; every frame on it carries that version
+byte. A gateway accepts both versions by default and a client offers both,
+preferring 2, so gateways can be upgraded ahead of their clients and clients
+move at their own pace. A client of this build also works against a gateway
+that speaks only version 1. Versions are never mixed within one flow (§10.1).
+Invitation, enrollment, renewal, and coded datagram formats are unchanged.
+The version history is in §18.1.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** describe protocol
 requirements. Unless stated otherwise, integers are unsigned and encoded in
@@ -29,7 +32,7 @@ network byte order (big-endian).
 
 ## 1. Protocol layers
 
-Queqiao version 2 has four related layers:
+Queqiao has four related layers:
 
 1. **Identity bootstrap:** a `queqiao://` invitation and a bounded enrollment
    exchange create a per-device identity.
@@ -50,8 +53,8 @@ The gateway normally listens on the same numeric port for UDP and TCP.
 
 | Purpose | Carrier | TLS authentication | ALPN |
 | --- | --- | --- | --- |
-| Data over QUIC | QUIC over UDP | mutual TLS | `queqiao/2` |
-| Data over TCP | TLS over TCP | mutual TLS | `queqiao/2` |
+| Data over QUIC | QUIC over UDP | mutual TLS | `queqiao/2` or `queqiao/1` |
+| Data over TCP | TLS over TCP | mutual TLS | `queqiao/2` or `queqiao/1` |
 | First enrollment | TLS over TCP | pinned gateway; no client certificate | `queqiao-enroll/1` |
 | Device renewal | TLS over TCP | mutual TLS | `queqiao-renew/1` |
 
@@ -92,10 +95,36 @@ client offers exactly `queqiao-enroll/1`. Renewal is selected only when the
 client offers exactly `queqiao-renew/1`. Offering either control ALPN alongside
 another protocol MUST NOT select the weaker enrollment configuration.
 
-A data connection that does not negotiate `queqiao/2` is incompatible and MUST
-be rejected. Neither endpoint falls back to a previous Queqiao protocol.
+### 2.3 Wire version negotiation
 
-### 2.3 QUIC and TCP carriage
+The data ALPN names the wire version: `queqiao/1` is version 1 and `queqiao/2`
+is version 2. A client offers the data ALPNs of every version it is willing to
+speak; a gateway selects one by its own preference, newest first, among those
+it accepts. The client's order does not steer the choice. A client offering
+only one version gets that version or no connection.
+
+| Gateway accepts | Client offers | Negotiated |
+| --- | --- | --- |
+| 1, 2 | 2, 1 | 2 |
+| 1, 2 | 1 | 1 |
+| 1 | 2, 1 | 1 |
+| 2 | 1 | none: TLS fails |
+
+Both endpoints MUST treat the negotiated ALPN as fixing the version of every
+frame on that connection, in both directions and on both substrates: the
+reliable stream and, on QUIC, the coded datagrams. A receiver MUST reject a
+frame whose version byte differs from the negotiated version, even one it could
+speak on another connection, and MUST NOT resynchronize within the connection.
+A data connection that negotiates no data ALPN the endpoint offered or accepts
+MUST be closed before any frame is exchanged.
+
+ALPN is inside the TLS 1.3 handshake transcript that both endpoints
+authenticate, so an on-path attacker cannot remove a version from the offer to
+force an older one. The enrollment and renewal isolation of §2.2 is unchanged:
+offering a data ALPN alongside a control ALPN selects the mutually
+authenticated data configuration.
+
+### 2.4 QUIC and TCP carriage
 
 Each QUIC bidirectional stream or TLS/TCP connection carries a sequence of
 Queqiao frames on its reliable byte stream. QUIC connections negotiate DATAGRAM
@@ -130,10 +159,10 @@ of an identifier alone.
 
 Every logical frame begins with this fixed 46-byte header:
 
-| Offset | Size | Field | Version-1 rule |
+| Offset | Size | Field | Rule |
 | ---: | ---: | --- | --- |
 | 0 | 2 | magic | ASCII `WO` (`0x57 0x4f`) |
-| 2 | 1 | version | `0x01` |
+| 2 | 1 | version | The connection's negotiated version: `0x01` or `0x02` |
 | 3 | 1 | type | One value from §5 |
 | 4 | 2 | flags | Only flags valid for the frame type |
 | 6 | 16 | session ID | Opaque bytes |
@@ -155,13 +184,14 @@ is 131072, MUST reject one whose payload length is 131073 or more, and MUST
 apply the same limit in both directions. An implementation MUST NOT expose the
 limit as configuration.
 
-This is a consequence of version 2 having no capability negotiation. Two peers
+This is a consequence of the wire having no capability negotiation beyond the
+version itself, and the limit is the same in both versions. Two peers
 holding different limits are mutually intelligible in one direction only, and
 the symptom -- a frame the sender considers legal being refused as malformed --
 names neither the setting nor the peer that holds it. A limit that is not
 negotiated must therefore be fixed.
 
-The value is derived rather than round. The largest frame version 2 can require
+The value is derived rather than round. The largest frame either version can require
 a peer to accept is a PACKET (§13) carrying a maximum-size UDP datagram to a
 maximum-length destination:
 
@@ -184,10 +214,11 @@ it is invisible until a specific datagram arrives.
 
 ### 4.2 Rejection
 
-The receiver MUST reject bad magic, a version other than 1, an unknown type,
-unknown flags, a class above 2, non-zero reserved bytes, or a payload length
-above 131072. A version mismatch is reported distinctly from malformed framing
-so an operator can perform a coordinated upgrade.
+The receiver MUST reject bad magic, a version other than the connection's
+negotiated version, an unknown type, flags unknown to that version, a class
+above 2, non-zero reserved bytes, or a payload length above 131072. A version
+mismatch is reported distinctly from malformed framing, because it names a peer
+that disagrees with its own handshake rather than a damaged frame.
 
 A receiver that rejects a frame for exceeding the payload limit MUST treat the
 connection as carrying a peer that disagrees about the wire, and MUST NOT
@@ -222,12 +253,14 @@ later frames must match the session and flow established by that first frame.
 | 3 | `ACK_DOWN` | ACK covers gateway-to-client bytes |
 | 4 | `CLOSE_ABORT` | CLOSE cancels both directions instead of half-closing one |
 | 5 | `RESERVE_CONTROL` | OPEN reserves the initial lane as control, or JOIN replaces that role |
-| 6 | `REPLACE_LANE` | JOIN names the old lane being replaced |
+| 6 | `REPLACE_LANE` | Version 2 only: JOIN names the old lane being replaced |
 | 7 | `ACK_RANGES` | ACK payload contains selective byte ranges |
 
 Bits 8–15 are reserved and MUST be zero. `RESERVE_CONTROL` is invalid on
 any type other than OPEN or JOIN. `ACK_RANGES` is invalid on any type other
-than ACK. `REPLACE_LANE` is invalid on any type other than JOIN.
+than ACK. `REPLACE_LANE` is invalid on any type other than JOIN. On version 1,
+bit 6 is reserved: a version-1 sender MUST NOT set it and a version-1 receiver
+MUST reject a frame that does.
 
 State-machine validation is stricter than header parsing:
 
@@ -395,7 +428,8 @@ destination socket or application payload is retained in the tombstone.
 
 JOIN is the first frame on a separately authenticated stream or TLS/TCP
 connection. It uses the existing non-zero session/flow IDs, sequence zero, and
-an exactly eight-byte non-zero lane ID payload. With `REPLACE_LANE`, the payload
+an exactly eight-byte non-zero lane ID payload. With `REPLACE_LANE` (version 2
+only), the payload
 is exactly 16 bytes: the new lane ID followed by the old lane ID, both big-endian
 uint64 values. The old ID may be zero (the initial lane). Equal IDs do not
 retire an existing lane; the normal duplicate-ID check still applies. An absent old lane does not authorize evicting a young rescue
@@ -424,6 +458,23 @@ time, apart from bounded transition/recovery state.
 When the first TCP replacement is accepted for a QUIC flow, both endpoints
 retire QUIC data lanes and continue on TCP. They do not mix QUIC and TCP data
 for the same flow.
+
+### 10.1 One version per flow
+
+A flow speaks the wire version its OPEN negotiated, on every lane, for its
+whole life. A gateway MUST record that version at OPEN and MUST refuse a JOIN
+for the flow that arrives on a connection of another version, with a
+`PROTOCOL` RESET (§15) whose text is `wire version mismatch`, leaving the flow
+and its existing lanes untouched. A client MUST dial every JOIN for a flow
+offering only the flow's version, and MUST NOT carry a flow's JOIN on a pooled
+connection that negotiated a different one.
+
+A version-1 flow has no `REPLACE_LANE`. Where a version-2 client would send an
+explicit replacement, it sends the plain JOIN, and the gateway admits it by its
+ordinary rules: a QUIC flow that has handed off to TCP takes the TCP lane, and
+at the lane ceiling the oldest lane whose transport has had its dead-path
+detection time to fail is retired. This is exactly how a version-1 gateway
+admits a rescue.
 
 ## 11. Reliable and datagram substrates
 
@@ -636,7 +687,8 @@ that sent `n` frames and read `m` echoes therefore faces exactly three cases:
    The client MUST treat it as an unfinished measurement and MUST NOT draw any
    conclusion about the peer from it.
 3. The stream ended, or an echo did not match, with `m < n`. The peer does not
-   implement §14.1. Because the version byte and the ALPN both said it did,
+   implement §14.1. Because the version byte and the ALPN both said it did --
+   the echo is the same in both versions --
    this is a disagreement about the wire and not a path condition.
 
 In case 3 the client MUST NOT continue using the connection. It MUST close the
@@ -646,8 +698,8 @@ call for opposite responses -- a failed lane is retried, and a peer that does
 not implement the protocol is not.
 
 A client MUST NOT tolerate a missing or partial echo as a compatibility
-allowance. Version 2 has no capability negotiation, so
-a peer that negotiated `queqiao/2` and then did not echo is not an older build;
+allowance. No version lacks the echo, so a peer that negotiated a data ALPN
+and then did not echo is not an older build;
 it is a peer this client cannot make correct measurements against, and silently
 degrading to no measurement hides that.
 
@@ -669,12 +721,14 @@ diagnostic UTF-8 text. Codes are:
 
 Messages are deliberately coarse and MUST NOT expose private authorization or
 infrastructure detail. A RESET is terminal for the stream/attempt it addresses.
+The codes are the same in both versions; an endpoint MUST NOT send a version-1
+peer a code outside this table.
 
 ## 16. Enrollment and renewal messages
 
 Invitation/profile schema versions and enrollment-service version 1 are
-independent namespaces from the data-plane wire byte and remain unchanged
-when the data plane moves to version 2.
+independent namespaces from the data-plane wire byte and are the same whichever
+data version a connection negotiates.
 
 ### 16.1 Invitation URI
 
@@ -741,23 +795,39 @@ lost.
 
 ## 18. Versioning and extension rules
 
-Version 2 has no generic capability-negotiation frame and no “ignore unknown”
+The wire version, negotiated once per connection by ALPN (§2.3), is the only
+capability negotiation. There is no capability frame and no “ignore unknown”
 extension rule. Unknown frame types, flags, classes, reserved bits, and wire
 versions fail closed.
 
 A future change that alters parsing, authentication, frame semantics, coded
 datagram decoding, or state-machine behavior MUST increment the data protocol
-version and change the data ALPN accordingly. It must document whether and how
-operators can run both versions during a coordinated migration. Pre-1.0
-software versioning does not waive this wire rule.
+version and change the data ALPN accordingly. It must state whether builds
+negotiate the new version alongside the old ones, and what an endpoint does on
+a connection of each. Pre-1.0 software versioning does not waive this wire
+rule.
 
-Changes to sender-only tuning that preserve every version-1 wire invariant—such
+Changes to sender-only tuning that preserve every wire invariant of every
+negotiable version—such
 as pacing gains, classification thresholds, FEC rate selection, queue limits,
 or fallback timing—do not require a wire increment.
 
 Regenerating the conformance vectors in §20 is a wire change by definition. If
 this build no longer produces them, either the wire moved and this section
 applies, or a regression was introduced; there is no third case.
+
+### 18.1 Version history
+
+| Version | Data ALPN | First release | Change | Status |
+| ---: | --- | --- | --- | --- |
+| 1 | `queqiao/1` | v0.12.0 | First public wire contract | The only version of v0.12.x; negotiated again by every build after v0.13.0 |
+| 2 | `queqiao/2` | v0.13.0 | Adds `REPLACE_LANE` and the 16-byte replacement JOIN payload | Preferred |
+
+v0.13.0 spoke version 2 only and refused version 1 at TLS negotiation. Builds
+after it negotiate both, so a v0.12.x client reaches a current gateway on version 1
+and a current client reaches a v0.12.x gateway the same way. A gateway may be
+restricted to a subset of versions; that is how a deployment retires version 1
+once no client needs it.
 
 ## 19. Security and resource invariants
 
@@ -776,7 +846,7 @@ applies, or a regression was introduced; there is no third case.
 
 ## 20. Conformance vectors
 
-Prose is not sufficient to specify all of version 2. The repair coefficients of
+Prose is not sufficient to specify the wire. The repair coefficients of
 §12.3 are computed on both endpoints and never transmitted, so an
 implementation that gets one shift or one multiplier wrong is not detectably
 wrong on the wire -- its repairs arrive well-formed and fail to solve, and the
@@ -785,8 +855,12 @@ Destination canonicalization has the same shape: two implementations that
 canonicalize differently disagree about the identity of a destination without
 either observing a parse error.
 
-[`testdata/protocol2/vectors.json`](../testdata/protocol2/vectors.json) is
-therefore normative. It is a frozen artifact, not a generated one. It covers:
+[`testdata/protocol2/vectors.json`](../testdata/protocol2/vectors.json) and
+[`testdata/protocol1/vectors.json`](../testdata/protocol1/vectors.json) are
+therefore normative, one per version. They are frozen artifacts, not generated
+ones, and differ only where the versions do: the version byte, the replacement
+JOIN header that only version 2 accepts, and what bit 6 means on DATA. Each
+covers:
 
 | Section | What it pins |
 | --- | --- |
@@ -806,8 +880,9 @@ fixed timestamps and a `parsed_at` instant to validate it against, because an
 invitation is valid for at most seven days and a vector built against the wall
 clock would be either unbuildable or unverifiable.
 
-An implementation MUST reproduce the accepted vectors byte for byte and MUST
-refuse every vector marked `reject`. Two implementations that agree on this
+An implementation MUST reproduce the accepted vectors of every version it
+negotiates byte for byte, decoding each file's headers as a connection of that
+version, and MUST refuse every vector marked `reject`. Two implementations that agree on this
 document but not on this file do not interoperate.
 
 The broader threat model, credential lifecycle, and residual risks are in

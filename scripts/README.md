@@ -214,6 +214,27 @@ checksummed provenance bundle:
 This is the deterministic release soak and runs weekly at a smaller count. It
 does not replace broader live NAT and middlebox campaigns.
 
+## Wire-version interoperability
+
+`wire_interop.py` builds the last version-1 release (`v0.12.1` by default)
+from its tag in a temporary worktree, builds this tree, and runs real binaries
+against each other on loopback: the old client through the new gateway, the
+new client through the old gateway, and new to new as the control. Over each
+of TCP and QUIC it runs a large download, a DNS query through a SOCKS5 UDP
+association, and a forced stall, in which a relay in front of the gateway
+black-holes every connection it carries while letting new ones through. It
+checks the bytes, the wire version each pairing negotiated, and that a lane
+joined the stalled flow, and writes `results.json` and every process log to
+the output directory:
+
+```sh
+./scripts/wire_interop.py --output-dir /tmp/queqiao-wire-interop
+```
+
+`--old-ref v0.12.2` tests the other version-1 release, as the candidate gate
+does; `--old-binary` and `--new-binary` reuse existing builds. Nothing listens beyond
+127.0.0.1. The release-candidate workflow runs it on every candidate.
+
 `field_soak.py` is the long-duration real-path harness. It keeps one SOCKS5 UDP
 association alive while opening independent verified HTTPS flows, snapshots
 metrics and process resources, writes redacted JSON Lines events, applies

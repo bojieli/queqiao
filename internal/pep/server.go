@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -75,6 +76,13 @@ type ServerConfig struct {
 	// route responses back through whichever port each client most recently
 	// used.
 	HopPortCount int
+	// AcceptWire lists the data-plane wire versions this gateway accepts. The
+	// order does not matter: the gateway always negotiates the newest version
+	// the client also offers. Empty accepts every version this build speaks,
+	// which is what lets gateways be upgraded ahead of their clients; a
+	// single version emulates a gateway that speaks only that one, and is how
+	// a deployment retires a version once its clients have moved.
+	AcceptWire []byte
 	// testLaneWriteHook is intentionally unexported and nil in production. It
 	// lets package integration tests reproduce loss of a specific logical
 	// frame without depending on encrypted QUIC packet layout.
@@ -118,8 +126,12 @@ type Server struct {
 }
 
 type serverFlow struct {
-	flow        *multipathFlow
-	principal   identity.Principal
+	flow      *multipathFlow
+	principal identity.Principal
+	// wire is the version the flow's OPEN negotiated. A flow keeps it for
+	// life: a JOIN arriving on a connection of another version is refused
+	// rather than mixed into the flow. Zero means the preferred version.
+	wire        byte
 	maxLanes    int
 	tcpMaxLanes int
 	tcpMode     bool
@@ -249,6 +261,14 @@ func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, repla
 	return nil
 }
 
+// wireVersion is the version the flow is pinned to.
+func (s *serverFlow) wireVersion() byte {
+	if s.wire == 0 {
+		return defaultFrameWire()
+	}
+	return s.wire
+}
+
 func newServerFlow(flow *multipathFlow, principal identity.Principal, initialKind TransportKind, tcpMaxLanes int) *serverFlow {
 	serverSession := &serverFlow{
 		flow: flow, principal: principal, maxLanes: serverLaneBudget(flow.reserveControlLane),
@@ -294,13 +314,20 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.MaxSessions > maxConfiguredSessions {
 		return nil, fmt.Errorf("maximum sessions must not exceed %d", maxConfiguredSessions)
 	}
+	acceptWire, err := resolveWireVersions(cfg.AcceptWire)
+	if err != nil {
+		return nil, fmt.Errorf("accepted wire versions: %w", err)
+	}
+	// The gateway's preference is what negotiates, so its list is kept newest
+	// first whatever order it was configured in.
+	slices.SortFunc(acceptWire, func(a, b byte) int { return int(b) - int(a) })
+	cfg.AcceptWire = acceptWire
 	if cfg.TCPFallbackLanes == 0 {
 		cfg.TCPFallbackLanes = maxTCPFallbackLanes
 	}
 	if cfg.TCPFallbackLanes < 1 || cfg.TCPFallbackLanes > maxTCPFallbackLanes {
 		return nil, fmt.Errorf("TCP fallback lanes must be between 1 and %d", maxTCPFallbackLanes)
 	}
-	var err error
 	cfg.TCPCongestion, err = normalizeTCPCongestion(cfg.TCPCongestion)
 	if err != nil {
 		return nil, err
@@ -477,7 +504,7 @@ func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error
 		_ = listener.Close()
 	}()
 
-	tlsConfig, err := identity.ServerTLSConfig(s.cfg.Credentials, defaultALPN, s.cfg.Enrollment != nil)
+	tlsConfig, err := identity.ServerTLSConfigProtocols(s.cfg.Credentials, wireALPNs(s.acceptWire()), s.cfg.Enrollment != nil)
 	if err != nil {
 		return fmt.Errorf("configure server TLS identity: %w", err)
 	}
@@ -545,13 +572,15 @@ func (s *Server) handleTCP(ctx context.Context, conn *tls.Conn) {
 		}
 		return
 	}
-	if state.NegotiatedProtocol != defaultALPN {
+	wire, ok := checkNegotiatedWire(state.NegotiatedProtocol, s.acceptWire())
+	if !ok {
 		return
 	}
 	principal, err := identity.PrincipalFromTLS(state)
 	if err != nil {
 		return
 	}
+	s.metrics.DataConnectionAccepted(wire)
 	s.handleSession(ctx, conn, principal, nil)
 }
 
@@ -595,7 +624,7 @@ func (s *Server) serveQUIC(ctx context.Context) error {
 
 // ServePacketConn runs the QUIC listener on an already-bound UDP socket.
 func (s *Server) ServePacketConn(ctx context.Context, packetConn net.PacketConn) error {
-	tlsConfig, err := identity.ServerTLSConfig(s.cfg.Credentials, defaultALPN, s.cfg.Enrollment != nil)
+	tlsConfig, err := identity.ServerTLSConfigProtocols(s.cfg.Credentials, wireALPNs(s.acceptWire()), s.cfg.Enrollment != nil)
 	if err != nil {
 		_ = packetConn.Close()
 		return fmt.Errorf("configure server TLS identity: %w", err)
@@ -716,13 +745,15 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 		}
 		return
 	}
-	if state.NegotiatedProtocol != defaultALPN {
+	wire, ok := checkNegotiatedWire(state.NegotiatedProtocol, s.acceptWire())
+	if !ok {
 		return
 	}
 	principal, err := identity.PrincipalFromTLS(state)
 	if err != nil {
 		return
 	}
+	s.metrics.DataConnectionAccepted(wire)
 	auth := &quicAuthState{principal: principal}
 	// Mutual TLS authenticates the whole QUIC connection before any stream is
 	// accepted. Every stream therefore begins directly with OPEN or JOIN.
@@ -786,7 +817,13 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		return
 	}
 	if open.Header.Type == protocol.TypeJoin {
-		validJoinFlags := protocol.FlagReserveControl | protocol.FlagReplaceLane
+		validJoinFlags := protocol.FlagReserveControl
+		if protocol.HasReplaceLane(fc.wire) {
+			// A version-1 connection cannot carry the flag at all; its decoder
+			// has already refused the frame. Restating it here keeps the rule
+			// next to the payload lengths it decides.
+			validJoinFlags |= protocol.FlagReplaceLane
+		}
 		if session.IsZeroSessionID(open.Header.SessionID) || open.Header.FlowID == 0 || open.Header.Sequence != 0 || open.Header.Flags&^validJoinFlags != 0 || len(open.Payload) != 8 && len(open.Payload) != 16 || len(open.Payload) == 16 && open.Header.Flags&protocol.FlagReplaceLane == 0 || len(open.Payload) == 8 && open.Header.Flags&protocol.FlagReplaceLane != 0 {
 			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: open.Header.SessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}, Payload: session.ResetPayload(session.ResetProtocol, "invalid lane join")})
 			return
@@ -832,7 +869,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	// DATA, and may need a replacement lane, as soon as its OPEN is written;
 	// a JOIN that overtook a slow dial used to find no session and get the
 	// permanent "unknown session" answer for a flow that was about to exist.
-	pending, ok := s.beginPendingSession(sessionID, open.Header.FlowID, principal)
+	pending, ok := s.beginPendingSession(sessionID, open.Header.FlowID, principal, fc.wire)
 	if !ok {
 		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetFlowLimit, "session already exists")})
 		return
@@ -849,7 +886,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		s.cfg.Logger.Debug("destination dial failed", "error", err)
 		return
 	}
-	s.cfg.Logger.Debug("remote flow opened", "transport", transportKindForConn(conn), "account", principal.AccountID, "device", principal.DeviceID, "open_duration", destinationDialStarted.Sub(sessionStarted), "destination_dial_duration", time.Since(destinationDialStarted), "total_duration", time.Since(sessionStarted))
+	s.cfg.Logger.Debug("remote flow opened", "transport", transportKindForConn(conn), "wire", fc.wire, "account", principal.AccountID, "device", principal.DeviceID, "open_duration", destinationDialStarted.Sub(sessionStarted), "destination_dial_duration", time.Since(destinationDialStarted), "total_duration", time.Since(sessionStarted))
 	defer destinationConn.Close()
 	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
 	flow.classifier = classifier.New(s.classifierConfig())
@@ -864,6 +901,8 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow.resetOnFailure = true
 	initialKind := transportKindForConn(conn)
 	serverSession := newServerFlow(flow, principal, initialKind, s.cfg.TCPFallbackLanes)
+	serverSession.wire = fc.wire
+	flow.wire = fc.wire
 	openLane := &mpLane{
 		id: laneID, kind: initialKind, fc: fc, writeHook: s.cfg.testLaneWriteHook,
 		control: flow.reserveControlLane && initialKind == TransportQUIC,
@@ -908,7 +947,9 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	settlePending()
 	_ = conn.SetDeadline(time.Time{})
 	s.metrics.FlowStarted()
+	s.metrics.WireFlowStarted(fc.wire)
 	stats, err := flow.run(ctx)
+	s.metrics.WireFlowFinished(fc.wire)
 	// A peer may close the transport immediately after receiving the final
 	// bytes, racing the server's final-ACK bookkeeping. If both directions
 	// have observed FIN sequences, the logical flow is complete even when the
@@ -931,7 +972,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	codedFrames, streamFrames := flow.dataSubstrates()
 	substrate, hasCoded := flow.codedSubstrate()
 	logFields := []any{"session_id", fmt.Sprintf("%x", sessionID), "flow_id", flow.flowID,
-		"transport", transportKindForConn(conn), "bytes_from_client", stats.BytesRead, "bytes_to_client", stats.BytesSent,
+		"transport", transportKindForConn(conn), "wire", fc.wire, "bytes_from_client", stats.BytesRead, "bytes_to_client", stats.BytesSent,
 		"duration", stats.Ended.Sub(stats.Started), "lane_bytes", stats.LaneBytes,
 		// Where the payload went. The server is the sender for a download, so
 		// this is the split that decides what a download costs.
@@ -1035,11 +1076,24 @@ func (s *Server) retainCompletedSession(sessionID [16]byte, serverSession *serve
 // refusals were only diagnosable from the peer, which is the one place the
 // answer is least useful. A refused join is a flow that is about to fail, so
 // it belongs at the level a failing flow is reported at.
+// wireMismatchAnswer is the RESET message for a JOIN whose connection
+// negotiated a different wire version from the flow it names. The code is
+// ResetProtocol, which every version already knows.
+const wireMismatchAnswer = "wire version mismatch"
+
+// acceptWire is the versions this gateway negotiates, newest first.
+func (s *Server) acceptWire() []byte {
+	if len(s.cfg.AcceptWire) == 0 {
+		return protocol.SupportedVersions()
+	}
+	return s.cfg.AcceptWire
+}
+
 func (s *Server) refuseLaneJoin(fc *frameConn, sessionID [16]byte, flowID, laneID uint64, reason metrics.LaneJoinRefusal, code session.ResetCode, message string) {
 	s.metrics.LaneJoinRefused(reason)
 	if write, suppressed, total := s.refusals.due(reason, time.Now()); write {
 		level := slog.LevelInfo
-		if reason == metrics.LaneJoinPrincipalMismatch || reason == metrics.LaneJoinFlowMismatch {
+		if reason == metrics.LaneJoinPrincipalMismatch || reason == metrics.LaneJoinFlowMismatch || reason == metrics.LaneJoinWireMismatch {
 			// Not a lost session: a peer that authenticated is naming a live
 			// session that is not the one it holds. That is a build
 			// disagreeing about the wire or a peer reaching for identifiers
@@ -1048,6 +1102,7 @@ func (s *Server) refuseLaneJoin(fc *frameConn, sessionID [16]byte, flowID, laneI
 		}
 		s.cfg.Logger.LogAttrs(context.Background(), level, "lane join refused",
 			slog.String("reason", reason.String()),
+			slog.Int("wire", int(fc.wire)),
 			slog.Uint64("lane", laneID),
 			slog.Uint64("flow_id", flowID),
 			slog.Uint64("suppressed", suppressed),
@@ -1071,7 +1126,11 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinInvalidIdentity, session.ResetProtocol, "invalid lane join identity")
 		return
 	}
-	serverSession, pending := s.lookupLiveOrPending(sessionID, open.Header.FlowID, principal)
+	serverSession, pending, wrongWire := s.lookupLiveOrPending(sessionID, open.Header.FlowID, principal, fc.wire)
+	if wrongWire {
+		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinWireMismatch, session.ResetProtocol, wireMismatchAnswer)
+		return
+	}
 	// A matching pending OPEN takes precedence even once its session is in
 	// the table: until its OPEN_OK is written, a JOIN admitted now could
 	// retire the OPEN's lane under it.
@@ -1115,6 +1174,14 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		return
 	case !samePrincipal(serverSession.principal, principal):
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinPrincipalMismatch, session.ResetProtocol, "unknown session")
+		return
+	case serverSession.wireVersion() != fc.wire:
+		// A flow speaks the version its OPEN negotiated, on every lane. The
+		// versions frame the same bytes differently only at the JOIN, but a
+		// flow whose lanes disagree about the wire is one nobody has tested,
+		// and a client that pins its flows never asks for it. The flow itself
+		// is left alone: this lane is refused, not the session.
+		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinWireMismatch, session.ResetProtocol, wireMismatchAnswer)
 		return
 	}
 	// A JOIN that gets this far is the peer's rescue, observable while it is
@@ -1434,6 +1501,9 @@ var pendingJoinWait = 5 * time.Second
 type pendingSession struct {
 	flowID    uint64
 	principal identity.Principal
+	// wire is the version the OPEN negotiated, so a JOIN of another version
+	// is refused before it can wait on, or ask to rescue, this OPEN.
+	wire byte
 	// done is closed once the OPEN has either registered its session or
 	// failed; admitted, written before, says which.
 	done     chan struct{}
@@ -1458,7 +1528,7 @@ const (
 // beginPendingSession announces a session whose OPEN is being dialled. It
 // refuses an identifier that is already pending or live, which is what
 // registerSession would have answered after the dial.
-func (s *Server) beginPendingSession(id [16]byte, flowID uint64, principal identity.Principal) (*pendingSession, bool) {
+func (s *Server) beginPendingSession(id [16]byte, flowID uint64, principal identity.Principal, wire byte) (*pendingSession, bool) {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
 	if _, exists := s.sessions[id]; exists {
@@ -1472,7 +1542,7 @@ func (s *Server) beginPendingSession(id [16]byte, flowID uint64, principal ident
 		// the destination a second time.
 		return nil, false
 	}
-	pending := &pendingSession{flowID: flowID, principal: principal, done: make(chan struct{})}
+	pending := &pendingSession{flowID: flowID, principal: principal, wire: wire, done: make(chan struct{})}
 	if s.pending == nil {
 		s.pending = make(map[[16]byte]*pendingSession)
 	}
@@ -1505,16 +1575,23 @@ func (s *Server) endPendingSession(id [16]byte, pending *pendingSession) {
 // it, and that JOIN is counted as its waiter here, under the same lock the
 // OPEN takes to decide whether a waiter is there to rescue it. The caller
 // must then call awaitPendingSession, which uncounts it.
-func (s *Server) lookupLiveOrPending(id [16]byte, flowID uint64, principal identity.Principal) (*serverFlow, *pendingSession) {
+//
+// wrongWire reports a pending OPEN of this device and flow that negotiated a
+// different wire version: the JOIN is neither counted nor allowed to mark the
+// OPEN as one a client wants rescued.
+func (s *Server) lookupLiveOrPending(id [16]byte, flowID uint64, principal identity.Principal, wire byte) (live *serverFlow, pending *pendingSession, wrongWire bool) {
 	s.sessionsMu.RLock()
 	defer s.sessionsMu.RUnlock()
-	pending := s.pending[id]
+	pending = s.pending[id]
 	if pending == nil || pending.flowID != flowID || !samePrincipal(pending.principal, principal) {
-		return s.sessions[id], nil
+		return s.sessions[id], nil, false
+	}
+	if pending.wire != 0 && pending.wire != wire {
+		return s.sessions[id], nil, true
 	}
 	pending.waiters.Add(1)
 	pending.rescueRequested.Store(true)
-	return s.sessions[id], pending
+	return s.sessions[id], pending, false
 }
 
 // pendingRescueRequested decides, under the lock JOINs register under,

@@ -12,7 +12,12 @@ import (
 )
 
 type Registry struct {
-	activeFlows      atomic.Int64
+	activeFlows atomic.Int64
+	// dataConnections and wireActiveFlows are indexed by wire version minus
+	// minWire. They are what shows a mixed fleet moving from one version to
+	// the next: a gateway's accepted connections and live flows per version.
+	dataConnections  [maxWire - minWire + 1]atomic.Uint64
+	wireActiveFlows  [maxWire - minWire + 1]atomic.Int64
 	flowsStarted     atomic.Uint64
 	flowsCompleted   atomic.Uint64
 	flowsFailed      atomic.Uint64
@@ -170,6 +175,10 @@ const (
 	// recently and has since ended. LaneJoinUnknownSession is now one it
 	// has no record of at all.
 	LaneJoinSessionEnded
+	// LaneJoinWireMismatch is a join whose connection negotiated a different
+	// wire version from the one the flow was opened on. A client pins each
+	// flow to its version, so this is a peer disagreeing about the wire.
+	LaneJoinWireMismatch
 	// LaneJoinReasons is how many reasons there are.
 	LaneJoinReasons
 )
@@ -190,7 +199,12 @@ var laneJoinRefusalNames = [LaneJoinReasons]string{
 	LaneJoinSessionPending:            "session_pending",
 	LaneJoinOpenFailed:                "open_failed",
 	LaneJoinSessionEnded:              "session_ended",
+	LaneJoinWireMismatch:              "wire_mismatch",
 }
+
+// minWire and maxWire bound the wire label: the versions a build can negotiate are
+// a compile-time set, so the label cannot be made unbounded by a peer.
+const minWire, maxWire = 1, 2
 
 // String is the stable label and log value for a refusal reason.
 func (r LaneJoinRefusal) String() string {
@@ -356,6 +370,10 @@ type Snapshot struct {
 	QUICObservationsExpired uint64
 	// LaneJoinRefusals is indexed by LaneJoinRefusal.
 	LaneJoinRefusals [LaneJoinReasons]uint64
+	// DataConnections and WireActiveFlows are indexed by wire version minus
+	// one.
+	DataConnections [maxWire - minWire + 1]uint64
+	WireActiveFlows [maxWire - minWire + 1]int64
 	// AccountAdmissionRefusals is indexed by AccountRefusal.
 	AccountAdmissionRefusals                [AccountRefusalReasons]uint64
 	FlowStallsDetected, StallSpareAttaches  uint64
@@ -590,6 +608,43 @@ func (r *Registry) BulkIsolated() {
 	r.bulkIsolations.Add(1)
 }
 
+func wireIndex(wire byte) (int, bool) {
+	if wire < minWire || wire > maxWire {
+		return 0, false
+	}
+	return int(wire - minWire), true
+}
+
+// DataConnectionAccepted records a data-plane connection that negotiated
+// wire version wire.
+func (r *Registry) DataConnectionAccepted(wire byte) {
+	if i, ok := wireIndex(wire); r != nil && ok {
+		r.dataConnections[i].Add(1)
+	}
+}
+
+// WireFlowStarted and WireFlowFinished track live flows per wire version.
+// They sit beside FlowStarted rather than inside it so the unlabelled
+// queqiao_active_flows keeps its meaning on both endpoints.
+func (r *Registry) WireFlowStarted(wire byte) {
+	if i, ok := wireIndex(wire); r != nil && ok {
+		r.wireActiveFlows[i].Add(1)
+	}
+}
+
+func (r *Registry) WireFlowFinished(wire byte) {
+	i, ok := wireIndex(wire)
+	if r == nil || !ok {
+		return
+	}
+	for {
+		active := r.wireActiveFlows[i].Load()
+		if active <= 0 || r.wireActiveFlows[i].CompareAndSwap(active, active-1) {
+			return
+		}
+	}
+}
+
 // LaneJoinRefused records a lane join answered with a reset.
 func (r *Registry) LaneJoinRefused(reason LaneJoinRefusal) {
 	if r == nil || reason < 0 || reason >= LaneJoinReasons {
@@ -743,6 +798,10 @@ func (r *Registry) Snapshot() Snapshot {
 	}
 	for i := range s.LaneJoinRefusals {
 		s.LaneJoinRefusals[i] = r.laneJoinRefusals[i].Load()
+	}
+	for i := range s.DataConnections {
+		s.DataConnections[i] = r.dataConnections[i].Load()
+		s.WireActiveFlows[i] = r.wireActiveFlows[i].Load()
 	}
 	for i := range s.AccountAdmissionRefusals {
 		s.AccountAdmissionRefusals[i] = r.accountAdmissionRefusals[i].Load()
@@ -903,6 +962,15 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	s := r.Snapshot()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintf(w, "queqiao_active_flows %d\n", s.ActiveFlows)
+	// Per wire version, as negotiated by ALPN. A gateway counts these; on a
+	// client they stay zero. The unlabelled total above is unchanged, so an
+	// existing alert on it keeps its meaning.
+	for i := range s.DataConnections {
+		fmt.Fprintf(w, "queqiao_data_connections_total{wire=\"%d\"} %d\n", i+minWire, s.DataConnections[i])
+	}
+	for i := range s.WireActiveFlows {
+		fmt.Fprintf(w, "queqiao_wire_active_flows{wire=\"%d\"} %d\n", i+minWire, s.WireActiveFlows[i])
+	}
 	fmt.Fprintf(w, "queqiao_flows_started_total %d\n", s.FlowsStarted)
 	fmt.Fprintf(w, "queqiao_flows_completed_total %d\n", s.FlowsCompleted)
 	fmt.Fprintf(w, "queqiao_flows_failed_total %d\n", s.FlowsFailed)

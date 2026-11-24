@@ -149,6 +149,9 @@ func TestCycloneDXIsDeterministicAndNamesTheLinkedBinary(t *testing.T) {
 	if got := bom.Metadata.Component.Properties[2].Value; got != fmt.Sprint(protocol.Version) {
 		t.Fatalf("wire protocol property = %q, want %d", got, protocol.Version)
 	}
+	if got := bom.Metadata.Component.Properties[3]; got.Name != "queqiao:wire-accept" || got.Value != "1,2" {
+		t.Fatalf("wire accept property = %+v, want 1,2", got)
+	}
 	if len(bom.Components) != 1 || bom.Components[0].Name != modules[0].Path || len(bom.Dependencies) != 1 {
 		t.Fatalf("linked dependency was not represented: %+v", bom)
 	}

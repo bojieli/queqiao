@@ -39,7 +39,10 @@ import (
 // So there is one reader, and it demultiplexes on the flow identity the
 // protocol already puts in every frame.
 type bulkDemux struct {
-	path        *coded.Path
+	path *coded.Path
+	// wire is the connection's negotiated version. Every lane on one QUIC
+	// connection shares it, because the ALPN belongs to the connection.
+	wire        byte
 	queueFrames int
 	heldFrames  int
 	heldBytes   int
@@ -64,14 +67,14 @@ type subscription struct {
 	lanes  int
 }
 
-func newBulkDemux(path *coded.Path, queueFrames int) *bulkDemux {
+func newBulkDemux(path *coded.Path, queueFrames int, wire byte) *bulkDemux {
 	if queueFrames < 1 || queueFrames > maxBulkQueueFrames {
 		queueFrames = maxBulkQueueFrames
 	}
 	heldFrames := min(maxHeldFrames, 2*queueFrames)
 	heldBytes := min(maxHeldBytes, heldFrames*protocol.MaxPayload)
 	d := &bulkDemux{
-		path: path, queueFrames: queueFrames, heldFrames: heldFrames, heldBytes: heldBytes,
+		path: path, wire: wire, queueFrames: queueFrames, heldFrames: heldFrames, heldBytes: heldBytes,
 		flows: make(map[uint64]*subscription),
 	}
 	go d.run()
@@ -90,12 +93,13 @@ func (d *bulkDemux) run() {
 			d.mu.Unlock()
 			return
 		}
-		frame, err := protocol.ParseFrame(payload)
+		frame, err := protocol.ParseFrameVersion(payload, d.wire)
 		if err != nil {
 			// The coded path hands up whole frames or none, so this is a peer
 			// sending something this one cannot parse rather than loss.
 			continue
 		}
+		observeTestFrame(d.wire, frame)
 		// The send happens under the lock that release closes under, or the
 		// two race: taking the channel and then sending outside the lock lets
 		// a flow that let go in between be sent to after its channel closed.
@@ -235,7 +239,7 @@ var (
 )
 
 // connBulkDemux returns the demultiplexer for a connection's coded path.
-func connBulkDemux(path *coded.Path, queueFrames int) *bulkDemux {
+func connBulkDemux(path *coded.Path, queueFrames int, wire byte) *bulkDemux {
 	if path == nil {
 		return nil
 	}
@@ -244,7 +248,7 @@ func connBulkDemux(path *coded.Path, queueFrames int) *bulkDemux {
 	if existing, ok := bulkDemuxs.Load(path); ok {
 		return existing.(*bulkDemux)
 	}
-	created := newBulkDemux(path, queueFrames)
+	created := newBulkDemux(path, queueFrames, wire)
 	bulkDemuxs.Store(path, created)
 	return created
 }

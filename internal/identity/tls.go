@@ -164,11 +164,24 @@ func verifyTLSCertificate(certificate tls.Certificate, root *x509.Certificate, u
 // offers exactly that ALPN. All normal data connections require a valid device
 // certificate and current authorization before TLS completes.
 func ServerTLSConfig(credentials ServerCredentials, dataALPN string, allowEnrollment bool) (*tls.Config, error) {
+	return ServerTLSConfigProtocols(credentials, []string{dataALPN}, allowEnrollment)
+}
+
+// ServerTLSConfigProtocols is ServerTLSConfig for a gateway that accepts more
+// than one data-plane protocol. dataALPNs is in the gateway's order of
+// preference: Go's TLS server selects the first of its own protocols that the
+// client also offers, so the client's order cannot steer it. The ALPN is part
+// of the TLS 1.3 handshake transcript that mutual authentication signs, so an
+// on-path attacker cannot strip a version from the offer to force a downgrade.
+//
+// Enrollment and renewal keep their isolation: each is selected only when
+// the client offers it alone, whatever data protocols the gateway accepts.
+func ServerTLSConfigProtocols(credentials ServerCredentials, dataALPNs []string, allowEnrollment bool) (*tls.Config, error) {
 	if err := credentials.Validate(); err != nil {
 		return nil, err
 	}
-	if dataALPN == "" || dataALPN == EnrollmentALPN {
-		return nil, errors.New("invalid data ALPN")
+	if err := validateDataALPNs(dataALPNs); err != nil {
+		return nil, err
 	}
 	roots := x509.NewCertPool()
 	roots.AddCert(credentials.Root)
@@ -178,7 +191,7 @@ func ServerTLSConfig(credentials ServerCredentials, dataALPN string, allowEnroll
 	}
 	data := &tls.Config{
 		MinVersion: tls.VersionTLS13, GetCertificate: getCertificate,
-		NextProtos: []string{dataALPN}, ClientAuth: tls.RequireAndVerifyClientCert,
+		NextProtos: append([]string(nil), dataALPNs...), ClientAuth: tls.RequireAndVerifyClientCert,
 		ClientCAs: roots,
 	}
 	data.VerifyConnection = func(state tls.ConnectionState) error {
@@ -202,7 +215,7 @@ func ServerTLSConfig(credentials ServerCredentials, dataALPN string, allowEnroll
 	renewal := data.Clone()
 	renewal.NextProtos = []string{RenewalALPN}
 	base := data.Clone()
-	base.NextProtos = []string{dataALPN, EnrollmentALPN, RenewalALPN}
+	base.NextProtos = append(append([]string(nil), dataALPNs...), EnrollmentALPN, RenewalALPN)
 	base.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 		if len(hello.SupportedProtos) == 1 && hello.SupportedProtos[0] == EnrollmentALPN {
 			return enrollment, nil
@@ -219,18 +232,44 @@ func RenewalTLSConfig(credentials ClientCredentials) (*tls.Config, error) {
 	if err := credentials.Validate(time.Now()); err != nil {
 		return nil, err
 	}
-	return pinnedClientTLSConfig(credentials.RootPin, credentials.ProviderID, credentials.GatewayID, RenewalALPN, []tls.Certificate{credentials.Certificate}), nil
+	return pinnedClientTLSConfig(credentials.RootPin, credentials.ProviderID, credentials.GatewayID, []string{RenewalALPN}, []tls.Certificate{credentials.Certificate}), nil
 }
 
 func ClientTLSConfig(credentials ClientCredentials, dataALPN string) (*tls.Config, error) {
+	return ClientTLSConfigProtocols(credentials, []string{dataALPN})
+}
+
+// ClientTLSConfigProtocols offers every data-plane protocol in dataALPNs. The
+// gateway chooses among them; the caller must check which one it chose.
+func ClientTLSConfigProtocols(credentials ClientCredentials, dataALPNs []string) (*tls.Config, error) {
 	if err := credentials.Validate(time.Now()); err != nil {
 		return nil, err
 	}
-	return pinnedClientTLSConfig(credentials.RootPin, credentials.ProviderID, credentials.GatewayID, dataALPN, []tls.Certificate{credentials.Certificate}), nil
+	if err := validateDataALPNs(dataALPNs); err != nil {
+		return nil, err
+	}
+	return pinnedClientTLSConfig(credentials.RootPin, credentials.ProviderID, credentials.GatewayID, dataALPNs, []tls.Certificate{credentials.Certificate}), nil
+}
+
+// validateDataALPNs refuses a data-plane offer that is empty, repeats itself,
+// or names a control protocol. A control ALPN offered beside a data one would
+// defeat the rule that enrollment and renewal are reached only alone.
+func validateDataALPNs(dataALPNs []string) error {
+	if len(dataALPNs) == 0 {
+		return errors.New("invalid data ALPN")
+	}
+	seen := make(map[string]bool, len(dataALPNs))
+	for _, alpn := range dataALPNs {
+		if alpn == "" || alpn == EnrollmentALPN || alpn == RenewalALPN || seen[alpn] {
+			return errors.New("invalid data ALPN")
+		}
+		seen[alpn] = true
+	}
+	return nil
 }
 
 func EnrollmentTLSConfig(rootPin, providerID, gatewayID string) *tls.Config {
-	return pinnedClientTLSConfig(rootPin, providerID, gatewayID, EnrollmentALPN, nil)
+	return pinnedClientTLSConfig(rootPin, providerID, gatewayID, []string{EnrollmentALPN}, nil)
 }
 
 // pinnedClientTLSConfig deliberately performs custom verification because a
@@ -238,10 +277,10 @@ func EnrollmentTLSConfig(rootPin, providerID, gatewayID string) *tls.Config {
 // scary standard-library field is never user-configurable: VerifyConnection
 // always pins the exact provider root, validates the chain and serverAuth EKU,
 // and checks the expected gateway URI.
-func pinnedClientTLSConfig(rootPin, expectedProvider, expectedGateway, alpn string, certificates []tls.Certificate) *tls.Config {
+func pinnedClientTLSConfig(rootPin, expectedProvider, expectedGateway string, alpns []string, certificates []tls.Certificate) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13, InsecureSkipVerify: true, // replaced below, never bypassed
-		Certificates: certificates, NextProtos: []string{alpn},
+		Certificates: certificates, NextProtos: append([]string(nil), alpns...),
 		VerifyConnection: func(state tls.ConnectionState) error {
 			return verifyGateway(state, rootPin, expectedProvider, expectedGateway, time.Now())
 		},

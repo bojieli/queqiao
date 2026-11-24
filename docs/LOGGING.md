@@ -369,6 +369,16 @@ anyone else gets `unknown_session`, which otherwise means a session the gateway
 has no record of. An OPEN for a session it remembers ending is refused, so a late copy
 of an OPEN cannot reach the destination twice.
 
+Every lane-join refusal also carries the `wire` version its connection
+negotiated. A join on a connection of a different version from the one the
+flow opened on is refused with `reason=wire_mismatch` (answer `wire version
+mismatch`) at `warn`: a current client keeps each flow on one version, so this
+is a peer disagreeing about the wire. The gateway's `remote flow opened` and
+`remote flow complete` records carry the flow's `wire`, and
+`queqiao_data_connections_total{wire}` and `queqiao_wire_active_flows{wire}`
+count accepted data connections and live flows per version, which is how an
+operator watches clients move from version 1 to version 2.
+
 A gateway that refuses a flow open because of the opening account's own limits
 writes `msg="account flow open refused"` at `warn`, naming the `reason` --
 `flow_limit`, `client_limit`, or `unauthorized` -- with the account and device.

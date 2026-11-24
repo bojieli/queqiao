@@ -56,7 +56,7 @@ func TestRound2QUICTriesSecondGatewayAddress(t *testing.T) {
 	original := net.DefaultResolver
 	net.DefaultResolver = resolver
 	defer func() { net.DefaultResolver = original }()
-	conn, packet, err := dialQUICConnection(ctx, remote, rig.client.currentCredentials(), time.Second, "", nil, nil, rig.client.windows(), rig.client.hopDialConfig())
+	conn, packet, err := dialQUICConnection(ctx, remote, rig.client.currentCredentials(), nil, time.Second, "", nil, nil, rig.client.windows(), rig.client.hopDialConfig())
 	if err != nil {
 		t.Fatalf("healthy second address not reached: %v", err)
 	}
