@@ -706,12 +706,26 @@ func (e *ErasureSender) rebaseFloor(now monotime.Time) {
 // of it, and the samples behind what is left. The pool weighs each member's
 // figure by the outcomes it has observed (State.ErasureWeight), so the
 // lane's part is removed exactly; ok is false when nothing is left.
+//
+// The samples are Kish's effective count, W^2 / sum(w^2/n) over the members
+// (pathmodel), which is not additive: a lane that has observed 100,000
+// packets on an estimate resting on 1,000 dominates the weights, and
+// subtracting its 1,000 from the pool's would leave a sibling's 100 fresh
+// samples reading as 2. So the lane's term is removed from the sums and the
+// count recomputed.
 func (e *ErasureSender) siblingsErasure() (erasure, samples float64, ok bool) {
 	weight := e.poolWeight - e.selfObserved
-	samples = e.poolSamples - e.selfSamples
-	if weight <= 0 || samples <= 0 {
+	if weight <= 0 || e.poolSamples <= 0 {
 		return 0, 0, false
 	}
+	spread := e.poolWeight * e.poolWeight / e.poolSamples
+	if e.selfSamples > 0 {
+		spread -= e.selfObserved * e.selfObserved / e.selfSamples
+	}
+	if spread <= 0 {
+		return 0, 0, false
+	}
+	samples = weight * weight / spread
 	pooled := float64(e.erasure.Load()) / partsPerMillion
 	erasure = (pooled*e.poolWeight - e.selfLoss*e.selfObserved) / weight
 	return math.Min(math.Max(erasure, 0), 1), samples, true
@@ -745,6 +759,9 @@ func (e *ErasureSender) endRamp() {
 	e.ramping.Store(false)
 	e.inner.startupHeld = false
 	e.inner.fullBandwidth = true
+	// The cap the lane hands over to, so that losing it before the next
+	// round is still seen as being left alone (maybeRearm).
+	e.lastShare = e.share.Load()
 	e.earnFromRamp()
 	// A re-armed ramp that found no more than it started from was a false
 	// alarm, and the next waits twice as long; one that found more resets

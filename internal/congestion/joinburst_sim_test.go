@@ -1231,3 +1231,40 @@ func TestAPendingReArmLapsesWhenTheCapReturns(t *testing.T) {
 		t.Fatal("the cap came back before the backoff ended, and the lane ramped anyway")
 	}
 }
+
+// The siblings' effective sample count is recomputed with the lane's own term
+// taken out, not subtracted: a lane that dominates the pool's weights would
+// otherwise hide a sibling's fresh samples.
+func TestSiblingSamplesAreRecomputedNotSubtracted(t *testing.T) {
+	m := pathmodel.NewPathModel()
+	m.Report(1, pathmodel.Observation{Erasure: 0.5, BurstFactor: 1, ObservedSamples: 100000, ErasureSamples: 1000, Delivered: 1e6})
+	state := m.Report(2, pathmodel.Observation{Erasure: 0.1, BurstFactor: 1, ObservedSamples: 100, ErasureSamples: 100, Delivered: 1e6})
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	sender.selfLoss, sender.selfObserved, sender.selfSamples = 0.5, 100000, 1000
+	sender.poolWeight, sender.poolSamples = state.ErasureWeight, state.ErasureSamples
+	sender.erasure.Store(uint64(state.Erasure * partsPerMillion))
+	erasure, samples, ok := sender.siblingsErasure()
+	if !ok || math.Abs(samples-100) > 1 || math.Abs(erasure-0.1) > 0.001 {
+		t.Fatalf("siblings: erasure %.3f on %.1f samples (ok %v); want 0.1 on 100", erasure, samples, ok)
+	}
+}
+
+// A ramp that ends at a cap hands the lane to it, and the cap vanishing before
+// the next round is still the lane being left alone.
+func TestALaneLeftAloneRightAfterItsRampEnds(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	sender.inner.minRTT = joiningRoundTrip
+	sender.SetRTTStatsProvider(&fixedRTT{min: joiningRoundTrip, smoothed: joiningRoundTrip})
+	sender.endRamp()
+	sender.inner.mode = tuicBbrProbeBW
+	sender.share.Store(0)
+	for sender.inner.round <= sender.rearmAfter && !sender.ramping.Load() {
+		sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
+		sendAt(sender, sender.GetCongestionWindow())
+		sender.inner.round++
+		sender.rampGate(base(), nil, nil)
+	}
+	if !sender.ramping.Load() {
+		t.Fatal("left alone before its first round at the cap, the lane never ramped again")
+	}
+}
