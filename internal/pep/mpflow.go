@@ -159,7 +159,6 @@ type mpLane struct {
 	rateSampled time.Time
 	rateBytes   float64       // estimated send rate in bytes per second
 	rateRTT     time.Duration // smoothed round-trip time
-	rateLoss    float64       // this lane's own lost/sent, over its life
 }
 
 // laneRateCacheTTL is far below one long-haul RTT, so the scheduler still
@@ -191,37 +190,9 @@ func (l *mpLane) sendRate() (float64, time.Duration) {
 	if rate <= 0 && stats.controller.CongestionWindow > 0 && rtt > 0 {
 		rate = float64(stats.controller.CongestionWindow) / rtt.Seconds()
 	}
-	loss := 0.0
-	if stats.packetsSent > 0 {
-		loss = float64(stats.controller.PacketsLostObserved) / float64(stats.packetsSent)
-	}
-	l.rateSampled, l.rateBytes, l.rateRTT, l.rateLoss = now, rate, rtt, loss
+	l.rateSampled, l.rateBytes, l.rateRTT = now, rate, rtt
 	return rate, rtt
 }
-
-// payloadRate is what the lane's send rate delivers: the pacing rate is what
-// goes on the wire, and on an erasure channel the controller compensates by
-// sending more than arrives. Scheduler admission counts payload, so it is
-// sized from this. The loss is the lane's own: the pool's erasure can be
-// another destination's, through a shared ancestor.
-func (l *mpLane) payloadRate() (float64, time.Duration) {
-	rate, rtt := l.sendRate()
-	l.rateMu.Lock()
-	loss := l.rateLoss
-	l.rateMu.Unlock()
-	arrival := 1 - loss
-	if arrival < payloadMinArrival {
-		arrival = payloadMinArrival
-	}
-	if arrival > 1 {
-		arrival = 1
-	}
-	return rate * arrival, rtt
-}
-
-// payloadMinArrival mirrors the controller's bound on its compensation
-// (congestion.erasureMinArrival).
-const payloadMinArrival = 0.15
 
 // laneFrame is a frame queued for one lane's writer, with an optional
 // notification for when the transport has taken its bytes.

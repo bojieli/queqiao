@@ -752,17 +752,6 @@ trials per arm; stalls counted in trials only):
 
 **Changes.**
 
-- A QUIC lane may hold unacknowledged no more than it can deliver in four of
-  its own round trips at the rate its pacer actually uses (after the share
-  and the delay brake, net of erasure compensation), with a floor of four
-  chunks (`quicLaneOutstanding`, through the per-lane `Outstanding`
-  admission that TCP striping already used). Four is a chunk's residency on
-  this path, median 3.5 round trips from a lane taking it to the peer
-  acknowledging it; at two, a share-capped lane could not keep its own rate
-  busy (emulated, 0.86x main against 0.92x). A slow lane carries what it can
-  and leaves the rest ready for lanes that can carry it sooner. Lane
-  telemetry now reports that effective pacing rate, which is what a trace
-  should have shown all along.
 - The pool's share is split between its busy members and at most one that is
   not (`pathmodel.Report`, and `Current` for a joining lane, which the coded
   path sizes its window from); only the sole busy member itself goes
@@ -775,7 +764,18 @@ trials per arm; stalls counted in trials only):
   that stopped keeps its last rate until it expires, and summed with the lanes
   still sending it is a peak nobody delivers (#160 item 2, for that case).
 
-Tried and dropped, for no measurable gain: keeping a live suspected lane as
+Lane telemetry now reports the rate the pacer uses, after the share and the
+delay brake, rather than the inner rate over the arrival: what a trace shows
+is what went on the wire.
+
+Tried and dropped. Bounding what a QUIC lane may hold unacknowledged by its
+own pacing rate over a few round trips -- so that a slow lane could not hoard
+chunks until they outlived the re-issue deadline -- cut stalls and wire
+overhead in emulation, but live it made the fast lossy path worse: in a
+bisect on the Beijing host (6 interleaved rounds), the build with it was
+slower than the same build without it in five of six rounds, and was the only
+build that failed flows (one of four, and two of four, in two trials). Also
+dropped, for no measurable gain: keeping a live suspected lane as
 the data lane when the spare is much slower; re-basing a ramping lane's
 startup pacing after rounds that were not backlogged; splitting the share
 between busy members only (it fails four simulated scenarios on caused loss,
@@ -791,8 +791,8 @@ and the bursts it reproduced neither the gap nor the stalls. Four concurrent
 | --- | ---: | ---: | ---: |
 | main | 64.1 | 16 | 1.30 |
 | this change before the fixes | 48.4 | 21 | 1.37 |
-| with the split and bottleneck fix only | 61.5 | 24 | 1.31 |
-| with both fixes | 60.7 | 17 | 1.20 |
+| with the split and bottleneck fix (kept) | 61.5 | 24 | 1.31 |
+| with that and the lane bound (dropped, see above) | 60.7 | 17 | 1.20 |
 
 Single runs varied by tens of percent (main 36-95 Mbit/s over the same five
 seeds), so this ranks the builds and does not measure them; the live A/B
