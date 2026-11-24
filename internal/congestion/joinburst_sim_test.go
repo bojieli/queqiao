@@ -242,7 +242,7 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 		at := base.Add(now)
 		if simTrace && now%(500*time.Millisecond) == 0 {
 			st := model.Current()
-			line := fmt.Sprintf("%v pool erasure %.3f/%.0f members %d share %.0f |", now, st.Erasure, st.ErasureSamples, st.Members, st.Share)
+			line := fmt.Sprintf("%v pool erasure %.3f/%.0f share %.0f |", now, st.Erasure, st.ErasureSamples, st.Share)
 			for i, l := range lanes {
 				if l.plan.stop > 0 && now >= l.plan.stop {
 					continue
@@ -279,7 +279,7 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 				if ramping && result.rampEnded[i] >= 0 {
 					result.rearms++
 					if simTrace {
-						fmt.Printf("%v lane %d rearm share=%.0f measured=%d members=%d\n", now, i, lane.e.Share(), lane.e.inner.estimator.measuredEstimate(), lane.e.members)
+						fmt.Printf("%v lane %d rearm share=%.0f measured=%d alone=%v\n", now, i, lane.e.Share(), lane.e.inner.estimator.measuredEstimate(), lane.e.departed)
 					}
 				} else if !ramping && simTrace {
 					fl, fn := lane.e.floor()
@@ -493,7 +493,7 @@ func TestAJoinerBesideALaneThatFillsThePathBacksOff(t *testing.T) {
 func joiningProbe() *seedObservationProbe {
 	return &seedObservationProbe{State: pathmodel.State{
 		Seed: 1e6, Share: 1.25e6, Erasure: 0.15, ObservedSamples: 5000, ErasureSamples: 5000, Arrival: 0.85, RoundTrip: joiningRoundTrip,
-		LeafRoundTrip: joiningRoundTrip, BurstFactor: 1, ErasureBurst: 1, Members: 2,
+		LeafRoundTrip: joiningRoundTrip, BurstFactor: 1, ErasureBurst: 1,
 	}}
 }
 
@@ -885,7 +885,11 @@ func TestTheLastLaneRefillsThePathItsSiblingsLeave(t *testing.T) {
 	if tail < 0.75 {
 		t.Errorf("alone on the path, the last lane delivered %.2f of it", tail)
 	}
-	if got := r.causedLossBetween(4, 14); got > 0.1 {
+	// The lane is alone and uncapped, as any first flow is: one lane on its
+	// own on this 12 ms buffer has the bottleneck drop 0.24 of what it sends
+	// over the same seconds, from ProbeBW's probes. The bound is that the
+	// refill costs no more than that.
+	if got := r.causedLossBetween(4, 14); got > 0.15 {
 		t.Errorf("refilling the path, the bottleneck dropped %.3f of what was sent", got)
 	}
 }
@@ -1067,32 +1071,39 @@ func TestGrowthAfterALullIsNotFlat(t *testing.T) {
 }
 
 // Siblings that finish free their capacity, and the lane left behind ramps
-// into it rather than growing a quarter per gain cycle.
-func TestALaneRampsAgainWhenThePoolLosesMembers(t *testing.T) {
-	probe := joiningProbe()
-	probe.Members = 4
-	sender := NewErasureSenderOn(1200, probe)
+// into it rather than growing a quarter per gain cycle. Left alone it is
+// uncapped, so the share cannot say so; the change itself is the signal, and
+// it waits out the backoff rather than being lost to it.
+func TestALaneRampsAgainWhenItIsLeftAlone(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
 	sender.inner.minRTT = joiningRoundTrip
 	sender.SetRTTStatsProvider(&fixedRTT{min: joiningRoundTrip, smoothed: joiningRoundTrip})
 	sender.endRamp()
 	sender.inner.mode = tuicBbrProbeBW
-	sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
-	closeIdle := func() {
+	closeRound := func(inFlight quiccongestion.ByteCount) {
 		sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
-		sendAt(sender, sender.GetCongestionWindow())
+		sendAt(sender, inFlight)
 		sender.inner.round++
 		sender.rampGate(base(), nil, nil)
 	}
-	for i := 0; i < rampRearmRounds+1; i++ {
-		closeIdle()
+	for sender.inner.round+2 < sender.rearmAfter {
+		closeRound(sender.GetCongestionWindow())
 	}
 	if sender.ramping.Load() {
-		t.Fatal("a lane at its share with its siblings all present ramped again")
+		t.Fatal("a lane at its share with its siblings all busy ramped again")
 	}
-	sender.members = 2
-	closeIdle()
+	// The last sibling finishes one round before the backoff is over.
+	sender.share.Store(0)
+	closeRound(sender.GetCongestionWindow())
+	if sender.ramping.Load() {
+		t.Fatal("the lane ramped again inside its backoff")
+	}
+	closeRound(sender.GetCongestionWindow())
 	if !sender.ramping.Load() || sender.inner.mode != tuicBbrStartup || sender.inner.fullBandwidth {
-		t.Fatalf("the pool lost members and the lane is ramping %v in mode %v", sender.ramping.Load(), sender.inner.mode)
+		t.Fatalf("left alone, the lane is ramping %v in mode %v", sender.ramping.Load(), sender.inner.mode)
+	}
+	if sender.rampBaseRTT != sender.poolRTT {
+		t.Fatalf("a re-armed ramp judges queue against %v, not the pool's current %v", sender.rampBaseRTT, sender.poolRTT)
 	}
 	// A re-armed ramp that finds nothing more waits twice as long next time.
 	sender.endRamp()
@@ -1102,16 +1113,13 @@ func TestALaneRampsAgainWhenThePoolLosesMembers(t *testing.T) {
 	// A share well above what the lane delivers re-arms it too, once the
 	// backoff has passed -- and not with the lane carrying only requests.
 	sender.share.Store(3e6)
-	for i := uint64(0); i <= sender.rearmBackoff; i++ {
-		sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
-		sendAt(sender, 1200)
-		sender.inner.round++
-		sender.rampGate(base(), nil, nil)
+	for sender.inner.round <= sender.rearmAfter {
+		closeRound(1200)
 	}
 	if sender.ramping.Load() {
 		t.Fatal("a lane carrying requests was re-armed")
 	}
-	closeIdle()
+	closeRound(sender.GetCongestionWindow())
 	if !sender.ramping.Load() {
 		t.Fatal("a backlogged lane with a share three times its delivery did not ramp again")
 	}
@@ -1141,5 +1149,30 @@ func TestAJoinerOnAnUnmeasuredLeafHasNoPooledQueueBaseline(t *testing.T) {
 	ackEvent(sender)
 	if !sender.ramping.Load() {
 		t.Fatal("a joiner on a 180 ms path with 5 ms of queue ended its ramp")
+	}
+}
+
+// Over a pool too thin to judge by, a lane's unconfirmed first flight is not
+// its floor either -- it may be overflow -- and the pool's floor matures only
+// on samples beyond the lane's own reports of that same flight.
+func TestAThinPoolDoesNotMakeAFirstFlightAFloor(t *testing.T) {
+	probe := joiningProbe()
+	probe.ErasureSamples = 10
+	sender := NewErasureSenderOn(1200, probe)
+	closeRound(sender, 4, 60)
+	if floor, n := sender.floor(); n >= rampLossSamples {
+		t.Fatalf("over a thin pool, the lane judges against %.3f on %.0f samples: its own unconfirmed first flight", floor, n)
+	}
+	sender.erasure.Store(uint64(0.94 * partsPerMillion))
+	sender.poolSamples, sender.selfSamples, sender.poolBurst = 70, 64, 1
+	sender.rampGate(base(), nil, nil)
+	if sender.rampFloorN >= rampLossSamples {
+		t.Fatalf("the pool's floor matured on %.0f samples, %.0f of them this lane's own", sender.poolSamples, sender.selfSamples)
+	}
+	sender.erasure.Store(uint64(0.15 * partsPerMillion))
+	sender.poolSamples = 64 + rampLossSamples
+	sender.rampGate(base(), nil, nil)
+	if sender.rampFloorN < rampLossSamples || sender.rampFloor != 0.15 {
+		t.Fatalf("with independent samples the floor did not mature: %.3f on %.0f", sender.rampFloor, sender.rampFloorN)
 	}
 }

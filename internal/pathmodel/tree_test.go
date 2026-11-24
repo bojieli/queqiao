@@ -577,17 +577,17 @@ func TestCombineCarriesTheSamplesBehindTheErasure(t *testing.T) {
 // another path's minimum.
 func TestTheLeafRoundTripIsTheLeafs(t *testing.T) {
 	out := combine([]State{
-		{RoundTrip: 40 * time.Millisecond, LeafRoundTrip: 40 * time.Millisecond, Members: 9},
+		{RoundTrip: 40 * time.Millisecond, LeafRoundTrip: 40 * time.Millisecond},
 		{},
 	})
-	if out.RoundTrip != 40*time.Millisecond || out.LeafRoundTrip != 0 || out.Members != 0 {
-		t.Fatalf("unmeasured leaf: RoundTrip %v, LeafRoundTrip %v, Members %d; want 40ms, 0, 0", out.RoundTrip, out.LeafRoundTrip, out.Members)
+	if out.RoundTrip != 40*time.Millisecond || out.LeafRoundTrip != 0 {
+		t.Fatalf("unmeasured leaf: RoundTrip %v, LeafRoundTrip %v; want 40ms, 0", out.RoundTrip, out.LeafRoundTrip)
 	}
 	out = combine([]State{
-		{RoundTrip: 40 * time.Millisecond, LeafRoundTrip: 40 * time.Millisecond, Members: 9},
-		{RoundTrip: 180 * time.Millisecond, LeafRoundTrip: 180 * time.Millisecond, Members: 2},
+		{RoundTrip: 40 * time.Millisecond, LeafRoundTrip: 40 * time.Millisecond},
+		{RoundTrip: 180 * time.Millisecond, LeafRoundTrip: 180 * time.Millisecond},
 	})
-	if out.LeafRoundTrip != 180*time.Millisecond || out.Members != 2 {
-		t.Fatalf("measured leaf: LeafRoundTrip %v, Members %d; want 180ms, 2", out.LeafRoundTrip, out.Members)
+	if out.LeafRoundTrip != 180*time.Millisecond {
+		t.Fatalf("measured leaf: LeafRoundTrip %v; want 180ms", out.LeafRoundTrip)
 	}
 }

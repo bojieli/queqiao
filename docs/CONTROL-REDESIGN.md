@@ -547,28 +547,33 @@ takes `1 - Erasure` whenever that asks for less).
 
 **Re-arming** (`maybeRearm`, `TUICBBRSender.reenterStartup`). A ramp still
 ends startup, but no longer for good. A lane that is not ramping ramps again,
-from its current estimate, when the pool reports fewer members sharing the
-bottleneck than it did a round before, or when its share stands twice above
-what it delivers -- in either case only with a backlog (half of what its
-pacing rate or window, whichever binds first, allows in flight), and no
-sooner than four rounds after its last ramp ended, doubling to at most 64
-each time a re-armed ramp found no more than it started from. A ramp that
-was re-armed ends on the same signals as a first one.
+from its current estimate, when its share stands twice above what it
+delivers, or when it was capped and no longer is because no other member is
+busy (below) -- the latter kept pending through the backoff, since a lane
+left alone has no share to compare with. Either needs a backlog (half of
+what its pacing rate or window, whichever binds first, allows in flight), and
+no re-arm comes sooner than four rounds after the last ramp ended, doubling
+to at most 64 each time a re-armed ramp found no more than it started from.
+A re-armed ramp ends on the same signals as a first one, and judges its
+queue against the pool's current minimum round trip, not the one at join.
+A bare drop in the number of members was tried as a third trigger and
+removed: every survivor of a burst re-entered startup at once into a path the
+others still filled (one lane of four finishing had the three left lose a
+quarter of what they sent for two seconds), and rescue joiners coming and
+going re-armed the long lanes 26 times in twelve seconds.
 
 **The pool counts who is using it** (`pathmodel.splitLocked`). Re-arming
 alone did not fix the tail. When three of four downloads finish, the last
 lane sits beside the pooled control connection, which counts as a member, and
 the even split holds the last lane at 5/8 of what it delivers, then 5/8 of
 that as the bottleneck window turns over (#160 item 3); and the finished
-lanes still count as members for five seconds. Two changes, neither of which
-moves the split itself:
-
-- `State.Members` counts the members that reported within
-  `activeWindow` -- four round trips, at least 500 ms -- so a lane sees its
-  siblings leave within a second rather than five;
-- a share is imposed only when at least two members are *busy*, delivering at
-  least a quarter of an even split. With one busy member there is nothing to
-  compound, which is the reason a lone member already went uncapped.
+lanes still count as members for five seconds. So a share is imposed only
+when at least two members are *busy* (`pathmodel.busyLocked`): reported
+within `activeWindow` -- four round trips, at least 500 ms -- and delivering at
+least a quarter of an even split. With one busy member there is nothing to
+compound, which is the reason a lone member already went uncapped; and a
+finished lane stops being busy within a second rather than expiring after
+five. The split itself does not move.
 
 Two alternatives were simulated and rejected: dividing the bottleneck between
 the active members only (with the sum still holding departed lanes' delivery,
@@ -579,6 +584,9 @@ earlier for the same reason (#160 item 3).
 
 **Review findings fixed with it.**
 
+- A lane whose pool has too few samples to judge by no longer falls back to
+  its own unconfirmed first rounds, which may be a first flight's overflow;
+  and an under-sampled floor matures only on samples beyond the lane's own.
 - In hierarchical (`Chain`) mode the queue baseline came from the chain's
   `RoundTrip`, which can be an ancestor's -- a shorter path to another
   destination -- when the leaf has measured none, so every ramp ended at
@@ -609,8 +617,8 @@ interval that the buffer or policer dropped.
 | policer, 2 MB/s, 300 ms, 8 ms bucket | 0.31 / 0.002 | 0.89 / 0.138 | 0.89 / 0.209 |
 | late joiner beside a full lane, 85 ms buffer (5-9 s) | 0.02 / 0 | 0.98 / 0.038 | 1.00 / 0.023 |
 | **new:** stale floor (0.15 inherited, 0.22 real), nothing earned; 11.25 MB/s, 180 ms, 50 ms buffer, 12 s | 0.14 / 0 | 0.42 / 0 | 0.85 / 0.035 |
-| **new:** tail -- three of four lanes finish by 4 s; fast path (6-14 s) | 0.04 / 0 | 0.27 / 0 | 0.92 / 0.088 |
-| **new:** rescue churn -- two lanes plus one joining every 0.5 s for 1.5 s; lossy path | 0.10 / 0 | 0.78 / 0.048 | 0.85 / 0.129 |
+| **new:** tail -- three of four lanes finish by 4 s; fast path (6-14 s) | 0.04 / 0 | 0.27 / 0 | 0.93 / 0.111 |
+| **new:** rescue churn -- two lanes plus one joining every 0.5 s for 1.5 s; lossy path | 0.10 / 0 | 0.78 / 0.048 | 0.85 / 0.111 |
 | **new:** requests then bulk -- 4 packets a round trip for 2 s (3-10 s) | 0.11 / 0 | 0.95 / 0.082 | 0.97 / 0.181 |
 
 Each cell is goodput / caused loss. Queue p90 is unchanged by this change
@@ -623,9 +631,11 @@ The cost is caused loss on shallow buffers: 0.13 rather than 0.07 on the fast
 path, and 0.18 rather than 0.08 after a request phase. It is the
 compensation: on a 15% channel the lanes now pace 1/0.85 of their share, as
 the ramp's first simulation did when its idle member was credited with that
-compensation (0.15 caused loss there). The churn scenario's 0.13 is the
-pool's own erasure settling near 0.28 on a 0.22 channel: rescue joiners take
-that inflated figure as their floor at join, as before. Both are bounded
-and inside the scenarios' limits; whether they show live is what the A/B
-below is for.
+compensation (0.15 caused loss there). In the tail the last lane is alone and
+uncapped, as any first flow is, and a single lane alone on that 12 ms buffer
+has the bottleneck drop 0.24 of what it sends from ProbeBW's probes; the
+refill costs 0.11. The churn scenario's 0.11 is the pool's own erasure
+settling near 0.28 on a 0.22 channel: rescue joiners take that inflated
+figure as their floor at join, as before. All are bounded and inside the
+scenarios' limits; whether they show live is what the A/B below is for.
 

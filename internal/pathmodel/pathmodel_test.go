@@ -347,27 +347,25 @@ func TestALaneBesideIdleMembersIsNotCapped(t *testing.T) {
 	}
 }
 
-// Members counts who reported within a few round trips, so a lane sees its
-// siblings finish long before they expire; the split itself still counts them
-// until then.
-func TestMembersCountsOnlyThoseStillReporting(t *testing.T) {
+// A lane that stops reporting stops being busy within a few round trips, so
+// the lane left behind is uncapped long before its siblings expire; the split
+// itself still counts them until then.
+func TestAFinishedLaneStopsCountingAsBusy(t *testing.T) {
 	now := time.Now()
 	m := NewPathModelClocked(func() time.Time { return now })
-	for member := Member(1); member <= 3; member++ {
-		m.Report(member, Observation{Delivered: 4e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
-	}
-	if got := m.Current().Members; got != 3 {
-		t.Fatalf("three lanes reporting: Members %d", got)
+	m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	if state := m.Report(2, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond}); state.Share == 0 {
+		t.Fatal("two busy lanes are not capped")
 	}
 	now = now.Add(time.Second)
-	state := m.Report(3, Observation{Delivered: 4e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
-	if state.Members != 1 {
-		t.Fatalf("a second after two lanes stopped reporting, Members %d, want 1", state.Members)
+	state := m.Report(2, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	if state.Share != 0 {
+		t.Fatalf("a second after its sibling stopped reporting, the lane is capped at %.0f", state.Share)
 	}
-	if want := 12e6 / 3; state.Seed != want {
-		t.Fatalf("the split stopped counting the quiet lanes before they expired: seed %.0f, want %.0f", state.Seed, want)
+	if want := 12e6 / 2; state.Seed != want {
+		t.Fatalf("the split stopped counting the quiet lane before it expired: seed %.0f, want %.0f", state.Seed, want)
 	}
-	if got := m.Members(); got != 3 {
-		t.Fatalf("quiet lanes expired after a second: %d members", got)
+	if got := m.Members(); got != 2 {
+		t.Fatalf("a quiet lane expired after a second: %d members", got)
 	}
 }
