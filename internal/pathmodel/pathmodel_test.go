@@ -369,3 +369,17 @@ func TestAFinishedLaneStopsCountingAsBusy(t *testing.T) {
 		t.Fatalf("a quiet lane expired after a second: %d members", got)
 	}
 }
+
+// The pooled erasure carries the weight it was averaged by, so a member can
+// take its own report back out of it.
+func TestErasureWeightIsTheObservationsBehindIt(t *testing.T) {
+	m := NewPathModel()
+	m.Report(1, Observation{Erasure: 0.9, BurstFactor: 1, ObservedSamples: 1000, Delivered: 1e6})
+	state := m.Report(2, Observation{Erasure: 0, BurstFactor: 1, ObservedSamples: 200, Delivered: 1e6})
+	if state.ErasureWeight != 1200 {
+		t.Fatalf("erasure weight %.0f, want 1200", state.ErasureWeight)
+	}
+	if others := (state.Erasure*state.ErasureWeight - 0.9*1000) / (state.ErasureWeight - 1000); math.Abs(others) > 1e-9 {
+		t.Fatalf("with member 1 taken out, the erasure is %.3f, want member 2's 0", others)
+	}
+}

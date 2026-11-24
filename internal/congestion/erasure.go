@@ -192,9 +192,11 @@ type ErasureSender struct {
 	lastShare    uint64
 	departed     bool
 	poolRTT      time.Duration
-	// selfSamples is what this lane's own loss estimate rests on, the part
-	// of the pool's that is not independent evidence about its rounds.
-	selfSamples float64
+	// selfSamples, selfLoss and selfObserved are this lane's own report to
+	// the pool -- the part of the pool's erasure that is not independent
+	// evidence about its rounds -- and poolWeight the observations the
+	// pool's figure is weighted by. See siblingsErasure.
+	selfSamples, selfLoss, selfObserved, poolWeight float64
 }
 
 type packetOutcome struct {
@@ -559,12 +561,12 @@ func (e *ErasureSender) floor() (rate, samples float64) {
 // or on the third that tried to send faster and delivered no more.
 func (e *ErasureSender) judgeRamp(arrived, lost uint64) {
 	// A round only counts as flat if the lane was sending as if it had a
-	// backlog: at some point half its window in flight. One carrying a few
-	// requests is not probing anything, and calling it flat would end the
-	// ramp before the bulk transfer it was opened for has started. A refused
-	// pacing or window poll is not that evidence: quic-go polls after the
-	// last packet of a request as readily as in the middle of a transfer.
-	limited := 2*e.rampPeak >= e.GetCongestionWindow()
+	// backlog (see backlogged). One carrying a few requests is not probing
+	// anything, and calling it flat would end the ramp before the bulk
+	// transfer it was opened for has started. A refused pacing or window
+	// poll is not that evidence: quic-go polls after the last packet of a
+	// request as readily as in the middle of a transfer.
+	limited := e.backlogged()
 	if e.aboveFloor {
 		e.endRamp()
 		return
@@ -658,9 +660,10 @@ func (e *ErasureSender) rebaseFloor(now monotime.Time) {
 	// would ever run for it. Enough besides this lane's own packets, or a
 	// lane alone in a thin pool would adopt its own first flight -- which
 	// may be overflow -- as soon as its reports had filled the pool.
-	if e.rampFloorN < rampLossSamples && e.poolSamples-e.selfSamples >= rampLossSamples {
-		e.rampFloor = float64(e.erasure.Load()) / partsPerMillion
-		e.rampFloorN, e.rampBurst = e.poolSamples, math.Max(e.poolBurst, 1)
+	if e.rampFloorN < rampLossSamples {
+		if floor, samples, ok := e.siblingsErasure(); ok && samples >= rampLossSamples {
+			e.rampFloor, e.rampFloorN, e.rampBurst = floor, samples, math.Max(e.poolBurst, 1)
+		}
 		return
 	}
 	// The window has to be observed, not merely elapsed: a lane that saw the
@@ -697,6 +700,21 @@ func (e *ErasureSender) rebaseFloor(now monotime.Time) {
 		// The last round was judged against the floor that just expired.
 		e.aboveFloor = false
 	}
+}
+
+// siblingsErasure is the pool's erasure with this lane's own report taken out
+// of it, and the samples behind what is left. The pool weighs each member's
+// figure by the outcomes it has observed (State.ErasureWeight), so the
+// lane's part is removed exactly; ok is false when nothing is left.
+func (e *ErasureSender) siblingsErasure() (erasure, samples float64, ok bool) {
+	weight := e.poolWeight - e.selfObserved
+	samples = e.poolSamples - e.selfSamples
+	if weight <= 0 || samples <= 0 {
+		return 0, 0, false
+	}
+	pooled := float64(e.erasure.Load()) / partsPerMillion
+	erasure = (pooled*e.poolWeight - e.selfLoss*e.selfObserved) / weight
+	return math.Min(math.Max(erasure, 0), 1), samples, true
 }
 
 // floorRebaseAfter is the pooled bottleneck's own window
@@ -805,23 +823,14 @@ func (e *ErasureSender) earnFromRamp() {
 // path the window has not yet forgotten -- probes it on a widening interval
 // rather than every few rounds.
 func (e *ErasureSender) maybeRearm() {
-	if share := e.share.Load(); share == 0 && e.lastShare > 0 {
-		e.departed = true
+	// Pending only while the lane stays uncapped: a sibling that starts
+	// again before the backoff ends takes the room back.
+	if share := e.share.Load(); share == 0 {
+		e.departed = e.departed || e.lastShare > 0
 	} else {
-		e.lastShare = share
+		e.departed, e.lastShare = false, share
 	}
-	if e.inner.round < e.rearmAfter {
-		return
-	}
-	_, minRTT := e.queueDelay()
-	if minRTT <= 0 {
-		return
-	}
-	// Whichever binds first, the pacer or the window: a share that rose
-	// above what the lane delivers raises the pacing rate long before the
-	// window, which follows the delivery.
-	allowed := math.Min(float64(e.bandwidth())*minRTT.Seconds(), float64(e.GetCongestionWindow()))
-	if float64(e.rampPeak) < allowed/2 {
+	if e.inner.round < e.rearmAfter || !e.backlogged() {
 		return
 	}
 	delivered := float64(e.inner.estimator.measuredEstimate())
@@ -832,6 +841,26 @@ func (e *ErasureSender) maybeRearm() {
 		return
 	}
 	e.rearm(delivered)
+}
+
+// backlogged reports whether the round just closed had at some point half of
+// what the lane was allowed in flight: by its window or by its pacing rate
+// over a round trip, whichever is smaller. A lane carrying requests has much
+// less. Either limit alone misreads one case: a share that rose above what a
+// lane delivers raises its pacing long before its window, which follows the
+// delivery; and a window sized from a seed's longer round trip can stay far
+// above what the pacer lets out, so a pacer-bound lane on a policer would
+// never count a flat round.
+func (e *ErasureSender) backlogged() bool {
+	allowed := float64(e.GetCongestionWindow())
+	rtt := e.inner.minRoundTrip()
+	if rtt <= 0 {
+		rtt = e.rampBaseRTT
+	}
+	if rtt > 0 {
+		allowed = math.Min(allowed, float64(e.bandwidth())*rtt.Seconds())
+	}
+	return 2*float64(e.rampPeak) >= allowed
 }
 
 // rearm puts a lane back into its ramp, and its controller into startup.
@@ -1273,7 +1302,8 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))
 		e.share.Store(uint64(state.Share))
 		e.poolSamples, e.poolBurst = state.ErasureSamples, state.ErasureBurst
-		e.selfSamples = snapshot.Samples
+		e.selfSamples, e.selfLoss, e.selfObserved = snapshot.Samples, snapshot.Loss, float64(snapshot.Decided)
+		e.poolWeight = state.ErasureWeight
 		e.poolRTT = state.LeafRoundTrip
 		e.rampGate(eventTime, acked, lost)
 	}

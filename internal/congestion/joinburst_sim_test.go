@@ -820,7 +820,7 @@ func TestAnUnderSampledFloorMatures(t *testing.T) {
 	probe := joiningProbe()
 	probe.ErasureSamples = 10
 	sender := NewErasureSenderOn(1200, probe)
-	sender.poolSamples, sender.poolBurst = 5000, 1
+	sender.poolSamples, sender.poolWeight, sender.poolBurst = 5000, 5000, 1
 	sender.erasure.Store(uint64(0.15 * partsPerMillion))
 	sender.rampGate(base(), nil, nil)
 	if sender.rampFloorN != 5000 || sender.rampFloor != 0.15 {
@@ -1154,7 +1154,7 @@ func TestAJoinerOnAnUnmeasuredLeafHasNoPooledQueueBaseline(t *testing.T) {
 
 // Over a pool too thin to judge by, a lane's unconfirmed first flight is not
 // its floor either -- it may be overflow -- and the pool's floor matures only
-// on samples beyond the lane's own reports of that same flight.
+// from what its siblings measured, this lane's own report taken out.
 func TestAThinPoolDoesNotMakeAFirstFlightAFloor(t *testing.T) {
 	probe := joiningProbe()
 	probe.ErasureSamples = 10
@@ -1163,16 +1163,71 @@ func TestAThinPoolDoesNotMakeAFirstFlightAFloor(t *testing.T) {
 	if floor, n := sender.floor(); n >= rampLossSamples {
 		t.Fatalf("over a thin pool, the lane judges against %.3f on %.0f samples: its own unconfirmed first flight", floor, n)
 	}
-	sender.erasure.Store(uint64(0.94 * partsPerMillion))
-	sender.poolSamples, sender.selfSamples, sender.poolBurst = 70, 64, 1
+	// The joiner's first flight lost 90% of 1,000 packets; one sibling lost
+	// none of 100. The pool reads 0.82.
+	sender.selfLoss, sender.selfObserved, sender.selfSamples = 0.9, 1000, 1000
+	sender.poolWeight, sender.poolSamples, sender.poolBurst = 1100, 1040, 1
+	sender.erasure.Store(818182)
 	sender.rampGate(base(), nil, nil)
 	if sender.rampFloorN >= rampLossSamples {
-		t.Fatalf("the pool's floor matured on %.0f samples, %.0f of them this lane's own", sender.poolSamples, sender.selfSamples)
+		t.Fatalf("the floor matured to %.3f on %.0f samples, 1,000 of them this lane's own", sender.rampFloor, sender.rampFloorN)
 	}
-	sender.erasure.Store(uint64(0.15 * partsPerMillion))
-	sender.poolSamples = 64 + rampLossSamples
+	sender.poolWeight, sender.poolSamples = 1200, 1100
+	sender.erasure.Store(750000)
 	sender.rampGate(base(), nil, nil)
-	if sender.rampFloorN < rampLossSamples || sender.rampFloor != 0.15 {
-		t.Fatalf("with independent samples the floor did not mature: %.3f on %.0f", sender.rampFloor, sender.rampFloorN)
+	if sender.rampFloorN < rampLossSamples || sender.rampFloor > 0.01 {
+		t.Fatalf("from 200 clean sibling outcomes the floor matured to %.3f on %.0f, want 0", sender.rampFloor, sender.rampFloorN)
+	}
+}
+
+// A lane the pacer holds back is backlogged even when its window is far
+// larger -- a window sized from a seed's longer round trip -- or its flat
+// rounds would never count, and on a queue-free policer whose drops are the
+// floor nothing else would end its ramp.
+func TestAPacerBoundLaneCountsFlatRounds(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	sender.inner.minRTT = 20 * time.Millisecond
+	sender.inner.cwnd *= 20
+	sender.inner.estimator.measured.updateMax(1, monotime.Time(0), 1e6)
+	paced := quiccongestion.ByteCount(float64(sender.bandwidth()) * 0.02)
+	if 2*paced >= sender.GetCongestionWindow() {
+		t.Fatalf("the window %d does not dwarf the pacing allowance %d; the test cannot tell", sender.GetCongestionWindow(), paced)
+	}
+	for round := 0; round <= rampFlatRounds; round++ {
+		sendAt(sender, paced)
+		sender.inner.round++
+		sender.rampGate(base(), nil, nil)
+	}
+	if sender.ramping.Load() {
+		t.Fatal("a lane with its pacing allowance in flight for three flat rounds is still ramping")
+	}
+}
+
+// A lane left alone re-arms when the backoff allows -- unless a sibling took
+// the room back first.
+func TestAPendingReArmLapsesWhenTheCapReturns(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	sender.inner.minRTT = joiningRoundTrip
+	sender.SetRTTStatsProvider(&fixedRTT{min: joiningRoundTrip, smoothed: joiningRoundTrip})
+	sender.endRamp()
+	sender.inner.mode = tuicBbrProbeBW
+	closeRound := func() {
+		sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
+		sendAt(sender, sender.GetCongestionWindow())
+		sender.inner.round++
+		sender.rampGate(base(), nil, nil)
+	}
+	closeRound()
+	sender.share.Store(0)
+	closeRound()
+	if !sender.departed {
+		t.Fatal("left alone during its backoff, the lane has nothing pending")
+	}
+	sender.share.Store(1.25e6)
+	for sender.inner.round <= sender.rearmAfter {
+		closeRound()
+	}
+	if sender.ramping.Load() {
+		t.Fatal("the cap came back before the backoff ended, and the lane ramped anyway")
 	}
 }

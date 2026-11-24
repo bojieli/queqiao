@@ -204,7 +204,7 @@ func combine(states []State) State {
 		// supplies it; among equal figures, including a measured clean
 		// floor, the best-measured one.
 		if s.Erasure > out.Erasure || (s.Erasure == out.Erasure && s.ErasureSamples > out.ErasureSamples) {
-			out.Erasure, out.ErasureSamples, out.ErasureBurst = s.Erasure, s.ErasureSamples, s.ErasureBurst
+			out.Erasure, out.ErasureSamples, out.ErasureBurst, out.ErasureWeight = s.Erasure, s.ErasureSamples, s.ErasureBurst, s.ErasureWeight
 		}
 		if s.BurstFactor > out.BurstFactor {
 			out.BurstFactor = s.BurstFactor

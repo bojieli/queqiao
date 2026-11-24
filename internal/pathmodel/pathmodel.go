@@ -189,6 +189,11 @@ type State struct {
 	// BurstFactor as the worst of its nodes, for sizing a code, but this from
 	// the node whose erasure it took.
 	ErasureBurst float64
+	// ErasureWeight is what Erasure is weighted by: the sum of the live
+	// contributors' ObservedSamples, each member's figure counting in
+	// proportion to its own, so that a member can take its report back out.
+	// Zero when Erasure is remembered rather than reported by anyone live.
+	ErasureWeight float64
 	// Share is this contributor's allowance of the bottleneck in bytes per
 	// second. Zero means the contributor must not cap itself -- either because
 	// the bottleneck is not yet known, or because it is the only one here and
@@ -354,7 +359,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 			effective = observed * observed / spread
 		}
 		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, effective
-		state.ErasureSamples = effective
+		state.ErasureSamples, state.ErasureWeight = effective, observed
 	} else if m.knowledge.erasureKnown {
 		state.Erasure, state.BurstFactor = m.knowledge.erasure, m.knowledge.burst
 		state.ErasureSamples = m.knowledge.erasureSamples
@@ -512,7 +517,7 @@ func (m *PathModel) Current() State {
 			effective = observed * observed / spread
 		}
 		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, effective
-		state.ErasureSamples = effective
+		state.ErasureSamples, state.ErasureWeight = effective, observed
 	} else if m.knowledge.erasureKnown {
 		state.Erasure, state.BurstFactor = m.knowledge.erasure, m.knowledge.burst
 		state.ErasureSamples = m.knowledge.erasureSamples

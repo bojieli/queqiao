@@ -586,7 +586,14 @@ earlier for the same reason (#160 item 3).
 
 - A lane whose pool has too few samples to judge by no longer falls back to
   its own unconfirmed first rounds, which may be a first flight's overflow;
-  and an under-sampled floor matures only on samples beyond the lane's own.
+  and an under-sampled floor matures only from what the siblings measured:
+  the pool now publishes the weight behind its erasure
+  (`State.ErasureWeight`), so a lane takes its own report back out exactly.
+- A round counts as probing (for the flat-delivery exit, and as a backlog for
+  re-arming) when half of the smaller of the window and the pacing rate over
+  a round trip was in flight. The window alone missed a pacer-bound lane
+  whose window was sized from a seed's longer round trip; on a queue-free
+  policer nothing else would have ended its ramp.
 - In hierarchical (`Chain`) mode the queue baseline came from the chain's
   `RoundTrip`, which can be an ancestor's -- a shorter path to another
   destination -- when the leaf has measured none, so every ramp ended at
