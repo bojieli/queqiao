@@ -1317,10 +1317,10 @@ func (s *Server) watchAuthorization(ctx context.Context, flow *serverFlow) {
 		select {
 		case <-ticker.C:
 			if _, err := s.cfg.Credentials.Store.Authorize(flow.principal, time.Now()); err != nil {
-				// Stop forwarding at once; telling the peer is best effort
-				// and must not keep a revoked flow's traffic moving.
-				_ = flow.flow.inner.Close()
-				flow.flow.failClose(errAuthorizationRevoked)
+				// No RESET here: the broadcast's bounded wait would leave
+				// data the scheduler already holds moving to a revoked
+				// device. Its replacement JOIN is refused at authorization.
+				flow.flow.closeAll()
 				return
 			}
 		case <-flow.flow.doneChan():

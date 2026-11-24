@@ -100,9 +100,6 @@ var (
 	errFlowIdleTimeout       = errors.New("flow idle timeout")
 	errFlowLifetime          = errors.New("flow lifetime exceeded")
 	errLocalApplicationClose = errors.New("local application closed")
-	// errAuthorizationRevoked ends a gateway flow whose device or account
-	// stopped being authorized while it was open.
-	errAuthorizationRevoked = errors.New("authorization revoked")
 )
 
 type mpLane struct {
@@ -3542,8 +3539,6 @@ func terminalResetReason(err error) (session.ResetCode, string) {
 		return session.ResetTransport, "flow ended: idle timeout"
 	case errors.Is(err, errFlowLifetime):
 		return session.ResetTransport, "flow ended: lifetime exceeded"
-	case errors.Is(err, errAuthorizationRevoked):
-		return session.ResetAuthentication, "flow ended: authorization revoked"
 	case expectedDestinationCloseError(err):
 		return session.ResetDestination, "flow ended: destination closed"
 	default:

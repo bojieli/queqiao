@@ -173,7 +173,6 @@ func TestTerminalResetReasonKeepsAddressesOffTheWire(t *testing.T) {
 		{errors.Join(errors.New("last lane failed (lane 0: read udp 192.0.2.1:1->192.0.2.2:2: timeout)"), errLaneReplacementTimeout), session.ResetTransport, "flow ended: lane replacement timeout"},
 		{errReplacementAbandoned, session.ResetTransport, "flow ended: lane replacement timeout"},
 		{errFlowLifetime, session.ResetTransport, "flow ended: lifetime exceeded"},
-		{errAuthorizationRevoked, session.ResetAuthentication, "flow ended: authorization revoked"},
 		{errors.New("read tcp 192.0.2.1:1->192.0.2.2:2: i/o timeout"), session.ResetTransport, "flow ended with error"},
 	}
 	for _, c := range cases {
