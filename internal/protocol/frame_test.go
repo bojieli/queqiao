@@ -325,3 +325,108 @@ func TestAPeerOfAnotherVersionIsRefused(t *testing.T) {
 		}
 	}
 }
+
+func TestNegotiableVersionsAndTheirALPNs(t *testing.T) {
+	if MinVersion != 1 || Version != 2 {
+		t.Fatalf("versions = %d..%d, want 1..2", MinVersion, Version)
+	}
+	if got := SupportedVersions(); !bytes.Equal(got, []byte{2, 1}) {
+		t.Fatalf("supported versions = %v, want preference order [2 1]", got)
+	}
+	for _, v := range []byte{0, 1, 2, 3} {
+		alpn := ALPN(v)
+		got, ok := VersionForALPN(alpn)
+		if want := v == 1 || v == 2; ok != want || Supported(v) != want || ok && got != v {
+			t.Fatalf("version %d via %q = (%d, %v), supported %v", v, alpn, got, ok, Supported(v))
+		}
+	}
+	if ALPN(Version) != DataALPN {
+		t.Fatalf("preferred ALPN %q, DataALPN %q", ALPN(Version), DataALPN)
+	}
+	for _, alpn := range []string{"", "queqiao/02", "queqiao-enroll/1", "queqiao-renew/1", "h2"} {
+		if _, ok := VersionForALPN(alpn); ok {
+			t.Fatalf("%q mapped to a data wire version", alpn)
+		}
+	}
+}
+
+// TestVersionFlagMatrix is the codec half of running two wire versions side by
+// side: every header is legal or illegal by the version it carries, and the
+// one difference between the versions is that REPLACE_LANE (bit 6) exists
+// only from version 2. A version-1 peer, which predates it, must see the bit
+// refused exactly as it refuses any other reserved bit.
+func TestVersionFlagMatrix(t *testing.T) {
+	type flagCase struct {
+		name  string
+		typ   Type
+		flags uint16
+		// minVersion is the oldest version on which the header is legal; zero
+		// means it is legal on none.
+		minVersion byte
+	}
+	cases := []flagCase{
+		{"plain join", TypeJoin, 0, 1},
+		{"control join", TypeJoin, FlagReserveControl, 1},
+		{"replacement join", TypeJoin, FlagReplaceLane, 2},
+		{"control replacement join", TypeJoin, FlagReserveControl | FlagReplaceLane, 2},
+		{"replacement flag on data", TypeData, FlagReplaceLane, 0},
+		{"replacement flag on open", TypeOpen, FlagReplaceLane, 0},
+		{"control open", TypeOpen, FlagReserveControl, 1},
+		{"ranged ack", TypeAck, FlagAckUp | FlagAckRanges, 1},
+		{"aborting close", TypeClose, FlagFin | FlagCloseAbort, 1},
+		{"reserved bit 8", TypeData, 1 << 8, 0},
+	}
+	for _, tc := range cases {
+		for _, version := range []byte{1, 2, 3} {
+			legal := tc.minVersion != 0 && version >= tc.minVersion && Supported(version)
+			h := Header{Version: version, Type: tc.typ, Flags: tc.flags, FlowID: 1, Class: ClassBulk}
+			var raw [HeaderSize]byte
+			err := h.Encode(raw[:])
+			if legal != (err == nil) {
+				t.Fatalf("%s on v%d: encode err=%v, legal=%v", tc.name, version, err, legal)
+			}
+			if err := h.Validate(); legal != (err == nil) {
+				t.Fatalf("%s on v%d: validate err=%v, legal=%v", tc.name, version, err, legal)
+			}
+			// Build the bytes by hand so an illegal header reaches the decoder.
+			raw[0], raw[1], raw[2], raw[3] = Magic0, Magic1, version, byte(tc.typ)
+			binary.BigEndian.PutUint16(raw[4:6], tc.flags)
+			binary.BigEndian.PutUint64(raw[22:30], 1)
+			raw[42] = byte(ClassBulk)
+			for _, wire := range []byte{1, 2} {
+				_, err := DecodeHeaderVersion(raw[:], wire)
+				if want := legal && wire == version; want != (err == nil) {
+					t.Fatalf("%s v%d on a v%d connection: decode err=%v, want accepted=%v", tc.name, version, wire, err, want)
+				}
+				if version != wire {
+					var mismatch UnsupportedVersionError
+					if !errors.As(err, &mismatch) || mismatch.Peer != version || mismatch.Local != wire {
+						t.Fatalf("v%d on a v%d connection failed ambiguously: %v", version, wire, err)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestFramesRoundTripOnEachVersion(t *testing.T) {
+	for _, wire := range SupportedVersions() {
+		var buf bytes.Buffer
+		want := Frame{Header: Header{Version: wire, Type: TypeJoin, FlowID: 9, Class: ClassBulk}, Payload: make([]byte, 8)}
+		if err := WriteFrame(&buf, want); err != nil {
+			t.Fatalf("v%d: %v", wire, err)
+		}
+		raw := append([]byte(nil), buf.Bytes()...)
+		got, err := ReadFrameVersion(&buf, wire)
+		if err != nil || got.Header.Version != wire || got.Header.Type != TypeJoin {
+			t.Fatalf("v%d: read %+v, %v", wire, got.Header, err)
+		}
+		if _, err := ParseFrameVersion(raw, wire); err != nil {
+			t.Fatalf("v%d: parse: %v", wire, err)
+		}
+		other := byte(3 - wire)
+		if _, err := ParseFrameVersion(raw, other); err == nil {
+			t.Fatalf("a v%d frame parsed on a v%d connection", wire, other)
+		}
+	}
+}

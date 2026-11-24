@@ -3,6 +3,7 @@ package coded
 import (
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,21 +12,30 @@ import (
 	"github.com/bojieli/queqiao/internal/fec"
 )
 
-// TestCodedDatagramVectors replays the committed protocol-2 datagram vectors
-// against the parser that faces the wire.
+// TestCodedDatagramVectors replays the committed datagram vectors of every
+// wire version this build speaks against the parser that faces the wire.
 //
 // It lives in this package rather than in internal/conformance because the
 // only thing worth testing here is the receive path itself, which is not
 // exported: a vector checked against a reimplementation of the parser proves
 // that the reimplementation is right.
 func TestCodedDatagramVectors(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "testdata", "protocol2", "vectors.json"))
+	for _, wire := range []int{1, 2} {
+		t.Run(fmt.Sprintf("protocol%d", wire), func(t *testing.T) { testCodedDatagramVectors(t, wire) })
+	}
+}
+
+func testCodedDatagramVectors(t *testing.T, wire int) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "testdata", fmt.Sprintf("protocol%d", wire), "vectors.json"))
 	if err != nil {
-		t.Fatalf("read protocol-2 vectors: %v", err)
+		t.Fatalf("read protocol-%d vectors: %v", wire, err)
 	}
 	var file conformance.File
 	if err := json.Unmarshal(raw, &file); err != nil {
-		t.Fatalf("parse protocol-2 vectors: %v", err)
+		t.Fatalf("parse protocol-%d vectors: %v", wire, err)
+	}
+	if file.Protocol != wire {
+		t.Fatalf("protocol-%d vectors describe protocol %d", wire, file.Protocol)
 	}
 	if file.Limits.MaxRepairWindow != fec.MaxRepairWindow {
 		t.Fatalf("vectors bound a repair at %d symbols, this build at %d", file.Limits.MaxRepairWindow, fec.MaxRepairWindow)
@@ -51,7 +61,7 @@ func TestCodedDatagramVectors(t *testing.T) {
 			// session above would not be.
 			if v.Reject {
 				if len(frames) != 0 {
-					t.Fatalf("a datagram protocol 2 forbids delivered %d frames (%s)", len(frames), v.Why)
+					t.Fatalf("a datagram protocol %d forbids delivered %d frames (%s)", wire, len(frames), v.Why)
 				}
 				return
 			}
