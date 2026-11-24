@@ -1349,7 +1349,9 @@ func (f *multipathFlow) closeFailedLane(lane *mpLane) bool {
 // reportLaneFailure exports and coordinates a lane already transitioned by
 // closeFailedLane.
 func (f *multipathFlow) reportLaneFailure(lane *mpLane, err error) {
-	if f.finished.Load() {
+	// A failing flow's peer closes its lanes on the first RESET it reads,
+	// possibly while the others are still being written: expected teardown.
+	if f.finished.Load() || f.terminating.Load() {
 		return
 	}
 	// Once both FIN directions are observed, a peer closing an outer lane is
@@ -3487,11 +3489,7 @@ func (f *multipathFlow) broadcastReset(err error) {
 	f.terminating.Store(true)
 	lanes := make([]*mpLane, 0, len(f.lanes))
 	for _, lane := range f.lanes {
-		// A staged JOIN has not had its OPEN_OK yet, so its peer would read
-		// a RESET as the answer to the JOIN rather than as the end of the
-		// flow. It is closed with the rest, and its peer's next JOIN finds
-		// no session.
-		if lane.fc != nil && !lane.closed.Load() && (!lane.staged || lane.ready.Load()) {
+		if lane.fc != nil && !lane.closed.Load() {
 			lanes = append(lanes, lane)
 		}
 	}
@@ -3504,6 +3502,13 @@ func (f *multipathFlow) broadcastReset(err error) {
 		Version: protocol.Version, Type: protocol.TypeReset, SessionID: f.sessionID,
 		FlowID: f.flowID, Class: protocol.ClassNew,
 	}, Payload: session.ResetPayload(code, reason)}
+	// A staged JOIN may or may not have had its OPEN_OK written yet. If not,
+	// its peer reads the RESET as the JOIN's answer, so there it carries the
+	// protocol code, the permanent refusal, never the transport code a client
+	// takes as "switch to TCP". Written either way, so no acknowledged JOIN is
+	// closed without one.
+	stagedFrame := frame
+	stagedFrame.Payload = session.ResetPayload(session.ResetProtocol, reason)
 	ctx, cancel := context.WithTimeout(context.Background(), terminalResetWait)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -3513,7 +3518,11 @@ func (f *multipathFlow) broadcastReset(err error) {
 			defer wg.Done()
 			// The reliable stream, never the coded datagrams: a RESET that
 			// can be lost is no better than none.
-			_ = lane.fc.writeControlContext(ctx, frame)
+			out := frame
+			if lane.staged && !lane.ready.Load() {
+				out = stagedFrame
+			}
+			_ = lane.fc.writeControlContext(ctx, out)
 		}(lane)
 	}
 	// A stream without write deadlines cannot be interrupted by the context,

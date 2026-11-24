@@ -266,9 +266,10 @@ func TestPeerResetReasonWinsOverTheTeardownError(t *testing.T) {
 	}
 }
 
-// A staged JOIN has not been answered yet; a RESET on it would be read as the
-// JOIN's refusal, so it gets none.
-func TestStagedLaneIsNotReset(t *testing.T) {
+// A staged JOIN may not have been answered yet, so its RESET carries the
+// permanent protocol code: never the transport code a client would read as
+// "switch to TCP", and never nothing.
+func TestStagedLaneGetsAPermanentReset(t *testing.T) {
 	inner, application := net.Pipe()
 	defer application.Close()
 	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024,
@@ -279,13 +280,17 @@ func TestStagedLaneIsNotReset(t *testing.T) {
 	if err := flow.addLane(&mpLane{id: 1, kind: TransportQUIC, fc: newFrameConn(outer), staged: true}); err != nil {
 		t.Fatal(err)
 	}
-	sawReset := make(chan bool, 1)
+	got := make(chan protocol.Frame, 1)
 	go func() {
 		frame, err := protocol.ReadFrame(peer)
-		sawReset <- err == nil && frame.Header.Type == protocol.TypeReset
+		if err == nil {
+			got <- frame
+		}
+		close(got)
 	}()
 	flow.failClose(errFlowLifetime)
-	if <-sawReset {
-		t.Fatal("a staged JOIN lane was sent RESET")
+	frame, ok := <-got
+	if !ok || frame.Header.Type != protocol.TypeReset || resetCode(frame.Payload) != session.ResetProtocol {
+		t.Fatalf("staged lane got %+v %q, want a protocol RESET", frame.Header, frame.Payload)
 	}
 }
