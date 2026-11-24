@@ -75,12 +75,22 @@ def log(message):
     print(f"[{stamp}] {message}", flush=True)
 
 
+ISSUED_PORTS = set()
+
+
 def free_port():
-    """A port free on both TCP and UDP, which a gateway listens on together."""
+    """A port free on both TCP and UDP, which a gateway listens on together.
+
+    No port is handed out twice in one run: the probe sockets are closed
+    before the port is used, so two calls could otherwise agree on one.
+    """
     for _ in range(64):
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp.bind(("127.0.0.1", 0))
         port = tcp.getsockname()[1]
+        if port in ISSUED_PORTS:
+            tcp.close()
+            continue
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             udp.bind(("127.0.0.1", port))
@@ -89,6 +99,7 @@ def free_port():
         finally:
             udp.close()
             tcp.close()
+        ISSUED_PORTS.add(port)
         return port
     raise RuntimeError("no port free on both TCP and UDP")
 
@@ -413,7 +424,14 @@ def download(proxy_port, destinations, size, timeout, on_progress=None):
     with conn:
         conn.sendall(f"{size}\n".encode())
         while True:
-            part = conn.recv(1 << 16)
+            try:
+                part = conn.recv(1 << 16)
+            except OSError:
+                # An interrupted download must still have delivered only
+                # what was sent, or the interruption hides corruption.
+                if digest.hexdigest() != expected_digest(received):
+                    raise IntegrityError(f"the {received} bytes delivered before the download failed do not match what was sent")
+                raise
             if not part:
                 break
             digest.update(part)
@@ -426,6 +444,8 @@ def download(proxy_port, destinations, size, timeout, on_progress=None):
     if received != size or digest.hexdigest() != expected_digest(size):
         if received == size:
             raise IntegrityError(f"downloaded {size} bytes that do not match what was sent")
+        if digest.hexdigest() != expected_digest(received):
+            raise IntegrityError(f"the {received} bytes delivered before the download ended do not match what was sent")
         raise RuntimeError(f"download ended at {received} of {size} bytes")
     return {"bytes": received, "seconds": round(elapsed, 3), "mbit_per_second": round(size * 8 / elapsed / 1e6, 1)}
 
@@ -722,10 +742,12 @@ def disrupted_transfer(client, gateway, destinations, direction, carrier, disrup
 
     def at(progress):
         if not applied and progress >= args.stall_after_mib << 20:
-            applied["joins"] = lane_joins(gateway, carrier)
-            applied["refusals"] = join_refusals(gateway)
+            # Counted once the relay has changed state, so a JOIN admitted
+            # before the disruption is never credited as its rescue.
             disrupt()
             applied["at"] = time.monotonic()
+            applied["joins"] = lane_joins(gateway, carrier)
+            applied["refusals"] = join_refusals(gateway)
 
     size = args.stall_mib << 20
     outcome = {"direction": direction, "carrier": carrier, "completed": False}

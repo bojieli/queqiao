@@ -85,12 +85,12 @@ func auditWire(t *testing.T, pin byte) *wireAudit {
 	if pin != 0 {
 		wires := []byte{pin}
 		testClientWires.Store(&wires)
-		testFrameWire.Store(uint32(pin))
+		testFrameWire.Store(&pin)
 	}
 	t.Cleanup(func() {
 		testFrameObserver.Store(nil)
 		testClientWires.Store(nil)
-		testFrameWire.Store(0)
+		testFrameWire.Store(nil)
 	})
 	return audit
 }

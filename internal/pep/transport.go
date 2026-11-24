@@ -47,14 +47,15 @@ func parseWireVersions(spec string) ([]byte, error) {
 	var out []byte
 	for _, field := range strings.Split(spec, ",") {
 		field = strings.TrimSpace(field)
-		n, err := strconv.Atoi(field)
-		if err != nil || n < 0 || n > 255 || !protocol.Supported(byte(n)) {
+		parsed, err := strconv.ParseUint(field, 10, 8)
+		version := byte(parsed)
+		if err != nil || !protocol.Supported(version) {
 			return nil, fmt.Errorf("unsupported wire version %q (this build speaks %s)", field, formatWireVersions(protocol.SupportedVersions()))
 		}
-		if slices.Contains(out, byte(n)) {
-			return nil, fmt.Errorf("wire version %d is listed twice", n)
+		if slices.Contains(out, version) {
+			return nil, fmt.Errorf("wire version %d is listed twice", version)
 		}
-		out = append(out, byte(n))
+		out = append(out, version)
 	}
 	return out, nil
 }

@@ -460,15 +460,15 @@ func (c *frameConn) writeControlContext(ctx context.Context, f protocol.Frame) e
 // them to replay end-to-end scenarios with every lane on one wire version and
 // to inspect every frame a lane accepts.
 var (
-	testFrameWire     atomic.Uint32
+	testFrameWire     atomic.Pointer[byte]
 	testFrameObserver atomic.Pointer[func(wire byte, f protocol.Frame)]
 )
 
 // defaultFrameWire is the version of a lane whose transport negotiates none,
 // which outside tests is only ever the preferred one.
 func defaultFrameWire() byte {
-	if forced := byte(testFrameWire.Load()); forced != 0 {
-		return forced
+	if forced := testFrameWire.Load(); forced != nil {
+		return *forced
 	}
 	return protocol.Version
 }
