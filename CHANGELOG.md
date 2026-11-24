@@ -10,6 +10,78 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.14.0 - 2026-11-24
+
+### Added
+
+- Client lane-recovery failure logs now name the flow and attempt on both
+  transports. The TCP `TCP bundle lane unavailable` line gains `flow_id`,
+  `attempt`, `replacement`, and `failure_kind`, matching the QUIC
+  `lane recovery unavailable` line. Every counted replacement failure is now
+  logged, including timeouts and peer refusals, which are written at info and
+  were previously dropped. A new `scripts/lane_replacement_split.py` splits
+  `lane replacement timeout` failures from these logs by what recovery did.
+
+### Changed
+
+- Gateways and clients negotiate the wire version per connection by ALPN
+  instead of requiring a paired upgrade. A gateway accepts versions 1 and 2
+  (`--accept-wire`, default `1,2`) and a client offers both, preferring 2
+  (`--wire-versions`, default `2,1`), so gateways can be upgraded ahead of their
+  clients: v0.12.x clients keep working against a current gateway on version 1,
+  and a current client works against a v0.12.x gateway. A flow keeps the version
+  it opened on; a lane joining it on the other version is refused with the
+  `wire_mismatch` reason. Version-1 rescues use the plain JOIN, since
+  `REPLACE_LANE` exists only on version 2. `--version` and `BUILDINFO` add
+  `wire_accept=1,2`, and the gateway reports
+  `queqiao_data_connections_total{wire}` and
+  `queqiao_wire_active_flows{wire}`, and a `wire` field on each flow's log
+  records.
+- A flow the client host slept through for longer than the gateway holds a
+  silent flow now fails with `peer dropped this session while this host was
+  suspended` instead of `peer does not hold this session`, and its completion
+  record carries `host_suspended`. The gateway had ended these flows correctly
+  during the sleep; they were being counted as sessions it lost.
+
+### Fixed
+
+- A gateway flow that ends with an error now sends RESET, with a short reason,
+  on every lane still open before it closes them. The client used to see only
+  the streams end, take that for a dead path, and ask to join a replacement lane
+  to a session the gateway had already dropped, failing the flow about half a
+  second later with `peer does not hold this session`. It now ends the flow at
+  once with `peer reset flow: flow ended: <reason>`.
+- A TCP lane JOIN interrupted because its flow's recovery ended is now reported
+  as `canceled` rather than `timeout`. Cancellation interrupts the handshake by
+  moving the socket deadline to now, and the resulting i/o timeout was counted
+  and logged at info as `failure_kind=timeout` after the flow had already gone,
+  inflating the timeouts that suggest a path cannot carry a handshake. Such
+  joins are no longer logged once the flow's recovery has stopped; a handshake
+  that expires while the flow is live is still a `timeout`.
+  `scripts/lane_replacement_split.py` now reports its `window` over every
+  client record with a time instead of only terminal flow records, and keeps
+  flow keys only when `--gateway` input is given.
+- A lane join that reaches the gateway while the flow's OPEN is still dialling
+  its destination now waits for the OPEN to be decided, and its acknowledgement,
+  instead of being refused as an unknown session. When the OPEN's own stream
+  dies during the dial and a join is waiting, the gateway keeps the flow for the
+  replacement instead of closing it, and a join admitted before the OPEN's
+  acknowledgement now confirms the flow on the client. A join still refused
+  before OPEN_OK fails the flow with `peer refused this flow before confirming
+  its open` rather than `peer does not hold this session`. The gateway now tells
+  a session it held and ended (`session_ended`) from one it never held, and
+  refuses an OPEN for a session it remembers ending. The failure kinds
+  `open_unconfirmed`, `open_failed` and `open_pending` and the gateway refusal
+  reasons `session_pending`, `open_failed` and `session_ended` keep these cases
+  apart from a lost session.
+- A TCP flow whose only lane ends now always gets its zero-lane replacement
+  attempts. Stall rescues beside a still-open lane used to spend the same
+  budget, so a flow rescued eight times within five minutes lost its last lane
+  with nothing left and waited out the whole 45-second replacement grace before
+  failing with `lane replacement timeout` and `lane_replacement_attempts` 0. A
+  spent zero-lane budget now also fails the flow at once, as on QUIC, instead
+  of holding the application for a grace nothing will arrive during.
+
 ## v0.13.0 - 2026-11-23
 
 ### Added
