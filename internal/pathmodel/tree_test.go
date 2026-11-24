@@ -570,3 +570,24 @@ func TestCombineCarriesTheSamplesBehindTheErasure(t *testing.T) {
 		t.Errorf("through a chain the erasure rests on %.0f samples, want 8000", state.ErasureSamples)
 	}
 }
+
+// A joining lane judges a queue against its own destination's round trip.
+// The chain's RoundTrip can come from an ancestor pooling other destinations,
+// and while the leaf has measured nothing, LeafRoundTrip is zero rather than
+// another path's minimum.
+func TestTheLeafRoundTripIsTheLeafs(t *testing.T) {
+	out := combine([]State{
+		{RoundTrip: 40 * time.Millisecond, LeafRoundTrip: 40 * time.Millisecond, Members: 9},
+		{},
+	})
+	if out.RoundTrip != 40*time.Millisecond || out.LeafRoundTrip != 0 || out.Members != 0 {
+		t.Fatalf("unmeasured leaf: RoundTrip %v, LeafRoundTrip %v, Members %d; want 40ms, 0, 0", out.RoundTrip, out.LeafRoundTrip, out.Members)
+	}
+	out = combine([]State{
+		{RoundTrip: 40 * time.Millisecond, LeafRoundTrip: 40 * time.Millisecond, Members: 9},
+		{RoundTrip: 180 * time.Millisecond, LeafRoundTrip: 180 * time.Millisecond, Members: 2},
+	})
+	if out.LeafRoundTrip != 180*time.Millisecond || out.Members != 2 {
+		t.Fatalf("measured leaf: LeafRoundTrip %v, Members %d; want 180ms, 2", out.LeafRoundTrip, out.Members)
+	}
+}

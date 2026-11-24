@@ -195,6 +195,8 @@ func (c *Chain) Current() State {
 //     the longest is the one that describes this flow's path.
 //   - ObservedSamples takes the maximum, because it is a statement about how
 //     much is known rather than a constraint.
+//   - LeafRoundTrip and Members are the leaf's: they describe this
+//     destination's lanes, and an ancestor's describe other destinations'.
 func combine(states []State) State {
 	var out State
 	for _, s := range states {
@@ -231,6 +233,12 @@ func combine(states []State) State {
 		if s.Seed > 0 && (out.Seed == 0 || s.Seed < out.Seed) {
 			out.Seed = s.Seed
 		}
+	}
+	// The leaf is this destination; an ancestor's members and round trips
+	// are other destinations' too.
+	if len(states) > 0 {
+		leaf := states[len(states)-1]
+		out.LeafRoundTrip, out.Members = leaf.LeafRoundTrip, leaf.Members
 	}
 	if out.BurstFactor < 1 {
 		out.BurstFactor = 1

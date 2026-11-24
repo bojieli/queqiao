@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"sort"
 	"testing"
 	"time"
@@ -67,11 +68,39 @@ type joinBurst struct {
 	// idle is the delivered rate of a member that is already in the pool and
 	// stays there without using its share -- the pooled control connection a
 	// bulk download joins next to. Zero means the lanes join an empty model.
-	idle float64
+	//
+	// What it reports is what such a connection measures. It carries
+	// requests, so its compensation gate never sees delivery rise with a step
+	// and it has earned nothing: it reports an arrival of 1, unless
+	// idleArrival says otherwise. Its loss estimate rests on the few
+	// packets it decides (idleSamples, 2000 if zero) and reads idleErasure,
+	// which is the path's erasure unless set: a floor measured at a calmer
+	// hour, or from a connection whose losses were never the bulk lanes',
+	// is the stale floor a joiner inherits.
+	idle        float64
+	idleArrival float64
+	idleErasure float64
+	idleSamples float64
+	// plan, when set, replaces lanes and stagger: each lane's own join time,
+	// when it stops sending, and a request phase before its bulk transfer.
+	plan []simLanePlan
 	// policer makes the bottleneck a token bucket holding this many seconds
 	// of its rate, which drops what it cannot pass and queues nothing.
 	policer time.Duration
 	seed    int64
+}
+
+// simLanePlan is one lane's life in a simulated run.
+type simLanePlan struct {
+	// join is when the lane opens, and stop when its flow ends: from then it
+	// sends nothing and, once what it had in flight has been decided, reports
+	// nothing, as a closed connection does. Zero stop runs to the end.
+	join, stop time.Duration
+	// bulkAt is when the bulk transfer starts. Before it the lane carries
+	// requestPackets packets once a round trip, the way a lane carries the
+	// requests of a page before the download it was opened for.
+	bulkAt         time.Duration
+	requestPackets int
 }
 
 type joinBurstResult struct {
@@ -91,6 +120,8 @@ type joinBurstResult struct {
 	// ramping, rampEnded negative for a lane that never ramped or never
 	// stopped.
 	joined, rampEnded []time.Duration
+	// rearms counts ramps started again after one had ended.
+	rearms int
 }
 
 // causedLossBetween is the fraction of packets sent in [from, to) seconds
@@ -149,7 +180,14 @@ type simLane struct {
 	next     quiccongestion.PacketNumber
 	inFlight quiccongestion.ByteCount
 	pending  []simPacket
+	plan     simLanePlan
+	// requestAt is when the lane last sent a request, in its request phase.
+	requestAt time.Duration
+	// wasRamping is whether the lane was ramping at the last tick.
+	wasRamping bool
 }
+
+var simTrace = os.Getenv("QUEQIAO_SIM_TRACE") != ""
 
 const (
 	simPacketSize = 1200
@@ -163,10 +201,20 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 	model := pathmodel.NewPathModelClocked(func() time.Time { return wall.Add(now) })
 	rng := rand.New(rand.NewSource(cfg.seed))
 	const idleMember = pathmodel.Member(1 << 62)
+	idleErasure, idleArrival, idleSamples := cfg.erasure, 1.0, 2000.0
+	if cfg.idleErasure > 0 {
+		idleErasure = cfg.idleErasure
+	}
+	if cfg.idleArrival > 0 {
+		idleArrival = cfg.idleArrival
+	}
+	if cfg.idleSamples > 0 {
+		idleSamples = cfg.idleSamples
+	}
 	reportIdle := func() {
 		model.Report(idleMember, pathmodel.Observation{
-			Erasure: cfg.erasure, BurstFactor: 1, ObservedSamples: 5000,
-			Delivered: cfg.idle, RoundTrip: cfg.rtt, Arrival: math.Max(1-cfg.erasure, erasureMinArrival),
+			Erasure: idleErasure, BurstFactor: 1, ObservedSamples: idleSamples, ErasureSamples: idleSamples,
+			Delivered: cfg.idle, RoundTrip: cfg.rtt, Arrival: idleArrival,
 		})
 	}
 	if cfg.idle > 0 {
@@ -180,14 +228,32 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 	result.droppedPerSecond = make([]uint64, seconds)
 	var busyUntil, refilled time.Duration
 	tokens := 0.0
-	lanes := make([]*simLane, 0, cfg.lanes)
+	plan := cfg.plan
+	if plan == nil {
+		for i := 0; i < cfg.lanes; i++ {
+			plan = append(plan, simLanePlan{join: time.Duration(i) * cfg.stagger})
+		}
+	}
+	lanes := make([]*simLane, 0, len(plan))
 	for now = 0; now < cfg.duration; now += simTick {
 		if cfg.idle > 0 && now%(100*time.Millisecond) == 0 {
 			reportIdle()
 		}
 		at := base.Add(now)
-		if len(lanes) < cfg.lanes && now >= time.Duration(len(lanes))*cfg.stagger {
-			lane := &simLane{e: NewErasureSenderOn(simPacketSize, model), next: 1}
+		if simTrace && now%(500*time.Millisecond) == 0 {
+			st := model.Current()
+			line := fmt.Sprintf("%v pool erasure %.3f/%.0f members %d share %.0f |", now, st.Erasure, st.ErasureSamples, st.Members, st.Share)
+			for i, l := range lanes {
+				if l.plan.stop > 0 && now >= l.plan.stop {
+					continue
+				}
+				fl, fn := l.e.floor()
+				line += fmt.Sprintf(" %d:arr=%.2f fl=%.2f/%.0f conf=%v ramp=%v above=%v sh=%.1f est=%.1f;", i, l.e.arrivalRate(), fl, fn, l.e.ownConfirmed, l.e.ramping.Load(), l.e.aboveFloor, l.e.Share()/1e6, float64(l.e.inner.estimator.estimate())/1e6)
+			}
+			fmt.Println(line)
+		}
+		for len(lanes) < len(plan) && now >= plan[len(lanes)].join {
+			lane := &simLane{e: NewErasureSenderOn(simPacketSize, model), next: 1, plan: plan[len(lanes)]}
 			// The gain cycle's phase is drawn from the clock; fix it so the run
 			// is reproducible.
 			lane.e.inner.randomState = uint64(len(lanes)+1) * 0x9e3779b97f4a7c15
@@ -208,6 +274,22 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 		for i, lane := range lanes {
 			if result.rampEnded[i] < 0 && lane.e.rampRound > 0 && !lane.e.ramping.Load() {
 				result.rampEnded[i] = now
+			}
+			if ramping := lane.e.ramping.Load(); ramping != lane.wasRamping {
+				if ramping && result.rampEnded[i] >= 0 {
+					result.rearms++
+					if simTrace {
+						fmt.Printf("%v lane %d rearm share=%.0f measured=%d members=%d\n", now, i, lane.e.Share(), lane.e.inner.estimator.measuredEstimate(), lane.e.members)
+					}
+				} else if !ramping && simTrace {
+					fl, fn := lane.e.floor()
+					fmt.Printf("%v lane %d ramp end above=%v floor=%.3f/%.0f own=%.3f pool=%.3f srtt=%v min=%v arrival=%.3f measured=%d\n", now, i, lane.e.aboveFloor, fl, fn, lane.e.ownFloor, lane.e.rampFloor, lane.rtt.smoothed, lane.e.inner.minRTT, lane.e.arrivalRate(), lane.e.inner.estimator.measuredEstimate())
+				}
+				lane.wasRamping = ramping
+			}
+			stopped := lane.plan.stop > 0 && now >= lane.plan.stop
+			if stopped && len(lane.pending) == 0 {
+				continue
 			}
 			// Acknowledgements and losses that have come due.
 			var acked []quiccongestion.AckedPacketInfo
@@ -243,7 +325,17 @@ func runJoinBurst(cfg joinBurst) joinBurstResult {
 			// Send what the window and the controller's own pacer allow, as
 			// quic-go asks them: the pacer's burst allowance, including the
 			// unmetered burst, is part of what is being simulated.
-			for lane.e.CanSend(lane.inFlight) && lane.e.HasPacingBudget(at) {
+			budget := -1
+			if stopped {
+				budget = 0
+			} else if now < lane.plan.bulkAt {
+				budget = 0
+				if now-lane.requestAt >= cfg.rtt {
+					budget, lane.requestAt = lane.plan.requestPackets, now
+				}
+			}
+			for budget != 0 && lane.e.CanSend(lane.inFlight) && lane.e.HasPacingBudget(at) {
+				budget--
 				lane.inFlight += simPacketSize
 				number := lane.next
 				lane.next++
@@ -401,7 +493,7 @@ func TestAJoinerBesideALaneThatFillsThePathBacksOff(t *testing.T) {
 func joiningProbe() *seedObservationProbe {
 	return &seedObservationProbe{State: pathmodel.State{
 		Seed: 1e6, Share: 1.25e6, Erasure: 0.15, ObservedSamples: 5000, ErasureSamples: 5000, Arrival: 0.85, RoundTrip: joiningRoundTrip,
-		BurstFactor: 1, ErasureBurst: 1,
+		LeafRoundTrip: joiningRoundTrip, BurstFactor: 1, ErasureBurst: 1, Members: 2,
 	}}
 }
 
@@ -444,6 +536,17 @@ func TestARampEndsAtAQuarterRoundTripOfQueue(t *testing.T) {
 	}
 }
 
+// primeOwnFloor closes the lane's first round, which becomes its own floor
+// rather than being judged against one: 64 packets losing lost of them, or as
+// many more as the burst factor deflates them by.
+func primeOwnFloor(e *ErasureSender, lost int) {
+	scale := int(math.Ceil(math.Max(e.rampBurst, 1)))
+	closeRound(e, (64-lost)*scale, lost*scale)
+	if e.ownFloorN == 0 {
+		panic("the first round did not gather the lane's own floor")
+	}
+}
+
 // closeRound hands the gate one round's outcomes and then the event that
 // closes it, with delivery still growing so that only the loss is judged.
 func closeRound(e *ErasureSender, arrived, lost int) {
@@ -465,6 +568,7 @@ func TestARampEndsOnLossAboveTheFloorButNotOnItsNoise(t *testing.T) {
 		{60, 40, false},
 	} {
 		sender := NewErasureSenderOn(1200, joiningProbe())
+		primeOwnFloor(sender, 10)
 		closeRound(sender, tc.arrived, tc.lost)
 		if got := sender.ramping.Load(); got != tc.ramping {
 			t.Errorf("%d of %d lost on a 0.15 floor: ramping %v, want %v", tc.lost, tc.arrived+tc.lost, got, tc.ramping)
@@ -477,6 +581,7 @@ func TestARampEndsOnLossAboveTheFloorButNotOnItsNoise(t *testing.T) {
 	thin := joiningProbe()
 	thin.Erasure, thin.ErasureSamples = 0, 10
 	sender := NewErasureSenderOn(1200, thin)
+	primeOwnFloor(sender, 0)
 	closeRound(sender, 63, 1)
 	if !sender.ramping.Load() {
 		t.Error("one loss in 64 ended a ramp against a floor measured from 10 packets")
@@ -490,6 +595,7 @@ func TestARampEndsOnLossAboveTheFloorButNotOnItsNoise(t *testing.T) {
 		ramping bool
 	}{{1, true}, {2, true}, {10, false}} {
 		sender := NewErasureSenderOn(1200, measured)
+		primeOwnFloor(sender, 0)
 		closeRound(sender, 100-tc.lost, tc.lost)
 		if got := sender.ramping.Load(); got != tc.ramping {
 			t.Errorf("%d of 100 lost on a measured clean path: ramping %v, want %v", tc.lost, got, tc.ramping)
@@ -618,14 +724,17 @@ func TestAJoinedLanesFloorFollowsAPathWhoseErasureRose(t *testing.T) {
 		sender.inner.estimator.maxFilter.updateMax(sender.inner.round, monotime.Time(0), sender.inner.estimator.estimate()*2)
 		return sender.compensationFor(0.70)
 	}
+	// The lane's own packets over the window lose what the pool does: the
+	// window was measured, not only watched.
+	acked, lost := make([]quiccongestion.AckedPacketInfo, 70), make([]quiccongestion.LostPacketInfo, 30)
 	start := base()
 	for at := start; at.Sub(start) < floorRebaseAfter; at = at.Add(time.Second) {
-		sender.rampGate(at, nil, nil)
+		sender.rampGate(at, acked, lost)
 		if got := grant(); got != 1 {
 			t.Fatalf("%v after the pool rose above the floor, compensation was granted (%.3f)", at.Sub(start), got)
 		}
 	}
-	sender.rampGate(start.Add(floorRebaseAfter), nil, nil)
+	sender.rampGate(start.Add(floorRebaseAfter), acked, lost)
 	if got := sender.rampFloor; got != 0.30 {
 		t.Fatalf("after a whole window above it, the floor is still %.3f", got)
 	}
@@ -648,6 +757,7 @@ func TestABurstOfErasureOnABurstyFloorDoesNotEndARamp(t *testing.T) {
 		probe := joiningProbe()
 		probe.BurstFactor, probe.ErasureBurst = tc.burst, tc.burst
 		sender := NewErasureSenderOn(1200, probe)
+		primeOwnFloor(sender, 10)
 		closeRound(sender, 70, 30)
 		if got := sender.ramping.Load(); got != tc.ramping {
 			t.Errorf("30 of 100 lost on a 0.15 floor with burst factor %.0f: ramping %v, want %v", tc.burst, got, tc.ramping)
@@ -716,8 +826,320 @@ func TestAnUnderSampledFloorMatures(t *testing.T) {
 	if sender.rampFloorN != 5000 || sender.rampFloor != 0.15 {
 		t.Fatalf("floor %.3f on %.0f samples, want 0.15 on 5000", sender.rampFloor, sender.rampFloorN)
 	}
+	primeOwnFloor(sender, 10)
 	closeRound(sender, 60, 40)
 	if sender.ramping.Load() {
 		t.Fatal("against the matured floor, 40% loss did not end the ramp")
+	}
+}
+
+// The Mac leg of the second A/B: about 90 Mbit/s, a 180 ms round trip, 22%
+// loss that does not respond to rate, and a 50 ms buffer. The floor a burst
+// inherits was measured lower than that -- by a connection that decides few
+// packets, at another hour -- and nobody in the pool has earned any
+// compensation. Judged against the inherited floor, every round of every lane
+// reads as overflow: the ramp ends at its first well-sampled round, the veto
+// refuses all compensation, and the lanes pace their delivered rate
+// uncompensated, which on this path walks down a fifth a round trip.
+func staleFloorLossyPath() joinBurst {
+	return joinBurst{
+		rate: 11.25e6, rtt: 180 * time.Millisecond, erasure: 0.22, buffer: 11.25e6 * 0.05,
+		lanes: 4, stagger: 20 * time.Millisecond, duration: 12 * time.Second,
+		idle: 60e3, idleErasure: 0.15, seed: 3,
+	}
+}
+
+func TestJoinersOnAStaleFloorWithNothingEarnedFillTheLossyPath(t *testing.T) {
+	cfg := staleFloorLossyPath()
+	r := runJoinBurst(cfg)
+	if got := cfg.report(t, "stale floor, nothing earned", r); got < 0.7 {
+		t.Errorf("the lanes delivered %.2f of a path with room for all of it", got)
+	}
+	// The second half, so a run that fills the path and then decays fails.
+	if got := r.goodputBetween(6, 12) / (cfg.rate * (1 - cfg.erasure)); got < 0.75 {
+		t.Errorf("over the last six seconds the lanes delivered %.2f of the path", got)
+	}
+	if got := r.causedLoss(); got > 0.15 {
+		t.Errorf("the bottleneck dropped %.3f of what was sent", got)
+	}
+}
+
+// The tail of every live trial: four downloads of different sizes share the
+// fast path, three finish, and the last carries on alone. When its siblings
+// stop, the capacity they leave is the last lane's, and it must take it up in
+// round trips, not the ten seconds ProbeBW's quarter-per-cycle takes.
+func TestTheLastLaneRefillsThePathItsSiblingsLeave(t *testing.T) {
+	cfg := fastModerateErasurePath()
+	cfg.duration = 14 * time.Second
+	cfg.plan = []simLanePlan{
+		{join: 0, stop: 3 * time.Second},
+		{join: 20 * time.Millisecond, stop: 3500 * time.Millisecond},
+		{join: 40 * time.Millisecond, stop: 4 * time.Second},
+		{join: 60 * time.Millisecond},
+	}
+	r := runJoinBurst(cfg)
+	cfg.report(t, "siblings finish", r)
+	capacity := cfg.rate * (1 - cfg.erasure)
+	tail := r.goodputBetween(6, 14) / capacity
+	t.Logf("after the last sibling finished: goodput %.2f of capacity, caused loss %.3f", tail, r.causedLossBetween(4, 14))
+	if tail < 0.75 {
+		t.Errorf("alone on the path, the last lane delivered %.2f of it", tail)
+	}
+	if got := r.causedLossBetween(4, 14); got > 0.1 {
+		t.Errorf("refilling the path, the bottleneck dropped %.3f of what was sent", got)
+	}
+}
+
+// Stall rescue on the lossy path: two lanes carry the transfer, and a new lane
+// joins every half second and lives a second and a half -- the 26 rescue
+// joiners per trial the Mac traces showed. None of them lives long enough to
+// re-base a floor on a ten-second window, so each has to judge the path from
+// its own rounds, and none may knock the long lanes off it.
+func TestShortLivedRescueJoinersDoNotStarveTheLossyPath(t *testing.T) {
+	cfg := staleFloorLossyPath()
+	cfg.plan = []simLanePlan{{join: 0}, {join: 20 * time.Millisecond}}
+	for at := time.Second; at < cfg.duration-time.Second; at += 500 * time.Millisecond {
+		cfg.plan = append(cfg.plan, simLanePlan{join: at, stop: at + 1500*time.Millisecond})
+	}
+	r := runJoinBurst(cfg)
+	if got := cfg.report(t, "rescue churn", r); got < 0.65 {
+		t.Errorf("with rescue joiners coming and going, the lanes delivered %.2f of the path", got)
+	}
+	if got := r.causedLoss(); got > 0.15 {
+		t.Errorf("the bottleneck dropped %.3f of what was sent", got)
+	}
+}
+
+// Lanes that carry a page's requests before the download they were opened
+// for: four packets a round trip for two seconds, then the bulk transfer.
+// The request rounds must neither spend the ramp nor become the baseline the
+// transfer is held to.
+func TestRequestsBeforeABulkTransferDoNotSpendItsRamp(t *testing.T) {
+	cfg := fastModerateErasurePath()
+	cfg.duration = 10 * time.Second
+	for i := 0; i < 4; i++ {
+		cfg.plan = append(cfg.plan, simLanePlan{join: time.Duration(i) * 20 * time.Millisecond, bulkAt: 2 * time.Second, requestPackets: 4})
+	}
+	r := runJoinBurst(cfg)
+	cfg.report(t, "requests then bulk", r)
+	capacity := cfg.rate * (1 - cfg.erasure)
+	if got := r.goodputBetween(3, 10) / capacity; got < 0.75 {
+		t.Errorf("after the bulk transfer started, the lanes delivered %.2f of the path", got)
+	}
+	if got := r.causedLossBetween(2, 10); got > 0.2 {
+		t.Errorf("the bottleneck dropped %.3f of what was sent", got)
+	}
+}
+
+// The window before a re-base must also have been measured. The pool's
+// estimator forgets by packets, so an overflow burst nobody has sent since
+// holds its figure indefinitely; a lane that watched it for ten seconds
+// without a packet of its own to show the path changed keeps its floor.
+func TestAFloorIsNotRebasedOnAFigureWithNoFreshSamples(t *testing.T) {
+	probe := joiningProbe()
+	probe.Erasure = 0.05
+	sender := NewErasureSenderOn(1200, probe)
+	sender.endRamp()
+	sender.poolSamples, sender.poolBurst = 5000, 1
+	sender.erasure.Store(uint64(0.30 * partsPerMillion))
+	start := base()
+	for at := start; at.Sub(start) <= floorRebaseAfter; at = at.Add(500 * time.Millisecond) {
+		sender.rampGate(at, nil, nil)
+	}
+	if got := sender.rampFloor; got != 0.05 {
+		t.Fatalf("ten seconds watching a pool figure with no fresh samples re-based the floor to %.3f", got)
+	}
+	// Nor on fresh samples that lose at the old floor: the pool's figure is
+	// someone else's overflow.
+	acked, lost := make([]quiccongestion.AckedPacketInfo, 95), make([]quiccongestion.LostPacketInfo, 5)
+	for at := start.Add(floorRebaseAfter); at.Sub(start) <= 3*floorRebaseAfter; at = at.Add(500 * time.Millisecond) {
+		sender.rampGate(at, acked, lost)
+	}
+	if got := sender.rampFloor; got != 0.05 {
+		t.Fatalf("a lane losing at its floor re-based it to the pool's %.3f", got)
+	}
+}
+
+// A lane's own first rounds are its floor once a faster round that delivered
+// more lost the same: the stale-floor case, where the pool's inherited figure
+// is lower than what the path erases.
+func TestAStaleFloorGivesWayToTheLanesOwnRounds(t *testing.T) {
+	probe := joiningProbe()
+	probe.Erasure = 0.15
+	sender := NewErasureSenderOn(1200, probe)
+	closeRound(sender, 50, 14) // 22%: the lane's first round, its own floor
+	if sender.ownFloorN == 0 || sender.ownConfirmed {
+		t.Fatalf("first round: own floor %.3f on %.0f, confirmed %v", sender.ownFloor, sender.ownFloorN, sender.ownConfirmed)
+	}
+	// 22% of 800, at twelve times the packets: against the pool's 0.15 that
+	// is far outside the noise, against the lane's own first round it is not.
+	closeRound(sender, 624, 176)
+	if !sender.ownConfirmed {
+		t.Fatal("a faster round that lost the same did not confirm the lane's floor")
+	}
+	if !sender.ramping.Load() {
+		t.Fatal("a round losing what the lane's own first round lost ended its ramp")
+	}
+	if floor, _ := sender.floor(); math.Abs(floor-0.22) > 0.01 {
+		t.Fatalf("the floor is %.3f, want the lane's own 0.22", floor)
+	}
+	// Loss that does rise with the rate still ends it.
+	closeRound(sender, 1600, 800)
+	if sender.ramping.Load() {
+		t.Fatal("a round losing a third, against a confirmed 0.22 floor, did not end the ramp")
+	}
+}
+
+// A lane whose first flight met a full queue loses most of it, and loses as
+// much at every rate; that is not a floor, and it is not confirmed unless
+// delivery grew with the rate.
+func TestAFirstFlightIntoAFullQueueIsNotAFloor(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	closeRound(sender, 4, 60)
+	// The same loss at twice the packets, but delivery flat.
+	sender.rampGate(base(), make([]quiccongestion.AckedPacketInfo, 8), make([]quiccongestion.LostPacketInfo, 120))
+	sender.inner.round++
+	sender.rampGate(base(), nil, nil)
+	if sender.ownConfirmed {
+		t.Fatal("a round that delivered no more confirmed a 94% floor")
+	}
+	if floor, _ := sender.floor(); floor != 0.15 {
+		t.Fatalf("judged against %.3f, want the pool's 0.15", floor)
+	}
+}
+
+// A ramp that showed loss independent of rate leaves the lane compensating
+// for it, when nothing in the pool had been earned.
+func TestARampEarnsTheCompensationItShowed(t *testing.T) {
+	probe := joiningProbe()
+	probe.Erasure, probe.Arrival = 0.15, 0
+	sender := NewErasureSenderOn(1200, probe)
+	closeRound(sender, 50, 14)
+	closeRound(sender, 156, 44)
+	closeRound(sender, 468, 132)
+	closeRound(sender, 1404, 396)
+	if !sender.ownConfirmed || sender.earnRounds < 2 {
+		t.Fatalf("confirmed %v after %d growth rounds", sender.ownConfirmed, sender.earnRounds)
+	}
+	sender.endRamp()
+	if got := sender.arrivalRate(); math.Abs(got-0.78) > 0.01 {
+		t.Fatalf("after a ramp that lost 22%% at every rate, arrival %.3f, want 0.78", got)
+	}
+	// Without the evidence -- no confirmed floor -- nothing is earned.
+	sender = NewErasureSenderOn(1200, probe)
+	closeRound(sender, 50, 14)
+	sender.endRamp()
+	if got := sender.arrivalRate(); got != 1 {
+		t.Fatalf("a ramp with no confirmed floor earned arrival %.3f", got)
+	}
+}
+
+// A request lull drops what the lane delivers. Growth back from it is growth,
+// not three flat rounds against the peak before the lull.
+func TestGrowthAfterALullIsNotFlat(t *testing.T) {
+	sender := NewErasureSenderOn(1200, joiningProbe())
+	primeOwnFloor(sender, 10)
+	setMeasured := func(rate uint64) {
+		sender.inner.estimator.measured = newTUICMinMax()
+		sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), rate)
+	}
+	setMeasured(4e6)
+	sender.inner.round++
+	sender.rampGate(base(), nil, nil)
+	// A lull: requests only, delivery down to a tenth.
+	setMeasured(4e5)
+	sendAt(sender, 1200)
+	sender.inner.round++
+	sender.rampGate(base(), nil, nil)
+	// The transfer: every round has the window in flight and delivery
+	// grows by half -- below the old peak for the first few.
+	rate := 4e5
+	for round := 0; round < 4; round++ {
+		rate *= 1.5
+		setMeasured(uint64(rate))
+		sendAt(sender, sender.GetCongestionWindow())
+		sender.inner.round++
+		sender.rampGate(base(), nil, nil)
+		if !sender.ramping.Load() {
+			t.Fatalf("round %d after the lull, growing by half, ended the ramp as flat", round+1)
+		}
+	}
+}
+
+// Siblings that finish free their capacity, and the lane left behind ramps
+// into it rather than growing a quarter per gain cycle.
+func TestALaneRampsAgainWhenThePoolLosesMembers(t *testing.T) {
+	probe := joiningProbe()
+	probe.Members = 4
+	sender := NewErasureSenderOn(1200, probe)
+	sender.inner.minRTT = joiningRoundTrip
+	sender.SetRTTStatsProvider(&fixedRTT{min: joiningRoundTrip, smoothed: joiningRoundTrip})
+	sender.endRamp()
+	sender.inner.mode = tuicBbrProbeBW
+	sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
+	closeIdle := func() {
+		sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
+		sendAt(sender, sender.GetCongestionWindow())
+		sender.inner.round++
+		sender.rampGate(base(), nil, nil)
+	}
+	for i := 0; i < rampRearmRounds+1; i++ {
+		closeIdle()
+	}
+	if sender.ramping.Load() {
+		t.Fatal("a lane at its share with its siblings all present ramped again")
+	}
+	sender.members = 2
+	closeIdle()
+	if !sender.ramping.Load() || sender.inner.mode != tuicBbrStartup || sender.inner.fullBandwidth {
+		t.Fatalf("the pool lost members and the lane is ramping %v in mode %v", sender.ramping.Load(), sender.inner.mode)
+	}
+	// A re-armed ramp that finds nothing more waits twice as long next time.
+	sender.endRamp()
+	if sender.rearmBackoff != 2*rampRearmRounds {
+		t.Fatalf("after a fruitless re-arm the backoff is %d rounds, want %d", sender.rearmBackoff, 2*rampRearmRounds)
+	}
+	// A share well above what the lane delivers re-arms it too, once the
+	// backoff has passed -- and not with the lane carrying only requests.
+	sender.share.Store(3e6)
+	for i := uint64(0); i <= sender.rearmBackoff; i++ {
+		sender.inner.estimator.measured.updateMax(sender.inner.round, monotime.Time(0), 1e6)
+		sendAt(sender, 1200)
+		sender.inner.round++
+		sender.rampGate(base(), nil, nil)
+	}
+	if sender.ramping.Load() {
+		t.Fatal("a lane carrying requests was re-armed")
+	}
+	closeIdle()
+	if !sender.ramping.Load() {
+		t.Fatal("a backlogged lane with a share three times its delivery did not ramp again")
+	}
+}
+
+// In hierarchical mode a lane can join a destination its leaf has not
+// measured, seeded from an ancestor that pools other destinations. Their
+// round trips are not this path's: a shorter one taken as the baseline read
+// the whole of this path's extra length as queue and ended every ramp at once.
+func TestAJoinerOnAnUnmeasuredLeafHasNoPooledQueueBaseline(t *testing.T) {
+	pathmodel.ResetTree()
+	defer pathmodel.ResetTree()
+	near := pathmodel.SharedChain(pathmodel.Key{Egress: "uplink-ramp", Dest: "near"})
+	for member := pathmodel.Member(1); member <= 2; member++ {
+		near.Report(member, pathmodel.Observation{Erasure: 0.1, BurstFactor: 1, ObservedSamples: 5000, Delivered: 4e6, RoundTrip: 30 * time.Millisecond})
+	}
+	far := pathmodel.SharedChain(pathmodel.Key{Egress: "uplink-ramp", Dest: "far"})
+	sender := NewErasureSenderOn(1200, far)
+	if !sender.ramping.Load() {
+		t.Skip("the chain gave this joiner no seed; nothing to judge")
+	}
+	if sender.rampBaseRTT != 0 {
+		t.Fatalf("a joiner to an unmeasured destination judges queue against %v, another destination's round trip", sender.rampBaseRTT)
+	}
+	sender.inner.minRTT = 180 * time.Millisecond
+	sender.SetRTTStatsProvider(&fixedRTT{min: 180 * time.Millisecond, smoothed: 185 * time.Millisecond})
+	ackEvent(sender)
+	if !sender.ramping.Load() {
+		t.Fatal("a joiner on a 180 ms path with 5 ms of queue ended its ramp")
 	}
 }

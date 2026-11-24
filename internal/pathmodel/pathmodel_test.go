@@ -324,3 +324,50 @@ func TestErasureSamplesFollowTheWeightsBehindTheEstimate(t *testing.T) {
 		t.Fatalf("an estimate weighted 99%% by a lane resting on 100 samples claims %.0f", state.ErasureSamples)
 	}
 }
+
+// A lane beside members that are not using the path has nothing to compound
+// with, and is not capped: the last download of a burst, beside the pooled
+// control connection, was held to 5/8 of what it delivered and then 5/8 of
+// that. Two busy lanes are capped as before, idle member and all.
+func TestALaneBesideIdleMembersIsNotCapped(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 60e3, ObservedSamples: 100})
+	state := m.Report(2, Observation{Delivered: 8e6, ObservedSamples: 1000})
+	if state.Share != 0 {
+		t.Fatalf("one busy lane beside an idle member is capped at %.0f", state.Share)
+	}
+	state = m.Report(3, Observation{Delivered: 8e6, ObservedSamples: 1000})
+	if want := shareProbeGain * 16.06e6 / 3; math.Abs(state.Share-want) > 1e3 {
+		t.Fatalf("two busy lanes and an idle member: share %.0f, want the even split's %.0f", state.Share, want)
+	}
+	// A joiner beside one busy lane takes a share: it will be the second.
+	if got := m.Current(); got.Share == 0 {
+		t.Fatal("a lane joining a busy one is not capped")
+	}
+}
+
+// Members counts who reported within a few round trips, so a lane sees its
+// siblings finish long before they expire; the split itself still counts them
+// until then.
+func TestMembersCountsOnlyThoseStillReporting(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	for member := Member(1); member <= 3; member++ {
+		m.Report(member, Observation{Delivered: 4e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	}
+	if got := m.Current().Members; got != 3 {
+		t.Fatalf("three lanes reporting: Members %d", got)
+	}
+	now = now.Add(time.Second)
+	state := m.Report(3, Observation{Delivered: 4e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	if state.Members != 1 {
+		t.Fatalf("a second after two lanes stopped reporting, Members %d, want 1", state.Members)
+	}
+	if want := 12e6 / 3; state.Seed != want {
+		t.Fatalf("the split stopped counting the quiet lanes before they expired: seed %.0f, want %.0f", state.Seed, want)
+	}
+	if got := m.Members(); got != 3 {
+		t.Fatalf("quiet lanes expired after a second: %d members", got)
+	}
+}
