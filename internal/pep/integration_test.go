@@ -217,7 +217,12 @@ func runUDPAssociateSOCKSEndToEnd(t *testing.T, transport TransportKind) {
 	}()
 
 	certificate, roots := testCertificate(t)
+	// The gateway's account of how the association ended, for the failure
+	// below: it has been seen once on a macOS runner and not reproduced
+	// (issue #187), so the next one has to explain itself.
+	gatewayLog := &lockedRecords{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	serverLogger := slog.New(slog.NewTextHandler(gatewayLog, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	var serverListener net.Listener
 	var serverPacketConn net.PacketConn
 	if transport == TransportQUIC {
@@ -231,7 +236,7 @@ func runUDPAssociateSOCKSEndToEnd(t *testing.T, transport TransportKind) {
 	serverAddr := serverListenerAddr(serverListener, serverPacketConn)
 	server, err := NewServer(ServerConfig{
 		ListenAddr: serverAddr, Credentials: certificate,
-		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableTCP: transport != TransportQUIC, EnableQUIC: transport != TransportTCP, Logger: logger,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableTCP: transport != TransportQUIC, EnableQUIC: transport != TransportTCP, Logger: serverLogger,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -316,7 +321,9 @@ func runUDPAssociateSOCKSEndToEnd(t *testing.T, transport TransportKind) {
 		}
 	}
 	if snapshot := server.Metrics().Snapshot(); snapshot.FlowsFailed != 0 {
-		t.Fatalf("clean UDP association counted as failed: %+v", snapshot)
+		gatewayLog.mu.Lock()
+		defer gatewayLog.mu.Unlock()
+		t.Fatalf("clean UDP association counted as failed: %+v\ngateway log:\n%s", snapshot, gatewayLog.buf.String())
 	}
 }
 
