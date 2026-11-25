@@ -573,6 +573,8 @@ type runtimeOptions struct {
 	congestionScope string
 	// codedRetry is the coded-retry bundle (design §14 stage 4).
 	codedRetry string
+	// classifierMode is the flow-classifier bundle (workload model R1).
+	classifierMode string
 	// carrierShadow runs the carrier-liveness observer (design §10, §14
 	// stage 0 and the groundwork of stage 8). It only records.
 	carrierShadow                    bool
@@ -632,6 +634,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.StringVar(&opts.congestionScope, "congestion-scope", string(pep.CongestionScopeConnection), "what one QUIC congestion controller governs: connection (one per connection), or path (one controller per path and direction that every connection on the path attaches to; requires --cc-api=v2 and --sched=class)")
 	fs.StringVar(&opts.sched, "sched", string(pep.SchedLegacy), "packet scheduler: legacy, or class (CONTROL, INTERACTIVE and BULK arbitrated by weighted deficit round robin; requires --cc-api=v2)")
 	fs.StringVar(&opts.codedRetry, "coded-retry", string(pep.CodedRetryLegacy), "coded-retry bundle: legacy, or sticky (a coded chunk's deadline starts when its datagrams are registered, and its retry stays on the stream; requires --cc-api=v2)")
+	fs.StringVar(&opts.classifierMode, "classifier", string(pep.ClassifierLegacy), "flow-classifier bundle: legacy (BULK is permanent), or phased (lane choice keeps the sticky class; the DATA class, queue and coding follow what the flow does now, and small writes onto an empty queue go interactive and coded)")
 	fs.BoolVar(&opts.carrierShadow, "carrier-shadow", false, "record the carrier state the path-authority design would assign to every QUIC connection, and the remedy it would take at every flow stall, beside today's recovery (observation only)")
 	fs.UintVar(&opts.carrierShadowKS, "carrier-shadow-ks", 0, "carrier-shadow k_s: probe timeouts without transport progress before a carrier is labelled suspect (0 = default)")
 	fs.UintVar(&opts.carrierShadowKP, "carrier-shadow-kp", 0, "carrier-shadow k_p: probe timeouts before a suspect carrier is labelled for replacement (0 = default)")
@@ -774,6 +777,9 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	}
 	if err := pep.ValidateCodedRetry(pep.CodedRetryMode(opts.codedRetry), pep.CCAPIVersion(opts.ccAPI)); err != nil {
 		return fmt.Errorf("--coded-retry: %w", err)
+	}
+	if err := pep.ValidateClassifier(pep.ClassifierMode(opts.classifierMode), bundleProfile); err != nil {
+		return fmt.Errorf("--classifier: %w", err)
 	}
 	if opts.carrierShadowKS > 64 || opts.carrierShadowKP > 64 {
 		return errors.New("--carrier-shadow-ks and --carrier-shadow-kp must be small probe-timeout counts")
@@ -959,6 +965,7 @@ func runServer(args []string) (returnErr error) {
 		CodedRetry:          pep.CodedRetryMode(opts.codedRetry),
 		CarrierShadow:       opts.carrierShadowConfig(),
 		Memory:              pep.MemoryMode(opts.memory),
+		Classifier:          pep.ClassifierMode(opts.classifierMode),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
 		Logger: logger, UDPOnStream: opts.udpOnStream, Profile: serverProfile,
@@ -1078,8 +1085,9 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("cc_api", opts.ccAPI),
 		slog.String("sched", opts.sched),
 		slog.String("congestion_scope", opts.congestionScope),
+		slog.String("classifier", opts.classifierMode),
 		slog.String("coded_retry", opts.codedRetry),
-		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)), pep.SchedMode(opts.sched), pep.CongestionScope(opts.congestionScope))),
+		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)), pep.SchedMode(opts.sched), pep.ClassifierMode(opts.classifierMode), pep.CongestionScope(opts.congestionScope))),
 		slog.String("mem", opts.memory),
 		slog.Bool("carrier_shadow", opts.carrierShadow),
 		slog.Uint64("carrier_shadow_ks", uint64(opts.carrierShadowKS)),

@@ -60,6 +60,10 @@ type Registry struct {
 	// time() - metric, the way process_start_time_seconds is used.
 	authorizationLastGoodUnix atomic.Int64
 	classTransitions          [3]atomic.Uint64
+	// dataClassBytes is DATA payload sent by class byte (new, interactive,
+	// bulk) and substrate (stream, coded): what the classifier's decision
+	// actually cost, per endpoint.
+	dataClassBytes [3][2]atomic.Uint64
 	// The rescue window is dropped rather than allowed to throttle the
 	// application. That trade has to be visible: a flow that has evicted part
 	// of its window will fail rather than recover if its lane dies, so a
@@ -342,31 +346,34 @@ type Snapshot struct {
 	AuthorizationConsecutiveRefreshFailures                       uint64
 	AuthorizationLastGoodUnix                                     int64
 	ClassTransitions                                              [3]uint64
-	BulkIsolations, Reinjections                                  uint64
-	PeerProtocolViolations                                        uint64
-	ReplayBytesInUse                                              int64
-	QUICLanes                                                     int64
-	QUICLatestRTT, QUICSmoothedRTT                                time.Duration
-	QUICBytesSent, QUICBytesReceived                              uint64
-	QUICPacketsSent, QUICPacketsReceived                          uint64
-	QUICLossObservedPackets                                       uint64
-	QUICCodedSources, QUICCodedRecovered, QUICCodedLost           uint64
-	QUICControllerKind                                            string
-	QUICControllerMode                                            uint32
-	QUICControllerMaxBandwidth, QUICControllerPacingRate          uint64
-	QUICControllerLatestSample, QUICControllerSamples             uint64
-	QUICControllerLatestAckRate, QUICControllerLatestSendRate     uint64
-	QUICControllerNonAppSamples, QUICControllerAppSamples         uint64
-	QUICControllerStateMisses, QUICControllerZeroSamples          uint64
-	QUICControllerRound                                           uint64
-	QUICControllerCongestionWindow, QUICControllerBytesInFlight   uint64
-	QUICControllerBytesLost, QUICControllerPacketsLost            uint64
-	QUICControllerMinRTT                                          time.Duration
-	QUICSampleMean, QUICSampleMax, QUICSampleDelivered            uint64
-	QUICSampleInterval                                            time.Duration
-	QUICErasureSend                                               float64
-	QUICDelayBrake                                                float64
-	QUICControllerInRecovery                                      bool
+	// DataClassBytes is indexed [class][substrate], substrate 0 stream and 1
+	// coded.
+	DataClassBytes                                              [3][2]uint64
+	BulkIsolations, Reinjections                                uint64
+	PeerProtocolViolations                                      uint64
+	ReplayBytesInUse                                            int64
+	QUICLanes                                                   int64
+	QUICLatestRTT, QUICSmoothedRTT                              time.Duration
+	QUICBytesSent, QUICBytesReceived                            uint64
+	QUICPacketsSent, QUICPacketsReceived                        uint64
+	QUICLossObservedPackets                                     uint64
+	QUICCodedSources, QUICCodedRecovered, QUICCodedLost         uint64
+	QUICControllerKind                                          string
+	QUICControllerMode                                          uint32
+	QUICControllerMaxBandwidth, QUICControllerPacingRate        uint64
+	QUICControllerLatestSample, QUICControllerSamples           uint64
+	QUICControllerLatestAckRate, QUICControllerLatestSendRate   uint64
+	QUICControllerNonAppSamples, QUICControllerAppSamples       uint64
+	QUICControllerStateMisses, QUICControllerZeroSamples        uint64
+	QUICControllerRound                                         uint64
+	QUICControllerCongestionWindow, QUICControllerBytesInFlight uint64
+	QUICControllerBytesLost, QUICControllerPacketsLost          uint64
+	QUICControllerMinRTT                                        time.Duration
+	QUICSampleMean, QUICSampleMax, QUICSampleDelivered          uint64
+	QUICSampleInterval                                          time.Duration
+	QUICErasureSend                                             float64
+	QUICDelayBrake                                              float64
+	QUICControllerInRecovery                                    bool
 	// QUICObservationsExpired counts flow telemetry entries dropped because
 	// they stopped being refreshed. See quicObservationsExpired.
 	QUICObservationsExpired uint64
@@ -727,6 +734,19 @@ func (r *Registry) ClassTransition(class int) {
 	}
 }
 
+// DataClassBytes records DATA payload sent with class byte class (0 new, 1
+// interactive, 2 bulk) on the coded or the stream substrate.
+func (r *Registry) DataClassBytes(class int, coded bool, n uint64) {
+	if r == nil || class < 0 || class >= len(r.dataClassBytes) {
+		return
+	}
+	substrate := 0
+	if coded {
+		substrate = 1
+	}
+	r.dataClassBytes[class][substrate].Add(n)
+}
+
 func (r *Registry) ObserveQUIC(key uint64, o QUICObservation) {
 	if key == 0 {
 		return
@@ -799,6 +819,11 @@ func (r *Registry) Snapshot() Snapshot {
 	}
 	for i := range s.ClassTransitions {
 		s.ClassTransitions[i] = r.classTransitions[i].Load()
+	}
+	for i := range s.DataClassBytes {
+		for j := range s.DataClassBytes[i] {
+			s.DataClassBytes[i][j] = r.dataClassBytes[i][j].Load()
+		}
 	}
 	for i := range s.LaneJoinRefusals {
 		s.LaneJoinRefusals[i] = r.laneJoinRefusals[i].Load()
@@ -1082,6 +1107,15 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	for i, value := range s.ClassTransitions {
 		fmt.Fprintf(w, "queqiao_class_transitions_total{class=\"%d\"} %d\n", i, value)
+	}
+	for i, bySubstrate := range s.DataClassBytes {
+		for j, value := range bySubstrate {
+			substrate := "stream"
+			if j == 1 {
+				substrate = "coded"
+			}
+			fmt.Fprintf(w, "queqiao_data_class_bytes_total{class=\"%d\",substrate=\"%s\"} %d\n", i, substrate, value)
+		}
 	}
 	// The reasons stay separate because they mean different things to whoever
 	// is on call: a forgotten session is a peer whose flows are failing, a

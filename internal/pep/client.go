@@ -196,8 +196,11 @@ type ClientConfig struct {
 	// the throughput-oriented defaults used by servers and desktop clients.
 	MemoryLimits *MemoryLimits
 	// Memory selects the memory-ownership bundle; empty is legacy.
-	Memory  MemoryMode
-	Metrics *metrics.Registry
+	Memory MemoryMode
+	// Classifier selects the flow-classifier bundle; see ClassifierMode.
+	// Empty is legacy.
+	Classifier ClassifierMode
+	Metrics    *metrics.Registry
 	// FallbackDelay is when AUTO starts connecting its warm-standby TCP
 	// candidate. It is not a deadline for QUIC and not a transport-selection
 	// race.
@@ -676,6 +679,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
 		return nil, err
 	}
+	if err := resolveClassifier(&cfg.Classifier, cfg.Profile); err != nil {
+		return nil, err
+	}
 	if err := cfg.CarrierShadow.resolve(); err != nil {
 		return nil, err
 	}
@@ -1122,6 +1128,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 		"data_coded", codedFrames, "data_stream", streamFrames,
 		"coded_substrate", codedSubstrateFields(substrate, hasCoded),
 		"class", classifier.Class(flowSession.class.Load())}
+	logFields = append(logFields, flowSession.classLogFields()...)
 	logFields = append(logFields, codedSubstrateLogFields(substrate, hasCoded)...)
 	logFields = append(logFields, flowSession.replacementLogFields()...)
 	if !flowComplete && err != nil && !errors.Is(err, context.Canceled) {
@@ -3637,10 +3644,11 @@ func closeAuthenticatedLane(lane *authenticatedLane) {
 // startup is visible in every flow the process creates, including ones opened
 // long afterwards.
 func (c *Client) classifierConfig() classifier.Config {
-	if c.cfg.Profile.Classifier.BulkBytes == 0 {
-		return profile.Default().Classifier
+	cfg := c.cfg.Profile.Classifier
+	if cfg.BulkBytes == 0 {
+		cfg = profile.Default().Classifier
 	}
-	return c.cfg.Profile.Classifier
+	return phasedClassifierConfig(cfg, c.cfg.Classifier)
 }
 
 // declareClass asks the local capture agent what opened this connection, and
@@ -3677,7 +3685,7 @@ func (c *Client) declareClass(ctx context.Context, inner net.Conn, flow *multipa
 		return
 	}
 	flow.classifier.Declare(class)
-	flow.class.Store(uint32(protocol.Class(class)))
+	flow.publishClass(class)
 	// Counted like any other transition. A declared class never passes through
 	// Observe, so without this the whole mechanism is invisible in telemetry:
 	// an operator reading class_transitions would see zero and conclude the

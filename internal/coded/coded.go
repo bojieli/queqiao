@@ -196,10 +196,10 @@ type Path struct {
 	// adds to it, and the carrier's observer, which settles it, so it has its
 	// own lock; nothing is called while that lock is held except appending
 	// to outcomes.
-	tagMu      sync.Mutex
-	tags       map[uint64][]*frameTrack
+	tagMu sync.Mutex
+	tags  map[uint64][]*frameTrack
 	// tagBytes is each outstanding tag's datagram size, for SourceRate.
-	tagBytes map[uint64]int
+	tagBytes   map[uint64]int
 	tagsClosed bool
 	outcomes   []settled
 	outcomeC   chan struct{}
