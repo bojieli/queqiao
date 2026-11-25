@@ -447,6 +447,16 @@ type multipathFlow struct {
 	ackMu      sync.Mutex
 	ackCovered uint64
 	ackDrained bool
+	// Refill evidence, for a flow whose threshold is too small to separate a
+	// transfer from a conversation by bytes outstanding (refillMode): a drain
+	// pending since drainPendingAt becomes a drain unless a read of at least
+	// fullReadBytes follows within refillWindow, and lastReadFull says whether
+	// the latest read filled its buffer. All under ackMu.
+	refillMode     bool
+	fullReadBytes  int
+	drainPending   bool
+	drainPendingAt time.Time
+	lastReadFull   bool
 	// ackSampleHook and afterAckSampleHook, when set by a test, run just
 	// before and just after an observation samples the acknowledgement state.
 	ackSampleHook, afterAckSampleHook func()
@@ -3525,7 +3535,7 @@ func (f *multipathFlow) observeLocked(n int, up, publish bool) bool {
 	if f.ackSampleHook != nil {
 		f.ackSampleHook()
 	}
-	upBytes, downBytes, sendBacklog, backlogDrained := f.countAndSample(n, up, publish)
+	upBytes, downBytes, sendBacklog, backlogDrained := f.countAndSample(now, n, up, publish)
 	if f.afterAckSampleHook != nil {
 		f.afterAckSampleHook()
 	}

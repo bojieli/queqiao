@@ -681,6 +681,8 @@ func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mixed := flowMemoryLimits{maxSendBytes: 33 << 10, maxOutstanding: 16384}
+	oneSlot := flowMemoryLimits{maxSendBytes: 1 << 20, maxOutstanding: 1}
 	for _, c := range []struct {
 		name            string
 		base            uint64
@@ -688,21 +690,27 @@ func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
 		chunk, readSize int
 		memOwned        bool
 		want            uint64
+		refill          bool
 	}{
-		{"default", base, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 64 << 10},
-		{"48 KiB send bound, legacy: the last 32 KiB read overshoots to 64 KiB", base, small, defaultChunkSize, defaultChunkSize, false, 16 << 10},
-		{"48 KiB send bound, mem=owned: clamped", base, small, defaultChunkSize, defaultChunkSize, true, 8 << 10},
-		{"32 KiB + 1 send bound, legacy", base, flowMemoryLimits{maxSendBytes: 32<<10 + 1, maxOutstanding: 16384}, 32 << 10, 32 << 10, false, 16 << 10},
-		{"two 16 KiB chunks", base, twoChunks, 16 << 10, 16 << 10, false, 8 << 10},
-		{"eight slots of 1 KiB staged reads", base, eightSlots, 32 << 10, stagingBytes, false, 3584},
-		{"ios, legacy memory", base, ios, iosChunkSize, iosChunkSize, false, 64 << 10},
-		{"ios, mem=owned at the autotune floor", base, ios, iosChunkSize, iosChunkSize, true, 24 << 10},
-		{"ios, mem=owned, staged reads that may be extended", base, ios, iosChunkSize, stagingBytes, true, 24 << 10},
-		{"48 KiB send bound, mem=owned, staged reads that may be extended", base, small, defaultChunkSize, stagingBytes, true, 8 << 10},
-		{"a profile's lower threshold is kept", 16 << 10, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 16 << 10},
+		{"default", base, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 64 << 10, false},
+		{"48 KiB send bound, legacy", base, small, defaultChunkSize, defaultChunkSize, false, 8 << 10, false},
+		{"48 KiB send bound, mem=owned", base, small, defaultChunkSize, defaultChunkSize, true, 8 << 10, false},
+		{"two 16 KiB chunks", base, twoChunks, 16 << 10, 16 << 10, false, 8 << 10, false},
+		{"ios, legacy memory", base, ios, iosChunkSize, iosChunkSize, false, 64 << 10, false},
+		{"ios, mem=owned at the autotune floor", base, ios, iosChunkSize, iosChunkSize, true, 24 << 10, false},
+		{"ios, mem=owned, staged reads that may be extended", base, ios, iosChunkSize, stagingBytes, true, 24 << 10, false},
+		{"48 KiB send bound, mem=owned, staged reads that may be extended", base, small, defaultChunkSize, stagingBytes, true, 8 << 10, false},
+		{"a profile's lower threshold is kept", 16 << 10, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 16 << 10, false},
+		// Too small to tell a transfer from a conversation by bytes: refill
+		// evidence.
+		{"eight slots of 1 KiB staged reads", base, eightSlots, 32 << 10, stagingBytes, false, 3584, true},
+		{"33 KiB legacy bound: a 32 KiB read and a 1 KiB staged read", base, mixed, 32 << 10, stagingBytes, false, 512, true},
+		{"32 KiB + 1 send bound, legacy", base, flowMemoryLimits{maxSendBytes: 32<<10 + 1, maxOutstanding: 16384}, 32 << 10, 32 << 10, false, 1, true},
+		{"one slot", base, oneSlot, 32 << 10, 32 << 10, false, 1, true},
 	} {
-		if got := backlogThresholdFor(c.base, c.limits, c.chunk, c.readSize, c.memOwned); got != c.want {
-			t.Errorf("%s: threshold %d, want %d", c.name, got, c.want)
+		got, refill := backlogThresholdFor(c.base, c.limits, c.chunk, c.readSize, c.memOwned)
+		if got != c.want || refill != c.refill {
+			t.Errorf("%s: threshold %d refill %v, want %d and %v", c.name, got, refill, c.want, c.refill)
 		}
 	}
 }
@@ -780,6 +788,103 @@ func TestAnExtendedStagedTransferReentersBulk(t *testing.T) {
 	}
 	if h.current() != classifier.ClassBulk {
 		t.Fatalf("a transfer holding 48 KiB in extended staged reads never re-entered BULK (threshold %d)", f.classifier.BacklogBytes())
+	}
+}
+
+// ackAll and ackTo acknowledge through the real path, which records drains.
+func (h *phaseHarness) ackTo(sequence uint64) {
+	h.t.Helper()
+	f := h.f
+	f.replayMu.Lock()
+	f.highestSent = f.bytesUp.Load()
+	f.replayMu.Unlock()
+	if _, err := f.acknowledgeCoverage(sequence, false, nil); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// leaveBulk takes a phased flow into BULK and out again.
+func (h *phaseHarness) leaveBulk() {
+	h.t.Helper()
+	h.advance(2 * time.Second)
+	h.burst()
+	h.keystrokes(5 * time.Second)
+	if h.current() == classifier.ClassBulk {
+		h.t.Fatal("setup: the flow did not leave BULK")
+	}
+}
+
+// A legacy-memory flow with a 33 KiB bound, 32 KiB chunks and staged 1 KiB
+// reads can hold one 32 KiB read and one unextended 1 KiB read. The peer
+// acknowledges the large one first, leaving 1 KiB, and the producer refills
+// at once; then the small one. The dip to 1 KiB is not the transfer
+// draining, so having left BULK it goes back in.
+func TestAMixedReadTransferReentersBulk(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	f.chunkSize = 32 << 10
+	f.sendMemory = memlimit.New(1 << 20)
+	f.memoryLimits.maxSendBytes = 33 << 10
+	f.fitBacklogThreshold()
+	h.leaveBulk()
+	queue := []int{}
+	read := func(n int) { h.write(n, false); queue = append(queue, n) }
+	read(32 << 10)
+	read(1 << 10)
+	acked := f.bytesUp.Load() - 33<<10
+	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
+		oldest := queue[0]
+		acked += uint64(oldest)
+		queue = queue[1:]
+		h.ackTo(acked)
+		h.advance(2 * time.Millisecond)
+		read(oldest) // the same shape comes back: large, small, large...
+		h.advance(5 * time.Millisecond)
+	}
+	if h.current() != classifier.ClassBulk {
+		t.Fatalf("a transfer alternating a 32 KiB and a 1 KiB read never re-entered BULK (threshold %d)", f.classifier.BacklogBytes())
+	}
+}
+
+// A single-slot flow (MaxFlowOutstanding=1) has nothing left after each
+// acknowledgement. A transfer whose producer refills the slot at once,
+// cycle after cycle, is still backlogged and re-enters BULK; a conversation
+// of small writes on the same flow does not, and neither does a transfer
+// whose refills come late.
+func TestASingleSlotFlowUsesRefillEvidence(t *testing.T) {
+	setup := func() *phaseHarness {
+		h := newPhaseHarness(t, ClassifierPhased)
+		h.f.chunkSize = 32 << 10
+		h.f.memoryLimits.maxSendBytes, h.f.memoryLimits.maxOutstanding = 1<<20, 1
+		h.f.fitBacklogThreshold()
+		h.leaveBulk()
+		return h
+	}
+	cycle := func(h *phaseHarness, n int, refillAfter, ackAfter time.Duration, cycles int) {
+		for i := 0; i < cycles && h.current() != classifier.ClassBulk; i++ {
+			h.write(n, false)
+			h.advance(ackAfter)
+			h.ackTo(h.f.bytesUp.Load())
+			h.advance(refillAfter)
+		}
+	}
+
+	transfer := setup()
+	cycle(transfer, 32<<10, time.Millisecond, 10*time.Millisecond, 400)
+	if transfer.current() != classifier.ClassBulk {
+		t.Fatal("a single-slot transfer refilled at once after every acknowledgement never re-entered BULK")
+	}
+
+	conversation := setup()
+	cycle(conversation, 200, 15*time.Millisecond, 10*time.Millisecond, 400)
+	if conversation.current() == classifier.ClassBulk {
+		t.Fatal("a single-slot conversation of 200-byte writes re-entered BULK")
+	}
+
+	late := setup()
+	cycle(late, 32<<10, 50*time.Millisecond, 10*time.Millisecond, 400)
+	if late.current() == classifier.ClassBulk {
+		t.Fatal("full reads arriving 50 ms after the slot opened were taken for a continuous backlog")
 	}
 }
 
