@@ -446,6 +446,11 @@ type multipathFlow struct {
 	// to the classifier's threshold or below since the last observation, so
 	// a backlog that dipped between reads is not taken for a continuous one.
 	backlogDrained atomic.Bool
+	// codedHigh is one past the highest DATA byte this endpoint sent on the
+	// coded substrate, and ackedPoint mirrors acked, so the stall watchdog
+	// can tell whether any coded DATA is still unacknowledged.
+	codedHigh  atomic.Uint64
+	ackedPoint atomic.Uint64
 	// classBytes counts DATA payload this endpoint sent, by class byte (new,
 	// interactive, bulk) and substrate (stream, coded).
 	classBytes [3][2]atomic.Uint64
@@ -544,7 +549,7 @@ type multipathFlow struct {
 	sparseCurrent, sparsePrior uint64
 	// clock, when set by a test, replaces time.Now for classification.
 	clock func() time.Time
-	// classifyMu orders observe-and-publish.
+	// classifyMu serialises observe: sampling, classifying and publishing.
 	classifyMu sync.Mutex
 
 	replayMu sync.Mutex
@@ -702,7 +707,7 @@ func (f *multipathFlow) startLane(lane *mpLane) {
 	// reader, as the first version did, meant the writer could already be
 	// asking for it.
 	lane.fc.setCodingPolicy(f.prefersCodingOverRetransmission)
-	lane.fc.setDataObserver(f.noteDataBytes)
+	lane.fc.setDataObserver(f.noteDataFrame)
 	if f.phased() {
 		lane.fc.setFrameCodingPolicy(f.frameCoding)
 	}
@@ -2192,7 +2197,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 				// sparse writes, so the question is whether the lane's coded
 				// path could have taken any of the pending DATA, not what the
 				// flow prefers now.
-				if lane.fc.codesData() || f.phased() && lane.fc.codingBulk() {
+				if lane.fc.codesData() || f.phased() && f.codedDataOutstanding() {
 					f.escapePendingCoding()
 					break
 				}
@@ -2759,6 +2764,7 @@ func (f *multipathFlow) acknowledgeCoverage(sequence uint64, final bool, ranges 
 	advanced := sequence > f.acked
 	if advanced {
 		f.acked = sequence
+		f.ackedPoint.Store(sequence)
 	}
 	if f.ackTrack != nil {
 		f.ackTrack.Advance(sequence)
@@ -3476,6 +3482,13 @@ func (f *multipathFlow) clockNow() time.Time {
 }
 
 func (f *multipathFlow) observe(n int, up bool) bool {
+	// Sampling, classifying and publishing are one step. Three goroutines
+	// observe (the application reader, the receive loop and the dispatch
+	// refresh); an observation sampled before a newer one but applied after
+	// it would, for instance, end a backlog stretch the newer one had begun,
+	// or publish a class the classifier has already left.
+	f.classifyMu.Lock()
+	defer f.classifyMu.Unlock()
 	now := f.clockNow()
 	previousPayload := f.lastPayload.Load()
 	if n > 0 {
@@ -3532,11 +3545,6 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 		SmoothedRTT:    time.Duration(f.currentRTTNS.Load()),
 		CarriedPayload: n > 0,
 	}
-	// Observing and publishing are one step: two goroutines observe (the
-	// application reader and the receive loop), and a result published out
-	// of order would leave dispatch on a class the classifier has left.
-	f.classifyMu.Lock()
-	defer f.classifyMu.Unlock()
 	oldClass := classifier.Class(f.class.Load())
 	newClass := f.classifier.Observe(obs)
 	f.publishClass(newClass)

@@ -79,7 +79,8 @@ func TestClassTelemetryCountsBothCopiesOfAnOpenSafetyFrame(t *testing.T) {
 	defer path.Close()
 	fc := &frameConn{control: &bufferConn{}, bulk: path, wantsCoding: func() bool { return true }}
 	var codedBytes, streamBytes int
-	fc.setDataObserver(func(_ protocol.Class, coded bool, n int) {
+	fc.setDataObserver(func(f protocol.Frame, coded bool) {
+		n := len(f.Payload)
 		if coded {
 			codedBytes += n
 		} else {

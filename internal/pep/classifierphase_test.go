@@ -530,6 +530,7 @@ func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
 	fc := newSplitFrameConn(capture, path)
 	fc.setCodingPolicy(f.prefersCodingOverRetransmission)
 	fc.setFrameCodingPolicy(f.frameCoding)
+	fc.setDataObserver(f.noteDataFrame)
 	lane := &mpLane{id: 0, kind: TransportQUIC, fc: fc, writeQ: make(chan laneFrame, 2),
 		writeInteractiveQ: make(chan laneFrame, 2), writeDone: make(chan struct{})}
 	lane.ready.Store(true)
@@ -559,7 +560,17 @@ func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	sent := <-lane.writeInteractiveQ
-	sent.onWritten(false)
+	if f.codedDataOutstanding() {
+		t.Fatal("coded DATA counted as outstanding before any was written")
+	}
+	reliable, err := fc.writeContextObserved(ctx, sent.frame, sent.forceReliable, nil)
+	if err != nil || reliable {
+		t.Fatalf("the echo was not written coded: reliable=%v err=%v", reliable, err)
+	}
+	sent.onWritten(reliable)
+	if !f.codedDataOutstanding() {
+		t.Fatal("a coded echo was not recorded as outstanding coded DATA")
+	}
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() { f.stallWatchdog(stop); close(done) }()

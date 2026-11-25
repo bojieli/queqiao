@@ -89,21 +89,32 @@ func TestASmallWriteBehindAQueuedRetryIsNotSparse(t *testing.T) {
 	defer s.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	src.writes <- make([]byte, 16<<10)
-	for s.ReadyBytes() == 0 {
-		time.Sleep(time.Millisecond)
+	waitReady := func(n uint64) {
+		t.Helper()
+		for s.ReadyBytes() != n {
+			if ctx.Err() != nil {
+				t.Fatalf("ready bytes %d, want %d", s.ReadyBytes(), n)
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
+	src.writes <- make([]byte, 16<<10)
+	waitReady(16 << 10)
 	c, err := s.Next(ctx, 1, 0)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || c == nil {
+		t.Fatalf("first dispatch: %v", err)
 	}
 	s.Fail(1, c) // requeued for another attempt
 	src.writes <- make([]byte, 36)
-	for s.ReadyBytes() == 0 {
-		time.Sleep(time.Millisecond)
+	waitReady(36)
+	retry, err := s.Next(ctx, 2, 0)
+	if err != nil || retry == nil {
+		t.Fatalf("retry dispatch: %v", err)
 	}
-	retry, _ := s.Next(ctx, 2, 0)
-	small, _ := s.Next(ctx, 2, 0)
+	small, err := s.Next(ctx, 2, 0)
+	if err != nil || small == nil {
+		t.Fatalf("small write dispatch: %v", err)
+	}
 	if retry.Offset != 0 || small.Sparse {
 		t.Fatalf("retry offset %d, small write sparse=%v; want the retry first and the write not sparse", retry.Offset, small.Sparse)
 	}
