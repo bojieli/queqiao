@@ -419,7 +419,7 @@ func TestSingleTopologyKeepsConcurrentBulkFlowsOnOneConnection(t *testing.T) {
 			if err := rig.download(4, func() {
 				deadline := time.Now().Add(2500 * time.Millisecond)
 				for time.Now().Before(deadline) {
-					_, n := pathAttachments(rig.client.pathPrincipal + "|")
+					_, n := pathAttachments(rig.client.pathPrincipalNow() + "|")
 					maxAttached = max(maxAttached, n)
 					time.Sleep(20 * time.Millisecond)
 				}
@@ -440,7 +440,7 @@ func TestSingleTopologyKeepsConcurrentBulkFlowsOnOneConnection(t *testing.T) {
 					// The explicit fan-out triggers on the same condition
 					// and stays inside its budget: the preferred
 					// connection plus fanOut-1, all one controller's.
-					controllers, _ := pathAttachments(rig.client.pathPrincipal + "|")
+					controllers, _ := pathAttachments(rig.client.pathPrincipalNow() + "|")
 					if isolations == 0 || rig.client.bulkConnCount() > arm.fanOut-1 || maxAttached > arm.fanOut || controllers != 1 {
 						t.Fatalf("fan-out %d: %d isolations, %d bulk connections, %d attachments over %d controllers",
 							arm.fanOut, isolations, rig.client.bulkConnCount(), maxAttached, controllers)
@@ -498,7 +498,7 @@ func TestSingleTopologyRescuesAFlowThatLosesItsLane(t *testing.T) {
 		// is an attachment of the client's one path controller.
 		deadline := time.Now().Add(1500 * time.Millisecond)
 		for time.Now().Before(deadline) {
-			controllers, n := pathAttachments(rig.client.pathPrincipal + "|")
+			controllers, n := pathAttachments(rig.client.pathPrincipalNow() + "|")
 			maxControllers = max(maxControllers, controllers)
 			maxAttached = max(maxAttached, n)
 			time.Sleep(5 * time.Millisecond)
@@ -507,7 +507,7 @@ func TestSingleTopologyRescuesAFlowThatLosesItsLane(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := clientMetrics.Snapshot()
-	controllers, _ := pathAttachments(rig.client.pathPrincipal + "|")
+	controllers, _ := pathAttachments(rig.client.pathPrincipalNow() + "|")
 	t.Logf("lane replacements %d, bulk isolations %d, client controllers %d (at most %d), attachments at most %d",
 		s.LaneReplacements, s.BulkIsolations, controllers, maxControllers, maxAttached)
 	if maxControllers != 1 {
@@ -517,16 +517,16 @@ func TestSingleTopologyRescuesAFlowThatLosesItsLane(t *testing.T) {
 	// dial finishes its handshake, so dial one directly, as a rescue
 	// round's sprayed attempt does: it is a second attachment of the same
 	// controller, not a second controller.
-	_, before := pathAttachments(rig.client.pathPrincipal + "|")
+	_, before := pathAttachments(rig.client.pathPrincipalNow() + "|")
 	lane, err := rig.client.dialJoinLane(context.Background(), TransportQUIC, [16]byte{7}, 9)
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, "the rescue dial to attach", func() bool {
-		_, n := pathAttachments(rig.client.pathPrincipal + "|")
+		_, n := pathAttachments(rig.client.pathPrincipalNow() + "|")
 		return n == before+1
 	})
-	if controllers, _ := pathAttachments(rig.client.pathPrincipal + "|"); controllers != 1 {
+	if controllers, _ := pathAttachments(rig.client.pathPrincipalNow() + "|"); controllers != 1 {
 		t.Fatalf("a dedicated rescue connection made %d controllers", controllers)
 	}
 	_ = lane.fc.Close()
@@ -665,7 +665,7 @@ func TestSingleTopologyStaysInsideTheIOSMemoryProfile(t *testing.T) {
 					var m runtime.MemStats
 					runtime.ReadMemStats(&m)
 					peak = max(peak, m.HeapInuse)
-					_, n := pathAttachments(rig.client.pathPrincipal + "|")
+					_, n := pathAttachments(rig.client.pathPrincipalNow() + "|")
 					maxAttached = max(maxAttached, n)
 					time.Sleep(50 * time.Millisecond)
 				}
@@ -739,7 +739,7 @@ func TestPreferredWindowCreditIsBoundedOverEveryLiveGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.closeQUICPool()
-	ccfg := congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2, sched: SchedClass, scope: CongestionScopePath, principal: client.pathPrincipal}
+	ccfg := congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2, sched: SchedClass, scope: CongestionScopePath, principal: client.pathPrincipalNow()}
 
 	const generations = 3
 	var live []*controlQUICGeneration
