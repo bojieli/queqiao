@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import threading
@@ -793,32 +794,47 @@ class LocalProcesses(unittest.TestCase):
             # on an idle host; less on a loaded one).
             self.assertGreater((c1 - c0) / 100 / (t1 - t0), 0.05)
 
+    def held(self, tag):
+        """Spawn, as campaign process `tag`, a sleeper that holds a Unix
+        socket connection to this test; return the test's end. Its exit is
+        then an event: the kernel closes the connection when the process
+        ends, so recv() returns b"" exactly then, with no polling interval
+        to outrun on a slow host."""
+        path = os.path.join(self.W, f"{tag}.sock")
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(path)
+        srv.listen(1)
+        srv.settimeout(60)
+        self.camp.spawn(self.host, tag, self.W,
+                        f"{sys.executable} -c 'import socket, sys, time; s = socket.socket(socket.AF_UNIX); "
+                        f"s.connect(sys.argv[1]); time.sleep(3600)' {path} {self.W}/marker")
+        conn, _ = srv.accept()          # the event "it is running"
+        srv.close()
+        conn.settimeout(60)             # a guard against a hang, not a deadline the test races
+        return conn
+
+    @staticmethod
+    def ended(conn):
+        try:
+            return conn.recv(1) == b""
+        except socket.timeout:
+            return False
+
     def test_spawn_then_stop_kills_only_work_directory_processes(self):
-        decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "decoy-not-in-workdir"])
+        decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3600)", "decoy-not-in-workdir"])
         self.procs.append(decoy)
-        self.camp.spawn(self.host, "t1", self.W, f"{sys.executable} -c 'import time; time.sleep(30)' {self.W}/marker")
-        pid = int(pathlib.Path(self.W, "run", "t1.pid").read_text())
-        self.assertTrue(self.alive(pid))
+        c1 = self.held("t1")
         # A pid file pointing at a process outside the work directory is not signalled.
         with open(os.path.join(self.W, "run", "t2.pid"), "w") as f:
             f.write(str(decoy.pid))
         self.camp.stop(self.host, "t2")
-        self.assertTrue(self.alive(decoy.pid))
         self.camp.stop(self.host, "t1")
-        for _ in range(40):
-            if not self.alive(pid):
-                break
-            time.sleep(0.05)
-        self.assertFalse(self.alive(pid))
-        self.camp.spawn(self.host, "t3", self.W, f"{sys.executable} -c 'import time; time.sleep(30)' {self.W}/marker")
-        pid3 = int(pathlib.Path(self.W, "run", "t3.pid").read_text())
+        self.assertTrue(self.ended(c1))
+        c3 = self.held("t3")
         self.camp.teardown()
-        for _ in range(60):
-            if not self.alive(pid3):
-                break
-            time.sleep(0.05)
-        self.assertFalse(self.alive(pid3))
-        self.assertTrue(self.alive(decoy.pid))
+        self.assertTrue(self.ended(c3))
+        # Our own child: poll() would reap it had any of the above signalled it.
+        self.assertIsNone(decoy.poll())
 
 
 if __name__ == "__main__":
