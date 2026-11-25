@@ -55,6 +55,12 @@ type ControllerTelemetry struct {
 	// queue and a rate that simply measured less look identical otherwise, and
 	// the two call for opposite responses.
 	DelayBrake float64
+	// NonElicitingBytes is the size of the packets sent that elicit no
+	// acknowledgement (QUIC ACK-only packets), and NonElicitingDebited how
+	// much of it was charged to the pacer. Only the erasure sender reports
+	// them.
+	NonElicitingBytes   uint64
+	NonElicitingDebited uint64
 	// SampleMean, SampleMax, SampleMaxDelivered and SampleMaxInterval describe
 	// the delivery-rate samples the bandwidth estimate is built from, which the
 	// estimate alone cannot: a rate is high either because the path is fast or

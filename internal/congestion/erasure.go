@@ -129,6 +129,14 @@ type ErasureSender struct {
 	path   pathmodel.Model
 	share  atomic.Uint64
 	member pathmodel.Member
+
+	// The bytes of packets that elicit no acknowledgement (QUIC ACK-only
+	// packets), counted by how they were accounted: debited from the pacer
+	// through the per-packet callbacks, not debited through
+	// ErasurePathSender. A connection uses one of the two, so the published
+	// total and debited figures are always consistent.
+	nonElicitingDebited   atomic.Uint64
+	nonElicitingUndebited atomic.Uint64
 }
 
 type packetOutcome struct {
@@ -514,8 +522,29 @@ func (e *ErasureSender) HasPacingBudget(now monotime.Time) bool {
 }
 
 func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
+	if !retransmittable {
+		e.nonElicitingDebited.Add(byteTotal(bytes))
+	}
 	e.pacer.sentPacket(sentTime, bytes)
 	e.inner.OnPacketSent(sentTime, bytesInFlight, number, bytes, retransmittable)
+}
+
+// byteTotal converts a packet size for a byte counter; a negative size
+// counts as none.
+func byteTotal(b quiccongestion.ByteCount) uint64 {
+	if b <= 0 {
+		return 0
+	}
+	return uint64(b) // #nosec G115 -- b is positive, and every ByteCount fits in uint64.
+}
+
+// onNonElicitingSent registers a packet that elicits no acknowledgement
+// without charging the pacer for it (cc-api v2). The delivery sampler credits
+// such a packet nothing, so charging it limits traffic by an estimate that was
+// not measured on it; see ErasurePathSender.
+func (e *ErasureSender) onNonElicitingSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount) {
+	e.nonElicitingUndebited.Add(byteTotal(bytes))
+	e.inner.OnPacketSent(sentTime, bytesInFlight, number, bytes, false)
 }
 
 // CanSend uses the compensated window for the same reason the pacer uses the
@@ -671,6 +700,8 @@ func (e *ErasureSender) Telemetry() ControllerTelemetry {
 	// diagnostic is a smaller problem than an unsynchronised read of the
 	// controller's state.
 	t.DelayBrake = float64(e.delayBrake.Load()) / partsPerMillion
+	t.NonElicitingDebited = e.nonElicitingDebited.Load()
+	t.NonElicitingBytes = t.NonElicitingDebited + e.nonElicitingUndebited.Load()
 	arrival := e.arrivalRate()
 	t.PacingRate = uint64(float64(t.PacingRate) / arrival)
 	t.CongestionWindow = uint64(float64(t.CongestionWindow) / arrival)

@@ -316,3 +316,47 @@ func TestGatewayAdmissionIsValidatedAtStartup(t *testing.T) {
 		t.Fatal("an unknown gateway admission was accepted")
 	}
 }
+
+// An unsupported bundle is refused by flag validation, before the process
+// logs its configuration or renews anything.
+func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
+	for _, client := range []bool{true, false} {
+		if opts := parseRuntimeForTest(t, client, "--cc-api=v2"); opts.ccAPI != "v2" {
+			t.Fatalf("cc-api=v2 not parsed: %q", opts.ccAPI)
+		}
+		for _, args := range [][]string{
+			{"--cc-api=v3"},
+			{"--cc-api=v2", "--congestion=reno"},
+			{"--cc-api=v2", "--path-profile=dc-long-haul"},
+		} {
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			var opts runtimeOptions
+			bindRuntimeFlags(fs, &opts, client)
+			if err := fs.Parse(args); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateRuntime(opts, client); err == nil {
+				t.Errorf("client=%v %v accepted", client, args)
+			}
+		}
+	}
+}
+
+// The memory-ownership bundle (design §14 stage 3) is independent: either
+// value starts on either role, and any other spelling is refused at start-up.
+func TestMemoryBundleIsValidatedAtStartup(t *testing.T) {
+	for _, client := range []bool{true, false} {
+		if opts := parseRuntimeForTest(t, client); opts.memory != "legacy" {
+			t.Fatalf("default memory bundle = %q", opts.memory)
+		}
+		if opts := parseRuntimeForTest(t, client, "--mem", "owned"); opts.memory != "owned" {
+			t.Fatalf("memory bundle = %q", opts.memory)
+		}
+		opts := parseRuntimeForTest(t, client)
+		opts.memory = "shared"
+		if err := validateRuntime(opts, client); err == nil {
+			t.Fatalf("unknown memory bundle accepted (client=%v)", client)
+		}
+	}
+}
