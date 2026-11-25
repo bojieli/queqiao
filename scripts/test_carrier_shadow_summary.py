@@ -420,5 +420,37 @@ class CalibrationFollowUpTest(unittest.TestCase):
         requests = summarize(client, [rec(30.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])["stalls"]["client"]["rescue_requests"]
         self.assertEqual((requests["requests_followed_by_a_rescue_round"], requests["requests_without_a_rescue_round"]), (1, 1))
 
+    def test_round_five_review(self):
+        gateway = [rec(100.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=1, grace=45_000_000_000),
+                   rec(120.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=1)]
+        # A new incident first seen on carrier 2, then on carrier 1 whose
+        # epoch moved since the previous incident: one incident.
+        client = [
+            stall(10.0, 1, 1, 5),
+            rec(20.0, "carrier shadow outage ended", endpoint="client", session_id=SESSION, flow_id=1),
+            stall(90.0, 1, 2, 1),
+            stall(95.0, 1, 1, 9),
+        ]
+        self.assertAlmostEqual(summarize(client, gateway)["recovery_deadline"]["skew_s"]["max"], 10.0, places=3)
+        # A zero-lane outage on the client is not ended by its former
+        # carrier recovering for another flow.
+        client = [
+            rec(80.0, "carrier shadow lane failed", endpoint="client", session_id=SESSION, flow_id=1, carrier_id=1, carrier_state="active", transport_epoch=5),
+            rec(80.1, "carrier shadow outage", endpoint="client", session_id=SESSION, flow_id=1, grace=45_000_000_000),
+            rec(85.0, "carrier shadow state", endpoint="client", carrier_id=1, to="active", transport_epoch=6, **{"from": "suspect"}),
+        ]
+        self.assertAlmostEqual(summarize(client, gateway)["recovery_deadline"]["skew_s"]["max"], 20.0, places=3)
+        # A JOIN started within the outage end's millisecond is this outage's.
+        client = [rec(4.9002, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=2, lane_id=8, transport="quic")]
+        gateway = [
+            rec(4.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=2, grace=45_000_000_000),
+            rec(4.9008, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=2,
+                observed_unix_ms=int(MODULE.parse_instant(at(4.9008)) * 1000)),
+            rec(5.2, "carrier shadow join arrived", endpoint="gateway", session_id=SESSION, flow_id=2, lane_id=8, in_outage=False),
+        ]
+        deadline = summarize(client, gateway)["recovery_deadline"]
+        self.assertEqual(deadline["joins_started_after_recovery"], 0)
+        self.assertEqual(deadline["join_transit_s"]["n"], 1)
+
 if __name__ == "__main__":
     unittest.main()

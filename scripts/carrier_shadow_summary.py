@@ -453,7 +453,7 @@ def incident_starts(index: tuple[dict[tuple, list[float]], dict[tuple, list[floa
     ended_at: dict[int, float] = {}
     epochs: dict[tuple, int] = {}
     carrier = None
-    for index, (t, _, record) in enumerate(observations):
+    for index, (t, kind, record) in enumerate(observations):
         start = starts[-1] if starts else 0
         if index:
             previous = observations[index - 1][0]
@@ -467,7 +467,13 @@ def incident_starts(index: tuple[dict[tuple, list[float]], dict[tuple, list[floa
             if evidence:
                 ended_at[start] = min(evidence)
                 start = index
-        if record.get("carrier_id") is not None:
+                # A new incident compares epochs from its own observations.
+                epochs.clear()
+        if kind == "outage":
+            # The flow has no lane: only its own outage end, not progress on
+            # a former carrier (which may serve other flows), ends this.
+            carrier = None
+        elif record.get("carrier_id") is not None:
             carrier = carrier_key(record)
             if isinstance(record.get("transport_epoch"), int):
                 epochs[carrier] = record["transport_epoch"]
@@ -603,7 +609,8 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
                 if not start <= j["_t"] < min(next_start, capture_end + 1):
                     continue
                 attempt = attempts.get((*key, j.get("lane_id")))
-                if attempt is not None and end is not None and attempt[0] > end:
+                # Outage ends are logged to the millisecond, attempts finer.
+                if attempt is not None and end is not None and attempt[0] >= end + 0.001:
                     # Started after the outage was over: not this recovery.
                     after_recovery += 1
                     continue
