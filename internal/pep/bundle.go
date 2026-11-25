@@ -2,6 +2,7 @@ package pep
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/bojieli/queqiao/internal/profile"
 )
@@ -61,10 +62,17 @@ func ValidateBundle(ccAPI CCAPIVersion, congestion CongestionControlKind, p prof
 }
 
 // Bundle names the switches in effect, for publishing an endpoint's effective
-// configuration.
-func Bundle(ccAPI CCAPIVersion) string {
+// configuration: "legacy" when every switch is off.
+func Bundle(ccAPI CCAPIVersion, memory MemoryMode) string {
+	var on []string
 	if ccAPI == CCAPIV2 {
-		return "cc-api=v2"
+		on = append(on, "cc-api=v2")
 	}
-	return "legacy"
+	if memory == MemoryOwned {
+		on = append(on, "mem=owned")
+	}
+	if len(on) == 0 {
+		return "legacy"
+	}
+	return strings.Join(on, ",")
 }

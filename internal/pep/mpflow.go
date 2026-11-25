@@ -239,6 +239,8 @@ type multipathFlow struct {
 	memoryLimits  flowMemoryLimits
 	sendMemory    *memlimit.Budget
 	receiveMemory *memlimit.Budget
+	// memOwned selects the owned-memory bundle (MemoryOwned).
+	memOwned bool
 
 	sendAckFlag uint16
 	recvAckFlag uint16
@@ -1997,7 +1999,19 @@ func (f *multipathFlow) pendingOutbound() bool {
 	f.chunkMu.Lock()
 	pending := len(f.outstandingChunks) > 0
 	f.chunkMu.Unlock()
-	return pending
+	if pending {
+		return true
+	}
+	if f.memOwned {
+		// READY bytes hold a shared reservation and are owed dispatch. On
+		// main this predicate looks only at sent offsets and tracked chunks,
+		// so bytes read while no binding exists were waiting without a
+		// deadline (design §8.3).
+		if sched := f.scheduler.Load(); sched != nil && sched.HasReadyWork() {
+			return true
+		}
+	}
+	return false
 }
 
 // scanStall advances one pending/progress pair and reports whether the pair

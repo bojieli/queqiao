@@ -185,7 +185,9 @@ type ClientConfig struct {
 	// MemoryLimits is required by resource-constrained clients. Nil retains
 	// the throughput-oriented defaults used by servers and desktop clients.
 	MemoryLimits *MemoryLimits
-	Metrics      *metrics.Registry
+	// Memory selects the memory-ownership bundle; empty is legacy.
+	Memory  MemoryMode
+	Metrics *metrics.Registry
 	// FallbackDelay is when AUTO starts connecting its warm-standby TCP
 	// candidate. It is not a deadline for QUIC and not a transport-selection
 	// race.
@@ -688,7 +690,12 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}).validate(); err != nil {
 		return nil, err
 	}
-	memoryLimits, sendMemory, receiveMemory, err := resolveMemoryLimits(cfg.MemoryLimits, cfg.ChunkSize)
+	memoryMode, err := ParseMemoryMode(string(cfg.Memory))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Memory = memoryMode
+	memoryLimits, sendMemory, receiveMemory, err := resolveMemoryLimits(cfg.MemoryLimits, cfg.ChunkSize, memoryMode)
 	if err != nil {
 		return nil, err
 	}
@@ -1029,6 +1036,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	c.cfg.Logger.Debug("local flow opened", "transport", flow.kind, "duration", time.Since(flowOpenStarted))
 	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
 	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
+	flowSession.memOwned = c.cfg.Memory == MemoryOwned
 	flowSession.wire = flow.fc.wire
 	c.declareClass(ctx, inner, flowSession)
 	flowSession.ackRanges.Store(true)

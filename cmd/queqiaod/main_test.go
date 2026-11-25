@@ -323,3 +323,21 @@ func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
 		}
 	}
 }
+
+// The memory-ownership bundle (design §14 stage 3) is independent: either
+// value starts on either role, and any other spelling is refused at start-up.
+func TestMemoryBundleIsValidatedAtStartup(t *testing.T) {
+	for _, client := range []bool{true, false} {
+		if opts := parseRuntimeForTest(t, client); opts.memory != "legacy" {
+			t.Fatalf("default memory bundle = %q", opts.memory)
+		}
+		if opts := parseRuntimeForTest(t, client, "--mem", "owned"); opts.memory != "owned" {
+			t.Fatalf("memory bundle = %q", opts.memory)
+		}
+		opts := parseRuntimeForTest(t, client)
+		opts.memory = "shared"
+		if err := validateRuntime(opts, client); err == nil {
+			t.Fatalf("unknown memory bundle accepted (client=%v)", client)
+		}
+	}
+}

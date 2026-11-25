@@ -561,6 +561,12 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion) {
 }
 
 func TestQUICFlowSurvivesOneLaneFailure(t *testing.T) {
+	runQUICFlowSurvivesOneLaneFailure(t, MemoryLegacy, nil)
+}
+
+// runQUICFlowSurvivesOneLaneFailure runs with the given memory bundle and limits, so the owned-memory
+// bundle is held to the same replay guarantee.
+func runQUICFlowSurvivesOneLaneFailure(t *testing.T, mode MemoryMode, limits *MemoryLimits) {
 	destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -576,7 +582,7 @@ func TestQUICFlowSurvivesOneLaneFailure(t *testing.T) {
 	}
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
-		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, ChunkSize: 4 * 1024, Logger: logger,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, ChunkSize: 4 * 1024, Logger: logger, Memory: mode,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -586,7 +592,7 @@ func TestQUICFlowSurvivesOneLaneFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
-		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, ChunkSize: 4 * 1024, Logger: logger,
+		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, ChunkSize: 4 * 1024, Logger: logger, Memory: mode, MemoryLimits: limits,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -722,6 +728,12 @@ func TestAutoTransportFallsBackToTCPWhenUDPUnavailable(t *testing.T) {
 }
 
 func TestAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T) {
+	runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t, MemoryLegacy, nil)
+}
+
+// runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail runs with the given memory bundle and limits, so the owned-memory
+// bundle is held to the same replay guarantee.
+func runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T, mode MemoryMode, limits *MemoryLimits) {
 	destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -734,7 +746,7 @@ func TestAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T) {
 	serverListener, packetConn := listenTCPAndUDPOnOnePort(t)
 	server, err := NewServer(ServerConfig{
 		ListenAddr: serverListener.Addr().String(), Credentials: certificate,
-		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableTCP: true, EnableQUIC: true, ChunkSize: 4 * 1024, Logger: logger,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableTCP: true, EnableQUIC: true, ChunkSize: 4 * 1024, Logger: logger, Memory: mode,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -744,7 +756,7 @@ func TestAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T) {
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
-		ListenAddr: clientListener.Addr().String(), RemoteAddr: serverListener.Addr().String(), Credentials: roots, Transport: TransportAuto, FallbackDelay: 300 * time.Millisecond, ChunkSize: 4 * 1024, Logger: logger,
+		ListenAddr: clientListener.Addr().String(), RemoteAddr: serverListener.Addr().String(), Credentials: roots, Transport: TransportAuto, FallbackDelay: 300 * time.Millisecond, ChunkSize: 4 * 1024, Logger: logger, Memory: mode, MemoryLimits: limits,
 	})
 	if err != nil {
 		t.Fatal(err)
