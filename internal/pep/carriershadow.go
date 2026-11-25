@@ -101,6 +101,8 @@ type carrierProgress struct {
 	// that does not count them leaves them zero.
 	Episodes         uint64
 	EpisodesReaching [metrics.CarrierShadowPTOBuckets]uint64
+	// LastEpisodePeak is the peak of the last completed episode.
+	LastEpisodePeak uint32
 }
 
 // carrierProgressSource is a lane transport that is a carrier the observer
@@ -126,7 +128,7 @@ func (c *quicStreamConn) carrierProgress() (carrierProgress, error) {
 	p := carrierProgress{
 		Epoch: s.ProgressEpoch, LastProgress: s.LastProgress, PTOExpiries: s.PTOExpiriesSinceProgress,
 		ElicitingOutstanding: s.ElicitingOutstanding, SmoothedRTT: s.SmoothedRTT,
-		Episodes: s.PTOEpisodes, EpisodesReaching: s.PTOEpisodesReaching,
+		Episodes: s.PTOEpisodes, EpisodesReaching: s.PTOEpisodesReaching, LastEpisodePeak: s.LastPTOEpisodePeak,
 	}
 	ctx := c.conn.Context()
 	if ctx.Err() == nil {
@@ -222,6 +224,9 @@ type carrierEvent struct {
 	// more than one packet was acknowledged since the last sample: the ACK
 	// that ended the episode may have come earlier.
 	DurationUpperBound bool
+	// PeakLowerBound says PTOs is the last bucket of the transport's
+	// histogram, which counts that many or more.
+	PeakLowerBound bool
 	// Epoch is the carrier's progress epoch after the event. A stall and a
 	// later transition with the same epoch belong to one no-progress
 	// episode.
@@ -343,6 +348,15 @@ func (m *carrierMachine) endRecoveredEpisodes(events []carrierEvent, s carrierSa
 		}
 		for range exactly {
 			event := carrierEvent{Kind: carrierEpisodeEnd, At: s.At, PTOs: uint32(n), Outcome: episodeRecovered, Epoch: s.Progress.Epoch}
+			if n == len(reach) {
+				// The last bucket is that many or more: one episode's exact
+				// peak is the transport's last one.
+				if ended == 1 && s.Progress.LastEpisodePeak >= uint32(n) {
+					event.PTOs = s.Progress.LastEpisodePeak
+				} else {
+					event.PeakLowerBound = true
+				}
+			}
 			if ended == 1 && m.started {
 				event.SinceProgress, event.DurationUpperBound = silent, bound
 			} else {
@@ -622,7 +636,10 @@ func (o *carrierShadow) emit(c *shadowCarrier, event carrierEvent, srtt time.Dur
 		// One-expiry episodes are routine tail probes; they are counted in
 		// the metrics and in the carrier's closing summary, not logged.
 		if event.PTOs >= 2 {
-			fields := []any{"endpoint", o.role, "carrier_id", c.id, "max_pto", event.PTOs, "outcome", event.Outcome}
+			fields := []any{"endpoint", o.role, "carrier_id", c.id, "max_pto", event.PTOs, "outcome", event.Outcome, "transport_epoch", event.Epoch}
+			if event.PeakLowerBound {
+				fields = append(fields, "max_pto_lower_bound", true)
+			}
 			if event.BetweenSamples {
 				fields = append(fields, "between_samples", true)
 			} else {
@@ -683,12 +700,24 @@ func (o *carrierShadow) idFields(sessionID [16]byte, flowID uint64) []any {
 // noteJoinAttempt records the client starting one JOIN, with the lane ID the
 // gateway will log when it arrives: the pair is the handoff transit J of
 // §10.3 step 4, per attempt and per transport.
-func (o *carrierShadow) noteJoinAttempt(sessionID [16]byte, flowID, laneID uint64, kind TransportKind) {
+// ctx names the rescue round the attempt belongs to, if any (noteRescue).
+func (o *carrierShadow) noteJoinAttempt(ctx context.Context, sessionID [16]byte, flowID, laneID uint64, kind TransportKind) {
 	if o == nil {
 		return
 	}
-	o.logger.Info("carrier shadow join attempt", append(o.idFields(sessionID, flowID), "lane_id", laneID, "transport", string(kind))...)
+	fields := append(o.idFields(sessionID, flowID), "lane_id", laneID, "transport", string(kind))
+	if round, ok := ctx.Value(shadowRescueRoundKey{}).(uint64); ok {
+		fields = append(fields, "rescue_round", round)
+	}
+	o.logger.Info("carrier shadow join attempt", fields...)
 }
+
+// shadowRescueRoundKey carries a rescue round's identifier to the JOIN
+// attempts it makes, so a measurement attributes attempts to rounds rather
+// than inferring it from timing.
+type shadowRescueRoundKey struct{}
+
+var shadowRescueRounds atomic.Uint64
 
 // noteJoinAfterEnd records a JOIN that reached the gateway after the flow's
 // session had ended, which is refused.
@@ -871,12 +900,25 @@ func (o *carrierShadow) noteOutageEnd(f *multipathFlow, ended, deadline time.Tim
 
 // noteRescue records the client starting a rescue round: the start of the
 // JOIN whose arrival the gateway records with noteJoinArrival.
-func (o *carrierShadow) noteRescue(f *multipathFlow) {
+// It returns ctx naming the round, for the JOIN attempts made under it.
+func (o *carrierShadow) noteRescue(ctx context.Context, f *multipathFlow) context.Context {
 	if o == nil {
+		return ctx
+	}
+	round := shadowRescueRounds.Add(1)
+	o.logger.Info("carrier shadow rescue started", append(o.flowFields(f),
+		"healthy_lanes", len(f.healthyLanes()), "rescue_round", round)...)
+	return context.WithValue(ctx, shadowRescueRoundKey{}, round)
+}
+
+// noteRescueRequest records the client's watchdog handing a rescue request
+// to the lane manager: one per request actually queued, which a stall
+// episode may make several of, or none while a round is in flight.
+func (o *carrierShadow) noteRescueRequest(f *multipathFlow) {
+	if o == nil || o.role != carrierShadowClient {
 		return
 	}
-	o.logger.Info("carrier shadow rescue started", append(o.flowFields(f),
-		"healthy_lanes", len(f.healthyLanes()))...)
+	o.logger.Info("carrier shadow rescue requested", o.flowFields(f)...)
 }
 
 // noteJoinArrival records a JOIN reaching the gateway's admission, with

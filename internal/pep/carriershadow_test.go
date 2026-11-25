@@ -262,7 +262,7 @@ func TestCarrierShadowConfig(t *testing.T) {
 	var off *carrierShadow
 	off.bindLane(nil, nil)
 	off.noteStall(nil, nil, time.Time{}, 0, false, false)
-	off.noteRescue(nil)
+	off.noteRescue(context.Background(), nil)
 	if obs := off.observeLane(nil); obs.tracked {
 		t.Fatal("a disabled observer observed")
 	}
@@ -401,6 +401,9 @@ func TestCarrierShadowLabelsCodedTailStallALiveCarrier(t *testing.T) {
 	}
 	if got.Stalls[metrics.CarrierShadowReplaceCarrier] != 0 || got.Transitions[metrics.CarrierShadowSuspect] != 0 {
 		t.Fatalf("a live carrier was suspected: %+v", got)
+	}
+	if request := findLogRecord(t, logs.String(), "carrier shadow rescue requested"); request["flow_id"] != float64(7) {
+		t.Fatalf("rescue request record = %v", request)
 	}
 	record := findLogRecord(t, logs.String(), "carrier shadow stall")
 	for key, want := range map[string]any{
@@ -714,5 +717,28 @@ func TestCarrierShadowSeedsCountersAndBoundsDurations(t *testing.T) {
 		if len(episodes) != 1 || episodes[0].DurationUpperBound != (acked > 1) {
 			t.Fatalf("%d acknowledged: episodes = %+v", acked, episodes)
 		}
+	}
+}
+
+// The transport's last bucket counts its peak or more: a single episode
+// takes its exact peak from the transport, several are marked lower bounds.
+func TestCarrierShadowPeakPastTheLastBucket(t *testing.T) {
+	trace := newShadowTrace(t, 2, 4)
+	trace.step(true, 0)
+	trace.step(false, 3)
+	trace.episodes++
+	for n := range trace.reaching {
+		trace.reaching[n]++
+	}
+	trace.now = trace.now.Add(100 * time.Millisecond)
+	trace.epoch++
+	events := trace.m.observe(carrierSample{At: trace.now, Progress: carrierProgress{Epoch: trace.epoch, LastProgress: trace.now,
+		Episodes: trace.episodes, EpisodesReaching: trace.reaching, LastEpisodePeak: 19}}, nil)
+	if episodes := episodesOf(events); len(episodes) != 1 || episodes[0].PTOs != 19 || episodes[0].PeakLowerBound {
+		t.Fatalf("one episode past the last bucket = %+v", episodes)
+	}
+	episodes := episodesOf(trace.recoverAfter(20, 18))
+	if len(episodes) != 2 || episodes[0].PTOs != metrics.CarrierShadowPTOBuckets || !episodes[0].PeakLowerBound || !episodes[1].PeakLowerBound {
+		t.Fatalf("two episodes past the last bucket = %+v", episodes)
 	}
 }

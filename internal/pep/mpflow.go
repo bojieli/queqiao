@@ -2204,6 +2204,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			select {
 			case f.stallSignal <- struct{}{}:
 				lastSignal = now
+				f.carrierShadow.noteRescueRequest(f)
 			default:
 			}
 		}

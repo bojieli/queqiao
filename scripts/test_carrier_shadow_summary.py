@@ -293,24 +293,39 @@ class CalibrationFollowUpTest(unittest.TestCase):
         self.assertEqual(outcomes["unresolved: no later evidence about the carrier"], 1)
 
     def test_rescue_requests_are_counted_against_rescue_rounds(self):
+        def request(t):
+            return rec(t, "carrier shadow rescue requested", endpoint="client", session_id=SESSION, flow_id=7)
+
+        def attempt(t, lane, **fields):
+            return rec(t, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=7, lane_id=lane, transport="quic", **fields)
+
         client = [
             stall(10.0, 7, 4, 1),
-            rec(10.0, "carrier shadow rescue started", endpoint="client", session_id=SESSION, flow_id=7, healthy_lanes=1),
-            rec(10.5, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=7, lane_id=1, transport="quic"),
-            rec(11.0, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=7, lane_id=2, transport="tcp"),
-            # The manager skips the next request (backoff); a much later
-            # ordinary JOIN is not that request's.
-            stall(20.0, 7, 4, 1),
-            rec(500.0, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=7, lane_id=3, transport="quic"),
+            request(10.0),
+            rec(10.0, "carrier shadow rescue started", endpoint="client", session_id=SESSION, flow_id=7, healthy_lanes=1, rescue_round=41),
+            attempt(10.5, 1, rescue_round=41),
+            attempt(11.0, 2, rescue_round=41),
+            # The same stall episode asks again; the manager skips it.
+            request(15.0),
+            # A much later ordinary JOIN belongs to no round.
+            attempt(500.0, 3),
         ]
         gateway = [stall(12.0, 7, 9, 1, endpoint="gateway", legacy_remedy="demote"),
                    rec(30.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)]
         report = summarize(client, gateway)
         requests = report["stalls"]["client"]["rescue_requests"]
-        self.assertEqual(requests, {"requests_followed_by_a_rescue_round": 1, "requests_without_a_rescue_round": 1,
+        self.assertEqual(requests, {"requests": 2, "requests_followed_by_a_rescue_round": 1, "requests_without_a_rescue_round": 1,
                                     "join_attempts_in_those_rounds": 2})
         self.assertIsNone(report["stalls"]["gateway"]["rescue_requests"], "a gateway stall requests nothing")
         self.assertEqual(report["stalls"]["client"]["by_kind"][0]["legacy_remedy"], "demote_and_request_rescue")
+
+    def test_an_episode_line_closes_an_open_episode(self):
+        client = [
+            stall(1.0, 5, 3, 7, pto_since_progress=1),
+            rec(1.2, "carrier shadow episode", endpoint="client", carrier_id=3, max_pto=2, outcome="recovered", transport_epoch=8),
+        ]
+        report = summarize(client, [rec(9.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
+        self.assertEqual(report["calibration"]["client"]["open_episodes_censored"], 0)
 
     def test_a_newer_zero_count_observation_closes_an_open_episode(self):
         client = [stall(1.0, 5, 3, 7, pto_since_progress=1), stall(2.0, 5, 3, 8, pto_since_progress=0)]
