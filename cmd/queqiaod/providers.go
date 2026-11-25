@@ -235,6 +235,7 @@ func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtim
 		CCAPI:               pep.CCAPIVersion(opts.ccAPI),
 		CodedRetry:          pep.CodedRetryMode(opts.codedRetry),
 		Memory:              pep.MemoryMode(opts.memory),
+		Classifier:          pep.ClassifierMode(opts.classifierMode),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
 		Profile:            opts.resolvedProfile,

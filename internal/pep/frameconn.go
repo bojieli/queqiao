@@ -58,6 +58,11 @@ type frameConn struct {
 	// wantsCoding reports whether this lane's flow would rather spend bytes
 	// than round trips. Nil means it would.
 	wantsCoding func() bool
+	// frameCoding, when set, replaces wantsCoding for DATA frames: the
+	// phased classifier stamps its per-frame decision in the class byte, so
+	// the write codes what the dispatch planned to code. Nil keeps the
+	// flow-level answer.
+	frameCoding func(protocol.Class) bool
 	// openUnconfirmed is installed only on an optimistic client lane. The first
 	// coded DATA frame sent before OPEN_OK is also written once behind OPEN on
 	// the reliable stream. The coded copy keeps short-flow latency; the bounded
@@ -88,6 +93,10 @@ type frameConn struct {
 // be called before the lane's goroutines start, because from then on the
 // answer is read on every write.
 func (c *frameConn) setCodingPolicy(wants func() bool) { c.wantsCoding = wants }
+
+// setFrameCodingPolicy installs the per-frame policy of the phased classifier.
+// Same ordering rule as setCodingPolicy.
+func (c *frameConn) setFrameCodingPolicy(wants func(protocol.Class) bool) { c.frameCoding = wants }
 
 func (c *frameConn) setOpenSafetyPolicy(unconfirmed func() bool) {
 	c.openUnconfirmed = unconfirmed
@@ -191,6 +200,9 @@ func newSplitFrameConnLimited(control io.ReadWriteCloser, bulk *coded.Path, read
 func (c *frameConn) bulkFrame(f protocol.Frame) bool {
 	switch f.Header.Type {
 	case protocol.TypeData:
+		if c.frameCoding != nil {
+			return c.codingBulk() && c.frameCoding(f.Header.Class)
+		}
 		return c.codesData()
 	case protocol.TypePacket:
 		return c.packetsOnDatagrams()

@@ -1373,10 +1373,10 @@ func TestAFailedRelayIsNotHandedToAWaitingReplacement(t *testing.T) {
 
 // The effective configuration names the stage 5 switch beside the others.
 func TestBundleNamesGatewayAdmission(t *testing.T) {
-	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy); got != "legacy" {
+	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, ClassifierLegacy); got != "legacy" {
 		t.Fatalf("all-off bundle = %q", got)
 	}
-	if got := Bundle(CCAPIV2, MemoryOwned, CodedRetrySticky, GatewayAdmissionOwned); got != "cc-api=v2,coded-retry=sticky,mem=owned,gateway-admission=owned" {
+	if got := Bundle(CCAPIV2, MemoryOwned, CodedRetrySticky, GatewayAdmissionOwned, ClassifierLegacy); got != "cc-api=v2,coded-retry=sticky,mem=owned,gateway-admission=owned" {
 		t.Fatalf("bundle = %q", got)
 	}
 }

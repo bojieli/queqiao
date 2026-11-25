@@ -569,6 +569,8 @@ type runtimeOptions struct {
 	ccAPI           string
 	// codedRetry is the coded-retry bundle (design §14 stage 4).
 	codedRetry string
+	// classifierMode is the flow-classifier bundle (workload model R1).
+	classifierMode string
 	// memory is the memory-ownership bundle (design §14 stage 3).
 	memory                                                      string
 	brutalBytesPerSec, adaptiveMinBytesSec, adaptiveMaxBytesSec uint64
@@ -622,6 +624,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.StringVar(&opts.congestion, "congestion", string(pep.CongestionErasure), "QUIC congestion controller")
 	fs.StringVar(&opts.ccAPI, "cc-api", string(pep.CCAPIV1), "how QUIC congestion controllers are driven: v1 (per-packet callbacks) or v2 (the path-authority controller API; requires --congestion=erasure)")
 	fs.StringVar(&opts.codedRetry, "coded-retry", string(pep.CodedRetryLegacy), "coded-retry bundle: legacy, or sticky (a coded chunk's deadline starts when its datagrams are registered, and its retry stays on the stream; requires --cc-api=v2)")
+	fs.StringVar(&opts.classifierMode, "classifier", string(pep.ClassifierLegacy), "flow-classifier bundle: legacy (BULK is permanent), or phased (lane choice keeps the sticky class; the DATA class, queue and coding follow what the flow does now, and small writes onto an empty queue go interactive and coded)")
 	fs.StringVar(&opts.memory, "mem", string(pep.MemoryLegacy), "memory-ownership bundle: legacy, or owned (fair shared send-memory grants and the credit-driven retention bound)")
 	fs.Uint64Var(&opts.brutalBytesPerSec, "brutal-bytes-per-sec", 0, "Brutal fixed byte rate")
 	fs.Uint64Var(&opts.adaptiveMinBytesSec, "adaptive-min-bytes-per-sec", 64*1024, "Adaptive minimum byte rate")
@@ -749,6 +752,9 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	}
 	if err := pep.ValidateCodedRetry(pep.CodedRetryMode(opts.codedRetry), pep.CCAPIVersion(opts.ccAPI)); err != nil {
 		return fmt.Errorf("--coded-retry: %w", err)
+	}
+	if err := pep.ValidateClassifier(pep.ClassifierMode(opts.classifierMode), bundleProfile); err != nil {
+		return fmt.Errorf("--classifier: %w", err)
 	}
 	if opts.logFormat != "json" && opts.logFormat != "text" {
 		return errors.New("--log-format must be json or text")
@@ -925,6 +931,7 @@ func runServer(args []string) (returnErr error) {
 		CCAPI:               pep.CCAPIVersion(opts.ccAPI),
 		CodedRetry:          pep.CodedRetryMode(opts.codedRetry),
 		Memory:              pep.MemoryMode(opts.memory),
+		Classifier:          pep.ClassifierMode(opts.classifierMode),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
 		Logger: logger, UDPOnStream: opts.udpOnStream, Profile: serverProfile,
@@ -1042,7 +1049,8 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("transport", opts.transport),
 		slog.String("congestion", opts.congestion),
 		slog.String("cc_api", opts.ccAPI),
-		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)))),
+		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)), pep.ClassifierMode(opts.classifierMode))),
+		slog.String("classifier", opts.classifierMode),
 		slog.String("coded_retry", opts.codedRetry),
 		slog.String("mem", opts.memory),
 		slog.Int("max_sessions", opts.maxSessions),

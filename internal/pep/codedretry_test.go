@@ -421,10 +421,10 @@ func TestCodedRetryRequiresCCAPIV2(t *testing.T) {
 			t.Errorf("ValidateCodedRetry(%q, %q) = %v, want ok=%v", test.mode, test.api, err, test.ok)
 		}
 	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetrySticky, GatewayAdmissionLegacy); got != "cc-api=v2,coded-retry=sticky" {
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetrySticky, GatewayAdmissionLegacy, ClassifierLegacy); got != "cc-api=v2,coded-retry=sticky" {
 		t.Fatalf("Bundle = %q", got)
 	}
-	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy); got != "legacy" {
+	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, ClassifierLegacy); got != "legacy" {
 		t.Fatalf("Bundle = %q", got)
 	}
 	certificate, credentials := testCertificate(t)

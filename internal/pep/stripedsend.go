@@ -351,6 +351,12 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		// cannot repair has no other way back on a single-lane flow.
 		Reliable:      f.laneRetransmits,
 		ForceReliable: f.recoverChunkReliably,
+		// The phased classifier's sparse-write rule (R1a): a small write onto
+		// an empty send queue is INTERACTIVE and coded whatever the flow's
+		// class, within the sparse allowance.
+		SparseBytes:    f.sparseBytes(),
+		Sparse:         f.admitSparse,
+		ReliableSparse: f.laneRetransmitsSparse,
 		// The coded-retry bundle (design §8.1): a coded attempt's deadline
 		// starts when its datagrams are registered, and its retry, like every
 		// later attempt of the chunk, is on the stream.
@@ -579,10 +585,12 @@ func (f *multipathFlow) watchChunkCompletion(ctx context.Context, sched *stripe.
 	}
 }
 
-// carriesBulk reports whether the flow is currently classified as bulk, which
-// decides the lanes its data may use.
+// carriesBulk reports whether the flow has been classified as bulk, which
+// decides the lanes its data may use. It is the sticky class under both
+// classifier bundles: a lane decision is expensive to reverse, so it does not
+// follow the phased bundle's current class.
 func (f *multipathFlow) carriesBulk() bool {
-	return protocol.Class(f.class.Load()) == protocol.ClassBulk
+	return f.everBulk.Load()
 }
 
 // laneCarriesData reports whether this lane is the one carrying this flow's
@@ -611,8 +619,13 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 	}
 	frame := protocol.Frame{Header: protocol.Header{
 		Version: protocol.Version, Type: protocol.TypeData, SessionID: f.sessionID, FlowID: f.flowID,
-		Sequence: chunk.Offset, Class: protocol.Class(f.class.Load()),
+		Sequence: chunk.Offset, Class: f.sendClass(chunk.Sparse),
 	}, Payload: chunk.Data}
+	if f.phased() {
+		// The lane was chosen by the sticky class; the queue within it and
+		// the aggregate budget's interactive flag follow what this frame is.
+		bulk = frame.Header.Class == protocol.ClassBulk
+	}
 	// Deliberately not retained here: the scheduler is holding this chunk until
 	// it is acknowledged, and is the thing that will re-issue it if this lane
 	// stops. Recording it again would put the same bytes under two limits.

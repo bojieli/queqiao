@@ -155,6 +155,18 @@ type Config struct {
 	// single coded lane accumulates one admission charge per erasure and
 	// eventually cannot retry the bytes which are missing.
 	Reliable func(laneID uint64) bool
+	// SparseBytes and Sparse mark sparse writes: a read of at most
+	// SparseBytes that found no READY bytes ahead of it -- the flow's send
+	// queue was empty -- is offered to Sparse, under the scheduler's lock, and
+	// the chunk is marked Sparse if it answers true. Sparse may refuse, to
+	// bound how much of a flow can be sent this way; it must not call back
+	// into the scheduler. Zero SparseBytes or a nil Sparse marks nothing.
+	SparseBytes int
+	Sparse      func(n int) bool
+	// ReliableSparse is Reliable for a chunk marked Sparse. A flow that is
+	// sending bulk may still code a sparse write, so the lane's answer for it
+	// can differ. Nil uses Reliable.
+	ReliableSparse func(laneID uint64) bool
 	// ForceReliable pins selected byte ranges to a reliable carrier even when
 	// the lane normally uses datagrams. The decision is snapshotted at dispatch
 	// just like Reliable, so an in-flight recovery cannot change substrates
@@ -295,6 +307,9 @@ type Chunk struct {
 	// other, so the end of the stream is ordered with respect to the data
 	// rather than being a separate event that can overtake it.
 	Final bool
+	// Sparse marks a small write that found the flow's send queue empty (see
+	// Config.Sparse). Every attempt of the chunk keeps it.
+	Sparse bool
 
 	// urgent marks a chunk that came back from a lane which stalled or died.
 	// Such a chunk is admitted to a lane even when that lane is at its window,
@@ -321,7 +336,7 @@ func (c *Chunk) End() uint64 { return c.Offset + uint64(len(c.Data)) }
 // Ref is this dispatch's identity without its bytes, for a callback that may
 // outlive the chunk's memory reservation.
 func (c *Chunk) Ref() *Chunk {
-	return &Chunk{Reliable: c.Reliable, Offset: c.Offset, Final: c.Final, attempt: c.attempt}
+	return &Chunk{Reliable: c.Reliable, Offset: c.Offset, Final: c.Final, Sparse: c.Sparse, attempt: c.attempt}
 }
 
 type attempt struct {
@@ -634,6 +649,9 @@ func (s *Scheduler) publish(buf []byte, n, reserved int, err error) bool {
 	}
 	if n > 0 {
 		chunk := &Chunk{Offset: s.nextOffset, Data: buf[:n], reservation: reserved}
+		if s.cfg.Sparse != nil && n <= s.cfg.SparseBytes && s.readyBytes == 0 {
+			chunk.Sparse = s.cfg.Sparse(n)
+		}
 		s.nextOffset += uint64(n)
 		s.stats.SourceBytes += uint64(n)
 		s.pending = append(s.pending, chunk)
@@ -961,7 +979,7 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 			s.nextAttempt++
 		}
 		id := s.nextAttempt
-		reliable := s.laneRetransmits(laneID)
+		reliable := s.laneRetransmitsChunk(laneID, chunk)
 		if s.cfg.ForceReliable != nil && s.cfg.ForceReliable(chunk.Offset) {
 			reliable = true
 		}
@@ -996,6 +1014,15 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		return &issued
 	}
 	return nil
+}
+
+// laneRetransmitsChunk is laneRetransmits for one chunk, which a sparse
+// write may answer differently.
+func (s *Scheduler) laneRetransmitsChunk(laneID uint64, chunk *Chunk) bool {
+	if chunk.Sparse && s.cfg.ReliableSparse != nil {
+		return s.cfg.ReliableSparse(laneID)
+	}
+	return s.laneRetransmits(laneID)
 }
 
 // laneRetransmits reports whether a lane recovers its own losses.
