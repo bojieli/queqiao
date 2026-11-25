@@ -134,23 +134,11 @@ func (p *pacer) maxBurstSize() quiccongestion.ByteCount {
 func (p *pacer) setBurstFloor(f func() quiccongestion.ByteCount) { p.burstFloor = f }
 
 func (p *pacer) timeUntilSend() monotime.Time {
-	if p.budgetAtLastSent >= p.maxDatagramSize {
-		return 0
-	}
-	bps := uint64(p.getBandwidth())
-	if bps == 0 {
-		return p.lastSentTime.Add(time.Second)
-	}
-	diff := 1e9 * uint64(p.maxDatagramSize-p.budgetAtLastSent)
-	d := diff / bps
-	if diff%bps != 0 {
-		d++
-	}
-	return p.lastSentTime.Add(maxDuration(quiccongestion.MinPacingDelay, time.Duration(d)*time.Nanosecond))
+	return p.timeUntilBudget(p.maxDatagramSize)
 }
 
-// timeUntilBudget is when the balance will reach need, for a debt-keeping
-// bucket whose callers ask for packets of their own size.
+// timeUntilBudget is when the balance will reach need: one datagram for
+// timeUntilSend, or a caller's own packet size.
 func (p *pacer) timeUntilBudget(need quiccongestion.ByteCount) monotime.Time {
 	if p.budgetAtLastSent >= need {
 		return 0
