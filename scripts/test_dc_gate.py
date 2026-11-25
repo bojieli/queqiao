@@ -17,7 +17,7 @@ sys.modules["dc_gate"] = dc
 SPEC.loader.exec_module(dc)
 
 COLUMNS = ("block", "path", "slot", "arm", "role", "arm_trial", "cold", "phase", "job", "client", "kind", "flow",
-           "start_utc", "end_utc", "http", "bytes", "seconds", "curl_exit", "complete", "wall")
+           "start_utc", "end_utc", "http", "bytes", "seconds", "curl_exit", "complete", "wall", "epoch")
 LOADED = ["la", "lb", "lc"]
 
 
@@ -27,7 +27,7 @@ def iso(t):
 
 def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blocks=12, seed=3,
              cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False, no_solo=(),
-             profile="dc-long-haul", fail_requests=()):
+             profile="dc-long-haul", fail_requests=(), stagger=(), gw_args=True):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -59,29 +59,38 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
                 size = 0 if (arm == "legacy" and b in zero_legacy) else int(level * share * noise / 2)
                 for i in (1, 2):
                     rows.append([b, "dc", slot] + base + ["sustained", j, leaf, "bulk", f"b{i}", iso(t), iso(t + 60),
-                                                          200, size, 60, 0 if finished else 28, int(finished), 60])
+                                                          200, size, 60, 0 if finished else 28, int(finished), 60, int(t + 60)])
                 rt = 0.30 * (1.0 if arm == "legacy" else cand_request / max(share, 1e-3)) * noise
                 failed = arm in fail_requests
                 for w in (1, 2, 3):
+                    # Wave w runs in [t+60+10w-1, t+60+10w] on every leaf, unless
+                    # this (block, leaf) is staggered past the others.
+                    end = int(t + 60 + 10 * w + (5 if (b, leaf) in stagger else 0))
                     for r in range(1, 9):
                         rows.append([b, "dc", slot] + base + ["requests", j, leaf, "requests", f"w{w}r{r}", iso(t + 60),
                                                               iso(t + 70), "000" if failed else 200, 0 if failed else 307200,
-                                                              30 if failed else f"{rt:.4f}", 28 if failed else 0, 0 if failed else 1, 10])
+                                                              30 if failed else f"{rt:.4f}", 28 if failed else 0, 0 if failed else 1, 10, end])
             ctl = 0.20 * (1.0 if arm == "legacy" else cand_control) * noise
             for phase in ("sustained", "requests"):
                 if (b, slot, phase) in drop_control:
                     continue
                 for p in range(1, 15):
+                    ep = int(t + 1 + 4 * p) if phase == "sustained" else int(t + 70 + 10 * (p % 3))
                     rows.append([b, "dc", slot] + base + [phase, 3, "ctl", "probe", f"p{p}", iso(t), iso(t + 60),
-                                                          200, 307200, f"{ctl:.4f}", 0, 1, 60])
+                                                          200, 307200, f"{ctl:.4f}", 0, 1, 60, ep])
             t += 80
         for j, leaf in enumerate(LOADED):
             if (b, leaf) in no_solo:
                 continue
             for i in (1, 2):
                 rows.append([b, "dc", 100 + j, "legacy", "main", 0, 0, "solo", 0, leaf, "bulk", f"b{i}", iso(t),
-                             iso(t + 60), 200, int(level / binding / 2), 60, 28, 0, 60])
+                             iso(t + 60), 200, int(level / binding / 2), 60, 28, 0, 60, int(t + 60)])
             t += 65
+    os.makedirs(os.path.join(root, "effective"), exist_ok=True)
+    for arm in ("legacy", "cand"):
+        if gw_args:
+            with open(os.path.join(root, "effective", f"gw-{arm}.args"), "w") as f:
+                f.write(f"server-b001-dc\t/x/gw-{arm}/queqiaod server --path-profile dc-long-haul\n")
     for arm in ("legacy", "cand"):
         for d in [f"gw-{arm}"] + [f"cl-{c}-{arm}" for c in LOADED + ["ctl"]]:
             os.makedirs(os.path.join(root, "logs", d), exist_ok=True)
@@ -206,6 +215,16 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("bothfail", fail_requests=("cand", "legacy"))
         self.assertEqual(v["cand"], "VOID")
         self.assertIn("the workload does not work", text)
+
+    def test_waves_that_did_not_overlap_leave_no_verdict(self):
+        text, v = self.run_gate("stagger", stagger=((3, "lb"),))
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("request latency p50: 11 of 12 blocks measured", text)
+
+    def test_gateway_profile_needs_its_own_evidence(self):
+        text, v = self.run_gate("nogw", gw_args=False)
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("gateway legacy: no evidence it ran --path-profile dc-long-haul", text)
 
     def test_unfinished_campaign_gets_no_verdict(self):
         root = os.path.join(self.tmp.name, "unfinished")

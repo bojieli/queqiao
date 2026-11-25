@@ -84,6 +84,16 @@ class DryRun(unittest.TestCase):
         self.assertIn("touch ~/qq-ab-example-dc-gate/run/stop-probe-leaf-ctl-", lines[i + 1])
         self.assertIn("[ ! -e ~/qq-ab-example-dc-gate/run/stop-probe-leaf-ctl-", text)
 
+    def test_dc_leaves_start_on_a_shared_barrier(self):
+        _, text = self.run_dry(DC_EXAMPLE)
+        self.assertRegex(text, r"while \[ \$\(date \+%s\) -lt \d+ \]; do sleep 0.1; done; for i in")
+        self.assertIn("ws=$((", text)
+
+    def test_metrics_scrapes_bypass_environment_proxies(self):
+        _, text = self.run_dry(EXAMPLE)
+        self.assertIn("env -u NO_PROXY", text.split("scrape gateway cand metrics")[1].split("\n")[1])
+        self.assertIn("env -u NO_PROXY", text.split("scrape client path-a/cand metrics")[1].split("\n")[1])
+
     def test_every_client_host_gets_a_run_directory(self):
         _, text = self.run_dry(DC_EXAMPLE)
         for host in ("dc-client-a", "dc-client-b", "dc-client-c", "dc-client-d"):
@@ -193,6 +203,12 @@ class Config(unittest.TestCase):
 
     def test_exactly_one_main(self):
         self.assertRejected(BASE.replace("[arm:cand]\n", "[arm:cand]\nrole = main\n"), "exactly one arm")
+
+    def test_windows_must_be_positive(self):
+        # curl --max-time 0 disables the limit: no fixed window.
+        self.assertRejected(BASE.replace("blocks = 4", "blocks = 4\nduration = 0"), "duration must be positive")
+        text = DC_EXAMPLE.read_text().replace("request_timeout = 30", "request_timeout = 0")
+        self.assertRejected(text, "request_timeout must be positive")
 
     def test_bad_names(self):
         self.assertRejected(BASE.replace("name = t1", "name = ../etc"), "campaign name")

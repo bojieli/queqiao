@@ -18,7 +18,7 @@ sys.modules["ab_analyze"] = an
 SPEC.loader.exec_module(an)
 
 COLUMNS = ("block", "path", "slot", "arm", "role", "arm_trial", "cold", "phase", "job", "client", "kind", "flow",
-           "start_utc", "end_utc", "http", "bytes", "seconds", "curl_exit", "complete", "wall")
+           "start_utc", "end_utc", "http", "bytes", "seconds", "curl_exit", "complete", "wall", "epoch")
 T0 = 1_780_000_000.0
 
 
@@ -66,14 +66,15 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
                 useful += size
                 rows.append([b, "p", slot, arm, "main" if arm == "main" else "candidate", seen[arm], int(seen[arm] == 1),
                              "main", 0, "p", "bulk", f"b{i}", iso(start), iso(end), 200 if size else "000", size, 20.0,
-                             0 if size else 28, 1 if size else 0, 20.0])
+                             0 if size else 28, 1 if size else 0, 20.0, int(end)])
             for k in range(1, 21) if workload == "interactive" else ():
                 # Main's probes take 0.1 s; the candidate's take cand_probe,
                 # where None means every other one fails.
                 ok = arm == "main" or cand_probe is not None or k % 2
                 secs = 0.1 if arm == "main" else (cand_probe if cand_probe is not None else 0.05)
                 rows.append([b, "p", slot, arm, "x", seen[arm], 0, "main", 1, "p", "probe", f"p{k}", iso(start), iso(end),
-                             200 if ok else "000", 1024 if ok else 0, secs if ok else 10.0, 0 if ok else 28, int(bool(ok)), 20.0])
+                             200 if ok else "000", 1024 if ok else 0, secs if ok else 10.0, 0 if ok else 28, int(bool(ok)), 20.0,
+                             int(start) + k])
             tag = f"b{b:03d}-p"
             name = f"{tag}-s{slot}-{arm}"
             md = os.path.join(root, "metrics")
@@ -238,8 +239,12 @@ class Analyzer(unittest.TestCase):
         probes = [{"epoch": "1005", "seconds": "0.1"}, {"epoch": "1020", "seconds": "0.1"},
                   {"epoch": "995", "seconds": "0.1"}, {"epoch": "", "seconds": "0.1"}]
         kept = an.under_load(probes, load)
-        self.assertEqual([p["epoch"] for p in kept], ["1005", ""])
-        self.assertEqual(an.under_load(probes, [{"epoch": "", "seconds": "1"}]), probes)
+        self.assertEqual([p["epoch"] for p in kept], ["1005"])
+        # Without timed load, overlap cannot be shown: nothing counts.
+        self.assertEqual(an.under_load(probes, [{"epoch": "", "seconds": "1"}]), [])
+        # A probe in the idle gap between two waves does not count.
+        waves = [{"epoch": "1010", "seconds": "2"}, {"epoch": "1030", "seconds": "2"}]
+        self.assertEqual(an.under_load([{"epoch": "1020", "seconds": "0.5"}], waves), [])
 
     def test_http_error_bodies_are_not_useful_bytes(self):
         t = an.Trial(1, "p", 1, "main", "main", 1, True)

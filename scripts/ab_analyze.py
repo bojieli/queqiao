@@ -111,24 +111,27 @@ def useful(row: dict) -> int:
     return int(row["bytes"] or 0) if row.get("http") == "200" else 0
 
 
+def span(r: dict) -> Optional[Tuple[float, float]]:
+    """A row's (start, end) on its host's clock: the remote completion time
+    (`epoch`, whole seconds) minus curl's duration; None if unrecorded."""
+    e = r.get("epoch") or ""
+    if not e.isdigit():
+        return None
+    return float(e) - float(r.get("seconds") or 0), float(e)
+
+
 def under_load(probes: List[dict], load: List[dict], slack: float = 1.0) -> List[dict]:
-    """Probes whose request overlapped the load, by each row's remote
-    completion time (`epoch`, whole seconds) minus its duration. The hosts'
-    clocks are assumed NTP-synchronised; `slack` absorbs the rounding. Rows
-    from a runner that did not record epochs are kept as they are."""
-    def span(r):
-        e = r.get("epoch") or ""
-        if not e.isdigit():
-            return None
-        return float(e) - float(r["seconds"] or 0), float(e)
-    spans = [span(r) for r in load]
-    if not load or any(x is None for x in spans):
-        return probes
-    lo, hi = min(a for a, _ in spans), max(b for _, b in spans)
+    """Probes whose request overlapped some load transfer: the union of the
+    load rows' intervals, so an idle gap between waves does not count. When
+    overlap cannot be established (no timed load, or an untimed probe) the
+    probe is left out, and the measure becomes unmeasured rather than idle.
+    The hosts' clocks are assumed NTP-synchronised; `slack` absorbs the
+    one-second rounding."""
+    spans = [sp for sp in (span(r) for r in load) if sp is not None]
     out = []
     for r in probes:
         sp = span(r)
-        if sp is None or (sp[1] >= lo - slack and sp[0] <= hi + slack):
+        if sp is not None and any(sp[1] >= a - slack and sp[0] <= b + slack for a, b in spans):
             out.append(r)
     return out
 

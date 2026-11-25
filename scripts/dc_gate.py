@@ -25,7 +25,7 @@ from typing import Dict, List, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
 from ab_analyze import (PROBE_TIMEOUT, Trial, completeness, fmt, iter_json, read_campaign,  # noqa: E402
-                        under_load, useful)
+                        span, under_load, useful)
 
 BOUNDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "dc_gate.ini")
 
@@ -64,12 +64,29 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     # An unfinished request is censored at its timeout rather than dropped:
     # dropping it would reward the arm that failed it.
     done = lambda r: float(r["seconds"]) if r["complete"] == "1" else float(request_timeout)
+    # Each request wave must actually have been concurrent across the loaded
+    # leaves, or the spread and latency do not describe contention.
+    waves = sorted({r["flow"].split("r", 1)[0] for r in req})
+    overlap = bool(waves)
+    for w in waves:
+        iv = []
+        for leaf in loaded:
+            sp = [x for x in (span(r) for r in req if r["client"] == leaf and r["flow"].split("r", 1)[0] == w) if x]
+            if not sp:
+                overlap = False
+                break
+            iv.append((min(a for a, _ in sp), max(b for _, b in sp)))
+        if overlap and not max(a for a, _ in iv) <= min(b for _, b in iv) + 1.0:
+            overlap = False
+    m["waves_overlap"] = float(overlap)
     leaf_med = [st.median([done(r) for r in req if r["client"] == leaf]) for leaf in loaded]
     leaf_med = [x for x in leaf_med if x == x]
     m["spread"] = max(leaf_med) / min(leaf_med) if leaf_med and min(leaf_med) > 0 else float("nan")
     lat = [done(r) for r in req]
     m["latency_p50"] = st.quantile(lat, 0.5)
     m["latency_p99"] = st.quantile(lat, 0.99)
+    if not overlap:
+        m["spread"] = m["latency_p50"] = m["latency_p99"] = float("nan")
     # Only control requests that overlapped the loaded leaves' phase count.
     probes = []
     for ph in ("sustained", "requests"):
@@ -147,17 +164,26 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     finished = sum(t.m["sus_finished"] for t in ab) / flows if flows else float("nan")
     backlogged = finished == finished and finished <= 0.10
 
-    # Every endpoint of every arm must actually have run dc-long-haul.
+    # Every endpoint of every arm must have run dc-long-haul, checked one
+    # endpoint at a time. Clients log their path profile; the gateway does
+    # not, so its evidence is its running command line, recorded by the
+    # runner at every start.
     import glob
-    profiles: Dict[str, set] = {}
     for arm in plan["arms"]:
-        files = glob.glob(os.path.join(campaign, "logs", f"gw-{arm}", "*.jsonl*")) + \
-            [f for leaf in loaded + [control] for f in glob.glob(os.path.join(campaign, "logs", f"cl-{leaf}-{arm}", "*.jsonl*"))]
-        profiles[arm] = {rec.get("path_profile", "") for rec in iter_json(files, ('"runtime configuration"',))
-                         if rec.get("msg") == "runtime configuration"}
-        if profiles[arm] != {"dc-long-haul"}:
-            problems = problems + [f"arm {arm}: endpoints ran path profile(s) {sorted(profiles[arm]) or 'unrecorded'}, "
-                                   "not only dc-long-haul"]
+        try:
+            with open(os.path.join(campaign, "effective", f"gw-{arm}.args")) as f:
+                gw = [line for line in f if line.strip()]
+        except OSError:
+            gw = []
+        if not gw or not all("--path-profile dc-long-haul" in line for line in gw):
+            problems = problems + [f"gateway {arm}: no evidence it ran --path-profile dc-long-haul"]
+        for leaf in loaded + [control]:
+            files = glob.glob(os.path.join(campaign, "logs", f"cl-{leaf}-{arm}", "*.jsonl*"))
+            seen = {rec.get("path_profile", "") for rec in iter_json(files, ('"runtime configuration"',))
+                    if rec.get("msg") == "runtime configuration"}
+            if seen != {"dc-long-haul"}:
+                problems = problems + [f"client {leaf}/{arm}: ran path profile(s) {sorted(seen) or 'unrecorded'}, "
+                                       "not only dc-long-haul"]
     a, r, s = bounds["alpha"], bounds["resamples"], bounds["seed"]
     # Section 15.4's void rule, on the sustained outcome: a campaign in which
     # too many legacy blocks delivered nothing is rerun, not judged.

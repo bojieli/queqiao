@@ -150,9 +150,11 @@ followed by its mirror, and every arm is compared with the reference.
   `probe_interval` seconds. It measures interactive p99 under bulk. The probe
   stops as soon as the bulk flows finish, so every sample is taken under
   load. A probe that does not finish counts at its 10-second timeout. Each row
-  carries its remote completion time (`epoch`). Only probes whose request
-  overlapped the load's interval are used. The hosts' clocks are assumed to
-  be NTP-synchronised, with one second of slack.
+  carries its remote completion time (`epoch`). A probe is used only if its
+  request overlapped an actual load transfer. A probe that falls in an idle
+  gap between waves, or whose overlap cannot be shown, is left out, and a
+  trial with none left is unmeasured. The hosts' clocks are assumed to be
+  NTP-synchronised, with one second of slack.
 
 A stage's gate needs all three. Run them as three campaigns with different
 names.
@@ -310,6 +312,11 @@ and each client host is one leaf under a shared ancestor. The DC campaign
   - *requests*: `waves` waves of `requests_per_leaf` concurrent 300 KB
     fetches per loaded leaf, the shape of the profile's own relay
     measurement.
+- **A shared start:** a phase's jobs start on a barrier, five seconds ahead
+  on the hosts' clocks. Request wave *w* starts at the barrier plus
+  (*w* − 1) × `request_timeout` on every leaf. The analysis requires each
+  wave's requests to overlap across all loaded leaves; otherwise latency and
+  spread are unmeasured. This also relies on NTP-synchronised clocks.
 - **Calibration:** at the end of every block, each loaded leaf runs alone on
   the legacy arm. Every judged block needs its own usable calibration of every
   loaded leaf; otherwise the campaign is INCOMPLETE.
@@ -357,9 +364,13 @@ The campaign is **VOID** in three cases:
 An unfinished campaign is INCOMPLETE, as in Gate 1. So is one in which any
 criterion lacks evidence in some judged block, for example a control probe
 that produced nothing or did not overlap the load. So is one in which any
-endpoint's runtime configuration record does not show `path_profile`
-`dc-long-haul`. The runner adds that flag to both ends and rejects configs
-that set it.
+endpoint does not show `dc-long-haul`. The runner adds that flag to both
+ends and rejects configs that set it. The check is made one endpoint at a
+time:
+
+- each client: its runtime configuration record;
+- the gateway: its running command line, recorded by the runner at every
+  start, because the gateway's record carries no profile.
 
 ```sh
 ./scripts/ab_campaign.py --config scripts/validation/dc.local.ini --dry-run

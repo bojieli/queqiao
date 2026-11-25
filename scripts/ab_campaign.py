@@ -61,6 +61,8 @@ WORK_PREFIX = "qq-ab-"
 WORKLOADS = ("bulk", "single", "interactive", "dc")
 # curl --max-time of one probe request; an unfinished probe counts as this long.
 PROBE_TIMEOUT = 10
+# Seconds between dispatching a DC phase's jobs and their shared start.
+BARRIER_LEAD = 5
 # The runner owns these options; an arm or host that set them could point a
 # temporary process at production state, a production port or a production log.
 OWNED_FLAGS = ("state", "listen", "metrics-listen", "log-file", "profile",
@@ -365,6 +367,16 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  gateway=gw, clients=clients, arms=arms, production=prod, dc=dc)
     if cfg.blocks < 1:
         raise ConfigError("blocks must be positive")
+    # curl --max-time 0 means no limit, which is not a fixed window.
+    checks = [("duration", cfg.duration), ("flows", cfg.flows), ("object_bytes", cfg.object_bytes),
+              ("probe_bytes", cfg.probe_bytes), ("probe_interval", cfg.probe_interval)]
+    if dc:
+        checks += [("[dc] request_timeout", dc.request_timeout), ("[dc] waves", dc.waves),
+                   ("[dc] requests_per_leaf", dc.requests_per_leaf), ("[dc] bulk_flows_per_leaf", dc.bulk_flows_per_leaf),
+                   ("[dc] request_bytes", dc.request_bytes), ("[dc] control_interval", dc.control_interval)]
+    for name, v in checks:
+        if not v > 0:
+            raise ConfigError(f"{name} must be positive")
     for host, ports in cfg.planned_ports().items():
         seen: Dict[int, str] = {}
         for p, what in ports:
@@ -951,10 +963,12 @@ class Campaign:
         host.run(f'''f={W}/run/{tag}.pid
 [ -f "$f" ] || exit 0
 p=$(cat "$f")
-if ps -o args= -p "$p" 2>/dev/null | grep -q -F -- "{W}/"; then
+mine() {{ ps -o args= -p "$p" 2>/dev/null | grep -q -F -- "{W}/"; }}
+if mine; then
   kill "$p" 2>/dev/null
-  for i in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
-  kill -9 "$p" 2>/dev/null
+  for i in $(seq 1 20); do mine || break; sleep 0.25; done
+  # Escalate only if the same process is still there: a reused pid fails mine.
+  mine && kill -9 "$p" 2>/dev/null
 fi
 rm -f "$f"''', what=f"stop {tag}")
 
@@ -982,6 +996,13 @@ rm -f "$f"''', what=f"stop {tag}")
         env = "QUEQIAO_LANE_TRACE=1" if self.cfg.lane_trace else ""
         self.spawn(gh, f"gw-{arm.name}", self.gw_dir(arm), self.gw_cmd(arm, logname), env)
         self.wait_port(gh, self.cfg.gateway.metrics_port_base + arm.index, f"gateway {arm.name} metrics", f"gw-{arm.name}")
+        # The gateway's runtime configuration record has no path profile, so
+        # keep its actual command line as evidence of what it ran.
+        rc, args = gh.run(f"ps -o args= -p $(cat {self.w(gh.dest)}/run/gw-{arm.name}.pid)", what=f"record gateway {arm.name} command line")
+        if not self.dry:
+            os.makedirs(os.path.join(self.out, "effective"), exist_ok=True)
+            with open(os.path.join(self.out, "effective", f"gw-{arm.name}.args"), "a") as f:
+                f.write(f"{logname}\t{args.strip()}\n")
 
     def cl_cmd(self, client: Client, arm: Arm, logname: str) -> str:
         d = self.cl_dir(client, arm)
@@ -1020,7 +1041,7 @@ rm -f "$f"''', what=f"stop {tag}")
         """The client's counters around a trial: TCP fallback is counted on
         the client, so the gateway's QUIC bytes alone cannot show it."""
         rc, text = self.hosts[client.host].run(
-            f"curl -s --max-time 10 http://127.0.0.1:{client.metrics_port_base + arm.index}/metrics | grep -E '^queqiao_' || true",
+            f"{CURL_ENV} -s --max-time 10 http://127.0.0.1:{client.metrics_port_base + arm.index}/metrics | grep -E '^queqiao_' || true",
             what=f"scrape client {client.name}/{arm.name} metrics ({name})")
         if not self.dry:
             os.makedirs(os.path.join(self.out, "metrics"), exist_ok=True)
@@ -1029,7 +1050,7 @@ rm -f "$f"''', what=f"stop {tag}")
 
     def scrape(self, arm: Arm, name: str) -> None:
         gh = self.hosts[self.cfg.gateway.host]
-        rc, text = gh.run(f"curl -s --max-time 10 http://127.0.0.1:{self.cfg.gateway.metrics_port_base + arm.index}/metrics "
+        rc, text = gh.run(f"{CURL_ENV} -s --max-time 10 http://127.0.0.1:{self.cfg.gateway.metrics_port_base + arm.index}/metrics "
                           "| grep -E '^queqiao_' || true", what=f"scrape gateway {arm.name} metrics ({name})")
         if not self.dry:
             os.makedirs(os.path.join(self.out, "metrics"), exist_ok=True)
@@ -1037,16 +1058,24 @@ rm -f "$f"''', what=f"stop {tag}")
                 f.write(text)
 
     # -- jobs
-    def job_script(self, client: Client, arm: Arm, kind: str, n: int, duration: float) -> str:
+    def job_script(self, client: Client, arm: Arm, kind: str, n: int, duration: float, start_at: int = 0) -> str:
+        """The job's shell. With start_at (a remote epoch second), load jobs
+        wait for it, and request wave w starts at start_at + (w - 1) x
+        request_timeout: a barrier across leaves, so that on a fast path one
+        leaf cannot finish its waves before another starts. It assumes the
+        hosts' clocks are NTP-synchronised."""
         port = client.socks_port_base + arm.index
+        barrier = f"while [ $(date +%s) -lt {start_at} ]; do sleep 0.1; done; " if start_at else ""
         url = f"http://127.0.0.1:{self.cfg.gateway.origin_port}/"
         curl = f"{CURL_ENV} --socks5-hostname 127.0.0.1:{port} -o /dev/null -s -w '%{{http_code}}\\t%{{size_download}}\\t%{{time_total}}\\t%{{exitcode}}'"
         if kind == "bulk":
-            return (f"for i in $(seq 1 {n}); do ( r=$({curl} --max-time {int(duration)} {url}obj-{self.cfg.object_bytes} 2>/dev/null); "
+            return (barrier + f"for i in $(seq 1 {n}); do ( r=$({curl} --max-time {int(duration)} {url}obj-{self.cfg.object_bytes} 2>/dev/null); "
                     f"printf '%s\\t%s\\t%s\\n' \"$(date +%s)\" \"b$i\" \"$r\" ) & done; wait")
         if kind == "requests":
             dc = self.cfg.dc
-            return (f"for w in $(seq 1 {dc.waves}); do for i in $(seq 1 {n}); do ( r=$({curl} --max-time {dc.request_timeout} "
+            wave = (f"ws=$(( {start_at} + (w - 1) * {dc.request_timeout} )); while [ $(date +%s) -lt $ws ]; do sleep 0.1; done; "
+                    if start_at else "")
+            return (f"for w in $(seq 1 {dc.waves}); do {wave}for i in $(seq 1 {n}); do ( r=$({curl} --max-time {dc.request_timeout} "
                     f"{url}obj-{dc.request_bytes} 2>/dev/null); printf '%s\\t%s\\t%s\\n' \"$(date +%s)\" \"w${{w}}r$i\" \"$r\" ) & done; wait; done")
         if kind == "probe":
             # The probe measures latency under load, so it stops as soon as
@@ -1092,8 +1121,8 @@ rm -f "$f"''', what=f"stop {tag}")
         def go(i, client, kind, n):
             t0 = time.time()
             try:
-                rc, out = self.hosts[client.host].run(self.job_script(client, arm, kind, n, duration),
-                                                      timeout=duration + 120, what=f"{phase}: {kind} x{n} via {client.name}/{arm.name}")
+                rc, out = self.hosts[client.host].run(self.job_script(client, arm, kind, n, duration, start_at),
+                                                      timeout=duration + 120 + BARRIER_LEAD, what=f"{phase}: {kind} x{n} via {client.name}/{arm.name}")
             except Exception as e:  # a hung ssh is a failed job, not a dead campaign
                 rc, out = -1, ""
                 self.log(f"job {kind} on {client.name} failed: {e}")
@@ -1105,6 +1134,9 @@ rm -f "$f"''', what=f"stop {tag}")
         for c, k, n in jobs:
             if k == "probe":
                 self.hosts[c.host].run(f"rm -f {self.stop_file(c, arm)}", what=f"{phase}: clear the probe stop file on {c.name}")
+        # Several loaded leaves (the DC workload) start on a shared remote
+        # clock, far enough ahead that every ssh session is up by then.
+        start_at = int(time.time()) + BARRIER_LEAD if self.cfg.workload == "dc" else 0
         threads = [threading.Thread(target=go, args=(i, c, k, n)) for i, (c, k, n) in enumerate(jobs)]
         for t in threads:
             t.start()
