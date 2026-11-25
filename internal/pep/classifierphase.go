@@ -6,6 +6,7 @@ import (
 	"github.com/bojieli/queqiao/internal/classifier"
 	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
+	"github.com/bojieli/queqiao/internal/stripe"
 )
 
 // ClassifierMode selects the flow-classifier bundle.
@@ -101,24 +102,61 @@ const sparseWriteBytes = 2 * 1400
 // its class like any other flow past this point.
 const sparseAllowanceBytes = smallExchangeBytes
 
-// classifierBacklogFor fits the phased classifier's backlog threshold to the
-// flow's send-memory bound. The backlog cannot exceed what the flow may
-// retain, so on a memory profile whose per-flow send limit is at or under
-// the default threshold, a sustained transfer could never show the evidence
-// that keeps or puts it in BULK. Half the bound is still far above any
-// conversation's backlog and is reached by any producer blocked for room.
-func classifierBacklogFor(cfg classifier.Config, limits flowMemoryLimits) classifier.Config {
-	if !cfg.Phased || limits.maxSendBytes <= 0 {
-		return cfg
+// backlogThresholdFor fits the phased classifier's backlog threshold to what
+// the flow's scheduler can actually hold. The backlog -- bytes read from the
+// application and not acknowledged -- cannot exceed the read-ahead the
+// scheduler allows, and the scheduler stops reading at whichever of its
+// bounds binds first:
+//
+//   - the per-flow send bytes (maxSendBytes);
+//   - the chunk count (maxOutstanding): a backlogged source fills each chunk,
+//     so this holds maxOutstanding x chunkSize bytes;
+//   - under mem=owned, the autotuned retention bound, which can sit at its
+//     startup floor of stripe.DefaultAutotuneStartupChunks chunks.
+//
+// If the threshold is at or above that capacity, a blocked transfer can never
+// show the evidence that keeps it in, or returns it to, BULK. Half the
+// capacity is still far above any conversation's backlog and is reached by a
+// producer blocked for room.
+func backlogThresholdFor(base uint64, limits flowMemoryLimits, chunkSize int, memOwned bool) uint64 {
+	if base == 0 {
+		base = classifier.DefaultConfig().BulkBacklogBytes
 	}
-	threshold := cfg.BulkBacklogBytes
-	if threshold == 0 {
-		threshold = classifier.DefaultConfig().BulkBacklogBytes
+	capacity := limits.maxSendBytes
+	if chunkSize > 0 && limits.maxOutstanding > 0 {
+		capacity = minPositive(capacity, limits.maxOutstanding*chunkSize)
+		if memOwned {
+			capacity = minPositive(capacity, stripe.DefaultAutotuneStartupChunks*chunkSize)
+		}
 	}
-	if half := countBytes(limits.maxSendBytes / 2); half < threshold {
-		cfg.BulkBacklogBytes = max(half, 1)
+	if capacity <= 0 {
+		return base
 	}
-	return cfg
+	if half := countBytes(capacity / 2); half < base {
+		return max(half, 1)
+	}
+	return base
+}
+
+func minPositive(a, b int) int {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 || a < b {
+		return a
+	}
+	return b
+}
+
+// fitBacklogThreshold applies backlogThresholdFor once the flow's chunk size,
+// memory limits and memory bundle are all settled, which is when its send
+// loop starts.
+func (f *multipathFlow) fitBacklogThreshold() {
+	if !f.phased() {
+		return
+	}
+	base := classifier.DefaultConfig().BulkBacklogBytes
+	f.classifier.SetBacklogBytes(backlogThresholdFor(base, f.memoryLimits, f.chunkSize, f.memOwned))
 }
 
 // phased reports whether this flow runs the phased classifier.
@@ -210,10 +248,33 @@ func (f *multipathFlow) noteAckedCoverage() {
 			}
 		}
 	}
-	f.ackedCum.Store(covered)
-	if saturatingSub(f.bytesUp.Load(), covered) <= f.classifierBacklogBytes() {
-		f.backlogDrained.Store(true)
+	threshold := f.classifierBacklogBytes()
+	f.ackMu.Lock()
+	defer f.ackMu.Unlock()
+	f.ackCovered = covered
+	if saturatingSub(f.bytesUp.Load(), covered) <= threshold {
+		f.ackDrained = true
 	}
+}
+
+// ackSample is the classifier's view of acknowledgements for one
+// observation: the send backlog against upBytes, and whether a drain was
+// published since the last sample, read and consumed together.
+func (f *multipathFlow) ackSample(upBytes uint64) (backlog uint64, drained bool) {
+	f.ackMu.Lock()
+	defer f.ackMu.Unlock()
+	backlog = saturatingSub(upBytes, f.ackCovered)
+	drained = f.ackDrained
+	f.ackDrained = false
+	return backlog, drained
+}
+
+// setAckCoverage publishes acknowledged coverage without a drain, for tests
+// that model the peer.
+func (f *multipathFlow) setAckCoverage(covered uint64) {
+	f.ackMu.Lock()
+	f.ackCovered = covered
+	f.ackMu.Unlock()
 }
 
 func (f *multipathFlow) classifierBacklogBytes() uint64 {

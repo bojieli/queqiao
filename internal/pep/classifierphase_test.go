@@ -50,7 +50,7 @@ func (h *phaseHarness) recv(n int) {
 }
 
 // ack has the peer acknowledge everything sent so far.
-func (h *phaseHarness) ack() { h.f.ackedCum.Store(h.f.bytesUp.Load()) }
+func (h *phaseHarness) ack() { h.f.setAckCoverage(h.f.bytesUp.Load()) }
 
 // write sends n bytes. queueEmpty says the flow's send queue held nothing when
 // the write arrived, which is what the scheduler checks before marking it.
@@ -270,7 +270,7 @@ func TestABackloggedDownloadStaysBulkThroughout(t *testing.T) {
 			out = append(out, decision{class, coded})
 			// About 1 MiB in flight and ready behind the reads.
 			if sent := h.f.bytesUp.Load(); sent > 1<<20 {
-				h.f.ackedCum.Store(sent - 1<<20)
+				h.f.setAckCoverage(sent - 1<<20)
 			}
 		}
 		h.recv(300)                 // the request
@@ -612,10 +612,11 @@ func TestSendBacklogCountsSelectiveCoverageAndDips(t *testing.T) {
 	if _, err := f.acknowledgeCoverage(0, false, [][2]uint64{{16 << 10, 400 << 10}}); err != nil {
 		t.Fatal(err)
 	}
-	if backlog := saturatingSub(f.bytesUp.Load(), f.ackedCum.Load()); backlog != 16<<10 {
+	backlog, drained := f.ackSample(f.bytesUp.Load())
+	if backlog != 16<<10 {
 		t.Fatalf("backlog %d with one 16 KiB gap, want %d", backlog, 16<<10)
 	}
-	if !f.backlogDrained.Load() {
+	if !drained {
 		t.Fatal("an acknowledgement that left 16 KiB outstanding was not recorded as a drain")
 	}
 }
@@ -663,22 +664,108 @@ func TestCodedDataOutstandingFollowsTheAttempts(t *testing.T) {
 	}
 }
 
-// On a memory profile whose per-flow send bound is at or under the backlog
-// threshold, the threshold follows the bound, so a blocked transfer can still
-// show a backlog.
-func TestBacklogThresholdFitsTheSendBound(t *testing.T) {
-	cfg := phasedClassifierConfig(profile.Default().Classifier, ClassifierPhased)
+// The backlog threshold fits what the flow's scheduler can hold: its send
+// bytes, its chunk count, and under mem=owned the autotune floor. A transfer
+// blocked for room must be able to show a backlog over it.
+func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
+	const base = 64 << 10
 	small := defaultFlowMemoryLimits()
 	small.maxSendBytes = 48 << 10
-	if got := classifierBacklogFor(cfg, small).BulkBacklogBytes; got != 24<<10 {
-		t.Fatalf("threshold %d with a 48 KiB send bound, want 24 KiB", got)
+	twoChunks := defaultFlowMemoryLimits()
+	twoChunks.maxSendBytes, twoChunks.maxOutstanding = 1<<20, 2
+	ios, _, _, err := resolveMemoryLimits(iosMemoryLimits(), iosChunkSize, MemoryOwned)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := classifierBacklogFor(cfg, defaultFlowMemoryLimits()).BulkBacklogBytes; got != 64<<10 {
-		t.Fatalf("threshold %d with the default bound, want 64 KiB", got)
+	for _, c := range []struct {
+		name     string
+		limits   flowMemoryLimits
+		chunk    int
+		memOwned bool
+		want     uint64
+	}{
+		{"default", defaultFlowMemoryLimits(), defaultChunkSize, false, 64 << 10},
+		{"48 KiB send bound", small, defaultChunkSize, false, 24 << 10},
+		{"two 16 KiB chunks", twoChunks, 16 << 10, false, 16 << 10},
+		{"ios, legacy memory", ios, iosChunkSize, false, 64 << 10},
+		{"ios, mem=owned at the autotune floor", ios, iosChunkSize, true, 32 << 10},
+	} {
+		if got := backlogThresholdFor(base, c.limits, c.chunk, c.memOwned); got != c.want {
+			t.Errorf("%s: threshold %d, want %d", c.name, got, c.want)
+		}
 	}
-	legacy := phasedClassifierConfig(profile.Default().Classifier, ClassifierLegacy)
-	if got := classifierBacklogFor(legacy, small); got != legacy {
-		t.Fatal("the legacy classifier's configuration was changed")
+}
+
+// A flow limited by chunk count -- two 16 KiB chunks, so at most 32 KiB read
+// ahead -- that left BULK and then transfers without a break goes back into
+// BULK. With a 64 KiB threshold its backlog could never show.
+func TestACountLimitedTransferReentersBulk(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	h.f.chunkSize = 16 << 10
+	h.f.memoryLimits.maxSendBytes, h.f.memoryLimits.maxOutstanding = 1<<20, 2
+	h.f.fitBacklogThreshold()
+	h.advance(2 * time.Second)
+	h.burst()
+	h.keystrokes(5 * time.Second)
+	if h.current() == classifier.ClassBulk {
+		t.Fatal("setup: the flow did not leave BULK")
+	}
+	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
+		h.write(16<<10, false)
+		// The scheduler holds two chunks; the peer acknowledges the rest.
+		if sent := h.f.bytesUp.Load(); sent > 32<<10 {
+			h.f.setAckCoverage(sent - 32<<10)
+		}
+		h.advance(10 * time.Millisecond)
+	}
+	if h.current() != classifier.ClassBulk {
+		t.Fatalf("a transfer held at its 32 KiB read-ahead never re-entered BULK (threshold %d)", h.f.classifier.BacklogBytes())
+	}
+}
+
+// An acknowledgement that drains the backlog while an observation is being
+// taken is seen with the backlog it drained, not the one before it. If the
+// drain were consumed against the stale backlog, the backlog stretch would
+// restart at that moment, and an idle gap followed by the next burst would
+// count as a continuous backlog and re-enter BULK at once.
+func TestADrainDuringAnObservationEndsTheBacklogStretch(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	// A count-limited flow (two 16 KiB chunks), whose threshold is 16 KiB,
+	// so one application read can refill the backlog past it.
+	f.chunkSize = 16 << 10
+	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 2
+	f.fitBacklogThreshold()
+	h.advance(2 * time.Second)
+	h.burst()
+	h.keystrokes(5 * time.Second)
+	if h.current() == classifier.ClassBulk {
+		t.Fatal("setup: the flow did not leave BULK")
+	}
+	// A 100 KB response is read and sent; nothing is acknowledged yet.
+	for i := 0; i < 7; i++ {
+		h.write(16<<10, false)
+	}
+	f.replayMu.Lock()
+	f.highestSent = f.bytesUp.Load()
+	f.replayMu.Unlock()
+	h.advance(100 * time.Millisecond)
+	// The peer's acknowledgement of all of it lands while the next
+	// observation samples.
+	f.ackSampleHook = func() {
+		f.ackSampleHook = nil
+		if _, err := f.acknowledgeCoverage(f.bytesUp.Load(), false, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.refresh()
+	// Five idle seconds, then the next response's first read.
+	h.advance(5 * time.Second)
+	h.write(32<<10, false)
+	h.advance(500 * time.Millisecond)
+	h.refresh()
+	if h.current() == classifier.ClassBulk {
+		t.Fatal("a backlog half a second old re-entered BULK: the idle gap after a drain was counted as backlog")
 	}
 }
 

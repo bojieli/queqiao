@@ -320,6 +320,7 @@ func (s *flowSource) Read(p []byte) (int, error) {
 // policy.
 func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 	defer close(f.sendDone)
+	f.fitBacklogThreshold()
 
 	retention := f.retentionBytes
 	var autotune *stripe.Autotune

@@ -632,7 +632,11 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 		if m > 0 {
 			n += m
 		}
-		drained = n < size
+		// Only a fill that actually ran can show the source drained. One
+		// the source cannot do (no read deadlines) leaves n short of the
+		// reservation for no reason but the reservation: the staging read
+		// filled, which says more may be waiting.
+		drained = n < size && !errors.Is(fillErr, ErrUnsupported)
 		if fillErr != nil && !errors.Is(fillErr, ErrUnsupported) {
 			err = fillErr
 		}

@@ -439,13 +439,17 @@ type multipathFlow struct {
 	// isolation read.
 	class    atomic.Uint32
 	everBulk atomic.Bool
-	// ackedCum mirrors acked for the classifier, which must not take
-	// replayMu: it is reached from the scheduler's dispatch.
-	ackedCum atomic.Uint64
-	// backlogDrained records that an acknowledgement took the send backlog
-	// to the classifier's threshold or below since the last observation, so
-	// a backlog that dipped between reads is not taken for a continuous one.
-	backlogDrained atomic.Bool
+	// ackMu guards the classifier's view of acknowledgements: ackCovered,
+	// what the peer holds of this endpoint's stream, and ackDrained, that an
+	// acknowledgement took the send backlog to the threshold or below since
+	// the last observation. They are published and consumed together, so an
+	// observation never pairs a drain with the backlog from before it.
+	ackMu      sync.Mutex
+	ackCovered uint64
+	ackDrained bool
+	// ackSampleHook, when set by a test, runs just before an observation
+	// samples the acknowledgement state.
+	ackSampleHook func()
 	// classBytes counts DATA payload this endpoint sent, by class byte (new,
 	// interactive, bulk) and substrate (stream, coded).
 	classBytes [3][2]atomic.Uint64
@@ -588,7 +592,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 		done: make(chan struct{}), localClosedCh: make(chan struct{}), remoteAbortCh: make(chan struct{}),
 		ackWake: make(chan struct{}, 1), ackErr: make(chan error, 1),
 		stallSignal: make(chan struct{}, 1),
-		classifier:  classifier.New(classifierBacklogFor(classifierCfg, memoryLimits)), started: time.Now(), completionGrace: flowCompletionGrace,
+		classifier:  classifier.New(classifierCfg), started: time.Now(), completionGrace: flowCompletionGrace,
 	}
 	f.idleTimeout = defaultFlowIdleTimeout
 	f.maxLifetime = defaultFlowMaxLifetime
@@ -3529,6 +3533,10 @@ func (f *multipathFlow) observeLocked(n int, up bool) bool {
 		downBytes += uint64(n)
 	}
 	recentUp, recentDown := f.recentBytes(now, n, up)
+	if f.ackSampleHook != nil {
+		f.ackSampleHook()
+	}
+	sendBacklog, backlogDrained := f.ackSample(upBytes)
 	obs := classifier.Observation{
 		BytesUp: upBytes, BytesDown: downBytes,
 		UpRate: float64(upBytes) / age.Seconds(), DownRate: float64(downBytes) / age.Seconds(),
@@ -3562,8 +3570,8 @@ func (f *multipathFlow) observeLocked(n int, up bool) bool {
 		SmallBidirectionalBursts: recentUp <= smallExchangeBytes && recentDown <= smallExchangeBytes,
 		// What this endpoint has read from its application and the peer has
 		// not acknowledged. Only the phased classifier reads it.
-		SendBacklog:    saturatingSub(upBytes, f.ackedCum.Load()),
-		BacklogDrained: f.backlogDrained.Swap(false),
+		SendBacklog:    sendBacklog,
+		BacklogDrained: backlogDrained,
 		SmoothedRTT:    time.Duration(f.currentRTTNS.Load()),
 		CarriedPayload: n > 0,
 	}
