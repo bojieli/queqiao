@@ -57,22 +57,48 @@ func (c *Client) fanOutConnections() int {
 // single-connection ceiling (one connection plateaued at 292 Mbit/s against
 // 536 for four on an unconstrained 200 ms path) is attributed, and leaves its
 // automatic trigger open (§16 Q3). So the only trigger built is the explicit
-// one: with a fan-out configured, the same condition as isolation, within
-// the fan-out's connection budget (maxBulkConns). An automatic trigger
-// belongs here, as a further condition on a measured ceiling.
-func (c *Client) secondConnectionWanted(snapshot flowSnapshot) bool {
-	if c.singleTopology() && c.fanOutConnections() == 0 {
-		return false
-	}
-	// Isolation earns its cost only while another flow shares the control
-	// connection. A bulk transfer alone on it has nothing to protect, and
-	// moving it would spend a handshake and a fresh congestion window for no
-	// benefit: measured on an otherwise idle path that costs about 8% of bulk
-	// goodput.
-	if c.quicPoolActive.Load() <= 1 {
+// one: with a fan-out configured, a bulk flow that shares the generation of
+// the pooled connection it is on with another flow, within the fan-out's
+// connection budget (maxBulkConns). An automatic trigger belongs here, as a
+// further condition on a measured ceiling.
+//
+// Sharing is judged on the flow's own generation (generation reports it, nil
+// when the flow is not on a pooled stream; it is consulted only when a
+// fan-out is configured): after a handover a flow still draining on
+// the old generation does not share the replacement with a lone bulk flow,
+// and moving that flow would spend a handshake and the fan-out slot for
+// nothing. Isolation keeps today's client-wide count.
+func (c *Client) secondConnectionWanted(snapshot flowSnapshot, generation func() *controlQUICGeneration) bool {
+	if c.singleTopology() {
+		if c.fanOutConnections() == 0 {
+			return false
+		}
+		if g := generation(); g == nil || g.flows.Load() <= 1 {
+			return false
+		}
+	} else if c.quicPoolActive.Load() <= 1 {
+		// Isolation earns its cost only while another flow shares the
+		// control connection. A bulk transfer alone on it has nothing to
+		// protect, and moving it would spend a handshake and a fresh
+		// congestion window for no benefit: measured on an otherwise idle
+		// path that costs about 8% of bulk goodput.
 		return false
 	}
 	return snapshot.Class == classifier.ClassBulk || shouldPrewarmBulkLane(snapshot)
+}
+
+// flowGeneration is the pooled control generation the flow's control lane
+// is a stream on, or nil.
+func flowGeneration(flow *multipathFlow) *controlQUICGeneration {
+	for _, lane := range flow.healthyLanes() {
+		if !flow.laneIsControl(lane) || lane.fc == nil {
+			continue
+		}
+		if s, ok := lane.fc.control.(*controlPoolStreamConn); ok {
+			return s.generation
+		}
+	}
+	return nil
 }
 
 // Receive-window credit for the preferred connection.
