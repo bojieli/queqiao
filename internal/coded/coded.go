@@ -661,13 +661,15 @@ func (p *Path) appendFrame(frame []byte, track *frameTrack) error {
 func (p *Path) sendFragments(frame []byte, limit int, track *frameTrack) error {
 	count := (len(frame) + limit - 1) / limit
 	if count > maxFragments {
+		// A failure of this frame, not of the path. Returning an error here
+		// used to stop the send loop without closing the path, which then
+		// accepted frames nobody would ever send; it is dropped like any
+		// datagram the carrier refuses, and an observed one is abandoned.
+		p.oversize.Add(1)
 		if track != nil {
-			// A failure of this frame, not of the path: the path keeps
-			// sending, so frames queued behind it still get their outcome.
 			p.abandon(track)
-			return nil
 		}
-		return fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, len(frame))
+		return nil
 	}
 	var tracks []*frameTrack
 	if track != nil {

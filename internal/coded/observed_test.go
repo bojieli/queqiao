@@ -17,19 +17,22 @@ type taggedCarrier struct {
 	tags     []uint64
 	untagged int
 	refuse   bool
-	// gate, when set, holds untagged sends until it is closed.
-	gate   chan struct{}
-	closed chan struct{}
-	once   sync.Once
+	// gate, when set, holds untagged sends until it is closed, after
+	// signalling entered.
+	gate    chan struct{}
+	entered chan struct{}
+	closed  chan struct{}
+	once    sync.Once
 }
 
 func newTaggedCarrier() *taggedCarrier { return &taggedCarrier{closed: make(chan struct{})} }
 
 func (c *taggedCarrier) Send([]byte) error {
 	c.mu.Lock()
-	gate := c.gate
+	gate, entered := c.gate, c.entered
 	c.mu.Unlock()
 	if gate != nil {
+		entered <- struct{}{}
 		<-gate
 	}
 	c.mu.Lock()
@@ -149,7 +152,7 @@ func TestObservedFrameIsRegisteredWithItsLastSymbol(t *testing.T) {
 func TestPackedObservedFramesShareOneTag(t *testing.T) {
 	carrier := newTaggedCarrier()
 	gate := make(chan struct{})
-	carrier.gate = gate
+	carrier.gate, carrier.entered = gate, make(chan struct{}, 1)
 	path := New(carrier, Config{})
 	defer path.Close()
 	// The send loop is held inside the carrier sending an unobserved frame,
@@ -157,9 +160,7 @@ func TestPackedObservedFramesShareOneTag(t *testing.T) {
 	if err := path.Send([]byte("plain")); err != nil {
 		t.Fatal(err)
 	}
-	for len(path.pending) > 0 {
-		time.Sleep(100 * time.Microsecond)
-	}
+	<-carrier.entered
 	first, second := make(outcomes, 1), make(outcomes, 1)
 	if err := path.SendObserved(context.Background(), []byte("one"), first.notify); err != nil {
 		t.Fatal(err)

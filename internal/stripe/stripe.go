@@ -1559,6 +1559,9 @@ func (s *Scheduler) RegisteredAgo(laneID uint64, chunk *Chunk, age time.Duration
 	if chunk == nil || !s.cfg.CodedRetry {
 		return
 	}
+	// Taken before the lock, so time spent waiting for it is not added to
+	// the code's ownership either.
+	registeredAt := s.cfg.Now().Add(-max(age, 0))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, a := s.attemptLocked(laneID, chunk)
@@ -1572,7 +1575,7 @@ func (s *Scheduler) RegisteredAgo(laneID uint64, chunk *Chunk, age time.Duration
 	}
 	a.deadline = time.Time{}
 	if after := s.retransmitAfter(); after > 0 {
-		a.deadline = s.cfg.Now().Add(after - max(age, 0))
+		a.deadline = registeredAt.Add(after)
 	}
 }
 

@@ -275,12 +275,15 @@ func TestCodedChunkDelayedInTheQueueIsNotRetriedEarly(t *testing.T) {
 	if got := <-settled; got != coded.Registered {
 		t.Fatalf("outcome = %d, want registered", got)
 	}
-	advance(deadline - time.Millisecond)
+	// The report reaches the scheduler a little after the packet, and that
+	// real delay is subtracted from the deadline; a margin far above it
+	// keeps this independent of how quickly the outcome was delivered.
+	advance(deadline - 50*time.Millisecond)
 	if n := sched.ReissueExpired(); n != 0 {
 		t.Fatal("retried before a full deadline from registration")
 	}
 	x.noStreamData(t)
-	advance(time.Millisecond)
+	advance(50 * time.Millisecond)
 	if n := sched.ReissueExpired(); n != 1 {
 		t.Fatalf("ReissueExpired = %d a deadline after registration, want 1", n)
 	}
