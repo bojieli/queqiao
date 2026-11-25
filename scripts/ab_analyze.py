@@ -266,6 +266,7 @@ class Trial:
         self.start = math.inf
         self.end = -math.inf
         self.rows: List[dict] = []
+        self.records: List[dict] = []
         self.m: Dict[str, float] = {}
 
     @property
@@ -292,6 +293,18 @@ def read_campaign(campaign: str) -> Tuple[dict, Dict[Tuple[int, str, int], Trial
             t.rows.append(r)
             t.start = min(t.start, ts(r["start_utc"]))
             t.end = max(t.end, ts(r["end_utc"]))
+    # Generators' raw records (measures.jsonl), each tagged with its phase.
+    mp = os.path.join(campaign, "measures.jsonl")
+    if os.path.exists(mp):
+        with open(mp) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                t = trials.get((rec.get("_block"), rec.get("_path"), rec.get("_slot")))
+                if t is not None:
+                    t.records.append(rec)
     return plan, trials
 
 
@@ -908,13 +921,82 @@ def pilot_report(campaign: str, gates: dict) -> Tuple[str, dict]:
     return "\n".join(out) + "\n", res
 
 
+# The workloads the stage-10 default flip needs a PASS for, on every path
+# (WORKLOADS.md 6.1; Phase B adds the rest).
+FLIP_WORKLOADS = ("bulk", "single", "interactive", "llm", "term", "mixed")
+
+
+def cell_verdicts(verdicts: dict, path: str, cand: str) -> Dict[str, str]:
+    """Per-cell verdicts from a report's verdict map: a rule-judged workload's
+    cells are its phases (every rule of a phase must pass); a bulk workload
+    has one cell, its overall verdict."""
+    overall = verdicts.get((path, cand, "overall"), "INCOMPLETE")
+    cells: Dict[str, List[str]] = collections.defaultdict(list)
+    for (p_, c_, key), v in verdicts.items():
+        if p_ == path and c_ == cand and key.startswith("rule:"):
+            cells[key[5:].split(".", 1)[0]].append(v)
+    if not cells:
+        return {"main": overall}
+    # The campaign itself without a verdict (incomplete) leaves every cell
+    # INCOMPLETE; otherwise an unmeasured rule does, then any failure fails.
+    incomplete = verdicts.get((path, cand, "primary")) == "INCOMPLETE"
+    out = {}
+    for cell, vs in cells.items():
+        out[cell] = ("INCOMPLETE" if incomplete or "n/a" in vs else
+                     "FAIL" if "**FAIL**" in vs else "PASS")
+    return out
+
+
+def flip_report(campaigns: Sequence[str], gates: dict) -> Tuple[str, bool]:
+    """The stage-10 default flip: every path x workload x cell of every
+    candidate must PASS, and every required workload must be there."""
+    rows: List[Tuple[str, str, str, str, str]] = []
+    seen = set()
+    for campaign in campaigns:
+        with open(os.path.join(campaign, "plan.json")) as f:
+            plan = json.load(f)
+        name = plan.get("workload", "bulk")
+        seen.add(name)
+        if name == "dc":
+            import dc_gate
+            _, v = dc_gate.evaluate(campaign, dc_gate.load_bounds())
+            for cand, verdict in v.items():
+                rows.append((name, "dc", cand, "dc-gate", verdict))
+            continue
+        _, v = report(campaign, gates)
+        main_ = plan["main"]
+        for path in plan["paths"]:
+            for cand in [a for a in plan["arms"] if a != main_]:
+                for cell, verdict in sorted(cell_verdicts(v, path, cand).items()):
+                    rows.append((name, path, cand, cell, verdict))
+    missing = [w_ for w_ in FLIP_WORKLOADS if w_ not in seen]
+    ok = bool(rows) and not missing and all(r[4] == "PASS" for r in rows)
+    out = ["## Stage-10 default flip", "",
+           "Every path x workload x cell of every candidate must PASS (DESIGN-PATH-AUTHORITY.md section 14, stage 10; "
+           "WORKLOADS.md 6).", "", "| workload | path | candidate | cell | verdict |", "|---|---|---|---|---|"]
+    out += [f"| {w_} | {p_} | {c_} | {cell} | {v_ if v_ == 'PASS' else '**' + v_ + '**'} |" for w_, p_, c_, cell, v_ in rows]
+    if missing:
+        out += ["", "Missing workloads: " + ", ".join(f"`{m}`" for m in missing) + "."]
+    out += ["", f"**Flip: {'PASS' if ok else 'NOT PASSED'}.**"]
+    return "\n".join(out) + "\n", ok
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("campaign")
+    ap.add_argument("campaign", nargs="+")
     ap.add_argument("--gates", default=GATES)
     ap.add_argument("--pilot", action="store_true", help="estimate the block count from this (pilot) campaign")
+    ap.add_argument("--flip", action="store_true",
+                    help="judge the stage-10 flip over these campaigns: every path x workload x cell must PASS")
     args = ap.parse_args(argv)
     gates = load_gates(args.gates)
+    if args.flip:
+        text, ok = flip_report(args.campaign, gates)
+        sys.stdout.write(text)
+        return 0 if ok else 1
+    if len(args.campaign) != 1:
+        ap.error("one campaign at a time, except with --flip")
+    args.campaign = args.campaign[0]
     if args.pilot:
         text, _ = pilot_report(args.campaign, gates)
         name = "pilot.md"

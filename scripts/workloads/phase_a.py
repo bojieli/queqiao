@@ -1,0 +1,417 @@
+"""Phase A scenario workloads (WORKLOADS.md 6.1): W5 LLM streaming calls, W6
+terminal keystrokes with output bursts, and the mixed scenarios M1 and M2.
+
+The far side is scripts/validation/wlserver.py on the gateway host's
+loopback; the client side is scripts/validation/wlclient.py on each client
+host. Every metric is computed here, from the raw timings wlclient records,
+so the definitions can be revised and re-run on old campaigns. The rules
+that judge them are in scripts/validation/gates.ini, [workload:llm],
+[workload:term] and [workload:mixed], all provisional until a pilot.
+
+Workloads and their cells (phases), each judged separately:
+
+* `llm`: <sequence>-<U>k-<background> for every sequence (single, loop,
+  swarm), prompt size U (KB) and background (none, down4, up1) configured.
+* `term`: term-<background>.
+* `mixed`: m1-<U>k (W5-single under four bulk downloads) and m2-<U>k
+  (W5-single under a bulk upload), each with W6 phase-A keystrokes as a
+  canary.
+"""
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import ab_campaign as ab
+import ab_stats as st
+import ab_workloads as w
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SERVER = os.path.join(HERE, "validation", "wlserver.py")
+CLIENT = os.path.join(HERE, "validation", "wlclient.py")
+
+STALL = 0.5          # an inter-delta gap this long is a visible hesitation (WORKLOADS.md W5)
+FREEZE = 2.0         # and this long a freeze
+STALL_EXCESS = 0.25  # gaps count toward the stall-time ratio beyond this
+SLOW_KEY = 1.0       # a keystroke echo slower than this is "over 1 s" (W6)
+AFTER_BURST = 2.0    # keystrokes this soon after a burst are left out of phase C (W6)
+COVERAGE = 0.9       # a background must cover this much of the foreground's span
+
+
+# --- metrics (pure functions over wlclient's records) ---------------------------------
+
+def lateness(deltas: Sequence[Sequence[float]]) -> List[float]:
+    """Clock-free lateness of one call's deltas (WORKLOADS.md 3.0): with
+    delta_i = r_i - s_i (client receive time minus server emission time, on
+    two unsynchronised clocks), L_i = delta_i - min_j delta_j, in seconds.
+    `deltas` holds [s_i in server ms, r_i in client seconds]."""
+    d = [r - s / 1000.0 for s, r in deltas]
+    if not d:
+        return []
+    m = min(d)
+    return [x - m for x in d]
+
+
+def gaps(deltas: Sequence[Sequence[float]]) -> List[float]:
+    """Inter-delta gaps g_i = r_i - r_{i-1} at the client, in seconds."""
+    r = [x[1] for x in deltas]
+    return [b - a for a, b in zip(r, r[1:])]
+
+
+def llm_metrics(calls: Sequence[dict]) -> Dict[str, float]:
+    """W5 metrics over a set of calls (a block's, pooled across the arm's
+    trials): TTFT_net quantiles, lateness quantiles, gap tail, stalls and
+    freezes per streamed minute, stall-time ratio, completion excess, upload
+    time R, connect time, and the call failure fraction."""
+    nan = float("nan")
+    if not calls:
+        return {}
+    ok = [c for c in calls if not c.get("fail")]
+    ttft_net = [c["ttft"] - c["T"] for c in ok if c.get("ttft") is not None]
+    late: List[float] = []
+    g: List[float] = []
+    streamed = 0.0
+    excess = []
+    for c in ok:
+        late += lateness(c["deltas"])
+        g += gaps(c["deltas"])
+        if len(c["deltas"]) > 1:
+            streamed += c["deltas"][-1][1] - c["deltas"][0][1]
+        excess.append(c["done"] - (c["T"] + c["N"] * c["c"]))
+    minutes = streamed / 60.0
+    q = st.quantile
+    return {
+        "ttft_net_p50_s": q(ttft_net, 0.5), "ttft_net_p95_s": q(ttft_net, 0.95),
+        "lateness_p50_s": q(late, 0.5), "lateness_p95_s": q(late, 0.95), "lateness_p99_s": q(late, 0.99),
+        "lateness_max_s": max(late) if late else nan,
+        "gap_p99_s": q(g, 0.99), "gap_max_s": max(g) if g else nan,
+        "stalls_per_min": sum(1 for x in g if x >= STALL) / minutes if minutes > 0 else nan,
+        "freezes_per_min": sum(1 for x in g if x >= FREEZE) / minutes if minutes > 0 else nan,
+        "stall_time_ratio": sum(max(0.0, x - STALL_EXCESS) for x in g) / streamed if streamed > 0 else nan,
+        "completion_excess_p50_s": q(excess, 0.5),
+        "upload_R_p50_s": q([c["R"] for c in ok if c.get("R") is not None], 0.5),
+        "connect_p50_s": q([c["connect"] for c in calls if c.get("connect") is not None], 0.5),
+        "call_failures": (len(calls) - len(ok)) / len(calls),
+    }
+
+
+def term_metrics(sessions: Sequence[dict]) -> Dict[str, float]:
+    """W6 metrics over a set of sessions: echo time quantiles and the
+    fraction over 1 s for phase A (before the first burst) and phase C
+    (after it, leaving out keystrokes within 2 s after any burst), and the
+    latch ratio p99(C) / p99(A). A canary session has phase A only."""
+    nan = float("nan")
+    a: List[float] = []
+    c: List[float] = []
+    unanswered = 0
+    for s in sessions:
+        if s.get("fail"):
+            continue
+        bursts = s.get("bursts") or []
+        first = bursts[0] if bursts else float("inf")
+        unanswered += int(s.get("unanswered") or 0)
+        for sent, echo in s.get("keys") or []:
+            if sent < first:
+                a.append(echo)
+            elif not any(b <= sent < b + AFTER_BURST for b in bursts):
+                c.append(echo)
+    q = st.quantile
+    out = {"echo_p50_a_s": q(a, 0.5), "echo_p95_a_s": q(a, 0.95), "echo_p99_a_s": q(a, 0.99),
+           "over1s_a": sum(1 for x in a if x > SLOW_KEY) / len(a) if a else nan,
+           "sessions_failed": sum(1 for s in sessions if s.get("fail")) / len(sessions) if sessions else nan}
+    if any(s.get("bursts") for s in sessions):
+        p99a, p99c = q(a, 0.99), q(c, 0.99)
+        out.update({"echo_p50_c_s": q(c, 0.5), "echo_p95_c_s": q(c, 0.95), "echo_p99_c_s": p99c,
+                    "over1s_c": sum(1 for x in c if x > SLOW_KEY) / len(c) if c else nan,
+                    "latch_ratio": p99c / p99a if p99a and p99a == p99a and p99c == p99c else nan})
+    return out
+
+
+def covered(fg: Tuple[float, float], bg_rows: Sequence[dict]) -> bool:
+    """The background was running for at least COVERAGE of the
+    foreground's span (its rows' wall-clock intervals, merged)."""
+    spans = sorted((float(r["t_start"]), float(r["t_end"])) for r in bg_rows if r.get("t_start") and r.get("t_end"))
+    if not spans or fg[1] <= fg[0]:
+        return False
+    merged: List[List[float]] = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1] + 1.0:   # back-to-back objects of one flow
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    inside = sum(max(0.0, min(b, fg[1]) - max(a, fg[0])) for a, b in merged)
+    return inside >= COVERAGE * (fg[1] - fg[0])
+
+
+def fg_span(records: Sequence[dict]) -> Optional[Tuple[float, float]]:
+    ends = []
+    for r in records:
+        t0 = r.get("t0")
+        if t0 is None:
+            continue
+        dur = r.get("done") or (r["keys"][-1][0] + r["keys"][-1][1] if r.get("keys") else 0)
+        ends.append((t0, t0 + float(dur or 0)))
+    if not ends:
+        return None
+    return min(a for a, _ in ends), max(b for _, b in ends)
+
+
+def useful_bg(rows: Sequence[dict]) -> float:
+    return float(sum(int(r["bytes"] or 0) for r in rows if r.get("http") == "200"))
+
+
+# --- generators ----------------------------------------------------------------------
+
+def _client(campaign: Any, job: w.Job, arm: Any, cmd: str, target_port: int, extra: str) -> str:
+    W = campaign.w(job.client.host)
+    socks = job.client.socks_port_base + arm.index
+    stop = f" --stop-file {campaign.stop_file(job.client, arm)}" if not job.load else ""
+    tls = " --no-tls" if not campaign.cfg.scenario_tls else ""
+    return (f"python3 {W}/wlclient.py {cmd} --socks 127.0.0.1:{socks} --target 127.0.0.1:{target_port}"
+            f"{tls}{stop} {extra}")
+
+
+def llm_script(campaign, job, arm, duration, start_at=0):
+    p = job.params
+    return _client(campaign, job, arm, "llm", campaign.cfg.scenario_http_port,
+                   f"--sequence {p['sequence']} --upload {p['upload']} --calls {p['calls']} --turns {p['turns']} "
+                   f"--agents {p['agents']} --think-ms {p['think_ms']} --deltas {p['deltas']} "
+                   f"--cadence-ms {p['cadence_ms']} --timeout {p['timeout']} --delay {p['delay']} "
+                   f"--duration {int(duration)} --seed {p.get('seed', 1)}")
+
+
+def term_script(campaign, job, arm, duration, start_at=0):
+    p = job.params
+    canary = " --canary" if p.get("canary") else ""
+    return _client(campaign, job, arm, "term", campaign.cfg.scenario_term_port,
+                   f"--duration {p['seconds']} --delay {p['delay']} --burst-at {p['burst_at']} "
+                   f"--burst-every {p['burst_every']} --burst-bytes {p['burst_bytes']}{canary}")
+
+
+def bgdown_script(campaign, job, arm, duration, start_at=0):
+    cfg = campaign.cfg
+    return _client(campaign, job, arm, "bgdown", cfg.gateway.origin_port,
+                   f"--flows {job.n} --path /obj-{cfg.object_bytes} --duration {int(duration)} --no-tls")
+
+
+def bgup_script(campaign, job, arm, duration, start_at=0):
+    return _client(campaign, job, arm, "bgup", campaign.cfg.scenario_http_port,
+                   f"--flows {job.n} --object-bytes {job.params.get('object_bytes', 8 << 20)} --duration {int(duration)}")
+
+
+def parse_rows(out: str, job: w.Job, duration: float) -> List[Tuple[str, ...]]:
+    """wlclient's rows: t_start t_end flow http bytes seconds exit."""
+    rows = []
+    for line in out.splitlines():
+        p = line.split("\t")
+        if len(p) != 7 or p[0] == "J":
+            continue
+        t0, t1, flow, code, size, secs, ex = p
+        rows.append((flow, code, size, secs, ex, t0, t1))
+    if not rows and job.load:
+        # Nothing at all: the job died. It still counts, as a failure.
+        rows.append(("x0", "000", "0", f"{duration:.3f}", "-1", "", ""))
+    return rows
+
+
+for name, fn in (("wl-llm", llm_script), ("wl-term", term_script), ("wl-bgdown", bgdown_script), ("wl-bgup", bgup_script)):
+    w.generator(name, w.Generator(fn, parse_rows, lambda job: 0, w.json_records))
+
+
+# --- workloads --------------------------------------------------------------------
+
+def _words(v: str) -> List[str]:
+    return v.replace(",", " ").split()
+
+
+LLM_REPORT_ONLY = ("lateness_p50_s", "lateness_p95_s", "lateness_max_s", "gap_p99_s", "gap_max_s",
+                   "stall_time_ratio", "completion_excess_p50_s", "upload_R_p50_s", "connect_p50_s")
+TERM_REPORT_ONLY = ("echo_p50_a_s", "echo_p95_a_s", "echo_p50_c_s", "echo_p95_c_s")
+
+
+class _Scenario(w.Workload):
+    """Shared: the wlserver endpoint, wlclient on every client host, a
+    background of four downloads or one upload, and per-block pooling."""
+    primary = False
+    default_backgrounds = "none down4 up1"
+
+    def configure(self, cfg, cp):
+        p = self.params(cp)
+        cfg.scenario_tls = ab._bool(p.get("tls", "true"))
+        cfg.scenario_http_port = int(p.get("server_port", "23485"))
+        cfg.scenario_term_port = int(p.get("term_port", "23486"))
+        cfg.scenario_backgrounds = _words(p.get("backgrounds", self.default_backgrounds))
+        for b in cfg.scenario_backgrounds:
+            if b not in ("none", "down4", "up1"):
+                raise ab.ConfigError(f"[workload:{self.name}] background {b!r} is not none, down4 or up1")
+        cfg.scenario_phase_seconds = int(p.get("phase_seconds", "180"))
+        cfg.scenario_upload_object = int(p.get("upload_object_bytes", str(8 << 20)))
+        self.read(cfg, p)
+
+    def read(self, cfg, p: Dict[str, str]) -> None:
+        pass
+
+    def positive(self, cfg):
+        return [("object_bytes", cfg.object_bytes), ("phase_seconds", cfg.scenario_phase_seconds)]
+
+    def objects(self, cfg):
+        return [(f"obj-{cfg.object_bytes}", cfg.object_bytes)]
+
+    def endpoints(self, cfg):
+        tls = "" if cfg.scenario_tls else " --no-tls"
+        return [w.Endpoint("wlserver", f"python3 {{W}}/wlserver.py --http {cfg.scenario_http_port} "
+                                       f"--term {cfg.scenario_term_port} --dir {{W}}{tls}",
+                           tcp_ports=[(cfg.scenario_http_port, "http"), (cfg.scenario_term_port, "terminal")],
+                           files=[SERVER])]
+
+    def client_files(self, cfg):
+        return [CLIENT]
+
+    def background(self, cfg, client, bg: str) -> List[w.Job]:
+        if bg == "down4":
+            return [w.Job(client, "wl-bgdown", 4, load=False)]
+        if bg == "up1":
+            return [w.Job(client, "wl-bgup", 1, load=False, params={"object_bytes": cfg.scenario_upload_object})]
+        return []
+
+    # Pooling: the per-block statistic of an arm pools its trials' records
+    # (WORKLOADS.md 3.0), rather than averaging per-trial quantiles.
+    def block_extract(self, trials: Sequence[Any], plan: dict) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        phases = sorted({r["phase"] for t in trials for r in t.rows})
+        for ph in phases:
+            recs = [rec for t in trials for rec in getattr(t, "records", []) if rec.get("_phase") == ph]
+            rows = [r for t in trials for r in t.rows if r["phase"] == ph]
+            for k, v in self.phase_measures(ph, recs, rows, trials).items():
+                out[f"{ph}.{k}"] = v
+        return out
+
+    def extract(self, trial, plan):
+        return self.block_extract([trial], plan)
+
+    def under_background(self, ph: str, recs: List[dict], rows: List[dict], trials: Sequence[Any]) -> bool:
+        """For a phase with a background: did it run across the foreground
+        in every trial? Unmeasured otherwise, never judged idle."""
+        if not ph.endswith(("down4", "up1")) and not ph.startswith(("m1", "m2")):
+            return True
+        for t in trials:
+            trecs = [x for x in getattr(t, "records", []) if x.get("_phase") == ph and x.get("kind") in ("llm", "term")
+                     and not x.get("canary")]
+            span = fg_span(trecs)
+            bg = [r for r in t.rows if r["phase"] == ph and r["kind"] in ("wl-bgdown", "wl-bgup")]
+            if span is None or not covered(span, bg):
+                return False
+        return True
+
+
+@w.register
+class LLM(_Scenario):
+    """W5: LLM streaming calls."""
+    name = "llm"
+    report_only = LLM_REPORT_ONLY
+
+    def read(self, cfg, p):
+        cfg.llm = {
+            "sequences": _words(p.get("sequences", "single loop")),
+            "uploads_kb": [int(x) for x in _words(p.get("uploads_kb", "100 400"))],
+            "calls": int(p.get("calls", "5")), "turns": int(p.get("turns", "5")), "agents": int(p.get("agents", "8")),
+            "think_ms": float(p.get("think_ms", "500")), "deltas": int(p.get("deltas", "400")),
+            "cadence_ms": float(p.get("cadence_ms", "25")), "timeout": float(p.get("timeout", "30")),
+            "delay": float(p.get("background_lead", "5")),
+        }
+        for s in cfg.llm["sequences"]:
+            if s not in ("single", "loop", "swarm"):
+                raise ab.ConfigError(f"[workload:llm] sequence {s!r} is not single, loop or swarm")
+
+    def call_params(self, cfg, seq: str, kb: int, bg: str) -> dict:
+        p = dict(cfg.llm, sequence=seq, upload=kb * 1000)
+        p["delay"] = p["delay"] if bg != "none" else 0
+        return p
+
+    def phases(self, cfg, path):
+        client = cfg.clients[path]
+        out = []
+        for seq in cfg.llm["sequences"]:
+            for kb in cfg.llm["uploads_kb"]:
+                for bg in cfg.scenario_backgrounds:
+                    jobs = self.background(cfg, client, bg) + \
+                        [w.Job(client, "wl-llm", 1, params=self.call_params(cfg, seq, kb, bg))]
+                    out.append(w.Phase(f"{seq}-{kb}k-{bg}", cfg.scenario_phase_seconds, jobs))
+        return out
+
+    def phase_measures(self, ph, recs, rows, trials):
+        m = llm_metrics([r for r in recs if r.get("kind") == "llm"])
+        if not self.under_background(ph, recs, rows, trials):
+            return {k: float("nan") for k in m}
+        # Per-byte class telemetry (WORKLOADS.md R3) does not exist yet: the
+        # class-correctness assertion stays unmeasured until it does.
+        m["class_interactive"] = float("nan")
+        return m
+
+
+@w.register
+class Term(_Scenario):
+    """W6: terminal keystrokes with 300 KB output bursts."""
+    name = "term"
+    report_only = TERM_REPORT_ONLY
+
+    def read(self, cfg, p):
+        cfg.term = {"seconds": float(p.get("seconds", "120")), "burst_at": float(p.get("burst_at", "40")),
+                    "burst_every": float(p.get("burst_every", "20")), "burst_bytes": int(p.get("burst_bytes", "300000")),
+                    "delay": float(p.get("background_lead", "5"))}
+
+    def phases(self, cfg, path):
+        client = cfg.clients[path]
+        out = []
+        for bg in cfg.scenario_backgrounds:
+            params = dict(cfg.term, delay=cfg.term["delay"] if bg != "none" else 0)
+            out.append(w.Phase(f"term-{bg}", max(cfg.scenario_phase_seconds, cfg.term["seconds"] + 30),
+                               self.background(cfg, client, bg) + [w.Job(client, "wl-term", 1, params=params)]))
+        return out
+
+    def phase_measures(self, ph, recs, rows, trials):
+        m = term_metrics([r for r in recs if r.get("kind") == "term"])
+        if not self.under_background(ph, recs, rows, trials):
+            return {k: float("nan") for k in m}
+        return m
+
+
+@w.register
+class Mixed(_Scenario):
+    """M1 (W5-single under four bulk downloads) and M2 (W5-single under a
+    bulk upload), each with W6 phase-A keystrokes as a canary."""
+    name = "mixed"
+    report_only = LLM_REPORT_ONLY
+
+    def read(self, cfg, p):
+        LLM.read(self, cfg, p)
+        cfg.mixed = {"scenarios": _words(p.get("scenarios", "m1 m2"))}
+        for s in cfg.mixed["scenarios"]:
+            if s not in ("m1", "m2"):
+                raise ab.ConfigError(f"[workload:mixed] scenario {s!r} is not m1 or m2 (Phase A)")
+
+    def phases(self, cfg, path):
+        client = cfg.clients[path]
+        out = []
+        for sc in cfg.mixed["scenarios"]:
+            bg = "down4" if sc == "m1" else "up1"
+            for kb in cfg.llm["uploads_kb"]:
+                call = dict(cfg.llm, sequence="single", upload=kb * 1000)
+                canary = {"seconds": cfg.scenario_phase_seconds, "delay": 0, "burst_at": 0, "burst_every": 0,
+                          "burst_bytes": 0, "canary": True}
+                out.append(w.Phase(f"{sc}-{kb}k", cfg.scenario_phase_seconds,
+                                   self.background(cfg, client, bg)
+                                   + [w.Job(client, "wl-term", 1, load=False, params=canary),
+                                      w.Job(client, "wl-llm", 1, params=call)]))
+        return out
+
+    def phase_measures(self, ph, recs, rows, trials):
+        m = llm_metrics([r for r in recs if r.get("kind") == "llm"])
+        canary = term_metrics([r for r in recs if r.get("kind") == "term" and r.get("canary")])
+        m["canary_echo_p99_s"] = canary.get("echo_p99_a_s", float("nan"))
+        bg = [r for r in rows if r["kind"] in ("wl-bgdown", "wl-bgup")]
+        m["bg_bytes"] = useful_bg(bg) / max(1, len(trials))
+        if not self.under_background(ph, recs, rows, trials):
+            return {k: float("nan") for k in m}
+        m["class_interactive"] = float("nan")
+        return m

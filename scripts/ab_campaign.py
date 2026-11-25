@@ -756,6 +756,7 @@ class Campaign:
         self.fetch_failures: List[str] = []
         self.reserved: List[str] = []
         self.production_changed = False
+        self.measures_path = None if dry else os.path.join(self.out, "measures.jsonl")
         self.job_seq = 0
         self.token = "dry-run-token" if dry else os.urandom(16).hex()
         self.started = False
@@ -951,6 +952,14 @@ class Campaign:
         for host in cfg.hosts():
             if host != g.host:
                 self.must(self.hosts[host], f"mkdir -p {self.w(host)}/run", "create work directory")
+        # Files a workload's generators run on the client hosts.
+        files = cfg.wl.client_files(cfg)
+        for host in dict.fromkeys(c.host for c in cfg.clients.values()):
+            if files:
+                self.must(self.hosts[host], "command -v python3 >/dev/null || { echo 'python3 is required on this "
+                          f"client host for workload {cfg.workload}'; exit 1; }}", "check for python3")
+            for f in files:
+                self.hosts[host].put(f, f"{self.w(host)}/{os.path.basename(f)}")
         # --directory puts the work directory in the command line, which is
         # what stop() and teardown() check before signalling anything.
         self.spawn(gh, "origin", f"{W}/origin",
@@ -1188,6 +1197,16 @@ rm -f "$f"''', what=f"stop {tag}")
         for i, (job, gen) in enumerate(zip(phase.jobs, gens)):
             t0, t1, rc, out = results[i]
             want = gen.expected(job)
+            # A generator's raw records ("J<TAB>{json}" lines) go to
+            # measures.jsonl, keyed to the trial and phase, for the workload's
+            # extractor.
+            recs = gen.records(out) if gen.records else []
+            if recs and self.measures_path:
+                with open(self.measures_path, "a") as f:
+                    for rec in recs:
+                        rec.update(_block=slot.block, _path=slot.path, _slot=slot.slot, _arm=arm.name,
+                                   _phase=phase.name, _client=job.client.name, _job=i)
+                        f.write(json.dumps(rec, separators=(",", ":")) + "\n")
             for flow, code, size, secs, ex, ts0, ts1 in gen.parse(out, job, duration):
                 complete = int(ex == "0" and code == "200" and (not want or size == str(want)))
                 writer([slot.block, slot.path, slot.slot, arm.name, arm.role, slot.arm_trial, int(slot.cold), phase.name, i,

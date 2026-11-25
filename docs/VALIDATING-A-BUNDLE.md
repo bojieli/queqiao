@@ -448,8 +448,9 @@ one release. Its gate is Gate 1 run on the release candidate:
   before the flip, with no flags: the legacy bundle. The candidate is the
   release-candidate build with no flags, so its new defaults are what is
   measured.
-- **Paths and workloads.** Every path in the field campaign, with all three
-  workloads.
+- **Paths and workloads.** Every path in the field campaign. Run every
+  workload in `FLIP_WORKLOADS`: `bulk`, `single`, `interactive`, `llm`,
+  `term` and `mixed` for now; Phase B of the workload model adds the rest.
 - **Gateways first.** Add a crossover arm (`gateway_ref = <candidate>`,
   `client_ref = <previous release>`). It shows that an upgraded gateway does
   no harm to clients that have not upgraded yet, which is the order the
@@ -461,8 +462,63 @@ one release. Its gate is Gate 1 run on the release candidate:
   at stage 9 or still runs the legacy bundle. Run its campaign again on the
   candidate either way.
 
-The flip passes only if every path and workload is PASS. INCOMPLETE is not
-PASS.
+The flip passes only if every path × workload × cell of every candidate is
+PASS. INCOMPLETE is not PASS. `ab_analyze.py --flip` judges a set of
+campaign directories, prints that matrix, and exits non-zero unless it
+passes. It also fails if a required workload has no campaign:
+
+```sh
+./scripts/ab_analyze.py --flip ~/campaigns/rc-bulk ~/campaigns/rc-single ~/campaigns/rc-interactive \
+    ~/campaigns/rc-llm ~/campaigns/rc-term ~/campaigns/rc-mixed
+```
+
+## Scenario workloads
+
+The workload model groups applications by the network behaviour that
+changes what the transport does. Phase A of it, needed before the stage 6
+and 7 campaigns, is built:
+
+| Workload | Cells (one per phase) | Measures (rules in `gates.ini`) |
+|---|---|---|
+| `llm` (W5, LLM streaming) | `<sequence>-<U>k-<background>`, for sequences single (cold connection per call), loop (5 turns on one connection, each turn's prompt 8 KB larger) and swarm (8 looping agents, staggered over 2 s); prompts of 100 and 400 KB; backgrounds none, down4 and up1 | TTFT net of think time, p50 and p95; delta lateness p99; stalls (gap ≥ 0.5 s) and freezes (≥ 2 s) per streamed minute; call failures; delta bytes sent INTERACTIVE |
+| `term` (W6, SSH keystrokes with output bursts) | `term-<background>` | echo p99 before the first burst (phase A) and after it (phase C, leaving out keystrokes within 2 s of a burst); fraction of echoes over 1 s; the latch ratio p99(C) / p99(A) |
+| `mixed` (M1, M2) | `m1-<U>k` (single calls under four downloads), `m2-<U>k` (under one upload) | the `llm` measures, a phase-A keystroke canary's echo p99, and the background's own bytes |
+
+How these campaigns run:
+
+- **The far side.** `scripts/validation/wlserver.py` runs on the gateway
+  host's loopback, beside the HTTP origin, and the preflight reserves its
+  ports. It provides:
+  - a deterministic SSE emitter: it reads the prompt and measures its
+    upload time `R`, thinks 500 ms, then sends 400 deltas, one every 25 ms;
+  - a terminal echo with on-demand 300 KB output bursts;
+  - an upload sink.
+
+  Both ports use TLS: 1.3 where the host's ssl library allows it, otherwise
+  1.2. Each call records which version it negotiated. TLS needs `openssl`
+  on the gateway host, unless you set `tls = false`.
+- **The client side.** `scripts/validation/wlclient.py` is copied to every
+  client host, which must have `python3`. It records raw timings only; every
+  measure is computed by `scripts/workloads/phase_a.py`. So definitions can
+  change and old campaigns can be re-analysed.
+- **Clock-free lateness.** Each delta carries the server's monotonic
+  emission time `s_i`. The client records its receive time `r_i`. Lateness
+  is `(r_i − s_i) − min_j (r_j − s_j)` per call, so the unknown clock offset
+  cancels.
+- **Backgrounds.** A background starts 5 s before the foreground and stops
+  when it ends. It must have run across at least 90% of the foreground's
+  span in every trial; otherwise that cell is unmeasured.
+- **Pooling.** An arm's per-block statistic pools its two trials' raw
+  samples before taking quantiles.
+- **Provisional bounds.** Every bound comes from the workload model and is
+  provisional until a pilot confirms it.
+- **Two rules are expected to fail today.** "≥ 99% of delta bytes
+  INTERACTIVE" needs the per-byte class telemetry the model recommends (R3).
+  Until that telemetry exists, the measure is unmeasured and `llm` and
+  `mixed` are INCOMPLETE. The terminal's latch ratio bound (≤ 1.15) assumes
+  the recommended classifier change (R1).
+
+`scripts/validation/scenario-campaign.example.ini` is an example.
 
 ## Adding a workload
 

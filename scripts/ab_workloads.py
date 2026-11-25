@@ -77,6 +77,22 @@ class Generator:
     script: Callable[..., str]
     parse: Callable[..., List[Tuple[str, ...]]]
     expected: Callable[[Job], int]
+    # The job's raw records for the extractor; by default its
+    # "J<TAB>{json}" lines. None: the generator has none.
+    records: Optional[Callable[[str], List[dict]]] = None
+
+
+def json_records(out: str) -> List[dict]:
+    """The "J<TAB>{json}" lines of a job's output."""
+    import json
+    recs = []
+    for line in out.splitlines():
+        if line.startswith("J\t"):
+            try:
+                recs.append(json.loads(line[2:]))
+            except ValueError:
+                continue
+    return recs
 
 
 GENERATORS: Dict[str, Generator] = {}
@@ -167,6 +183,11 @@ class Workload:
         return []
 
     def gateway_flags(self, cfg: Any) -> List[str]:
+        return []
+
+    def client_files(self, cfg: Any) -> List[str]:
+        """Local files its generators run on client hosts, copied into each
+        client host's work directory at setup."""
         return []
 
     def client_flags(self, cfg: Any) -> List[str]:

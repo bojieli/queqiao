@@ -187,7 +187,7 @@ class Schedule(unittest.TestCase):
 
 class Config(unittest.TestCase):
     def test_examples_parse(self):
-        for f in (EXAMPLE, DC_EXAMPLE):
+        for f in (EXAMPLE, DC_EXAMPLE, HERE / "validation" / "scenario-campaign.example.ini"):
             cfg = ab.load_config(str(f))
             self.assertEqual(cfg.main.role, "main")
 
@@ -639,7 +639,6 @@ class LocalProcesses(unittest.TestCase):
         self.assertTrue(os.path.isdir(self.W))
 
     def test_readiness_requires_the_spawned_process_to_own_the_port(self):
-        import socket
         listener = subprocess.Popen([sys.executable, "-c",
                                      "import socket,sys,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen();"
                                      "print(s.getsockname()[1], flush=True); time.sleep(30)", f"{self.W}/marker"],
