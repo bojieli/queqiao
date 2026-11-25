@@ -290,3 +290,21 @@ func TestClassArbiterIdleClassKeepsItsUnspentShareForTheRound(t *testing.T) {
 		t.Fatalf("CONTROL came back with %d, more than the %d it left", got, left)
 	}
 }
+
+// Bytes charged to a class while it is idle -- a PTO probe retransmitting
+// its data -- come off the credit it gets back: 500 held, 1000 sent while
+// idle, leaves a 500-byte debt.
+func TestClassArbiterIdleDebitComesOffHeldCredit(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	ci := demandOf(quiccongestion.ClassControl, quiccongestion.ClassInteractive)
+	a.OnDemand(ci)
+	a.Permit(arbPacket)
+	spend := quiccongestion.ByteCount(a.Stats().Deficit[quiccongestion.ClassControl] - 500)
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassControl: spend})
+	a.OnDemand(demandOf(quiccongestion.ClassInteractive)) // 500 held
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassControl: 1000})
+	a.OnDemand(ci)
+	if got := a.Stats().Deficit[quiccongestion.ClassControl]; got > -500 {
+		t.Fatalf("CONTROL deficit %d after a 1000-byte idle charge against 500 held, want -500 or less", got)
+	}
+}

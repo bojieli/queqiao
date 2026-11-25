@@ -88,7 +88,9 @@ func (a *ClassArbiter) OnDemand(d quiccongestion.Demand) {
 		if d.Eligible[c] && !a.demand[c] && a.held[c] > 0 && a.heldRound[c] == a.round {
 			// Back within the round it went idle in: it keeps what it had
 			// not spent of this round's allocation, and nothing more.
-			a.deficit[c] = max(a.deficit[c], a.held[c])
+			// Anything charged to it while idle (a PTO probe's
+			// retransmission) is taken off what it held.
+			a.deficit[c] += a.held[c]
 			a.held[c] = 0
 		} else if d.Eligible[c] && !a.demand[c] && a.deficit[c] >= 0 && a.credited[c] != a.round+1 {
 			// A class that becomes eligible joins the current round with
