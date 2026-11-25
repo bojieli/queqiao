@@ -218,3 +218,27 @@ func TestErasurePathSenderClassScheduling(t *testing.T) {
 		t.Fatalf("stats %+v, want the packet settled", st)
 	}
 }
+
+// A class that becomes eligible while another holds credit joins the current
+// round: an ACK arriving during BULK-only service gets the next turn instead
+// of waiting out BULK's allocation, and toggling its demand earns no more
+// than one quantum per round.
+func TestClassArbiterNewlyEligibleControlJoinsTheRound(t *testing.T) {
+	a := NewClassArbiter(ClassWeights{Control: 4, Interactive: 2, Bulk: 50}, arbPacket)
+	bulk := demandOf(quiccongestion.ClassBulk)
+	a.OnDemand(bulk)
+	a.OnSent(simBuilder(a.Permit(arbPacket), bulk, 0)) // BULK now has most of its large credit left
+	both := demandOf(quiccongestion.ClassControl, quiccongestion.ClassBulk)
+	a.OnDemand(both)
+	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassControl {
+		t.Fatalf("turn %v: newly eligible CONTROL waits behind BULK's credit", p.Turn)
+	}
+	before := a.Stats().Deficit[quiccongestion.ClassControl]
+	for range 10 {
+		a.OnDemand(bulk)
+		a.OnDemand(both)
+	}
+	if after := a.Stats().Deficit[quiccongestion.ClassControl]; after > before {
+		t.Fatalf("toggling demand raised CONTROL's credit from %d to %d", before, after)
+	}
+}

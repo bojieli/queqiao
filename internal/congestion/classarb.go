@@ -52,6 +52,10 @@ type ClassArbiter struct {
 	demand  [quiccongestion.NumSendClasses]bool
 	served  [quiccongestion.NumSendClasses]uint64
 	turns   [quiccongestion.NumSendClasses]uint64
+	// round counts replenishments; credited is the round in which each
+	// class last got the quantum it is owed on becoming eligible.
+	round    uint64
+	credited [quiccongestion.NumSendClasses]uint64
 }
 
 // NewClassArbiter returns an arbiter with the given weights; a weight below
@@ -76,6 +80,15 @@ func (a *ClassArbiter) SetQuantum(q quiccongestion.ByteCount) {
 func (a *ClassArbiter) OnDemand(d quiccongestion.Demand) {
 	a.mu.Lock()
 	for _, c := range scheduledClasses {
+		if d.Eligible[c] && !a.demand[c] && a.deficit[c] >= 0 && a.credited[c] != a.round+1 {
+			// A class that becomes eligible joins the current round with
+			// its quantum, as in deficit round robin, so a sparse ACK does
+			// not wait out another class's whole allocation. Debt is kept,
+			// and the credit is given once per round however often the
+			// class's demand toggles.
+			a.deficit[c] = max(a.deficit[c], a.weights[c]*a.quantum)
+			a.credited[c] = a.round + 1
+		}
 		a.demand[c] = d.Eligible[c]
 	}
 	a.normalize()
@@ -159,6 +172,7 @@ func (a *ClassArbiter) normalize() {
 			a.deficit[c] += rounds * a.weights[c] * a.quantum
 		}
 	}
+	a.round++
 }
 
 // ClassArbiterStats is what an arbiter has done.

@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apernet/quic-go"
+
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/protocol"
@@ -559,10 +561,22 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedM
 		t.Fatalf("client flow lifecycle leaked: active=%d started=%d completed=%d failed=%d", got.ActiveFlows, got.FlowsStarted, got.FlowsCompleted, got.FlowsFailed)
 	}
 	if sched == SchedClass {
-		scheduled := 0
-		classScheduledConns.Range(func(any, any) bool { scheduled++; return true })
-		if scheduled == 0 {
-			t.Fatal("no connection schedules classes under sched=class")
+		// Both ends of this test's live connection schedule classes: the
+		// client's dials the gateway's address, the gateway's is bound to
+		// it.
+		gateway := packetConn.LocalAddr().String()
+		var clientSide, gatewaySide bool
+		classScheduledConns.Range(func(k, _ any) bool {
+			conn := k.(*quic.Conn)
+			if conn.Context().Err() != nil {
+				return true
+			}
+			clientSide = clientSide || conn.RemoteAddr().String() == gateway
+			gatewaySide = gatewaySide || conn.LocalAddr().String() == gateway
+			return true
+		})
+		if !clientSide || !gatewaySide {
+			t.Fatalf("sched=class installed on the client: %v, on the gateway: %v", clientSide, gatewaySide)
 		}
 	}
 	cancel()
