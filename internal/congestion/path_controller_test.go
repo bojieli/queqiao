@@ -1043,3 +1043,41 @@ func TestTheDatagramBurstStatisticIsTheDatagramsOwn(t *testing.T) {
 		t.Fatalf("datagram burst %.2f (%v) against path-wide %.2f", b, ok, path)
 	}
 }
+
+// An admitted turn that builds nothing -- its work does not fit the permit,
+// demand unchanged -- is passed over for that attachment: the connection is
+// woken and its next permit serves another class it has; once every class
+// is passed over it is refused until the earliest hold ends, and a send
+// clears the holds.
+func TestAnEmptyBuildPassesTheTurnToAnotherClass(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassInteractive: true, quiccongestion.ClassBulk: true}})
+	p := a.a.Admit(now, 1200)
+	if !p.OK || p.Turn != quiccongestion.ClassInteractive {
+		t.Fatalf("first permit %+v", p)
+	}
+	wakes := a.wakes
+	a.a.OnEmptyBuild(now, p)
+	if a.wakes == wakes {
+		t.Fatal("the connection was not woken to take another decision")
+	}
+	q := a.a.Admit(now, 1200)
+	if !q.OK || q.Turn != quiccongestion.ClassBulk || q.Fill[quiccongestion.ClassInteractive] != 0 {
+		t.Fatalf("after INTERACTIVE built nothing the permit is %+v; want BULK with no INTERACTIVE fill", q)
+	}
+	a.a.OnEmptyBuild(now, q)
+	r := a.a.Admit(now, 1200)
+	if r.OK || r.RetryAt.IsZero() {
+		t.Fatalf("with every class passed over the permit is %+v; want a refusal with a retry", r)
+	}
+	if s := a.a.Admit(r.RetryAt, 1200); !s.OK {
+		t.Fatalf("still refused once the holds ended: %+v", s)
+	}
+	a.a.OnEmptyBuild(r.RetryAt, quiccongestion.Permit{Turn: quiccongestion.ClassInteractive})
+	a.sendClass(r.RetryAt, 1200, quiccongestion.ClassBulk)
+	if u := a.a.Admit(r.RetryAt, 1200); !u.OK || u.Turn != quiccongestion.ClassInteractive {
+		t.Fatalf("a send did not clear the hold: %+v", u)
+	}
+}

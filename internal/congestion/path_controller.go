@@ -101,7 +101,8 @@ type PathController struct {
 	// datagramBurst publishes its burst factor (math.Float64bits), zero
 	// until datagramsSeen is enough to say.
 	datagrams     *lossmodel.Estimator
-	datagramsSeen uint64
+	datagramPairs uint64
+	datagramPrev  bool
 	datagramBurst atomic.Uint64
 
 	// Scratch for the law's batches.
@@ -261,8 +262,10 @@ func (c *PathController) appLimited() bool {
 	return o
 }
 
-// pathDatagramEvidence is how many datagram-bearing samples must have
-// resolved before their own burst statistic replaces the path-wide one.
+// pathDatagramEvidence is how many transitions between adjacent
+// datagram-bearing samples must have been observed before their own burst
+// statistic replaces the path-wide one. Datagram packets that never sit next
+// to each other in the send order give none, however many there are.
 const pathDatagramEvidence = 200
 
 // DatagramBurstFactor is the burst factor of the loss of datagram-bearing
@@ -466,15 +469,21 @@ func (c *PathController) advance(now monotime.Time) {
 		switch {
 		case !r.datagram || (r.fate != fateDelivered && r.fate != fateLost):
 			c.datagrams.Break()
+			c.datagramPrev = false
 		default:
 			c.datagrams.ObserveOutcome(r.fate == fateDelivered)
-			c.datagramsSeen++
+			if c.datagramPrev {
+				// A transition between two adjacent datagram-bearing
+				// samples: the evidence the statistic is made of.
+				c.datagramPairs++
+			}
+			c.datagramPrev = true
 		}
 		c.ring[0] = fateRecord{}
 		c.ring = c.ring[1:]
 		c.ringBase++
 	}
-	if c.datagramsSeen >= pathDatagramEvidence {
+	if c.datagramPairs >= pathDatagramEvidence {
 		b := c.datagrams.Snapshot().BurstFactor
 		if b < 1 {
 			b = 1
@@ -682,17 +691,26 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	// lapsed until the claimant sends again. A claimant that asks and cannot
 	// use the turn for a reason of its own (a PROBING attachment's full
 	// probe window) holds no claim until it next sends either.
+	//
+	// A class whose turn this attachment could not build (OnEmptyBuild) is
+	// passed over for it as if it had no demand in it, for a short hold or
+	// until something changes; once every class it has is passed over it is
+	// refused until the earliest hold ends.
+	own := a.usable(now)
+	if hasDemand(a.demand) && !hasDemand(quiccongestion.Demand{Eligible: own}) {
+		return quiccongestion.Permit{RetryAt: a.earliestUnstick()}, wakes
+	}
 	turn := c.arb.Select()
-	if turn != quiccongestion.ClassExempt && !a.demand.Eligible[turn] && !c.claimed(a, turn, now) {
+	if turn != quiccongestion.ClassExempt && !own[turn] && !c.claimed(a, turn, now) {
 		for o := range c.atts {
-			if o != a && o.demand.Eligible[turn] {
+			if o != a && o.usable(now)[turn] {
 				// Another attachment has demand in the turn but no live
 				// claim: its claim lapsed.
 				c.stats.lapsedClaims.Add(1)
 				break
 			}
 		}
-		turn = c.arb.SelectAmong(a.demand.Eligible)
+		turn = c.arb.SelectAmong(own)
 	}
 	// The window and the balance, for the turn the path would serve now.
 	borrowed, refusal := c.admissible(a, now, turn, maxBytes)
@@ -727,10 +745,10 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 		a.claimDeadline = 0
 		return quiccongestion.Permit{RetryAt: retry}, wakes
 	}
-	if !a.demand.Eligible[turn] && turn != quiccongestion.ClassExempt {
+	if !own[turn] && turn != quiccongestion.ClassExempt {
 		// Every claim on the path's turn lapsed: this attachment is served
 		// from its own demand, and the class keeps its deficit.
-		turn = c.arb.SelectAmong(a.demand.Eligible)
+		turn = c.arb.SelectAmong(own)
 		if borrowed, refusal = c.admissible(a, now, turn, maxBytes); refusal != nil {
 			a.waiting = true
 			return *refusal, wakes
@@ -743,18 +761,55 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	a.waiting, a.deferred = false, false
 	c.permitSeq++
 	a.lastPermit = c.permitSeq
-	return c.arb.PermitTurn(turn, maxBytes, !borrowed), wakes
+	p := c.arb.PermitTurn(turn, maxBytes, !borrowed)
+	for cl := range p.Fill {
+		if !own[cl] {
+			// Nothing of a class this attachment cannot build fills it.
+			p.Fill[cl] = 0
+		}
+	}
+	return p, wakes
+}
+
+// usable is the attachment's demand less the classes it is passed over in.
+func (a *PathAttachment) usable(now monotime.Time) [quiccongestion.NumSendClasses]bool {
+	own := a.demand.Eligible
+	for cl, until := range a.stuckUntil {
+		if !until.IsZero() && now.Before(until) {
+			own[cl] = false
+		}
+	}
+	return own
+}
+
+func (a *PathAttachment) earliestUnstick() monotime.Time {
+	var at monotime.Time
+	for _, until := range a.stuckUntil {
+		if !until.IsZero() && (at.IsZero() || until.Before(at)) {
+			at = until
+		}
+	}
+	return at
+}
+
+func hasDemand(d quiccongestion.Demand) bool {
+	for _, cl := range scheduledClasses {
+		if d.Eligible[cl] {
+			return true
+		}
+	}
+	return false
 }
 
 // claims says whether o holds a claim on turn against a.
 func (c *PathController) claims(o, a *PathAttachment, turn quiccongestion.SendClass, now monotime.Time) bool {
-	if o == a || !o.demand.Eligible[turn] || o.unable {
+	if o == a || !o.usable(now)[turn] || o.unable {
 		return false
 	}
 	if !o.claimDeadline.IsZero() && !now.Before(o.claimDeadline) {
 		return false // lapsed: it was given a packet time and did not ask
 	}
-	if !a.demand.Eligible[turn] {
+	if !a.usable(now)[turn] {
 		return true
 	}
 	return o.waiting && o.lastPermit < a.lastPermit
@@ -828,6 +883,8 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 	c.sendSeq++
 	a.lastSentSeq = c.sendSeq
 	a.unable = false
+	// Something was built: work that did not fit may now.
+	a.stuckUntil = [quiccongestion.NumSendClasses]monotime.Time{}
 	a.claimDeadline = 0
 	if s.Exempt {
 		c.stats.exemptBytes.Add(byteTotal(s.Bytes))
@@ -911,6 +968,8 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 	windowBefore := c.law.GetCongestionWindow()
 	rateBefore := c.law.bandwidth()
 	c.setGauge(a, ev.InFlight)
+	// The flight and the window moved: work that did not fit may now.
+	a.stuckUntil = [quiccongestion.NumSendClasses]monotime.Time{}
 	if ev.RTTSample > 0 {
 		// The event's sample is raw: send to ACK receipt. The connection's
 		// own statistics have already removed the peer's reported ACK
@@ -1078,6 +1137,9 @@ type PathAttachment struct {
 	// the epoch last seen.
 	progress      func() TransportProgress
 	progressEpoch uint64
+	// stuckUntil is, per class, until when a turn this attachment could not
+	// build is passed over for it (OnEmptyBuild).
+	stuckUntil [quiccongestion.NumSendClasses]monotime.Time
 	// pacingBlocked says its last refusal was for the balance.
 	pacingBlocked bool
 	// unable says it asked and could not use the path's opportunity for a
@@ -1111,9 +1173,10 @@ type PathAttachment struct {
 var attachmentEpochs atomic.Uint64
 
 var (
-	_ quiccongestion.PathSender     = (*PathAttachment)(nil)
-	_ quiccongestion.ClassScheduler = (*PathAttachment)(nil)
-	_ TelemetryProvider             = (*PathAttachment)(nil)
+	_ quiccongestion.PathSender         = (*PathAttachment)(nil)
+	_ quiccongestion.ClassScheduler     = (*PathAttachment)(nil)
+	_ quiccongestion.EmptyBuildObserver = (*PathAttachment)(nil)
+	_ TelemetryProvider                 = (*PathAttachment)(nil)
 )
 
 // Controller returns the controller the attachment is attached to.
@@ -1295,6 +1358,31 @@ func (a *PathAttachment) OnDetach(now monotime.Time) {
 	wakes := c.detach(a, now)
 	c.mu.Unlock()
 	runWakes(wakes)
+}
+
+// OnEmptyBuild is told that a packet admitted under a permit could not be
+// built although the connection's demand is unchanged: the turn's work does
+// not fit. That class is passed over for this attachment for a short hold or
+// until it sends or is acknowledged, and the connection is woken to take
+// another decision -- another class it has, or, once all are passed over, a
+// refusal until the earliest hold ends.
+func (a *PathAttachment) OnEmptyBuild(now monotime.Time, p quiccongestion.Permit) {
+	cl := p.Turn
+	if cl == quiccongestion.ClassExempt || int(cl) >= quiccongestion.NumSendClasses {
+		return
+	}
+	c := a.ctl.Load()
+	c.mu.Lock()
+	now = c.clamp(now)
+	if until := a.stuckUntil[cl]; !until.IsZero() && now.Before(until) {
+		c.mu.Unlock()
+		return
+	}
+	a.stuckUntil[cl] = now.Add(emptyBuildHold)
+	c.mu.Unlock()
+	if a.wake != nil {
+		a.wake()
+	}
 }
 
 // TransportProgress is a connection's published transport progress: an

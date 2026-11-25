@@ -50,3 +50,22 @@ func TestASparseCodedLaneSizesItsWindowFromItsOwnSourceRate(t *testing.T) {
 		peer.Close()
 	}
 }
+
+// A burst followed by an idle gap of several round trips ends the
+// measurement: the next decision sizes from the cold-start prior, not from
+// the stale burst spread over the gap.
+func TestTheSourceRateRestartsAfterAnIdleGap(t *testing.T) {
+	var m sourceMeter
+	rtt := 20 * time.Millisecond
+	t0 := time.Now()
+	m.rate(t0, rtt)
+	for i := range 20 {
+		m.add(1000, t0.Add(time.Duration(i)*time.Millisecond))
+	}
+	if r := m.rate(t0.Add(25*time.Millisecond), rtt); r <= 0 {
+		t.Fatalf("no rate measured over a busy round trip: %.0f", r)
+	}
+	if r := m.rate(t0.Add(time.Second), rtt); r != 0 {
+		t.Fatalf("after an idle second the rate is %.0f B/s; want none, so the prior stands", r)
+	}
+}
