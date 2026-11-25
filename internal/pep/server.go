@@ -22,6 +22,7 @@ import (
 	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/session"
+	"github.com/bojieli/queqiao/internal/stripe"
 )
 
 // Must exceed the client's bounded lane-replacement wait so a final-ACK loss
@@ -206,7 +207,7 @@ func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, repla
 		f.lanesMu.Unlock()
 		for _, old := range retired {
 			if sched := f.scheduler.Load(); sched != nil {
-				sched.RetireLane(old.id)
+				sched.RetireLaneFor(old.id, stripe.ReissueRescue)
 			}
 			if old.fc != nil {
 				_ = old.fc.Close()

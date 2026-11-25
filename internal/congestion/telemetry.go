@@ -78,6 +78,31 @@ type ControllerTelemetry struct {
 	// connection, so it keeps what a clean window established while this
 	// follows the path. On the live incident the two read 1.76% and 19.9%.
 	Erasure float64
+	// The rest describe how the share and the pacer treated this
+	// connection's traffic, for the lane trace; only ErasureSender sets them.
+	//
+	// Share is the pool's allowance for this lane, ShareCapped whether it was
+	// below the rate the controller would otherwise have used when the rate
+	// was last read (and the lane was not ramping), and UncappedPacing that
+	// rate on the wire. AppLimited is the pool's verdict on whether the lane
+	// is sending all it is allowed to (see pathmodel.Observation).
+	Share          uint64
+	ShareCapped    bool
+	UncappedPacing uint64
+	AppLimited     bool
+	// AckOnlyBytes counts packets that elicit no acknowledgement -- QUIC's
+	// own ACK-only packets, which quic-go sends past the pacer -- and
+	// AckOnlyCharged the part of them debited from this sender's pacer
+	// budget. AckedBytes counts newly acknowledged ack-eliciting bytes.
+	AckOnlyBytes   uint64
+	AckOnlyCharged uint64
+	AckedBytes     uint64
+	// PacingDenials and WindowDenials count refused HasPacingBudget and
+	// CanSend polls, and HeldSends the ack-eliciting packets sent after a
+	// refusal, which are the sends a refusal actually delayed.
+	PacingDenials uint64
+	WindowDenials uint64
+	HeldSends     uint64
 }
 
 const (

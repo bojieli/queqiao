@@ -440,6 +440,9 @@ type multipathFlow struct {
 	acksOut           atomic.Uint64
 	acksSched         atomic.Uint64
 	ackWriteNS        atomic.Uint64
+	// ackPendingSinceNS is when the oldest acknowledgement not yet written was
+	// scheduled, for the lane trace's per-ACK record (see traceACKSent).
+	ackPendingSinceNS atomic.Int64
 	finSequence       atomic.Uint64
 	remoteFinSequence atomic.Uint64
 	finSent           atomic.Bool
@@ -2780,6 +2783,9 @@ func (f *multipathFlow) writeACKPreferred(ctx context.Context, sequence uint64, 
 	var lastErr error
 	for _, lane := range lanes {
 		if err := lane.fc.WriteContext(ctx, frame); err == nil {
+			if timing, ok := ctx.Value(ackTimingKey{}).(*ackTiming); ok {
+				timing.lane, timing.carrier = lane.id, lane
+			}
 			return nil
 		} else {
 			lastErr = err
@@ -2895,6 +2901,9 @@ func (f *multipathFlow) scheduleACK(sequence uint64) {
 		return
 	}
 	f.acksSched.Add(1)
+	if laneTrace.Load() {
+		f.ackPendingSinceNS.CompareAndSwap(0, time.Now().UnixNano())
+	}
 	for {
 		old := f.ackSequence.Load()
 		if sequence <= old || f.ackSequence.CompareAndSwap(old, sequence) {
@@ -2956,9 +2965,17 @@ func (f *multipathFlow) ackLoop(ctx context.Context) {
 				break
 			}
 			ackStart := time.Now()
-			err := f.writeACKPreferred(ctx, sequence, f.recvAckFlag, false, preferred)
+			writeCtx, timing := ctx, (*ackTiming)(nil)
+			if laneTrace.Load() {
+				timing = &ackTiming{pendingSinceNS: f.ackPendingSinceNS.Swap(0)}
+				writeCtx = context.WithValue(ctx, ackTimingKey{}, timing)
+			}
+			err := f.writeACKPreferred(writeCtx, sequence, f.recvAckFlag, false, preferred)
 			f.ackWriteNS.Add(uint64(time.Since(ackStart)))
 			f.acksOut.Add(1)
+			if timing != nil {
+				f.traceACKSent(sequence, gap, repeat, ackStart, timing, err)
+			}
 			if err != nil {
 				// A failed ACK write is a lane's failure, not the flow's. The
 				// lane is already transitioned by writeACK; this loop must
@@ -3037,6 +3054,9 @@ func (f *multipathFlow) receiveACK(event inboundEvent) error {
 		return errors.New("ack belongs to another flow")
 	}
 	f.acksIn.Add(1)
+	if laneTrace.Load() {
+		f.traceACKReceived(event)
+	}
 	if frame.Header.Flags&f.sendAckFlag == 0 {
 		return errors.New("acknowledgement has wrong direction")
 	}

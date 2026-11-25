@@ -142,15 +142,25 @@ type ErasureSender struct {
 	// the round it last judged; the delivery the last growth reached and how
 	// many rounds have passed without more; and the packets decided in the
 	// round in progress.
-	ramping       atomic.Bool
-	rampPeak      quiccongestion.ByteCount
-	rampFloor     float64
-	rampFloorN    float64
-	rampRound     uint64
-	rampDelivered float64
-	rampFlat      int
-	rampArrived   uint64
-	rampLost      uint64
+	ramping  atomic.Bool
+	rampPeak quiccongestion.ByteCount
+	// Trace counters; see the matching ControllerTelemetry fields. denied is
+	// whether a poll has been refused since the last ack-eliciting send.
+	capBound                     atomic.Bool
+	appLimitedTrace              atomic.Bool
+	ackOnlyBytes, ackOnlyCharged atomic.Uint64
+	ackedBytes                   atomic.Uint64
+	pacingDenials, windowDenials atomic.Uint64
+	heldSends                    atomic.Uint64
+	uncappedPacing               atomic.Uint64
+	denied                       bool
+	rampFloor                    float64
+	rampFloorN                   float64
+	rampRound                    uint64
+	rampDelivered                float64
+	rampFlat                     int
+	rampArrived                  uint64
+	rampLost                     uint64
 	// joined is whether this lane joined from a pooled seed; aboveFloor
 	// whether its last judged round lost significantly more than the floor it
 	// joined with; and poolSamples how many packets the pool's current
@@ -396,9 +406,12 @@ func newErasureSender(initialPacketSize quiccongestion.ByteCount) *ErasureSender
 // A lane that is still ramping is not capped; see rampGate.
 func (e *ErasureSender) deliveredRate() float64 {
 	delivered := float64(e.inner.bandwidth())
+	e.uncappedPacing.Store(uint64(delivered))
+	capped := false
 	if share := float64(e.share.Load()); share > 0 && share < delivered && !e.ramping.Load() {
-		delivered = share
+		delivered, capped = share, true
 	}
+	e.capBound.Store(capped)
 	return delivered
 }
 
@@ -1299,10 +1312,24 @@ func (e *ErasureSender) recordInFlight(bytesInFlight quiccongestion.ByteCount) {
 }
 
 func (e *ErasureSender) HasPacingBudget(now monotime.Time) bool {
-	return e.pacer.budget(now) >= e.inner.maxDatagramSize
+	ok := e.pacer.budget(now) >= e.inner.maxDatagramSize
+	if !ok {
+		e.pacingDenials.Add(1)
+		e.denied = true
+	}
+	return ok
 }
 
 func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
+	if retransmittable {
+		if e.denied {
+			e.heldSends.Add(1)
+			e.denied = false
+		}
+	} else {
+		e.ackOnlyBytes.Add(uint64(bytes))
+		e.ackOnlyCharged.Add(uint64(bytes))
+	}
 	e.pacer.sentPacket(sentTime, bytes)
 	if bytesInFlight > e.rampPeak {
 		e.rampPeak = bytesInFlight
@@ -1315,7 +1342,12 @@ func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 // channel what is on the wire is more than what will arrive.
 func (e *ErasureSender) CanSend(bytesInFlight quiccongestion.ByteCount) bool {
 	e.recordInFlight(bytesInFlight)
-	return bytesInFlight < e.GetCongestionWindow()
+	ok := bytesInFlight < e.GetCongestionWindow()
+	if !ok {
+		e.windowDenials.Add(1)
+		e.denied = true
+	}
+	return ok
 }
 
 func (e *ErasureSender) GetCongestionWindow() quiccongestion.ByteCount {
@@ -1362,6 +1394,11 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	// fictitious gap. Retaining the scratch slice avoids allocating on every
 	// acknowledgement.
 	e.outcomes = e.outcomes[:0]
+	var ackedBytes uint64
+	for _, packet := range acked {
+		ackedBytes += uint64(packet.BytesAcked)
+	}
+	e.ackedBytes.Add(ackedBytes)
 	for _, packet := range acked {
 		if packet.PacketNumber >= 0 {
 			e.outcomes = append(e.outcomes, packetOutcome{number: packet.PacketNumber, arrived: true})
@@ -1491,6 +1528,12 @@ func (e *ErasureSender) Telemetry() ControllerTelemetry {
 		t.PacingRate = pacing
 	}
 	t.CongestionWindow = uint64(float64(t.CongestionWindow) / arrival)
+	t.Share, t.ShareCapped = e.share.Load(), e.capBound.Load()
+	t.UncappedPacing = uint64(float64(e.uncappedPacing.Load()) / arrival)
+	t.AppLimited = e.appLimitedTrace.Load()
+	t.AckOnlyBytes, t.AckOnlyCharged = e.ackOnlyBytes.Load(), e.ackOnlyCharged.Load()
+	t.AckedBytes = e.ackedBytes.Load()
+	t.PacingDenials, t.WindowDenials, t.HeldSends = e.pacingDenials.Load(), e.windowDenials.Load(), e.heldSends.Load()
 	return t
 }
 

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/bojieli/queqiao/internal/stripe"
 )
 
 // laneTrace prints one line per lane per congestion sample when
@@ -40,6 +42,7 @@ func traceLane(f *multipathFlow, laneID uint64, stats laneTransportStats) {
 	var chunks, ready int
 	var flowHeld uint64
 	var issued, reissued, sourceBytes, reissuedBytes, laneFailures uint64
+	var reissue stripe.ReissueStats
 	if sched := f.scheduler.Load(); sched != nil {
 		chunks, held, queued = sched.LaneOutstanding(laneID)
 		ready, flowHeld = sched.Pending()
@@ -49,6 +52,7 @@ func traceLane(f *multipathFlow, laneID uint64, stats laneTransportStats) {
 		issued, reissued = st.ChunksIssued, st.ChunksRetransmit
 		sourceBytes, reissuedBytes = st.SourceBytes, st.BytesRetransmit
 		laneFailures = st.LaneFailures
+		reissue = st.Reissue
 	}
 	meanResidency, maxResidency := f.takeResidency()
 	if f.logger == nil {
@@ -70,7 +74,16 @@ func traceLane(f *multipathFlow, laneID uint64, stats laneTransportStats) {
 		// What the path did, not what the controller was charged. quic-go's own
 		// loss counters are absent because this transport replaces its
 		// congestion controller, so they never leave zero.
-		"lost", c.PacketsLostObserved, "lostcong", c.PacketsLost, "mode", c.Mode)
+		"lost", c.PacketsLostObserved, "lostcong", c.PacketsLost, "mode", c.Mode,
+		// How the share and the pacer treated this connection; see
+		// congestion.ControllerTelemetry.
+		"share", c.Share, "capped", c.ShareCapped, "upace", c.UncappedPacing, "applimited", c.AppLimited,
+		"aobytes", c.AckOnlyBytes, "aocharged", c.AckOnlyCharged, "ackedb", c.AckedBytes,
+		"pdeny", c.PacingDenials, "wdeny", c.WindowDenials, "held", c.HeldSends,
+		// Reissued bytes by cause and by the replaced attempt's substrate.
+		"rs_lane", reissue.Bytes[stripe.ReissueLane], "rs_timer", reissue.Bytes[stripe.ReissueTimer],
+		"rs_gap", reissue.Bytes[stripe.ReissueGap], "rs_rescue", reissue.Bytes[stripe.ReissueRescue],
+		"rs_rel", reissue.FromReliable, "rs_coded", reissue.FromCoded)
 }
 
 // residency records how long a chunk stays in the scheduler's window: from the
@@ -109,4 +122,65 @@ func (f *multipathFlow) takeResidency() (mean, max time.Duration) {
 	max = f.residency.max
 	f.residency.total, f.residency.count, f.residency.max = 0, 0, 0
 	return mean, max
+}
+
+// ackTiming rides the context of a traced flow-acknowledgement write, so the
+// lane that carried it and where its time went can be recorded without
+// changing the write path's signatures. Only the ACK loop attaches one, and
+// only while the trace is on.
+type ackTiming struct {
+	pendingSinceNS  int64
+	lockNS, writeNS int64
+	lane            uint64
+	carrier         *mpLane
+}
+
+type ackTimingKey struct{}
+
+// traceACKSent records one flow acknowledgement as written: which lane's
+// connection actually carried it -- writeACKPreferred can use any healthy
+// lane, so the flow's data lane does not identify it -- how long it waited to
+// be coalesced, for the frame writer's lock and in the stream write, and that
+// connection's controller state at the moment, so a delay can be pinned on
+// the pacer, the share or the window.
+func (f *multipathFlow) traceACKSent(sequence uint64, gap, repeat bool, start time.Time, t *ackTiming, err error) {
+	if f.logger == nil {
+		return
+	}
+	coalesce := 0.0
+	if t.pendingSinceNS > 0 {
+		coalesce = float64(start.UnixNano()-t.pendingSinceNS) / 1e6
+	}
+	attrs := []any{
+		"type", "flow_ack", "telemetry_schema", 1, "flow_id", f.flowID, "seq", sequence,
+		"gap", gap, "repeat", repeat, "carrier", t.lane, "failed", err != nil,
+		"coalesce_ms", coalesce, "lock_ms", float64(t.lockNS) / 1e6, "write_ms", float64(t.writeNS) / 1e6,
+		"total_ms", float64(time.Since(start).Microseconds()) / 1000,
+	}
+	if t.carrier != nil && t.carrier.fc != nil {
+		if provider, ok := t.carrier.fc.transport().(laneStatsProvider); ok {
+			c := provider.transportStats().controller
+			attrs = append(attrs, "pacing", c.PacingRate, "upace", c.UncappedPacing, "share", c.Share,
+				"capped", c.ShareCapped, "inflight", c.BytesInFlight, "cwnd", c.CongestionWindow,
+				"pdeny", c.PacingDenials, "wdeny", c.WindowDenials, "held", c.HeldSends,
+				"aobytes", c.AckOnlyBytes, "aocharged", c.AckOnlyCharged, "ackedb", c.AckedBytes,
+				"applimited", c.AppLimited)
+		}
+	}
+	f.logger.Info("flow ack sent", attrs...)
+}
+
+// traceACKReceived records a flow acknowledgement's arrival, with the lane it
+// arrived on; matched against traceACKSent by flow and sequence it is the
+// acknowledgement's transit.
+func (f *multipathFlow) traceACKReceived(event inboundEvent) {
+	if f.logger == nil {
+		return
+	}
+	var lane uint64
+	if event.lane != nil {
+		lane = event.lane.id
+	}
+	f.logger.Info("flow ack received", "type", "flow_ack", "telemetry_schema", 1, "flow_id", f.flowID,
+		"seq", event.frame.Header.Sequence, "flags", event.frame.Header.Flags, "lane", lane)
 }
