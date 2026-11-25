@@ -186,6 +186,7 @@ func TestCodedTailLostAloneIsRecoveredWithoutTheWatchdog(t *testing.T) {
 	defer cancel()
 	sched := x.scheduler(t, nil)
 	go x.flow.writeLane(x.lane)
+	t.Cleanup(func() { x.flow.signalDone(); <-x.lane.writeDone })
 	go x.flow.superviseChunks(ctx, sched)
 	go func() {
 		for {

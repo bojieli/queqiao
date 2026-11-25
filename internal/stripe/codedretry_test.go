@@ -89,6 +89,37 @@ func TestCodedDeadlineCountsFromThePacketNotTheReport(t *testing.T) {
 	}
 }
 
+// Gap evidence the receiver reported before a coded attempt left cannot
+// show that attempt lost; only evidence that advances afterwards can.
+func TestStaleGapEvidenceDoesNotRetryAFreshCodedAttempt(t *testing.T) {
+	f := newCodedRetryFixture(t, true, bytes.Repeat([]byte("x"), 64), 16)
+	a := f.next(0)
+	f.sched.WroteAs(0, a, false)
+	if n := f.sched.ReissueUnacknowledgedBelow(48); n != 0 {
+		t.Fatal("gap evidence retried an unregistered attempt")
+	}
+	f.sched.Registered(0, a)
+	if n := f.sched.ReissueUnacknowledgedBelow(48); n != 0 {
+		t.Fatal("gap evidence older than the attempt retried it")
+	}
+	if n := f.sched.ReissueUnacknowledgedBelow(64); n != 1 {
+		t.Fatalf("fresh gap evidence retried %d attempts, want 1", n)
+	}
+}
+
+// A stream safety write that completes after the code's registration gets
+// the stream's own deadline, from the write, not the code's.
+func TestStreamWriteAfterRegistrationGetsTheStreamsDeadline(t *testing.T) {
+	f := newCodedRetryFixture(t, true, []byte("response"), 64)
+	a := f.next(0)
+	f.sched.Registered(0, a)
+	f.now = f.now.Add(2 * codedRetryAfter)
+	f.sched.WroteAs(0, a, true)
+	if n := f.sched.ReissueExpired(); n != 0 {
+		t.Fatal("a stream write inherited the code's expired deadline")
+	}
+}
+
 // Registration can be reported before the lane writer reports the write: the
 // connection may build the packet while the writer is still returning.
 func TestCodedRegistrationBeforeTheWriteReport(t *testing.T) {
@@ -170,7 +201,7 @@ func TestGapEvidenceRetiresOnlyRegisteredCodedAttempts(t *testing.T) {
 	f := newCodedRetryFixture(t, true, bytes.Repeat([]byte("x"), 64), 16)
 	a := f.next(0)
 	f.sched.WroteAs(0, a, false)
-	if n := f.sched.ReissueUnacknowledgedBelow(64); n != 0 {
+	if n := f.sched.ReissueUnacknowledgedBelow(48); n != 0 {
 		t.Fatal("gap evidence retried a coded attempt that was never registered")
 	}
 	f.sched.Registered(0, a)

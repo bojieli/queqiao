@@ -344,6 +344,10 @@ type attempt struct {
 	// transport reported the write, which settles it when that report comes.
 	registered bool
 	abandoned  bool
+	// gapFloor is the receiver gap evidence already seen when the attempt
+	// was registered. Evidence no newer than that was about bytes that left
+	// before this attempt did, and cannot show this attempt lost.
+	gapFloor uint64
 }
 
 type outstanding struct {
@@ -404,7 +408,11 @@ type Scheduler struct {
 	// idleLanes counts lanes waiting in Next with room for work and nothing
 	// ready to take.
 	idleLanes int
-	tune      autotuneState
+	// gapHigh is the highest offset ReissueUnacknowledgedBelow has been
+	// given, and gapNow the one it is acting on (CodedRetry only).
+	gapHigh uint64
+	gapNow  uint64
+	tune    autotuneState
 }
 
 // autotuneState is the Autotune bound and the facts of its current round.
@@ -1254,6 +1262,8 @@ func (s *Scheduler) requeueLocked(chunk *Chunk) {
 func (s *Scheduler) ReissueUnacknowledgedBelow(offset uint64) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.gapNow = offset
+	defer func() { s.gapHigh = max(s.gapHigh, offset) }()
 	reissued := 0
 	for _, out := range s.live {
 		if out.chunk.End() > offset || len(out.attempts) == 0 {
@@ -1388,7 +1398,10 @@ func (s *Scheduler) retireUnreliableAttemptsLocked(out *outstanding, deadline ti
 		} else if retire && s.cfg.CodedRetry {
 			// Coverage beyond an attempt still waiting to leave says nothing
 			// about it; copying it now would give its bytes a second owner.
-			retire = a.registered
+			// Nor does coverage the receiver already reported before the
+			// attempt left: only evidence that has advanced since then
+			// can show the attempt lost.
+			retire = a.registered && s.gapNow > a.gapFloor
 		}
 		if !retire {
 			kept = append(kept, a)
@@ -1536,10 +1549,10 @@ func (s *Scheduler) wrote(laneID uint64, chunk *Chunk, reliable *bool) {
 func (s *Scheduler) substrateChangedLocked(a *attempt, reliable bool) {
 	switch {
 	case reliable:
-		if a.deadline.IsZero() {
-			if after := s.retransmitAfter(); after > 0 {
-				a.deadline = s.cfg.Now().Add(after)
-			}
+		// Whatever deadline the code had, the stream's own starts now.
+		a.deadline = time.Time{}
+		if after := s.retransmitAfter(); after > 0 {
+			a.deadline = s.cfg.Now().Add(after)
 		}
 	case !a.registered:
 		a.deadline = time.Time{}
@@ -1569,6 +1582,7 @@ func (s *Scheduler) RegisteredAgo(laneID uint64, chunk *Chunk, age time.Duration
 		return
 	}
 	a.registered = true
+	a.gapFloor = s.gapHigh
 	if a.reliable {
 		// A stream copy (the pre-OPEN_OK safety copy) owns these bytes.
 		return
