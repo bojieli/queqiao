@@ -1145,13 +1145,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		lease.add(func() { <-s.semaphore })
 	}
 	releaseFirstFrame()
-	refusal := s.admitAccountFlow(principal)
-	if refusal == errAccountFlowLimit && s.admissionOwned() {
-		// The same for the account's slots.
-		s.udpRelays.expire()
-		refusal = s.admitAccountFlow(principal)
-	}
-	if refusal != nil {
+	if refusal := s.admitAccountFlowReclaiming(principal); refusal != nil {
 		s.refuseAccountFlow(fc, sessionID, open.Header.FlowID, principal, refusal)
 		return
 	}

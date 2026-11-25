@@ -1483,3 +1483,84 @@ func TestAUDPOpenAcknowledgementKeepsItsHandshakeDeadline(t *testing.T) {
 		})
 	}
 }
+
+// A parked relay holds its device's place among the account's clients as
+// well as a flow. Once it has expired, a new device of a MaxClients=1 account
+// is admitted rather than refused for it, as for MaxFlows.
+func TestAnExpiredParkedRelayFreesItsAccountCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		limits identity.AccountLimits
+	}{
+		{"flow-limit", identity.AccountLimits{MaxFlows: 1}},
+		{"client-limit", identity.AccountLimits{MaxClients: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, principals := admissionFixture(t, tc.limits, 2)
+			server.cfg.GatewayAdmission = GatewayAdmissionOwned
+			server.udpRelays = newUDPRelayStore()
+			old, fresh := principals[0], principals[1]
+			if refusal := server.admitAccountFlow(old); refusal != nil {
+				t.Fatal(refusal)
+			}
+			lease := &flowLease{}
+			lease.add(func() { server.releaseAccountFlow(old) })
+			relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			token, err := newUDPResumeToken()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server.udpRelays.mu.Lock()
+			server.udpRelays.retainLocked(token, old, relay, lease, nil)
+			held := server.udpRelays.relays[token]
+			held.expires = time.Now().Add(-time.Second)
+			server.udpRelays.relays[token] = held
+			server.udpRelays.mu.Unlock()
+			if refusal := server.admitAccountFlowReclaiming(fresh); refusal != nil {
+				t.Fatalf("a new device was refused for an expired relay: %v", refusal)
+			}
+		})
+	}
+}
+
+// A UDP association's OPEN_OK that cannot be written is interrupted when the
+// association's context ends, in every mode and whether or not it is
+// resumable, instead of holding shutdown until the handshake deadline.
+func TestAStalledUDPOpenAcknowledgementEndsWithItsContext(t *testing.T) {
+	credentials, _ := testCertificate(t)
+	for _, mode := range []GatewayAdmission{GatewayAdmissionLegacy, GatewayAdmissionOwned} {
+		for _, resumable := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/resumable=%v", mode, resumable), func(t *testing.T) {
+				server, err := NewServer(ServerConfig{
+					ListenAddr: "127.0.0.1:0", Credentials: credentials, GatewayAdmission: mode,
+					DestinationPolicy: DestinationPolicy{AllowPrivate: true},
+					Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				local, remote := net.Pipe()
+				defer remote.Close()
+				defer local.Close()
+				// The peer never reads; the stream's handshake deadline is far.
+				_ = local.SetDeadline(time.Now().Add(time.Minute))
+				ctx, cancel := context.WithCancel(context.Background())
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					server.handleUDPAssociation(ctx, local, newFrameConn(local), udpTestPrincipal, [16]byte{0x73}, 1, nil, resumable, &flowLease{}, nil)
+				}()
+				time.Sleep(50 * time.Millisecond)
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(3 * time.Second):
+					t.Fatal("a stalled OPEN_OK outlived its association's context")
+				}
+			})
+		}
+	}
+}

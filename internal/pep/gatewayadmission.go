@@ -296,3 +296,16 @@ func waitForSlot(ctx context.Context, conn *quic.Conn, slots chan struct{}) bool
 	}
 	return false
 }
+
+// admitAccountFlowReclaiming is admitAccountFlow that, in owned admission,
+// first takes back what expired parked relays still hold before it refuses
+// for the account's capacity: a parked relay keeps a flow and its device's
+// place among the account's clients until the sweeper reaches it.
+func (s *Server) admitAccountFlowReclaiming(principal identity.Principal) *accountRefusal {
+	refusal := s.admitAccountFlow(principal)
+	if (refusal == errAccountFlowLimit || refusal == errAccountClientLimit) && s.admissionOwned() {
+		s.udpRelays.expire()
+		refusal = s.admitAccountFlow(principal)
+	}
+	return refusal
+}

@@ -804,13 +804,10 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		openOK.Payload = session.EncodeUDPResumeGrant(resumed, grant)
 	}
 	// The acknowledgement keeps the stream's handshake deadline, as it
-	// always has. In owned admission a replacement taking this relay over
-	// also interrupts it, so it does not wait out a stalled write before the
-	// relay is handed to it; nothing else about the deadline changes.
-	stopInterrupt := func() bool { return false }
-	if live != nil {
-		stopInterrupt = context.AfterFunc(assocCtx, func() { _ = conn.SetDeadline(time.Now()) })
-	}
+	// always has, and is interrupted when the association ends first: on
+	// shutdown, in every mode, and in owned admission when a replacement
+	// takes this relay over and must not wait out a stalled write.
+	stopInterrupt := context.AfterFunc(assocCtx, func() { _ = conn.SetDeadline(time.Now()) })
 	ackErr := fc.Write(openOK)
 	stopInterrupt()
 	if ackErr != nil {
