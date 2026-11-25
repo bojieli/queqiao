@@ -32,4 +32,4 @@ tool golang.org/x/mobile/cmd/gobind
 
 replace github.com/bojieli/queqiao => ../..
 
-replace github.com/apernet/quic-go => github.com/bojieli/quic-go v0.61.1-0.20261125041458-a5e73261e4d4
+replace github.com/apernet/quic-go => github.com/bojieli/quic-go v0.61.1-0.20261125042537-c73f5362c4fe

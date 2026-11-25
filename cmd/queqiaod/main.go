@@ -717,6 +717,15 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	if opts.congestion == string(pep.CongestionBrutal) && opts.brutalBytesPerSec == 0 {
 		return errors.New("--brutal-bytes-per-sec is required with brutal congestion")
 	}
+	// The bundle is checked before anything is logged or renewed; the
+	// constructors check it again for direct callers.
+	bundleProfile := opts.resolvedProfile
+	if p, err := profile.ByName(opts.pathProfile); err == nil {
+		bundleProfile = p
+	}
+	if err := pep.ValidateBundle(pep.CCAPIVersion(opts.ccAPI), pep.CongestionControlKind(opts.congestion), bundleProfile); err != nil {
+		return err
+	}
 	if opts.logFormat != "json" && opts.logFormat != "text" {
 		return errors.New("--log-format must be json or text")
 	}

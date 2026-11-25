@@ -55,6 +55,11 @@ func validateBundle(ccAPI *CCAPIVersion, congestion CongestionControlKind, p pro
 	return nil
 }
 
+// ValidateBundle reports whether a combination of switches is supported.
+func ValidateBundle(ccAPI CCAPIVersion, congestion CongestionControlKind, p profile.Profile) error {
+	return validateBundle(&ccAPI, congestion, p)
+}
+
 // Bundle names the switches in effect, for publishing an endpoint's effective
 // configuration.
 func Bundle(ccAPI CCAPIVersion) string {
