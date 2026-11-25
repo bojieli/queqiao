@@ -164,10 +164,12 @@ func runReverseAckDownloads(t *testing.T, v2 bool) (p50, p90 time.Duration, clie
 	var latencies []time.Duration
 	var controllers []TelemetryProvider
 	var conns []*quic.Conn
+	delivered := make([]int, downloads)
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithTimeout(context.Background(), duration+10*time.Second)
 	defer cancel()
 	for i := 0; i < downloads; i++ {
+		i := i
 		cfg.Seed = int64(5 + i)
 		client, server, controller := reverseAckPair(t, cfg, upstream, downstream, v2)
 		controllers = append(controllers, controller)
@@ -234,12 +236,24 @@ func runReverseAckDownloads(t *testing.T, v2 bool) (p50, p90 time.Duration, clie
 				if sent.Sub(start) >= warmup {
 					mu.Lock()
 					latencies = append(latencies, time.Since(sent))
+					delivered[i]++
 					mu.Unlock()
 				}
 			}
 		}()
 	}
 	wg.Wait()
+	if ctx.Err() != nil {
+		t.Fatal("a connection stalled until the test's deadline")
+	}
+	// Every download's acknowledgements must keep arriving: one stalled
+	// connection cannot hide behind the healthy ones.
+	expectedEach := int((duration - warmup) / interval)
+	for i, n := range delivered {
+		if n < expectedEach*7/10 {
+			t.Fatalf("connection %d delivered %d of about %d messages after the warm-up", i, n, expectedEach)
+		}
+	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	if len(latencies) == 0 {
 		t.Fatal("no message arrived after the warm-up")

@@ -725,6 +725,9 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	}
 	// The bundle is checked before anything is logged or renewed; the
 	// constructors check it again for direct callers.
+	if opts.ccAPI == "" {
+		return errors.New("--cc-api must be v1 or v2")
+	}
 	bundleProfile := opts.resolvedProfile
 	if p, err := profile.ByName(opts.pathProfile); err == nil {
 		bundleProfile = p

@@ -1,7 +1,7 @@
 # Exact modules reachable from the shipped Go mobile core. Keep sorted.
 # Format: module@version|SPDX license|maintenance source
 github.com/andybalholm/brotli@v1.2.7|MIT|https://github.com/andybalholm/brotli
-github.com/bojieli/quic-go@v0.61.1-0.20261125052405-7c3b7dcac6e2|MIT|https://github.com/bojieli/quic-go
+github.com/bojieli/quic-go@v0.61.1-0.20261125052831-1595c13a3773|MIT|https://github.com/bojieli/quic-go
 github.com/google/btree@v1.1.2|Apache-2.0|https://github.com/google/btree
 github.com/klauspost/compress@v1.20.2|BSD-3-Clause|https://github.com/klauspost/compress
 github.com/liyue201/goqr@v0.0.0-20200803022322-df443203d4ea|MIT|https://github.com/liyue201/goqr
