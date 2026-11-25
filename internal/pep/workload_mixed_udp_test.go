@@ -76,6 +76,8 @@ type audioFarEnd struct {
 	count int
 	mu    sync.Mutex
 	up    audioDirection
+	// downSent is closed when the downlink's last packet has been sent.
+	downSent chan struct{}
 }
 
 func newAudioFarEnd(t *testing.T, count int) *audioFarEnd {
@@ -85,7 +87,7 @@ func newAudioFarEnd(t *testing.T, count int) *audioFarEnd {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	f := &audioFarEnd{conn: conn, count: count, up: audioDirection{delays: make([]time.Duration, count)}}
+	f := &audioFarEnd{conn: conn, count: count, up: audioDirection{delays: make([]time.Duration, count)}, downSent: make(chan struct{})}
 	go func() {
 		buf := make([]byte, 2048)
 		started := false
@@ -106,6 +108,7 @@ func newAudioFarEnd(t *testing.T, count int) *audioFarEnd {
 			if !started {
 				started = true
 				go func() {
+					defer close(f.downSent)
 					start := time.Now()
 					for seq := range count {
 						if wait := time.Until(start.Add(time.Duration(seq) * audioInterval)); wait > 0 {
@@ -127,16 +130,31 @@ func (f *audioFarEnd) uplink() audioDirection {
 }
 
 // runCall sends the uplink for count packets and records the downlink until
-// the call and a drain period are over, reading on across any gap.
+// the far end has sent its last packet and a drain period has passed,
+// reading on across any gap. A downlink that never starts ends the wait at
+// the call's length plus a minute.
 func runCall(a *socksAssociation, far *audioFarEnd, count int, drain time.Duration) (down audioDirection) {
 	down.delays = make([]time.Duration, count)
-	end := time.Now().Add(time.Duration(count)*audioInterval + drain)
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-far.downSent:
+			time.Sleep(drain)
+		case <-time.After(time.Duration(count)*audioInterval + time.Minute):
+		}
+		close(stop)
+	}()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		buf := make([]byte, 2048)
-		for time.Now().Before(end) {
-			payload, err := a.receive(buf, end)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			payload, err := a.receive(buf, time.Now().Add(100*time.Millisecond))
 			if err != nil {
 				if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
 					continue
@@ -336,7 +354,7 @@ func runM5Arm(t *testing.T, rig *workloadRig, server *innerQUICServer, far *audi
 		return err
 	}
 	var request [4]byte
-	binary.BigEndian.PutUint32(request[:], 1<<31)
+	binary.BigEndian.PutUint32(request[:], 1<<30) // outlasts the block, and fits an int on 32-bit hosts
 	if _, err := stream.Write(request[:]); err != nil {
 		return err
 	}

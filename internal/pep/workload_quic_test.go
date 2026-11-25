@@ -283,8 +283,8 @@ func runTunnelledQUIC(t *testing.T, path pathsim.Config, size, pages int) []w8Ou
 				return
 			}
 			sentAfter, wireAfter := servers[i].stats(), rigs[i].wireBytes()
-			if n == 0 {
-				errs <- fmt.Errorf("%s: the download delivered nothing in %v", arm.name, limit)
+			if n == 0 || (int(n) < size && elapsed < limit) {
+				errs <- fmt.Errorf("%s: the download ended after %d of %d bytes in %v", arm.name, n, size, elapsed.Round(time.Millisecond))
 				return
 			}
 			o.goodput = float64(n) / elapsed.Seconds()

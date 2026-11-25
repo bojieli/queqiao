@@ -105,7 +105,12 @@ func newWorkloadRig(t *testing.T, path pathsim.Config, arm workloadArm, setup fu
 	if err != nil {
 		t.Fatalf("%s gateway: %v", arm.name, err)
 	}
-	relay, err := pathsim.New("127.0.0.1:0", packetConn.LocalAddr().String(), path)
+	// The client reaches the relay over IPv6 loopback and the gateway is
+	// reached over IPv4, so the two ends' path keys differ ("::1->::1" and
+	// "127.0.0.1->127.0.0.1"), as two hosts' would: on one loopback the
+	// legacy bundle's two controllers would share one path model and each
+	// would learn from the other direction's traffic.
+	relay, err := pathsim.New("[::1]:0", packetConn.LocalAddr().String(), path)
 	if err != nil {
 		t.Fatal(err)
 	}

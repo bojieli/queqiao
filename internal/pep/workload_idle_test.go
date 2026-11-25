@@ -362,7 +362,11 @@ func TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock(t *testing.T) {
 				len(cells), countTrue(arm), len(cells)-len(arm))
 		})
 	}
-	legacy, flip := delivered[t.Name()+"/"+legacyArm.name], delivered[t.Name()+"/"+flipArm.name]
+	legacy, legacyRan := delivered[t.Name()+"/"+legacyArm.name]
+	flip, flipRan := delivered[t.Name()+"/"+flipArm.name]
+	if !legacyRan || !flipRan {
+		return // one arm selected with -run: its own assertions have run
+	}
 	for cell, ok := range legacy {
 		if ok && !flip[cell] {
 			t.Errorf("%s: delivered under the legacy bundle, not under the flip bundle", cell)

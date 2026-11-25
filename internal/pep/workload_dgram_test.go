@@ -62,21 +62,19 @@ type oneShotResult struct {
 // the fraction of queries answered later than that or not at all, for fresh
 // and reused associations separately.
 //
-// Bound (model W11): fraction over 1 s ≤ legacy + 0.5 pp, per kind. The
-// model's margin is for thousands of pooled live queries; at this size one
-// query is several points, so the bound is applied as a count with an
-// allowance of one query, stated in the failure.
+// Bound (model W11): fraction over 1 s ≤ legacy + 0.5 pp, per kind, as a
+// count. The full suite runs 200 queries, 100 of each kind; -short runs 30
+// as a smoke test and reports, since one query there is several points.
 //
 // The path is a long-haul shape at a modest size: 120 ms round trip, 10 %
 // random loss each way, a policed 20 Mbit/s. Queries run one at a time, the
 // next starting when the last is answered or reaches the 1 s retry: fresh
 // and reused associations share the tunnel's coded symbol stream, so a later
 // query in flight could reveal a lost tail that the tunnel must repair on its
-// own. That is the model's 1 s spacing without its idle remainder. -short
-// halves the queries.
+// own. That is the model's 1 s spacing without its idle remainder.
 func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 	requireStableImpairmentClock(t)
-	queries := 60
+	queries := 200
 	if testing.Short() {
 		queries = 30
 	}
@@ -211,18 +209,27 @@ func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 	if !judgeComparisons(t) {
 		return
 	}
-	legacy, flip := over[legacyArm.name], over[flipArm.name]
+	legacy, legacyRan := over[legacyArm.name]
+	flip, flipRan := over[flipArm.name]
+	if !legacyRan || !flipRan {
+		return // one arm selected with -run
+	}
+	if testing.Short() {
+		// At 15 queries a kind one query is several points; the model's
+		// 0.5 pp needs the full suite's count to mean anything.
+		return
+	}
 	for kind, name := range []string{"reused", "fresh"} {
 		if limit := oneShotLimit(legacy[kind], queries/2); flip[kind] > limit {
 			t.Errorf("%s associations: %d of %d queries over %v under the flip bundle against %d under legacy; "+
-				"the bound (legacy + 0.5 pp, plus one query at this size) allows %d",
+				"the bound (legacy + 0.5 pp) allows %d",
 				name, flip[kind], queries/2, retry, legacy[kind], limit)
 		}
 	}
 }
 
 // oneShotLimit is W11's bound as a count: legacy's count plus 0.5 pp of the
-// queries in whole queries, plus one query of small-sample allowance.
+// queries, in whole queries.
 func oneShotLimit(legacy, queries int) int {
-	return legacy + queries*5/1000 + 1
+	return legacy + queries*5/1000
 }
