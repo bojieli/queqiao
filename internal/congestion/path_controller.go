@@ -474,10 +474,13 @@ func (c *PathController) publishObserved(a *PathAttachment, now monotime.Time, w
 	}
 	c.unpublished = false
 	c.law.pacer.settle(now)
-	rateBefore := c.law.bandwidth()
+	rateBefore, windowBefore := c.law.bandwidth(), c.law.GetCongestionWindow()
 	c.law.publishMeasurement()
 	if c.law.bandwidth() > rateBefore {
 		wakes = c.collectPacing(a, wakes)
+	}
+	if c.law.GetCongestionWindow() > windowBefore {
+		wakes = c.collectBlocked(a, wakes)
 	}
 	return wakes
 }
@@ -1117,6 +1120,9 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []func() {
 	now := c.clamp(s.Time)
 	c.accrue(now)
+	if a.staleRTT && a.movedFrom < 0 && s.Space == quiccongestion.SpaceApplication {
+		a.movedFrom = s.Number
+	}
 	var wakes []func()
 	before := c.flight
 	c.setGauge(a, s.InFlight)
@@ -1218,15 +1224,19 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 	c.acked, c.lost = c.acked[:0], c.lost[:0]
 	var resolved quiccongestion.ByteCount
 	// largestOwn says the largest application packet this event newly
-	// acknowledges -- the one its RTT sample times -- was registered on
-	// this controller by this attachment.
+	// acknowledges -- the one its RTT sample times -- was sent after the
+	// move. Ownership is by packet number, not by the fate map, whose
+	// records can expire before a long round trip's ACK arrives; and it is
+	// worked out only while the guard needs it.
 	largestOwn := false
-	largestPN := quiccongestion.PacketNumber(-1)
-	for _, r := range ev.Acked {
-		if r.Space == quiccongestion.SpaceApplication && r.Number > largestPN {
-			largestPN = r.Number
-			_, largestOwn = a.pkts[packetKey{space: r.Space, number: r.Number}]
+	if a.staleRTT && ev.RTTSample > 0 && a.movedFrom >= 0 {
+		largestPN := quiccongestion.PacketNumber(-1)
+		for _, r := range ev.Acked {
+			if r.Space == quiccongestion.SpaceApplication && r.Number > largestPN {
+				largestPN = r.Number
+			}
 		}
+		largestOwn = largestPN >= a.movedFrom
 	}
 	progress := false
 	for _, r := range ev.Acked {
@@ -1415,10 +1425,12 @@ type PathAttachment struct {
 	// the epoch last seen.
 	progress      func() TransportProgress
 	progressEpoch uint64
-	// staleRTT says the attachment moved controllers and none of its packets
-	// on this one has been acknowledged yet: RTT samples still time packets
-	// of the path it left.
-	staleRTT bool
+	// staleRTT says the attachment moved controllers and no RTT sample has
+	// yet timed one of its packets on this one: samples still time packets
+	// of the path it left. movedFrom is its first application packet number
+	// on this controller, -1 until it sends one.
+	staleRTT  bool
+	movedFrom quiccongestion.PacketNumber
 	// bypassed says CONTROL went past this attachment's claim and it has
 	// not been admitted since: no further bypass until it is.
 	bypassed bool
@@ -1631,7 +1643,7 @@ func (a *PathAttachment) OnPathMigrated(now monotime.Time, oldLocal, newLocal, o
 	gauge := a.gauge
 	wakes := old.detach(a, now)
 	// Its packets in flight were sent on the path it left.
-	a.staleRTT = true
+	a.staleRTT, a.movedFrom = true, -1
 	old.mu.Unlock()
 	runWakes(wakes)
 	a.attachTo(next, now, gauge)

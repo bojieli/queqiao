@@ -1716,3 +1716,25 @@ func TestPublishingOutsideAnAckSettlesTheBalance(t *testing.T) {
 		t.Fatalf("the balance was last settled at %v, not at the discard that published (%v)", settled, later)
 	}
 }
+
+// After a move to a path whose round trip exceeds the fresh controller's
+// initial fate horizon, the guard still ends on the first sample timing the
+// attachment's own packet: ownership is by packet number, not by fate
+// records that expired while the ACK was on its way.
+func TestTheMoveRTTGuardEndsOnALongRoundTrip(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	p, gen := movingPC(t, old, next, now, 600*time.Millisecond)
+	*gen = 1
+	fresh := p.send(now, 1200) // moves; its record expires before the ACK
+	if p.a.Controller() != next {
+		t.Fatal("setup: no move")
+	}
+	p.event(now.Add(600*time.Millisecond), []quiccongestion.PacketNumber{fresh}, nil)
+	next.mu.Lock()
+	min := next.rtt.MinRTT()
+	next.mu.Unlock()
+	if min != 600*time.Millisecond {
+		t.Fatalf("the new path never learned its round trip (min %v): the guard outlived the attachment's own packet", min)
+	}
+}
