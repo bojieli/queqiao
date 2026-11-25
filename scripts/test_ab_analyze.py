@@ -255,6 +255,10 @@ class Analyzer(unittest.TestCase):
         # Marginal overlap, below what clock error could explain, is ambiguous.
         self.assertEqual(an.under_load([r("10.050", "10.150")], [r("10.000", "10.100")]), [])
         self.assertEqual(len(an.under_load([r("10.000", "10.500")], [r("10.100", "11.000")])), 1)
+        # A fast probe well inside a long download counts, however short.
+        self.assertEqual(len(an.under_load([r("30.000", "30.020")], [r("0.000", "60.000")])), 1)
+        # At the edge of the load, within the clock uncertainty, it does not.
+        self.assertEqual(an.under_load([r("59.950", "59.970")], [r("0.000", "60.000")]), [])
 
     def test_byte_capped_trials_void_the_gate_and_the_pilot(self):
         # The candidate's flows finish their objects in 5 of 20 s: its bytes
@@ -341,6 +345,14 @@ class Analyzer(unittest.TestCase):
         self.assertIsInstance(n, int)
         self.assertGreaterEqual(n, 2)
         self.assertIn("blocks needed", text)
+
+    def test_a_short_or_incomplete_pilot_recommends_nothing(self):
+        text, res = an.pilot_report(self.campaign("short", cand_ratio=1.0, blocks=6), self.gates)
+        self.assertIsNone(res[("p", "cand")])
+        self.assertIn("withheld: fewer than 12 blocks", text)
+        text, res = an.pilot_report(self.campaign("unfinishedpilot", cand_ratio=1.0, status=None), self.gates)
+        self.assertIsNone(res[("p", "cand")])
+        self.assertIn("No block count is recommended", text)
 
     def test_cli_writes_summary(self):
         root = self.campaign("cli", cand_ratio=1.0)

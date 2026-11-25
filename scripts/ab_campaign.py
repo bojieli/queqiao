@@ -1311,26 +1311,31 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         if not self.dry:
             os.makedirs(self.out, exist_ok=False)
         self.print_plan(slots)
+        # SIGINT/SIGTERM become KeyboardInterrupt from before the first
+        # reservation, so every path out of reserve, build and the plan's
+        # publication releases what was reserved.
+        prev = {}
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            prev[sig] = signal.signal(sig, _interrupt)
         try:
             self.preflight()
             manifest = self.build()
+            plan = {"config": {k: v for k, v in cfg.__dict__.items() if k not in ("gateway", "clients", "arms", "production", "dc", "wl")},
+                    "workload": cfg.workload, "analyzer": cfg.wl.analyzer, "paths": cfg.paths(),
+                    "dc": cfg.dc.__dict__ if cfg.dc else None,
+                    "arms": manifest, "schedule": [s.__dict__ for s in slots], "main": cfg.main.name,
+                    "clients": {c.name: {"small": c.small, "platform": c.platform} for c in cfg.clients.values()}}
+            if not self.dry:
+                with open(os.path.join(self.out, "plan.json"), "w") as f:
+                    json.dump(plan, f, indent=2, default=str)
         except BaseException:
             # Nothing was started; give back whatever was reserved so a
             # corrected rerun is not refused.
             self.release()
+            for sig, h in prev.items():
+                signal.signal(sig, h)
             raise
-        plan = {"config": {k: v for k, v in cfg.__dict__.items() if k not in ("gateway", "clients", "arms", "production", "dc", "wl")},
-                "workload": cfg.workload, "analyzer": cfg.wl.analyzer, "paths": cfg.paths(),
-                "dc": cfg.dc.__dict__ if cfg.dc else None,
-                "arms": manifest, "schedule": [s.__dict__ for s in slots], "main": cfg.main.name,
-                "clients": {c.name: {"small": c.small, "platform": c.platform} for c in cfg.clients.values()}}
-        if not self.dry:
-            with open(os.path.join(self.out, "plan.json"), "w") as f:
-                json.dump(plan, f, indent=2, default=str)
         status = 0
-        prev = {}
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            prev[sig] = signal.signal(sig, _interrupt)
         tsv = None
         try:
             self.started = True
@@ -1382,12 +1387,19 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 self.clean()
             for sig, h in prev.items():
                 signal.signal(sig, h)
+        production_unknown = False
         try:
             self.check_production("after")
         except ProductionChanged as e:
             self.log(f"PRODUCTION CHANGED during the campaign: {e}")
             status = 3
-        production = "changed" if self.production_changed else "unchanged"
+        except Exception as e:
+            # A host that cannot be snapshotted at the end leaves production
+            # unverified: that is an abort, not "nothing was started".
+            self.log(f"the final production snapshot failed: {type(e).__name__}: {e}")
+            production_unknown = True
+            status = status or 6
+        production = "changed" if self.production_changed else "unknown" if production_unknown else "unchanged"
         if leftovers and status == 0:
             status = 5
         if not self.dry:

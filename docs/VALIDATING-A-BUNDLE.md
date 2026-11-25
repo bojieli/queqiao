@@ -155,10 +155,13 @@ followed by its mirror, and every arm is compared with the reference.
   stops as soon as the bulk flows finish, so every sample is taken under
   load. A probe that does not finish counts at its 10-second timeout. Each row
   carries millisecond start and end times on its host's clock (`t_start`,
-  `t_end`). A probe is used only if it overlapped one actual load transfer by
-  at least 0.1 s (`OVERLAP_MIN`, which absorbs NTP-level clock error). A
-  probe in an idle gap between waves, with marginal overlap, or without
-  sub-second times is left out, and a trial with none left is unmeasured.
+  `t_end`). A probe is used only if it ran while some load transfer did.
+  0.1 s of clock uncertainty (`OVERLAP_MIN`, for NTP-level error between
+  hosts) is taken off each end of every load interval, and the probe must
+  overlap what remains. So a 20 ms probe in the middle of a download counts,
+  and one at the download's edge does not. A probe in an idle gap between
+  waves, or without sub-second times, is left out, and a trial with none left
+  is unmeasured.
 
 A stage's gate needs all three. Run them as three campaigns with different
 names.
@@ -201,7 +204,8 @@ campaign, then:
 The pilot table gives, per path and candidate, the blocks needed for 80%
 power when the true ratio is 1, using the pilot's contrast variance and its
 mean main outcome. If no block count up to 100,000 reaches that power, the
-table says so instead of printing a number. Freeze the largest number as
+table says so instead of printing a number. It also withholds the number
+for a pilot that is incomplete or shorter than 12 blocks. Freeze the largest number as
 `blocks`. Do not reuse the
 pilot's blocks, and change the campaign `name` so the new campaign gets its
 own directory.
@@ -226,7 +230,9 @@ A campaign directory holds:
   whether production was unchanged, which temporary listeners or processes
   survived teardown, and which log files could not be fetched. Either of the
   last two makes the runner keep the remote work directories, and a teardown
-  leftover makes it exit with status 5.
+  leftover makes it exit with status 5. If the final production snapshot
+  cannot be taken, the campaign is recorded as aborted with production
+  `unknown`, and the runner exits with status 6.
 
 The analyzer adds `per_trial.tsv` and `summary.md`.
 
@@ -331,6 +337,11 @@ and each client host is one leaf under a shared ancestor. The DC campaign
   loaded leaf to have been in each wave together for at least 0.1 s, on
   millisecond times; otherwise latency and spread are unmeasured. This also
   relies on NTP-synchronised clocks.
+- **A shared sustained window:** every loaded leaf must have been
+  transferring together for at least 90% of the window. A leaf whose ssh
+  session missed the barrier runs late and alone, and its bytes are not
+  service it received while competing. Otherwise that trial's aggregate,
+  worst-leaf, fairness and binding measures are unmeasured.
 - **Calibration:** at the end of every block, each loaded leaf runs alone on
   the legacy arm. Every judged block needs its own usable calibration of every
   loaded leaf; otherwise the campaign is INCOMPLETE.

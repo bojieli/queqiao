@@ -284,6 +284,26 @@ class DCGate(unittest.TestCase):
         self.assertEqual(v["cand"], "VOID")
         self.assertIn("client lc fell back to TCP", text)
 
+    def test_a_tcp_record_without_a_leaf_key_is_still_tcp(self):
+        # The gateway omits path_key for TCP carriers: that is evidence of
+        # TCP, not missing evidence.
+        text, v = self.run_gate("tcpnokey", tcp_leaf="lb", no_path_key=True)
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("not only QUIC", text)
+
+    def test_a_leaf_that_missed_the_sustained_window_is_unmeasured(self):
+        root = os.path.join(self.tmp.name, "late")
+        write_dc(root, blocks=2)
+        plan, trials = dc.read_campaign(root)
+        t = next(t for t in trials.values() if t.arm == "legacy" and t.slot < 100)
+        for r in t.rows:
+            if r["client"] == "lc" and r["phase"] == "sustained":
+                r["t_start"] = ms(float(r["t_start"]) + 20)
+                r["t_end"] = ms(float(r["t_end"]) + 20)
+        m = dc.dc_measures(t, LOADED, "ctl", 30, 60)
+        self.assertNotEqual(m["jain"], m["jain"])
+        self.assertNotEqual(m["aggregate_bytes"], m["aggregate_bytes"])
+
     def test_without_leaf_evidence_there_is_no_verdict(self):
         text, v = self.run_gate("nokey", no_path_key=True)
         self.assertEqual(v["cand"], "INCOMPLETE")

@@ -230,7 +230,9 @@ def probe_script(campaign: Any, job: Job, arm: Any, duration: float, start_at: i
     drops the stop file after the phase's load finished."""
     url, curl = _curl(campaign, job, arm)
     stop = campaign.stop_file(job.client, arm)
-    return (ab.NOW_SH + f"end=$(( $(date +%s) + {int(duration)} )); i=0; "
+    # On the phase's barrier like its load, so the window it measures is the
+    # window the load runs in.
+    return (ab.NOW_SH + _barrier(start_at) + f"end=$(( $(date +%s) + {int(duration)} )); i=0; "
             f"while [ $(date +%s) -lt $end ] && [ ! -e {stop} ]; do i=$((i+1)); "
             f"t0=$(now); r=$({curl} --max-time {ab.PROBE_TIMEOUT} {url}obj-{job.params['bytes']} 2>/dev/null); t1=$(now); "
             f"{_ROW} \"p$i\" \"$r\"; sleep {job.params['interval']}; done; rm -f {stop}")

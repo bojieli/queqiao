@@ -162,16 +162,19 @@ def overlap(a: Tuple[float, float], b: Tuple[float, float]) -> float:
 
 
 def under_load(probes: List[dict], load: List[dict]) -> List[dict]:
-    """Probes that demonstrably overlapped a load transfer, by at least
-    OVERLAP_MIN against some single load row: the union of load intervals,
-    so an idle gap between waves does not count. A probe whose overlap
-    cannot be shown (untimed, or only marginal) is left out, and the measure
-    becomes unmeasured rather than idle. Hosts are assumed NTP-synchronised."""
-    spans = [sp for sp in (span(r) for r in load) if sp is not None]
+    """Probes that demonstrably ran while some load transfer did. Clock
+    uncertainty (OVERLAP_MIN, for NTP-level error between hosts and the
+    milliseconds the timestamps bracket around curl) is taken off each load
+    interval's ends, and a probe counts if it overlaps what remains: a 20 ms
+    probe in the middle of a download counts, one at its edge does not. A
+    probe whose overlap cannot be shown (untimed, in a gap between waves,
+    marginal) is left out, and the measure becomes unmeasured, not idle."""
+    spans = [(a + OVERLAP_MIN, b - OVERLAP_MIN) for a, b in (sp for sp in (span(r) for r in load) if sp is not None)
+             if b - a > 2 * OVERLAP_MIN]
     out = []
     for r in probes:
         sp = span(r)
-        if sp is not None and any(overlap(sp, x) >= OVERLAP_MIN - 1e-6 for x in spans):
+        if sp is not None and any(sp[1] > a and sp[0] < b for a, b in spans):
             out.append(r)
     return out
 
@@ -761,7 +764,8 @@ def pilot_report(campaign: str, gates: dict) -> Tuple[str, dict]:
            "before the campaign, and do not reuse the pilot's blocks.", "",
            "| path | candidate | pilot blocks | E[main], MB | sd(contrast), MB | blocks needed |", "|---|---|---:|---:|---:|---:|"]
     if problems:
-        out[2:2] = ["**The pilot is incomplete:** " + "; ".join(problems) + ".", ""]
+        out[2:2] = ["**The pilot is incomplete:** " + "; ".join(problems) + ". No block count is recommended "
+                    "until a complete pilot exists.", ""]
     res = {}
     for path in plan["paths"]:
         for cand in arms:
@@ -784,8 +788,14 @@ def pilot_report(campaign: str, gates: dict) -> Tuple[str, dict]:
                 n = None
             except OverflowError:
                 n = "more than 100000: the paths' variance is too large for this gate"
+            note = ""
+            if problems or len(common) < gates["pilot_blocks"]:
+                # The variance is shown for diagnosis; the number to freeze is
+                # withheld until the pilot is complete and long enough.
+                why = "incomplete pilot" if problems else f"fewer than {gates['pilot_blocks']} blocks"
+                note = f" (withheld: {why})"
+                n = None
             res[(path, cand)] = n
-            note = "" if len(common) >= gates["pilot_blocks"] else f" (pilot has fewer than {gates['pilot_blocks']} blocks)"
             out.append(f"| {path} | {cand} | {len(common)} | {fmt(em / 1e6, '.1f')} | {fmt(sd / 1e6, '.2f')} | "
                        f"{n if n is not None else 'n/a'}{note} |")
     return "\n".join(out) + "\n", res

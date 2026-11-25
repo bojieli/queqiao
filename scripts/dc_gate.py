@@ -52,6 +52,19 @@ def leaf_rate(rows: List[dict]) -> float:
     return sum(useful(r) for r in rows) / secs if secs > 0 else float("nan")
 
 
+def shared_window(rows: List[dict], leaves: List[str], duration: float, share: float = 0.9) -> bool:
+    """Every leaf was transferring together for at least `share` of the
+    window, on millisecond times less the clock uncertainty."""
+    iv = []
+    for leaf in leaves:
+        sp = [x for x in (span(r) for r in rows if r["client"] == leaf) if x]
+        if not sp:
+            return False
+        iv.append((min(a for a, _ in sp), max(b for _, b in sp)))
+    common = min(b for _, b in iv) - max(a for a, _ in iv) - 2 * OVERLAP_MIN
+    return duration <= 0 or common >= share * duration
+
+
 def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: float, duration: float = 0.0) -> Dict[str, float]:
     m: Dict[str, float] = {}
     sus = [r for r in t.rows if r["phase"] == "sustained" and r["kind"] == "bulk"]
@@ -63,6 +76,12 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     m["aggregate_bytes"] = sum(per_leaf.values())
     m["worst_leaf_bytes"] = min(per_leaf.values()) if per_leaf else float("nan")
     m["jain"] = st.jain(list(per_leaf.values()))
+    # The leaves' sustained transfers must have shared the window: a leaf
+    # whose ssh session missed the barrier runs late and alone, and its
+    # bytes are not service it got while competing.
+    if not shared_window(sus, loaded, duration):
+        for k in ("sim_rate", "aggregate_bytes", "worst_leaf_bytes", "jain"):
+            m[k] = float("nan")
     req = [r for r in t.rows if r["phase"] == "requests" and r["kind"] == "requests"]
     # An unfinished request is censored at its timeout rather than dropped:
     # dropping it would reward the arm that failed it.
@@ -152,12 +171,18 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
 
     def check(t: Trial, leaves: List[str], what: str) -> Optional[set]:
         rs = in_trial(t)
-        if not rs or any("path_key" not in r for r in rs):
+        if not rs:
+            missing.append(f"{what}: no gateway record of its flows")
+            return None
+        # The carrier first: a TCP record is positive evidence against the
+        # gate (and carries no leaf key by design).
+        if any(r.get("transport") != "quic" for r in rs):
+            wrong.append(f"{what}: flows ran over {sorted({str(r.get('transport')) for r in rs})}, not only QUIC")
+            return None
+        if any("path_key" not in r for r in rs):
             missing.append(f"{what}: no gateway record of its carrier and leaf (needs QUEQIAO_LANE_TRACE=1 and a build "
                            "that logs path_key)")
             return None
-        if any(r.get("transport") != "quic" for r in rs):
-            wrong.append(f"{what}: flows ran over {sorted({r.get('transport') for r in rs})}, not only QUIC")
         for leaf in leaves:
             fb = fallbacks(t, leaf)
             if fb != fb:
@@ -218,7 +243,6 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     for t in ab:
         t.m = dc_measures(t, loaded, control, dc["request_timeout"], duration)
     evidence_missing, evidence_wrong = carrier_evidence(campaign, plan, ab, solo, loaded, control)
-    problems = problems + evidence_missing
 
     def per_block(arm: str, key: str, agg) -> Dict[int, float]:
         out: Dict[int, List[float]] = {}
@@ -253,8 +277,8 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
             continue
         binding.append(st.mean(sim) / sum(rates[x] for x in loaded))
     if uncalibrated:
-        problems = problems + [f"{len(uncalibrated)} block(s) lack a usable solo calibration of every loaded leaf "
-                               f"(first: block {uncalibrated[0]})"]
+        evidence_missing = evidence_missing + [f"{len(uncalibrated)} block(s) lack a usable solo calibration of every "
+                                               f"loaded leaf (first: block {uncalibrated[0]})"]
     binding_mean = st.mean(binding)
     bound_ok = binding_mean == binding_mean and binding_mean <= bounds["binding_max"]
     # The sustained outcome is bytes within the window; if a flow ran out of
@@ -362,10 +386,13 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
             out.append(f"| {label} | `{desc}` | {len(d)} | {fmt(mean_d, '.4g')} | {fmt(tl, '.4g')} | {fmt(bl, '.4g')} | {cell} |")
         # An unfinished campaign has no verdict; a finished one that did not
         # test the regime is void; then every criterion must be measured.
-        why = problems + ([] if void_reason else unmeasured)
+        # An unfinished campaign has no verdict. Positive evidence that the
+        # traffic was not what the gate is about voids it even where other
+        # evidence is missing. Then every criterion needs its evidence.
+        why = problems + ([] if void_reason else evidence_missing + unmeasured)
         verdict = ("INCOMPLETE" if problems else
                    "VOID" if void_reason else
-                   "INCOMPLETE" if unmeasured else
+                   "INCOMPLETE" if evidence_missing or unmeasured else
                    "PASS" if all_pass else "FAIL")
         verdicts[cand] = verdict
         out += ["", f"**Verdict for {cand}: {verdict}.** "

@@ -84,6 +84,11 @@ class DryRun(unittest.TestCase):
         self.assertIn("touch ~/qq-ab-example-dc-gate/run/stop-probe-leaf-ctl-", lines[i + 1])
         self.assertIn("[ ! -e ~/qq-ab-example-dc-gate/run/stop-probe-leaf-ctl-", text)
 
+    def test_the_control_probe_waits_for_the_barrier(self):
+        _, text = self.run_dry(DC_EXAMPLE)
+        probe = next(l for l in text.splitlines() if "stop-probe-leaf-ctl" in l and "while [ $(date +%s) -lt $end ]" in l)
+        self.assertRegex(probe, r"while \[ \$\(date \+%s\) -lt \d+ \]; do sleep 0.1; done; end=")
+
     def test_dc_leaves_start_on_a_shared_barrier(self):
         _, text = self.run_dry(DC_EXAMPLE)
         self.assertRegex(text, r"while \[ \$\(date \+%s\) -lt \d+ \]; do sleep 0.1; done; end=")
@@ -368,6 +373,45 @@ class Safety(unittest.TestCase):
             status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
         self.assertEqual(rc, 3)
         self.assertEqual(status["production"], "changed")
+
+    def test_signals_are_caught_from_the_first_reservation(self):
+        import signal
+        seen = {}
+        camp = ab.Campaign(parse(BASE), "/nonexistent/out", ".", dry=False, stream=io.StringIO())
+        before = signal.getsignal(signal.SIGTERM)
+
+        def preflight(self_):
+            seen["handler"] = signal.getsignal(signal.SIGTERM)
+            raise KeyboardInterrupt
+        with mock.patch.object(ab.os, "makedirs"), mock.patch.object(ab.Campaign, "preflight", preflight), \
+                mock.patch.object(ab.Campaign, "release") as release:
+            with self.assertRaises(KeyboardInterrupt):
+                camp.run()
+        self.assertIs(seen["handler"], ab._interrupt)
+        release.assert_called_once()
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+    def test_an_unverifiable_final_snapshot_is_an_abort(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            camp = ab.Campaign(parse(BASE), os.path.join(tmp, "out"), ".", dry=False, stream=io.StringIO())
+            same = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("listen-ok")}
+
+            def snapshot_all(self_, tag):
+                if tag == "after":
+                    raise ab.Refused("gw: snapshot failed (exit 255)")
+                return same if tag != "teardown" else {"gw": ab.parse_snapshot("listen-ok"), "c1": ab.parse_snapshot("listen-ok")}
+            with mock.patch.object(ab.Campaign, "snapshot_all", snapshot_all), \
+                    mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
+                    mock.patch.object(ab.Campaign, "setup"), mock.patch.object(ab.Campaign, "record_effective"), \
+                    mock.patch.object(ab.Campaign, "run_block"), mock.patch.object(ab.Campaign, "teardown"), \
+                    mock.patch.object(ab.Campaign, "clean"), mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), \
+                    mock.patch.object(ab.time, "sleep"):
+                rc = camp.run()
+            status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
+        self.assertEqual(rc, 6)
+        self.assertEqual(status["status"], "aborted")
+        self.assertEqual(status["production"], "unknown")
 
     def test_refused_campaign_starts_nothing(self):
         cfg = parse(BASE)
