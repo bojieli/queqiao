@@ -836,9 +836,9 @@ class LocalProcesses(unittest.TestCase):
                         pass
             self.assertTrue(done.wait(10))
 
-    def members(self, tok, mode, env=None):
-        p = subprocess.run(["bash", "-s"], input=ab.JOB_OWN_SH + f"\nmembers {tok} {mode}", capture_output=True,
-                           text=True, env=env)
+    def members(self, tok, mode, env=None, jobpid=""):
+        p = subprocess.run(["bash", "-s"], input=ab.JOB_OWN_SH + f"\nmembers {tok} {mode} {jobpid}",
+                           capture_output=True, text=True, env=env)
         return p.returncode, p.stdout.split()
 
     def test_job_tokens_are_fixed_length_random(self):
@@ -862,6 +862,24 @@ class LocalProcesses(unittest.TestCase):
         self.assertEqual((rc, pids), (0, [str(mine.pid)]))
         rc, pids = self.members("b" * 32, "proc")
         self.assertEqual((rc, pids), (1, []))
+
+    @unittest.skipUnless(os.path.exists("/proc/self/environ"), "needs /proc/<pid>/environ (Linux)")
+    def test_an_unreadable_process_is_skipped_unless_it_is_the_jobs_own(self):
+        # A non-dumpable process of this user: its environ is unreadable.
+        prog = ("import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); "    # PR_SET_DUMPABLE 0
+                "print('ready', flush=True); time.sleep(30)")
+        hidden = subprocess.Popen([sys.executable, "-c", prog], stdout=subprocess.PIPE, text=True)
+        self.procs.append(hidden)
+        self.assertEqual(hidden.stdout.readline().strip(), "ready")
+        with self.assertRaises(OSError):
+            open(f"/proc/{hidden.pid}/environ", "rb").read()
+        tok = "d" * 32
+        # Someone else's unreadable process: skipped, so a verified none.
+        rc, pids = self.members(tok, "proc", jobpid=os.getpid())
+        self.assertEqual((rc, pids), (1, []))
+        # The job's own recorded pid unreadable: the scan cannot vouch for it.
+        rc, pids = self.members(tok, "proc", jobpid=hidden.pid)
+        self.assertEqual(rc, 2)
 
     def test_a_failed_inspection_is_never_verified_absence(self):
         self.assertEqual(self.members("c" * 32, "bogus")[0], 2)

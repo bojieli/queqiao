@@ -121,7 +121,9 @@ built to refuse rather than to trust:
   shows environments). Teardown signals exactly the owners (TERM, then
   KILL), checks that none is left, and only then removes the job's record:
   only a verified absence retires it, and an inspection that fails leaves it
-  in place, reported as unverified. Where ownership cannot be established (a macOS host whose
+  in place, reported as unverified. A process whose environment cannot be
+  read (not dumpable, or exiting) is skipped, except the job's own recorded
+  process, which must be readable or the inspection fails. Where ownership cannot be established (a macOS host whose
   `ps` hides environments), nothing is signalled: the record stays and the
   teardown is reported as unverified, for manual cleanup. A record whose
   fields do not each check out is left alone; a `run/` directory that

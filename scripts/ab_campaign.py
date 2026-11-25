@@ -854,14 +854,18 @@ JOB_OWN_SH = r'''own_mode() {
   if ps -E -ww -o command= -p "$q" 2>/dev/null | tr ' ' '\n' | grep -q -x -F 'QQ_AB_PROBE=yes'; then echo ps; else echo none; fi
   kill "$q" 2>/dev/null; wait "$q" 2>/dev/null
 }
-# members TOKEN MODE: the owners' pids on stdout; exit 0 found, 1 verified
-# none, 2 the processes could not be inspected. An owner has the exact entry
-# QQ_AB_TOKEN=<token> in its environment: a whole NUL-separated entry of
-# /proc/<pid>/environ, or a whole whitespace-separated word of ps -E's line.
+# members TOKEN MODE JOBPID: the owners' pids on stdout; exit 0 found, 1
+# verified none, 2 the processes could not be inspected. An owner has the
+# exact entry QQ_AB_TOKEN=<token> in its environment: a whole NUL-separated
+# entry of /proc/<pid>/environ, or a whole whitespace-separated word of ps
+# -E's line. A process whose environment cannot be read (not dumpable, or
+# exiting) is skipped -- except the job's own recorded pid, which this
+# campaign spawned and must be able to inspect. A scan that fails as a whole
+# (/proc unlistable, ps failing) is exit 2.
 members() {
-  python3 - "$1" "$2" "$$" <<'QQ_AB_PY'
+  python3 - "$1" "$2" "$$" "${3:-}" <<'QQ_AB_PY'
 import os, subprocess, sys
-tok, mode, me = sys.argv[1], sys.argv[2], sys.argv[3]
+tok, mode, me, job = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 want = ("QQ_AB_TOKEN=" + tok).encode()
 found = []
 try:
@@ -875,8 +879,10 @@ try:
                     continue
                 with open("/proc/%s/environ" % d, "rb") as f:
                     env = f.read()
-            except (FileNotFoundError, ProcessLookupError):
-                continue          # it ended meanwhile
+            except OSError:
+                if d == job and os.path.exists("/proc/" + d):
+                    sys.exit(2)   # the job's own process, alive and unreadable
+                continue          # ended meanwhile, or not readable: skipped
             if want in env.split(b"\0"):
                 found.append(d)
     elif mode == "ps":
@@ -887,6 +893,8 @@ try:
                 found.append(words[0].decode())
     else:
         sys.exit(2)
+except SystemExit:
+    raise
 except Exception:
     sys.exit(2)
 print(" ".join(found))
@@ -1418,7 +1426,7 @@ rm -f "$f"''', what=f"stop {tag}")
                 f"wait $j\nrc=$?\n"
                 f"m=$(own_mode)\n"
                 # Only a verified absence (exit 1) retires the descriptor.
-                f"if [ \"$m\" != none ]; then members {tok} $m >/dev/null; [ $? -eq 1 ] && rm -f {f} {body}; fi\n"
+                f"if [ \"$m\" != none ]; then members {tok} $m $j >/dev/null; [ $? -eq 1 ] && rm -f {f} {body}; fi\n"
                 f"exit $rc")
 
     def interim(self, path: str, trial: str = "") -> Tuple[bool, str]:
@@ -1736,7 +1744,7 @@ for f in {W}/run/job-*.pgid; do
   case "$p" in ""|*[!0-9]*) echo "stale job descriptor $f left alone"; continue;; esac
   tok_ok "$t" && [ -z "$x" ] || {{ echo "stale job descriptor $f left alone"; continue; }}
   [ "$m" = none ] && {{ echo "UNVERIFIED: $f: job ownership cannot be established on this host"; continue; }}
-  ps_=$(members "$t" "$m"); r=$?
+  ps_=$(members "$t" "$m" "$p"); r=$?
   [ $r -eq 2 ] && {{ echo "UNVERIFIED: $f: the processes could not be inspected"; continue; }}
   [ $r -eq 0 ] && kill -TERM $ps_ 2>/dev/null
 done
@@ -1746,9 +1754,9 @@ for f in {W}/run/job-*.pgid; do
   read -r p t x < "$f" 2>/dev/null || continue
   case "$p" in ""|*[!0-9]*) continue;; esac
   tok_ok "$t" && [ -z "$x" ] && [ "$m" != none ] || continue
-  ps_=$(members "$t" "$m"); r=$?
+  ps_=$(members "$t" "$m" "$p"); r=$?
   [ $r -eq 0 ] && kill -KILL $ps_ 2>/dev/null
-  for i in 1 2 3 4 5 6 7 8 9 10; do members "$t" "$m" >/dev/null; r=$?; [ $r -ne 0 ] && break; sleep 0.2; done
+  for i in 1 2 3 4 5 6 7 8 9 10; do members "$t" "$m" "$p" >/dev/null; r=$?; [ $r -ne 0 ] && break; sleep 0.2; done
   # Only a verified absence retires the descriptor.
   case $r in
     1) rm -f "$f" "${{f%.pgid}}.sh" ;;
