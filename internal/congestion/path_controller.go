@@ -1148,7 +1148,7 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 		// since the last acknowledgement stand in for its expiry count.
 		a.ptoSinceProgress++
 		if !a.probing && a.ptoSinceProgress >= pathProbingPTOProbes {
-			wakes = append(wakes, c.demote(a)...)
+			wakes = append(wakes, c.demote(a, now)...)
 			before = c.flight
 			// Its flight left the sum: the siblings it held may send.
 			wakes = c.collectBlocked(a, wakes)
@@ -1185,7 +1185,13 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 // Its discards can release siblings' resolved outcomes held behind its
 // records; those are observed and published now, and the wakers of siblings
 // a rate or window rise frees are returned.
-func (c *PathController) demote(a *PathAttachment) []func() {
+//
+// at is the demoting callback's time, zero for a callback that carries none
+// (then the clock is read): a publication settles the balance at the
+// demotion's time, which for a PTO probe is its own clamped send time -- a
+// later reading would move the balance's time past the probe's, and the
+// probe's debit would then rewind it and credit the interval twice.
+func (c *PathController) demote(a *PathAttachment, at monotime.Time) []func() {
 	if a.probing {
 		return nil
 	}
@@ -1201,10 +1207,11 @@ func (c *PathController) demote(a *PathAttachment) []func() {
 			c.discard(a, key)
 		}
 	}
-	// Demotion can be found from transport progress before the callback's
-	// own time is clamped in: read the clock, so a publication settles the
-	// balance at the demotion's time, not the previous event's.
-	now := c.clamp(c.clock())
+	now := at
+	if now.IsZero() {
+		now = c.clock()
+	}
+	now = c.clamp(now)
 	c.advance(now)
 	return c.publishObserved(a, now, nil)
 }
@@ -1592,7 +1599,7 @@ func (a *PathAttachment) OnDemand(d quiccongestion.Demand) {
 	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
-	early := c.applyProgress(a, tp)
+	early := c.applyProgress(a, tp, 0)
 	wakes := c.setDemand(a, d)
 	wakes = append(wakes, early...)
 	c.mu.Unlock()
@@ -1604,7 +1611,7 @@ func (a *PathAttachment) Admit(now monotime.Time, maxBytes quiccongestion.ByteCo
 	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
-	early := c.applyProgress(a, tp)
+	early := c.applyProgress(a, tp, now)
 	p, wakes := c.admit(a, now, maxBytes)
 	wakes = append(wakes, early...)
 	c.mu.Unlock()
@@ -1619,7 +1626,7 @@ func (a *PathAttachment) OnSent(s quiccongestion.SentPacket) {
 	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
-	early := c.applyProgress(a, tp)
+	early := c.applyProgress(a, tp, s.Time)
 	wakes := c.sent(a, s)
 	wakes = append(wakes, early...)
 	c.mu.Unlock()
@@ -1631,7 +1638,7 @@ func (a *PathAttachment) OnAckEvent(ev quiccongestion.AckEvent) {
 	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
-	early := c.applyProgress(a, tp)
+	early := c.applyProgress(a, tp, ev.Time)
 	wakes := c.ackEvent(a, ev)
 	wakes = append(wakes, early...)
 	c.mu.Unlock()
@@ -1642,7 +1649,7 @@ func (a *PathAttachment) OnDiscarded(now monotime.Time, inFlight quiccongestion.
 	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
-	early := c.applyProgress(a, tp)
+	early := c.applyProgress(a, tp, now)
 	wakes := c.discarded(a, now, inFlight, refs)
 	wakes = append(wakes, early...)
 	c.mu.Unlock()
@@ -1764,7 +1771,7 @@ func (a *PathAttachment) readProgress() (tp TransportProgress) {
 // applyProgress moves the attachment between COUNTED and PROBING on its
 // transport's progress. It is called, with a fresh reading, at every
 // callback of the connection's run loop.
-func (c *PathController) applyProgress(a *PathAttachment, tp TransportProgress) []func() {
+func (c *PathController) applyProgress(a *PathAttachment, tp TransportProgress, at monotime.Time) []func() {
 	if a.progress == nil {
 		return nil
 	}
@@ -1775,7 +1782,7 @@ func (c *PathController) applyProgress(a *PathAttachment, tp TransportProgress) 
 	}
 	if !a.probing && tp.PTOExpiries >= pathProbingPTOExpiries {
 		before := c.flight
-		wakes := c.demote(a)
+		wakes := c.demote(a, at)
 		if c.flight < before {
 			wakes = c.collectBlocked(a, wakes)
 		}
@@ -1793,7 +1800,7 @@ func (a *PathAttachment) SetProbing(on bool) {
 	var wakes []func()
 	if on {
 		before := c.flight
-		wakes = c.demote(a)
+		wakes = c.demote(a, 0)
 		if c.flight < before {
 			wakes = c.collectBlocked(a, wakes)
 		}
