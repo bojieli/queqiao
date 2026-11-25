@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/bojieli/queqiao/internal/classifier"
+	wancongestion "github.com/bojieli/queqiao/internal/congestion"
 	"github.com/bojieli/queqiao/internal/metrics"
 )
 
@@ -99,8 +100,8 @@ func TestTopologyValidator(t *testing.T) {
 
 // The placement decision itself: under topology=single nothing moves a flow
 // to a second connection unless a fan-out is configured, and then the
-// trigger is exactly isolation's -- a bulk flow sharing the preferred
-// connection -- within the fan-out's connection budget.
+// trigger is a bulk flow sharing its generation of the preferred connection,
+// within the fan-out's connection budget.
 func TestSingleTopologyIsolatesOnlyForAnExplicitFanOut(t *testing.T) {
 	bulk := flowSnapshot{Class: classifier.ClassBulk}
 	quiet := flowSnapshot{Class: classifier.ClassInteractive}
@@ -127,7 +128,9 @@ func TestSingleTopologyIsolatesOnlyForAnExplicitFanOut(t *testing.T) {
 			client := &Client{cfg: ClientConfig{Topology: c.topology, TopologyFanOut: c.fanOut}}
 			client.memoryLimits.maxBulkConnections = isolatedBulkConns
 			client.quicPoolActive.Store(c.shared)
-			if got := client.secondConnectionWanted(c.snapshot); got != c.want {
+			generation := &controlQUICGeneration{}
+			generation.flows.Store(c.shared)
+			if got := client.secondConnectionWanted(c.snapshot, generation); got != c.want {
 				t.Fatalf("secondConnectionWanted = %v, want %v", got, c.want)
 			}
 			if got := client.maxBulkConns(); got != c.budget {
@@ -517,17 +520,35 @@ func TestSingleTopologyRescuesAFlowThatLosesItsLane(t *testing.T) {
 	// dial finishes its handshake, so dial one directly, as a rescue
 	// round's sprayed attempt does: it is a second attachment of the same
 	// controller, not a second controller.
-	_, before := pathAttachments(rig.client.pathPrincipalNow() + "|")
+	// The identity is compared directly, not inferred from an attachment
+	// count that moves as the rescue round's losers detach (#201).
+	rig.client.quicMu.Lock()
+	preferred := rig.client.quicGeneration
+	rig.client.quicMu.Unlock()
+	if preferred == nil {
+		t.Fatal("no preferred connection")
+	}
+	want, ok := preferred.controller.(*wancongestion.PathAttachment)
+	if !ok {
+		t.Fatalf("the preferred connection's controller is %T, not a path attachment", preferred.controller)
+	}
 	lane, err := rig.client.dialJoinLane(context.Background(), TransportQUIC, [16]byte{7}, 9)
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 5*time.Second, "the rescue dial to attach", func() bool {
-		_, n := pathAttachments(rig.client.pathPrincipalNow() + "|")
-		return n == before+1
-	})
-	if controllers, _ := pathAttachments(rig.client.pathPrincipalNow() + "|"); controllers != 1 {
-		t.Fatalf("a dedicated rescue connection made %d controllers", controllers)
+	dedicated, ok := lane.outer.(*quicStreamConn)
+	if !ok || dedicated.conn == preferred.conn {
+		t.Fatalf("the rescue dial is not a connection of its own: %T", lane.outer)
+	}
+	got, ok := dedicated.controller.(*wancongestion.PathAttachment)
+	if !ok {
+		t.Fatalf("the rescue connection's controller is %T, not a path attachment", dedicated.controller)
+	}
+	if got == want {
+		t.Fatal("the rescue connection shares the preferred connection's attachment")
+	}
+	if got.Controller() != want.Controller() {
+		t.Fatal("the rescue connection attached to a different path controller")
 	}
 	_ = lane.fc.Close()
 	if s.LaneReplacements == 0 {
@@ -820,5 +841,80 @@ func TestEndedConnectionHoldsNoWindowCredit(t *testing.T) {
 	third, none := client.reservePreferredWindows()
 	if third.maxConnection != mib || none != nil {
 		t.Fatalf("a second live preferred connection got %d KiB beside a live holder", third.maxConnection>>10)
+	}
+}
+
+// Fan-out judges sharing on the flow's own generation (#201). After a
+// handover one flow still drains on the old generation while one bulk flow
+// is alone on the replacement: the client-wide pooled count is two, but
+// neither connection is shared, so the bulk flow stays on its warm
+// connection. A second flow on the replacement is sharing, and fans out.
+func TestFanOutJudgesSharingPerGeneration(t *testing.T) {
+	pathAuthorities.forget()
+	// A client that is not serving a listener runs no path prewarm, so the
+	// only pooled flows are the test's.
+	certificate, roots := testCertificate(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, Logger: logger,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true},
+		CCAPI:             CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serving, stop := context.WithCancel(context.Background())
+	defer stop()
+	go func() { _ = server.ServePacketConn(serving, packetConn) }()
+	cfg := newBundleClientConfig(TopologySingle)
+	cfg.TopologyFanOut = 2
+	cfg.ListenAddr, cfg.RemoteAddr, cfg.Credentials, cfg.Logger = "127.0.0.1:0", packetConn.LocalAddr().String(), roots, logger
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.closeQUICPool()
+	ctx := context.Background()
+	pooled := func(id byte) (*authenticatedLane, *controlQUICGeneration) {
+		t.Helper()
+		lane, err := client.dialLaneMode(ctx, TransportQUIC, [16]byte{id}, 0, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = lane.fc.Close() })
+		s, ok := lane.outer.(*controlPoolStreamConn)
+		if !ok || s.generation == nil {
+			t.Fatalf("lane %d is not a pooled stream: %T", id, lane.outer)
+		}
+		return lane, s.generation
+	}
+	_, old := pooled(1)
+	// A handover: the old generation stops lending and drains while its
+	// flow lives on.
+	client.supersedeSilentGeneration(old, nil)
+	_, replacement := pooled(2)
+	if replacement == old || old.conn.Context().Err() != nil {
+		t.Fatal("no draining generation beside the replacement")
+	}
+	bulk := flowSnapshot{Class: classifier.ClassBulk}
+	if n := client.quicPoolActive.Load(); n != 2 {
+		t.Fatalf("pooled flows across generations = %d, want 2 (the count the old trigger read)", n)
+	}
+	if client.secondConnectionWanted(bulk, replacement) {
+		t.Fatal("a bulk flow alone on the replacement fans out because a flow drains on the old generation")
+	}
+	_, again := pooled(3)
+	if again != replacement {
+		t.Fatal("the second flow landed on another generation")
+	}
+	if !client.secondConnectionWanted(bulk, replacement) {
+		t.Fatal("a bulk flow sharing the replacement does not fan out")
+	}
+	if client.secondConnectionWanted(bulk, nil) {
+		t.Fatal("a flow on no pooled generation fans out")
 	}
 }
