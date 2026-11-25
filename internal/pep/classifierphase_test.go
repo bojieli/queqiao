@@ -697,7 +697,8 @@ func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
 		{"eight slots of 1 KiB staged reads", base, eightSlots, 32 << 10, stagingBytes, false, 3584},
 		{"ios, legacy memory", base, ios, iosChunkSize, iosChunkSize, false, 64 << 10},
 		{"ios, mem=owned at the autotune floor", base, ios, iosChunkSize, iosChunkSize, true, 24 << 10},
-		{"ios, mem=owned, staged reads", base, ios, iosChunkSize, stagingBytes, true, 32256},
+		{"ios, mem=owned, staged reads that may be extended", base, ios, iosChunkSize, stagingBytes, true, 24 << 10},
+		{"48 KiB send bound, mem=owned, staged reads that may be extended", base, small, defaultChunkSize, stagingBytes, true, 8 << 10},
 		{"a profile's lower threshold is kept", 16 << 10, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 16 << 10},
 	} {
 		if got := backlogThresholdFor(c.base, c.limits, c.chunk, c.readSize, c.memOwned); got != c.want {
@@ -730,6 +731,55 @@ func TestFitBacklogThresholdUsesTheProfileAndTheReadPath(t *testing.T) {
 	staged.fitBacklogThreshold()
 	if got := staged.classifier.BacklogBytes(); got != 3584 {
 		t.Fatalf("eight staged 1 KiB reads: threshold %d, want 3584", got)
+	}
+}
+
+// A flow with shared send memory whose staged reads are extended: under
+// mem=owned with a 48 KiB send bound and 32 KiB chunks, the scheduler holds a
+// 32 KiB and a 16 KiB chunk, and the peer acknowledges whichever is oldest
+// before the producer refills the room. The dip to 16 KiB is not a drain, so
+// the transfer, having left BULK, goes back into it.
+func TestAnExtendedStagedTransferReentersBulk(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	f.chunkSize = 32 << 10
+	f.memOwned = true
+	f.sendMemory = memlimit.New(1 << 20)
+	f.memoryLimits.maxSendBytes = 48 << 10
+	f.fitBacklogThreshold()
+	h.advance(2 * time.Second)
+	h.burst()
+	h.keystrokes(5 * time.Second)
+	if h.current() == classifier.ClassBulk {
+		t.Fatal("setup: the flow did not leave BULK")
+	}
+	var queue []int // unacknowledged reads, oldest first
+	read := func(n int) {
+		h.write(n, false)
+		queue = append(queue, n)
+	}
+	read(32 << 10)
+	read(16 << 10)
+	acked := f.bytesUp.Load() - 48<<10
+	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
+		acked += uint64(queue[0])
+		queue = queue[1:]
+		f.replayMu.Lock()
+		f.highestSent = f.bytesUp.Load()
+		f.replayMu.Unlock()
+		if _, err := f.acknowledgeCoverage(acked, false, nil); err != nil {
+			t.Fatal(err)
+		}
+		h.advance(5 * time.Millisecond)
+		held := 0
+		for _, n := range queue {
+			held += n
+		}
+		read(min(32<<10, 48<<10-held)) // the owned scheduler clamps to the bound
+		h.advance(5 * time.Millisecond)
+	}
+	if h.current() != classifier.ClassBulk {
+		t.Fatalf("a transfer holding 48 KiB in extended staged reads never re-entered BULK (threshold %d)", f.classifier.BacklogBytes())
 	}
 }
 

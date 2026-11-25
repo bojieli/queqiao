@@ -131,31 +131,51 @@ func backlogThresholdFor(base uint64, limits flowMemoryLimits, chunkSize, readSi
 	if readSize <= 0 || readSize > chunkSize {
 		readSize = chunkSize
 	}
+	// A read is between readSize (a staged read left unextended) and
+	// chunkSize (a full or fully extended one), and an acknowledgement can
+	// remove one of either. Take the lower of the two extremes: every read at
+	// the minimum, and every read a whole chunk.
+	threshold := base
+	for _, size := range []int{readSize, chunkSize} {
+		if remaining, ok := remainingAfterOneRead(limits, chunkSize, size, memOwned); ok {
+			if half := max(countBytes(remaining/2), 1); half < threshold {
+				threshold = half
+			}
+		}
+	}
+	return threshold
+}
+
+// remainingAfterOneRead is the least a continuously backlogged flow holds,
+// unacknowledged, just after the peer acknowledges one read of readSize
+// bytes and before the producer refills: the scheduler's capacity with reads
+// of that size, less one of them. If the capacity is a single read, it is the
+// capacity itself. It reports false when no bound applies.
+func remainingAfterOneRead(limits flowMemoryLimits, chunkSize, readSize int, memOwned bool) (int, bool) {
+	if readSize <= 0 {
+		return 0, false
+	}
 	capacity := limits.maxSendBytes
-	if !memOwned && readSize > 0 && capacity > 0 {
+	if !memOwned && capacity > 0 {
 		// The legacy scheduler admits a whole read whenever retained bytes
 		// are under the limit, so the last read can overshoot it: it holds
 		// the limit rounded up to whole reads. The owned scheduler clamps
 		// its last read to the bound.
 		capacity = (capacity + readSize - 1) / readSize * readSize
 	}
-	if readSize > 0 && limits.maxOutstanding > 0 {
+	if limits.maxOutstanding > 0 {
 		capacity = minPositive(capacity, limits.maxOutstanding*readSize)
 	}
 	if memOwned && chunkSize > 0 {
 		capacity = minPositive(capacity, stripe.DefaultAutotuneStartupChunks*chunkSize)
 	}
 	if capacity <= 0 {
-		return base
+		return 0, false
 	}
-	remaining := capacity
-	if readSize > 0 && capacity > readSize {
-		remaining = capacity - readSize
+	if capacity > readSize {
+		return capacity - readSize, true
 	}
-	if half := countBytes(remaining / 2); half < base {
-		return max(half, 1)
-	}
-	return base
+	return capacity, true
 }
 
 func minPositive(a, b int) int {
