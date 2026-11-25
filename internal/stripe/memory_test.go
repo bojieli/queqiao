@@ -611,3 +611,28 @@ func TestDelayedLaneAttachDoesNotBackdateU(t *testing.T) {
 		t.Fatalf("after an hour with no lane the bound is %d, want %d", bound, startup)
 	}
 }
+
+// Bytes in hand never wait for a speculative full-chunk grant: with only a
+// little of the budget free, a request that exactly fills the staging buffer
+// is published at its own size instead of queueing for a whole chunk.
+func TestStagedBytesDoNotWaitForASpeculativeChunk(t *testing.T) {
+	const chunkSize = 16 * 1024
+	memory := memlimit.NewFair(4 * chunkSize)
+	if err := memory.Acquire(context.Background(), 4*chunkSize-2*DefaultStagingBytes); err != nil {
+		t.Fatal(err)
+	}
+	src := newAvailableSource()
+	defer src.close()
+	src.write(bytes.Repeat([]byte{5}, DefaultStagingBytes))
+	s := New(src, Config{ChunkSize: chunkSize, MaxOutstanding: 64, MaxOutstandingBytes: 1024 * 1024, Memory: memory})
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	chunk, err := s.Next(ctx, 1, 0)
+	if err != nil {
+		t.Fatalf("staged request waited for room it did not need: %v", err)
+	}
+	if len(chunk.Data) != DefaultStagingBytes {
+		t.Fatalf("published %d bytes", len(chunk.Data))
+	}
+}

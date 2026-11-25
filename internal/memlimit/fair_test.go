@@ -25,6 +25,9 @@ func acquireAsync(b *Budget, ctx context.Context, n int) chan error {
 	return done
 }
 
+// granted reports whether a request that must have been granted did so. A
+// grant is made synchronously by Release, so the generous timeout only
+// covers the waiter goroutine being scheduled.
 func granted(done chan error) bool {
 	select {
 	case err := <-done:
@@ -32,8 +35,16 @@ func granted(done chan error) bool {
 			panic(err)
 		}
 		return true
-	case <-time.After(20 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		return false
+	}
+}
+
+// stillQueued checks, from the Budget's own state, that no grant was made.
+func stillQueued(t *testing.T, b *Budget, used, waiters int64) {
+	t.Helper()
+	if got := b.Snapshot(); got.Used != used || got.Waiters != waiters {
+		t.Fatalf("expected no grant: %+v, want used=%d waiters=%d", got, used, waiters)
 	}
 }
 
@@ -53,9 +64,7 @@ func TestFairBudgetGrantsInArrivalOrder(t *testing.T) {
 	waitWaiters(t, b, 3)
 
 	b.Release(1)
-	if granted(second) {
-		t.Fatal("a later small request overtook the head of the queue")
-	}
+	stillQueued(t, b, 3, 3) // the 1-byte request did not overtake the head
 	if b.TryAcquire(1) {
 		t.Fatal("TryAcquire overtook queued waiters")
 	}
@@ -67,10 +76,8 @@ func TestFairBudgetGrantsInArrivalOrder(t *testing.T) {
 	if !granted(second) {
 		t.Fatal("the second waiter was not granted")
 	}
-	if granted(third) {
-		t.Fatal("granted beyond capacity")
-	}
-	if got := b.Snapshot(); got.Used != 3 || got.Waiters != 1 || got.Peak != 4 {
+	stillQueued(t, b, 3, 1) // the third does not fit yet
+	if got := b.Snapshot(); got.Peak != 4 {
 		t.Fatalf("snapshot = %+v", got)
 	}
 	b.Release(1)
@@ -96,9 +103,7 @@ func TestFairBudgetCancelledHeadPassesItsTurn(t *testing.T) {
 	next := acquireAsync(b, context.Background(), 1)
 	waitWaiters(t, b, 2)
 	b.Release(1)
-	if granted(next) {
-		t.Fatal("overtook a live head")
-	}
+	stillQueued(t, b, 1, 2) // did not overtake a live head
 	cancel()
 	if err := <-head; err == nil {
 		t.Fatal("cancelled acquire succeeded")

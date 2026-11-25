@@ -374,6 +374,9 @@ type Scheduler struct {
 	// uniqueBytes is U: bytes of logical chunks dispatched at least once and
 	// not yet acknowledged, each counted once however many attempts it has.
 	uniqueBytes uint64
+	// readyBytes is Q: bytes in the ready set that have never been
+	// dispatched. A retry waiting there is already in uniqueBytes.
+	readyBytes uint64
 	// idleLanes counts lanes waiting in Next with room for work and nothing
 	// ready to take.
 	idleLanes int
@@ -475,8 +478,10 @@ func (s *Scheduler) waitForRoom() (int, bool) {
 			continue
 		}
 		allowance := s.cfg.ChunkSize
-		retained := s.retainedBytes()
-		if s.cfg.Autotune != nil {
+		var retained uint64
+		if s.cfg.Autotune == nil {
+			retained = s.retainedBytes()
+		} else {
 			s.autotuneLocked(s.cfg.Now())
 			ready := s.readyBytesLocked()
 			if limit := s.readyLimit(); limit > 0 {
@@ -522,12 +527,15 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 	size := n
 	filler, canFill := s.src.(AvailableReader)
 	// A read that filled the staging buffer suggests more is waiting; one
-	// that did not has drained the source and the chunk is what it is.
-	fill := canFill && err == nil && n == len(staging) && allowance > n
+	// that did not has drained the source and the chunk is what it is. The
+	// larger allocation is only speculative, so it is taken only if it is
+	// free now: bytes in hand never wait -- nor hold up the fair queue --
+	// for room they may not need.
+	fill := canFill && err == nil && n == len(staging) && allowance > n &&
+		s.cfg.Memory.TryAcquire(allowance)
 	if fill {
 		size = allowance
-	}
-	if acquireErr := s.cfg.Memory.Acquire(s.producerCtx, size); acquireErr != nil {
+	} else if acquireErr := s.cfg.Memory.Acquire(s.producerCtx, size); acquireErr != nil {
 		s.mu.Lock()
 		if !s.closed {
 			s.srcErr = acquireErr
@@ -574,6 +582,7 @@ func (s *Scheduler) publish(buf []byte, n, reserved int, err error) bool {
 		s.nextOffset += uint64(n)
 		s.stats.SourceBytes += uint64(n)
 		s.pending = append(s.pending, chunk)
+		s.readyBytes += uint64(n)
 	} else {
 		s.cfg.Memory.Release(reserved)
 	}
@@ -624,15 +633,7 @@ func (s *Scheduler) retainedBytes() uint64 {
 
 // readyBytesLocked is Q: bytes read and not yet dispatched. A chunk waiting
 // for a retry is already counted in U and is not counted again.
-func (s *Scheduler) readyBytesLocked() uint64 {
-	var total uint64
-	for _, chunk := range s.pending {
-		if _, live := s.live[chunk.Offset]; !live {
-			total += uint64(len(chunk.Data))
-		}
-	}
-	return total
-}
+func (s *Scheduler) readyBytesLocked() uint64 { return s.readyBytes }
 
 func (s *Scheduler) readyLimit() int {
 	if s.cfg.Autotune == nil || s.cfg.Autotune.ReadyLimit == nil {
@@ -866,6 +867,7 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 			// Close the rounds that ended before this dispatch with the U
 			// they had: bytes that sat READY were not in flight then.
 			s.autotuneLocked(s.cfg.Now())
+			s.readyBytes -= min(s.readyBytes, uint64(len(chunk.Data)))
 			s.uniqueBytes += uint64(len(chunk.Data))
 			s.sampleUniqueLocked()
 			s.stats.ChunksIssued++
@@ -993,6 +995,8 @@ func (s *Scheduler) Complete(laneID uint64, chunk *Chunk) {
 	if ok {
 		s.releaseChunkLocked(live.chunk)
 	} else {
+		// Acknowledged before its first dispatch: it leaves Q.
+		s.readyBytes -= min(s.readyBytes, uint64(len(dropped.Data)))
 		s.releaseChunkLocked(dropped)
 	}
 	s.signalIfDoneLocked()
@@ -1508,6 +1512,7 @@ func (s *Scheduler) Close() {
 	s.pending = nil
 	s.live = make(map[uint64]*outstanding)
 	s.uniqueBytes = 0
+	s.readyBytes = 0
 	s.ready.Broadcast()
 	s.produced.Broadcast()
 }
