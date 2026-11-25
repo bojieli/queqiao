@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	quiccongestion "github.com/apernet/quic-go/congestion"
+	"github.com/apernet/quic-go/monotime"
 )
 
 const (
@@ -181,6 +182,9 @@ func TestClassArbiterIndivisibleDatagramsStayWithinOnePacketPerRound(t *testing.
 		served := float64(s[quiccongestion.ClassInteractive] + s[quiccongestion.ClassBulk])
 		// Rounds of 10 quanta each, so far.
 		rounds := served / (10 * arbPacket)
+		if s[quiccongestion.ClassBulk] == 0 {
+			t.Fatalf("after %d packets BULK has not been served", n)
+		}
 		for c, weight := range map[quiccongestion.SendClass]float64{quiccongestion.ClassInteractive: 0.9, quiccongestion.ClassBulk: 0.1} {
 			if dev := math.Abs(float64(s[c]) - weight*served); dev > rounds*arbPacket {
 				t.Fatalf("after %d packets class %d deviates from its weight by %.0f bytes, more than one packet per round (%.0f rounds)", n, c, dev, rounds)
@@ -352,5 +356,71 @@ func TestClassArbiterAckOnlyPacketsChargeNoClass(t *testing.T) {
 	a.OnDemand(cb)
 	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassControl {
 		t.Fatalf("turn %v: ACK-only traffic left CONTROL in debt", p.Turn)
+	}
+}
+
+// A turn that builds nothing because its work does not fit the permit is
+// passed over: the next permit goes to another class with demand; once
+// every class with demand is passed over, admission is refused until the
+// earliest mark expires -- no spin, and no wait for an unrelated event --
+// after which the class gets its turn again; a sent packet clears the marks.
+func TestClassArbiterPassesOverAStuckTurn(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	now := monotime.Now()
+	a.OnDemand(demandOf(quiccongestion.ClassInteractive, quiccongestion.ClassBulk))
+	p := a.PermitAt(now, arbPacket)
+	if p.Turn != quiccongestion.ClassInteractive {
+		t.Fatalf("turn %v, want INTERACTIVE", p.Turn)
+	}
+	if !a.OnEmptyBuild(now, p.Turn) {
+		t.Fatal("a first empty build allows no other decision")
+	}
+	if p := a.PermitAt(now, arbPacket); p.Turn != quiccongestion.ClassBulk || p.Fill[quiccongestion.ClassInteractive] != 0 {
+		t.Fatalf("permit %+v, want BULK with no INTERACTIVE fill", p)
+	}
+	a.OnEmptyBuild(now, quiccongestion.ClassBulk)
+	p = a.PermitAt(now, arbPacket)
+	if p.OK || p.RetryAt.IsZero() || !now.Before(p.RetryAt) {
+		t.Fatalf("permit %+v with every class passed over, want a refusal with a retry time", p)
+	}
+	if a.OnEmptyBuild(now, quiccongestion.ClassExempt) {
+		t.Fatal("an EXEMPT empty build asks for another decision: the connection would spin")
+	}
+	if p := a.PermitAt(p.RetryAt, arbPacket); !p.OK || p.Turn != quiccongestion.ClassInteractive {
+		t.Fatalf("permit %+v at the retry time, want INTERACTIVE's turn back", p)
+	}
+	a.OnEmptyBuild(now, quiccongestion.ClassInteractive)
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassExempt: 40})
+	if p := a.PermitAt(now, arbPacket); p.Turn != quiccongestion.ClassInteractive {
+		t.Fatalf("turn %v after a packet was sent, want INTERACTIVE back", p.Turn)
+	}
+}
+
+// A class whose work keeps failing to fit does not starve its siblings: with
+// INTERACTIVE holding credit but never building, CONTROL and BULK share the
+// path by weight.
+func TestClassArbiterStuckClassLeavesSiblingsTheirWeights(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	now := monotime.Now()
+	all := demandOf(quiccongestion.ClassControl, quiccongestion.ClassInteractive, quiccongestion.ClassBulk)
+	a.OnDemand(all)
+	sendable := demandOf(quiccongestion.ClassControl, quiccongestion.ClassBulk)
+	for range 5000 {
+		p := a.PermitAt(now, arbPacket)
+		if !p.OK {
+			t.Fatalf("refused with sendable work: %+v", p)
+		}
+		if p.Turn == quiccongestion.ClassInteractive {
+			a.OnEmptyBuild(now, p.Turn) // its datagram never fits
+			continue
+		}
+		a.OnSent(simBuilder(p, sendable, 0))
+	}
+	s := a.Stats().Served
+	if s[quiccongestion.ClassBulk] == 0 {
+		t.Fatal("BULK was starved while INTERACTIVE could not build")
+	}
+	if share := float64(s[quiccongestion.ClassBulk]) / float64(s[quiccongestion.ClassBulk]+s[quiccongestion.ClassControl]); share < 0.15 {
+		t.Fatalf("BULK share %.3f against CONTROL, want about its weight 0.2", share)
 	}
 }

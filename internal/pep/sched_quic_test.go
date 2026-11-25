@@ -6,6 +6,7 @@ import (
 	"io"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -291,19 +292,29 @@ func TestDueWindowUpdatesAreServedAgainstBusyBulk(t *testing.T) {
 	}
 	fc := newFrameConn(&quicStreamConn{stream: upload, conn: client})
 	chunk := protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeData, FlowID: 1, Class: protocol.ClassBulk}, Payload: make([]byte, 32<<10)}
+	uploadErr := make(chan error, 1)
 	go func() {
 		for ctx.Err() == nil {
-			if fc.WriteContext(ctx, chunk) != nil {
+			if err := fc.WriteContext(ctx, chunk); err != nil {
+				// A write cut off at the test's own deadline is the end of
+				// the test, not a failure.
+				if deadline, _ := ctx.Deadline(); time.Until(deadline) > 200*time.Millisecond {
+					uploadErr <- err
+				}
 				return
 			}
 		}
 	}()
+	var uploaded atomic.Int64
 	go func() {
 		stream, err := server.AcceptStream(context.Background())
 		if err != nil {
 			return
 		}
-		go func() { _, _ = io.Copy(io.Discard, stream) }()
+		go func() {
+			n, _ := io.Copy(io.Discard, countingReader{stream, &uploaded})
+			_ = n
+		}()
 		// The download, on a stream of the server's own.
 		down, err := server.OpenStreamSync(context.Background())
 		if err != nil {
@@ -328,7 +339,16 @@ func TestDueWindowUpdatesAreServedAgainstBusyBulk(t *testing.T) {
 		got += int64(n)
 	}
 	stats, _ := controller.ClassStats()
-	t.Logf("downloaded %d bytes through 64 KiB windows; client served %v", got, stats.Served)
+	t.Logf("downloaded %d bytes through 64 KiB windows, uploaded %d; client served %v", got, uploaded.Load(), stats.Served)
+	select {
+	case err := <-uploadErr:
+		t.Fatalf("the BULK upload failed: %v", err)
+	default:
+	}
+	// The upload kept the path busy with BULK the whole time.
+	if uploaded.Load() < 1<<20 {
+		t.Fatalf("uploaded only %d bytes: the window updates did not compete with busy BULK", uploaded.Load())
+	}
 	// A stalled window update would hold the download at one window.
 	if got < 1<<20 {
 		t.Fatalf("downloaded %d bytes: window updates were held behind BULK", got)
@@ -336,4 +356,15 @@ func TestDueWindowUpdatesAreServedAgainstBusyBulk(t *testing.T) {
 	if stats.Turns[quiccongestion.ClassControl] == 0 {
 		t.Fatal("no CONTROL turn was taken for the window updates")
 	}
+}
+
+type countingReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (c countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n.Add(int64(n))
+	return n, err
 }

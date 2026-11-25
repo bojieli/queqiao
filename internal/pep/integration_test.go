@@ -27,7 +27,7 @@ import (
 	"github.com/bojieli/queqiao/internal/socks5"
 )
 
-func testCertificate(t *testing.T) (identity.ServerCredentials, identity.ClientCredentials) {
+func testCertificate(t testing.TB) (identity.ServerCredentials, identity.ClientCredentials) {
 	t.Helper()
 	now := time.Now()
 	provider, err := identity.InitProvider(t.TempDir()+"/provider", "test provider", "127.0.0.1:1", now)

@@ -67,9 +67,10 @@ type erasurePathState struct {
 }
 
 var (
-	_ quiccongestion.PathSender     = (*ErasurePathSender)(nil)
-	_ quiccongestion.ClassScheduler = (*ErasurePathSender)(nil)
-	_ TelemetryProvider             = (*ErasurePathSender)(nil)
+	_ quiccongestion.PathSender         = (*ErasurePathSender)(nil)
+	_ quiccongestion.ClassScheduler     = (*ErasurePathSender)(nil)
+	_ quiccongestion.EmptyBuildObserver = (*ErasurePathSender)(nil)
+	_ TelemetryProvider                 = (*ErasurePathSender)(nil)
 )
 
 // EnableClassScheduling makes the sender arbitrate between send classes with
@@ -79,6 +80,18 @@ var (
 // the sender is installed on a connection.
 func (p *ErasurePathSender) EnableClassScheduling(w ClassWeights) {
 	p.arb = NewClassArbiter(w, p.Sender().inner.maxDatagramSize)
+}
+
+// OnEmptyBuild is told that a packet admitted under a permit could not be
+// built although demand is unchanged: the turn's work does not fit. The
+// arbiter passes that class over for a few milliseconds or until something
+// changes, and the connection is woken to try another decision. Once every
+// class with demand is passed over, admission is refused until the earliest
+// mark expires, which is when the connection tries again.
+func (p *ErasurePathSender) OnEmptyBuild(now monotime.Time, permit quiccongestion.Permit) {
+	if p.arb != nil && p.arb.OnEmptyBuild(now, permit.Turn) && p.wake != nil {
+		p.wake()
+	}
 }
 
 // SchedulesClasses says whether the connection's builder executes this
@@ -181,7 +194,7 @@ func (p *ErasurePathSender) Admit(now monotime.Time, maxBytes quiccongestion.Byt
 		return quiccongestion.Permit{RetryAt: retry}
 	}
 	if p.arb != nil {
-		return p.arb.Permit(maxBytes)
+		return p.arb.PermitAt(now, maxBytes)
 	}
 	return quiccongestion.Permit{OK: true, Turn: quiccongestion.ClassBulk, MaxBytes: maxBytes}
 }
@@ -210,6 +223,10 @@ func (p *ErasurePathSender) OnSent(s quiccongestion.SentPacket) {
 // OnAckEvent hands the event's outcomes to the control law in one batch, with
 // the flight before the event, exactly as the extended callback did.
 func (p *ErasurePathSender) OnAckEvent(ev quiccongestion.AckEvent) {
+	if p.arb != nil {
+		// The flight and the window moved: work that did not fit may now.
+		p.arb.Unstick()
+	}
 	prior := p.gauge
 	p.gauge = ev.InFlight
 	if len(ev.Acked) == 0 && len(ev.Lost) == 0 {

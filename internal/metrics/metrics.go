@@ -130,8 +130,10 @@ type Registry struct {
 	// summing the live flows, because the connections they measure are shared
 	// by many flows and outlive any one of them.  See QUICConnectionCounters.
 	quicCounters quicCounterTotals
-	telemetryMu  sync.Mutex
-	quicFlows    map[uint64]quicObservation
+	// carrierShadow is written only by the carrier-liveness observer.
+	carrierShadow carrierShadowCounters
+	telemetryMu   sync.Mutex
+	quicFlows     map[uint64]quicObservation
 	// clock is the time source for observation freshness. Tests replace it;
 	// production leaves it nil and reads the wall clock.
 	clock func() time.Time
@@ -380,6 +382,8 @@ type Snapshot struct {
 	LaneRescueAttempts, LaneGraceExtensions uint64
 	// LaneRescueWins is indexed by the winning attempt of a rescue round.
 	LaneRescueWins [RescueAttemptSlots]uint64
+	// CarrierShadow is the carrier-liveness observer's record.
+	CarrierShadow CarrierShadowSnapshot
 }
 
 // QUICObservation is a point-in-time aggregate over the lanes of one logical
@@ -813,6 +817,7 @@ func (r *Registry) Snapshot() Snapshot {
 	for i := range s.LaneRescueWins {
 		s.LaneRescueWins[i] = r.laneRescueWins[i].Load()
 	}
+	s.CarrierShadow = r.carrierShadowSnapshot()
 	now := r.now()
 	var expired uint64
 	r.telemetryMu.Lock()
@@ -1099,6 +1104,7 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		fmt.Fprintf(w, "queqiao_lane_rescue_wins_total{attempt=\"%d\"} %d\n", i, value)
 	}
 	fmt.Fprintf(w, "queqiao_lane_grace_extensions_total %d\n", s.LaneGraceExtensions)
+	writeCarrierShadow(w, s.CarrierShadow)
 }
 
 // ReceiveErasure is the share of the peer's source symbols that did not arrive,

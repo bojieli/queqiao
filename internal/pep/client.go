@@ -229,6 +229,11 @@ type ClientConfig struct {
 	// reactively when sustained zero-receive loss is detected.
 	HopPortCount int
 	Logger       *slog.Logger
+
+	// CarrierShadow runs the carrier-liveness observer beside today's
+	// recovery; see CarrierShadowConfig. Off by default; it never changes a
+	// decision.
+	CarrierShadow CarrierShadowConfig
 }
 
 type Client struct {
@@ -325,6 +330,9 @@ type Client struct {
 	// non-blocking: callers beyond the bound are rejected promptly, release
 	// their total-session slot, and leave capacity for established flows.
 	pendingOpens chan struct{}
+
+	// carrierShadow is the carrier-liveness observer; nil when it is off.
+	carrierShadow *carrierShadow
 }
 
 // SessionLimit bounds concurrent local SOCKS sessions across one or more
@@ -668,6 +676,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
 		return nil, err
 	}
+	if err := cfg.CarrierShadow.resolve(); err != nil {
+		return nil, err
+	}
 	if cfg.AdaptiveMinBytesSec == 0 {
 		cfg.AdaptiveMinBytesSec = defaultAdaptiveMinBytesPerSec
 	}
@@ -736,6 +747,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		metrics: cfg.Metrics, sessionLimit: cfg.SessionLimit, pendingOpens: make(chan struct{}, cfg.MaxPendingOpens),
 		sendMemory: sendMemory, receiveMemory: receiveMemory, memoryLimits: memoryLimits,
 	}
+	client.carrierShadow = newCarrierShadow(cfg.CarrierShadow, carrierShadowClient, cfg.Logger, cfg.Metrics)
 	client.checkSystemResume()
 	return client, nil
 }
@@ -1062,6 +1074,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
 	flowSession.memOwned = c.cfg.Memory == MemoryOwned
 	flowSession.codedRetrySticky = c.cfg.CodedRetry == CodedRetrySticky
+	flowSession.carrierShadow = c.carrierShadow
 	flowSession.wire = flow.fc.wire
 	c.declareClass(ctx, inner, flowSession)
 	flowSession.ackRanges.Store(true)
@@ -2039,6 +2052,7 @@ func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID
 	if kind != TransportQUIC && kind != TransportTCP {
 		return nil, fmt.Errorf("unsupported join transport %q", kind)
 	}
+	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, kind)
 	if kind == TransportQUIC && c.cfg.EnableQUICPool {
 		if lane, poolErr := c.openPooledJoinLane(ctx, sessionID, flowID, laneID); poolErr == nil {
 			return lane, nil
@@ -2061,6 +2075,7 @@ func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID
 // controller, while this pool is the multiplexed control failure domain being
 // rebuilt.
 func (c *Client) openControlPoolJoinLane(ctx context.Context, sessionID [16]byte, flowID, laneID uint64) (*mpLane, error) {
+	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, TransportQUIC)
 	lane, err := c.dialLaneMode(ctx, TransportQUIC, sessionID, laneID, true)
 	if err != nil {
 		return nil, err
@@ -3110,6 +3125,7 @@ func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessio
 		ctx = context.WithValue(ctx, laneReplacementContextKey{}, *hint)
 	}
 	flow.rescueInFlight.Store(true)
+	flow.carrierShadow.noteRescue(flow)
 	err := c.openParallelRescue(ctx, flow, sessionID, flowID)
 	flow.rescueInFlight.Store(false)
 	// The capacity streak is kept per round rather than per attempt: a round
@@ -3312,6 +3328,7 @@ func (c *Client) openSprayedQUICRescueJoin(ctx context.Context, flow *multipathF
 	if err != nil {
 		return nil, err
 	}
+	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, TransportQUIC)
 	lane, err := c.dialJoinLane(ctx, TransportQUIC, sessionID, laneID)
 	if err != nil {
 		return nil, err
