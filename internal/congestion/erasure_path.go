@@ -54,6 +54,11 @@ type ErasurePathSender struct {
 	acked    []quiccongestion.AckedPacketInfo
 	lost     []quiccongestion.LostPacketInfo
 	attached bool
+
+	// arb, if set, arbitrates between send classes (sched=class): Admit
+	// answers with its turn and Fill, and the connection's builder executes
+	// them. It is set before installation and never changes.
+	arb *ClassArbiter
 }
 
 type erasurePathState struct {
@@ -62,9 +67,31 @@ type erasurePathState struct {
 }
 
 var (
-	_ quiccongestion.PathSender = (*ErasurePathSender)(nil)
-	_ TelemetryProvider         = (*ErasurePathSender)(nil)
+	_ quiccongestion.PathSender     = (*ErasurePathSender)(nil)
+	_ quiccongestion.ClassScheduler = (*ErasurePathSender)(nil)
+	_ TelemetryProvider             = (*ErasurePathSender)(nil)
 )
+
+// EnableClassScheduling makes the sender arbitrate between send classes with
+// the §4.3 deficit round robin (stage 2 of the path-authority migration,
+// sched=class): the window and the pacer still decide whether a packet may
+// go, and the arbiter decides which class it serves. It must be called before
+// the sender is installed on a connection.
+func (p *ErasurePathSender) EnableClassScheduling(w ClassWeights) {
+	p.arb = NewClassArbiter(w, p.Sender().inner.maxDatagramSize)
+}
+
+// SchedulesClasses says whether the connection's builder executes this
+// sender's class decisions.
+func (p *ErasurePathSender) SchedulesClasses() bool { return p.arb != nil }
+
+// ClassStats returns the arbiter's state, or false without class scheduling.
+func (p *ErasurePathSender) ClassStats() (ClassArbiterStats, bool) {
+	if p.arb == nil {
+		return ClassArbiterStats{}, false
+	}
+	return p.arb.Stats(), true
+}
 
 // NewErasurePathSender wraps sender. rekey, if not nil, is asked after a
 // migration whether the path changed; it returns the sender for the new path,
@@ -128,9 +155,15 @@ func (p *ErasurePathSender) OnAttach(_ monotime.Time, inFlight, maxPacket quicco
 	}
 }
 
-// OnDemand records the connection's demand. One controller per connection
-// has no class to arbitrate and derives nothing from it yet.
-func (p *ErasurePathSender) OnDemand(d quiccongestion.Demand) { p.demand = d }
+// OnDemand records the connection's demand. Without class scheduling one
+// controller per connection has no class to arbitrate and derives nothing
+// from it; with it, the arbiter normalises its deficits on the transition.
+func (p *ErasurePathSender) OnDemand(d quiccongestion.Demand) {
+	p.demand = d
+	if p.arb != nil {
+		p.arb.OnDemand(d)
+	}
+}
 
 // Admit asks the same two questions, in the same order, as the connection did
 // of a CongestionControl: the window, then the pacer.
@@ -147,12 +180,19 @@ func (p *ErasurePathSender) Admit(now monotime.Time, maxBytes quiccongestion.Byt
 		}
 		return quiccongestion.Permit{RetryAt: retry}
 	}
+	if p.arb != nil {
+		return p.arb.Permit(maxBytes)
+	}
 	return quiccongestion.Permit{OK: true, Turn: quiccongestion.ClassBulk, MaxBytes: maxBytes}
 }
 
 // OnSent registers a packet as it was built.
 func (p *ErasurePathSender) OnSent(s quiccongestion.SentPacket) {
 	p.gauge = s.InFlight
+	if p.arb != nil {
+		// Every class byte is settled, whatever built the packet.
+		p.arb.OnSent(s.ClassBytes)
+	}
 	if s.Kind == quiccongestion.KindPathProbe && !s.InFlightCounted {
 		// Probes sent outside the flight never reached the controller. A
 		// path-validation packet on the current path is in flight and is
@@ -227,6 +267,9 @@ func (p *ErasurePathSender) SetRTTStatsProvider(provider quiccongestion.RTTStats
 func (p *ErasurePathSender) SetMaxDatagramSize(size quiccongestion.ByteCount) {
 	p.maxSize = size
 	p.Sender().SetMaxDatagramSize(size)
+	if p.arb != nil {
+		p.arb.SetQuantum(size)
+	}
 }
 
 func (p *ErasurePathSender) GetCongestionWindow() quiccongestion.ByteCount {

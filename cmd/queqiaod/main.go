@@ -567,6 +567,8 @@ type runtimeOptions struct {
 	resolvedProfile profile.Profile
 	congestion      string
 	ccAPI           string
+	// sched is the class scheduler (design §14 stage 2).
+	sched string
 	// memory is the memory-ownership bundle (design §14 stage 3).
 	memory                                                      string
 	brutalBytesPerSec, adaptiveMinBytesSec, adaptiveMaxBytesSec uint64
@@ -616,6 +618,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.IntVar(&opts.hopPortCount, "hop-port-count", 0, "number of UDP ports to listen on for port hopping (0/1 = disabled)")
 	fs.StringVar(&opts.congestion, "congestion", string(pep.CongestionErasure), "QUIC congestion controller")
 	fs.StringVar(&opts.ccAPI, "cc-api", string(pep.CCAPIV1), "how QUIC congestion controllers are driven: v1 (per-packet callbacks) or v2 (the path-authority controller API; requires --congestion=erasure)")
+	fs.StringVar(&opts.sched, "sched", string(pep.SchedLegacy), "packet scheduler: legacy, or class (CONTROL, INTERACTIVE and BULK arbitrated by weighted deficit round robin; requires --cc-api=v2)")
 	fs.StringVar(&opts.memory, "mem", string(pep.MemoryLegacy), "memory-ownership bundle: legacy, or owned (fair shared send-memory grants and the credit-driven retention bound)")
 	fs.Uint64Var(&opts.brutalBytesPerSec, "brutal-bytes-per-sec", 0, "Brutal fixed byte rate")
 	fs.Uint64Var(&opts.adaptiveMinBytesSec, "adaptive-min-bytes-per-sec", 64*1024, "Adaptive minimum byte rate")
@@ -733,6 +736,12 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 		bundleProfile = p
 	}
 	if err := pep.ValidateBundle(pep.CCAPIVersion(opts.ccAPI), pep.CongestionControlKind(opts.congestion), bundleProfile); err != nil {
+		return err
+	}
+	if opts.sched == "" {
+		return errors.New("--sched must be legacy or class")
+	}
+	if err := pep.ValidateSched(pep.SchedMode(opts.sched), pep.CCAPIVersion(opts.ccAPI)); err != nil {
 		return err
 	}
 	if opts.logFormat != "json" && opts.logFormat != "text" {
@@ -907,7 +916,7 @@ func runServer(args []string) (returnErr error) {
 		EnableQUIC:        opts.transport == string(pep.TransportQUIC) || opts.transport == string(pep.TransportAuto),
 		TCPFallbackLanes:  opts.tcpFallbackLanes, TCPCongestion: opts.tcpCongestion,
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
-		CCAPI:               pep.CCAPIVersion(opts.ccAPI),
+		CCAPI: pep.CCAPIVersion(opts.ccAPI), Sched: pep.SchedMode(opts.sched),
 		Memory:              pep.MemoryMode(opts.memory),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
@@ -1025,7 +1034,8 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("transport", opts.transport),
 		slog.String("congestion", opts.congestion),
 		slog.String("cc_api", opts.ccAPI),
-		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory))),
+		slog.String("sched", opts.sched),
+		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.SchedMode(opts.sched), pep.MemoryMode(opts.memory))),
 		slog.String("mem", opts.memory),
 		slog.Int("max_sessions", opts.maxSessions),
 		slog.Uint64("max_payload_bytes", uint64(protocol.MaxPayload)),

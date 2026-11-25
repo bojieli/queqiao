@@ -232,7 +232,7 @@ func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtim
 		TCPFallbackLanes: opts.tcpFallbackLanes, EnableQUICPool: opts.quicPool,
 		WaitForOpenAcknowledgement: opts.waitForOpenAck, UDPOnStream: opts.udpOnStream, WireVersions: mustWireVersions(opts.wireVersions),
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
-		CCAPI:               pep.CCAPIVersion(opts.ccAPI),
+		CCAPI: pep.CCAPIVersion(opts.ccAPI), Sched: pep.SchedMode(opts.sched),
 		Memory:              pep.MemoryMode(opts.memory),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,

@@ -59,7 +59,10 @@ type ServerConfig struct {
 	Congestion CongestionControlKind
 	// CCAPI selects how QUIC congestion controllers are driven; see
 	// CCAPIVersion. Empty is v1.
-	CCAPI                         CCAPIVersion
+	CCAPI CCAPIVersion
+	// Sched selects how a QUIC connection orders the classes of work it
+	// sends; see SchedMode. Empty is legacy. Class requires CCAPI v2.
+	Sched                         SchedMode
 	BrutalBytesPerSec             uint64
 	AdaptiveMinBytesSec           uint64
 	AdaptiveMaxBytesSec           uint64
@@ -354,6 +357,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, errors.New("brutal congestion requires a positive per-lane byte rate")
 	}
 	if err := validateBundle(&cfg.CCAPI, cfg.Congestion, cfg.Profile); err != nil {
+		return nil, err
+	}
+	if err := validateSched(&cfg.Sched, cfg.CCAPI); err != nil {
 		return nil, err
 	}
 	if cfg.AdaptiveMinBytesSec == 0 {
@@ -718,7 +724,7 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	controller := configureQUICController(conn, congestionConfig{
 		kind: s.cfg.Congestion, brutalBytesPerSecond: s.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: s.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: s.cfg.AdaptiveMaxBytesSec,
-		ccAPI: s.cfg.CCAPI,
+		ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched,
 	})
 	state := conn.ConnectionState().TLS
 	if state.NegotiatedProtocol == identity.EnrollmentALPN {

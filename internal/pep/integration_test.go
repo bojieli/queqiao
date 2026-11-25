@@ -409,15 +409,21 @@ func portBelowTheDynamicRange(t *testing.T) int {
 }
 
 func TestQUICOneLaneSOCKSEndToEnd(t *testing.T) {
-	testQUICOneLaneSOCKSEndToEnd(t, "")
+	testQUICOneLaneSOCKSEndToEnd(t, "", "")
 }
 
 // The cc-api=v2 bundle starts, both ends, and carries the same flows.
 func TestQUICOneLaneSOCKSEndToEndUnderCCAPIV2(t *testing.T) {
-	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2)
+	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, "")
 }
 
-func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion) {
+// The sched=class bundle (cc-api=v2 with the class scheduler) starts, both
+// ends, and carries the same flows.
+func TestQUICOneLaneSOCKSEndToEndUnderSchedClass(t *testing.T) {
+	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, SchedClass)
+}
+
+func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedMode) {
 	destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -434,7 +440,7 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion) {
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
-		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond, CCAPI: ccAPI,
+		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond, CCAPI: ccAPI, Sched: sched,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -445,7 +451,7 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion) {
 	}
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true, Logger: logger,
-		Metrics: metrics.New(), CCAPI: ccAPI,
+		Metrics: metrics.New(), CCAPI: ccAPI, Sched: sched,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -551,6 +557,13 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion) {
 	}
 	if got := client.Metrics().Snapshot(); got.ActiveFlows != 0 || got.FlowsCompleted != 2 {
 		t.Fatalf("client flow lifecycle leaked: active=%d started=%d completed=%d failed=%d", got.ActiveFlows, got.FlowsStarted, got.FlowsCompleted, got.FlowsFailed)
+	}
+	if sched == SchedClass {
+		scheduled := 0
+		classScheduledConns.Range(func(any, any) bool { scheduled++; return true })
+		if scheduled == 0 {
+			t.Fatal("no connection schedules classes under sched=class")
+		}
 	}
 	cancel()
 	for range 2 {

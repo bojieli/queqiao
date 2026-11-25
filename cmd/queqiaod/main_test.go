@@ -305,10 +305,20 @@ func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
 		if opts := parseRuntimeForTest(t, client, "--cc-api=v2"); opts.ccAPI != "v2" {
 			t.Fatalf("cc-api=v2 not parsed: %q", opts.ccAPI)
 		}
+		if opts := parseRuntimeForTest(t, client, "--cc-api=v2", "--sched=class"); opts.sched != "class" {
+			t.Fatalf("sched=class not parsed: %q", opts.sched)
+		}
+		if opts := parseRuntimeForTest(t, client); opts.sched != "legacy" {
+			t.Fatalf("the default sched is %q, want legacy", opts.sched)
+		}
 		for _, args := range [][]string{
 			{"--cc-api=v3"},
 			{"--cc-api=v2", "--congestion=reno"},
 			{"--cc-api=v2", "--path-profile=dc-long-haul"},
+			{"--sched=class"},
+			{"--cc-api=v1", "--sched=class"},
+			{"--cc-api=v2", "--sched=fifo"},
+			{"--cc-api=v2", "--sched="},
 		} {
 			fs := flag.NewFlagSet("test", flag.ContinueOnError)
 			fs.SetOutput(io.Discard)
