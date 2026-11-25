@@ -40,9 +40,20 @@ def load_bounds(path: str = BOUNDS) -> dict:
     return out
 
 
+def leaf_rate(rows: List[dict]) -> float:
+    """Bytes per second while the leaf was loaded: its bytes over the longest
+    of its flows. A rate, not a byte total, so that objects finishing inside
+    the window cannot make a shared bottleneck look unshared."""
+    secs = max((float(r["seconds"]) for r in rows), default=0.0)
+    return sum(int(r["bytes"] or 0) for r in rows) / secs if secs > 0 else float("nan")
+
+
 def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: float) -> Dict[str, float]:
     m: Dict[str, float] = {}
     sus = [r for r in t.rows if r["phase"] == "sustained" and r["kind"] == "bulk"]
+    m["sim_rate"] = sum(leaf_rate([r for r in sus if r["client"] == leaf]) for leaf in loaded)
+    m["sus_flows"] = len(sus)
+    m["sus_finished"] = sum(1 for r in sus if r["complete"] == "1")
     per_leaf = {leaf: float(sum(int(r["bytes"] or 0) for r in sus if r["client"] == leaf)) for leaf in loaded}
     m["aggregate_bytes"] = sum(per_leaf.values())
     m["worst_leaf_bytes"] = min(per_leaf.values()) if per_leaf else float("nan")
@@ -57,9 +68,12 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     lat = [done(r) for r in req]
     m["latency_p50"] = st.quantile(lat, 0.5)
     m["latency_p99"] = st.quantile(lat, 0.99)
-    ctl = [float(r["seconds"]) if r["complete"] == "1" else PROBE_TIMEOUT
-           for r in t.rows if r["client"] == control and r["kind"] == "probe"]
-    m["control_p50"] = st.quantile(ctl, 0.5)
+    probes = [r for r in t.rows if r["client"] == control and r["kind"] == "probe"]
+    ctl = [float(r["seconds"]) if r["complete"] == "1" else PROBE_TIMEOUT for r in probes]
+    # The control leaf must have been observed under both phases' load; a
+    # probe job that produced nothing leaves the trial unmeasured.
+    phases = {r["phase"] for r in probes}
+    m["control_p50"] = st.quantile(ctl, 0.5) if {"sustained", "requests"} <= phases else float("nan")
     m["requests_ok"] = sum(1 for r in req if r["complete"] == "1")
     m["requests"] = len(req)
     return m
@@ -86,19 +100,27 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
                 out.setdefault(t.block, []).append(t.m[key])
         return {b: agg(v) for b, v in out.items()}
 
-    total = lambda v: float(sum(v))
-    avg = lambda v: st.mean(v)
+    # Strict: a block with an unmeasured trial is unmeasured, not averaged
+    # over whatever is left.
+    strict = lambda f: (lambda v: f(v) if v and all(x == x for x in v) else float("nan"))
+    total = strict(lambda v: float(sum(v)))
+    avg = strict(lambda v: sum(v) / len(v))
 
     # Validity: did the shared ancestor bind? Legacy's simultaneous rate per
     # block against the sum of the leaves' solo rates in the same block.
     binding: List[float] = []
     for b in sorted({t.block for t in solo}):
-        solo_rate = sum(float(sum(int(r["bytes"] or 0) for r in t.rows)) for t in solo if t.block == b)
-        sim = [t.m["aggregate_bytes"] for t in ab if t.block == b and t.arm == main]
+        solo_rate = sum(leaf_rate([r for r in t.rows if r["kind"] == "bulk"]) for t in solo if t.block == b)
+        sim = [t.m["sim_rate"] for t in ab if t.block == b and t.arm == main]
         if solo_rate > 0 and sim:
             binding.append(st.mean(sim) / solo_rate)
     binding_mean = st.mean(binding)
     bound_ok = binding_mean == binding_mean and binding_mean <= bounds["binding_max"]
+    # The sustained outcome is bytes within the window; if the objects ran
+    # out first, both arms are capped at the object size and look alike.
+    flows = sum(t.m["sus_flows"] for t in ab)
+    finished = sum(t.m["sus_finished"] for t in ab) / flows if flows else float("nan")
+    backlogged = finished == finished and finished <= 0.10
 
     a, r, s = bounds["alpha"], bounds["resamples"], bounds["seed"]
     # Section 15.4's void rule, on the sustained outcome: a campaign in which
@@ -106,6 +128,10 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     legacy_sus = per_block(main, "aggregate_bytes", total)
     zero_frac = (sum(1 for v in legacy_sus.values() if v == 0) / len(legacy_sus)) if legacy_sus else float("nan")
     zero_void = not (zero_frac <= bounds["max_zero_main_fraction"])
+    void_reason = ("more than the pre-registered fraction of legacy blocks delivered nothing" if zero_void else
+                   "the shared ancestor did not bind; add load" if not bound_ok else
+                   f"{finished:.0%} of sustained flows finished their object inside the window; raise object_bytes"
+                   if not backlogged else "")
     criteria = [
         # name, key, per-block aggregation, contrast builder (cand, legacy) -> d
         ("sustained goodput (aggregate bytes)", "aggregate_bytes", total,
@@ -130,7 +156,7 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
            "Bounds frozen in `scripts/validation/dc_gate.ini` (DESIGN-PATH-AUTHORITY.md section 11.3). Each row is a "
            f"paired per-block contrast that must be positive: one-sided {1 - a:.0%} t and bootstrap lower bounds both above zero.",
            "", f"Loaded leaves: {', '.join(loaded)}; control leaf: {control}.",
-           f"Ancestor binding (legacy simultaneous / sum of solo, mean over {len(binding)} blocks): "
+           f"Ancestor binding (legacy simultaneous rate / sum of solo rates, mean over {len(binding)} blocks): "
            f"{fmt(binding_mean, '.2f')} (must be <= {bounds['binding_max']:g})"
            + ("" if bound_ok else " -- **the shared ancestor did not bind: campaign VOID**"), ""]
     if problems:
@@ -152,25 +178,33 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
         out += ["", f"**{cand} against {main}**", "",
                 "| criterion | contrast | blocks | mean | t lower bound | bootstrap lower bound | verdict |",
                 "|---|---|---:|---:|---:|---:|---|"]
-        all_pass = True
+        all_pass, unmeasured = True, []
         for label, key, agg, build, desc in criteria:
             cb, lb = per_block(cand, key, agg), per_block(main, key, agg)
             common = sorted(set(cb) & set(lb))
             d = [build(cb[b], lb[b]) for b in common if cb[b] == cb[b] and lb[b] == lb[b]]
             mean_d, tl, bl, ok = st.lower_bounds(d, a, int(r), int(s))
-            all_pass &= ok
-            out.append(f"| {label} | `{desc}` | {len(d)} | {fmt(mean_d, '.4g')} | {fmt(tl, '.4g')} | {fmt(bl, '.4g')} | "
-                       f"{'pass' if ok else '**FAIL**'} |")
-        verdict = ("VOID" if not bound_ok or zero_void else
-                   "INCOMPLETE" if problems and all_pass else
+            if len(d) < len(common) or len(d) < 2:
+                # Every judged block must carry the criterion's evidence.
+                unmeasured.append(f"{label}: {len(d)} of {len(common)} blocks measured")
+                cell = "n/a"
+            else:
+                all_pass &= ok
+                cell = "pass" if ok else "**FAIL**"
+            out.append(f"| {label} | `{desc}` | {len(d)} | {fmt(mean_d, '.4g')} | {fmt(tl, '.4g')} | {fmt(bl, '.4g')} | {cell} |")
+        # An unfinished campaign has no verdict; a finished one that did not
+        # test the regime is void; then every criterion must be measured.
+        why = problems + ([] if void_reason else unmeasured)
+        verdict = ("INCOMPLETE" if problems else
+                   "VOID" if void_reason else
+                   "INCOMPLETE" if unmeasured else
                    "PASS" if all_pass else "FAIL")
         verdicts[cand] = verdict
         out += ["", f"**Verdict for {cand}: {verdict}.** "
                 + {"PASS": "The profile may move to the new architecture and the legacy bundle may be deleted (section 11.3).",
                    "FAIL": "The legacy bundle stays for dc-long-haul; joint limiting waits for the tree-arbiter design (Q2).",
-                   "VOID": ("Rerun: more than the pre-registered fraction of legacy blocks delivered nothing."
-                            if zero_void else "Rerun with more load on the loaded leaves so the common ancestor binds."),
-                   "INCOMPLETE": "No verdict: " + "; ".join(problems) + "."}[verdict]]
+                   "VOID": f"Rerun: {void_reason}.",
+                   "INCOMPLETE": "No verdict: " + "; ".join(why) + "."}[verdict]]
     return "\n".join(out) + "\n", verdicts
 
 

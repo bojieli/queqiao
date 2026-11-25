@@ -192,8 +192,11 @@ A campaign directory holds:
 - `metrics/`: gateway scrapes before and after each trial.
 - `logs/`: gateway and client logs, gzipped, and client CPU samples.
 - `prod-*.txt`: the production snapshots.
-- `status.json`: written last, saying whether the campaign completed and
-  whether production was unchanged.
+- `status.json`: written last. It says whether the campaign completed,
+  whether production was unchanged, which temporary listeners or processes
+  survived teardown, and which log files could not be fetched. Either of the
+  last two makes the runner keep the remote work directories, and a teardown
+  leftover makes it exit with status 5.
 
 The analyzer adds `per_trial.tsv` and `summary.md`.
 
@@ -236,9 +239,16 @@ Next come the secondary bounds from `gates.ini`. Each one is a per-block
 `candidate − main` difference with a one-sided bootstrap bound against a
 pre-registered margin. The design requires all of them but does not give
 their values. The margins in `gates.ini` are **provisional** and must be
-confirmed before the stage's campaign starts. Sender-side credit delay p95 and
-the shadow false-promotion rate need the stage 0 instrumentation and are not
-computed yet.
+confirmed before the stage's campaign starts.
+
+A secondary is judged only when it was measured in both arms in every block
+the primary gate judged (`secondary_min_coverage`). A block counts as
+measured only if every trial in it has the measure. A trial in which any flow
+fell back to TCP has no QUIC-only wire count, so it leaves wire cost
+unmeasured rather than flattering it. Sender-side credit delay p95 and the
+shadow false-promotion rate need the stage 0 instrumentation. They are listed
+as required and reported as not measured, so until that instrumentation
+lands, no campaign reaches an overall PASS.
 
 The last line per candidate is the overall verdict:
 
@@ -246,7 +256,9 @@ The last line per candidate is the overall verdict:
 - **FAIL**: any of them fails.
 - **INCOMPLETE**: there is no verdict. Either a required secondary could not
   be measured, or the campaign itself is incomplete: `status.json` is missing
-  or not `complete`, production changed, or a planned trial has no rows. The
+  or not `complete`, production changed, teardown left something behind, or a
+  planned trial has no rows. An incomplete campaign gets no PASS, and no FAIL
+  either. The
   analyzer leaves out any block with a missing trial, so an interrupted block
   cannot pair two candidate trials with one main trial, and it still prints
   the numbers for diagnosis. INCOMPLETE is not a pass.
@@ -304,14 +316,21 @@ shared relay, but their groups spread out by 3.5×, while the shared relay
 finished every flow within 2 ms. A knowledge-only tree buys aggregate the same
 way, so a candidate that wins on goodput by starving a leaf fails here.
 
-The campaign is **VOID** in two cases:
+The campaign is **VOID** in three cases:
 
-- The shared ancestor did not bind. The legacy arm's simultaneous aggregate
-  must average at most 0.80 of the sum of the leaves' solo rates. Otherwise
-  the campaign did not test the regime, so add load and rerun.
+- The shared ancestor did not bind. The legacy arm's simultaneous rate must
+  average at most 0.80 of the sum of the leaves' solo rates. Each rate is a
+  leaf's bytes over the duration of its longest flow, so objects that finish
+  early cannot hide a shared bottleneck. Otherwise the campaign did not test
+  the regime, so add load and rerun.
+- More than 10% of the sustained flows finished their object inside the
+  window. Both arms were then capped at the object size, so raise
+  `object_bytes`.
 - More than 10% of the legacy arm's blocks delivered nothing. Rerun.
 
-An unfinished campaign is INCOMPLETE, as in Gate 1.
+An unfinished campaign is INCOMPLETE, as in Gate 1. So is one in which any
+criterion lacks evidence in some judged block, for example a control probe
+that produced nothing.
 
 ```sh
 ./scripts/ab_campaign.py --config scripts/validation/dc.local.ini --dry-run

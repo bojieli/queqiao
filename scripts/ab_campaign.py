@@ -633,6 +633,19 @@ def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[T
     return [got[f] for f in order]
 
 
+def origin_script(W: str, objects: Sequence[Tuple[str, int]]) -> str:
+    """Create the origin's objects at their exact sizes, or fail. A truncated
+    object (a full disk, an interrupted earlier run) would make every arm
+    benchmark the same undersized payload."""
+    mk = [f"mkdir -p {W}/origin {W}/run"]
+    for name, size in objects:
+        f = f"{W}/origin/{name}"
+        mk.append(f"[ \"$(( $(wc -c < {f} 2>/dev/null || echo 0) ))\" -eq {size} ] || "
+                  f"{{ head -c {size} /dev/urandom > {f}.tmp && mv {f}.tmp {f}; }}")
+        mk.append(f"[ \"$(( $(wc -c < {f}) ))\" -eq {size} ] || {{ echo 'origin object {name} is not {size} bytes'; exit 1; }}")
+    return "\n".join(mk)
+
+
 def cpu_sampler(pid_file: str, out_file: str) -> str:
     """Shell that samples a process's cumulative CPU once a second as
     "epoch ticks" lines, 100 ticks per second: /proc on Linux, ps's
@@ -662,12 +675,20 @@ class Campaign:
                                       for h in cfg.hosts() + [p.host for p in cfg.production]}
         self.before: Dict[str, dict] = {}
         self.active_small: Dict[str, str] = {}   # host -> running temporary client tag
+        self.fetch_failures: List[str] = []
         self.started = False
 
     # paths on a host
     def w(self, host: str) -> str:
         h = self.hosts[host]
         return f"{h.home}/{self.cfg.work_dir}" if h.home else f"~/{self.cfg.work_dir}"
+
+    def must(self, host: Host, script: str, what: str, timeout: Optional[float] = 120) -> str:
+        """Run a setup step that has to succeed."""
+        rc, out = host.run(script, timeout=timeout, what=what)
+        if rc != 0 and not self.dry:
+            raise RuntimeError(f"{host.dest}: {what} failed (exit {rc}): {out.strip()[:400]}")
+        return out
 
     def log(self, msg: str) -> None:
         print(f"{utc(time.time())} {msg}", file=self.stream, flush=True)
@@ -801,13 +822,10 @@ class Campaign:
         cfg, g = self.cfg, self.cfg.gateway
         gh = self.hosts[g.host]
         W = self.w(g.host)
-        mk = [f"mkdir -p {W}/origin {W}/run"]
-        for name, size in self.objects():
-            mk.append(f"[ -s {W}/origin/{name} ] || head -c {size} /dev/urandom > {W}/origin/{name}")
-        gh.run("\n".join(mk), what="create work directory and origin objects")
+        self.must(gh, origin_script(W, self.objects()), "create work directory and origin objects", timeout=600)
         for host in cfg.hosts():
             if host != g.host:
-                self.hosts[host].run(f"mkdir -p {self.w(host)}/run", what="create work directory")
+                self.must(self.hosts[host], f"mkdir -p {self.w(host)}/run", "create work directory")
         # --directory puts the work directory in the command line, which is
         # what stop() and teardown() check before signalling anything.
         self.spawn(gh, "origin", f"{W}/origin",
@@ -815,12 +833,14 @@ class Campaign:
         self.wait_port(gh, g.origin_port, "origin")
         for arm in cfg.arms:
             d = self.gw_dir(arm)
-            gh.run(f"mkdir -p {d}/logs", what=f"gateway directory for {arm.name}")
+            self.must(gh, f"mkdir -p {d}/logs", f"gateway directory for {arm.name}")
             gh.put(self.binary(arm, g.platform, "gateway"), f"{d}/queqiaod")
-            gh.run(f"chmod +x {d}/queqiaod\ncd {d} && [ -d state ] || {{ ./queqiaod provider init --state ./state "
-                   f"--name {cfg.work_dir}-{arm.name} --endpoint {g.address}:{g.port_base + arm.index} >/dev/null && "
-                   f"./queqiaod provider add-user --state ./state --name ab >/dev/null; }}",
-                   what=f"temporary provider state for {arm.name}")
+            # Fresh provider state every campaign: a kept work directory from
+            # an earlier run must not supply this one's identity or users.
+            self.must(gh, f"chmod +x {d}/queqiaod\ncd {d} && rm -rf ./state && ./queqiaod provider init --state ./state "
+                      f"--name {cfg.work_dir}-{arm.name} --endpoint {g.address}:{g.port_base + arm.index} >/dev/null && "
+                      f"./queqiaod provider add-user --state ./state --name ab >/dev/null",
+                      f"temporary provider state for {arm.name}")
         # Enrollment needs a running gateway; start each, enroll every client, stop.
         for arm in cfg.arms:
             self.start_gateway(arm, "enroll")
@@ -831,18 +851,20 @@ class Campaign:
     def enroll(self, client: Client, arm: Arm) -> None:
         gh, ch = self.hosts[self.cfg.gateway.host], self.hosts[client.host]
         d = self.cl_dir(client, arm)
-        rc, out = gh.run(f"cd {self.gw_dir(arm)} && ./queqiaod provider invite --state ./state --user ab --expires-in 1h",
-                         what=f"invitation for {client.name}/{arm.name}")
+        out = self.must(gh, f"cd {self.gw_dir(arm)} && ./queqiaod provider invite --state ./state --user ab --expires-in 1h",
+                        f"invitation for {client.name}/{arm.name}")
         m = re.search(r"queqiao://\S+", out)
         invite = m.group(0) if m else "<invite>"
         if not self.dry and not m:
             raise RuntimeError(f"no invitation from gateway {arm.name}: {out.strip()[:300]}")
-        ch.run(f"mkdir -p {d}/logs", what=f"client directory {client.name}/{arm.name}")
+        self.must(ch, f"mkdir -p {d}/logs", f"client directory {client.name}/{arm.name}")
         ch.put(self.binary(arm, client.platform, "client"), f"{d}/queqiaod")
         local = " ".join(_q(x) for x in local_address_args(client.flags))
-        ch.run(f"chmod +x {d}/queqiaod\ncd {d} && ./queqiaod enroll --invite {_q(invite)} --profile {d}/profile.json "
-               f"--device-name {self.cfg.work_dir}-{client.name} {local} >/dev/null",
-               what=f"enroll {client.name} with {arm.name}")
+        # A profile left by an earlier run would point at another gateway:
+        # remove it, enroll, and fail the campaign if enrollment fails.
+        self.must(ch, f"chmod +x {d}/queqiaod\ncd {d} && rm -f {d}/profile.json && ./queqiaod enroll --invite {_q(invite)} "
+                  f"--profile {d}/profile.json --device-name {self.cfg.work_dir}-{client.name} {local} >/dev/null && "
+                  f"test -s {d}/profile.json", f"enroll {client.name} with {arm.name}")
 
     # -- processes
     def spawn(self, host: Host, tag: str, cwd: str, cmd: str, env: str = "") -> None:
@@ -1099,8 +1121,16 @@ rm -f "$f"''', what=f"stop {tag}")
                            what=f"list {prefix} logs")
         names = [x.strip() for x in out.splitlines() if x.strip().startswith(prefix)] if not self.dry else [prefix + ".*"]
         for n in names:
-            if host.get(f"{remote_dir}/{n}", os.path.join(local_dir, n)) and not self.dry:
+            ok = host.get(f"{remote_dir}/{n}", os.path.join(local_dir, n)) or \
+                host.get(f"{remote_dir}/{n}", os.path.join(local_dir, n))
+            if self.dry:
+                continue
+            if ok:
                 host.run(f"rm -f {remote_dir}/{_q(n)}", what=f"delete fetched {n}")
+            else:
+                # Keep the remote copy; the work directory is then kept too.
+                self.fetch_failures.append(f"{host.dest}:{remote_dir}/{n}")
+                self.log(f"could not fetch {host.dest}:{remote_dir}/{n}; it stays on the host")
 
     def record_effective(self) -> None:
         """Publish each endpoint's effective configuration (section 14)."""
@@ -1205,8 +1235,17 @@ ps -eo pid=,args= | grep -F -- "{W}/" | grep -v -F grep || true''', what="stop e
         finally:
             if tsv:
                 tsv.close()
-            self.teardown()
-            if clean:
+            leftovers: List[str] = []
+            try:
+                self.teardown()
+                leftovers = self.verify_teardown()
+            except Exception as e:
+                leftovers = [f"teardown could not be verified: {type(e).__name__}: {e}"]
+            if leftovers:
+                self.log("TEARDOWN INCOMPLETE, the work directories are kept for manual cleanup:\n  " + "\n  ".join(leftovers))
+            elif self.fetch_failures:
+                self.log(f"{len(self.fetch_failures)} log file(s) could not be fetched; the work directories are kept")
+            elif clean:
                 self.clean()
             for sig, h in prev.items():
                 signal.signal(sig, h)
@@ -1216,13 +1255,34 @@ ps -eo pid=,args= | grep -F -- "{W}/" | grep -v -F grep || true''', what="stop e
         except ProductionChanged as e:
             self.log(f"PRODUCTION CHANGED during the campaign: {e}")
             production, status = "changed", 3
+        if leftovers and status == 0:
+            status = 5
         if not self.dry:
-            # The analyzers issue a verdict only for a campaign that finished
-            # and left production as it found it.
+            # The analyzers issue a verdict only for a campaign that finished,
+            # cleaned up after itself and left production as it found it.
             with open(os.path.join(self.out, "status.json"), "w") as f:
                 json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
-                           "production": production, "finished_utc": utc(time.time())}, f)
+                           "production": production, "teardown_leftovers": leftovers,
+                           "fetch_failures": self.fetch_failures, "finished_utc": utc(time.time())}, f, indent=2)
         return status
+
+    def verify_teardown(self) -> List[str]:
+        """Temporary listeners (TCP or UDP) or processes that survived
+        teardown, read from each host's listener and process tables."""
+        if self.dry:
+            self.snapshot_all("teardown")
+            return []
+        snaps = self.snapshot_all("teardown")
+        out = []
+        for host, ports in self.cfg.planned_ports().items():
+            snap = snaps.get(host, {})
+            if not snap.get("listen_ok"):
+                out.append(f"{host}: could not read the listening ports")
+            for port, what in ports:
+                if port in snap.get("listen", set()):
+                    out.append(f"{host}: {what} port {port} is still listening")
+            out += [f"{host}: still running: {x}" for x in snap.get("leftover", [])]
+        return out
 
     def print_plan(self, slots: List[Slot]) -> None:
         cfg = self.cfg

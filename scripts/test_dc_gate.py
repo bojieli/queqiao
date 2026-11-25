@@ -26,7 +26,7 @@ def iso(t):
 
 
 def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blocks=12, seed=3,
-             cand_request=1.0, cand_control=1.0, zero_legacy=()):
+             cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -58,16 +58,19 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
                 size = 0 if (arm == "legacy" and b in zero_legacy) else int(level * share * noise / 2)
                 for i in (1, 2):
                     rows.append([b, "dc", slot] + base + ["sustained", j, leaf, "bulk", f"b{i}", iso(t), iso(t + 60),
-                                                          200, size, 60, 28, 0, 60])
+                                                          200, size, 60, 0 if finished else 28, int(finished), 60])
                 rt = 0.30 * (1.0 if arm == "legacy" else cand_request / max(share, 1e-3)) * noise
                 for w in (1, 2, 3):
                     for r in range(1, 9):
                         rows.append([b, "dc", slot] + base + ["requests", j, leaf, "requests", f"w{w}r{r}", iso(t + 60),
                                                               iso(t + 70), 200, 307200, f"{rt:.4f}", 0, 1, 10])
             ctl = 0.20 * (1.0 if arm == "legacy" else cand_control) * noise
-            for p in range(1, 30):
-                rows.append([b, "dc", slot] + base + ["sustained", 3, "ctl", "probe", f"p{p}", iso(t), iso(t + 60),
-                                                      200, 307200, f"{ctl:.4f}", 0, 1, 60])
+            for phase in ("sustained", "requests"):
+                if (b, slot, phase) in drop_control:
+                    continue
+                for p in range(1, 15):
+                    rows.append([b, "dc", slot] + base + [phase, 3, "ctl", "probe", f"p{p}", iso(t), iso(t + 60),
+                                                          200, 307200, f"{ctl:.4f}", 0, 1, 60])
             t += 80
         for j, leaf in enumerate(LOADED):
             for i in (1, 2):
@@ -144,6 +147,34 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("zero", zero_legacy=(1, 2))
         self.assertEqual(v["cand"], "VOID")
         self.assertIn("delivered nothing", text)
+
+    def test_missing_control_observations_leave_no_verdict(self):
+        text, v = self.run_gate("noctl", drop_control=((4, 2, "requests"),))
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("control leaf request p50: 11 of 12 blocks measured", text)
+
+    def test_objects_that_finish_inside_the_window_void_the_campaign(self):
+        text, v = self.run_gate("finished", finished=True)
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("raise object_bytes", text)
+
+    def test_binding_is_judged_on_rates(self):
+        # Same bytes alone and together, but together took three times as
+        # long: the ancestor bound, and a byte ratio would have said 1.0.
+        root = os.path.join(self.tmp.name, "rates")
+        write_dc(root, binding=1.0)
+        path = os.path.join(root, "trials.tsv")
+        lines = pathlib.Path(path).read_text().splitlines()
+        out = [lines[0]]
+        for line in lines[1:]:
+            f = line.split("\t")
+            if f[7] == "solo":
+                f[16] = "20"  # the solo run moved its bytes in a third of the time
+            out.append("\t".join(f))
+        pathlib.Path(path).write_text("\n".join(out) + "\n")
+        text, v = dc.evaluate(root, self.bounds)
+        self.assertIn("sum of solo rates, mean over 12 blocks): 0.33", text)
+        self.assertNotEqual(v["cand"], "VOID")
 
     def test_unfinished_campaign_gets_no_verdict(self):
         root = os.path.join(self.tmp.name, "unfinished")

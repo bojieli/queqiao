@@ -390,6 +390,27 @@ class LocalProcesses(unittest.TestCase):
         self.assertEqual(snap["leftover"], [])
         self.assertIn(snap.get("os"), ("Linux", "Darwin"))
 
+    def test_origin_objects_have_their_exact_size(self):
+        objs = [("obj-1000", 1000), ("obj-5", 5)]
+        rc, out = self.host.run(ab.origin_script(self.W, objs))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(os.path.getsize(os.path.join(self.W, "origin", "obj-1000")), 1000)
+        # A truncated object from an interrupted run is regenerated.
+        with open(os.path.join(self.W, "origin", "obj-1000"), "r+b") as f:
+            f.truncate(10)
+        rc, out = self.host.run(ab.origin_script(self.W, objs))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(os.path.getsize(os.path.join(self.W, "origin", "obj-1000")), 1000)
+
+    def test_teardown_leftovers_are_reported(self):
+        snap = {"local": ab.parse_snapshot("listen-ok\nlisten udp 23471\nleftover 99 " + self.W + "/gw-main/queqiaod server\n")}
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value=snap):
+            left = self.camp.verify_teardown()
+        self.assertTrue(any("gateway main port 23471 is still listening" in x for x in left), left)
+        self.assertTrue(any("still running: 99" in x for x in left), left)
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\n")}):
+            self.assertEqual(self.camp.verify_teardown(), [])
+
     def test_cpu_sampler_reads_a_busy_process(self):
         busy = subprocess.Popen([sys.executable, "-c", "while True: pass"])
         self.procs.append(busy)

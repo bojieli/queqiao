@@ -27,7 +27,7 @@ def iso(t):
 
 
 def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, late_every=5, zero_main=(), cand_stalls=3,
-                   status="complete", drop_slot=None, workload="bulk", cand_probe=None):
+                   status="complete", drop_slot=None, workload="bulk", cand_probe=None, cand_fallbacks=0, missing_queue=()):
     """A two-arm campaign on one path with known outcomes.
 
     Main delivers ~40 MB per trial (four 10 MB flows) with 20% block-to-block
@@ -79,10 +79,11 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
             os.makedirs(md, exist_ok=True)
             with open(os.path.join(md, name + "-pre.txt"), "w") as f:
                 f.write("queqiao_quic_packets_sent 0\nqueqiao_quic_loss_observed_packets_total 0\n"
-                        "queqiao_quic_bytes_sent 0\nqueqiao_flow_stalls_detected_total 5\n")
+                        "queqiao_quic_bytes_sent 0\nqueqiao_flow_stalls_detected_total 5\nqueqiao_fallbacks_total 2\n")
             with open(os.path.join(md, name + "-post.txt"), "w") as f:
                 f.write(f"queqiao_quic_packets_sent 1000\nqueqiao_quic_loss_observed_packets_total 100\n"
-                        f"queqiao_quic_bytes_sent {useful * 1.3}\nqueqiao_flow_stalls_detected_total {5 + (3 if arm == 'main' else cand_stalls)}\n")
+                        f"queqiao_quic_bytes_sent {useful * 1.3}\nqueqiao_flow_stalls_detected_total {5 + (3 if arm == 'main' else cand_stalls)}\n"
+                        f"queqiao_fallbacks_total {2 + (0 if arm == 'main' else cand_fallbacks)}\n")
             srv = os.path.join(root, "logs", f"gw-{arm}")
             cli = os.path.join(root, "logs", f"cl-p-{arm}")
             os.makedirs(srv, exist_ok=True)
@@ -98,8 +99,9 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
                     ts_ = tc + 0.2 + (0.3 if k % late_every == late_every - 1 else 0.0)
                     cf.write(json.dumps({"time": iso(tc), "msg": "lane performance snapshot", "type": "lane_metrics",
                                          "flow_id": 7 + slot, "acksout": 1}) + "\n")
+                    srtt = 150.0 if (b, slot) not in missing_queue else 0.0
                     sf.write(json.dumps({"time": iso(ts_), "msg": "lane performance snapshot", "type": "lane_metrics",
-                                         "flow_id": 7 + slot, "acksin": 1, "srtt": 150.0, "minrtt": 100.0,
+                                         "flow_id": 7 + slot, "acksin": 1, "srtt": srtt, "minrtt": 100.0,
                                          "inflight": 5000, "pktsent": k + 1000 * slot, "sent": k,
                                          "breissued": 10 * (k + 1), "source": 1000 * (k + 1)}) + "\n")
             with open(os.path.join(cli, f"client-{tag}-s{slot}.cpu"), "w") as f:
@@ -122,6 +124,10 @@ class Analyzer(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.gates = an.load_gates()
         self.gates["resamples"] = 4000
+        # The same gates without the two secondaries that need stage 0
+        # instrumentation, to test the verdict logic on measurable ones.
+        self.measurable = dict(self.gates, secondary={k: v for k, v in self.gates["secondary"].items()
+                                                      if k not in ("credit_delay_p95_s", "false_promotion_rate")})
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -140,7 +146,7 @@ class Analyzer(unittest.TestCase):
         self.assertEqual(g["true_ratio"], 1.0)
 
     def test_equal_candidate_passes(self):
-        text, v = an.report(self.campaign("eq", cand_ratio=1.0), self.gates)
+        text, v = an.report(self.campaign("eq", cand_ratio=1.0), self.measurable)
         self.assertEqual(v[("p", "cand", "primary")], "**PASS**")
         self.assertEqual(v[("p", "cand", "overall")], "PASS")
         self.assertIn("| cand | 12 |", text)
@@ -188,17 +194,42 @@ class Analyzer(unittest.TestCase):
         self.assertIn("- `main` gateway: `bundle=legacy congestion=erasure`", text)
         self.assertIn("- `cand` client: `bundle=cc-api=v2 congestion=erasure`", text)
         for want in ("### p: 12 blocks", "| metric | main | cand |", "flow-ACK transit p50 / p90",
-                     "queue p90", "**Primary gate (section 15.4), p**", "stalls / trial", "wire bytes / useful byte"):
+                     "queue p90", "**Primary gate (section 15.4), p**", "stalls / trial", "wire bytes / useful byte", "TCP fallbacks"):
             self.assertIn(want, text)
 
     def test_secondary_bounds_are_evaluated(self):
-        _, v = an.report(self.campaign("sec", cand_ratio=1.0), self.gates)
+        _, v = an.report(self.campaign("sec", cand_ratio=1.0), self.measurable)
         # Identical secondary measures in both arms: every bound passes.
         for key in ("stalls_per_trial", "wire_per_useful", "queue_p90_ms", "completion", "cpu_p90"):
             self.assertEqual(v[("p", "cand", key)], "pass", key)
 
+    def test_required_secondaries_without_instrumentation_leave_the_gate_incomplete(self):
+        text, v = an.report(self.campaign("noinstr", cand_ratio=1.0), self.gates)
+        self.assertEqual(v[("p", "cand", "primary")], "**PASS**")
+        self.assertEqual(v[("p", "cand", "credit_delay_p95_s")], "n/a")
+        self.assertEqual(v[("p", "cand", "false_promotion_rate")], "n/a")
+        self.assertEqual(v[("p", "cand", "overall")], "INCOMPLETE")
+
+    def test_partially_measured_secondary_is_not_judged(self):
+        _, v = an.report(self.campaign("partial", cand_ratio=1.0, missing_queue=((3, 2),)), self.measurable)
+        self.assertEqual(v[("p", "cand", "queue_p90_ms")], "n/a")
+        self.assertEqual(v[("p", "cand", "overall")], "INCOMPLETE")
+
+    def test_tcp_fallback_trials_have_no_wire_cost(self):
+        root = self.campaign("fallback", cand_ratio=1.0, cand_fallbacks=1)
+        plan, trials = an.read_campaign(root)
+        an.measure(root, plan, trials)
+        cand = [t for t in trials.values() if t.arm == "cand"]
+        self.assertTrue(all(t.m["wire_per_useful"] != t.m["wire_per_useful"] for t in cand))
+        _, v = an.report(root, self.measurable)
+        self.assertEqual(v[("p", "cand", "wire_per_useful")], "n/a")
+
+    def test_incomplete_overrides_a_failing_verdict_too(self):
+        _, v = an.report(self.campaign("badnostatus", cand_ratio=0.6, status=None), self.gates)
+        self.assertEqual(v[("p", "cand", "primary")], "INCOMPLETE")
+
     def test_a_failed_secondary_fails_the_gate(self):
-        text, v = an.report(self.campaign("stalls", cand_ratio=1.0, cand_stalls=9), self.gates)
+        text, v = an.report(self.campaign("stalls", cand_ratio=1.0, cand_stalls=9), self.measurable)
         self.assertEqual(v[("p", "cand", "primary")], "**PASS**")
         self.assertEqual(v[("p", "cand", "stalls_per_trial")], "**FAIL**")
         self.assertEqual(v[("p", "cand", "overall")], "FAIL")

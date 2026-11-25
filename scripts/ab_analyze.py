@@ -65,6 +65,7 @@ def load_gates(path: str = GATES) -> dict:
     return {"ratio": p.getfloat("ratio"), "alpha": p.getfloat("alpha"),
             "resamples": p.getint("bootstrap_resamples"), "seed": p.getint("bootstrap_seed"),
             "max_zero_main_fraction": p.getfloat("max_zero_main_fraction"),
+            "secondary_min_coverage": p.getfloat("secondary_min_coverage", fallback=1.0),
             "pilot_blocks": w.getint("pilot_blocks"), "power": w.getfloat("power"),
             "true_ratio": w.getfloat("true_ratio"), "secondary": sec}
 
@@ -318,7 +319,10 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         t.m["loss"] = d("queqiao_quic_loss_observed_packets_total") / sent if sent and sent == sent else float("nan")
         t.m["stalls_per_trial"] = d("queqiao_flow_stalls_detected_total")
         wire = d("queqiao_quic_bytes_sent")
-        t.m["wire_per_useful"] = wire / useful if useful else float("nan")
+        t.m["tcp_fallbacks"] = d("queqiao_fallbacks_total")
+        # QUIC bytes only: a trial that moved data over TCP fallback has no
+        # comparable wire count, so it is not measured rather than flattered.
+        t.m["wire_per_useful"] = (wire / useful if useful and t.m["tcp_fallbacks"] == 0 else float("nan"))
         # A probe that did not finish counts at its timeout: dropping it
         # would let an arm improve its p99 by failing its slowest requests.
         probes = [float(r["seconds"]) if r["complete"] == "1" else PROBE_TIMEOUT for r in t.rows if r["kind"] == "probe"]
@@ -392,7 +396,12 @@ def block_outcome(ts_: List[Trial]) -> float:
 
 
 def block_metric(ts_: List[Trial], key: str) -> float:
-    return st.mean([t.m.get(key, float("nan")) for t in ts_])
+    """The arm's mean over its trials in the block; NaN unless every trial
+    has the measure, so a block cannot be judged on half its evidence."""
+    vals = [t.m.get(key, float("nan")) for t in ts_]
+    if not vals or any(v is None or v != v for v in vals):
+        return float("nan")
+    return sum(vals) / len(vals)
 
 
 def paired(trials, path: str, main: str, cand: str, f) -> Tuple[List[float], List[float], List[int]]:
@@ -415,6 +424,8 @@ SECONDARY_LABELS = {
     "queue_p90_ms": "queue p90, ms",
     "interactive_p99_s": "interactive p99 under bulk, s",
     "cpu_p90": "client CPU p90, cores",
+    "credit_delay_p95_s": "sender-side credit delay p95, s",
+    "false_promotion_rate": "shadow false-promotion rate",
 }
 
 
@@ -475,7 +486,8 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
         row("server loss (median)", [fmt(med(a, "loss"), ".3f") for a in arms])
         row("queue p90 srtt-minRTT, ms (median)", [fmt(med(a, "queue_p90_ms"), ".0f") for a in arms])
         row("stalls / trial (median)", [fmt(med(a, "stalls_per_trial"), ".1f") for a in arms])
-        row("wire bytes / useful byte (median)", [fmt(med(a, "wire_per_useful"), ".2f") for a in arms])
+        row("gateway QUIC wire bytes / useful byte (median)", [fmt(med(a, "wire_per_useful"), ".2f") for a in arms])
+        row("TCP fallbacks (total)", [fmt(sum(t.m.get("tcp_fallbacks", 0) for t in pts[a] if t.m.get("tcp_fallbacks") == t.m.get("tcp_fallbacks")), ".0f") for a in arms])
         row("reissued / source bytes (median)", [fmt(med(a, "reissued_per_source"), ".1%") for a in arms])
         pooled = {a: [x for t in pts[a] for x in t.m.get("_transit", [])] for a in arms}
         row("flow-ACK transit p50 / p90, s (pooled)", [f"{fmt(st.quantile(pooled[a], .5), '.3f')} / {fmt(st.quantile(pooled[a], .9), '.3f')}" for a in arms])
@@ -486,13 +498,16 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
         out += ["", f"**Primary gate (section 15.4), {path}**", "",
                 "| candidate | blocks | ratio of means | mean contrast, MB | t lower bound, MB | bootstrap lower bound, MB | main zero blocks | verdict |",
                 "|---|---:|---:|---:|---:|---:|---:|---|"]
+        judged: Dict[str, int] = {}
         for cand in arms[1:]:
             c, m, common = paired(trials, path, main, cand, block_outcome)
             g = st.gate(c, m, ratio=gates["ratio"], alpha=gates["alpha"], resamples=gates["resamples"],
                         seed=gates["seed"], max_zero_main_fraction=gates["max_zero_main_fraction"])
             verdict = "VOID" if g.void else ("**PASS**" if g.passed else "**FAIL**")
-            if problems and verdict == "**PASS**":
+            if problems:
+                # No verdict from an incomplete campaign, whatever the numbers say.
                 verdict = "INCOMPLETE"
+            judged[cand] = g.n
             verdicts[(path, cand, "primary")] = verdict
             out.append(f"| {cand} | {g.n} | {fmt(g.ratio_of_means, '.3f')} | {fmt(g.mean_contrast / 1e6, '.2f')} | "
                        f"{fmt(g.t_lower / 1e6, '.2f')} | {fmt(g.boot_lower / 1e6, '.2f')} | {fmt(g.zero_main_fraction, '.0%')} | "
@@ -507,7 +522,8 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
                     upper = better == "lower"
                     mdiff, bound, n = st.paired_secondary(c, m, alpha=gates["alpha"], resamples=gates["resamples"],
                                                           seed=gates["seed"], upper=upper)
-                    if bound != bound:
+                    need = math.ceil(gates["secondary_min_coverage"] * judged.get(cand, 0) - 1e-9)
+                    if bound != bound or n < max(need, 2):
                         verdict = "n/a"
                     elif upper:
                         verdict = "pass" if bound <= margin else "**FAIL**"
@@ -520,8 +536,8 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
             prim = verdicts[(path, cand, "primary")]
             sv = [verdicts[(path, cand, k)] for k in secondary]
             fails, missing = sv.count("**FAIL**"), sv.count("n/a")
-            overall = ("VOID" if prim == "VOID" else
-                       "INCOMPLETE" if prim == "INCOMPLETE" else
+            overall = ("INCOMPLETE" if problems or prim == "INCOMPLETE" else
+                       "VOID" if prim == "VOID" else
                        "FAIL" if prim != "**PASS**" or fails else
                        "INCOMPLETE" if missing else "PASS")
             verdicts[(path, cand, "overall")] = overall
