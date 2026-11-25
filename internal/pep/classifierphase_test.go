@@ -2,6 +2,7 @@ package pep
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/bojieli/queqiao/internal/classifier"
 	"github.com/bojieli/queqiao/internal/coded"
+	"github.com/bojieli/queqiao/internal/memlimit"
 	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
@@ -664,62 +666,114 @@ func TestCodedDataOutstandingFollowsTheAttempts(t *testing.T) {
 	}
 }
 
-// The backlog threshold fits what the flow's scheduler can hold: its send
-// bytes, its chunk count, and under mem=owned the autotune floor. A transfer
-// blocked for room must be able to show a backlog over it.
+// The backlog threshold fits what the flow's scheduler can hold -- its send
+// bytes, its chunk count times what each read can hold, and under mem=owned
+// the autotune floor -- and sits at half of what remains after one read is
+// acknowledged. It only lowers the configured value.
 func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
 	const base = 64 << 10
 	small := defaultFlowMemoryLimits()
 	small.maxSendBytes = 48 << 10
 	twoChunks := defaultFlowMemoryLimits()
 	twoChunks.maxSendBytes, twoChunks.maxOutstanding = 1<<20, 2
+	eightSlots := defaultFlowMemoryLimits()
+	eightSlots.maxSendBytes, eightSlots.maxOutstanding = 1<<20, 8
 	ios, _, _, err := resolveMemoryLimits(iosMemoryLimits(), iosChunkSize, MemoryOwned)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range []struct {
-		name     string
-		limits   flowMemoryLimits
-		chunk    int
-		memOwned bool
-		want     uint64
+		name            string
+		base            uint64
+		limits          flowMemoryLimits
+		chunk, readSize int
+		memOwned        bool
+		want            uint64
 	}{
-		{"default", defaultFlowMemoryLimits(), defaultChunkSize, false, 64 << 10},
-		{"48 KiB send bound", small, defaultChunkSize, false, 24 << 10},
-		{"two 16 KiB chunks", twoChunks, 16 << 10, false, 16 << 10},
-		{"ios, legacy memory", ios, iosChunkSize, false, 64 << 10},
-		{"ios, mem=owned at the autotune floor", ios, iosChunkSize, true, 32 << 10},
+		{"default", base, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 64 << 10},
+		{"48 KiB send bound", base, small, defaultChunkSize, defaultChunkSize, false, 8 << 10},
+		{"two 16 KiB chunks", base, twoChunks, 16 << 10, 16 << 10, false, 8 << 10},
+		{"eight slots of 1 KiB staged reads", base, eightSlots, 32 << 10, stagingBytes, false, 3584},
+		{"ios, legacy memory", base, ios, iosChunkSize, iosChunkSize, false, 64 << 10},
+		{"ios, mem=owned at the autotune floor", base, ios, iosChunkSize, iosChunkSize, true, 24 << 10},
+		{"a profile's lower threshold is kept", 16 << 10, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 16 << 10},
 	} {
-		if got := backlogThresholdFor(base, c.limits, c.chunk, c.memOwned); got != c.want {
+		if got := backlogThresholdFor(c.base, c.limits, c.chunk, c.readSize, c.memOwned); got != c.want {
 			t.Errorf("%s: threshold %d, want %d", c.name, got, c.want)
 		}
 	}
 }
 
+// fitBacklogThreshold starts from the profile's threshold, and sizes reads
+// to the staging buffer when the scheduler stages them and the connection
+// cannot take the read deadline that would extend them.
+func TestFitBacklogThresholdUsesTheProfileAndTheReadPath(t *testing.T) {
+	cfg := phasedClassifierConfig(profile.Default().Classifier, ClassifierPhased)
+	cfg.BulkBacklogBytes = 16 << 10
+	inner, peer := net.Pipe()
+	defer inner.Close()
+	defer peer.Close()
+	f := newMultipathFlowWithMemory(context.Background(), inner, [16]byte{1}, 1, 32<<10,
+		protocol.FlagAckDown, protocol.FlagAckUp, nil, nil, nil, defaultFlowMemoryLimits(), nil, nil, cfg)
+	f.fitBacklogThreshold()
+	if got := f.classifier.BacklogBytes(); got != 16<<10 {
+		t.Fatalf("a configured 16 KiB threshold became %d", got)
+	}
+
+	limits := defaultFlowMemoryLimits()
+	limits.maxSendBytes, limits.maxOutstanding = 1<<20, 8
+	staged := newMultipathFlowWithMemory(context.Background(), noDeadlineConn{inner}, [16]byte{1}, 2, 32<<10,
+		protocol.FlagAckDown, protocol.FlagAckUp, nil, nil, nil, limits, memlimit.New(1<<20), nil,
+		phasedClassifierConfig(profile.Default().Classifier, ClassifierPhased))
+	staged.fitBacklogThreshold()
+	if got := staged.classifier.BacklogBytes(); got != 3584 {
+		t.Fatalf("eight staged 1 KiB reads: threshold %d, want 3584", got)
+	}
+}
+
+// noDeadlineConn is a connection that cannot take read deadlines.
+type noDeadlineConn struct{ net.Conn }
+
+func (noDeadlineConn) SetReadDeadline(time.Time) error { return errors.New("no deadlines") }
+
 // A flow limited by chunk count -- two 16 KiB chunks, so at most 32 KiB read
 // ahead -- that left BULK and then transfers without a break goes back into
-// BULK. With a 64 KiB threshold its backlog could never show.
+// BULK. The peer acknowledges one chunk before the producer refills its slot,
+// through the real acknowledgement path, so every dip is recorded: a dip to
+// one chunk of backlog must not count as the transfer draining.
 func TestACountLimitedTransferReentersBulk(t *testing.T) {
 	h := newPhaseHarness(t, ClassifierPhased)
-	h.f.chunkSize = 16 << 10
-	h.f.memoryLimits.maxSendBytes, h.f.memoryLimits.maxOutstanding = 1<<20, 2
-	h.f.fitBacklogThreshold()
+	f := h.f
+	f.chunkSize = 16 << 10
+	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 2
+	f.fitBacklogThreshold()
 	h.advance(2 * time.Second)
 	h.burst()
 	h.keystrokes(5 * time.Second)
 	if h.current() == classifier.ClassBulk {
 		t.Fatal("setup: the flow did not leave BULK")
 	}
-	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
-		h.write(16<<10, false)
-		// The scheduler holds two chunks; the peer acknowledges the rest.
-		if sent := h.f.bytesUp.Load(); sent > 32<<10 {
-			h.f.setAckCoverage(sent - 32<<10)
+	ackTo := func(sequence uint64) {
+		t.Helper()
+		f.replayMu.Lock()
+		f.highestSent = f.bytesUp.Load()
+		f.replayMu.Unlock()
+		if _, err := f.acknowledgeCoverage(sequence, false, nil); err != nil {
+			t.Fatal(err)
 		}
-		h.advance(10 * time.Millisecond)
+	}
+	// Fill both slots.
+	h.write(16<<10, false)
+	h.write(16<<10, false)
+	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
+		// The oldest chunk is acknowledged, then its slot is refilled.
+		ackTo(f.bytesUp.Load() - 16<<10)
+		h.advance(5 * time.Millisecond)
+		h.write(16<<10, false)
+		h.advance(5 * time.Millisecond)
 	}
 	if h.current() != classifier.ClassBulk {
-		t.Fatalf("a transfer held at its 32 KiB read-ahead never re-entered BULK (threshold %d)", h.f.classifier.BacklogBytes())
+		t.Fatalf("a transfer held at its 32 KiB read-ahead never re-entered BULK (threshold %d)", f.classifier.BacklogBytes())
 	}
 }
 

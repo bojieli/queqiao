@@ -2,6 +2,7 @@ package pep
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/bojieli/queqiao/internal/classifier"
 	"github.com/bojieli/queqiao/internal/profile"
@@ -109,30 +110,41 @@ const sparseAllowanceBytes = smallExchangeBytes
 // bounds binds first:
 //
 //   - the per-flow send bytes (maxSendBytes);
-//   - the chunk count (maxOutstanding): a backlogged source fills each chunk,
-//     so this holds maxOutstanding x chunkSize bytes;
+//   - the chunk count (maxOutstanding). A backlogged source fills each read,
+//     so this holds maxOutstanding x readSize bytes, where readSize is a
+//     whole chunk, or only the staging buffer when the scheduler stages
+//     reads and the source cannot do the fill that would extend them;
 //   - under mem=owned, the autotuned retention bound, which can sit at its
 //     startup floor of stripe.DefaultAutotuneStartupChunks chunks.
 //
-// If the threshold is at or above that capacity, a blocked transfer can never
-// show the evidence that keeps it in, or returns it to, BULK. Half the
-// capacity is still far above any conversation's backlog and is reached by a
-// producer blocked for room.
-func backlogThresholdFor(base uint64, limits flowMemoryLimits, chunkSize int, memOwned bool) uint64 {
+// A continuously backlogged flow dips below that capacity each time the peer
+// acknowledges a read before the producer refills its slot, and a dip to the
+// threshold or under it is recorded as a drain that ends the backlog
+// stretch. The threshold is therefore half of what remains after one read is
+// acknowledged: a blocked transfer stays above it between refills, and it is
+// still far above any conversation's backlog. It only ever lowers base.
+func backlogThresholdFor(base uint64, limits flowMemoryLimits, chunkSize, readSize int, memOwned bool) uint64 {
 	if base == 0 {
 		base = classifier.DefaultConfig().BulkBacklogBytes
 	}
+	if readSize <= 0 || readSize > chunkSize {
+		readSize = chunkSize
+	}
 	capacity := limits.maxSendBytes
-	if chunkSize > 0 && limits.maxOutstanding > 0 {
-		capacity = minPositive(capacity, limits.maxOutstanding*chunkSize)
-		if memOwned {
-			capacity = minPositive(capacity, stripe.DefaultAutotuneStartupChunks*chunkSize)
-		}
+	if readSize > 0 && limits.maxOutstanding > 0 {
+		capacity = minPositive(capacity, limits.maxOutstanding*readSize)
+	}
+	if memOwned && chunkSize > 0 {
+		capacity = minPositive(capacity, stripe.DefaultAutotuneStartupChunks*chunkSize)
 	}
 	if capacity <= 0 {
 		return base
 	}
-	if half := countBytes(capacity / 2); half < base {
+	remaining := capacity
+	if readSize > 0 && capacity > readSize {
+		remaining = capacity - readSize
+	}
+	if half := countBytes(remaining / 2); half < base {
 		return max(half, 1)
 	}
 	return base
@@ -150,13 +162,27 @@ func minPositive(a, b int) int {
 
 // fitBacklogThreshold applies backlogThresholdFor once the flow's chunk size,
 // memory limits and memory bundle are all settled, which is when its send
-// loop starts.
+// loop starts. It starts from the threshold the profile configured.
 func (f *multipathFlow) fitBacklogThreshold() {
 	if !f.phased() {
 		return
 	}
-	base := classifier.DefaultConfig().BulkBacklogBytes
-	f.classifier.SetBacklogBytes(backlogThresholdFor(base, f.memoryLimits, f.chunkSize, f.memOwned))
+	readSize := f.chunkSize
+	if f.sendMemory != nil && !f.innerTakesReadDeadlines() {
+		// The scheduler stages each read in stagingBytes and cannot extend
+		// it, so a backlogged source still arrives one staging buffer at a
+		// time.
+		readSize = min(readSize, stagingBytes)
+	}
+	f.classifier.SetBacklogBytes(backlogThresholdFor(f.classifier.BacklogBytes(), f.memoryLimits, f.chunkSize, readSize, f.memOwned))
+}
+
+// innerTakesReadDeadlines reports whether the application connection
+// supports read deadlines, which is what flowSource.ReadAvailable needs to
+// fill a staged chunk. Clearing the deadline is harmless here: the send loop
+// sets one only around each fill.
+func (f *multipathFlow) innerTakesReadDeadlines() bool {
+	return f.inner != nil && f.inner.SetReadDeadline(time.Time{}) == nil
 }
 
 // phased reports whether this flow runs the phased classifier.
