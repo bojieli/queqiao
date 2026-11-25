@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import random
+import select
 import socket
 import ssl
 import struct
@@ -52,42 +53,60 @@ def record(obj: dict) -> None:
 
 # --- SOCKS5 and TLS ---------------------------------------------------------------
 
-def socks_connect(socks: str, target: str, timeout: float) -> socket.socket:
-    """A TCP connection to target through a SOCKS5 proxy (no auth, CONNECT)."""
+def _left(deadline) -> float:
+    """Seconds to an absolute monotonic deadline; a timeout once it passed."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise socket.timeout("deadline")
+    return left
+
+
+def socks_connect(socks: str, target: str, timeout: float, deadline: float = None) -> socket.socket:
+    """A TCP connection to target through a SOCKS5 proxy (no auth, CONNECT),
+    all of it by `deadline` (monotonic; default now + timeout): every
+    blocking step gets only the time left."""
+    deadline = deadline if deadline is not None else time.monotonic() + timeout
     sh, sp = socks.rsplit(":", 1)
     th, tp = target.rsplit(":", 1)
-    s = socket.create_connection((sh, int(sp)), timeout=timeout)
+    s = socket.create_connection((sh, int(sp)), timeout=_left(deadline))
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.settimeout(_left(deadline))
     s.sendall(b"\x05\x01\x00")
-    if _exact(s, 2) != b"\x05\x00":
+    if _exact(s, 2, deadline) != b"\x05\x00":
         raise OSError("socks: no acceptable auth method")
     addr = th.encode()
+    s.settimeout(_left(deadline))
     s.sendall(b"\x05\x01\x00\x03" + bytes([len(addr)]) + addr + struct.pack(">H", int(tp)))
-    head = _exact(s, 4)
+    head = _exact(s, 4, deadline)
     if head[1] != 0:
         raise OSError(f"socks: connect failed ({head[1]})")
     n = {1: 4, 4: 16}.get(head[3])
     if n is None:
-        n = _exact(s, 1)[0]
-    _exact(s, n + 2)
+        n = _exact(s, 1, deadline)[0]
+    _exact(s, n + 2, deadline)
     return s
 
 
-def _exact(s, n: int) -> bytes:
+def _exact(s, n: int, deadline: float = None) -> bytes:
     buf = b""
     while len(buf) < n:
+        if deadline is not None:
+            s.settimeout(_left(deadline))
         b = s.recv(n - len(buf))
         if not b:
-            raise EOFError("connection closed")
+            raise EOFError
         buf += b
     return buf
 
 
-def open_conn(args, timeout: float):
+def open_conn(args, timeout: float, deadline: float = None):
     """A connection to the far side: SOCKS CONNECT, then TLS 1.3 unless
-    --no-tls. The certificate is the harness's own, so it is not verified."""
-    s = socks_connect(args.socks, args.target, timeout)
+    --no-tls, all of it by `deadline` (monotonic; default now + timeout).
+    The certificate is the harness's own, so it is not verified."""
+    deadline = deadline if deadline is not None else time.monotonic() + timeout
+    s = socks_connect(args.socks, args.target, timeout, deadline)
     if args.no_tls:
+        s.settimeout(timeout)
         return s
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
@@ -96,7 +115,21 @@ def open_conn(args, timeout: float):
         ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     except (ValueError, AttributeError):      # an ssl library without it as a minimum
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    return ctx.wrap_socket(s, server_hostname="wlserver")
+    ss = ctx.wrap_socket(s, server_hostname="wlserver", do_handshake_on_connect=False)
+    # The handshake against the same deadline, however many round trips.
+    ss.setblocking(False)
+    while True:
+        try:
+            ss.do_handshake()
+            break
+        except ssl.SSLWantReadError:
+            if not select.select([ss], [], [], _left(deadline))[0]:
+                raise socket.timeout("deadline")
+        except ssl.SSLWantWriteError:
+            if not select.select([], [ss], [], _left(deadline))[1]:
+                raise socket.timeout("deadline")
+    ss.settimeout(timeout)
+    return ss
 
 
 def stopped(args) -> bool:
@@ -110,6 +143,22 @@ class Reader:
         self.s = sock
         self.buf = b""
         self.deadline = None     # monotonic; a read past it times out
+        # Bytes consumed before buf, and per recv the stream offset it ended
+        # at and when it arrived: a byte's arrival time is its recv's, not
+        # the time the parser got to it.
+        self.base = 0
+        self.fills: list = []
+
+    def arrival(self, offset: int) -> float:
+        """Monotonic time the byte at stream offset `offset` arrived."""
+        for end, t in self.fills:
+            if end > offset:
+                return t
+        return time.monotonic()
+
+    def _consume(self, n: int) -> None:
+        self.base += n
+        self.fills = [f for f in self.fills if f[0] > self.base]
 
     def fill(self) -> None:
         if self.deadline is not None:
@@ -121,17 +170,20 @@ class Reader:
         if not b:
             raise EOFError("connection closed")
         self.buf += b
+        self.fills.append((self.base + len(self.buf), time.monotonic()))
 
     def line(self) -> bytes:
         while b"\r\n" not in self.buf:
             self.fill()
         ln, _, self.buf = self.buf.partition(b"\r\n")
+        self._consume(len(ln) + 2)
         return ln
 
     def exact(self, n: int) -> bytes:
         while len(self.buf) < n:
             self.fill()
         out, self.buf = self.buf[:n], self.buf[n:]
+        self._consume(n)
         return out
 
 
@@ -499,30 +551,52 @@ def socks_udp(socks: str, timeout: float):
     return c, u, (addr, port)
 
 
-# Packet layout (both directions): magic "QC", stream (a|v), 0, seq u32,
-# frame u32, index u16, count u16, client send time (double, monotonic ms)
-# at 16; the reflector writes its receive time (double) and its running
-# count (u32) at 24..35; the call's id (4 bytes) at 36..39, by which the
-# reflector keeps its own record of the uplink; padding follows.
+# Packet layout (both directions): magic "QC", stream (a|v), direction (0
+# up, 1 down), seq u32, frame u32, index u16, count u16, sender's send time
+# (double, its monotonic ms) at 16; 12 spare bytes; the call's id (4 bytes)
+# at 36..39; on the uplink the call's duration in ms (u32) at 40..43;
+# padding follows.
 CALL_HEAD = struct.Struct(">2sccIIHHd")
 
 
+def call_schedule(duration: float):
+    """W7's open-loop media (wlserver has the same): (offset s, stream,
+    frame, index, count, size)."""
+    out = []
+    t = 0.0
+    while t < duration:
+        out.append((t, b"a", int(round(t / 0.02)), 0, 1, 160))
+        t += 0.020
+    frame, t = 0, 0.0
+    while t < duration:
+        frame += 1
+        size = 40_000 if frame % 60 == 1 else 10_000
+        parts = (size + 1099) // 1100
+        for i in range(parts):
+            out.append((t, b"v", frame, i, parts, min(1100, size - i * 1100)))
+        t += 1.0 / 30
+    out.sort(key=lambda x: (x[0], x[1] != b"a"))
+    return out
+
+
 def cmd_call(args) -> None:
-    """Open loop, both directions at once (the far side reflects): audio of
-    160 B every 20 ms; video at 30 frames/s of 10 KB in 1,100 B packets,
-    with a 40 KB key frame every 2 s. Records, per packet sent, its stream,
-    frame, send time and -- when it came back -- its up and down transit
-    deltas on the two unsynchronised clocks (milliseconds). The up delta
-    comes from the reflector's own report of what it received (fetched over
-    TCP afterwards), so a packet lost up is told from one lost down; a call
-    whose report cannot be fetched is a failed call."""
+    """A call, both directions at once and each open loop on its own clock:
+    the client sends W7's uplink stream; the far side, once the call's first
+    packet names it and its return address, sends its own downlink stream of
+    the same shape on its own timer. Neither side's sending depends on the
+    other's arrivals. Afterwards the reflector's report gives the uplink's
+    arrivals and the downlink's sends, so each direction's losses and
+    lateness are its own. Records per uplink packet [frame, send ms, up
+    delta, None] and per downlink packet [frame, send ms, None, down delta]
+    (deltas on two unsynchronised clocks, ms; None when lost). A call whose
+    report cannot be fetched is a failed call."""
     time.sleep(args.delay)
     cid = os.urandom(4)
     th, tp = args.target.rsplit(":", 1)
     dest = socket.inet_aton(th) + struct.pack(">H", int(tp))
     t0 = time.time()
-    rec = {"kind": "call", "t0": round(t0, 3), "fail": "", "audio": [], "video": [], "count": 0,
-           "seconds": args.duration}
+    rec = {"kind": "call", "id": cid.hex(), "t0": round(t0, 3), "fail": "", "audio": [], "video": [],
+           "down_audio": [], "down_video": [], "seconds": args.duration}
     try:
         ctl, u, relay = socks_udp(args.socks, 10)
     except (OSError, EOFError, ValueError) as e:
@@ -534,9 +608,8 @@ def cmd_call(args) -> None:
     u.settimeout(0.2)
     c0 = time.monotonic()
     sent = {}          # (stream, seq) -> [frame, send ms]
-    back = {}          # (stream, seq) -> (server ms, client receive ms)
+    got_down = {}      # (stream, seq) -> (server send ms, client receive ms)
     done = threading.Event()
-    maxcount = [0]
 
     def receiver():
         while not done.is_set():
@@ -548,64 +621,58 @@ def cmd_call(args) -> None:
                 return
             now = (time.monotonic() - c0) * 1000.0
             payload = data[10:]   # RSV(2) FRAG(1) ATYP(1)=1 ADDR(4) PORT(2)
-            if len(payload) < 36 or payload[:2] != b"QC":
+            if len(payload) < 40 or payload[:2] != b"QC" or payload[3:4] != b"\x01" or payload[36:40] != cid:
                 continue
-            _, stream, _, seq, frame, _, _, _ = CALL_HEAD.unpack_from(payload)
-            srv, cnt = struct.unpack_from(">dI", payload, 24)
-            maxcount[0] = max(maxcount[0], cnt)
-            back[(stream, seq)] = (srv, now)
+            _, stream, _, seq, frame, _, _, srv = CALL_HEAD.unpack_from(payload)
+            got_down[(stream, seq)] = (srv, now)
 
     th_ = threading.Thread(target=receiver, daemon=True)
     th_.start()
     seq = {b"a": 0, b"v": 0}
-    nxt_audio = 0.0
-    nxt_video = 0.0
-    frame_no = 0
     header = b"\x00\x00\x00\x01" + dest
-
-    def send(stream: bytes, frame: int, idx: int, count: int, size: int):
-        seq[stream] += 1
-        t = (time.monotonic() - c0) * 1000.0
-        body = CALL_HEAD.pack(b"QC", stream, b"\x00", seq[stream], frame, idx, count, t) + b"\x00" * 12 + cid
-        body += b"p" * max(0, size - len(body))
-        sent[(stream, seq[stream])] = [frame, t]
-        u.sendto(header + body, relay)
-
+    tail = cid + struct.pack(">I", int(args.duration * 1000))
     try:
-        while not stopped(args):
-            now = time.monotonic() - c0
-            if now >= args.duration:
+        for off, stream, frame, idx, count, size in call_schedule(args.duration):
+            if stopped(args):
                 break
-            if now >= nxt_audio:
-                send(b"a", int(nxt_audio / 0.02), 0, 1, 160)
-                nxt_audio += 0.020
-            if now >= nxt_video:
-                frame_no += 1
-                size = 40_000 if frame_no % 60 == 1 else 10_000
-                parts = (size + 1099) // 1100
-                for i in range(parts):
-                    send(b"v", frame_no, i, parts, min(1100, size - i * 1100))
-                nxt_video += 1.0 / 30
-            time.sleep(max(0.0, min(nxt_audio, nxt_video) - (time.monotonic() - c0)))
+            delay = off - (time.monotonic() - c0)
+            if delay > 0:
+                time.sleep(delay)
+            seq[stream] += 1
+            t = (time.monotonic() - c0) * 1000.0
+            body = CALL_HEAD.pack(b"QC", stream, b"\x00", seq[stream], frame, idx, count, t) + b"\x00" * 12 + tail
+            body += b"p" * max(0, size - len(body))
+            sent[(stream, seq[stream])] = [frame, t]
+            u.sendto(header + body, relay)
     except OSError as e:
         rec["fail"] = f"{type(e).__name__}: {e}"[:200]
-    time.sleep(1.0)                     # the last echoes
-    done.set()
-    up = {}
+    up, down = {}, []
     if not rec["fail"]:
         try:
-            up = call_report(args, cid)
-        except (OSError, EOFError, ValueError, ssl.SSLError) as e:
+            # Until the far side's downlink has finished, then a second for
+            # its last packets in flight; the final read releases its state.
+            deadline = time.monotonic() + 15
+            rep_ = call_report(args, cid)
+            while not rep_.get("down_done") and time.monotonic() < deadline:
+                time.sleep(0.5)
+                rep_ = call_report(args, cid)
+            time.sleep(1.0)
+            rep_ = call_report(args, cid, release=True)
+            if not rep_.get("down_done"):
+                raise ValueError("the downlink did not finish")
+            up = rep_["up"]
+            down = rep_["down"]
+        except (OSError, EOFError, ValueError, KeyError, ssl.SSLError) as e:
             rec["fail"] = f"no reflector report: {type(e).__name__}: {e}"[:200]
-    # Per packet: frame, send ms, up delta (None: the reflector never got
-    # it), down delta (None: it never came back).
+    done.set()
     for (stream, sq), (frame, t) in sorted(sent.items()):
-        b = back.get((stream, sq))
-        srv = up.get((stream, sq), b[0] if b else None)
-        entry = [frame, round(t, 1), round(srv - t, 1) if srv is not None else None,
-                 round(b[1] - b[0], 1) if b else None]
-        rec["audio" if stream == b"a" else "video"].append(entry)
-    rec["count"] = maxcount[0]
+        srv = up.get((stream, sq))
+        rec["audio" if stream == b"a" else "video"].append(
+            [frame, round(t, 1), round(srv - t, 1) if srv is not None else None, None])
+    for stream, sq, frame, ts in down:
+        b = got_down.get((stream, sq))
+        rec["down_audio" if stream == b"a" else "down_video"].append(
+            [frame, round(ts, 1), None, round(b[1] - ts, 1) if b else None])
     rec["t1"] = round(time.time(), 3)
     for s_ in (u, ctl):
         try:
@@ -616,15 +683,17 @@ def cmd_call(args) -> None:
     row(t0, time.time(), "v0", 0 if rec["fail"] else 200, len(sent), time.time() - t0, 1 if rec["fail"] else 0)
 
 
-def call_report(args, cid: bytes) -> dict:
-    """The reflector's record of this call's uplink: (stream, seq) -> its
-    receive time (server ms), fetched from wlserver's HTTP port."""
+def call_report(args, cid: bytes, release: bool = False) -> dict:
+    """The reflector's report of this call, from wlserver's HTTP port: the
+    uplink's arrivals, (stream, seq) -> receive ms; the downlink's sends,
+    [(stream, seq, frame, send ms)]; and whether the downlink finished."""
     a = argparse.Namespace(**vars(args))
     a.target = args.report_target
     s = open_conn(a, 15)
     s.settimeout(15)
     try:
-        s.sendall(f"GET /call-report?id={cid.hex()} HTTP/1.1\r\nHost: wlserver\r\n\r\n".encode())
+        s.sendall(f"GET /call-report?id={cid.hex()}{'&release=1' if release else ''} HTTP/1.1\r\n"
+                  "Host: wlserver\r\n\r\n".encode())
         r = Reader(s)
         status = r.line()
         length = 0
@@ -640,7 +709,9 @@ def call_report(args, cid: bytes) -> dict:
     if b" 200 " not in status + b" ":
         raise ValueError(f"call report: {status[:40]!r}")
     rep_ = json.loads(body)
-    return {(st, int(q)): float(t) for st, key in ((b"a", "a"), (b"v", "v")) for q, t in rep_.get(key, [])}
+    return {"up": {(st, int(q)): float(t) for st, key in ((b"a", "a"), (b"v", "v")) for q, t in rep_.get(key, [])},
+            "down": [(st_.encode(), int(q), int(f), float(t)) for st_, q, f, t in rep_.get("down", [])],
+            "down_done": bool(rep_.get("down_done"))}
 
 
 # --- W3 browsing burst -----------------------------------------------------------------
@@ -686,6 +757,27 @@ def http_get(sock, reader: "Reader", n: int) -> float:
     return first
 
 
+def mux_read(r: "Reader", left: dict, c0: float, first: dict, done) -> None:
+    """Read mux frames until every stream in `left` is complete (removing
+    each, and calling done(sid)). A stream's first byte is timed at the
+    arrival of its first DATA payload byte, not after its whole 16 KiB frame
+    has been read."""
+    while left:
+        t = r.exact(1)
+        if t == b"D":
+            sid, k = struct.unpack(">II", r.exact(8))
+            if k and sid not in first:
+                first[sid] = round(r.arrival(r.base) - c0, 4)
+            r.exact(k)
+        elif t == b"F":
+            sid = struct.unpack(">I", r.exact(4))[0]
+            if sid in left:
+                done(sid)
+                left.pop(sid)
+        else:
+            raise ValueError(f"mux frame {t!r}")
+
+
 def mux_page(args, rec: dict, c0: float, sizes: list) -> None:
     """The page over HTTP/2-shaped connections (W3 h2): one new connection
     per origin; the HTML first on the first origin's, then every object
@@ -717,19 +809,7 @@ def mux_page(args, rec: dict, c0: float, sizes: list) -> None:
             for idx, n in objs:
                 start[idx] = round(time.monotonic() - c0, 4)
                 s.sendall(b"R" + struct.pack(">II", idx, n) + b"p" * (REQUEST_BYTES - 9))
-            while left:
-                t = r.exact(1)
-                if t == b"D":
-                    sid, k = struct.unpack(">II", r.exact(8))
-                    r.exact(k)
-                    first.setdefault(sid, round(time.monotonic() - c0, 4))
-                elif t == b"F":
-                    sid = struct.unpack(">I", r.exact(4))[0]
-                    if sid in left:
-                        note(sid, size[sid], start.get(sid), first.get(sid), "")
-                        left.pop(sid)
-                else:
-                    raise ValueError(f"mux frame {t!r}")
+            mux_read(r, left, c0, first, lambda sid: note(sid, size[sid], start.get(sid), first.get(sid), ""))
         except (OSError, EOFError, ValueError, ssl.SSLError) as e:
             for idx in list(left):
                 note(idx, size[idx], start.get(idx), first.get(idx), type(e).__name__)
@@ -888,7 +968,7 @@ def cmd_wake(args) -> None:
         at, mode = plan[i]
         rec = {"kind": "wake", "conn": i, "of": args.conns, "at": at, "mode": mode, "follow": args.follow,
                "t0": round(time.time(), 3), "fail": "", "pushes": [], "sends": [], "end": "", "end_at": None,
-               "sync_done": None}
+               "sync_done": None, "sync_seconds": None}
         try:
             s = open_conn(args, 30)
             s.settimeout(None)
@@ -904,6 +984,7 @@ def cmd_wake(args) -> None:
         lock = threading.Lock()
         stop = threading.Event()
         got_sync = [0]
+        synced = threading.Event()
 
         def reader():
             r = Reader(s)
@@ -915,7 +996,12 @@ def cmd_wake(args) -> None:
                         r.exact(n)
                         got_sync[0] += n
                         if got_sync[0] >= args.sync and rec["sync_done"] is None:
-                            rec["sync_done"] = round(time.monotonic() - c0, 4)
+                            # The whole sync is here: acknowledge it; the idle
+                            # interval starts now, on both sides.
+                            with lock:
+                                s.sendall(b"K\x00\x00\x00\x00")
+                            rec["sync_done"] = rec["sync_seconds"] = round(time.monotonic() - c0, 4)
+                            synced.set()
                             mark_synced()
                     elif t == b"P":
                         idx, srv = struct.unpack(">Id", r.exact(12))
@@ -936,13 +1022,17 @@ def cmd_wake(args) -> None:
                     rec["end_at"] = round(time.monotonic() - c0, 3)
             if rec["sync_done"] is None:
                 mark_synced()
+                synced.set()             # no sync is coming: do not wait for it
 
         th_ = threading.Thread(target=reader, daemon=True)
         th_.start()
         try:
+            if not synced.wait(timeout=max(1.0, args.duration)) or rec["sync_done"] is None:
+                raise OSError("the sync did not complete")
+            base = rec["sync_done"]          # wake times count from the end of the sync
             if mode == "send":
                 for k in range(args.follow + 1):          # the wake, then the warm sends
-                    delay = at + k - (time.monotonic() - c0)
+                    delay = base + at + k - (time.monotonic() - c0)
                     if delay > 0:
                         if stopped(args) or (time.monotonic() - c0) > args.duration:
                             break
@@ -951,14 +1041,16 @@ def cmd_wake(args) -> None:
                         break
                     with lock:
                         pending[k] = time.monotonic() - c0
-                    s.sendall(b"S" + struct.pack(">I", k))
-            last = at + args.follow + (SEND_TIMEOUT if mode == "send" else WAKE_WITHIN + 1)
+                        s.sendall(b"S" + struct.pack(">I", k))
+            last = base + at + args.follow + (SEND_TIMEOUT if mode == "send" else WAKE_WITHIN + 1)
             while time.monotonic() - c0 < last and not stopped(args):
                 if mode == "send" and not pending:
                     break
                 time.sleep(0.5)
         except (OSError, ssl.SSLError) as e:
-            if not rec["end"]:
+            if rec["sync_done"] is None:
+                rec["fail"] = rec["fail"] or f"sync: {type(e).__name__}: {e}"[:200]
+            elif not rec["end"]:
                 rec["end"] = type(e).__name__
                 rec["end_at"] = round(time.monotonic() - c0, 3)
         stop.set()
@@ -1041,7 +1133,7 @@ def cmd_rpc(args) -> None:
         deadline = time.monotonic() + args.timeout
         try:
             if sock is None:
-                sock = open_conn(args, max(0.1, deadline - time.monotonic()))
+                sock = open_conn(args, args.timeout, deadline)
                 reader = Reader(sock)
             if asr:
                 code, got = http_exchange(sock, reader, "POST", f"/sink?reply={args.asr_down}", args.asr_up,

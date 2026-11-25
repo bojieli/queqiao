@@ -344,8 +344,8 @@ LOG_MEASURES = ("queue_p90_ms", "reissued_per_source", "transit_p50_s", "transit
 
 
 def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial],
-                 interim: bool = False, units_run: Optional[Sequence[Sequence[Any]]] = None
-                 ) -> Tuple[List[str], Dict[Tuple[int, str, int], Trial]]:
+                 interim: bool = False, units_run: Optional[Sequence[Sequence[Any]]] = None,
+                 failures: Optional[dict] = None) -> Tuple[List[str], Dict[Tuple[int, str, int], Trial]]:
     """Problems that forbid a verdict, and the trials of complete blocks only.
 
     A verdict needs a campaign that finished (status.json from the runner)
@@ -371,6 +371,11 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
     except (OSError, ValueError):
         if interim:
             last_block = max((b for b, _, s_ in trials if s_ < 100), default=0)
+            # The runner's failures so far: a look applies the same evidence
+            # rules as the final analysis.
+            failed_jobs = list((failures or {}).get("job_failures") or [])
+            if (failures or {}).get("fetch_failures"):
+                problems.append(f"{len(failures['fetch_failures'])} log file(s) could not be fetched")
         else:
             problems.append("no status.json: the campaign did not finish")
     else:
@@ -700,13 +705,13 @@ def decision_verdict(dec: str, interim: bool) -> str:
 
 
 def report(campaign: str, gates: dict, interim: bool = False,
-           units_run: Optional[Sequence[Sequence[Any]]] = None) -> Tuple[str, dict]:
+           units_run: Optional[Sequence[Sequence[Any]]] = None, failures: Optional[dict] = None) -> Tuple[str, dict]:
     plan, trials = read_campaign(campaign)
     if plan.get("workload") == "dc":
         raise SystemExit("this is a DC gate campaign: evaluate it with scripts/dc_gate.py")
     EFFECTIVE.clear()
     sq = sequential_of(plan)
-    problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run)
+    problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run, failures=failures)
     frozen = plan.get("gates_sha256")
     if frozen and gates.get("sha256") and frozen != gates["sha256"]:
         # The rules (and the stopping looks) the campaign ran under are not
@@ -1080,8 +1085,8 @@ def _sample_stat(xs, stat) -> float:
     return st.quantile(xs, stat)
 
 
-def interim_decisions(campaign: str, gates: dict,
-                      units_run: Optional[Sequence[Sequence[Any]]] = None) -> Dict[Tuple[str, str], List[str]]:
+def interim_decisions(campaign: str, gates: dict, units_run: Optional[Sequence[Sequence[Any]]] = None,
+                      failures: Optional[dict] = None) -> Dict[Tuple[str, str], List[str]]:
     """The runner's look: every gate decision on the units run so far, as
     'pass', 'fail' or 'continue' (undecided, unmeasured or void), by (path,
     cell): a rule's cell is its phase (the trial type that measures it), the
@@ -1089,9 +1094,14 @@ def interim_decisions(campaign: str, gates: dict,
     with open(os.path.join(campaign, "plan.json")) as f:
         plan = json.load(f)
     wl = ab_workloads.get(plan.get("workload", "bulk"))
-    _, v = report(campaign, gates, interim=True, units_run=units_run)
+    _, v = report(campaign, gates, interim=True, units_run=units_run, failures=failures)
     out: Dict[Tuple[str, str], List[str]] = collections.defaultdict(list)
+    # A look on evidence the final analysis would reject (a fetch failure, a
+    # missing unit) decides nothing: it waits for another block.
+    incomplete = {p_ for (p_, _, k), x in v.items() if k == "primary" and x == "INCOMPLETE"}
     for (path, _, key), verdict in v.items():
+        if path in incomplete:
+            verdict = "INCOMPLETE"
         # Only the gates that apply: a workload without a byte outcome has no
         # primary gate to wait for.
         if (key == "primary" and wl.primary) or key.startswith("rule:"):
@@ -1312,9 +1322,9 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
     roles: Dict[str, str] = {}
     paths_all: set = set()
     candidates: set = set()
-    # (arm, path) -> (identity, order, campaign): a path's final bundle
-    # includes the client switches that path ran with.
-    final: Dict[Tuple[str, str], Tuple[tuple, tuple, str]] = {}
+    # One final build per candidate arm, across every path: its build and arm
+    # flags in the newest campaign -> (identity, order, campaign).
+    final: Dict[str, Tuple[tuple, tuple, str]] = {}
     for n_, campaign in enumerate(campaigns):
         base = os.path.basename(os.path.normpath(campaign))
         with open(os.path.join(campaign, "plan.json")) as f:
@@ -1333,13 +1343,14 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
             if roles.setdefault(arm, role) != role:
                 problems.append(f"arm `{arm}` is {role} in {base} but {roles[arm]} elsewhere")
             b = build_identity(e)
+            build = (b[0], tuple(sorted(b[1].items())) if isinstance(b[1], dict) else b[1], arm_config(e))
             for p_ in plan_paths:
-                ident[(arm, p_)] = (b[0], tuple(sorted(b[1].items())) if isinstance(b[1], dict) else b[1],
-                                    arm_config(e) + endpoint_switches(plan, p_))
-                if role == "candidate" and ((arm, p_) not in final or order > final[(arm, p_)][1]):
-                    final[(arm, p_)] = (ident[(arm, p_)], order, base)
+                # (build, arm flags, this path's endpoint switches)
+                ident[(arm, p_)] = build + (endpoint_switches(plan, p_),)
             if role == "candidate":
                 candidates.add(arm)
+                if arm not in final or order > final[arm][1]:
+                    final[arm] = (build, order, base)
         if name == "dc":
             import dc_gate
             _, v = dc_gate.evaluate(campaign, dc_gate.load_bounds())
@@ -1354,21 +1365,29 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
                     rows.append((name, path, cand, cell, verdict, ident[(cand, path)], order, base))
 
     def same(a: tuple, b: tuple) -> bool:
-        """Same build (binaries: every role and platform both used) and flags."""
-        if a[2] != b[2]:
+        """Same build (binaries: every role and platform both used) and arm flags."""
+        if not a or not b or a[2] != b[2]:
             return False
         ba = (a[0], dict(a[1]) if a[0] == "binaries" else a[1])
         bb = (b[0], dict(b[1]) if b[0] == "binaries" else b[1])
         return same_build(ba, bb)
     rows = [r for r in rows if r[0] in required]
+    # A path's final endpoint switches: those of the newest campaign on that
+    # path that ran the candidate's final build.
+    final_sw: Dict[Tuple[str, str], tuple] = {}
+    for r in sorted(rows, key=lambda r: r[6]):
+        fin = final.get(r[2])
+        if fin and same(r[5], fin[0]):
+            final_sw[(r[2], r[1])] = r[5][3]
     # Per (workload, path, candidate, cell): the newest row on the final
-    # bundle, else the newest earlier one if it may carry forward.
+    # bundle (the final build, with the path's final switches), else the
+    # newest earlier one if it may carry forward.
     chosen: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
     stale: List[str] = []
     for key in sorted({r[:4] for r in rows}):
         rs = sorted((r for r in rows if r[:4] == key), key=lambda r: r[6])
-        fin = final.get((key[2], key[1]))
-        on_final = [r for r in rs if fin and same(r[5], fin[0])]
+        fin = final.get(key[2])
+        on_final = [r for r in rs if fin and same(r[5], fin[0]) and r[5][3] == final_sw.get((key[2], key[1]))]
         if on_final:
             chosen[key] = (on_final[-1][4], "")
         elif key[3].lower() in carry:
@@ -1397,8 +1416,7 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
     out += [f"| {w_} | {p_} | {c_} | {cell} | {v_ if v_ == 'PASS' else '**' + v_ + '**'} | {note} |"
             for (w_, p_, c_, cell), (v_, note) in sorted(chosen.items())]
     if final:
-        out += ["", "Final bundle: " + "; ".join(f"`{a_}` on {p_} as run in {fin[2]}"
-                                                 for (a_, p_), fin in sorted(final.items())) + "."]
+        out += ["", "Final bundle: " + "; ".join(f"`{a_}` as run in {fin[2]}" for a_, fin in sorted(final.items())) + "."]
     if missing:
         out += ["", "Missing: " + ", ".join(f"`{m}`" for m in missing) + "."]
     if stale:

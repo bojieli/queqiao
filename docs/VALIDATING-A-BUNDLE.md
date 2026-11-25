@@ -502,10 +502,12 @@ every path. A DC campaign alone covers nothing else.
 Each trial type runs once per path, at its gate (design section 15.3): A
 and B at stages 6 and 7, DC at stage 9, C and D at stage 10. A pass carries
 forward to the flip; a trial is rerun on the final bundle only when a later
-stage changes what it exercises. The flip takes the final bundle of each
-candidate arm to be what it ran in the newest campaign (its build: commits,
-or each prebuilt binary's SHA-256 by role and platform; its arm flags; and
-the `[gateway]` and `[client:...]` flags every endpoint ran with). A
+stage changes what it exercises. The flip takes one final build per
+candidate arm, across every path: what it ran in the newest campaign (its
+build: commits, or each prebuilt binary's SHA-256 by role and platform; and
+its arm flags). On each path the result must also have that path's final
+endpoint switches (`[gateway]` flags and that path's `[client:...]` flags,
+from the newest campaign on the final build there). A
 cell measured on the final bundle counts as it is. A cell measured only on
 an earlier build or flag bundle counts only when you name it in `--carry`,
 your statement that no later stage changed what it exercises; the matrix
@@ -566,11 +568,15 @@ from the model):
 - **C:** the same LLM measures; keystroke echo p99 and the fraction over
   1 s (echo time alone, no bursts); the call per direction: audio late
   loss, frame loss, freezes per minute and lateness p99 (a packet is bad in
-  a direction when it is lost there or more than 150 ms late; the
-  reflector's own report of what it received tells a packet lost up from
-  one lost down); the page load time p50 and p95 (from the first CONNECT)
+  a direction when it is lost there or more than 150 ms late). Each
+  direction is its own open-loop stream on its own clock: the far side
+  starts its downlink when the call's first packet names the call and its
+  return address, and uplink arrivals never pace it; its report gives the
+  uplink's arrivals and the downlink's sends; the page load time p50 and p95 (from the first CONNECT)
   and failed objects.
-- **D** (`gates.ini [workload:idle-wake]`): no silent deaths and every wake
+- **D** (`gates.ini [workload:idle-wake]`). The idle interval starts when
+  the client has the whole 200 KB sync and acknowledges it, for pushes and
+  sends alike; the sync's own duration is reported. Gated: no silent deaths and every wake
   at 1 and 5 minutes delivered within 5 s (hard); the delivered count at
   16 minutes at least main's (a count); the push and send wake penalty p50
   within the model's bound of main's (an unpaired bootstrap over the

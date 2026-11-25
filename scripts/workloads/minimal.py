@@ -64,28 +64,36 @@ def _runs(bad: Sequence[bool], length: int) -> int:
     return n
 
 
+def _streams(c: dict, d: str) -> Tuple[List[list], List[list], int]:
+    """A call's audio and video packets in one direction, and the index of
+    that direction's transit: the client's sends up, the far side's own
+    sends down."""
+    if d == "up":
+        return c.get("audio") or [], c.get("video") or [], 2
+    return c.get("down_audio") or [], c.get("down_video") or [], 3
+
+
 def call_samples(calls: Sequence[dict]) -> Dict[str, List[float]]:
     """Per-direction lateness samples (seconds) of the calls that started."""
     out: Dict[str, List[float]] = {"up": [], "down": []}
     for c in calls:
         if c.get("fail"):
             continue
-        pk = c["audio"] + c["video"]
-        out["up"] += _lateness([p[2] for p in pk if len(p) > 2 and p[2] is not None])
-        out["down"] += _lateness([p[3] for p in pk if len(p) > 3 and p[3] is not None])
+        for d in ("up", "down"):
+            a, v, idx = _streams(c, d)
+            out[d] += _lateness([p[idx] for p in a + v if len(p) > idx and p[idx] is not None])
     return out
 
 
 def call_metrics(calls: Sequence[dict]) -> Dict[str, float]:
     """W7 metrics per direction over a set of call records.
 
-    Each packet carries its up transit (reflector receive minus send, None if
-    the reflector never got it, from the reflector's own report) and its
-    down transit (client receive minus reflector receive, None if it never
-    came back). Lateness is per direction on that direction's clock pair
-    (clock-free); a packet is bad in a direction when it is missing or more
-    than 150 ms late there. Up: over every packet sent. Down: over the
-    packets the reflector received, the only ones it could send back. Per
+    Each direction is its own open-loop stream: the client's uplink, and the
+    far side's downlink sent on its own clock. Each packet carries its
+    transit in its direction (None when it never arrived: up from the
+    reflector's report of its arrivals, down from the client's receipts of
+    the reflector's sends). Lateness is on that direction's clock pair
+    (clock-free); a packet is bad when missing or more than 150 ms late. Per
     direction: audio late loss, frame loss (a frame with any bad packet),
     freezes (runs of 6 bad frames) and audio gaps (runs of 3 bad audio
     packets) per minute, lateness p99, and late loss over all packets."""
@@ -99,30 +107,28 @@ def call_metrics(calls: Sequence[dict]) -> Dict[str, float]:
         return {"sessions_failed": 1.0}
     minutes = sum(float(c.get("seconds") or 0) for c in ok) / 60.0
     out: Dict[str, float] = {"sessions_failed": (len(calls) - len(ok)) / len(calls)}
-    for d, idx in (("up", 2), ("down", 3)):
+    for d in ("up", "down"):
         lat_all: List[float] = []
         pkts = bad_pkts = audio = audio_bad = frames = frames_bad = freezes = gaps = 0
         for c in ok:
-            pk = c["audio"] + c["video"]
+            a_pk, v_pk, idx = _streams(c, d)
+            pk = a_pk + v_pk
             lat = _lateness([p[idx] for p in pk if len(p) > idx and p[idx] is not None])
             lat_all += lat
             lat_iter = iter(lat)
             bad: Dict[int, bool] = {}
             for p in pk:
-                if d == "down" and (len(p) < 3 or p[2] is None):
-                    continue          # never reached the reflector: not the downlink's
                 v = p[idx] if len(p) > idx else None
                 bad[id(p)] = v is None or next(lat_iter) > LATE
             pkts += len(bad)
             bad_pkts += sum(bad.values())
-            a_bad = [bad[id(p)] for p in c["audio"] if id(p) in bad]
+            a_bad = [bad[id(p)] for p in a_pk]
             audio += len(a_bad)
             audio_bad += sum(a_bad)
             gaps += _runs(a_bad, AUDIO_GAP)
             by_frame: Dict[int, bool] = {}
-            for p in c["video"]:
-                if id(p) in bad:
-                    by_frame[p[0]] = by_frame.get(p[0], False) or bad[id(p)]
+            for p in v_pk:
+                by_frame[p[0]] = by_frame.get(p[0], False) or bad[id(p)]
             fb = [by_frame[f] for f in sorted(by_frame)]
             frames += len(fb)
             frames_bad += sum(fb)
@@ -214,18 +220,22 @@ def wake_samples(conns: Sequence[dict]) -> Dict[str, List[float]]:
     seen while idle."""
     out: Dict[str, List[float]] = {f"delivered_{t}": [] for t in WAKE_TIMES}
     for k in ("push_penalty", "send_penalty", "silent", "death_eof", "death_rst", "death_timeout",
-              "death_silent", "idle_eof"):
+              "death_silent", "idle_eof", "sync_seconds"):
         out[k] = []
     for c in conns:
         at = float(c.get("at") or 0)
         mode = c.get("mode")
         end_at = c.get("end_at")
+        # Wake times count from the end of the sync (acknowledged by the
+        # client), not from the connection: the idle interval is the plan's.
+        base = c.get("sync_done")
         ok = False
-        if not c.get("fail"):
+        if not c.get("fail") and base is not None:
+            base = float(base)
             if mode == "push":
                 pushes = {p[0]: p for p in c.get("pushes") or []}
                 wp = pushes.get(0)
-                ok = wp is not None and wp[2] <= at + WAKE_WITHIN
+                ok = wp is not None and wp[2] <= base + at + WAKE_WITHIN
                 if wp is not None:
                     warm = [pushes[j][2] - pushes[j][1] / 1000.0 for j in range(1, WAKE_FOLLOW + 1) if j in pushes]
                     if warm:
@@ -238,19 +248,22 @@ def wake_samples(conns: Sequence[dict]) -> Dict[str, List[float]]:
                     warm = [sends[j][2] for j in range(1, WAKE_FOLLOW + 1) if j in sends]
                     if warm:
                         out["send_penalty"].append(ws[2] - min(warm))
+        base = float(c.get("sync_done") or 0.0)
         out.setdefault(f"delivered_{int(at)}", []).append(1.0 if ok else 0.0)
         if ok:
             out["silent"].append(0.0)
         else:
-            told = end_at is not None and float(end_at) <= at + WAKE_WITHIN
+            told = end_at is not None and float(end_at) <= base + at + WAKE_WITHIN
             out["silent"].append(0.0 if told else 1.0)
             end = (c.get("end") or "").lower()
             mode_ = ("eof" if "eof" in end else "rst" if end else
                      "timeout" if mode == "send" else "silent") if not c.get("fail") else "rst"
             for m in ("eof", "rst", "timeout", "silent"):
                 out[f"death_{m}"].append(1.0 if m == mode_ else 0.0)
-        if end_at is not None and c.get("sync_done") is not None and float(end_at) < at:
-            out["idle_eof"].append(float(end_at) - float(c["sync_done"]))
+        if end_at is not None and c.get("sync_done") is not None and float(end_at) < base + at:
+            out["idle_eof"].append(float(end_at) - base)
+        if c.get("sync_seconds") is not None:
+            out["sync_seconds"].append(float(c["sync_seconds"]))
     return out
 
 
@@ -299,6 +312,9 @@ DC_TRIAL_SECONDS = 60  # the DC gate at minimal size, its own campaign (stage 9)
 # Tail percentiles: their quantile and pooled samples, for the per-block or
 # pooled test of section 15.4.
 LLM_TAILS = {"ttft_net_p95_s": 0.95, "lateness_p99_s": 0.99}
+# The foreground whose span the backgrounds must cover, and over which their
+# rate is taken: every measured workload, the page load included.
+FOREGROUND = ("llm", "term", "call", "browse")
 
 
 def wake_session_seconds() -> float:
@@ -488,7 +504,7 @@ class Minimal(pa._Scenario):
 
     def under_background(self, ph, recs, rows, trials):
         for t in trials:
-            trecs = [x for x in getattr(t, "records", []) if x.get("_phase") == ph and x.get("kind") in ("llm", "term", "call")]
+            trecs = [x for x in getattr(t, "records", []) if x.get("_phase") == ph and x.get("kind") in FOREGROUND]
             span = pa.fg_span(trecs)
             bg = [r for r in t.rows if r["phase"] == ph and r["kind"] in ("wl-bgdown", "wl-bgup")]
             down = [r for r in bg if r["kind"] == "wl-bgdown"]
@@ -555,7 +571,7 @@ class Minimal(pa._Scenario):
                 trows = [r for r in t.rows if r["phase"] == ph and r["kind"] == kind]
                 unknown |= any(r.get("curl_exit") == pa.SINK_UNKNOWN for r in trows)
                 span = pa.fg_span([x for x in getattr(t, "records", []) if x.get("_phase") == ph
-                                   and x.get("kind") in ("llm", "term", "call")])
+                                   and x.get("kind") in FOREGROUND])
                 if span and trows:
                     g, w_ = pa.rate_in_window(trows, span)
                     got, secs = got + g, secs + w_
@@ -575,7 +591,8 @@ class IdleWake(pa._Scenario):
     trials_per_arm = 1
     sample_based = True
     report_only = ("push_penalty_p95_s", "push_penalty_max_s", "send_penalty_p95_s", "send_penalty_max_s",
-                   "deaths_eof", "deaths_rst", "deaths_timeout", "deaths_silent", "idle_eofs", "idle_eof_p50_s")
+                   "deaths_eof", "deaths_rst", "deaths_timeout", "deaths_silent", "idle_eofs", "idle_eof_p50_s",
+                   "sync_p50_s", "sync_max_s")
 
     def configure(self, cfg, cp):
         # D's arms run at once, as paired sessions beside the blocks (design
@@ -617,7 +634,8 @@ class IdleWake(pa._Scenario):
                "send_penalty_p95_s": ("send_penalty", 0.95), "send_penalty_max_s": ("send_penalty", "max"),
                "deaths_eof": ("death_eof", "sum"), "deaths_rst": ("death_rst", "sum"),
                "deaths_timeout": ("death_timeout", "sum"), "deaths_silent": ("death_silent", "sum"),
-               "idle_eofs": ("idle_eof", "count"), "idle_eof_p50_s": ("idle_eof", 0.5)}
+               "idle_eofs": ("idle_eof", "count"), "idle_eof_p50_s": ("idle_eof", 0.5),
+               "sync_p50_s": ("sync_seconds", 0.5), "sync_max_s": ("sync_seconds", "max")}
 
     def samples(self, trials: Sequence[Any]) -> Dict[str, List[float]]:
         recs = [r for t in trials for r in getattr(t, "records", []) if r.get("kind") == "wake"]

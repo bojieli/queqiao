@@ -39,24 +39,29 @@ def iso(t):
 # --- metrics ------------------------------------------------------------------------
 
 def call_record(n_audio=500, frames=150, up=40.0, down=60.0, lost_up=(), lost_down=()):
-    """A call: audio packets every 20 ms, video frames of 10 packets; transit
-    deltas `up` and `down` ms (on two clocks). Packets whose running index is
-    in lost_up never reached the reflector; in lost_down, it got them but they
-    never came back."""
-    audio, video, k = [], [], 0
+    """A call: each direction its own stream of audio packets every 20 ms and
+    video frames of 10 packets, with transit `up` and `down` ms (on two
+    clocks). Packets whose running index (per direction) is in lost_up or
+    lost_down never arrived."""
+    def stream(idx, delta, lost):
+        audio, video, k = [], [], 0
 
-    def pkt(frame, t):
-        nonlocal k
-        k += 1
-        if k in lost_up:
-            return [frame, t, None, None]
-        return [frame, t, up, None if k in lost_down else down]
-    for i in range(n_audio):
-        audio.append(pkt(i, i * 20.0))
-    for f in range(1, frames + 1):
-        for j in range(10):
-            video.append(pkt(f, f * 33.3))
-    return {"kind": "call", "fail": "", "audio": audio, "video": video, "seconds": 10}
+        def pkt(frame, t):
+            nonlocal k
+            k += 1
+            p = [frame, t, None, None]
+            if k not in lost:
+                p[idx] = delta
+            return p
+        for i in range(n_audio):
+            audio.append(pkt(i, i * 20.0))
+        for f in range(1, frames + 1):
+            for _ in range(10):
+                video.append(pkt(f, f * 33.3))
+        return audio, video
+    a, v = stream(2, up, lost_up)
+    da, dv = stream(3, down, lost_down)
+    return {"kind": "call", "fail": "", "audio": a, "video": v, "down_audio": da, "down_video": dv, "seconds": 10}
 
 
 class CallMetrics(unittest.TestCase):
@@ -74,7 +79,7 @@ class CallMetrics(unittest.TestCase):
         # each counted only in its own direction (from the reflector's report).
         m = mn.call_metrics([call_record(lost_up={10, 11, 12}, lost_down={20, 21, 22})])
         self.assertAlmostEqual(m["audio_late_loss_up"], 3 / 500)
-        self.assertAlmostEqual(m["audio_late_loss_down"], 3 / 497)     # over what reached the reflector
+        self.assertAlmostEqual(m["audio_late_loss_down"], 3 / 500)     # over the downlink's own sends
         self.assertAlmostEqual(m["audio_gaps_per_min_up"], 1 / (10 / 60))
         self.assertAlmostEqual(m["audio_gaps_per_min_down"], 1 / (10 / 60))
         self.assertEqual(m["frame_loss_up"], 0.0)
@@ -82,7 +87,7 @@ class CallMetrics(unittest.TestCase):
 
     def test_late_packets_are_bad_in_their_direction_only(self):
         rec = call_record()
-        for p in rec["audio"][100:103]:
+        for p in rec["down_audio"][100:103]:
             p[3] += 300.0                          # late on the way down only
         m = mn.call_metrics([rec])
         self.assertEqual(m["audio_late_loss_up"], 0.0)
@@ -92,7 +97,7 @@ class CallMetrics(unittest.TestCase):
     def test_a_freeze_is_six_bad_frames_in_a_row(self):
         rec = call_record()
         for p in rec["video"]:
-            if 20 <= p[0] < 26 and p[1] is not None:
+            if 20 <= p[0] < 26:
                 p[2] += 500.0                      # six frames late up
         m = mn.call_metrics([rec])
         self.assertAlmostEqual(m["frame_loss_up"], 6 / 150)
@@ -170,6 +175,54 @@ class WakeSamples(unittest.TestCase):
         self.assertEqual(s["delivered_60"], [0.0])
         self.assertEqual(s["death_timeout"], [1.0])
         self.assertEqual(s["silent"], [1.0])
+
+
+class IdleFromTheSync(unittest.TestCase):
+    def test_a_wake_counts_from_the_end_of_the_sync(self):
+        # A sync that took 30 s on a slow shared path: the push at 60 s of
+        # idle arrives 94 s after connecting, which is on time.
+        c = wake_conn(0)
+        c["sync_done"] = c["sync_seconds"] = 30.0
+        c["pushes"] = [[j, (1000.0 + 60 + j) * 1000.0, 30.0 + 60 + j + 0.05 if j == 0 else 30.0 + 60 + j + 0.02]
+                       for j in range(6)]
+        s = mn.wake_samples([c])
+        self.assertEqual(s["delivered_60"], [1.0])
+        self.assertEqual(s["sync_seconds"], [30.0])
+        # A close 20 s into the idle interval is an idle EOF at 20 s, and was
+        # told before the wake.
+        c = dict(wake_conn(0, late=True), sync_done=30.0, end="EOF", end_at=50.0)
+        s = mn.wake_samples([c])
+        self.assertEqual((s["idle_eof"], s["silent"]), ([20.0], [0.0]))
+
+    def test_the_server_waits_for_the_syncs_acknowledgement(self):
+        port = free_port()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        srv = subprocess.Popen([sys.executable, str(SERVER), "--http", str(free_port()), "--term", str(free_port()),
+                                "--wake", str(port), "--dir", tmp.name, "--no-tls"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (srv.kill(), srv.wait()))
+        for _ in range(100):
+            try:
+                c = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+                break
+            except OSError:
+                time.sleep(0.05)
+        c.settimeout(5)
+        c.sendall(b"W 1000 0.2 push 0\n")
+        got = b""
+        while len(got) < 1003:                # the sync: one Y record of 1000 bytes
+            got += c.recv(65536)
+        # No acknowledgement yet: no push, however long the wake time has passed.
+        c.settimeout(1.0)
+        with self.assertRaises(socket.timeout):
+            c.recv(1)
+        c.settimeout(5)
+        c.sendall(b"K\x00\x00\x00\x00")
+        t = time.monotonic()
+        self.assertEqual(c.recv(1), b"P")
+        self.assertGreaterEqual(time.monotonic() - t, 0.15)    # 0.2 s after the acknowledgement
+        c.close()
 
 
 # --- analysis: sample-based idle-wake, sequential minimal -------------------------------
@@ -426,7 +479,7 @@ class Runner(unittest.TestCase):
                 self.assertEqual({s.trial for s in slots}, {trial})
                 self.assertEqual(len(slots), 4)
 
-            def looks(campaign, gates, units_run):
+            def looks(campaign, gates, units_run, failures=None):
                 out = {}
                 for b, p, ty in units_run:
                     out[(p, ty)] = decide(p, ty, sum(1 for u in units_run if (u[1], u[2]) == (p, ty)))
@@ -1022,6 +1075,204 @@ class RoundThreeFixes(unittest.TestCase):
         parse(BASE.replace("[client:a]\nhost = c1", "[client:a]\nhost = c1\nflags = --log-tag agent.sock --peer https://x/y"))
 
 
+class OneFinalBuild(unittest.TestCase):
+    def gates(self):
+        g = an.load_gates()
+        g["resamples"] = 500
+        g["workloads"]["llm"] = {k: v for k, v in g["workloads"]["llm"].items() if k != "*.class_interactive"}
+        return g
+
+    def one_path(self, root, path, commit):
+        pa_tests = importlib.import_module("test_phase_a")
+        pa_tests.write_llm_campaign(root)
+        plan = json.loads(pathlib.Path(root, "plan.json").read_text())
+        plan["paths"] = [path]
+        plan["schedule"] = [dict(sl, path=path) for sl in plan["schedule"]]
+        plan["arms"]["cand"]["commit"] = commit
+        pathlib.Path(root, "plan.json").write_text(json.dumps(plan))
+        tsv = pathlib.Path(root, "trials.tsv").read_text().splitlines()
+        pathlib.Path(root, "trials.tsv").write_text("\n".join(
+            [tsv[0]] + ["\t".join(f[:1] + [path] + f[2:]) for f in (l.split("\t") for l in tsv[1:])]) + "\n")
+        recs = [json.loads(l) for l in pathlib.Path(root, "measures.jsonl").read_text().splitlines()]
+        pathlib.Path(root, "measures.jsonl").write_text("".join(json.dumps(dict(r, _path=path)) + "\n" for r in recs))
+
+    def test_paths_on_different_commits_are_not_one_release(self):
+        llm = wl.WORKLOADS["llm"]
+        with tempfile.TemporaryDirectory() as d:
+            a_, b_ = os.path.join(d, "path-a-x"), os.path.join(d, "path-b-y")
+            self.one_path(a_, "a", "1" * 40)
+            self.one_path(b_, "b", "2" * 40)
+            with mock.patch.object(an, "FLIP_WORKLOADS", ("llm",)), \
+                    mock.patch.object(llm, "report_only", llm.report_only + ("class_interactive",)):
+                text, ok = an.flip_report([a_, b_], self.gates())
+                self.assertFalse(ok)
+                self.assertIn("on a for cand ran on an earlier build or other flags (path-a-x; the final bundle is "
+                              "path-b-y)", text)
+                # The same commit on both paths is one release.
+                c_ = os.path.join(d, "path-a-y")
+                self.one_path(c_, "a", "2" * 40)
+                text, ok = an.flip_report([c_, b_], self.gates())
+                self.assertTrue(ok, text)
+
+    def test_an_older_lone_dc_campaign_is_not_final_on_its_own(self):
+        dc = importlib.import_module("dc_gate")
+        llm = wl.WORKLOADS["llm"]
+        with tempfile.TemporaryDirectory() as d:
+            dcdir, b_ = os.path.join(d, "s9-dc"), os.path.join(d, "rc")
+            os.makedirs(dcdir)
+            pathlib.Path(dcdir, "plan.json").write_text(json.dumps(
+                {"workload": "dc", "main": "main", "paths": ["dc"],
+                 "arms": {"main": {"commit": "a" * 40}, "cand": {"commit": "3" * 40}}}))
+            self.one_path(b_, "b", "2" * 40)
+            with mock.patch.object(an, "FLIP_WORKLOADS", ("llm", "dc")), \
+                    mock.patch.object(an, "FLIP_PROFILES", dict(an.FLIP_PROFILES, minimal={"llm": (), "dc": ("dc-gate",)})), \
+                    mock.patch.object(dc, "evaluate", return_value=("", {"cand": "PASS"})), \
+                    mock.patch.object(llm, "report_only", llm.report_only + ("class_interactive",)):
+                text, ok = an.flip_report([dcdir, b_], self.gates())
+                self.assertFalse(ok)
+                self.assertIn("dc dc-gate on dc for cand ran on an earlier build", text)
+                text, ok = an.flip_report([dcdir, b_], self.gates(), carry=["dc-gate"])
+                self.assertTrue(ok, text)
+
+
+def load_script(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class RoundFourFixes(unittest.TestCase):
+    def test_reflector_state_expires_by_age_and_on_release(self):
+        srv = load_script(SERVER, "wlserver_for_tests")
+        with srv.CALLS_LOCK:
+            for i in range(3):                       # far fewer than any count threshold
+                cid = bytes([i]) * 4
+                srv.CALLS[cid] = {(b"a", 1): 0.0}
+                srv.CALLS_SEEN[cid] = 0.0 if i < 2 else 1_000_000.0
+                srv.PEERS[cid] = ("127.0.0.1", 1)
+                srv.DOWN_LOG[cid] = [(b"a", 1, 0, 0.0)]
+            srv.expire_calls(1_000_000.0)
+            self.assertEqual(set(srv.CALLS), {b"\x02" * 4})
+            self.assertEqual(set(srv.PEERS), {b"\x02" * 4})
+            self.assertEqual(set(srv.DOWN_LOG), {b"\x02" * 4})
+
+    def test_the_final_report_read_releases_the_call(self):
+        e2e = EndToEnd()
+        e2e.setUp()
+        try:
+            recs = e2e.client("call", "--target", f"127.0.0.1:{e2e.udp}", "--duration", "1",
+                              "--report-target", f"127.0.0.1:{e2e.http}")
+            self.assertEqual(recs[0]["fail"], "")
+            # The client's final read released the call: the reflector keeps
+            # nothing of it, so another read is a 404.
+            cl = load_script(CLIENT, "wlclient_for_tests")
+            args = cl.argparse.Namespace(socks=f"127.0.0.1:{e2e.socks.port}", no_tls=True,
+                                         report_target=f"127.0.0.1:{e2e.http}", target="")
+            with self.assertRaises(ValueError):
+                cl.call_report(args, bytes.fromhex(recs[0]["id"]))
+        finally:
+            e2e.tearDown()
+
+    def test_job_failures_reach_the_stopping_look(self):
+        # Six good bulk blocks decide a pass; with block 6's job failed, that
+        # block is left out at the look as it would be at the end.
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            units = [(b, "a", "bulk") for b in range(1, 7)]
+            unit_campaign(root, units)
+            os.remove(os.path.join(root, "status.json"))
+            g = an.load_gates()
+            g["resamples"] = 500
+            dec = an.interim_decisions(root, g, [list(u) for u in units])
+            self.assertIn("pass", dec[("a", "bulk")])
+            failed = {"job_failures": [{"block": 6, "path": "a", "trial": "bulk"}], "fetch_failures": []}
+            dec = an.interim_decisions(root, g, [list(u) for u in units], failed)
+            self.assertNotIn("pass", dec[("a", "bulk")])
+            dec = an.interim_decisions(root, g, [list(u) for u in units], {"fetch_failures": ["x"], "job_failures": []})
+            self.assertNotIn("pass", dec[("a", "bulk")])
+
+    def test_the_runner_passes_its_failures_to_the_look(self):
+        cfg = parse(BASE)
+        camp = ab.Campaign(cfg, "/nonexistent", ".", dry=False, stream=io.StringIO())
+        camp.job_failures.append({"block": 1, "path": "a", "trial": "bulk"})
+        camp.fetch_failures.append("f")
+        with mock.patch.object(an, "interim_decisions", return_value={}) as look:
+            camp.interim("a", "bulk")
+        self.assertEqual(look.call_args[0][3], {"job_failures": [{"block": 1, "path": "a", "trial": "bulk"}],
+                                                "fetch_failures": ["f"]})
+
+    def test_the_rpc_deadline_covers_socks_and_tls_setup(self):
+        # A SOCKS proxy that answers each step just under the timeout: each
+        # step alone fits, together they do not.
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+
+        def slow():
+            try:
+                c, _ = srv.accept()
+                c.recv(3)
+                time.sleep(0.7)
+                c.sendall(b"\x05\x00")
+                c.recv(64)
+                time.sleep(0.7)
+                c.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
+                time.sleep(3)
+                c.close()
+            except OSError:
+                pass
+        threading.Thread(target=slow, daemon=True).start()
+        cl = load_script(CLIENT, "wlclient_for_tests2")
+        args = cl.argparse.Namespace(socks=f"127.0.0.1:{port}", target="127.0.0.1:9", no_tls=True)
+        t = time.monotonic()
+        with self.assertRaises(socket.timeout):
+            cl.open_conn(args, 1.0, time.monotonic() + 1.0)
+        self.assertLess(time.monotonic() - t, 1.3)
+        srv.close()
+
+    def test_the_page_load_is_inside_cs_background_window(self):
+        # The page ends at 130 s; the download stopped at 110 s: the page was
+        # not measured under the background, so C is unmeasured.
+        m = wl.WORKLOADS["minimal"]()
+        T = collections.namedtuple("T", "rows records trial")
+        recs = [{"_phase": "mixed-all", "kind": k, "t0": 0.0, "t1": 100.0} for k in ("llm", "term", "call")]
+        recs.append({"_phase": "mixed-all", "kind": "browse", "t0": 20.0, "t1": 130.0})
+        bg = [{"phase": "mixed-all", "kind": kind, "flow": "b1o1", "bytes": "100", "http": "200",
+               "t_start": "0", "t_end": "110"} for kind in ("wl-bgdown", "wl-bgup")]
+        t = T(bg, recs, "mixed-all")
+        self.assertFalse(m.under_background("mixed-all", recs, bg, [t]))
+        for r in bg:
+            r["t_end"] = "131"
+        self.assertTrue(m.under_background("mixed-all", recs, bg, [t]))
+
+    def test_h2_first_byte_is_the_first_payload_bytes_arrival(self):
+        # A 16 KiB frame whose first bytes arrive at once and the rest 0.4 s
+        # later: the stream's first byte is the first arrival.
+        cl = load_script(CLIENT, "wlclient_for_tests3")
+        frame = b"D" + struct.pack(">II", 7, 16384) + b"x" * 16384 + b"F" + struct.pack(">I", 7)
+
+        class Slow:
+            def __init__(self):
+                self.parts = [frame[:100], frame[100:]]
+
+            def recv(self, n):
+                if len(self.parts) == 1:
+                    time.sleep(0.4)
+                return self.parts.pop(0) if self.parts else b""
+
+            def settimeout(self, t):
+                pass
+        r = cl.Reader(Slow())
+        c0 = time.monotonic()
+        first, done = {}, []
+        cl.mux_read(r, {7: 16384}, c0, first, done.append)
+        self.assertEqual(done, [7])
+        self.assertLess(first[7], 0.2)
+        self.assertGreater(time.monotonic() - c0, 0.35)
+
+
 class ShortAnswers(unittest.TestCase):
     def test_a_short_rpc_answer_is_not_a_completed_request(self):
         # A server that answers every request with 200 and 10 bytes.
@@ -1136,10 +1387,13 @@ class BesideSession(unittest.TestCase):
 # --- end to end on this machine -----------------------------------------------------
 
 class Socks5UDP(threading.Thread):
-    """SOCKS5 relay for the tests: CONNECT and UDP ASSOCIATE, on loopback."""
+    """SOCKS5 relay for the tests: CONNECT and UDP ASSOCIATE, on loopback.
+    With drop_every n it drops every n-th uplink datagram; with burst s it
+    holds the uplink and releases it in bursts every s seconds."""
 
-    def __init__(self):
+    def __init__(self, drop_every=0, burst=0.0):
         super().__init__(daemon=True)
+        self.drop_every, self.burst = drop_every, burst
         self.srv = socket.socket()
         self.srv.bind(("127.0.0.1", 0))
         self.srv.listen(64)
@@ -1194,8 +1448,13 @@ class Socks5UDP(threading.Thread):
         relay.bind(("127.0.0.1", 0))
         c.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack(">H", relay.getsockname()[1]))
         client = [None]
-        relay.settimeout(0.2)
+        relay.settimeout(0.02 if self.burst else 0.2)
+        held, n_up, flushed = [], 0, time.monotonic()
         while True:
+            if held and time.monotonic() - flushed >= self.burst:
+                for payload, dst in held:
+                    relay.sendto(payload, dst)
+                held, flushed = [], time.monotonic()
             try:
                 data, peer = relay.recvfrom(65535)
             except socket.timeout:
@@ -1213,6 +1472,12 @@ class Socks5UDP(threading.Thread):
             if peer[0] == "127.0.0.1" and (client[0] is None or peer == client[0]) and data[:3] == b"\x00\x00\x00":
                 client[0] = peer
                 dst = (socket.inet_ntoa(data[4:8]), struct.unpack(">H", data[8:10])[0])
+                n_up += 1
+                if self.drop_every and n_up % self.drop_every == 0:
+                    continue
+                if self.burst:
+                    held.append((data[10:], dst))
+                    continue
                 relay.sendto(data[10:], dst)
             elif client[0]:
                 relay.sendto(b"\x00\x00\x00\x01" + socket.inet_aton(peer[0]) + struct.pack(">H", peer[1]) + data, client[0])
@@ -1274,10 +1539,32 @@ class EndToEnd(unittest.TestCase):
         self.assertLess(m["late_loss_up"], 0.05)
         self.assertLess(m["frame_loss_up"], 0.2)
         self.assertLess(m["frame_loss_down"], 0.2)
+        self.assertTrue(all(p[3] is not None for p in c["down_audio"] + c["down_video"]))
         # Without the report the call is a failure, not a guess.
         recs = self.client("call", "--target", f"127.0.0.1:{self.udp}", "--duration", "1",
                            "--report-target", f"127.0.0.1:{free_port()}")
         self.assertIn("no reflector report", recs[0]["fail"])
+
+    def test_the_downlink_keeps_its_own_clock_under_a_lossy_bursty_uplink(self):
+        # The uplink loses every other packet and arrives in 300 ms bursts;
+        # the downlink must still be the full open-loop stream, on time.
+        bad = Socks5UDP(drop_every=2, burst=0.3)
+        bad.start()
+        try:
+            p = subprocess.run([sys.executable, str(CLIENT), "call", "--socks", f"127.0.0.1:{bad.port}", "--no-tls",
+                                "--target", f"127.0.0.1:{self.udp}", "--duration", "3",
+                                "--report-target", f"127.0.0.1:{self.http}"], capture_output=True, text=True, timeout=60)
+        finally:
+            bad.srv.close()
+        c = [json.loads(l[2:]) for l in p.stdout.splitlines() if l.startswith("J\t")][0]
+        self.assertEqual(c["fail"], "")
+        self.assertEqual(len(c["down_audio"]), 150)                  # 3 s of 20 ms audio, all sent
+        got = [x[3] for x in c["down_audio"] if x[3] is not None]
+        self.assertGreaterEqual(len(got), 140)
+        m = mn.call_metrics([c])
+        self.assertLess(m["lateness_p99_down_s"], 0.1)                # not shaped by the uplink's bursts
+        self.assertLess(m["audio_late_loss_down"], 0.05)
+        self.assertGreater(m["audio_late_loss_up"], 0.3)              # the uplink's own losses stay its own
 
     def test_a_browsing_burst(self):
         for mode in ("h1", "h2"):

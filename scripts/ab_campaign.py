@@ -1353,7 +1353,9 @@ rm -f "$f"''', what=f"stop {tag}")
         the blocks run so far. Each type stops on its own; the others go on."""
         import ab_analyze
         try:
-            by_cell = ab_analyze.interim_decisions(self.out, ab_analyze.load_gates(), self.units_run)
+            by_cell = ab_analyze.interim_decisions(self.out, ab_analyze.load_gates(), self.units_run,
+                                                   {"job_failures": list(self.job_failures),
+                                                    "fetch_failures": list(self.fetch_failures)})
         except Exception as e:  # an analysis error must not end the campaign
             return False, f"interim analysis failed ({type(e).__name__}: {e}); continuing"
         import ab_stats

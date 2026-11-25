@@ -57,6 +57,12 @@ SINK_LOCK = threading.Lock()
 CALLS: dict = {}
 CALLS_SEEN: dict = {}
 CALLS_LOCK = threading.Lock()
+# The call's own downlink: its return address (the latest uplink's sender),
+# what it sent, and whether it has finished.
+PEERS: dict = {}
+DOWN_LOG: dict = {}
+DOWN_DONE: set = set()
+CALL_MAX_AGE_MS = 300_000    # a call not heard from for 5 minutes is forgotten
 MUX_FRAME = 16384
 
 
@@ -153,8 +159,17 @@ class HTTP(socketserver.StreamRequestHandler):
                     cid = b""
                 with CALLS_LOCK:
                     got = dict(CALLS.get(cid, {}))
+                    down = list(DOWN_LOG.get(cid, []))
+                    done = cid in DOWN_DONE
+                    if q.get("release") == "1" and got:
+                        # The client's final read: forget the call now.
+                        forget(cid)
+                # The uplink as the reflector received it, per stream (seq,
+                # receive ms); the downlink it sent, (stream, seq, frame,
+                # send ms); and whether the downlink has finished.
                 rep_ = {"a": sorted([s, round(t, 1)] for (st_, s), t in got.items() if st_ == b"a"),
-                        "v": sorted([s, round(t, 1)] for (st_, s), t in got.items() if st_ == b"v")}
+                        "v": sorted([s, round(t, 1)] for (st_, s), t in got.items() if st_ == b"v"),
+                        "down": [[st_.decode(), q_, f_, round(t, 1)] for st_, q_, f_, t in down], "down_done": done}
                 body = json.dumps(rep_, separators=(",", ":")).encode() if got else b""
                 self.wfile.write((b"HTTP/1.1 200 OK" if got else b"HTTP/1.1 404 Not Found") +
                                  b"\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
@@ -349,44 +364,109 @@ def tls_context(directory: str) -> ssl.SSLContext:
     return ctx
 
 
+def call_schedule(duration: float):
+    """W7's open-loop media, the same each way: (offset s, stream, frame,
+    index, count, size). Audio: 160 B every 20 ms. Video: 30 frames/s of 10 KB
+    in 1,100 B packets, a 40 KB key frame every 2 s."""
+    out = []
+    t = 0.0
+    while t < duration:
+        out.append((t, b"a", int(round(t / 0.02)), 0, 1, 160))
+        t += 0.020
+    frame, t = 0, 0.0
+    while t < duration:
+        frame += 1
+        size = 40_000 if frame % 60 == 1 else 10_000
+        parts = (size + 1099) // 1100
+        for i in range(parts):
+            out.append((t, b"v", frame, i, parts, min(1100, size - i * 1100)))
+        t += 1.0 / 30
+    out.sort(key=lambda x: (x[0], x[1] != b"a"))
+    return out
+
+
+CALL_HEAD = struct.Struct(">2sccIIHHd")
+
+
+def forget(cid: bytes) -> None:
+    """Drop a call's state (CALLS_LOCK held)."""
+    for d in (CALLS, CALLS_SEEN, PEERS, DOWN_LOG):
+        d.pop(cid, None)
+    DOWN_DONE.discard(cid)
+
+
+def expire_calls(now_ms: float) -> None:
+    """Forget calls not heard from for CALL_MAX_AGE_MS, however few there
+    are (CALLS_LOCK held)."""
+    for cid in [c for c, t in CALLS_SEEN.items() if now_ms - t > CALL_MAX_AGE_MS]:
+        forget(cid)
+
+
+def downlink(sock: socket.socket, cid: bytes, duration: float) -> None:
+    """The call's downlink: its own open-loop stream on its own clock, sent to
+    the call's latest return address. Uplink arrivals only name the call and
+    that address; they neither pace nor gate it."""
+    start = time.monotonic()
+    seq = {b"a": 0, b"v": 0}
+    for off, stream, frame, idx, count, size in call_schedule(duration):
+        delay = start + off - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        seq[stream] += 1
+        t = mono_ms()
+        body = CALL_HEAD.pack(b"QC", stream, b"\x01", seq[stream], frame, idx, count, t) + b"\x00" * 12 + cid
+        body += b"q" * max(0, size - len(body))
+        with CALLS_LOCK:
+            peer = PEERS.get(cid)
+            if peer is None:
+                return              # forgotten
+            DOWN_LOG.setdefault(cid, []).append((stream, seq[stream], frame, t))
+        try:
+            sock.sendto(body, peer)
+        except OSError:
+            pass
+    with CALLS_LOCK:
+        DOWN_DONE.add(cid)
+
+
 def reflect(sock: socket.socket) -> None:
-    """The call's far side: every datagram straight back to its sender, with
-    the reflector's receive time (server monotonic ms, 8 bytes) and its
-    running count of datagrams from that sender (4 bytes) written at bytes
-    24..35 -- the layout wlclient's call generator reserves for them."""
-    counts: dict = {}
+    """The call's far side. Each uplink packet's arrival is recorded by call
+    id (bytes 36..39) for the call's report; the first one of a call starts
+    its downlink (duration in ms at bytes 40..43), and every one updates the
+    call's return address."""
+    last_sweep = 0.0
     while True:
         try:
             data, peer = sock.recvfrom(65535)
         except OSError:
             continue
         now = mono_ms()
-        counts[peer] = counts.get(peer, 0) + 1
-        if len(data) >= 40 and data[:2] == b"QC":
-            cid = data[36:40]
-            stream, seq = data[2:3], struct.unpack_from(">I", data, 4)[0]
-            with CALLS_LOCK:
-                CALLS.setdefault(cid, {})[(stream, seq)] = now
-                CALLS_SEEN[cid] = now
-                if len(CALLS) > 64:
-                    # Forget calls not heard from for ten minutes.
-                    for old in [c for c, t in CALLS_SEEN.items() if now - t > 600_000]:
-                        CALLS.pop(old, None)
-                        CALLS_SEEN.pop(old, None)
-        if len(data) >= 36:
-            data = data[:24] + struct.pack(">dI", now, counts[peer]) + data[36:]
-        try:
-            sock.sendto(data, peer)
-        except OSError:
-            pass
+        if len(data) < 44 or data[:2] != b"QC" or data[3:4] != b"\x00":
+            continue
+        cid = data[36:40]
+        stream, seq = data[2:3], struct.unpack_from(">I", data, 4)[0]
+        start = False
+        with CALLS_LOCK:
+            CALLS.setdefault(cid, {})[(stream, seq)] = now
+            CALLS_SEEN[cid] = now
+            start = cid not in PEERS
+            PEERS[cid] = peer
+            if now - last_sweep > 1000:
+                expire_calls(now)
+                last_sweep = now
+        if start:
+            duration = struct.unpack_from(">I", data, 40)[0] / 1000.0
+            threading.Thread(target=downlink, args=(sock, cid, min(duration, 3600.0)), daemon=True).start()
 
 
 class Wake(socketserver.BaseRequestHandler):
     """Idle-wake connections (W9a, trial D). The client opens one with a
     line `W <sync bytes> <wake seconds> <push|send> <followups>`; the server
-    sends the sync burst at once (login history), then stays silent. For a
-    push wake it pushes one message at the wake time (seconds after the
-    request, on its own clock) and `followups` more at 1 s spacing; a push
+    sends the sync burst at once (login history), then stays silent. The
+    client acknowledges the whole sync with `K` and 4 zero bytes; the idle
+    interval starts then. For a push wake the server pushes one message at
+    the wake time (seconds after that acknowledgement, on its own clock) and
+    `followups` more at 1 s spacing; a push
     is `P<4-byte index><8-byte server monotonic ms>`. The client may send
     `S<4-byte n>` at any time, answered at once by `A<4-byte n>` (a send
     wake and its warm follow-ups)."""
@@ -407,7 +487,6 @@ class Wake(socketserver.BaseRequestHandler):
                 line += b
             _, sync, at, mode, follow = line.decode().split()
             wakes = at if mode == "push" else ""
-            t0 = time.monotonic()
             left = int(sync)
             with lock:
                 while left > 0:
@@ -415,7 +494,7 @@ class Wake(socketserver.BaseRequestHandler):
                     s.sendall(b"Y" + struct.pack(">H", k) + b"y" * k)
                     left -= k
 
-            def pushes():
+            def pushes(t0):
                 i = 0
                 try:
                     for w in [float(x) for x in wakes.split(",") if x]:
@@ -430,10 +509,15 @@ class Wake(socketserver.BaseRequestHandler):
                 except (OSError, ssl.SSLError):
                     return
 
-            threading.Thread(target=pushes, daemon=True).start()
+            started = False
             while True:
                 head = read_exact(s, 5)
-                if head[:1] == b"S":
+                if head[:1] == b"K" and not started:
+                    # The client has the whole sync: the idle interval, and
+                    # the push clock, start now.
+                    started = True
+                    threading.Thread(target=pushes, args=(time.monotonic(),), daemon=True).start()
+                elif head[:1] == b"S":
                     with lock:
                         s.sendall(b"A" + head[1:5])
         except (EOFError, OSError, ssl.SSLError, ValueError):
