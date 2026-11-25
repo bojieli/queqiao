@@ -777,3 +777,49 @@ func TestAStalledClaimantDoesNotThrottleItsSibling(t *testing.T) {
 		t.Fatalf("the healthy sibling sent %d of 20 packets beside a stalled claimant", sent)
 	}
 }
+
+// Each attachment publishes its own share of the path's cumulative
+// counters, so connections on one path that each publish count every loss
+// and sample once between them.
+func TestAttachmentCountersSumToThePaths(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	for range 10 {
+		a.send(now, 1200)
+		b.send(now, 1200)
+	}
+	now = now.Add(100 * time.Millisecond)
+	a.event(now, numbers(0, 7), numbers(7, 10))
+	b.event(now, numbers(0, 9), numbers(9, 10))
+	path, ta, tb := c.Telemetry(), a.a.Telemetry(), b.a.Telemetry()
+	if ta.PacketsLost+tb.PacketsLost != path.PacketsLost || ta.PacketsLost != 3 || tb.PacketsLost != 1 {
+		t.Fatalf("losses: path %d, attachments %d and %d", path.PacketsLost, ta.PacketsLost, tb.PacketsLost)
+	}
+	if ta.Samples+tb.Samples != path.Samples {
+		t.Fatalf("samples: path %d, attachments %d and %d", path.Samples, ta.Samples, tb.Samples)
+	}
+}
+
+// A packet must fit the window: one byte short of a full window admits no
+// full-size packet, and a CONTROL packet that fits only on the debt carries
+// nothing else.
+func TestAPacketMustFitTheWindow(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	window := c.law.GetCongestionWindow()
+	for a.inFlight+1200 <= window-1 {
+		a.send(now, 1200)
+	}
+	a.send(now, window-1-a.inFlight)
+	now = now.Add(time.Second)
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	if p := a.a.Admit(now, 1200); p.OK {
+		t.Fatalf("a full packet was admitted with one byte of window left: %+v", p)
+	}
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true, quiccongestion.ClassBulk: true}})
+	if p := a.a.Admit(now, 1200); !p.OK || p.Turn != quiccongestion.ClassControl || p.Fill != [4]quiccongestion.ByteCount{} {
+		t.Fatalf("a CONTROL packet on the debt: %+v", p)
+	}
+}

@@ -543,7 +543,7 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 		turn = c.arb.SelectAmong(a.demand.Eligible)
 	}
 	// The window and the balance, for the turn the path would serve now.
-	borrowed, refusal := c.admissible(a, now, turn)
+	borrowed, refusal := c.admissible(a, now, turn, maxBytes)
 	if refusal != nil {
 		a.waiting = true
 		return *refusal, wakes
@@ -572,7 +572,7 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 		// Every claim on the path's turn lapsed: this attachment is served
 		// from its own demand, and the class keeps its deficit.
 		turn = c.arb.SelectAmong(a.demand.Eligible)
-		if borrowed, refusal = c.admissible(a, now, turn); refusal != nil {
+		if borrowed, refusal = c.admissible(a, now, turn, maxBytes); refusal != nil {
 			a.waiting = true
 			return *refusal, wakes
 		}
@@ -617,7 +617,7 @@ func (c *PathController) claimed(a *PathAttachment, turn quiccongestion.SendClas
 // admissible checks the window, against the path's flight or a PROBING
 // attachment's own, and the balance, for a packet of the given turn. A
 // CONTROL turn may borrow the control debt; borrowed says it did.
-func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn quiccongestion.SendClass) (bool, *quiccongestion.Permit) {
+func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn quiccongestion.SendClass, maxBytes quiccongestion.ByteCount) (bool, *quiccongestion.Permit) {
 	debt := quiccongestion.ByteCount(0)
 	if turn == quiccongestion.ClassControl {
 		debt = pathControlDebtPackets * c.maxPacket
@@ -625,25 +625,29 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 	borrowed := false
 	window := c.law.GetCongestionWindow()
 	c.law.recordInFlight(c.flight)
+	// The packet must fit: refused if the flight after it would exceed the
+	// window (§4.3), or, on a CONTROL turn, the window plus the debt.
 	if a.probing {
-		if a.gauge >= pathProbeWindowPackets*c.maxPacket {
+		if a.gauge+maxBytes > pathProbeWindowPackets*c.maxPacket {
 			a.windowBlocked = true
 			a.unable = true
 			c.stats.refusedWindow.Add(1)
 			return false, &quiccongestion.Permit{}
 		}
-	} else if c.flight >= window {
-		if c.flight >= window+debt {
+	} else if c.flight+maxBytes > window {
+		if c.flight+maxBytes > window+debt {
 			a.windowBlocked = true
 			c.stats.refusedWindow.Add(1)
 			return false, &quiccongestion.Permit{}
 		}
 		borrowed = true
 	}
-	if budget, need := c.law.pacer.budget(now), c.law.inner.maxDatagramSize; budget < need {
-		if budget < need-debt {
+	// The balance must cover this packet, of the size the asking
+	// connection builds.
+	if budget := c.law.pacer.budget(now); budget < maxBytes {
+		if budget < maxBytes-debt {
 			c.stats.refusedPacing.Add(1)
-			retry := c.law.pacer.timeUntilSend()
+			retry := c.law.pacer.timeUntilBudget(maxBytes - debt)
 			if retry.IsZero() || retry.Before(now) {
 				retry = now
 			}
@@ -696,6 +700,7 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 	default:
 		c.stats.nonEliciting.Add(1)
 		c.law.nonElicitingUndebited.Add(byteTotal(s.Bytes))
+		a.bankNonEliciting(byteTotal(s.Bytes))
 	}
 	c.advance(now)
 	return wakes
@@ -813,7 +818,13 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 	if len(c.acked) > 0 || len(c.lost) > 0 {
 		// The law's flight after the event is the path's: its prior is
 		// that plus what this event resolved of its samples.
+		before := c.law.Telemetry()
 		c.law.afterOutcomes(c.flight+resolved, now, c.acked, c.lost)
+		// The event's movement of the cumulative counters is this
+		// attachment's, and only its: a connection's published counters
+		// must count each loss and sample of the path once.
+		after := c.law.Telemetry()
+		a.bankCounters(&after, &before)
 	}
 	if c.flight < before || c.law.GetCongestionWindow() > windowBefore {
 		return c.collectBlocked(a, nil)
@@ -877,6 +888,11 @@ type PathAttachment struct {
 	// were last acknowledged.
 	ptoSinceProgress int
 
+	// counters are this attachment's share of the path's cumulative
+	// counters, read from any goroutine.
+	countersMu sync.Mutex
+	counters   ControllerTelemetry
+
 	// Run loop only.
 	wake      func()
 	attached  bool
@@ -900,7 +916,47 @@ func (a *PathAttachment) Controller() *PathController { return a.ctl.Load() }
 func (a *PathAttachment) SchedulesClasses() bool { return true }
 
 // Telemetry is the path's.
-func (a *PathAttachment) Telemetry() ControllerTelemetry { return a.ctl.Load().Telemetry() }
+// Its gauges and estimates are the path's; its cumulative counters are the
+// attachment's own share of the path's, so connections on one path that
+// each publish their counters count every loss and sample once.
+func (a *PathAttachment) Telemetry() ControllerTelemetry {
+	t := a.ctl.Load().Telemetry()
+	a.countersMu.Lock()
+	own := a.counters
+	a.countersMu.Unlock()
+	t.Samples, t.NonAppSamples, t.AppSamples = own.Samples, own.NonAppSamples, own.AppSamples
+	t.StateMisses, t.ZeroSamples = own.StateMisses, own.ZeroSamples
+	t.BytesLost, t.PacketsLost, t.PacketsLostObserved = own.BytesLost, own.PacketsLost, own.PacketsLostObserved
+	t.NonElicitingBytes, t.NonElicitingDebited = own.NonElicitingBytes, own.NonElicitingDebited
+	return t
+}
+
+// bankCounters adds the counters' movement from before to after.
+func (a *PathAttachment) bankCounters(after, before *ControllerTelemetry) {
+	d := func(x, y uint64) uint64 {
+		if x < y {
+			return 0
+		}
+		return x - y
+	}
+	a.countersMu.Lock()
+	c := &a.counters
+	c.Samples += d(after.Samples, before.Samples)
+	c.NonAppSamples += d(after.NonAppSamples, before.NonAppSamples)
+	c.AppSamples += d(after.AppSamples, before.AppSamples)
+	c.StateMisses += d(after.StateMisses, before.StateMisses)
+	c.ZeroSamples += d(after.ZeroSamples, before.ZeroSamples)
+	c.BytesLost += d(after.BytesLost, before.BytesLost)
+	c.PacketsLost += d(after.PacketsLost, before.PacketsLost)
+	c.PacketsLostObserved += d(after.PacketsLostObserved, before.PacketsLostObserved)
+	a.countersMu.Unlock()
+}
+
+func (a *PathAttachment) bankNonEliciting(bytes uint64) {
+	a.countersMu.Lock()
+	a.counters.NonElicitingBytes += bytes
+	a.countersMu.Unlock()
+}
 
 // ClassStats returns the path's arbiter state.
 func (a *PathAttachment) ClassStats() (ClassArbiterStats, bool) {

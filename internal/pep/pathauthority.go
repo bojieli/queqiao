@@ -63,7 +63,7 @@ type pathAuthorityRegistry struct {
 }
 
 // controller returns the path's controller, creating it on first use.
-func (r *pathAuthorityRegistry) controller(principal, key, egress string, cfg congestionConfig, initialPacketSize quiccongestion.ByteCount) *wancongestion.PathController {
+func (r *pathAuthorityRegistry) controller(principal, key string, initialPacketSize quiccongestion.ByteCount) *wancongestion.PathController {
 	name := principal + "|" + key
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -76,7 +76,7 @@ func (r *pathAuthorityRegistry) controller(principal, key, egress string, cfg co
 				// The principal's model goes with its controller: a
 				// principal that does not return would otherwise keep it
 				// for the life of the process.
-				forgetPathModel(k, cfg.hierarchicalPath)
+				pathmodel.Forget(k)
 			}
 		}
 	}
@@ -88,8 +88,12 @@ func (r *pathAuthorityRegistry) controller(principal, key, egress string, cfg co
 	}
 	// The model is the principal's too: its pooled erasure sets the law's
 	// compensation, and one device's loss must not move another's rate.
-	c := wancongestion.NewPathController(initialPacketSize,
-		pathModelForKey(name, egress, cfg.hierarchicalPath, cfg.discoverGrouping), wancongestion.DefaultClassWeights)
+	//
+	// It is flat: the hierarchical model is dc-long-haul's, and that profile
+	// stays on the legacy bundle (validateBundle), so the connection's
+	// readers, pointed at pathmodel.Shared(name) by rekeyPathModel, read
+	// exactly the model the law reports to.
+	c := wancongestion.NewPathController(initialPacketSize, pathmodel.Shared(name), wancongestion.DefaultClassWeights)
 	r.controllers[name] = c
 	return c
 }
@@ -99,19 +103,10 @@ func (r *pathAuthorityRegistry) controller(principal, key, egress string, cfg co
 func (r *pathAuthorityRegistry) forget() {
 	r.mu.Lock()
 	for k := range r.controllers {
-		forgetPathModel(k, false)
+		pathmodel.Forget(k)
 	}
 	clear(r.controllers)
 	r.mu.Unlock()
-}
-
-// forgetPathModel drops the shared model a controller's law reports to.
-func forgetPathModel(name string, hierarchical bool) {
-	if hierarchical {
-		pathmodel.ForgetTree(name)
-		return
-	}
-	pathmodel.Forget(name)
 }
 
 // attachPathController attaches conn to its path's controller and installs
@@ -120,22 +115,22 @@ func forgetPathModel(name string, hierarchical bool) {
 // attachment, with the connection's flight, to that path's controller; a
 // port-only rebinding keeps it.
 func attachPathController(conn *quic.Conn, cfg congestionConfig, principal string) wancongestion.TelemetryProvider {
-	egress, current := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
+	_, current := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
 	initial := conn.InitialPacketSize()
-	controller := pathAuthorities.controller(principal, current, egress, cfg, initial)
+	controller := pathAuthorities.controller(principal, current, initial)
 	// The connection's FEC and probe readers read the model the law reports
 	// to: the principal's.
 	rekeyPathModel(conn, principal+"|"+current)
 	// rekey is called only on the connection's run loop.
 	rekey := func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
-		egress, next := resolvePath(newLocal, newRemote)
+		_, next := resolvePath(newLocal, newRemote)
 		if next == current {
 			return nil
 		}
 		current = next
 		// The connection's other readers of the path follow it too.
 		rekeyPathModel(conn, principal+"|"+next)
-		return pathAuthorities.controller(principal, next, egress, cfg, initial)
+		return pathAuthorities.controller(principal, next, initial)
 	}
 	attachment := controller.Attach(rekey, func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
 	markClassScheduled(conn)

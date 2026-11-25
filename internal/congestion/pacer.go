@@ -149,6 +149,24 @@ func (p *pacer) timeUntilSend() monotime.Time {
 	return p.lastSentTime.Add(maxDuration(quiccongestion.MinPacingDelay, time.Duration(d)*time.Nanosecond))
 }
 
+// timeUntilBudget is when the balance will reach need, for a debt-keeping
+// bucket whose callers ask for packets of their own size.
+func (p *pacer) timeUntilBudget(need quiccongestion.ByteCount) monotime.Time {
+	if p.budgetAtLastSent >= need {
+		return 0
+	}
+	bps := uint64(p.getBandwidth())
+	if bps == 0 {
+		return p.lastSentTime.Add(time.Second)
+	}
+	diff := 1e9 * uint64(need-p.budgetAtLastSent)
+	d := diff / bps
+	if diff%bps != 0 {
+		d++
+	}
+	return p.lastSentTime.Add(maxDuration(quiccongestion.MinPacingDelay, time.Duration(d)*time.Nanosecond))
+}
+
 func (p *pacer) setMaxDatagramSize(size quiccongestion.ByteCount) {
 	if size > 0 {
 		p.maxDatagramSize = size
