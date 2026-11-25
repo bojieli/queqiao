@@ -290,8 +290,7 @@ func (s *flowSource) ReadAvailable(p []byte) (int, error) {
 func (s *flowSource) Read(p []byte) (int, error) {
 	n, err := s.flow.inner.Read(p)
 	if n > 0 {
-		s.flow.observe(n, true)
-		s.flow.bytesUp.Add(uint64(n))
+		s.flow.observeCarried(n, true)
 	}
 	if err != nil {
 		// HTTP clients often close a fully-consumed SOCKS socket without a TCP

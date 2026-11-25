@@ -101,6 +101,26 @@ const sparseWriteBytes = 2 * 1400
 // its class like any other flow past this point.
 const sparseAllowanceBytes = smallExchangeBytes
 
+// classifierBacklogFor fits the phased classifier's backlog threshold to the
+// flow's send-memory bound. The backlog cannot exceed what the flow may
+// retain, so on a memory profile whose per-flow send limit is at or under
+// the default threshold, a sustained transfer could never show the evidence
+// that keeps or puts it in BULK. Half the bound is still far above any
+// conversation's backlog and is reached by any producer blocked for room.
+func classifierBacklogFor(cfg classifier.Config, limits flowMemoryLimits) classifier.Config {
+	if !cfg.Phased || limits.maxSendBytes <= 0 {
+		return cfg
+	}
+	threshold := cfg.BulkBacklogBytes
+	if threshold == 0 {
+		threshold = classifier.DefaultConfig().BulkBacklogBytes
+	}
+	if half := uint64(limits.maxSendBytes / 2); half < threshold {
+		cfg.BulkBacklogBytes = max(half, 1)
+	}
+	return cfg
+}
+
 // phased reports whether this flow runs the phased classifier.
 func (f *multipathFlow) phased() bool {
 	return f.classifier != nil && f.classifier.Phased()

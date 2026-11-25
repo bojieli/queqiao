@@ -654,3 +654,32 @@ func TestCodedDataOutstandingFollowsTheAttempts(t *testing.T) {
 		t.Fatal("a coded chunk acknowledged selectively still counted as outstanding")
 	}
 }
+
+// On a memory profile whose per-flow send bound is at or under the backlog
+// threshold, the threshold follows the bound, so a blocked transfer can still
+// show a backlog.
+func TestBacklogThresholdFitsTheSendBound(t *testing.T) {
+	cfg := phasedClassifierConfig(profile.Default().Classifier, ClassifierPhased)
+	small := defaultFlowMemoryLimits()
+	small.maxSendBytes = 48 << 10
+	if got := classifierBacklogFor(cfg, small).BulkBacklogBytes; got != 24<<10 {
+		t.Fatalf("threshold %d with a 48 KiB send bound, want 24 KiB", got)
+	}
+	if got := classifierBacklogFor(cfg, defaultFlowMemoryLimits()).BulkBacklogBytes; got != 64<<10 {
+		t.Fatalf("threshold %d with the default bound, want 64 KiB", got)
+	}
+	legacy := phasedClassifierConfig(profile.Default().Classifier, ClassifierLegacy)
+	if got := classifierBacklogFor(legacy, small); got != legacy {
+		t.Fatal("the legacy classifier's configuration was changed")
+	}
+}
+
+// observeCarried counts the bytes in the same step as the observation.
+func TestObserveCarriedCountsTheBytes(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	h.f.observeCarried(100, true)
+	h.f.observeCarried(40, false)
+	if h.f.bytesUp.Load() != 100 || h.f.bytesDown.Load() != 40 {
+		t.Fatalf("totals up=%d down=%d, want 100 and 40", h.f.bytesUp.Load(), h.f.bytesDown.Load())
+	}
+}

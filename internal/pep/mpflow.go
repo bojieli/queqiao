@@ -588,7 +588,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 		done: make(chan struct{}), localClosedCh: make(chan struct{}), remoteAbortCh: make(chan struct{}),
 		ackWake: make(chan struct{}, 1), ackErr: make(chan error, 1),
 		stallSignal: make(chan struct{}, 1),
-		classifier:  classifier.New(classifierCfg), started: time.Now(), completionGrace: flowCompletionGrace,
+		classifier:  classifier.New(classifierBacklogFor(classifierCfg, memoryLimits)), started: time.Now(), completionGrace: flowCompletionGrace,
 	}
 	f.idleTimeout = defaultFlowIdleTimeout
 	f.maxLifetime = defaultFlowMaxLifetime
@@ -2187,14 +2187,20 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			// This escape lasts only until the bytes pending now are acknowledged:
 			// loss of feedback alone is not evidence against future coded DATA.
 			// Only those byte offsets escape; later exchanges remain coded.
-			for _, lane := range f.healthyLanes() {
-				// Under the phased classifier a BULK flow still codes its
-				// sparse writes, so the question is whether the lane's coded
-				// path could have taken any of the pending DATA, not what the
-				// flow prefers now.
-				if lane.fc.codesData() || f.phased() && f.codedDataOutstanding() {
+			if f.phased() {
+				// Under the phased classifier what the flow prefers now says
+				// nothing about what is pending: a BULK flow codes its sparse
+				// writes, and a flow that left BULK may have only stream data
+				// outstanding. The scheduler knows which chunks went coded.
+				if f.codedDataOutstanding() {
 					f.escapePendingCoding()
-					break
+				}
+			} else {
+				for _, lane := range f.healthyLanes() {
+					if lane.fc.codesData() {
+						f.escapePendingCoding()
+						break
+					}
 				}
 			}
 			// Coded bytes are pending only if the escape latched a frontier.
@@ -3258,8 +3264,7 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 			resetAbortTimer(f.localAbortDrainGrace())
 			return nil
 		}
-		f.observe(len(out), false)
-		f.bytesDown.Add(uint64(len(out)))
+		f.observeCarried(len(out), false)
 
 		return nil
 	}
@@ -3475,14 +3480,37 @@ func (f *multipathFlow) clockNow() time.Time {
 	return time.Now()
 }
 
-func (f *multipathFlow) observe(n int, up bool) bool {
-	// Sampling, classifying and publishing are one step. Three goroutines
-	// observe (the application reader, the receive loop and the dispatch
-	// refresh); an observation sampled before a newer one but applied after
-	// it would, for instance, end a backlog stretch the newer one had begun,
-	// or publish a class the classifier has already left.
+// observeCarried observes n bytes just carried and counts them in the flow's
+// byte totals in the same step, so no other observation can see the one
+// without the other.
+func (f *multipathFlow) observeCarried(n int, up bool) bool {
 	f.classifyMu.Lock()
 	defer f.classifyMu.Unlock()
+	bulk := f.observeLocked(n, up)
+	if n > 0 {
+		if up {
+			f.bytesUp.Add(uint64(n))
+		} else {
+			f.bytesDown.Add(uint64(n))
+		}
+	}
+	return bulk
+}
+
+// observe classifies the flow with n more bytes than its totals hold.
+//
+// Sampling, classifying and publishing are one step. Three goroutines
+// observe (the application reader, the receive loop and the dispatch
+// refresh); an observation sampled before a newer one but applied after it
+// would, for instance, end a backlog stretch the newer one had begun, or
+// publish a class the classifier has already left.
+func (f *multipathFlow) observe(n int, up bool) bool {
+	f.classifyMu.Lock()
+	defer f.classifyMu.Unlock()
+	return f.observeLocked(n, up)
+}
+
+func (f *multipathFlow) observeLocked(n int, up bool) bool {
 	now := f.clockNow()
 	previousPayload := f.lastPayload.Load()
 	if n > 0 {
@@ -3549,9 +3577,15 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 		if f.logger != nil {
 			// The transition record (R3): when, at what age, and to what, so a
 			// trial's class timeline can be rebuilt per flow and endpoint.
-			f.logger.Debug("flow class changed", "session_id", fmt.Sprintf("%x", f.sessionID), "flow_id", f.flowID,
+			fields := []any{"session_id", fmt.Sprintf("%x", f.sessionID), "flow_id", f.flowID,
 				"from", oldClass, "to", newClass, "ever_bulk", f.everBulk.Load(), "age", age,
-				"recent_up", recentUp, "recent_down", recentDown, "send_backlog", obs.SendBacklog)
+				"recent_up", recentUp, "recent_down", recentDown, "phased", f.phased()}
+			if f.phased() {
+				// Acknowledged coverage is tracked only under the phased
+				// bundle, so the backlog means nothing on a legacy flow.
+				fields = append(fields, "send_backlog", obs.SendBacklog)
+			}
+			f.logger.Debug("flow class changed", fields...)
 		}
 	}
 	return newClass == classifier.ClassBulk

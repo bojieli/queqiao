@@ -147,3 +147,34 @@ func TestAFullReadIsNotSparse(t *testing.T) {
 		t.Fatalf("full 1 KiB read sparse=%v, short read sparse=%v; want false and true", full.Sparse, short.Sparse)
 	}
 }
+
+// A chunk whose coded attempt expired and is waiting for its retry is still
+// outstanding coded work: the stall watchdog samples once per episode and
+// must not miss it in that gap.
+func TestCodedLossIsRememberedWhileTheRetryWaits(t *testing.T) {
+	src := &writesReader{writes: make(chan []byte, 2)}
+	defer close(src.writes)
+	now := time.Now()
+	s := New(src, Config{
+		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
+		Reliable:        func(uint64) bool { return false },
+		RetransmitAfter: func() time.Duration { return time.Millisecond },
+		Now:             func() time.Time { return now },
+	})
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	src.writes <- make([]byte, 36)
+	c, err := s.Next(ctx, 0, 0)
+	if err != nil || c == nil {
+		t.Fatal(err)
+	}
+	s.WroteAs(0, c, false)
+	now = now.Add(time.Second)
+	if s.ReissueExpired() != 1 {
+		t.Fatal("the coded attempt did not expire")
+	}
+	if !s.UnreliableOutstanding() {
+		t.Fatal("a requeued chunk whose coded attempt was lost is not outstanding coded work")
+	}
+}

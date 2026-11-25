@@ -385,6 +385,10 @@ const gapHistory = 16
 type outstanding struct {
 	chunk    *Chunk
 	attempts []attempt
+	// coded records that an attempt of this chunk was written unreliably
+	// (on a coded path). It outlives the attempt: a retry waiting for
+	// dispatch after its coded attempt expired is still coded loss.
+	coded bool
 }
 
 // Stats reports what the scheduler did, for tests and metrics.
@@ -1031,6 +1035,9 @@ func (s *Scheduler) UnreliableOutstanding() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, out := range s.live {
+		if out.coded {
+			return true
+		}
 		for _, a := range out.attempts {
 			if !a.reliable {
 				return true
@@ -1622,6 +1629,9 @@ func (s *Scheduler) wrote(laneID uint64, chunk *Chunk, reliable *bool) {
 				s.substrateChangedLocked(a, *reliable)
 			}
 			a.reliable = *reliable
+		}
+		if !a.reliable {
+			out.coded = true
 		}
 		s.releaseQueuedLocked(laneID, uint64(len(out.chunk.Data)))
 		if s.cfg.CodedRetry && a.abandoned && !a.reliable {

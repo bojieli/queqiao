@@ -1206,7 +1206,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	s.cfg.Logger.Debug("remote flow opened", "transport", transportKindForConn(conn), "wire", fc.wire, "account", principal.AccountID, "device", principal.DeviceID, "open_duration", destinationDialStarted.Sub(sessionStarted), "destination_dial_duration", time.Since(destinationDialStarted), "total_duration", time.Since(sessionStarted))
 	defer destinationConn.Close()
 	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
-	flow.classifier = classifier.New(s.classifierConfig())
+	flow.classifier = classifier.New(classifierBacklogFor(s.classifierConfig(), flow.memoryLimits))
 	flow.memOwned = s.cfg.Memory == MemoryOwned
 	flow.codedRetrySticky = s.cfg.CodedRetry == CodedRetrySticky
 	flow.carrierShadow = s.carrierShadow
