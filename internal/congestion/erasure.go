@@ -284,7 +284,16 @@ const (
 	// appLimitedRounds is how many closed rounds in a row a lane must go
 	// without being send-limited before the pool stops capping it; one
 	// send-limited round caps it again.
-	appLimitedRounds = 3
+	//
+	// Six, not three. A lane's first rounds, before its round trip and window
+	// settle, say little about its demand, and with three the lanes that
+	// carried a page's requests were released from their shares a round or
+	// two before their transfer began (TestRequestsBeforeABulkTransferDoNot-
+	// SpendItsRamp went from 0.191 caused loss to 0.207). With six the
+	// forward scenarios run exactly as without the verdict, on twenty seeds,
+	// while an acknowledgement-only lane -- uncapped while it ramps -- is
+	// still released about a second after it joins.
+	appLimitedRounds = 6
 )
 
 // NewErasureSender returns a controller for a path whose loss is mostly not
