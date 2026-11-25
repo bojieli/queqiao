@@ -72,7 +72,7 @@ class CallMetrics(unittest.TestCase):
         sent = 500 + 1500
         m = mn.call_metrics([call_record(drop_down=drops, count=sent - 4)])
         self.assertAlmostEqual(m["late_loss_up"], 4 / sent)
-        self.assertAlmostEqual(m["late_loss_down"], 6 / sent)
+        self.assertAlmostEqual(m["late_loss_down"], 6 / (sent - 4))   # over what the reflector sent back
 
     def test_late_audio_and_gaps(self):
         # Three consecutive late audio packets make one audible gap.
@@ -154,7 +154,7 @@ def write_wake_campaign(root, cand_penalty=0.05, cand_late=False):
         for i in range(50):
             c = w_.conn(wake_delay=(cand_penalty if arm == "cand" else 0.05) + rng.uniform(0, 0.01), warm=0.02,
                         late=(cand_late and arm == "cand" and i == 7))
-            c.update(_block=1, _path="a", _slot=slot, _arm=arm, _phase="wake", _client="a", _job=0, t0=t, t1=t + 1000)
+            c.update(conn=i, of=50, _block=1, _path="a", _slot=slot, _arm=arm, _phase="wake", _client="a", _job=0, t0=t, t1=t + 1000)
             recs.append(c)
         rows.append([1, "a", slot, arm, "x", 1, 1, "wake", 0, "a", "wl-wake", "w0", iso(t), iso(t + 1000), 200, 50,
                      1000, 0, 1, 1000, f"{t:.3f}", f"{t + 1000:.3f}"])
@@ -191,6 +191,17 @@ class IdleWakeGate(unittest.TestCase):
         write_wake_campaign(root, cand_penalty=0.20)
         _, v = an.report(root, self.gates)
         self.assertEqual(v[("a", "cand", "rule:wake.push_penalty_p50_s")], "**FAIL**")
+
+    def test_missing_connections_leave_no_verdict(self):
+        # Only 49 of the 50 planned connections' records survived.
+        root = os.path.join(self.tmp.name, "missing")
+        write_wake_campaign(root)
+        recs = [json.loads(l) for l in pathlib.Path(root, "measures.jsonl").read_text().splitlines()]
+        recs = [r for r in recs if not (r["_arm"] == "cand" and r["conn"] == 13)]
+        pathlib.Path(root, "measures.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
+        _, v = an.report(root, self.gates)
+        self.assertEqual(v[("a", "cand", "rule:wake.delivered")], "n/a")
+        self.assertEqual(v[("a", "cand", "overall")], "INCOMPLETE")
 
     def test_one_undelivered_wake_fails_the_hard_rule(self):
         root = os.path.join(self.tmp.name, "lost")
@@ -285,6 +296,7 @@ class Runner(unittest.TestCase):
             blocks = []
             with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok), \
                     mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
+                    mock.patch.object(ab.Campaign, "canonical_path_reasons", return_value=[]), \
                     mock.patch.object(ab.Campaign, "setup"), mock.patch.object(ab.Campaign, "record_effective"), \
                     mock.patch.object(ab.Campaign, "run_block", lambda self_, b, *a: blocks.append(b)), \
                     mock.patch.object(ab.Campaign, "teardown"), mock.patch.object(ab.Campaign, "verify_teardown", return_value=[]), \
@@ -338,6 +350,17 @@ class Runner(unittest.TestCase):
         slots = ab.schedule(cfg)
         self.assertEqual(sorted(s.arm for s in slots), ["cand", "main"])
 
+    def test_sequential_needs_a_rule_judged_workload(self):
+        # bulk is judged by the primary gate and [secondary] bounds, which the
+        # stopping looks do not decide: no sequential mode for it.
+        with self.assertRaises(ab.ConfigError):
+            parse(BASE.replace("workload = minimal", "workload = bulk"))
+
+    def test_bad_alphas_are_refused_at_load(self):
+        for bad in ("interim_alpha = 0", "interim_alpha = -0.1", "interim_alpha = 0.5", "alpha = 1.5"):
+            with self.assertRaises(ab.ConfigError, msg=bad):
+                parse(BASE.replace("first_blocks = 6", f"first_blocks = 6\n{bad}"))
+
     def test_sequential_is_refused_for_the_dc_gate(self):
         text = (HERE / "validation" / "dc-campaign.example.ini").read_text().replace("blocks = 12", "blocks = 12\nsequential = true")
         with self.assertRaises(ab.ConfigError):
@@ -345,6 +368,29 @@ class Runner(unittest.TestCase):
 
 
 class ProductionPaths(unittest.TestCase):
+    def test_paths_are_compared_as_resolved_on_the_host(self):
+        # A flag path that reaches a production directory through a symlink,
+        # and one through '..', are refused; an unrelated path is not.
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            prod = os.path.join(d, "prod")
+            os.makedirs(prod)
+            os.symlink(prod, os.path.join(d, "alias"))
+            os.makedirs(os.path.join(d, "home"))
+            text = BASE.replace("host = gw\naddress", "host = local\naddress").replace("[production:gw]\nhost = gw\npaths = /var/lib/queqiao /usr/local/bin/queqiaod",
+                                                                                     f"[production:gw]\nhost = local\npaths = {prod}")
+            text = text.replace("[arm:cand]\nbinary_linux_amd64 = /bin/true",
+                                f"[arm:cand]\nbinary_linux_amd64 = /bin/true\ngateway_flags = --cert {d}/alias/x.pem --key {d}/other/k.pem")
+            cfg = parse(text)
+            camp = ab.Campaign(cfg, "/o", ".", dry=False, stream=io.StringIO())
+            camp.hosts["local"].home = os.path.join(d, "home")
+            r = camp.canonical_path_reasons()
+            self.assertEqual(len(r), 1, r)
+            self.assertIn(f"{d}/alias/x.pem resolves to {prod}/x.pem", r[0])
+            camp.hosts["local"].home = os.path.join(prod, "sub", "..")
+            r = camp.canonical_path_reasons()
+            self.assertTrue(any("work directory" in x for x in r), r)
+
     def test_flags_may_not_name_production_paths(self):
         for flags in ("--log-dir=/var/lib/queqiao/x", "--cert /usr/local/bin/queqiaod"):
             with self.assertRaises(ab.ConfigError) as cm:
@@ -362,7 +408,73 @@ class ProductionPaths(unittest.TestCase):
         self.assertEqual(ab.refusal_reasons(cfg, snaps), [])
 
 
+class RoundOneFixes(unittest.TestCase):
+    def test_a_workload_without_a_primary_gate_can_stop(self):
+        with tempfile.TemporaryDirectory() as d:
+            pathlib.Path(d, "plan.json").write_text(json.dumps({"workload": "minimal"}))
+            v = {("a", "cand", "primary"): "n/a", ("a", "cand", "rule:bulk.goodput_bps"): "pass",
+                 ("a", "cand", "overall"): "INCOMPLETE"}
+            with mock.patch.object(an, "report", return_value=("", v)):
+                dec = an.interim_decisions(d, an.load_gates())
+        self.assertEqual(dec, ["pass"])
+        self.assertTrue(st.overall_stop(dec))
+
+    def test_a_failed_session_is_evidence_and_a_failure(self):
+        m = wl.WORKLOADS["minimal"]()
+        recs = [{"kind": k, "fail": "ConnectionRefusedError"} for k in ("llm", "term", "call", "browse")]
+        self.assertTrue(m.has_evidence("mixed-all", recs))
+        self.assertEqual(mn.call_metrics([{"kind": "call", "fail": "x", "audio": [], "video": []}]), {"call_failures": 1.0})
+
+    def test_send_trios_survive_a_lost_acknowledgement(self):
+        c = {"kind": "wake", "fail": "", "pushes": [], "wakes": [], "follow": 5, "end": "",
+             "sends": [[1, 180, 0.30], [3, 182, 0.20], [4, 600, 0.50], [5, 601, 0.21], [6, 602, 0.20]]}
+        self.assertEqual([round(x, 6) for x in mn.wake_samples([c])["send_penalty"]], [0.1, 0.3])
+
+    def test_an_early_stop_leaves_undecided_gates_undecided(self):
+        tests = importlib.import_module("test_ab_analyze")
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            tests.write_campaign(root, cand_ratio=0.92, blocks=6, noise=0.05)
+            plan = json.loads(pathlib.Path(root, "plan.json").read_text())
+            plan["sequential"] = {"first": 6, "cap": 12, "alpha": 0.05, "interim_alpha": 0.001}
+            pathlib.Path(root, "plan.json").write_text(json.dumps(plan))
+            status = json.loads(pathlib.Path(root, "status.json").read_text())
+            status.update(blocks_run=6, stopped="after block 6: 1 fail")
+            pathlib.Path(root, "status.json").write_text(json.dumps(status))
+            g = an.load_gates()
+            g["resamples"] = 1000
+            text, v = an.report(root, g)
+        self.assertEqual(v[("p", "cand", "primary")], "undecided")
+        self.assertIn("alpha 0.001", text)               # the bounds shown are the look's
+
+    def test_the_minimal_dc_example_is_six_blocks(self):
+        cfg = ab.load_config(str(HERE / "validation" / "dc-minimal.example.ini"))
+        self.assertEqual(cfg.blocks, 6)
+        lo, hi = ab.Campaign(cfg, "<o>", ".", dry=True, stream=io.StringIO()).estimate()["dc"]
+        self.assertLess(hi, 2 * 3600)
+
+
 class Flip(unittest.TestCase):
+    def test_optional_campaigns_do_not_change_the_matrix(self):
+        pa_tests = importlib.import_module("test_phase_a")
+        with tempfile.TemporaryDirectory() as d:
+            good = os.path.join(d, "good")
+            pa_tests.write_llm_campaign(good)
+            extra = os.path.join(d, "extra")
+            pa_tests.write_llm_campaign(extra)
+            plan = json.loads(pathlib.Path(extra, "plan.json").read_text())
+            plan.update(workload="term", paths=["z"])
+            plan["arms"]["cand"]["commit"] = "9" * 40           # even another build
+            pathlib.Path(extra, "plan.json").write_text(json.dumps(plan))
+            g = an.load_gates()
+            g["resamples"] = 500
+            g["workloads"]["llm"] = {k: v for k, v in g["workloads"]["llm"].items() if k != "*.class_interactive"}
+            llm = wl.WORKLOADS["llm"]
+            with mock.patch.object(an, "FLIP_WORKLOADS", ("llm",)), \
+                    mock.patch.object(llm, "report_only", llm.report_only + ("class_interactive",)):
+                text, ok = an.flip_report([good, extra], g)
+        self.assertTrue(ok, text)
+
     def test_the_minimal_profile_is_the_default_requirement(self):
         self.assertEqual(set(an.FLIP_PROFILES["minimal"]), {"minimal", "idle-wake", "dc"})
         self.assertEqual(an.FLIP_PROFILES["minimal"]["minimal"], ("bulk", "mixed-67", "mixed-all"))

@@ -368,8 +368,13 @@ class Sequential:
     def __post_init__(self):
         if not 2 <= self.first <= self.cap:
             raise ValueError("need 2 <= first <= cap")
+        for name, v in (("alpha", self.alpha), ("interim_alpha", self.interim_alpha)):
+            if not (isinstance(v, (int, float)) and math.isfinite(v) and 0 < v < 1):
+                raise ValueError(f"{name} must be in (0, 1), not {v!r}")
         if self.final_alpha <= 0:
             raise ValueError("interim looks spend all of alpha")
+        if self.interim_alpha > self.final_alpha:
+            raise ValueError("interim_alpha must not exceed the final look's alpha")
 
     @property
     def interim_looks(self) -> int:

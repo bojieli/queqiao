@@ -68,6 +68,17 @@ PROBE_TIMEOUT = 10
 # Exit status of the ownership guard: the work directory is not this
 # invocation's, so nothing was done to it.
 NOT_OWNER = 9
+# Portable path resolution on a host: the deepest existing ancestor through
+# `cd -P`/`pwd -P` (symlinks resolved), the not-yet-existing rest appended.
+# Python's normpath then folds '..' and '//'.
+CANON_SH = r'''canon() {
+  p="$1"; rest=""
+  while [ ! -e "$p" ] && [ "$p" != "/" ] && [ -n "$p" ]; do rest="/$(basename "$p")$rest"; p=$(dirname "$p"); done
+  if [ -d "$p" ]; then r=$(cd -P "$p" 2>/dev/null && pwd -P)
+  else r="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd -P)/$(basename "$p")"; fi
+  echo "${r:-$p}$rest"
+}
+'''
 # Wall-time estimates: seconds the runner adds per trial (client start and
 # stop, scrapes), per block (gateway restarts, log collection) and once
 # (builds, copies, enrollment). Measured on earlier campaigns; rough.
@@ -378,9 +389,10 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=15")),
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
-    if cfg.sequential and wl.analyzer != "ab_analyze":
-        # The stopping looks run ab_analyze; dc_gate judges its campaign at a
-        # fixed size.
+    if cfg.sequential and (wl.analyzer != "ab_analyze" or wl.primary or wl.sample_based):
+        # The stopping looks decide [workload:...] rules; a workload judged by
+        # the primary gate with its [secondary] bounds, by samples, or by
+        # dc_gate runs a fixed number of blocks.
         raise ConfigError(f"sequential stopping is not supported for workload {workload}; set a fixed blocks")
     owned = wl.owned_flags()
     for where, fl in [("[gateway] flags", gw.flags)] + [(f"[client:{c.name}] flags", c.flags) for c in clients.values()] + \
@@ -404,11 +416,14 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
             seen[p] = what
     # No configured flag may reach a production path, in any spelling
     # (--state=/x, --state /x, or a path inside it).
-    prod_paths = [p_.rstrip("/") for pr in prod for p_ in pr.paths]
+    prod_paths = [os.path.normpath(p_) for pr in prod for p_ in pr.paths]
     for where, fl in [("[gateway] flags", gw.flags)] + [(f"[client:{c.name}] flags", c.flags) for c in clients.values()] + \
             [(f"[arm:{a.name}]", a.flags + a.gateway_flags + a.client_flags) for a in arms]:
         for f in fl:
             for tok in [f] + ([f.split("=", 1)[1]] if "=" in f else []):
+                if not tok.startswith("/"):
+                    continue
+                tok = os.path.normpath(tok)       # "//x/../y" is "/y"
                 for p_ in prod_paths:
                     if tok == p_ or tok.startswith(p_ + "/"):
                         raise ConfigError(f"{where}: {f!r} names production path {p_}")
@@ -890,10 +905,57 @@ class Campaign:
                 print(f"    {host}: " + ", ".join(f"{p} ({w})" for p, w in ports), file=self.stream)
             self.reserve()
             return
-        reasons = refusal_reasons(self.cfg, self.before)
+        reasons = refusal_reasons(self.cfg, self.before) + self.canonical_path_reasons()
         if reasons:
             raise Refused("\n".join(reasons))
         self.reserve()
+
+    def flag_paths(self, host: str) -> List[str]:
+        """Absolute paths in the flags processes on this host will get."""
+        cfg = self.cfg
+        flags: List[str] = []
+        if host == cfg.gateway.host:
+            flags += cfg.gateway.flags + [f for a in cfg.arms for f in a.flags + a.gateway_flags]
+        for c in cfg.clients.values():
+            if c.host == host:
+                flags += c.flags + [f for a in cfg.arms for f in a.flags + a.client_flags]
+        out = []
+        for f in flags:
+            for tok in [f] + ([f.split("=", 1)[1]] if "=" in f else []):
+                if tok.startswith("/"):
+                    out.append(tok)
+        return sorted(set(out))
+
+    def canonical_path_reasons(self) -> List[str]:
+        """Compare filesystem identities, not strings: resolve the declared
+        production paths, the work directory's parent and every path a flag
+        names, on each host (symlinks, '..', '//'), and refuse any overlap."""
+        reasons: List[str] = []
+        by_host: Dict[str, List[str]] = {}
+        for p in self.cfg.production:
+            by_host.setdefault(p.host, []).extend(p.paths)
+        for host, prod_paths in by_host.items():
+            if not prod_paths:
+                continue
+            h = self.hosts[host]
+            items = prod_paths + [h.home] + self.flag_paths(host)
+            script = CANON_SH + "".join(f"canon {_q(x)}\n" for x in items)
+            rc, out = h.run(script, what="resolve production and flag paths (read-only)")
+            lines = out.strip().splitlines()
+            if rc != 0 or len(lines) != len(items):
+                reasons.append(f"{host}: could not resolve production paths ({out.strip()[:200]})")
+                continue
+            canon = dict(zip(items, (os.path.normpath(x) for x in lines)))
+            prod = [canon[p_] for p_ in prod_paths]
+            under = lambda x, root: x == root or x.startswith(root.rstrip("/") + "/")
+            work = canon[h.home].rstrip("/") + "/" + self.cfg.work_dir
+            for root in prod:
+                if under(work, root):
+                    reasons.append(f"{host}: the work directory {work} is inside production path {root}")
+                for tok in self.flag_paths(host):
+                    if under(canon[tok], root):
+                        reasons.append(f"{host}: flag path {tok} resolves to {canon[tok]}, inside production path {root}")
+        return reasons
 
     def reserve(self) -> None:
         """Claim ~/qq-ab-<name> on every host with an atomic mkdir and an

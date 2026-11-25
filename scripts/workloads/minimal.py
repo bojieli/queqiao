@@ -71,11 +71,15 @@ def call_metrics(calls: Sequence[dict]) -> Dict[str, float]:
     both ways."""
     nan = float("nan")
     ok = [c for c in calls if not c.get("fail")]
-    if not ok:
+    if not calls:
         return {}
+    if not ok:
+        # Every call failed to start: that is measured, as failures; the
+        # quality measures have nothing to describe.
+        return {"call_failures": 1.0}
     up_lat: List[float] = []
     down_lat: List[float] = []
-    sent = lost_up = lost_down = late_up = late_down = 0
+    sent = reflected = lost_up = lost_down = late_up = late_down = 0
     audio_sent = audio_bad = 0
     frames = frames_bad = gaps = freezes = 0
     minutes = 0.0
@@ -84,6 +88,7 @@ def call_metrics(calls: Sequence[dict]) -> Dict[str, float]:
         back = [p for p in pk if len(p) == 4]
         sent += len(pk)
         received_up = min(len(pk), int(c.get("count") or len(back)))
+        reflected += received_up
         lost_up += len(pk) - received_up
         lost_down += max(0, received_up - len(back))
         lu = _lateness([p[2] for p in back])
@@ -113,7 +118,9 @@ def call_metrics(calls: Sequence[dict]) -> Dict[str, float]:
     return {
         "lateness_p99_up_s": st.quantile(up_lat, 0.99), "lateness_p99_down_s": st.quantile(down_lat, 0.99),
         "late_loss_up": (lost_up + late_up) / sent if sent else nan,
-        "late_loss_down": (lost_down + late_down) / sent if sent else nan,
+        # Downlink: over the packets the reflector sent back, the only ones
+        # that could arrive.
+        "late_loss_down": (lost_down + late_down) / reflected if reflected else nan,
         "audio_late_loss": audio_bad / audio_sent if audio_sent else nan,
         "frame_loss": frames_bad / frames if frames else nan,
         "audio_gaps_per_min": gaps / minutes if minutes else nan,
@@ -177,11 +184,14 @@ def wake_samples(conns: Sequence[dict]) -> Dict[str, List[float]]:
                 warm = [pushes[base + j][2] - pushes[base + j][1] / 1000.0 for j in range(1, group) if base + j in pushes]
                 if warm:
                     out["push_penalty"].append((wp[2] - wp[1] / 1000.0) - min(warm))
-        sends = sorted(c.get("sends") or [], key=lambda s: s[0])
-        for k in range(0, len(sends), 3):
-            trio = sends[k:k + 3]
-            if len(trio) == 3 and trio[0][0] % 3 == 1:
-                out["send_penalty"].append(trio[0][2] - min(trio[1][2], trio[2][2]))
+        # Sends are numbered 3k+1 (after idle), 3k+2 and 3k+3 (warm): group by
+        # scheduled id, so a lost acknowledgement cannot shift the trios.
+        by_id = {s[0]: s for s in c.get("sends") or []}
+        trios = max((n - 1) // 3 for n in by_id) + 1 if by_id else 0
+        for k in range(trios):
+            cold, warm = by_id.get(3 * k + 1), [by_id[i] for i in (3 * k + 2, 3 * k + 3) if i in by_id]
+            if cold and warm:
+                out["send_penalty"].append(cold[2] - min(x[2] for x in warm))
         out["silent_deaths"].append(1.0 if missed and not c.get("end") and not c.get("fail") else 0.0)
     return out
 
@@ -274,7 +284,8 @@ class Minimal(pa._Scenario):
         ]
 
     def has_evidence(self, ph, recs):
-        kinds = {r.get("kind") for r in recs if not r.get("fail")}
+        # Present, failed or not: a failed session is a measured failure.
+        kinds = {r.get("kind") for r in recs}
         need = {"bulk": set(), "mixed-67": {"llm", "term"}, "mixed-all": {"llm", "term", "call", "browse"}}.get(ph, set())
         return need <= kinds
 
@@ -371,6 +382,22 @@ class IdleWake(pa._Scenario):
 
     def has_evidence(self, ph, recs):
         return any(r.get("kind") == "wake" for r in recs)
+
+    def samples_complete(self, trials: Sequence[Any]) -> bool:
+        """Every trial has one record per planned connection (0..of-1), each
+        with the same wake schedule: missing or malformed records must not
+        leave a few connections to stand for 50."""
+        for t in trials:
+            recs = [r for r in getattr(t, "records", []) if r.get("kind") == "wake"]
+            if not recs:
+                return False
+            of = recs[0].get("of")
+            ids = [r.get("conn") for r in recs]
+            if not isinstance(of, int) or sorted(ids) != list(range(of)):
+                return False
+            if any(r.get("wakes") != recs[0].get("wakes") for r in recs):
+                return False
+        return True
 
     # Sample-based judging: the analyzer compares the arms' pooled samples.
     SAMPLES = {"delivered": ("delivered", "mean"), "push_penalty_p50_s": ("push_penalty", 0.5),

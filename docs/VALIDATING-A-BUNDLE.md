@@ -63,7 +63,10 @@ built to refuse rather than to trust:
   host's systemd units, launchd labels, declared ports (include a production
   gateway's whole hop-port range), production paths (its binary, state,
   config and logs), and a process pattern. No configured flag may name a
-  production path, and no work directory may be inside one. The section must
+  production path, and no work directory may be inside one. Before anything
+  is copied, the preflight resolves those paths, the work directory and
+  every path a flag names on the host itself (symlinks, `..`, `//`). So a
+  path that reaches production through a symlink is refused too. The section must
   exist even when it lists nothing, so no host is touched without being looked
   at first.
 - **Preflight is read-only, and it refuses.** Before anything is copied or
@@ -515,7 +518,7 @@ regression in call jitter or page time.
 | B | `minimal` / `mixed-67` | a 5-turn LLM loop (100 KB prompt) and a terminal session with one 300 KB burst, under two downloads, about 90 s | stages 6 and 7 |
 | C | `minimal` / `mixed-all` | a video call (audio and about 3 Mbit/s of video each way, open loop, through UDP ASSOCIATE), one browsing burst (30 KB of HTML and 40 objects), one LLM call, keystrokes, one download and one upload, at once, 120 s | stage 10 |
 | D | `idle-wake` / `wake` | 50 idle connections after a 200 KB sync. The far side wakes each at 1, 5 and 16 minutes, followed by warm pushes; the client wakes it at 3 and 10 minutes. One session per arm | stage 10 |
-| DC | `dc` | the stage 9 gate at its minimal size, 6 blocks | stage 9 |
+| DC | `dc` | the stage 9 gate at its minimal size, 6 blocks (`dc-minimal.example.ini`) | stage 9 |
 
 What each cell measures:
 
@@ -538,7 +541,8 @@ What each cell measures:
     and p99.
 
   D runs once per arm, so it is judged over its pooled wakes by an unpaired
-  bootstrap, not over blocks.
+  bootstrap, not over blocks. Every planned connection must have its
+  record, with the planned wake schedule, or there is no verdict.
 
 The bounds are in `gates.ini` (`[workload:minimal]`, `[workload:idle-wake]`)
 and are provisional. Example configs: `minimal-campaign.example.ini` and
@@ -561,8 +565,16 @@ most 0.05, whatever the correlation between looks. The final look keeps
 almost all of a fixed 12-block test's power, which a Bonferroni split
 (0.05 / 7 at every look) would not. A pass needs the t and the bootstrap
 bound to agree, while either one can show an early failure. `status.json`
-records the blocks used, why the campaign stopped, and its wall time. The
-analyzer judges a stopped campaign at its last look. The DC gate keeps a
+records the blocks used, why the campaign stopped, and its wall time.
+
+The analyzer judges a stopped campaign at its last look, and its tables
+show the bounds at that look's α. A gate still undecided when another
+gate's failure stopped the campaign is reported as undecided, which counts
+as INCOMPLETE, not as failed.
+
+Sequential mode is only for workloads judged entirely by their own rules,
+such as `minimal`. The primary gate with its `[secondary]` bounds (`bulk`,
+`single`, `interactive`), sample-based `idle-wake` and the DC gate keep a
 fixed number of blocks.
 
 **Cost.** `--dry-run` prints the estimated wall time per path. For the

@@ -674,6 +674,15 @@ def report(campaign: str, gates: dict, interim: bool = False) -> Tuple[str, dict
     EFFECTIVE.clear()
     sq = sequential_of(plan)
     problems, trials = completeness(campaign, plan, trials, interim=interim)
+    # A sequential campaign that stopped early (on another gate's verdict)
+    # leaves its undecided gates undecided, not failed.
+    stopped_early = False
+    try:
+        with open(os.path.join(campaign, "status.json")) as f:
+            stopped_early = bool(json.load(f).get("stopped"))
+    except (OSError, ValueError):
+        pass
+    undecided_ok = interim or stopped_early
     method = measure(campaign, plan, trials)
     wl = ab_workloads.get(plan.get("workload", "bulk"))
     for t in trials.values():
@@ -767,10 +776,15 @@ def report(campaign: str, gates: dict, interim: bool = False) -> Tuple[str, dict
             verdict = "VOID" if g.void else ("**PASS**" if g.passed else "**FAIL**")
             if sq and not g.void:
                 # Sequential: the Haybittle-Peto boundary at this look decides.
-                dec = sq.decide(st.contrasts(c, m, gates["ratio"]), gates["resamples"], gates["seed"])
-                verdict = {"pass": "**PASS**", "fail": "**FAIL**"}.get(dec, "undecided" if interim else "**FAIL**")
+                d_ = st.contrasts(c, m, gates["ratio"])
+                dec = sq.decide(d_, gates["resamples"], gates["seed"])
+                verdict = {"pass": "**PASS**", "fail": "**FAIL**"}.get(dec, "undecided" if undecided_ok else "**FAIL**")
                 g.passed = verdict == "**PASS**"
-                g.reason = g.reason if not g.passed else "pass"
+                # Report the bounds of the look that decided, at its alpha.
+                a_ = sq.alpha_at(len(d_))
+                g.t_lower = st.t_lower_bound(d_, a_)
+                g.boot_lower = st.bootstrap_lower_bound(d_, a_, gates["resamples"], gates["seed"])
+                g.reason = f"sequential look at {len(d_)} blocks, alpha {a_:g}" if not g.passed else "pass"
             capped = sum(int(t.m.get("capped", 0)) for t in trials.values()
                          if t.path == path and t.arm in (main, cand) and t.block in set(common))
             if capped:
@@ -865,8 +879,10 @@ def report(campaign: str, gates: dict, interim: bool = False) -> Tuple[str, dict
                         mean_d, tl, bl, ok = st.lower_bounds(d, gates["alpha"], gates["resamples"], gates["seed"])
                         if sq:
                             dec = sq.decide(d, gates["resamples"], gates["seed"])
+                            a_ = sq.alpha_at(len(d))
+                            mean_d, tl, bl, _ = st.lower_bounds(d, a_, gates["resamples"], gates["seed"])
                     verdict = "n/a" if len(measured) < max(need, 2) else (
-                        decision_verdict(dec, interim) if dec is not None else ("pass" if ok else "**FAIL**"))
+                        decision_verdict(dec, undecided_ok) if dec is not None else ("pass" if ok else "**FAIL**"))
                     verdicts[(path, cand, f"rule:{key}")] = verdict
                     out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {len(measured)} | "
                                f"{fmt(mean_d, '.4g')} | {fmt(tl, '.4g')} | {fmt(bl, '.4g')} | {verdict} |")
@@ -908,8 +924,13 @@ def sample_rule(wl, trials, path: str, cand: str, main: str, key: str, kind: str
     if not spec:
         return "n/a", nan, nan, nan, 0
     src, stat = spec
-    cs = wl.samples([t for t in trials.values() if t.path == path and t.arm == cand]).get(src, [])
-    ms = wl.samples([t for t in trials.values() if t.path == path and t.arm == main]).get(src, [])
+    ct = [t for t in trials.values() if t.path == path and t.arm == cand]
+    mt = [t for t in trials.values() if t.path == path and t.arm == main]
+    check = getattr(wl, "samples_complete", None)
+    if check and not (check(ct) and check(mt)):
+        return "n/a", nan, nan, nan, 0
+    cs = wl.samples(ct).get(src, [])
+    ms = wl.samples(mt).get(src, [])
     statf = (lambda xs: _sample_stat(xs, stat))
     if kind in HARD:
         if not cs:
@@ -943,10 +964,15 @@ def _sample_stat(xs, stat) -> float:
 def interim_decisions(campaign: str, gates: dict) -> List[str]:
     """The runner's look: every gate decision on the blocks run so far, as
     'pass', 'fail' or 'continue' (undecided, unmeasured or void)."""
+    with open(os.path.join(campaign, "plan.json")) as f:
+        plan = json.load(f)
+    wl = ab_workloads.get(plan.get("workload", "bulk"))
     _, v = report(campaign, gates, interim=True)
     out = []
     for (_, _, key), verdict in v.items():
-        if key == "primary" or key.startswith("rule:"):
+        # Only the gates that apply: a workload without a byte outcome has no
+        # primary gate to wait for.
+        if (key == "primary" and wl.primary) or key.startswith("rule:"):
             out.append({"**PASS**": "pass", "pass": "pass", "**FAIL**": "fail"}.get(verdict, "continue"))
     return out
 
@@ -1113,11 +1139,17 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal")
     roles: Dict[str, str] = {}
     paths_all: set = set()
     candidates: set = set()
+    required = FLIP_PROFILES[profile] if FLIP_WORKLOADS == tuple(FLIP_PROFILES["minimal"]) else \
+        {w_: () for w_ in FLIP_WORKLOADS}
     for campaign in campaigns:
         base = os.path.basename(os.path.normpath(campaign))
         with open(os.path.join(campaign, "plan.json")) as f:
             plan = json.load(f)
         name = plan.get("workload", "bulk")
+        if name not in required:
+            # An optional campaign may be supplied for its report; it neither
+            # covers nor constrains the flip's matrix.
+            continue
         seen.add(name)
         for arm, e in plan["arms"].items():
             role = "main" if arm == plan["main"] else "candidate"
@@ -1156,8 +1188,6 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal")
     # Per cell: a workload's required cells are every cell any campaign ran
     # for it, and each must be there on every path for every candidate.
     have = {(w_, p_, c_, cell) for w_, p_, c_, cell, _ in rows}
-    required = FLIP_PROFILES[profile] if FLIP_WORKLOADS == tuple(FLIP_PROFILES["minimal"]) else \
-        {w_: () for w_ in FLIP_WORKLOADS}
     cells_of: Dict[str, set] = collections.defaultdict(set)
     for w_, _, _, cell, _ in rows:
         cells_of[w_].add(cell)

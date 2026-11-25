@@ -717,7 +717,7 @@ def cmd_wake(args) -> None:
     t0 = time.time()
 
     def one(i):
-        rec = {"kind": "wake", "conn": i, "t0": round(time.time(), 3), "fail": "", "pushes": [], "sends": [],
+        rec = {"kind": "wake", "conn": i, "of": args.conns, "t0": round(time.time(), 3), "fail": "", "pushes": [], "sends": [],
                "wakes": [float(x) for x in wakes.split(",") if x], "follow": args.follow, "end": ""}
         try:
             s = open_conn(args, 30)
