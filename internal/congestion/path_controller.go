@@ -1344,6 +1344,10 @@ type PathAttachment struct {
 	// it sends first; zero while nobody has deferred to it since it last
 	// sent.
 	claimDeadline monotime.Time
+	// generation reads the endpoint's uplink generation; seenGeneration is
+	// the one this attachment last resolved its key with. Run loop only.
+	generation     func() uint64
+	seenGeneration uint64
 	// progress reads the connection's transport progress; progressEpoch is
 	// the epoch last seen.
 	progress      func() TransportProgress
@@ -1494,6 +1498,7 @@ func (a *PathAttachment) OnDemand(d quiccongestion.Demand) {
 }
 
 func (a *PathAttachment) Admit(now monotime.Time, maxBytes quiccongestion.ByteCount) quiccongestion.Permit {
+	a.followGeneration(now)
 	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
@@ -1517,6 +1522,7 @@ func (a *PathAttachment) OnSent(s quiccongestion.SentPacket) {
 }
 
 func (a *PathAttachment) OnAckEvent(ev quiccongestion.AckEvent) {
+	a.followGeneration(ev.Time)
 	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
@@ -1605,6 +1611,34 @@ type TransportProgress struct {
 // pathProbingPTOExpiries is k_s (§10.2): the probe timeouts without transport
 // progress after which an attachment is PROBING.
 const pathProbingPTOExpiries = 2
+
+// SetGeneration gives the attachment its endpoint's uplink generation. The
+// generation is part of the path key, and an uplink change that keeps the
+// connection's addresses produces no migration: so the attachment compares
+// it at its own callbacks, on its run loop, and moves to the path's current
+// controller when it changed. It must be called before installation.
+func (a *PathAttachment) SetGeneration(read func() uint64) {
+	a.generation = read
+	a.seenGeneration = read()
+}
+
+// followGeneration re-attaches a, on its run loop, if its endpoint's uplink
+// generation moved since it last looked.
+func (a *PathAttachment) followGeneration(now monotime.Time) {
+	if a.generation == nil || !a.attached {
+		return
+	}
+	g := a.generation()
+	if g == a.seenGeneration {
+		return
+	}
+	a.seenGeneration = g
+	if a.addrs == nil {
+		return
+	}
+	local, remote := a.addrs()
+	a.OnPathMigrated(now, local, local, remote, remote)
+}
 
 // SetTransportProgress gives the attachment its connection's progress
 // export. With it, PROBING follows the transport's own evidence -- which

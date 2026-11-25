@@ -186,6 +186,9 @@ type congestionConfig struct {
 	// congestion=path, read at installation and at each migration; see
 	// Client.pathPrincipalNow.
 	principal func() string
+	// generation, if set, reads the endpoint's uplink generation, which
+	// principal includes; see PathAttachment.SetGeneration.
+	generation func() uint64
 }
 
 type udpHealth struct {

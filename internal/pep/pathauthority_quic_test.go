@@ -622,3 +622,46 @@ func TestAResumeWithAnUplinkChangeStartsANewGeneration(t *testing.T) {
 		t.Fatal("a resume that saw a same-address network change kept the old generation")
 	}
 }
+
+// A dedicated, unpooled connection that survives a same-address uplink
+// change -- no migration, so no rekey from QUIC -- moves to the new
+// generation's controller at its own next callbacks, on its run loop.
+func TestASurvivingConnectionFollowsTheUplinkGeneration(t *testing.T) {
+	pathAuthorities.forget()
+	_, credentials := testCertificate(t)
+	client, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
+		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bed := newPathBed(t, pathsim.Config{OneWayDelay: time.Millisecond, Seed: 18})
+	cfg := pathScopeConfig
+	cfg.principal = client.pathPrincipalNow
+	cfg.generation = client.uplinkGeneration.Load
+	conn := bed.clientTLS()
+	surviving := configureQUICController(conn, cfg).(*wancongestion.PathAttachment)
+	old := surviving.Controller()
+	waitAttached(t, old, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client.onUplinkChanged(ctx)
+	current := configureQUICController(bed.clientTLS(), cfg).(*wancongestion.PathAttachment).Controller()
+	if current == old {
+		t.Fatal("setup: the uplink change did not start a new controller")
+	}
+	// Traffic on the surviving connection drives its callbacks.
+	sendCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	go bulk(sendCtx, conn)
+	for surviving.Controller() != current {
+		if sendCtx.Err() != nil {
+			t.Fatal("a connection that survived the uplink change kept spending the old generation's controller")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if old.Attachments() != 0 {
+		t.Fatalf("the old controller still has %d attachments", old.Attachments())
+	}
+}

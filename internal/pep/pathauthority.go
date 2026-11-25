@@ -173,6 +173,11 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal func(
 	readers := pathModelOfKey(conn, current)
 	rekey := pathRekey(principal, current, initial, func(next string) { rekeyPathModel(conn, next) })
 	attachment := controller.Attach(rekey, func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
+	if cfg.generation != nil {
+		// An uplink change that keeps this connection's addresses is no
+		// migration; the attachment follows the generation itself.
+		attachment.SetGeneration(cfg.generation)
+	}
 	// PROBING follows the transport's own progress export (§4.4, §10.2).
 	attachment.SetTransportProgress(func() wancongestion.TransportProgress {
 		st := conn.ConnectionStats()
