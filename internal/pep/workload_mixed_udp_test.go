@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -221,8 +222,9 @@ type m5Outcome struct {
 // block. The measures follow the inner controller's sawtooth, so one block's
 // tail moves by a third from run to run in either arm and either direction,
 // as the design expects of a tail (§15.4 judges tails over blocks). The full
-// suite runs five blocks and holds each measure's median over them to its
-// bound. -short runs one 8 s block as a smoke test: every keystroke echoed,
+// suite runs five blocks and applies §15.4's contrast to each measure: it
+// fails when the flip bundle exceeds the bound with one-sided 95 %
+// confidence over the blocks. -short runs one 8 s block as a smoke test: every keystroke echoed,
 // audio measured both ways, the heavy flow moving.
 func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 	requireStableImpairmentClock(t)
@@ -278,22 +280,66 @@ func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 	if testing.Short() || !judgeComparisons(t) {
 		return
 	}
-	median := func(arm, measure int) float64 { return floatQuantile(measures[arm][measure], 0.5) }
 	packets := float64(measure / audioInterval)
-	for d, name := range []string{"uplink", "downlink"} {
-		if got, limit := median(1, d), median(0, d)+0.005+1/packets; got > limit {
-			t.Errorf("%s audio late loss, median over %d blocks: %.2f %% under the flip bundle against %.2f %% under legacy; "+
-				"the bound (legacy + 0.5 pp, plus one packet) allows %.2f %%", name, blocks, 100*got, 100*median(0, d), 100*limit)
+	checks := []struct {
+		name    string
+		measure int
+		m, a    float64 // bound: flip ≤ m × legacy + a
+		unit    float64 // for the message: 100 for %, 1000 for ms
+	}{
+		{"uplink audio late loss (%)", 0, 1, 0.005 + 1/packets, 100},
+		{"downlink audio late loss (%)", 1, 1, 0.005 + 1/packets, 100},
+		{"uplink audio lateness p99 (ms)", 2, 1.10, 0.010, 1000},
+		{"downlink audio lateness p99 (ms)", 3, 1.10, 0.010, 1000},
+		{"keystroke echo p99 (ms)", 4, 1.10, 0.020, 1000},
+	}
+	for _, c := range checks {
+		// Design §15.4's contrast for a smaller-is-better measure, per
+		// block: d = (m × legacy + a) − flip. The gate fails when the
+		// one-sided 95 % upper bound of its mean is below zero, so a
+		// tail that moves from block to block fails only when the flip
+		// bundle is worse beyond the bound with confidence.
+		var d []float64
+		for b := range blocks {
+			d = append(d, c.m*measures[0][c.measure][b]+c.a-measures[1][c.measure][b])
 		}
-		if got, limit := median(1, 2+d), median(0, 2+d)*1.10+0.010; got > limit {
-			t.Errorf("%s audio lateness p99, median over %d blocks: %.0f ms under the flip bundle; the bound is legacy × 1.10 + 10 ms = %.0f ms",
-				name, blocks, 1000*got, 1000*limit)
+		mean, upper := oneSidedUpper(d)
+		t.Logf("%s: legacy %v, flip %v; contrast mean %.3g, upper bound %.3g",
+			c.name, scaled(measures[0][c.measure], c.unit), scaled(measures[1][c.measure], c.unit), mean*c.unit, upper*c.unit)
+		if upper < 0 {
+			t.Errorf("%s: the flip bundle exceeds legacy × %.2f + %.3g in every sense the blocks can show "+
+				"(contrast mean %.3g, one-sided 95 %% upper bound %.3g)", c.name, c.m, c.a*c.unit, mean*c.unit, upper*c.unit)
 		}
 	}
-	if got, limit := median(1, 4), median(0, 4)*1.10+0.020; got > limit {
-		t.Errorf("keystroke echo p99, median over %d blocks: %.0f ms under the flip bundle; the bound is legacy × 1.10 + 20 ms = %.0f ms",
-			blocks, 1000*got, 1000*limit)
+}
+
+// oneSidedUpper is the mean of d and the one-sided 95 % t upper bound of
+// that mean. It supports up to ten samples.
+func oneSidedUpper(d []float64) (mean, upper float64) {
+	// t quantiles at 0.95 for 1 to 9 degrees of freedom.
+	t95 := []float64{6.314, 2.920, 2.353, 2.132, 2.015, 1.943, 1.895, 1.860, 1.833}
+	n := float64(len(d))
+	for _, v := range d {
+		mean += v
 	}
+	mean /= n
+	if len(d) < 2 || len(d) > len(t95)+1 {
+		return mean, mean
+	}
+	var ss float64
+	for _, v := range d {
+		ss += (v - mean) * (v - mean)
+	}
+	se := math.Sqrt(ss/(n-1)) / math.Sqrt(n)
+	return mean, mean + t95[len(d)-2]*se
+}
+
+func scaled(values []float64, unit float64) []float64 {
+	out := make([]float64, len(values))
+	for i, v := range values {
+		out[i] = math.Round(v*unit*10) / 10
+	}
+	return out
 }
 
 // runM5Block runs one M5 block: both arms at once, each on a fresh client,
