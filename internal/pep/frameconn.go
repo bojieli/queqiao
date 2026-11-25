@@ -431,13 +431,16 @@ func (c *frameConn) writeControlContext(ctx context.Context, f protocol.Frame) e
 	if timing != nil {
 		lockStart = time.Now()
 	}
-	if err := c.writeMu.LockContext(ctx); err != nil {
+	err := c.writeMu.LockContext(ctx)
+	if timing != nil {
+		// Counted whether or not the lock was won: a wait that timed out
+		// on one lane is still where an acknowledgement's time went.
+		timing.lockNS += int64(time.Since(lockStart))
+	}
+	if err != nil {
 		return err
 	}
 	defer c.writeMu.Unlock()
-	if timing != nil {
-		timing.lockNS += int64(time.Since(lockStart))
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}

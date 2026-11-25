@@ -1018,6 +1018,8 @@ func (f *multipathFlow) removeLane(lane *mpLane) {
 // admitted. Removing it from the flow map and scheduler is one transition:
 // leaving either copy behind lets a replacement appear healthy while the
 // sender still offers work to the old socket.
+// retireLaneByID retires a lane a rescue replaced; its outstanding chunks
+// are reissued as ReissueRescue.
 func (f *multipathFlow) retireLaneByID(id uint64) bool {
 	f.lanesMu.Lock()
 	lane := f.lanes[id]
@@ -1032,7 +1034,7 @@ func (f *multipathFlow) retireLaneByID(id uint64) bool {
 	lane.closed.Store(true)
 	f.lanesMu.Unlock()
 	if sched := f.scheduler.Load(); sched != nil {
-		sched.RetireLane(lane.id)
+		sched.RetireLaneFor(lane.id, stripe.ReissueRescue)
 	}
 	if lane.fc != nil {
 		_ = lane.fc.Close()
