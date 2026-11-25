@@ -496,7 +496,8 @@ def socks_udp(socks: str, timeout: float):
 # Packet layout (both directions): magic "QC", stream (a|v), 0, seq u32,
 # frame u32, index u16, count u16, client send time (double, monotonic ms)
 # at 16; the reflector writes its receive time (double) and its running
-# count (u32) at 24..35; padding follows.
+# count (u32) at 24..35; the call's id (4 bytes) at 36..39, by which the
+# reflector keeps its own record of the uplink; padding follows.
 CALL_HEAD = struct.Struct(">2sccIIHHd")
 
 
@@ -505,8 +506,12 @@ def cmd_call(args) -> None:
     160 B every 20 ms; video at 30 frames/s of 10 KB in 1,100 B packets,
     with a 40 KB key frame every 2 s. Records, per packet sent, its stream,
     frame, send time and -- when it came back -- its up and down transit
-    deltas on the two unsynchronised clocks (milliseconds)."""
+    deltas on the two unsynchronised clocks (milliseconds). The up delta
+    comes from the reflector's own report of what it received (fetched over
+    TCP afterwards), so a packet lost up is told from one lost down; a call
+    whose report cannot be fetched is a failed call."""
     time.sleep(args.delay)
+    cid = os.urandom(4)
     th, tp = args.target.rsplit(":", 1)
     dest = socket.inet_aton(th) + struct.pack(">H", int(tp))
     t0 = time.time()
@@ -555,7 +560,7 @@ def cmd_call(args) -> None:
     def send(stream: bytes, frame: int, idx: int, count: int, size: int):
         seq[stream] += 1
         t = (time.monotonic() - c0) * 1000.0
-        body = CALL_HEAD.pack(b"QC", stream, b"\x00", seq[stream], frame, idx, count, t) + b"\x00" * 12
+        body = CALL_HEAD.pack(b"QC", stream, b"\x00", seq[stream], frame, idx, count, t) + b"\x00" * 12 + cid
         body += b"p" * max(0, size - len(body))
         sent[(stream, seq[stream])] = [frame, t]
         u.sendto(header + body, relay)
@@ -580,9 +585,19 @@ def cmd_call(args) -> None:
         rec["fail"] = f"{type(e).__name__}: {e}"[:200]
     time.sleep(1.0)                     # the last echoes
     done.set()
+    up = {}
+    if not rec["fail"]:
+        try:
+            up = call_report(args, cid)
+        except (OSError, EOFError, ValueError, ssl.SSLError) as e:
+            rec["fail"] = f"no reflector report: {type(e).__name__}: {e}"[:200]
+    # Per packet: frame, send ms, up delta (None: the reflector never got
+    # it), down delta (None: it never came back).
     for (stream, sq), (frame, t) in sorted(sent.items()):
         b = back.get((stream, sq))
-        entry = [frame, round(t, 1)] + ([round(b[0] - t, 1), round(b[1] - b[0], 1)] if b else [])
+        srv = up.get((stream, sq), b[0] if b else None)
+        entry = [frame, round(t, 1), round(srv - t, 1) if srv is not None else None,
+                 round(b[1] - b[0], 1) if b else None]
         rec["audio" if stream == b"a" else "video"].append(entry)
     rec["count"] = maxcount[0]
     rec["t1"] = round(time.time(), 3)
@@ -593,6 +608,33 @@ def cmd_call(args) -> None:
             pass
     record(rec)
     row(t0, time.time(), "v0", 0 if rec["fail"] else 200, len(sent), time.time() - t0, 1 if rec["fail"] else 0)
+
+
+def call_report(args, cid: bytes) -> dict:
+    """The reflector's record of this call's uplink: (stream, seq) -> its
+    receive time (server ms), fetched from wlserver's HTTP port."""
+    a = argparse.Namespace(**vars(args))
+    a.target = args.report_target
+    s = open_conn(a, 15)
+    s.settimeout(15)
+    try:
+        s.sendall(f"GET /call-report?id={cid.hex()} HTTP/1.1\r\nHost: wlserver\r\n\r\n".encode())
+        r = Reader(s)
+        status = r.line()
+        length = 0
+        while True:
+            h = r.line()
+            if not h:
+                break
+            if h.lower().startswith(b"content-length:"):
+                length = int(h.split(b":", 1)[1])
+        body = r.exact(length) if length else b""
+    finally:
+        s.close()
+    if b" 200 " not in status + b" ":
+        raise ValueError(f"call report: {status[:40]!r}")
+    rep_ = json.loads(body)
+    return {(st, int(q)): float(t) for st, key in ((b"a", "a"), (b"v", "v")) for q, t in rep_.get(key, [])}
 
 
 # --- W3 browsing burst -----------------------------------------------------------------
@@ -606,10 +648,15 @@ def page_objects(seed: int, n: int = 40) -> list:
     return [min(2_000_000, int(15_000 * _m.exp(rng.gauss(0, sigma)))) for _ in range(n)]
 
 
+REQUEST_BYTES = 600   # an object's request, headers and cookies (W3)
+ORIGINS = 6           # a page's origins (W3)
+
+
 def http_get(sock, reader: "Reader", n: int) -> float:
-    """GET /bytes/n on an open connection; returns the first-byte time
-    (monotonic) and leaves the body read."""
-    sock.sendall(f"GET /bytes/{n} HTTP/1.1\r\nHost: wlserver\r\n\r\n".encode())
+    """GET /bytes/n on an open connection (a 600-byte request); returns the
+    first-byte time (monotonic) and leaves the body read."""
+    head = f"GET /bytes/{n} HTTP/1.1\r\nHost: wlserver\r\nX-Pad: "
+    sock.sendall((head + "p" * max(0, REQUEST_BYTES - len(head) - 4) + "\r\n\r\n").encode())
     if not reader.buf:
         reader.fill()
     first = time.monotonic()
@@ -633,14 +680,110 @@ def http_get(sock, reader: "Reader", n: int) -> float:
     return first
 
 
+def mux_page(args, rec: dict, c0: float, sizes: list) -> None:
+    """The page over HTTP/2-shaped connections (W3 h2): one new connection
+    per origin; the HTML first on the first origin's, then every object
+    requested at once on its origin's connection, the responses interleaved.
+    Objects go to the origins in turn."""
+    lock = threading.Lock()
+
+    def note(idx, n, start, first, err):
+        with lock:
+            rec["objects"].append([idx, n, start, first, round(time.monotonic() - c0, 4), err])
+
+    def open_mux():
+        s = open_conn(args, args.timeout)
+        s.settimeout(args.timeout)
+        s.sendall(b"GET /mux HTTP/1.1\r\nHost: wlserver\r\n\r\n")
+        r = Reader(s)
+        if b" 101 " not in r.line() + b" ":
+            raise OSError("no mux upgrade")
+        while r.line():
+            pass
+        return s, r
+
+    def fetch(conn, objs):
+        """Request objs together on conn and read until each is complete."""
+        s, r = conn
+        start, first, size = {}, {}, dict(objs)
+        left = dict(objs)
+        try:
+            for idx, n in objs:
+                start[idx] = round(time.monotonic() - c0, 4)
+                s.sendall(b"R" + struct.pack(">II", idx, n) + b"p" * (REQUEST_BYTES - 9))
+            while left:
+                t = r.exact(1)
+                if t == b"D":
+                    sid, k = struct.unpack(">II", r.exact(8))
+                    r.exact(k)
+                    first.setdefault(sid, round(time.monotonic() - c0, 4))
+                elif t == b"F":
+                    sid = struct.unpack(">I", r.exact(4))[0]
+                    if sid in left:
+                        note(sid, size[sid], start.get(sid), first.get(sid), "")
+                        left.pop(sid)
+                else:
+                    raise ValueError(f"mux frame {t!r}")
+        except (OSError, EOFError, ValueError, ssl.SSLError) as e:
+            for idx in list(left):
+                note(idx, size[idx], start.get(idx), first.get(idx), type(e).__name__)
+
+    def origin(k, objs, conn=None):
+        if conn is None:
+            try:
+                conn = open_mux()
+            except (OSError, EOFError, ssl.SSLError) as e:
+                now = round(time.monotonic() - c0, 4)
+                for idx, n in objs:
+                    note(idx, n, now, None, type(e).__name__)
+                return
+            conns.append(conn)
+        fetch(conn, objs)
+
+    conns: list = []
+    try:
+        first_conn = open_mux()
+    except (OSError, EOFError, ssl.SSLError) as e:
+        rec["fail"] = f"{type(e).__name__}: {e}"[:200]
+        return
+    conns.append(first_conn)
+    fetch(first_conn, [(0, 30_000)])           # the HTML
+    per = [[] for _ in range(ORIGINS)]
+    for i, n in enumerate(sizes, start=1):
+        per[(i - 1) % ORIGINS].append((i, n))
+    ths = [threading.Thread(target=origin, args=(k, per[k], first_conn if k == 0 else None), daemon=True)
+           for k in range(ORIGINS)]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join()
+    for s, _ in conns:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
 def cmd_browse(args) -> None:
-    """One page: the HTML (30 KB), then its 40 objects queued on up to 6
-    new connections (HTTP/1.1, as a browser opens per origin). Records every
-    object's start, first byte and end (client monotonic, from the page start)."""
+    """One page on cold connections: the HTML (30 KB), then its 40 objects
+    (log-normal sizes), as h1 (queued on up to 6 new connections) or h2 (one
+    new connection per origin, all objects at once). Records every object's
+    start, first byte and end, from the page's first CONNECT."""
     time.sleep(args.delay)
+    if args.mode == "h2":
+        t0 = time.time()
+        rec = {"kind": "browse", "mode": "h2", "t0": round(t0, 3), "fail": "", "objects": []}
+        c0 = time.monotonic()
+        mux_page(args, rec, c0, page_objects(args.seed))
+        rec["t1"] = round(time.time(), 3)
+        record(rec)
+        bad = sum(1 for o in rec["objects"] if o[5])
+        row(t0, time.time(), "g0", 0 if rec["fail"] else 200, len(rec["objects"]), time.time() - t0,
+            1 if rec["fail"] or bad else 0)
+        return
     t0 = time.time()
     sizes = page_objects(args.seed)
-    rec = {"kind": "browse", "t0": round(t0, 3), "fail": "", "objects": []}
+    rec = {"kind": "browse", "mode": "h1", "t0": round(t0, 3), "fail": "", "objects": []}
     c0 = time.monotonic()
     queue = list(enumerate(sizes, start=1))
     lock = threading.Lock()
@@ -705,42 +848,69 @@ def cmd_browse(args) -> None:
 
 # --- idle wake ----------------------------------------------------------------------
 
+WAKE_WITHIN = 5.0     # a wake is delivered if it arrives within this (W9)
+SEND_TIMEOUT = 30.0   # the client's own wait for an answer
+
+
+def wake_plan(conns: int, times: list) -> list:
+    """(wake time, direction) per connection: the times in turn, push and
+    send alternating within each time (50 over 1, 5, 16 min: 17/17/16)."""
+    return [(times[i % len(times)], "push" if (i // len(times)) % 2 == 0 else "send") for i in range(conns)]
+
+
 def cmd_wake(args) -> None:
-    """`conns` connections, each: a sync burst, then silence; the far side
-    pushes at each of --wakes (seconds after the connection's request) and
-    --follow more at 1 s spacing; the client sends one message at each of
-    --sends, then two warm ones 1 s apart. Records every push's server time
-    and client receive time, every send's round trip, and how the
-    connection ended."""
-    wakes = args.wakes
-    sends = [float(x) for x in args.sends.split(",") if x]
+    """`conns` connections, each: a sync burst, then silence, then one wake
+    at its time (seconds after connecting): a push from the far side or a
+    send from the client, then --follow warm ones 1 s apart. Records the
+    pushes (index, server ms, client receive s), the sends (n, sent s, round
+    trip s), when the sync ended, and how and when the connection ended.
+    --ready-file appears once every connection has synced (or failed)."""
+    times = [float(x) for x in args.wake_times.split(",") if x]
+    plan = wake_plan(args.conns, times)
     t0 = time.time()
+    synced = [0]
+    slock = threading.Lock()
+
+    def mark_synced():
+        with slock:
+            synced[0] += 1
+            if synced[0] == args.conns and args.ready_file:
+                with open(args.ready_file, "w") as f:
+                    f.write("ready\n")
 
     def one(i):
-        rec = {"kind": "wake", "conn": i, "of": args.conns, "t0": round(time.time(), 3), "fail": "", "pushes": [], "sends": [],
-               "wakes": [float(x) for x in wakes.split(",") if x], "follow": args.follow, "end": ""}
+        at, mode = plan[i]
+        rec = {"kind": "wake", "conn": i, "of": args.conns, "at": at, "mode": mode, "follow": args.follow,
+               "t0": round(time.time(), 3), "fail": "", "pushes": [], "sends": [], "end": "", "end_at": None,
+               "sync_done": None}
         try:
             s = open_conn(args, 30)
             s.settimeout(None)
             c0 = time.monotonic()
-            s.sendall(f"W {args.sync} {wakes} {args.follow}\n".encode())
+            s.sendall(f"W {args.sync} {at:g} {mode} {args.follow}\n".encode())
         except (OSError, EOFError, ssl.SSLError) as e:
             rec["fail"] = f"{type(e).__name__}: {e}"[:200]
             rec["t1"] = round(time.time(), 3)
+            mark_synced()
             record(rec)
             return
         pending = {}
         lock = threading.Lock()
         stop = threading.Event()
+        got_sync = [0]
 
         def reader():
             r = Reader(s)
             try:
                 while not stop.is_set():
                     t = r.exact(1)
-                    if t in (b"Y",):
+                    if t == b"Y":
                         n = struct.unpack(">H", r.exact(2))[0]
                         r.exact(n)
+                        got_sync[0] += n
+                        if got_sync[0] >= args.sync and rec["sync_done"] is None:
+                            rec["sync_done"] = round(time.monotonic() - c0, 4)
+                            mark_synced()
                     elif t == b"P":
                         idx, srv = struct.unpack(">Id", r.exact(12))
                         rec["pushes"].append([idx, round(srv, 3), round(time.monotonic() - c0, 4)])
@@ -752,32 +922,39 @@ def cmd_wake(args) -> None:
                             rec["sends"].append([n, round(sent_at, 4), round(time.monotonic() - c0 - sent_at, 4)])
             except EOFError:
                 if not stop.is_set():
-                    rec["end"] = f"EOF at {time.monotonic() - c0:.1f}s"
+                    rec["end"] = "EOF"
+                    rec["end_at"] = round(time.monotonic() - c0, 3)
             except (OSError, ssl.SSLError) as e:
                 if not stop.is_set():
-                    rec["end"] = f"{type(e).__name__} at {time.monotonic() - c0:.1f}s"
+                    rec["end"] = type(e).__name__
+                    rec["end_at"] = round(time.monotonic() - c0, 3)
+            if rec["sync_done"] is None:
+                mark_synced()
 
         th_ = threading.Thread(target=reader, daemon=True)
         th_.start()
-        n = 0
         try:
-            for at in sends:
-                for k in range(3):        # the wake, then two warm sends
-                    due = at + k
-                    delay = due - (time.monotonic() - c0)
+            if mode == "send":
+                for k in range(args.follow + 1):          # the wake, then the warm sends
+                    delay = at + k - (time.monotonic() - c0)
                     if delay > 0:
                         if stopped(args) or (time.monotonic() - c0) > args.duration:
                             break
                         time.sleep(delay)
-                    n += 1
+                    if rec["end"]:
+                        break
                     with lock:
-                        pending[n] = time.monotonic() - c0
-                    s.sendall(b"S" + struct.pack(">I", n))
-            last = max(rec["wakes"] + sends + [0]) + args.follow + 6
+                        pending[k] = time.monotonic() - c0
+                    s.sendall(b"S" + struct.pack(">I", k))
+            last = at + args.follow + (SEND_TIMEOUT if mode == "send" else WAKE_WITHIN + 1)
             while time.monotonic() - c0 < last and not stopped(args):
+                if mode == "send" and not pending:
+                    break
                 time.sleep(0.5)
         except (OSError, ssl.SSLError) as e:
-            rec["end"] = rec["end"] or f"{type(e).__name__} at {time.monotonic() - c0:.1f}s"
+            if not rec["end"]:
+                rec["end"] = type(e).__name__
+                rec["end_at"] = round(time.monotonic() - c0, 3)
         stop.set()
         rec["unanswered_sends"] = len(pending)
         try:
@@ -796,9 +973,80 @@ def cmd_wake(args) -> None:
     row(t0, time.time(), "w0", 200, args.conns, time.time() - t0, 0)
 
 
+# --- W4: transactional requests (the DC gate at minimal size) -------------------------
+
+def http_exchange(sock, reader: "Reader", method: str, path: str, up: int, pad_to: int) -> tuple:
+    """One request on an open keep-alive connection: `up` body bytes, the
+    head padded to `pad_to`. Returns (status, body bytes read)."""
+    head = f"{method} {path} HTTP/1.1\r\nHost: wlserver\r\nContent-Length: {up}\r\nX-Pad: "
+    head += "p" * max(0, pad_to - up - len(head) - 4) + "\r\n\r\n"
+    sock.sendall(head.encode())
+    left = up
+    while left > 0:
+        k = min(left, 65536)
+        sock.sendall(BODY[:k])
+        left -= k
+    status = reader.line()
+    length = 0
+    while True:
+        h = reader.line()
+        if not h:
+            break
+        if h.lower().startswith(b"content-length:"):
+            length = int(h.split(b":", 1)[1])
+    reader.exact(length)
+    return (200 if b" 200 " in status + b" " else 0), length
+
+
+BODY = os.urandom(65536)
+
+
+def cmd_rpc(args) -> None:
+    """W4 at minimal size: --count requests one at a time, --spacing s apart
+    (from each start), ASR (--asr-up up, --asr-down back) and TTS (--tts-up
+    request, --tts-down back) alternating, on one keep-alive connection, the
+    first one cold; a failed request's connection is replaced. Row per
+    request: flow w<i>r1 (request i of every leaf is wave i), the bytes
+    back, its seconds."""
+    sock = reader = None
+    c0 = time.monotonic()
+    for i in range(args.count):
+        due = c0 + i * args.spacing
+        if due > time.monotonic():
+            time.sleep(due - time.monotonic())
+        asr = i % 2 == 0
+        t0 = time.time()
+        code, got, ex = 0, 0, 0
+        try:
+            if sock is None:
+                sock = open_conn(args, args.timeout)
+                sock.settimeout(args.timeout)
+                reader = Reader(sock)
+            if asr:
+                code, got = http_exchange(sock, reader, "POST", f"/sink?reply={args.asr_down}", args.asr_up, args.asr_up + 300)
+            else:
+                code, got = http_exchange(sock, reader, "GET", f"/bytes/{args.tts_down}", 0, args.tts_up)
+            ex = 0 if code == 200 else 22
+        except (OSError, EOFError, ValueError, ssl.SSLError):
+            ex = 28
+            try:
+                if sock is not None:
+                    sock.close()
+            except OSError:
+                pass
+            sock = reader = None
+        t1 = time.time()
+        row(t0, t1, f"w{i + 1}r1", code, got, t1 - t0, ex)
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("cmd", choices=("llm", "term", "bgdown", "bgup", "call", "browse", "wake"))
+    ap.add_argument("cmd", choices=("llm", "term", "bgdown", "bgup", "call", "browse", "wake", "rpc"))
     ap.add_argument("--socks", required=True)
     ap.add_argument("--target", required=True)
     ap.add_argument("--no-tls", action="store_true")
@@ -829,9 +1077,20 @@ def main(argv=None) -> int:
     # wake
     ap.add_argument("--conns", type=int, default=50)
     ap.add_argument("--sync", type=int, default=200_000)
-    ap.add_argument("--wakes", default="60,300,960", help="server push times, seconds after connecting")
-    ap.add_argument("--sends", default="180,600", help="client send times, seconds after connecting")
+    ap.add_argument("--wake-times", default="60,300,960", help="wake times, seconds after connecting (in turn)")
     ap.add_argument("--follow", type=int, default=5)
+    ap.add_argument("--ready-file", default="", help="written once every connection has synced")
+    # call
+    ap.add_argument("--report-target", default="", help="wlserver's HTTP port, for the reflector's report")
+    # browse
+    ap.add_argument("--mode", choices=("h1", "h2"), default="h2")
+    # rpc (W4)
+    ap.add_argument("--count", type=int, default=10)
+    ap.add_argument("--spacing", type=float, default=2.0)
+    ap.add_argument("--asr-up", type=int, default=355_000)
+    ap.add_argument("--asr-down", type=int, default=200)
+    ap.add_argument("--tts-up", type=int, default=300)
+    ap.add_argument("--tts-down", type=int, default=300_000)
     # backgrounds
     ap.add_argument("--flows", type=int, default=4)
     ap.add_argument("--path", default="/")
@@ -839,7 +1098,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     args.deadline = time.time() + args.delay + args.duration
     {"llm": cmd_llm, "term": cmd_term, "bgdown": cmd_bgdown, "bgup": cmd_bgup, "call": cmd_call,
-     "browse": cmd_browse, "wake": cmd_wake}[args.cmd](args)
+     "browse": cmd_browse, "wake": cmd_wake, "rpc": cmd_rpc}[args.cmd](args)
     return 0
 
 

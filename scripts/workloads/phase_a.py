@@ -316,15 +316,21 @@ class _Scenario(w.Workload):
     # (WORKLOADS.md 3.0), rather than averaging per-trial quantiles.
     def block_extract(self, trials: Sequence[Any], plan: dict) -> Dict[str, float]:
         out: Dict[str, float] = {}
-        phases = sorted({r["phase"] for t in trials for r in t.rows})
+        phases = sorted({r["phase"] for t in trials for r in t.rows} |
+                        {t.trial for t in trials if getattr(t, "trial", "")})
         for ph in phases:
-            recs = [rec for t in trials for rec in getattr(t, "records", []) if rec.get("_phase") == ph]
-            rows = [r for t in trials for r in t.rows if r["phase"] == ph]
-            m = self.phase_measures(ph, recs, rows, trials)
+            # Only the trials that ran this phase: with trial types (one phase
+            # each) an arm's block holds trials of other types too.
+            # A trial of another type is told by its type, not by its rows, so
+            # a trial whose jobs wrote nothing still counts as missing evidence.
+            pt = [t for t in trials if not getattr(t, "trial", "") or t.trial == ph]
+            recs = [rec for t in pt for rec in getattr(t, "records", []) if rec.get("_phase") == ph]
+            rows = [r for t in pt for r in t.rows if r["phase"] == ph]
+            m = self.phase_measures(ph, recs, rows, pt)
             # Before pooling: every trial must carry this phase's evidence, or
             # one trial's records would stand in for the block.
             if not all(self.has_evidence(ph, [x for x in getattr(t, "records", []) if x.get("_phase") == ph])
-                       for t in trials):
+                       for t in pt):
                 m = {k: float("nan") for k in m}
             for k, v in m.items():
                 out[f"{ph}.{k}"] = v

@@ -72,6 +72,20 @@ class Endpoint:
 
 
 @dataclass
+class Beside:
+    """A paired session that runs beside the blocks (trial D): each arm on its
+    own gateway and client instances, which the blocks' restarts do not touch.
+    `job` runs once per path and arm; `ready_file` (on the client host, with
+    {arm} for the arm) appears once the session's set-up traffic is done, and
+    the blocks wait for it; `workload` judges the session as its own campaign
+    in the subdirectory `name`."""
+    name: str
+    workload: str
+    phase: Phase
+    ready_seconds: float = 120.0
+
+
+@dataclass
 class Generator:
     """script(campaign, job, arm, duration, start_at) -> shell for the client
     host; parse(output, job, duration) -> rows of (flow, http, bytes,
@@ -183,6 +197,38 @@ class Workload:
     def phases(self, cfg: Any, path: str) -> List[Phase]:
         raise NotImplementedError
 
+    def trial_types(self, cfg: Any) -> List[str]:
+        """Trial types that run as blocks of their own (DESIGN-PATH-AUTHORITY.md
+        section 15.3): each is a block of four trials with the endpoints
+        restarted before it, the types taken round-robin at block granularity,
+        and each stopped on its own under sequential stopping. A type is the
+        name of the one phase it runs. The default, [""], is one type that
+        runs every phase in each trial."""
+        return [""]
+
+    def type_phases(self, cfg: Any, path: str, trial: str) -> List[Phase]:
+        """The phases one trial of type `trial` runs."""
+        phases = self.phases(cfg, path)
+        return phases if not trial else [p for p in phases if p.name == trial]
+
+    def trial_seconds(self, cfg: Any, path: str, trial: str) -> float:
+        """Nominal seconds of one trial of this type, for the wall-time
+        estimate (the runner adds its per-block restarts)."""
+        return float(sum(ph.expected or ph.duration for ph in self.type_phases(cfg, path, trial)))
+
+    def run_first(self, cfg: Any) -> List[Tuple[int, str]]:
+        """(block, type) units to run before the round-robin, in this order:
+        a session that must overlap particular blocks (D beside C)."""
+        return []
+
+    def beside(self, cfg: Any) -> Optional["Beside"]:
+        """A paired session run beside the blocks on its own instances (D)."""
+        return None
+
+    def plan_notes(self, cfg: Any) -> List[str]:
+        """Extra lines for the dry-run plan (estimates of campaigns run apart)."""
+        return []
+
     def objects(self, cfg: Any) -> List[Tuple[str, int]]:
         """Files the HTTP origin serves, as (name, size)."""
         return []
@@ -208,13 +254,12 @@ class Workload:
     def after_block(self, campaign: Any, block: int, path: str, tagp: str, writer: Any) -> None:
         """Extra trials at the end of each block (the DC calibration)."""
 
-    def estimate_seconds(self, cfg: Any, path: str) -> float:
-        """Seconds of workload in one trial on this path (its phases' windows;
-        the runner adds its own per-trial and per-block overheads)."""
-        return float(sum(ph.expected or ph.duration for ph in self.phases(cfg, path)))
-
     def extra_block_seconds(self, cfg: Any, path: str) -> float:
         """Seconds of extra trials per block (the DC calibration)."""
+        return 0.0
+
+    def extra_once_seconds(self, cfg: Any, path: str) -> float:
+        """Seconds of extra trials in the first block only."""
         return 0.0
 
     def samples(self, trials: Sequence[Any]) -> Dict[str, List[float]]:
@@ -223,6 +268,12 @@ class Workload:
 
     def extract(self, trial: Any, plan: dict) -> Dict[str, float]:
         """Per-trial measures, "<phase>.<metric>", for the rules in gates.ini."""
+        return {}
+
+    def block_tails(self, trials: Sequence[Any], plan: dict) -> Dict[str, Tuple[float, List[float]]]:
+        """For each tail-percentile measure of an arm's block, (q, its pooled
+        samples): one with too few samples per block is judged over every
+        block's samples pooled instead (section 15.4)."""
         return {}
 
     def block_extract(self, trials: Sequence[Any], plan: dict) -> Dict[str, float]:
@@ -369,7 +420,56 @@ class DCParams:
     waves: int
     request_timeout: int
     control_interval: float
-    calibrate: bool
+    # Solo calibration of each loaded leaf: "every" block, the "first" block
+    # only (the minimal profile), or "false".
+    calibrate: str = "every"
+    # "waves": request waves of downloads after the sustained phase (the full
+    # gate); "rpc": the model's W4 at minimal size before it -- `rpc_requests`
+    # requests one at a time, `rpc_spacing` s apart, ASR (355 KB up, 200 B
+    # down) and TTS (300 B up, 300 KB down) alternating, the first on a cold
+    # app connection (design section 15.3, trial DC).
+    request_mode: str = "waves"
+    rpc_requests: int = 10
+    rpc_spacing: float = 2.0
+    rpc_port: int = 23485
+
+
+def _calibrate(v: str) -> str:
+    v = v.strip().lower()
+    if v in ("first", "every"):
+        return v
+    return "every" if ab._bool(v) else "false"
+
+
+ASR_UP, ASR_DOWN, TTS_UP, TTS_DOWN = 355_000, 200, 300, 300_000   # W4's requests
+CLIENT_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "wlclient.py")
+SERVER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "wlserver.py")
+
+
+def rpc_script(campaign: Any, job: Job, arm: Any, duration: float, start_at: int = 0) -> str:
+    """W4 at minimal size through the leaf's client: wlclient rpc, on the
+    phase's shared start."""
+    dc = campaign.cfg.dc
+    W = campaign.w(job.client.host)
+    return (_barrier(start_at) + f"python3 {W}/wlclient.py rpc --socks 127.0.0.1:{job.client.socks_port_base + arm.index} "
+            f"--target 127.0.0.1:{dc.rpc_port} --count {dc.rpc_requests} --spacing {dc.rpc_spacing:g} "
+            f"--timeout {dc.request_timeout} --asr-up {ASR_UP} --asr-down {ASR_DOWN} --tts-up {TTS_UP} "
+            f"--tts-down {TTS_DOWN}")
+
+
+def _rpc_rows(out: str, job: Job, duration: float) -> List[Tuple[str, ...]]:
+    rows = []
+    for line in out.splitlines():
+        p = line.split("\t")
+        if len(p) == 7 and p[0] != "J":
+            t0, t1, flow, code, size, secs, ex = p
+            rows.append((flow, code, size, secs, ex, t0, t1))
+    if not rows:
+        rows.append(("w1r1", "000", "0", f"{duration:.3f}", "-1", "", ""))   # the job died: a failure
+    return rows
+
+
+generator("dc-rpc", Generator(rpc_script, _rpc_rows, lambda job: 0))
 
 
 @register
@@ -388,7 +488,11 @@ class DC(Workload):
                       bulk_flows_per_leaf=d.getint("bulk_flows_per_leaf", 2), request_bytes=d.getint("request_bytes", 307200),
                       requests_per_leaf=d.getint("requests_per_leaf", 8), waves=d.getint("waves", 3),
                       request_timeout=d.getint("request_timeout", 30), control_interval=d.getfloat("control_interval", 1.0),
-                      calibrate=ab._bool(d.get("calibrate", "true")))
+                      calibrate=_calibrate(d.get("calibrate", "true")), request_mode=d.get("request_mode", "waves"),
+                      rpc_requests=d.getint("rpc_requests", 10), rpc_spacing=d.getfloat("rpc_spacing", 2.0),
+                      rpc_port=d.getint("rpc_port", 23485))
+        if dc.request_mode not in ("waves", "rpc"):
+            raise ab.ConfigError("[dc] request_mode must be waves or rpc")
         if len(dc.loaded) < 2:
             raise ab.ConfigError("[dc] loaded needs at least two leaves")
         for leaf in dc.loaded + [dc.control]:
@@ -428,12 +532,32 @@ class DC(Workload):
     def objects(self, cfg: Any) -> List[Tuple[str, int]]:
         return [(f"obj-{cfg.object_bytes}", cfg.object_bytes), (f"obj-{cfg.dc.request_bytes}", cfg.dc.request_bytes)]
 
+    def endpoints(self, cfg: Any) -> List[Endpoint]:
+        if cfg.dc.request_mode != "rpc":
+            return []
+        p = cfg.dc.rpc_port
+        return [Endpoint("wlserver", f"python3 {{W}}/wlserver.py --http {p} --term {p + 1} --dir {{W}}",
+                         tcp_ports=[(p, "rpc http"), (p + 1, "terminal")], files=[SERVER_PY])]
+
+    def client_files(self, cfg: Any) -> List[str]:
+        return [CLIENT_PY] if cfg.dc.request_mode == "rpc" else []
+
     def phases(self, cfg: Any, path: str) -> List[Phase]:
         dc = cfg.dc
         loaded = [cfg.clients[x] for x in dc.loaded]
         control = cfg.clients[dc.control]
         probe = {"bytes": dc.request_bytes, "interval": dc.control_interval}
         req = {"waves": dc.waves, "timeout": dc.request_timeout, "bytes": dc.request_bytes}
+        if dc.request_mode == "rpc":
+            # W4 first (one request at a time, all loaded leaves together),
+            # then the sustained phase.
+            rpc_window = dc.rpc_requests * dc.rpc_spacing
+            return [Phase("requests", rpc_window + dc.request_timeout,
+                          [Job(c, "dc-rpc", 1) for c in loaded] + [Job(control, "probe", 1, load=False, params=probe)],
+                          barrier=True, expected=rpc_window + 2),
+                    Phase("sustained", cfg.duration,
+                          [Job(c, "bulk", dc.bulk_flows_per_leaf, params={"expected": cfg.object_bytes}) for c in loaded]
+                          + [Job(control, "probe", 1, load=False, params=probe)], barrier=True)]
         return [Phase("sustained", cfg.duration,
                       [Job(c, "bulk", dc.bulk_flows_per_leaf, params={"expected": cfg.object_bytes}) for c in loaded]
                       + [Job(control, "probe", 1, load=False, params=probe)], barrier=True),
@@ -442,14 +566,17 @@ class DC(Workload):
                       + [Job(control, "probe", 1, load=False, params=probe)], barrier=True)]
 
     def extra_block_seconds(self, cfg: Any, path: str) -> float:
-        return float(len(cfg.dc.loaded) * (cfg.duration + 15)) if cfg.dc.calibrate else 0.0
+        return float(len(cfg.dc.loaded) * (cfg.duration + 15)) if cfg.dc.calibrate == "every" else 0.0
+
+    def extra_once_seconds(self, cfg: Any, path: str) -> float:
+        return float(len(cfg.dc.loaded) * (cfg.duration + 15)) if cfg.dc.calibrate == "first" else 0.0
 
     def after_block(self, campaign: Any, block: int, path: str, tagp: str, writer: Any) -> None:
         """Each loaded leaf alone on the main arm: the common ancestor binds
         only if the leaves together deliver clearly less than the sum of what
         each delivers alone (dc_gate.ini)."""
         cfg = campaign.cfg
-        if not cfg.dc.calibrate:
+        if cfg.dc.calibrate == "false" or (cfg.dc.calibrate == "first" and block != 1):
             return
         arm = cfg.main
         for i, name in enumerate(cfg.dc.loaded):

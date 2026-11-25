@@ -345,52 +345,169 @@ def bounds(d: Sequence[float], alpha: float, resamples: int = 20000, seed: int =
             bootstrap_bound(d, alpha=alpha, resamples=resamples, seed=seed, upper=True))
 
 
+def pooled_quantile_bounds(cand_blocks: Sequence[Sequence[float]], main_blocks: Sequence[Sequence[float]], q: float,
+                           contrast: Callable[[float, float], float], alpha: float, resamples: int = 20000,
+                           seed: int = 1):
+    """A tail percentile over all blocks' pooled samples: the contrast of the
+    arms' pooled q-quantiles, and its one-sided (lower, upper) bounds at
+    level alpha from a bootstrap that resamples blocks (both arms' samples
+    of a block together), so the blocks stay the unit of analysis. Returns
+    (observed, lower, upper)."""
+    n = len(cand_blocks)
+    if n == 0 or n != len(main_blocks):
+        return float("nan"), float("nan"), float("nan")
+
+    def stat(idx):
+        c = [x for i in idx for x in cand_blocks[i]]
+        m = [x for i in idx for x in main_blocks[i]]
+        if not c or not m:
+            return float("nan")
+        return contrast(quantile(c, q), quantile(m, q))
+    observed = stat(range(n))
+    rng = random.Random(seed)
+    reps = max(200, resamples // 10)
+    ds = sorted(d for d in (stat([rng.randrange(n) for _ in range(n)]) for _ in range(reps)) if d == d)
+    if not ds:
+        return observed, float("nan"), float("nan")
+    k = int(math.floor(alpha * len(ds)))
+    return observed, ds[k], ds[min(len(ds) - 1, len(ds) - 1 - k)]
+
+
+def _phi(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+
+def _Phi_upper(x: float) -> float:
+    """P(Z > x) for a standard normal Z."""
+    return 0.5 * math.erfc(x / math.sqrt(2))
+
+
+def pocock_spending(t: float, alpha: float) -> float:
+    """Lan-DeMets Pocock-type alpha-spending function: alpha x ln(1 + (e - 1) t)."""
+    return alpha * math.log(1 + (math.e - 1) * min(max(t, 0.0), 1.0))
+
+
+_LEVELS_CACHE: dict = {}
+
+
+def spending_levels(looks: Sequence[int], alpha: float, step: float = 0.05) -> List[float]:
+    """Nominal one-sided levels for a group-sequential test that looks after
+    each block count in `looks` (increasing), spending `alpha` by the Pocock-
+    type function over information fraction n / looks[-1].
+
+    Under the null the sum of n block contrasts (standardised) is a random
+    walk, so the statistic at successive looks is correlated; the boundary
+    at each look is solved so that the probability of a first crossing there
+    is that look's share of alpha (Armitage, McPherson and Rowe's recursive
+    numerical integration on a grid). The nominal level of look k is the
+    tail probability of its boundary. Only the pass boundary spends alpha:
+    stopping to fail never inflates the false-pass rate."""
+    looks = [int(n) for n in looks]
+    if not looks or looks[0] < 1 or any(b <= a for a, b in zip(looks, looks[1:])):
+        raise ValueError("looks must be increasing positive block counts")
+    key = (tuple(looks), float(alpha), step)
+    if key in _LEVELS_CACHE:
+        return list(_LEVELS_CACHE[key])
+    cap = looks[-1]
+    spent = [pocock_spending(n / cap, alpha) for n in looks]
+    inc = [spent[0]] + [b - a for a, b in zip(spent, spent[1:])]
+    levels: List[float] = []
+    # Look 1: the statistic is N(0, n1).
+    n1 = looks[0]
+    b = normal_quantile(1 - inc[0]) * math.sqrt(n1)
+    levels.append(inc[0])
+    lo = -10.0 * math.sqrt(cap)
+    xs = [lo + i * step for i in range(int((b - lo) / step) + 1)]
+    f = [_phi(x / math.sqrt(n1)) / math.sqrt(n1) for x in xs]
+    prev = n1
+    for k in range(1, len(looks)):
+        n = looks[k]
+        sd = math.sqrt(n - prev)
+        # Trapezoid weights for the density held on the grid below the last boundary.
+        w = [step * fx for fx in f]
+        w[0] *= 0.5
+        w[-1] *= 0.5
+
+        def cross(bk: float) -> float:
+            return sum(wi * _Phi_upper((bk - x) / sd) for wi, x in zip(w, xs))
+        lo_b, hi_b = -5.0 * math.sqrt(n), 12.0 * math.sqrt(n)
+        for _ in range(80):
+            mid = 0.5 * (lo_b + hi_b)
+            if cross(mid) > inc[k]:
+                lo_b = mid
+            else:
+                hi_b = mid
+        bk = 0.5 * (lo_b + hi_b)
+        levels.append(_Phi_upper(bk / math.sqrt(n)))
+        # The density of the walk at look k, on the paths not yet crossed.
+        nxs = [lo + i * step for i in range(int((bk - lo) / step) + 1)]
+        f = [sum(wi * _phi((y - x) / sd) for wi, x in zip(w, xs)) / sd for y in nxs]
+        xs, prev = nxs, n
+    _LEVELS_CACHE[key] = list(levels)
+    return levels
+
+
+SPENDING = ("pocock", "bonferroni")
+
+
 @dataclass
 class Sequential:
-    """A Haybittle-Peto group-sequential design over blocks.
+    """A group-sequential design over blocks (DESIGN-PATH-AUTHORITY.md
+    section 15.4).
 
-    Looks happen after `first`, first + 1, ..., `cap` blocks. At every
-    interim look a contrast is decided only if it is overwhelming: its
-    one-sided lower bound at `interim_alpha` is above zero (pass) or its
-    upper bound at the same level is below zero (fail). At the cap it is
-    decided at `final_alpha` = alpha - (number of interim looks) x
-    interim_alpha, as an ordinary one-sided test. By the union bound the
-    chance of a wrong pass over all looks is at most alpha, whatever the
-    correlation between looks; the final look keeps almost all of the
-    fixed-sample test's power, which a Bonferroni split over every look
-    would not.
+    Looks happen after `first`, first + 1, ..., `cap` blocks. Each look tests
+    at its own nominal one-sided level, from the Lan-DeMets Pocock-type
+    alpha-spending function over the looks with total one-sided `alpha`
+    (`spending = "pocock"`), or alpha / looks at every look (`"bonferroni"`,
+    the conservative fallback). The levels are computed once, before the
+    first block, and frozen in the campaign's plan (`levels`).
+
+    At a look a contrast passes when its lower bound at the look's level is
+    above zero (t and bootstrap both), fails when its upper bound is below
+    zero (either), and otherwise waits for another block; at the cap a
+    contrast that has not passed fails.
     """
     first: int = 6
     cap: int = 12
     alpha: float = 0.05
-    interim_alpha: float = 0.001
+    spending: str = "pocock"
+    levels: Optional[List[float]] = None
 
     def __post_init__(self):
         if not 2 <= self.first <= self.cap:
             raise ValueError("need 2 <= first <= cap")
-        for name, v in (("alpha", self.alpha), ("interim_alpha", self.interim_alpha)):
-            if not (isinstance(v, (int, float)) and math.isfinite(v) and 0 < v < 1):
-                raise ValueError(f"{name} must be in (0, 1), not {v!r}")
-        if self.final_alpha <= 0:
-            raise ValueError("interim looks spend all of alpha")
-        if self.interim_alpha > self.final_alpha:
-            raise ValueError("interim_alpha must not exceed the final look's alpha")
+        if not (isinstance(self.alpha, (int, float)) and math.isfinite(self.alpha) and 0 < self.alpha < 1):
+            raise ValueError(f"alpha must be in (0, 1), not {self.alpha!r}")
+        if self.spending not in SPENDING:
+            raise ValueError(f"spending must be one of {', '.join(SPENDING)}, not {self.spending!r}")
+        looks = self.cap - self.first + 1
+        if self.levels is None:
+            if self.spending == "bonferroni":
+                self.levels = [self.alpha / looks] * looks
+            else:
+                self.levels = spending_levels(range(self.first, self.cap + 1), self.alpha)
+        else:
+            # Frozen levels read back from a plan: they must fit this design
+            # and must not spend more than alpha in all.
+            lv = [float(x) for x in self.levels]
+            if len(lv) != looks or not all(math.isfinite(x) and 0 < x < 1 for x in lv) or sum(lv) > self.alpha * looks:
+                raise ValueError(f"levels {self.levels!r} do not fit looks {self.first}..{self.cap}")
+            self.levels = lv
 
     @property
-    def interim_looks(self) -> int:
-        return self.cap - self.first
-
-    @property
-    def final_alpha(self) -> float:
-        return self.alpha - self.interim_looks * self.interim_alpha
+    def looks(self) -> int:
+        return self.cap - self.first + 1
 
     def alpha_at(self, blocks: int) -> float:
-        return self.final_alpha if blocks >= self.cap else self.interim_alpha
+        """The nominal one-sided level of the look after `blocks` blocks."""
+        k = min(max(blocks, self.first), self.cap) - self.first
+        return self.levels[k]
 
     def decide(self, d: Sequence[float], resamples: int = 20000, seed: int = 1) -> str:
         """'pass', 'fail' or 'continue' for one contrast after len(d) blocks.
         At the cap it is pass or fail. Both the t and the bootstrap bound
-        must agree for a pass, and either one suffices for an early fail."""
+        must agree for a pass, and either one suffices for a fail on a clear
+        negative bound."""
         n = len(_finite(d))
         if n < self.first:
             return "continue"
@@ -398,9 +515,9 @@ class Sequential:
         tl, tu, bl, bu = bounds(d, a, resamples, seed)
         if tl > 0 and bl > 0:
             return "pass"
-        if n >= self.cap:
-            return "fail"
         if tu < 0 or bu < 0:
+            return "fail"
+        if n >= self.cap:
             return "fail"
         return "continue"
 

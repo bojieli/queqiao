@@ -474,10 +474,10 @@ one release. Its gate is Gate 1 run on the release candidate:
   release-candidate build with no flags, so its new defaults are what is
   measured.
 - **Paths and workloads.** Every path in the field campaign, with the
-  minimal profile: `minimal` (trial types A, B and C) and `idle-wake` (D)
-  on every path, and the DC gate. `--profile full` instead requires the
-  full matrix (`bulk`, `single`, `interactive`, `llm`, `term`, `mixed` and
-  `dc`).
+  minimal profile: trial types A, B, C and D (`minimal`, and its
+  `idle-wake` subdirectory) on every path, and the DC gate. `--profile full`
+  instead requires the full matrix (`bulk`, `single`, `interactive`, `llm`,
+  `term`, `mixed` and `dc`).
 - **Gateways first.** Add a crossover arm (`gateway_ref = <candidate>`,
   `client_ref = <previous release>`). It shows that an upgraded gateway does
   no harm to clients that have not upgraded yet, which is the order the
@@ -489,110 +489,141 @@ one release. Its gate is Gate 1 run on the release candidate:
   at stage 9 or still runs the legacy bundle. Run its campaign again on the
   candidate either way.
 
-The flip passes only if every path × workload × cell of every candidate is
-PASS. INCOMPLETE is not PASS. `ab_analyze.py --flip` judges a set of
-campaign directories, prints that matrix, and exits non-zero unless it
-passes. Coverage is checked before any verdict, cell by cell: every
-candidate must have every cell any campaign ran for a workload, on every
-path, in every required workload. A DC campaign alone covers nothing else. A candidate tested in
-only some campaigns fails the flip rather than passing on the rows that
-exist. The campaigns must also be one release: each arm must be the same
-build, with the same flags, in the same role, everywhere. For arms built from refs that means
-the same commits; for prebuilt binaries, the same SHA-256 for each role and
-platform.
+The flip passes only if every path × trial type of every candidate is PASS
+(design section 15.4: A, B, C, D and DC on every path). INCOMPLETE is not
+PASS. `ab_analyze.py --flip` judges a set of campaign directories, prints
+that matrix, and exits non-zero unless it passes. Coverage is checked before
+any verdict, cell by cell: every candidate must have every required cell on
+every path. A DC campaign alone covers nothing else.
+
+Each trial type runs once per path, at its gate (design section 15.3): A
+and B at stages 6 and 7, DC at stage 9, C and D at stage 10. A pass carries
+forward to the flip; a trial is rerun on the final bundle only when a later
+stage changes what it exercises. The flip takes the final bundle of each
+candidate arm to be what it ran in the newest campaign (its build: commits,
+or each prebuilt binary's SHA-256 by role and platform; and its flags). A
+cell measured on the final bundle counts as it is. A cell measured only on
+an earlier build or flag bundle counts only when you name it in `--carry`,
+your statement that no later stage changed what it exercises; the matrix
+marks it "carried forward from" its campaign. Otherwise the flip lists it
+under "Not on the final bundle". An arm that is the reference in one
+campaign and a candidate in another is inconsistent and fails the flip.
 
 ```sh
-./scripts/ab_analyze.py --flip ~/campaigns/rc-minimal-a ~/campaigns/rc-minimal-b \
-    ~/campaigns/rc-wake-a ~/campaigns/rc-wake-b ~/campaigns/rc-dc
+./scripts/ab_analyze.py --flip --carry bulk,mixed-67,dc-gate \
+    ~/campaigns/s67-a ~/campaigns/s67-b ~/campaigns/s9-dc \
+    ~/campaigns/rc-a ~/campaigns/rc-a/idle-wake ~/campaigns/rc-b ~/campaigns/rc-b/idle-wake
 ```
 
 ## The minimal profile
 
-Four trial types, each running several workloads in one trial so that they
-share blocks. The cells are judged separately, so a bulk gain cannot hide a
-regression in call jitter or page time.
+The model's minimal live plan (`docs/WORKLOAD-MODEL.md`, design section
+15.3) gates on four trial types and the DC gate, about 2.5 to 3 hours of
+live time per path. Every setting is fixed by that plan; the harness has no
+knob for them. Each trial type is a block of its own: four trials in ABBA or
+BAAB order with every endpoint restarted before the block, so each arm's
+first trial in it is cold. The types run round-robin at block granularity
+(every type's block b before any type's block b + 1), so a path that drifts
+drifts under all of them. Within a trial every workload's metrics are judged
+separately, so a bulk gain cannot hide a regression in call jitter or page
+time.
 
-| Trial type | Cell | What runs | Gates |
-|---|---|---|---|
-| A | `minimal` / `bulk` | four downloads, 60 s, judged as a rate (0.90 of main) | stages 6 and 7 |
-| B | `minimal` / `mixed-67` | a 5-turn LLM loop (100 KB prompt) and a terminal session with one 300 KB burst, under two downloads, about 90 s | stages 6 and 7 |
-| C | `minimal` / `mixed-all` | a video call (audio and about 3 Mbit/s of video each way, open loop, through UDP ASSOCIATE), one browsing burst (30 KB of HTML and 40 objects), one LLM call, keystrokes, one download and one upload, at once, 120 s | stage 10 |
-| D | `idle-wake` / `wake` | 50 idle connections after a 200 KB sync. The far side wakes each at 1, 5 and 16 minutes, followed by warm pushes; the client wakes it at 3 and 10 minutes. One session per arm | stage 10 |
-| DC | `dc` | the stage 9 gate at its minimal size, 6 blocks (`dc-minimal.example.ini`) | stage 9 |
+| Trial | Cell | What runs | Length | Gate |
+|---|---|---|---|---|
+| A | `minimal` / `bulk` | four downloads | 60 s | stages 6 and 7 |
+| B | `minimal` / `mixed-67` | a 5-turn LLM loop on one connection (100 KB prompt plus 8 KB per turn, 2 s apart) and keystrokes with one 300 KB burst at 40 s, under two downloads that start 5 s earlier | 90 s | stages 6 and 7 |
+| DC | `dc` / `dc-gate` | the stage 9 gate at minimal size: 10 transactional requests one at a time, 2 s apart, ASR (355 KB up, 200 B back) and TTS (300 B up, 300 KB back) alternating, the first on a cold app connection, then 40 s of the sustained-goodput and multi-leaf fairness workload (`dc-minimal.example.ini`) | 60 s | stage 9 |
+| C | `minimal` / `mixed-all` | at once: a video call for the whole trial (audio and about 3 Mbit/s of video each way, open loop, through UDP ASSOCIATE), one h2 page on cold connections at 20 s, one LLM call (100 KB) at 50 s, keystrokes without bursts, one download and one upload | 120 s | stage 10 |
+| D | `idle-wake` / `wake` | 50 connections per arm after a 200 KB sync, no heartbeat; each woken once at 1, 5 or 16 minutes (17, 17 and 16), push and send alternating, then 5 warm follow-ups | about 17 min | stage 10 |
 
-What each cell measures:
+Choose the types a campaign runs with `[workload:minimal] trials`:
+`bulk, mixed-67` at stages 6 and 7, `mixed-all` at stage 10.
 
-- **A:** goodput as a rate.
-- **B:** the `llm` and `term` measures, and the background's rate.
-- **C:** for each traffic class on its own:
-  - the call, per direction: lateness p99 (clock-free, from the reflector's
-    stamps), late loss (lost, or more than 150 ms late), audio late loss and
-    gaps, frame loss and freezes;
-  - the page load time and its failed objects;
-  - the LLM's TTFT, lateness, stalls and freezes;
-  - keystroke echo p99;
-  - the download's and the upload's rates.
-- **D:**
-  - wakes delivered within 5 s, which must be all of them;
-  - silent deaths (a wake lost with no EOF or error seen locally), which
-    must be none;
-  - the wake penalty: the push's delay over the best of its own warm
-    follow-ups, and a client send's round trip over its warm sends, at p50
-    and p99.
+What each cell gates (`gates.ini [workload:minimal]`, provisional bounds
+from the model):
 
-  D runs once per arm, so it is judged over its pooled wakes by an unpaired
-  bootstrap, not over blocks. Every planned connection must have its
-  record, with the planned wake schedule, or there is no verdict.
+- **Primaries.** Only the bulk flows' bytes: A's downloads; B's downloads;
+  C's download and upload, each its own primary; DC's sustained phase.
+  Each is `atleast 0.90` of main.
+- **B:** the LLM's TTFT p50 and p95, delta lateness p99, stalls and
+  freezes per streamed minute, call failures, and class correctness (at
+  least 99 % of the response's DATA bytes sent INTERACTIVE, from the
+  gateway's per-flow class telemetry; a hard assertion); keystroke echo p99
+  and the fraction over 1 s before the burst and after it, and the latch
+  ratio (at most 1.15, absolute).
+- **C:** the same LLM measures; keystroke echo p99 and the fraction over
+  1 s (echo time alone, no bursts); the call per direction: audio late
+  loss, frame loss, freezes per minute and lateness p99 (a packet is bad in
+  a direction when it is lost there or more than 150 ms late; the
+  reflector's own report of what it received tells a packet lost up from
+  one lost down); the page load time p50 and p95 (from the first CONNECT)
+  and failed objects.
+- **D** (`gates.ini [workload:idle-wake]`): no silent deaths and every wake
+  at 1 and 5 minutes delivered within 5 s (hard); the delivered count at
+  16 minutes at least main's (a count); the push and send wake penalty p50
+  within the model's bound of main's (an unpaired bootstrap over the
+  session's wakes). The p95, max, death modes (EOF, reset, a send's 30 s
+  timeout, a push never seen) and idle EOF times are reported.
 
-The bounds are in `gates.ini` (`[workload:minimal]`, `[workload:idle-wake]`)
-and are provisional. Example configs: `minimal-campaign.example.ini` and
-`idle-wake.example.ini`.
+A tail percentile is gated per block only when the block holds at least 20
+samples per arm for a p95 and 100 for a p99. Otherwise (B's and C's TTFT
+p95, C's page load p95) it is computed over every block's samples pooled,
+at the stopping look, and tested with a bootstrap that resamples blocks.
 
-**Sequential stopping** (A, B and C; `sequential = true`). The campaign
-runs 6 blocks, then recomputes every gate after each further block, up to
-a cap of 12. It stops as soon as the verdict is determined: every
-contrast's one-sided lower bound clears its margin, or any contrast's upper
-bound falls below it.
+**D beside the blocks.** D barely contends after its sync, so its arms run
+at once as paired sessions, each on its own gateway and client instances
+(`<arm>-wake`, on the ports after the arms'), which the blocks' restarts do
+not touch. The campaign starts D first and waits until every connection has
+synced, then runs C's first two blocks back to back to cover D's
+17 minutes, so its wakes happen under the path's load. With
+`idle_wake = auto` (the default) D runs when the campaign has C; `true` runs
+it beside A and B as well (the `classifier=v2` gate). It is written as a
+campaign of its own in `<campaign>/idle-wake`, judged by `ab_analyze.py`
+like any other. On a small client host D's two idle client instances need
+`idle_wake_on_small = true`. A campaign of D alone is refused: its arms
+would run one after the other.
 
-The correction for repeated looks is a Haybittle–Peto boundary:
+**Sequential stopping** (design section 15.4; `sequential = true`). Each
+trial type starts with 6 blocks per path. After block 6 and after each
+further block, that type's one-sided tests are re-run at the look's
+nominal level, from the Lan–DeMets Pocock-type α-spending function
+α ln(1 + (e − 1) t) over the 7 possible looks (t = blocks / 12) with total
+one-sided α = 0.05. The levels are computed before the first block and
+frozen in `plan.json` (look 6: 0.031, then about 0.016 to 0.019; the dry run
+prints them). `spending = bonferroni` uses 0.05/7 at every look instead. At
+a look a trial type:
 
-- at each interim look (after blocks 6 to 11), a contrast is decided only
-  at one-sided α = 0.001;
-- at the cap, it is decided at α = 0.05 − 6 × 0.001 = 0.044.
+- **passes** when the lower bound of every contrast is above zero (the t
+  and the bootstrap bound both) and every hard assertion holds;
+- **fails** when a hard assertion fails, or when the upper bound of any
+  contrast is below zero (either bound);
+- otherwise gets one more block. At the 12-block cap a type that has not
+  passed fails.
 
-By the union bound, the chance of a wrong pass over all seven looks is at
-most 0.05, whatever the correlation between looks. The final look keeps
-almost all of a fixed 12-block test's power, which a Bonferroni split
-(0.05 / 7 at every look) would not. A pass needs the t and the bootstrap
-bound to agree, while either one can show an early failure. `status.json`
-records the blocks used, why the campaign stopped, and its wall time.
+Each trial type stops on its own; the others continue. `status.json`
+records the units run (block, path, type), why each type stopped, and the
+wall time. The analyzer judges each type at its last look, and its tables
+show the bounds at that look's level. Sequential mode is only for workloads
+judged entirely by their own rules, such as `minimal`; the primary gate
+with its `[secondary]` bounds (`bulk`, `single`, `interactive`), D and the
+DC gate keep a fixed number of blocks.
 
-The analyzer judges a stopped campaign at its last look, and its tables
-show the bounds at that look's α. A gate still undecided when another
-gate's failure stopped the campaign is reported as undecided, which counts
-as INCOMPLETE, not as failed.
-
-Sequential mode is only for workloads judged entirely by their own rules,
-such as `minimal`. The primary gate with its `[secondary]` bounds (`bulk`,
-`single`, `interactive`), sample-based `idle-wake` and the DC gate keep a
-fixed number of blocks.
-
-**Cost.** `--dry-run` prints the estimated wall time per path. For the
-example configs:
-
-| Campaign | Estimated wall time |
-|---|---|
-| A, B and C | about 2¼ hours if it stops at block 6, about 4½ hours at the cap of 12 |
-| D | about 40 minutes |
-| DC, on its own path | about 1¾ hours at 6 blocks |
+**Cost.** One block is four trials plus about a minute of restarts, so a
+block of A takes about 5 minutes, B 7, C 9 and DC 5: about 26 minutes per
+block per path for all four, 2.6 hours at 6 blocks and 5.2 hours at the
+12-block cap (design section 15.4). D adds no wall time. `--dry-run`
+prints the per-type block time, the campaign's estimate, the look levels,
+and the run order. DC calibrates each loaded leaf alone in its first block
+only (`calibrate = first`), and that block's solo rates stand for every
+block's ancestor-binding check.
 
 **Optional workloads.** The rest of the workload model is available but is
 not a gate:
 
 - `llm`, `term` and `mixed` with every variant;
 - the swarm (M3) and the soak (M7);
-- the long-tail workloads, which are not built yet: long-idle survival
-  (W9b), HTTP/3 (W8), segment fetch (W10) and one-shot datagrams (W11).
+- the entries the model moves to deterministic tests (W8, W9b, W10, W11,
+  M5), whose live forms are not built.
 
 `ab_analyze.py --flip --profile full` judges the full matrix instead of
 the minimal one.

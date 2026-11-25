@@ -31,7 +31,8 @@ def ms(x):
 def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blocks=12, seed=3,
              cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False, no_solo=(),
              profile="dc-long-haul", fail_requests=(), stagger=(), gw_args=True, nat=False, tcp_leaf=None,
-             no_path_key=False, fallback_leaf=None, tcp_lane_leaf=None, empty_egress=False):
+             no_path_key=False, fallback_leaf=None, tcp_lane_leaf=None, empty_egress=False, calibrate=None,
+             request_kind="requests"):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -47,7 +48,8 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
     rng = random.Random(seed)
     os.makedirs(root)
     plan = {"main": "legacy", "workload": "dc", "paths": ["dc"], "config": {"duration": 60},
-            "dc": {"loaded": LOADED, "control": "ctl", "request_timeout": 30},
+            "dc": dict({"loaded": LOADED, "control": "ctl", "request_timeout": 30},
+                       **({"calibrate": calibrate} if calibrate else {})),
             "arms": {"legacy": {"role": "main", "flags": []}, "cand": {"role": "candidate", "flags": ["--congestion=path"]}},
             "clients": {c: {"small": True} for c in LOADED + ["ctl"]}, "schedule": []}
     rows, srv, mets = [], {}, {}
@@ -98,7 +100,7 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
                     end = t + 60 + 10 * w + (5 if (b, leaf) in stagger else 0)
                     dur = 30.0 if failed else rt
                     for r in range(1, 9):
-                        rows.append([b, "dc", slot] + base + ["requests", j, leaf, "requests", f"w{w}r{r}", iso(t + 60),
+                        rows.append([b, "dc", slot] + base + ["requests", j, leaf, request_kind, f"w{w}r{r}", iso(t + 60),
                                                               iso(t + 70), "000" if failed else 200, 0 if failed else 307200,
                                                               30 if failed else f"{rt:.4f}", 28 if failed else 0,
                                                               0 if failed else 1, 10, ms(end - dur), ms(end)])
@@ -245,6 +247,24 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("uncal", no_solo=((7, "lb"),))
         self.assertEqual(v["cand"], "INCOMPLETE")
         self.assertIn("lack a usable solo calibration of every loaded leaf (first: block 7)", text)
+
+    def test_calibrate_first_lets_block_one_stand_for_every_block(self):
+        # The minimal profile calibrates in the first block only.
+        later = tuple((b, leaf) for b in range(2, 13) for leaf in LOADED)
+        text, v = self.run_gate("first", no_solo=later, calibrate="first")
+        self.assertEqual(v["cand"], "PASS", text)
+        text, v = self.run_gate("every", no_solo=later, calibrate="every")
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        # Block 1's binding is still checked against every block's rates.
+        text, v = self.run_gate("unbound", no_solo=later, calibrate="first", binding=0.95)
+        self.assertEqual(v["cand"], "VOID")
+
+    def test_one_at_a_time_requests_are_the_request_phase(self):
+        # W4 at minimal size (dc-rpc rows) is judged like the request waves.
+        text, v = self.run_gate("rpc", request_kind="dc-rpc")
+        self.assertEqual(v["cand"], "PASS", text)
+        text, v = self.run_gate("rpcslow", request_kind="dc-rpc", cand_request=1.5)
+        self.assertEqual(v["cand"], "FAIL")
 
     def test_the_wrong_profile_gets_no_verdict(self):
         text, v = self.run_gate("profile", profile="wan-shared-bottleneck")

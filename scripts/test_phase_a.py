@@ -457,7 +457,12 @@ class Flip(unittest.TestCase):
                 pathlib.Path(bulk, "plan.json").write_text(json.dumps(bplan))
                 text, ok = an.flip_report([good, bulk], self.gates)
                 self.assertFalse(ok)
-                self.assertIn("arm `cand` is a different build", text)
+                # The newer campaign's build is the final bundle; llm ran on
+                # an earlier one and counts only if carried forward.
+                self.assertIn("Not on the final bundle: llm single-100k-down4 on a for cand", text)
+                text, ok = an.flip_report([good, bulk], self.gates, carry=["single-100k-down4", "single-100k-none"])
+                self.assertNotIn("Not on the final bundle", text)
+                self.assertIn("| llm | a | cand | single-100k-none | PASS | carried forward from good |", text)
             text, ok = an.flip_report([good, other], self.gates)
             self.assertIn("| llm | b | cand |", text)
             self.assertTrue(ok, text)   # llm on both paths
@@ -524,7 +529,9 @@ class Flip(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("llm single-100k-down4 on b for cand", text)
 
-    def test_the_same_arm_with_other_flags_is_not_one_release(self):
+    def test_a_pass_on_other_flags_is_stale_unless_carried_forward(self):
+        # flags-a ran both cells; the newer flags-b (another flag bundle: the
+        # final bundle) reran only one of them.
         a_ = os.path.join(self.tmp.name, "flags-a")
         write_llm_campaign(a_)
         b_ = os.path.join(self.tmp.name, "flags-b")
@@ -532,10 +539,37 @@ class Flip(unittest.TestCase):
         plan = json.loads(pathlib.Path(b_, "plan.json").read_text())
         plan["arms"]["cand"]["flags"] = ["--sched=class"]
         pathlib.Path(b_, "plan.json").write_text(json.dumps(plan))
+        tsv = pathlib.Path(b_, "trials.tsv").read_text().splitlines()
+        pathlib.Path(b_, "trials.tsv").write_text("\n".join(
+            [tsv[0]] + [l for l in tsv[1:] if l.split("\t")[7] != "single-100k-down4"]) + "\n")
+        recs = [json.loads(l) for l in pathlib.Path(b_, "measures.jsonl").read_text().splitlines()]
+        pathlib.Path(b_, "measures.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs
+                                                              if r["_phase"] != "single-100k-down4"))
         with mock.patch.object(an, "FLIP_WORKLOADS", ("llm",)):
             text, ok = an.flip_report([a_, b_], self.gates)
+            self.assertFalse(ok)
+            self.assertIn("llm single-100k-down4 on a for cand ran on an earlier build or other flags (flags-a; "
+                          "the final bundle is flags-b)", text)
+            # The cell flags-b reran is taken from the final bundle.
+            self.assertIn("| llm | a | cand | single-100k-none | PASS |  |", text)
+            text, ok = an.flip_report([a_, b_], self.gates, carry=["single-100k-down4"])
+            self.assertTrue(ok, text)
+            self.assertIn("| llm | a | cand | single-100k-down4 | PASS | carried forward from flags-a |", text)
+            with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(an, "load_gates", return_value=self.gates):
+                self.assertEqual(an.main([a_, b_, "--flip", "--carry", "single-100k-down4"]), 0)
+
+    def test_a_failure_on_the_final_bundle_is_not_rescued_by_an_earlier_pass(self):
+        a_ = os.path.join(self.tmp.name, "early")
+        write_llm_campaign(a_)
+        b_ = os.path.join(self.tmp.name, "final")
+        write_llm_campaign(b_, cand_late=0.15)
+        plan = json.loads(pathlib.Path(b_, "plan.json").read_text())
+        plan["arms"]["cand"]["commit"] = "e" * 40
+        pathlib.Path(b_, "plan.json").write_text(json.dumps(plan))
+        with mock.patch.object(an, "FLIP_WORKLOADS", ("llm",)):
+            text, ok = an.flip_report([a_, b_], self.gates, carry=["single-100k-none"])
         self.assertFalse(ok)
-        self.assertIn("arm `cand` has different flags", text)
+        self.assertIn("| llm | a | cand | single-100k-none | **FAIL** |  |", text)
 
     def test_binary_digests_accumulate_across_campaigns(self):
         gw = {"gateway": {"platform": "linux/amd64", "sha256": "1" * 64}}

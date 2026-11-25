@@ -28,7 +28,7 @@ import math
 import os
 import re
 import sys
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
@@ -69,7 +69,7 @@ def load_gates(path: str = GATES) -> dict:
             rules = {}
             for k, v in cp[section].items():
                 parts = v.split()
-                kinds = list(RULES) + list(HARD)
+                kinds = list(RULES) + list(HARD) + list(VS_MAIN)
                 if parts and parts[0] in ("atmost", "atleast") and len(parts) in (2, 3):
                     pass
                 elif len(parts) != 2 or parts[0] not in kinds:
@@ -104,6 +104,13 @@ RULES: Dict[str, Callable[[float, float, Tuple[float, ...]], float]] = {
 HARD: Dict[str, Callable[[float, Tuple[float, ...]], bool]] = {
     "floor": lambda c, v: c >= v[0],
     "ceiling": lambda c, v: c <= v[0],
+}
+
+
+# Deterministic comparisons with main, not statistical (D's "delivered count
+# at 16 min >= main's"): nofewer v (cand >= main - v).
+VS_MAIN: Dict[str, Callable[[float, float, Tuple[float, ...]], bool]] = {
+    "nofewer": lambda c, m, v: c >= m - v[0],
 }
 
 
@@ -260,9 +267,15 @@ def capped_flows(rows: List[dict], duration: float) -> int:
 
 
 class Trial:
-    def __init__(self, block: int, path: str, slot: int, arm: str, role: str, arm_trial: int, cold: bool):
+    def __init__(self, block: int, path: str, slot: int, arm: str, role: str, arm_trial: int, cold: bool,
+                 trial: str = ""):
         self.block, self.path, self.slot, self.arm, self.role = block, path, slot, arm, role
         self.arm_trial, self.cold = arm_trial, cold
+        # The trial type whose block this trial is in ("" when every trial
+        # runs every phase).
+        self.trial = trial
+        # The gateway's flow completion records in this trial's window.
+        self.flow_records: List[dict] = []
         self.start = math.inf
         self.end = -math.inf
         self.rows: List[dict] = []
@@ -271,7 +284,11 @@ class Trial:
 
     @property
     def tag(self) -> str:
-        return f"b{self.block:03d}-{self.path}"
+        return f"b{self.block:03d}-{self.path}" + (f"-{self.trial}" if self.trial else "")
+
+    @property
+    def unit(self) -> Tuple[int, str, str]:
+        return self.block, self.path, self.trial
 
     def bulk(self) -> List[dict]:
         return [r for r in self.rows if r["kind"] == "bulk"]
@@ -289,7 +306,8 @@ def read_campaign(campaign: str) -> Tuple[dict, Dict[Tuple[int, str, int], Trial
             key = (int(r["block"]), r["path"], int(r["slot"]))
             t = trials.get(key)
             if t is None:
-                t = trials[key] = Trial(key[0], key[1], key[2], r["arm"], r["role"], int(r["arm_trial"]), r["cold"] == "1")
+                t = trials[key] = Trial(key[0], key[1], key[2], r["arm"], r["role"], int(r["arm_trial"]), r["cold"] == "1",
+                                        r.get("trial") or "")
             t.rows.append(r)
             t.start = min(t.start, ts(r["start_utc"]))
             t.end = max(t.end, ts(r["end_utc"]))
@@ -321,7 +339,8 @@ LOG_MEASURES = ("queue_p90_ms", "reissued_per_source", "transit_p50_s", "transit
 
 
 def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial],
-                 interim: bool = False) -> Tuple[List[str], Dict[Tuple[int, str, int], Trial]]:
+                 interim: bool = False, units_run: Optional[Sequence[Sequence[Any]]] = None
+                 ) -> Tuple[List[str], Dict[Tuple[int, str, int], Trial]]:
     """Problems that forbid a verdict, and the trials of complete blocks only.
 
     A verdict needs a campaign that finished (status.json from the runner)
@@ -333,6 +352,10 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
     problems: List[str] = []
     failed_jobs: List[dict] = []
     last_block = None
+    # The (block, path, trial type) units that ran: a type stopped by the
+    # sequential rule planned no more blocks, and at a look the units run so
+    # far are the plan.
+    ran: Optional[set] = {tuple(u) for u in units_run} if units_run is not None else None
     try:
         if interim:
             # A look during the campaign: no status yet; the blocks run so
@@ -346,7 +369,9 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
         else:
             problems.append("no status.json: the campaign did not finish")
     else:
-        if plan.get("sequential") and status.get("blocks_run"):
+        if plan.get("sequential") and status.get("units_run") is not None:
+            ran = {tuple(u) for u in status["units_run"]}
+        elif plan.get("sequential") and status.get("blocks_run"):
             # A sequential campaign that stopped early planned no more.
             last_block = int(status["blocks_run"])
         if status.get("status") != "complete":
@@ -357,18 +382,19 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
             problems.append(f"{len(status['fetch_failures'])} log file(s) could not be fetched; the log-derived "
                             "measures of the affected trials are withheld")
         failed_jobs = status.get("job_failures") or []
-    planned: Dict[Tuple[int, str], set] = collections.defaultdict(set)
+    planned: Dict[Tuple[int, str, str], set] = collections.defaultdict(set)
     for sl in plan.get("schedule", []):
-        if last_block is None or sl["block"] <= last_block:
-            planned[(sl["block"], sl["path"])].add(sl["slot"])
-    have: Dict[Tuple[int, str], set] = collections.defaultdict(set)
-    for (b, p, slot) in trials:
+        u = (sl["block"], sl["path"], sl.get("trial") or "")
+        if (last_block is None or sl["block"] <= last_block) and (ran is None or u in ran):
+            planned[u].add(sl["slot"])
+    have: Dict[Tuple[int, str, str], set] = collections.defaultdict(set)
+    for (b, p, slot), t in trials.items():
         if slot < 100:
-            have[(b, p)].add(slot)
+            have[t.unit].add(slot)
     bad = sorted(k for k, slots in planned.items() if not slots <= have.get(k, set()))
     # A block in which a generator did not run to its end has harness
     # evidence, not the arm's: left out like a missing trial.
-    broken = sorted({(j["block"], j["path"]) for j in failed_jobs})
+    broken = sorted({(j["block"], j["path"], j.get("trial") or "") for j in failed_jobs})
     if broken:
         problems.append(f"{len(broken)} block(s) had a job that did not run to its end "
                         f"(first: block {broken[0][0]} on {broken[0][1]}); they are left out")
@@ -376,7 +402,7 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
     if bad:
         problems.append(f"{len(bad)} of {len(planned)} planned blocks are missing trials "
                         f"(first: block {bad[0][0]} on {bad[0][1]}); they are left out")
-    keep = {k: t for k, t in trials.items() if (k[0], k[1]) not in set(bad)}
+    keep = {k: t for k, t in trials.items() if t.unit not in set(bad) and (k[2] >= 100 or t.unit in planned or not planned)}
     return problems, keep
 
 
@@ -592,6 +618,7 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         # the gateway's flow records, none showing a TCP carrier or lane.
         flows_rec = [r for r in srecs if r.get("msg") in ("remote flow complete", "remote flow ended with error")
                      and t.start - 1 <= r["_t"] <= t.end + 5]
+        t.flow_records = flows_rec
         t.m["tcp_flows"] = float(sum(1 for r in flows_rec if tcp_evidence(r)))
         if t.m.get("client_transport") not in ("quic", "auto") or not flows_rec or t.m["tcp_flows"]:
             t.m["wire_per_useful"] = float("nan")
@@ -667,13 +694,14 @@ def decision_verdict(dec: str, interim: bool) -> str:
     return {"pass": "pass", "fail": "**FAIL**"}.get(dec, "undecided" if interim else "**FAIL**")
 
 
-def report(campaign: str, gates: dict, interim: bool = False) -> Tuple[str, dict]:
+def report(campaign: str, gates: dict, interim: bool = False,
+           units_run: Optional[Sequence[Sequence[Any]]] = None) -> Tuple[str, dict]:
     plan, trials = read_campaign(campaign)
     if plan.get("workload") == "dc":
         raise SystemExit("this is a DC gate campaign: evaluate it with scripts/dc_gate.py")
     EFFECTIVE.clear()
     sq = sequential_of(plan)
-    problems, trials = completeness(campaign, plan, trials, interim=interim)
+    problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run)
     # A sequential campaign that stopped early (on another gate's verdict)
     # leaves its undecided gates undecided, not failed.
     stopped_early = False
@@ -698,6 +726,14 @@ def report(campaign: str, gates: dict, interim: bool = False) -> Tuple[str, dict
             ts_ = [t for t in trials.values() if t.path == path and t.block == block and t.arm == arm]
             block_cache[k] = wl.block_extract(ts_, plan) if ts_ else {}
         return block_cache[k]
+    tail_cache: Dict[Tuple[str, int, str], Dict[str, Tuple[float, List[float]]]] = {}
+
+    def block_tails(path: str, block: int, arm: str) -> Dict[str, Tuple[float, List[float]]]:
+        k = (path, block, arm)
+        if k not in tail_cache:
+            ts_ = [t for t in trials.values() if t.path == path and t.block == block and t.arm == arm]
+            tail_cache[k] = wl.block_tails(ts_, plan) if ts_ else {}
+        return tail_cache[k]
     main = plan["main"]
     arms = [main] + [a for a in plan["arms"] if a != main]
     paths = plan["paths"]
@@ -775,7 +811,7 @@ def report(campaign: str, gates: dict, interim: bool = False) -> Tuple[str, dict
                         seed=gates["seed"], max_zero_main_fraction=gates["max_zero_main_fraction"])
             verdict = "VOID" if g.void else ("**PASS**" if g.passed else "**FAIL**")
             if sq and not g.void:
-                # Sequential: the Haybittle-Peto boundary at this look decides.
+                # Sequential: the look's nominal level (alpha spending) decides.
                 d_ = st.contrasts(c, m, gates["ratio"])
                 dec = sq.decide(d_, gates["resamples"], gates["seed"])
                 verdict = {"pass": "**PASS**", "fail": "**FAIL**"}.get(dec, "undecided" if undecided_ok else "**FAIL**")
@@ -859,7 +895,11 @@ def report(campaign: str, gates: dict, interim: bool = False) -> Tuple[str, dict
                     "|---|---|---|---:|---:|---:|---:|---|"]
             for key, (kind, values) in judged_rules.items():
                 for cand in arms[1:]:
-                    common = [b for b in blocks_here if block_measures(path, b, cand) and block_measures(path, b, main)]
+                    # The blocks in which this measure's trial type ran in
+                    # both arms (a type stopped early has fewer blocks).
+                    common = [b for b in blocks_here if key in block_measures(path, b, cand)
+                              and key in block_measures(path, b, main)] or \
+                             [b for b in blocks_here if block_measures(path, b, cand) and block_measures(path, b, main)]
                     c = [block_measures(path, b, cand).get(key, float("nan")) for b in common]
                     m = [block_measures(path, b, main).get(key, float("nan")) for b in common]
                     need = math.ceil(gates["secondary_min_coverage"] * judged.get(cand, len(common)) - 1e-9)
@@ -871,8 +911,34 @@ def report(campaign: str, gates: dict, interim: bool = False) -> Tuple[str, dict
                                    f"{fmt(mean_d, '.4g')} | n/a | {fmt(bl, '.4g')} | {verdict} |")
                         continue
                     dec = None
+                    tails = [(block_tails(path, b, cand).get(key), block_tails(path, b, main).get(key)) for b in common]
+                    if kind in RULES and tails and all(c_ and m_ for c_, m_ in tails) and \
+                            min(min(len(c_[1]), len(m_[1])) for c_, m_ in tails) < tail_min(tails[0][0][0]):
+                        # A tail percentile with too few samples per block is
+                        # computed over all blocks' pooled samples and tested
+                        # by resampling blocks (section 15.4).
+                        a_ = sq.alpha_at(len(tails)) if sq else gates["alpha"]
+                        q = tails[0][0][0]
+                        mean_d, lo_, hi_ = st.pooled_quantile_bounds(
+                            [c_[1] for c_, _ in tails], [m_[1] for _, m_ in tails], q,
+                            lambda c__, m__: RULES[kind](c__, m__, values), a_, gates["resamples"], gates["seed"])
+                        if lo_ > 0:
+                            dec = "pass"
+                        elif hi_ < 0 or (sq and len(tails) >= sq.cap) or not sq:
+                            dec = "fail"
+                        else:
+                            dec = "continue"
+                        n_pooled = sum(len(c_[1]) for c_, _ in tails)
+                        verdict = "n/a" if len(tails) < max(need, 2) else decision_verdict(dec, undecided_ok)
+                        verdicts[(path, cand, f"rule:{key}")] = verdict
+                        out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {len(tails)} "
+                                   f"(pooled, {n_pooled} samples) | {fmt(mean_d, '.4g')} | n/a | {fmt(lo_, '.4g')} | {verdict} |")
+                        continue
                     if kind in HARD:
                         ok = bool(measured) and all(HARD[kind](x, values) for x, _ in measured)
+                        mean_d, tl, bl = float("nan"), float("nan"), float("nan")
+                    elif kind in VS_MAIN:
+                        ok = bool(measured) and all(y == y and VS_MAIN[kind](x, y, values) for x, y in measured)
                         mean_d, tl, bl = float("nan"), float("nan"), float("nan")
                     else:
                         d = rule_contrasts(kind, values, [x for x, _ in measured], [y for _, y in measured])
@@ -913,6 +979,12 @@ def report(campaign: str, gates: dict, interim: bool = False) -> Tuple[str, dict
     return "\n".join(out) + "\n", verdicts
 
 
+def tail_min(q: float) -> int:
+    """Samples per arm a block needs for a tail percentile to be gated per
+    block (section 15.4): 20 for a p95, 100 for a p99."""
+    return 100 if q >= 0.99 else 20 if q >= 0.95 else 2
+
+
 def sample_rule(wl, trials, path: str, cand: str, main: str, key: str, kind: str, values, gates: dict):
     """A sample-based workload's rule (idle-wake): the arms' pooled samples
     compared by an unpaired bootstrap of the measure's statistic; a hard
@@ -932,6 +1004,11 @@ def sample_rule(wl, trials, path: str, cand: str, main: str, key: str, kind: str
     cs = wl.samples(ct).get(src, [])
     ms = wl.samples(mt).get(src, [])
     statf = (lambda xs: _sample_stat(xs, stat))
+    if kind in VS_MAIN:
+        if not cs or not ms:
+            return "n/a", nan, nan, nan, len(cs)
+        ok = VS_MAIN[kind](statf(cs), statf(ms), values)
+        return ("pass" if ok else "**FAIL**"), statf(cs) - statf(ms), nan, nan, len(cs)
     if kind in HARD:
         if not cs:
             return "n/a", nan, nan, nan, 0
@@ -961,20 +1038,24 @@ def _sample_stat(xs, stat) -> float:
     return st.quantile(xs, stat)
 
 
-def interim_decisions(campaign: str, gates: dict) -> List[str]:
-    """The runner's look: every gate decision on the blocks run so far, as
-    'pass', 'fail' or 'continue' (undecided, unmeasured or void)."""
+def interim_decisions(campaign: str, gates: dict,
+                      units_run: Optional[Sequence[Sequence[Any]]] = None) -> Dict[Tuple[str, str], List[str]]:
+    """The runner's look: every gate decision on the units run so far, as
+    'pass', 'fail' or 'continue' (undecided, unmeasured or void), by (path,
+    cell): a rule's cell is its phase (the trial type that measures it), the
+    primary gate's is ""."""
     with open(os.path.join(campaign, "plan.json")) as f:
         plan = json.load(f)
     wl = ab_workloads.get(plan.get("workload", "bulk"))
-    _, v = report(campaign, gates, interim=True)
-    out = []
-    for (_, _, key), verdict in v.items():
+    _, v = report(campaign, gates, interim=True, units_run=units_run)
+    out: Dict[Tuple[str, str], List[str]] = collections.defaultdict(list)
+    for (path, _, key), verdict in v.items():
         # Only the gates that apply: a workload without a byte outcome has no
         # primary gate to wait for.
         if (key == "primary" and wl.primary) or key.startswith("rule:"):
-            out.append({"**PASS**": "pass", "pass": "pass", "**FAIL**": "fail"}.get(verdict, "continue"))
-    return out
+            cell = key[5:].split(".", 1)[0] if key.startswith("rule:") and "." in key else ""
+            out[(path, cell)].append({"**PASS**": "pass", "pass": "pass", "**FAIL**": "fail"}.get(verdict, "continue"))
+    return dict(out)
 
 
 def write_per_trial(campaign: str, trials) -> None:
@@ -1126,22 +1207,41 @@ def merge_build(a: Tuple[str, object], b: Tuple[str, object]) -> Tuple[str, obje
     return a
 
 
-def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal") -> Tuple[str, bool]:
-    """The stage-10 default flip over a set of campaigns. One release: each
-    arm the same build, in the same role, everywhere. Full coverage: every
-    candidate on every path in every required workload. Then every cell of
-    every one of those must PASS."""
-    rows: List[Tuple[str, str, str, str, str]] = []
+def finished_at(campaign: str) -> str:
+    """When the campaign finished (status.json), for ordering; "" if unknown."""
+    try:
+        with open(os.path.join(campaign, "status.json")) as f:
+            return str(json.load(f).get("finished_utc") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
+                carry: Sequence[str] = ()) -> Tuple[str, bool]:
+    """The stage-10 default flip over a set of campaigns (design section 15.3:
+    each trial type runs once per path, at its gate, and a pass carries
+    forward to the flip; a trial is rerun on the final bundle only when a
+    later stage changes what it exercises).
+
+    The final bundle of a candidate arm is what it ran in the newest campaign
+    (build and flags). A cell measured on the final bundle counts as is. A
+    cell measured only on an earlier build counts only when it is named in
+    `carry` (the operator's statement that no later stage changed what it
+    exercises), and is reported as carried forward. Full coverage: every
+    candidate on every path in every required cell. Then each counted cell
+    must PASS."""
+    required = FLIP_PROFILES[profile] if FLIP_WORKLOADS == tuple(FLIP_PROFILES["minimal"]) else \
+        {w_: () for w_ in FLIP_WORKLOADS}
+    carry = {c.strip().lower() for c in carry if c.strip()}
+    # (workload, path, candidate, cell, verdict, identity, order, campaign)
+    rows: List[Tuple[str, str, str, str, str, tuple, tuple, str]] = []
     seen = set()
-    mismatch: List[str] = []
-    builds: Dict[str, Tuple[str, object]] = {}
-    configs: Dict[str, Tuple[Tuple[str, ...], ...]] = {}
+    problems: List[str] = []
     roles: Dict[str, str] = {}
     paths_all: set = set()
     candidates: set = set()
-    required = FLIP_PROFILES[profile] if FLIP_WORKLOADS == tuple(FLIP_PROFILES["minimal"]) else \
-        {w_: () for w_ in FLIP_WORKLOADS}
-    for campaign in campaigns:
+    final: Dict[str, Tuple[tuple, tuple, str]] = {}      # arm -> (identity, order, campaign)
+    for n_, campaign in enumerate(campaigns):
         base = os.path.basename(os.path.normpath(campaign))
         with open(os.path.join(campaign, "plan.json")) as f:
             plan = json.load(f)
@@ -1151,65 +1251,82 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal")
             # covers nor constrains the flip's matrix.
             continue
         seen.add(name)
+        order = (finished_at(campaign), n_)
+        ident: Dict[str, tuple] = {}
         for arm, e in plan["arms"].items():
             role = "main" if arm == plan["main"] else "candidate"
             if roles.setdefault(arm, role) != role:
-                mismatch.append(f"arm `{arm}` is {role} in {base} but {roles[arm]} elsewhere")
+                problems.append(f"arm `{arm}` is {role} in {base} but {roles[arm]} elsewhere")
             b = build_identity(e)
-            if arm in builds:
-                if not same_build(builds[arm], b):
-                    mismatch.append(f"arm `{arm}` is a different build in {base}")
-                else:
-                    builds[arm] = merge_build(builds[arm], b)
-            else:
-                builds[arm] = b
-            cfg_ = arm_config(e)
-            if configs.setdefault(arm, cfg_) != cfg_:
-                mismatch.append(f"arm `{arm}` has different flags in {base}")
+            ident[arm] = (b[0], tuple(sorted(b[1].items())) if isinstance(b[1], dict) else b[1], arm_config(e))
             if role == "candidate":
                 candidates.add(arm)
+                if arm not in final or order > final[arm][1]:
+                    final[arm] = (ident[arm], order, base)
         if name == "dc":
             import dc_gate
             _, v = dc_gate.evaluate(campaign, dc_gate.load_bounds())
             for cand, verdict in v.items():
-                rows.append((name, "dc", cand, "dc-gate", verdict))
+                rows.append((name, "dc", cand, "dc-gate", verdict, ident.get(cand, ()), order, base))
             continue
         paths_all |= set(plan["paths"])
         _, v = report(campaign, gates)
         for path in plan["paths"]:
             for cand in [a for a in plan["arms"] if a != plan["main"]]:
                 for cell, verdict in sorted(cell_verdicts(v, path, cand).items()):
-                    rows.append((name, path, cand, cell, verdict))
-    if len({a for a, r in roles.items() if r == "main"}) > 1:
-        mismatch.append("the campaigns do not share one reference arm: "
-                        + ", ".join(sorted(a for a, r in roles.items() if r == "main")))
+                    rows.append((name, path, cand, cell, verdict, ident[cand], order, base))
+
+    def same(a: tuple, b: tuple) -> bool:
+        """Same build (binaries: every role and platform both used) and flags."""
+        if a[2] != b[2]:
+            return False
+        ba = (a[0], dict(a[1]) if a[0] == "binaries" else a[1])
+        bb = (b[0], dict(b[1]) if b[0] == "binaries" else b[1])
+        return same_build(ba, bb)
+    rows = [r for r in rows if r[0] in required]
+    # Per (workload, path, candidate, cell): the newest row on the final
+    # bundle, else the newest earlier one if it may carry forward.
+    chosen: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
+    stale: List[str] = []
+    for key in sorted({r[:4] for r in rows}):
+        rs = sorted((r for r in rows if r[:4] == key), key=lambda r: r[6])
+        fin = final.get(key[2])
+        on_final = [r for r in rs if fin and same(r[5], fin[0])]
+        if on_final:
+            chosen[key] = (on_final[-1][4], "")
+        elif key[3].lower() in carry:
+            chosen[key] = (rs[-1][4], f"carried forward from {rs[-1][7]}")
+        else:
+            stale.append(f"{key[0]} {key[3]} on {key[1]} for {key[2]} ran on an earlier build or other flags "
+                         f"({rs[-1][7]}; the final bundle is {fin[2] if fin else '?'}): rerun it on the final bundle, "
+                         f"or carry it forward with --carry {key[3]} if no later stage changed what it exercises")
     # Coverage before verdicts: a combination with no row is missing, not
     # passed by the rows that happen to exist.
-    # Per cell: a workload's required cells are every cell any campaign ran
-    # for it, and each must be there on every path for every candidate.
-    have = {(w_, p_, c_, cell) for w_, p_, c_, cell, _ in rows}
     cells_of: Dict[str, set] = collections.defaultdict(set)
-    for w_, _, _, cell, _ in rows:
-        cells_of[w_].add(cell)
+    for r in rows:
+        cells_of[r[0]].add(r[3])
     missing: List[str] = [f"{w_} (no campaign)" for w_ in required if w_ not in seen]
-    # Only the required workloads count: optional ones (the long-tail
-    # workloads) may be reported but do not decide the flip.
-    rows = [r for r in rows if r[0] in required]
     for w_ in sorted(set(required)):
         for p_ in (["dc"] if w_ == "dc" else sorted(paths_all)):
             for c_ in sorted(candidates):
                 for cell in sorted(set(required[w_]) or cells_of.get(w_) or {"(any)"}):
-                    if (w_, p_, c_, cell) not in have:
+                    if not any(r[:4] == (w_, p_, c_, cell) for r in rows):
                         missing.append(f"{w_} {cell} on {p_} for {c_}")
-    ok = bool(rows) and not missing and not mismatch and all(r[4] == "PASS" for r in rows)
+    ok = bool(chosen) and not missing and not stale and not problems and all(v_ == "PASS" for v_, _ in chosen.values())
     out = ["## Stage-10 default flip", "",
-           "Every path x workload x cell of every candidate must PASS (DESIGN-PATH-AUTHORITY.md section 14, stage 10; "
-           "WORKLOADS.md 6).", "", "| workload | path | candidate | cell | verdict |", "|---|---|---|---|---|"]
-    out += [f"| {w_} | {p_} | {c_} | {cell} | {v_ if v_ == 'PASS' else '**' + v_ + '**'} |" for w_, p_, c_, cell, v_ in rows]
+           "Every path x trial type of every candidate must PASS on the final bundle, or carry its pass forward "
+           "(DESIGN-PATH-AUTHORITY.md sections 14 and 15.3).", "",
+           "| workload | path | candidate | cell | verdict | note |", "|---|---|---|---|---|---|"]
+    out += [f"| {w_} | {p_} | {c_} | {cell} | {v_ if v_ == 'PASS' else '**' + v_ + '**'} | {note} |"
+            for (w_, p_, c_, cell), (v_, note) in sorted(chosen.items())]
+    if final:
+        out += ["", "Final bundle: " + "; ".join(f"`{a}` as run in {fin[2]}" for a, fin in sorted(final.items())) + "."]
     if missing:
         out += ["", "Missing: " + ", ".join(f"`{m}`" for m in missing) + "."]
-    if mismatch:
-        out += ["", "Not one release: " + "; ".join(mismatch) + "."]
+    if stale:
+        out += ["", "Not on the final bundle: " + "; ".join(stale) + "."]
+    if problems:
+        out += ["", "Inconsistent: " + "; ".join(problems) + "."]
     out += ["", f"**Flip: {'PASS' if ok else 'NOT PASSED'}.**"]
     return "\n".join(out) + "\n", ok
 
@@ -1223,10 +1340,13 @@ def main(argv=None) -> int:
                     help="judge the stage-10 flip over these campaigns: every path x workload x cell must PASS")
     ap.add_argument("--profile", choices=sorted(FLIP_PROFILES), default="minimal",
                     help="which workloads the flip requires (default: minimal)")
+    ap.add_argument("--carry", default="",
+                    help="with --flip: comma-separated cells (bulk, mixed-67, dc-gate, ...) whose pass on an earlier "
+                         "build carries forward because no later stage changed what they exercise")
     args = ap.parse_args(argv)
     gates = load_gates(args.gates)
     if args.flip:
-        text, ok = flip_report(args.campaign, gates, args.profile)
+        text, ok = flip_report(args.campaign, gates, args.profile, args.carry.split(","))
         sys.stdout.write(text)
         return 0 if ok else 1
     if len(args.campaign) != 1:

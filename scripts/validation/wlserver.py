@@ -51,6 +51,13 @@ BLOCK = os.urandom(1 << 16)
 # Bytes received per tagged upload, and whether its request has ended.
 SINK: dict = {}
 SINK_LOCK = threading.Lock()
+# Per call id (4 bytes the client writes at 36..39): (stream, seq) -> the
+# reflector's receive time, for the call's per-direction report; and when
+# the call was last heard from, to forget old calls.
+CALLS: dict = {}
+CALLS_SEEN: dict = {}
+CALLS_LOCK = threading.Lock()
+MUX_FRAME = 16384
 
 
 def mono_ms() -> float:
@@ -135,6 +142,31 @@ class HTTP(socketserver.StreamRequestHandler):
                 if tag:
                     with SINK_LOCK:
                         SINK[tag]["done"] = True
+            if method == "GET" and url.path == "/call-report":
+                # The call's uplink as the reflector saw it: per stream, every
+                # (seq, receive ms) it got, so the client can tell a packet
+                # lost up from one lost down.
+                q = {k: v[0] for k, v in parse_qs(url.query).items()}
+                try:
+                    cid = bytes.fromhex(q.get("id", ""))
+                except ValueError:
+                    cid = b""
+                with CALLS_LOCK:
+                    got = dict(CALLS.get(cid, {}))
+                rep_ = {"a": sorted([s, round(t, 1)] for (st_, s), t in got.items() if st_ == b"a"),
+                        "v": sorted([s, round(t, 1)] for (st_, s), t in got.items() if st_ == b"v")}
+                body = json.dumps(rep_, separators=(",", ":")).encode() if got else b""
+                self.wfile.write((b"HTTP/1.1 200 OK" if got else b"HTTP/1.1 404 Not Found") +
+                                 b"\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+                self.wfile.flush()
+                continue
+            if method == "GET" and url.path == "/mux":
+                # An HTTP/2-shaped connection (W3 h2): every object requested on
+                # it at once, the responses interleaved in frames.
+                self.wfile.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: qq-mux\r\n\r\n")
+                self.wfile.flush()
+                self.mux()
+                return
             if method == "GET" and url.path == "/sink-report":
                 q = {k: v[0] for k, v in parse_qs(url.query).items()}
                 with SINK_LOCK:
@@ -168,11 +200,66 @@ class HTTP(socketserver.StreamRequestHandler):
                     left -= k
                 self.wfile.flush()
             elif method == "POST" and url.path == "/sink":
-                self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok\n")
+                # ?reply=N: an N-byte answer (W4's ASR reply), else "ok".
+                q = {k: v[0] for k, v in parse_qs(url.query).items()}
+                try:
+                    n = max(0, min(int(q.get("reply", "0")), 1 << 20))
+                except ValueError:
+                    n = 0
+                body = BLOCK[:n] if n else b"ok\n"
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
                 self.wfile.flush()
             else:
                 self.wfile.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                 self.wfile.flush()
+
+    def mux(self) -> None:
+        """Streams on one connection, as HTTP/2 carries a page's objects:
+        requests are `R` + stream id (4) + size (4) + padding to 600 bytes;
+        responses are frames `D` + stream id (4) + length (4) + payload, of
+        up to 16 KiB, taken round-robin across the open streams, and `F` +
+        stream id (4) when a stream's object is complete."""
+        active: list = []
+        cond = threading.Condition()
+        closed = [False]
+
+        def reader():
+            try:
+                while True:
+                    head = self.rfile.read(600)
+                    if len(head) < 600 or head[:1] != b"R":
+                        break
+                    sid, size = struct.unpack(">II", head[1:9])
+                    with cond:
+                        active.append([sid, min(size, 1 << 30)])
+                        cond.notify()
+            except (OSError, ssl.SSLError, ValueError):
+                pass
+            with cond:
+                closed[0] = True
+                cond.notify()
+        threading.Thread(target=reader, daemon=True).start()
+        try:
+            while True:
+                with cond:
+                    while not active and not closed[0]:
+                        cond.wait()
+                    if not active:
+                        return
+                    st_ = active.pop(0)
+                sid, left = st_
+                k = min(left, MUX_FRAME)
+                out = b"D" + struct.pack(">II", sid, k) + BLOCK[:k]
+                left -= k
+                if left <= 0:
+                    out += b"F" + struct.pack(">I", sid)
+                self.wfile.write(out)
+                self.wfile.flush()
+                if left > 0:
+                    with cond:
+                        active.append([sid, left])
+        except (OSError, ssl.SSLError):
+            return
 
     def llm(self, R: float, think_ms: float, n: int, cadence_ms: float, seed: int) -> None:
         time.sleep(think_ms / 1000.0)
@@ -275,6 +362,17 @@ def reflect(sock: socket.socket) -> None:
             continue
         now = mono_ms()
         counts[peer] = counts.get(peer, 0) + 1
+        if len(data) >= 40 and data[:2] == b"QC":
+            cid = data[36:40]
+            stream, seq = data[2:3], struct.unpack_from(">I", data, 4)[0]
+            with CALLS_LOCK:
+                CALLS.setdefault(cid, {})[(stream, seq)] = now
+                CALLS_SEEN[cid] = now
+                if len(CALLS) > 64:
+                    # Forget calls not heard from for ten minutes.
+                    for old in [c for c, t in CALLS_SEEN.items() if now - t > 600_000]:
+                        CALLS.pop(old, None)
+                        CALLS_SEEN.pop(old, None)
         if len(data) >= 36:
             data = data[:24] + struct.pack(">dI", now, counts[peer]) + data[36:]
         try:
@@ -284,14 +382,14 @@ def reflect(sock: socket.socket) -> None:
 
 
 class Wake(socketserver.BaseRequestHandler):
-    """Idle-wake connections. The client opens one with a line
-    `W <sync bytes> <wake seconds,...> <followups>`; the server sends the
-    sync burst at once (login history), then stays silent until each wake
-    time (seconds after the request, on its own clock), when it pushes one
-    message and `followups` more at 1 s spacing. A push is the record
-    `P<4-byte index><8-byte server monotonic ms>`. The client may also send
-    `S<4-byte n>` at any time, answered at once by `A<4-byte n>` (the
-    client-send wake)."""
+    """Idle-wake connections (W9a, trial D). The client opens one with a
+    line `W <sync bytes> <wake seconds> <push|send> <followups>`; the server
+    sends the sync burst at once (login history), then stays silent. For a
+    push wake it pushes one message at the wake time (seconds after the
+    request, on its own clock) and `followups` more at 1 s spacing; a push
+    is `P<4-byte index><8-byte server monotonic ms>`. The client may send
+    `S<4-byte n>` at any time, answered at once by `A<4-byte n>` (a send
+    wake and its warm follow-ups)."""
 
     def setup(self):
         handshake(self)
@@ -307,7 +405,8 @@ class Wake(socketserver.BaseRequestHandler):
                 if not b:
                     return
                 line += b
-            _, sync, wakes, follow = line.decode().split()
+            _, sync, at, mode, follow = line.decode().split()
+            wakes = at if mode == "push" else ""
             t0 = time.monotonic()
             left = int(sync)
             with lock:

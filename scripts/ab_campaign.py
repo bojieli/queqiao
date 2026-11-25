@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import dataclasses
 import datetime as dt
 import hashlib
 import json
@@ -79,11 +80,12 @@ CANON_SH = r'''canon() {
   echo "${r:-$p}$rest"
 }
 '''
-# Wall-time estimates: seconds the runner adds per trial (client start and
-# stop, scrapes), per block (gateway restarts, log collection) and once
-# (builds, copies, enrollment). Measured on earlier campaigns; rough.
-TRIAL_OVERHEAD = 25
-BLOCK_OVERHEAD = 45
+# Wall-time estimates: seconds the runner adds per block of one trial type
+# (endpoint restarts, client starts and stops, scrapes, log collection:
+# design section 15.4's "about 26 min" for one block each of A, B, C and DC
+# is four trials of 60, 90, 120 and 60 s plus this per block) and once
+# (builds, copies, enrollment). Rough.
+BLOCK_OVERHEAD = 60
 SETUP_SECONDS = 240
 # Seconds between dispatching a DC phase's jobs and their shared start.
 BARRIER_LEAD = 5
@@ -102,7 +104,7 @@ CURL_ENV = ("env -u NO_PROXY -u no_proxy -u ALL_PROXY -u all_proxy -u HTTP_PROXY
             "-u HTTPS_PROXY -u http_proxy -u https_proxy curl --noproxy ''")
 TRIAL_COLUMNS = ("block", "path", "slot", "arm", "role", "arm_trial", "cold", "phase", "job",
                  "client", "kind", "flow", "start_utc", "end_utc", "http", "bytes", "seconds",
-                 "curl_exit", "complete", "wall", "t_start", "t_end")
+                 "curl_exit", "complete", "wall", "t_start", "t_end", "trial")
 
 
 class ConfigError(Exception):
@@ -266,10 +268,19 @@ class Config:
         once, so it has a single path."""
         return self.wl.paths(self)
 
+    def beside_arms(self) -> List[Arm]:
+        """The instances of a session run beside the blocks (trial D): per arm
+        a copy with its own name, directories and ports (index after the
+        arms'), which the blocks' restarts never touch."""
+        if not (self.wl and self.wl.beside(self)):
+            return []
+        n = len(self.arms)
+        return [dataclasses.replace(a, name=f"{a.name}-wake", index=n + a.index) for a in self.arms]
+
     def planned_ports(self) -> Dict[str, List[Tuple[int, str]]]:
         out: Dict[str, List[Tuple[int, str]]] = {}
         g = self.gateway
-        for a in self.arms:
+        for a in self.arms + self.beside_arms():
             out.setdefault(g.host, []).append((g.port_base + a.index, f"gateway {a.name}"))
             out.setdefault(g.host, []).append((g.metrics_port_base + a.index, f"gateway metrics {a.name}"))
         out.setdefault(g.host, []).append((g.origin_port, "origin"))
@@ -277,7 +288,7 @@ class Config:
             for port, what in ep.tcp_ports + ep.udp_ports:
                 out.setdefault(g.host, []).append((port, f"{ep.tag} {what}"))
         for c in self.clients.values():
-            for a in self.arms:
+            for a in self.arms + (self.beside_arms() if c.name in self.paths() else []):
                 out.setdefault(c.host, []).append((c.socks_port_base + a.index, f"client {c.name} socks {a.name}"))
                 out.setdefault(c.host, []).append((c.metrics_port_base + a.index, f"client {c.name} metrics {a.name}"))
         return out
@@ -291,14 +302,20 @@ def load_config(path: str) -> Config:
 
 
 def _sequential(c) -> Any:
-    """[campaign] sequential = true: Haybittle-Peto stopping from
-    first_blocks (default 6) to blocks (the cap, default 12)."""
+    """[campaign] sequential = true: looks after first_blocks (default 6) to
+    blocks (the cap, default 12), each at its nominal level from the
+    Pocock-type alpha-spending function with total one-sided alpha (default
+    0.05), or alpha / looks at every look with spending = bonferroni (section
+    15.4). The levels are computed here, before the first block, and frozen
+    in the plan."""
     if not _bool(c.get("sequential", "false")):
         return None
+    if "interim_alpha" in c:
+        raise ConfigError("interim_alpha is gone: looks use alpha spending (spending = pocock or bonferroni)")
     import ab_stats
     try:
         return ab_stats.Sequential(first=c.getint("first_blocks", 6), cap=c.getint("blocks", 12),
-                                   alpha=c.getfloat("alpha", 0.05), interim_alpha=c.getfloat("interim_alpha", 0.001))
+                                   alpha=c.getfloat("alpha", 0.05), spending=c.get("spending", "pocock"))
     except ValueError as e:
         raise ConfigError(f"sequential: {e}")
 
@@ -449,6 +466,9 @@ class Slot:
     arm: str
     arm_trial: int
     cold: bool
+    # The trial type (Workload.trial_types) whose block this slot is in; ""
+    # for a workload whose every trial runs all its phases.
+    trial: str = ""
 
 
 def block_order(n_arms: int, block: int, rng: random.Random, trials_per_arm: int = 2) -> List[int]:
@@ -473,17 +493,39 @@ def block_order(n_arms: int, block: int, rng: random.Random, trials_per_arm: int
 
 
 def schedule(cfg: Config) -> List[Slot]:
+    """Every slot: per block, per path, per trial type its own ABBA or BAAB
+    order. Slot numbers run on across a block's types on a path, so a
+    (block, path, slot) names one trial."""
     rng = random.Random(cfg.seed)
     out: List[Slot] = []
     paths = cfg.paths()
+    types = cfg.wl.trial_types(cfg)
     for b in range(1, cfg.blocks + 1):
         k = (b - 1) % len(paths)
         for path in paths[k:] + paths[:k]:
-            seen: Dict[int, int] = {}
-            for i, ai in enumerate(block_order(len(cfg.arms), b, rng, cfg.wl.trials_per_arm), start=1):
-                seen[ai] = seen.get(ai, 0) + 1
-                out.append(Slot(b, path, i, cfg.arms[ai].name, seen[ai], seen[ai] == 1))
+            n = 0
+            for trial in types:
+                seen: Dict[int, int] = {}
+                for ai in block_order(len(cfg.arms), b, rng, cfg.wl.trials_per_arm):
+                    n += 1
+                    seen[ai] = seen.get(ai, 0) + 1
+                    out.append(Slot(b, path, n, cfg.arms[ai].name, seen[ai], seen[ai] == 1, trial))
     return out
+
+
+def run_units(cfg: Config, slots: Sequence[Slot]) -> List[Tuple[int, str, str]]:
+    """The order the (block, path, trial type) units run in: the workload's
+    run_first units (D's cover: C's first two blocks back to back), then the
+    rest round-robin at block granularity, every type's block b before any
+    type's block b + 1, so a path that drifts drifts under all of them."""
+    units = list(dict.fromkeys((s.block, s.path, s.trial) for s in slots))
+    first = [u for b, t in cfg.wl.run_first(cfg) for u in units if u[0] == b and u[2] == t]
+    return first + [u for u in units if u not in first]
+
+
+def unit_tag(block: int, path: str, trial: str = "") -> str:
+    """Log and scrape names of one unit: b001-<path>[-<type>]."""
+    return f"b{block:03d}-{path}" + (f"-{trial}" if trial else "")
 
 
 # --- hosts -------------------------------------------------------------------
@@ -829,7 +871,10 @@ class Campaign:
         self.measures_path = None if dry else os.path.join(self.out, "measures.jsonl")
         self.job_seq = 0
         self.blocks_run = 0
+        self.units_run: List[List[Any]] = []
         self.stopped = ""
+        self.stopped_types: Dict[str, str] = {}
+        self.beside_threads: List[threading.Thread] = []
         self.t_start = time.time()
         self.job_failures: List[dict] = []
         self.token = "dry-run-token" if dry else os.urandom(16).hex()
@@ -1096,7 +1141,7 @@ class Campaign:
             self.spawn(gh, ep.tag, W, ep.command.replace("{W}", W))
             for port, what in ep.tcp_ports:
                 self.wait_port(gh, port, f"{ep.tag} {what}", ep.tag)
-        for arm in cfg.arms:
+        for arm in cfg.arms + cfg.beside_arms():
             d = self.gw_dir(arm)
             self.must(gh, f"mkdir -p {d}/logs", f"gateway directory for {arm.name}")
             gh.put(self.binary(arm, g.platform, "gateway"), f"{d}/queqiaod")
@@ -1110,7 +1155,7 @@ class Campaign:
                       f"./queqiaod provider add-user --state ./state --name ab --max-flows 0 --max-clients 0 >/dev/null",
                       f"temporary provider state for {arm.name}")
         # Enrollment needs a running gateway; start each, enroll every client, stop.
-        for arm in cfg.arms:
+        for arm in cfg.arms + cfg.beside_arms():
             self.start_gateway(arm, "enroll", enroll=True)
             for client in cfg.clients.values():
                 self.enroll(client, arm)
@@ -1207,10 +1252,10 @@ rm -f "$f"''', what=f"stop {tag}")
         args += self.cfg.wl.client_flags(self.cfg)
         return " ".join(_q(a) for a in args)
 
-    def start_client(self, client: Client, arm: Arm, logname: str) -> None:
+    def start_client(self, client: Client, arm: Arm, logname: str, beside: bool = False) -> None:
         ch = self.hosts[client.host]
         tag = f"cl-{client.name}-{arm.name}"
-        if client.small:
+        if client.small and not beside:
             busy = self.active_small.get(client.host)
             if busy and busy != tag:
                 raise RuntimeError(f"{client.host} is small and already runs {busy}; refusing to start {tag}")
@@ -1274,14 +1319,16 @@ rm -f "$f"''', what=f"stop {tag}")
                 f"echo \"$j $(ps -o lstart= -p $j | tr -s ' ' | sed 's/^ //;s/ $//')\" > {f}\n"
                 f"wait $j\nrc=$?\nrm -f {f}\nexit $rc")
 
-    def interim(self, block: int) -> Tuple[bool, str]:
-        """(stop?, summary) for the sequential gate after `block` blocks."""
+    def interim(self, path: str, trial: str = "") -> Tuple[bool, str]:
+        """(stop?, summary) for one path x trial type's sequential gate on
+        the blocks run so far. Each type stops on its own; the others go on."""
         import ab_analyze
         try:
-            decisions = ab_analyze.interim_decisions(self.out, ab_analyze.load_gates())
+            by_cell = ab_analyze.interim_decisions(self.out, ab_analyze.load_gates(), self.units_run)
         except Exception as e:  # an analysis error must not end the campaign
             return False, f"interim analysis failed ({type(e).__name__}: {e}); continuing"
         import ab_stats
+        decisions = [d for (p_, cell), ds in by_cell.items() if p_ == path and (not trial or cell == trial) for d in ds]
         counts = {d: decisions.count(d) for d in sorted(set(decisions))}
         return ab_stats.overall_stop(decisions), ", ".join(f"{v} {k}" for k, v in counts.items()) or "nothing to judge"
 
@@ -1334,39 +1381,140 @@ rm -f "$f"''', what=f"stop {tag}")
         if self.dry:
             return
         for i, (job, gen) in enumerate(zip(phase.jobs, gens)):
-            t0, t1, rc, out = results[i]
-            if rc != 0:
-                # The generator did not run to its end (ssh dropped, timed out,
-                # crashed): a harness failure, not the arm's. Its block gets no
-                # verdict; its rows are still written for diagnosis.
-                self.job_failures.append({"block": slot.block, "path": slot.path, "slot": slot.slot, "arm": arm.name,
-                                          "phase": phase.name, "client": job.client.name, "kind": job.kind, "exit": rc})
-                self.log(f"job {job.kind} on {job.client.name} ({phase.name}) exited {rc}: its block will have no verdict")
-            want = gen.expected(job)
-            # A generator's raw records ("J<TAB>{json}" lines) go to
-            # measures.jsonl, keyed to the trial and phase, for the workload's
-            # extractor.
-            recs = gen.records(out) if gen.records else []
-            if recs and self.measures_path:
-                with open(self.measures_path, "a") as f:
-                    for rec in recs:
-                        rec.update(_block=slot.block, _path=slot.path, _slot=slot.slot, _arm=arm.name,
-                                   _phase=phase.name, _client=job.client.name, _job=i)
-                        f.write(json.dumps(rec, separators=(",", ":")) + "\n")
-            for flow, code, size, secs, ex, ts0, ts1 in gen.parse(out, job, duration):
-                complete = int(ex == "0" and code == "200" and (not want or size == str(want)))
-                writer([slot.block, slot.path, slot.slot, arm.name, arm.role, slot.arm_trial, int(slot.cold), phase.name, i,
-                        job.client.name, job.kind, flow, utc(t0), utc(t1), code, size, secs, ex, complete,
-                        f"{t1 - t0:.3f}", ts0, ts1])
+            self.record_job(slot, arm, phase, i, job, gen, results[i], writer, self.measures_path, duration)
+
+    def record_job(self, slot: Slot, arm: Arm, phase: Any, i: int, job: Any, gen: Any,
+                   result: Tuple[float, float, int, str], writer, measures_path: Optional[str], duration: float) -> None:
+        """A finished job's rows (trials.tsv) and raw records (measures.jsonl)."""
+        t0, t1, rc, out = result
+        if rc != 0:
+            # The generator did not run to its end (ssh dropped, timed out,
+            # crashed): a harness failure, not the arm's. Its block gets no
+            # verdict; its rows are still written for diagnosis.
+            self.job_failures.append({"block": slot.block, "path": slot.path, "trial": slot.trial, "slot": slot.slot,
+                                      "arm": arm.name, "phase": phase.name, "client": job.client.name,
+                                      "kind": job.kind, "exit": rc})
+            self.log(f"job {job.kind} on {job.client.name} ({phase.name}) exited {rc}: its block will have no verdict")
+        want = gen.expected(job)
+        # A generator's raw records ("J<TAB>{json}" lines) go to
+        # measures.jsonl, keyed to the trial and phase, for the workload's
+        # extractor.
+        recs = gen.records(out) if gen.records else []
+        if recs and measures_path:
+            with open(measures_path, "a") as f:
+                for rec in recs:
+                    rec.update(_block=slot.block, _path=slot.path, _slot=slot.slot, _arm=arm.name,
+                               _phase=phase.name, _client=job.client.name, _job=i)
+                    f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        for flow, code, size, secs, ex, ts0, ts1 in gen.parse(out, job, duration):
+            complete = int(ex == "0" and code == "200" and (not want or size == str(want)))
+            writer([slot.block, slot.path, slot.slot, arm.name, arm.role, slot.arm_trial, int(slot.cold), phase.name, i,
+                    job.client.name, job.kind, flow, utc(t0), utc(t1), code, size, secs, ex, complete,
+                    f"{t1 - t0:.3f}", ts0, ts1, slot.trial])
+
+    # -- a session beside the blocks (trial D)
+    def start_beside(self, beside: Any) -> None:
+        """Start D: per arm its own gateway and, per path, its own client (the
+        blocks' restarts do not touch them), then its session job on each, in
+        the background; wait until every session's set-up traffic is done."""
+        import ab_workloads
+        cfg = self.cfg
+        self.beside_results: Dict[Tuple[str, str], Tuple[float, float, int, str]] = {}
+        self.beside_slots: List[Tuple[Slot, Arm, Any]] = []
+        self.log(f"{beside.name}: starting its sessions beside the blocks")
+        for arm in cfg.beside_arms():
+            self.start_gateway(arm, f"server-{beside.name}")
+        ready: List[Tuple[Host, str]] = []
+        gen = ab_workloads.GENERATORS[beside.phase.jobs[0].kind]
+        n = 0
+        for path in cfg.paths():
+            client = cfg.clients[path]
+            ch = self.hosts[client.host]
+            for real, arm in zip(cfg.arms, cfg.beside_arms()):
+                self.start_client(client, arm, f"client-{beside.name}", beside=True)
+                f = f"{self.w(client.host)}/run/ready-{beside.name}-{client.name}-{arm.name}"
+                ch.run(f"rm -f {f}", what=f"{beside.name}: clear the ready marker of {client.name}/{arm.name}")
+                tmpl = beside.phase.jobs[0]
+                job = ab_workloads.Job(client, tmpl.kind, tmpl.n, load=True, params=dict(tmpl.params, ready_file=f))
+                n += 1
+                slot = Slot(1, path, n, real.name, 1, True, "")
+                self.beside_slots.append((slot, real, job))
+                script = self.as_job(client.host, gen.script(self, job, arm, beside.phase.duration))
+
+                def go(key=(path, real.name), host=ch, script=script, what=f"{beside.name} on {client.name}/{arm.name}"):
+                    t0 = time.time()
+                    try:
+                        rc, out = host.run(script, timeout=beside.phase.duration + 180, what=what)
+                    except Exception as e:
+                        rc, out = -1, ""
+                        self.log(f"{what} failed: {e}")
+                    self.beside_results[key] = (t0, time.time(), rc, out)
+                th = threading.Thread(target=go, daemon=True)
+                th.start()
+                self.beside_threads.append(th)
+                ready.append((ch, f))
+        if self.dry:
+            return
+        deadline = time.time() + beside.ready_seconds
+        waiting = list(ready)
+        while waiting and time.time() < deadline:
+            waiting = [(h, f) for h, f in waiting if h.run(f"test -f {f}", what="wait for the session's set-up")[0] != 0]
+            if waiting:
+                time.sleep(2)
+        if waiting:
+            self.log(f"{beside.name}: {len(waiting)} session(s) not set up after {beside.ready_seconds:.0f} s; "
+                     "the blocks start anyway and the session is judged on what it recorded")
+
+    def finish_beside(self, beside: Any) -> None:
+        """Wait for D's sessions, stop its instances, and write them as a
+        campaign of their own (workload `beside.workload`) in the subdirectory
+        `beside.name`, for the analyzer and the flip."""
+        import ab_workloads
+        cfg = self.cfg
+        for th in self.beside_threads:
+            th.join(timeout=beside.phase.duration + 240)
+        clients = [cfg.clients[p] for p in cfg.paths()]
+        for c in clients:
+            for arm in cfg.beside_arms():
+                self.stop_client(c, arm)
+        for arm in cfg.beside_arms():
+            self.stop(self.hosts[cfg.gateway.host], f"gw-{arm.name}")
+        if self.dry:
+            return
+        sub = os.path.join(self.out, beside.name)
+        os.makedirs(sub, exist_ok=True)
+        self.collect(beside.name, clients, cfg.beside_arms(), out=sub)
+        gen = ab_workloads.GENERATORS[beside.phase.jobs[0].kind]
+        with open(os.path.join(sub, "trials.tsv"), "w") as tsv:
+            tsv.write("\t".join(TRIAL_COLUMNS) + "\n")
+
+            def writer(row):
+                tsv.write("\t".join(str(x) for x in row) + "\n")
+            failures_before = len(self.job_failures)
+            for slot, real, job in self.beside_slots:
+                res = self.beside_results.get((slot.path, real.name), (time.time(), time.time(), -1, ""))
+                self.record_job(slot, real, beside.phase, 0, job, gen, res, writer,
+                                os.path.join(sub, "measures.jsonl"), beside.phase.duration)
+            self.beside_failures = self.job_failures[failures_before:]
+            # Its failures are its own; the blocks' verdicts do not depend on them.
+            del self.job_failures[failures_before:]
+        with open(os.path.join(self.out, "plan.json")) as f:
+            plan = json.load(f)
+        plan.update(workload=beside.workload, analyzer="ab_analyze", sequential=None, beside_of=os.path.basename(self.out),
+                    schedule=[s.__dict__ for s, _, _ in self.beside_slots])
+        with open(os.path.join(sub, "plan.json"), "w") as f:
+            json.dump(plan, f, indent=2, default=str)
 
     def clients_for(self, path: str) -> List[Client]:
         return self.cfg.wl.clients_for(self.cfg, path)
 
-    def run_block(self, block: int, path: str, slots: List[Slot], writer) -> None:
+    def run_block(self, block: int, path: str, slots: List[Slot], writer, trial: str = "") -> None:
+        """One block of one trial type on one path: every endpoint restarted
+        first, so each arm's first trial in it is cold."""
         cfg = self.cfg
         arms = {a.name: a for a in cfg.arms}
-        tagp = f"b{block:03d}-{path}"
-        self.log(f"block {block} path {path}: " + " ".join(s.arm for s in slots))
+        tagp = unit_tag(block, path, trial)
+        self.log(f"block {block} path {path}{' ' + trial if trial else ''}: " + " ".join(s.arm for s in slots))
         # Restart every gateway, so each arm's first trial in this block is cold.
         for arm in cfg.arms:
             self.stop(self.hosts[cfg.gateway.host], f"gw-{arm.name}")
@@ -1386,7 +1534,7 @@ rm -f "$f"''', what=f"stop {tag}")
             self.scrape(arm, name + "-pre")
             for c in clients:
                 self.scrape_client(c, arm, name + "-pre")
-            for phase in cfg.wl.phases(cfg, path):
+            for phase in cfg.wl.type_phases(cfg, path, trial):
                 self.run_phase(s, arm, phase, writer)
             self.scrape(arm, name + "-post")
             for c in clients:
@@ -1404,22 +1552,24 @@ rm -f "$f"''', what=f"stop {tag}")
             self.stop(self.hosts[cfg.gateway.host], f"gw-{arm.name}")
         self.collect(tagp, clients)
 
-    def collect(self, tagp: str, clients: List[Client]) -> None:
+    def collect(self, tagp: str, clients: List[Client], arms: Optional[List[Arm]] = None,
+                out: Optional[str] = None) -> None:
         """Fetch and delete this block's logs: small hosts have little disk."""
         g = self.cfg.gateway
         gh = self.hosts[g.host]
-        for arm in self.cfg.arms:
+        out = out or self.out
+        for arm in arms or self.cfg.arms:
             d = self.gw_dir(arm)
             gh.run(f"cd {d}/logs && for f in server-{tagp}.jsonl*; do case $f in *.gz) ;; *) [ -f \"$f\" ] && gzip -1f \"$f\";; esac; done; true",
                    what=f"compress gateway {arm.name} logs")
-            self._fetch_glob(gh, f"{d}/logs", f"server-{tagp}", os.path.join(self.out, "logs", f"gw-{arm.name}"))
+            self._fetch_glob(gh, f"{d}/logs", f"server-{tagp}", os.path.join(out, "logs", f"gw-{arm.name}"))
         for c in clients:
             ch = self.hosts[c.host]
-            for arm in self.cfg.arms:
+            for arm in arms or self.cfg.arms:
                 d = self.cl_dir(c, arm)
                 ch.run(f"cd {d}/logs && for f in client-{tagp}.jsonl* client-{tagp}-s*.jsonl*; do case $f in *.gz) ;; *) [ -f \"$f\" ] && gzip -1f \"$f\";; esac; done; true",
                        what=f"compress client {c.name}/{arm.name} logs")
-                self._fetch_glob(ch, f"{d}/logs", f"client-{tagp}", os.path.join(self.out, "logs", f"cl-{c.name}-{arm.name}"))
+                self._fetch_glob(ch, f"{d}/logs", f"client-{tagp}", os.path.join(out, "logs", f"cl-{c.name}-{arm.name}"))
 
     def _fetch_glob(self, host: Host, remote_dir: str, prefix: str, local_dir: str) -> None:
         # NAME.jsonl[.N][.gz], NAME.cpu, or NAME-sSLOT.*: never another path
@@ -1576,27 +1726,48 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 if tsv:
                     tsv.write("\t".join(str(x) for x in row) + "\n")
                     tsv.flush()
-            for block in range(1, cfg.blocks + 1):
+            beside = cfg.wl.beside(cfg)
+            if beside:
+                # D: its sessions start first, on their own instances, and the
+                # blocks wait for their set-up traffic to end.
+                self.start_beside(beside)
+            done_types: Dict[Tuple[str, str], str] = {}
+            units = run_units(cfg, slots)
+            last_block = 0
+            told = False
+            for block, path, trial in units:
                 if self.dry and block > dry_blocks:
-                    print(f"... blocks {block}-{cfg.blocks} repeat the same commands in their own order", file=self.stream)
-                    break
-                for path in dict.fromkeys(s.path for s in slots if s.block == block):
-                    self.run_block(block, path, [s for s in slots if s.block == block and s.path == path], writer)
-                    if not self.dry:
-                        time.sleep(cfg.block_gap)
-                self.blocks_run = block
+                    if not told:
+                        print(f"... blocks {dry_blocks + 1}-{cfg.blocks} repeat the same commands in their own order",
+                              file=self.stream)
+                        told = True
+                    continue
+                if (path, trial) in done_types:
+                    continue
+                if block > last_block:
+                    if cfg.snapshot_every and last_block and last_block % cfg.snapshot_every == 0:
+                        self.check_production(f"mid-b{last_block:03d}")
+                    last_block = block
+                self.run_block(block, path, [s for s in slots if (s.block, s.path, s.trial) == (block, path, trial)],
+                               writer, trial)
+                self.units_run.append([block, path, trial])
+                self.blocks_run = max(self.blocks_run, block)
+                if not self.dry:
+                    time.sleep(cfg.block_gap)
                 if cfg.sequential and not self.dry and block >= cfg.sequential.first and block < cfg.blocks:
-                    # Recompute the gate on the blocks so far; stop once its
-                    # verdict is determined (ab_stats.Sequential).
+                    # Recompute this type's gate on its blocks so far; stop it
+                    # once its verdict is determined (ab_stats.Sequential).
                     if tsv:
                         tsv.flush()
-                    stop, why = self.interim(block)
-                    self.log(f"look after block {block}: {why}")
+                    stop, why = self.interim(path, trial)
+                    self.log(f"look after block {block} on {path}{' ' + trial if trial else ''}: {why}")
                     if stop:
-                        self.stopped = f"after block {block}: {why}"
-                        break
-                if cfg.snapshot_every and block % cfg.snapshot_every == 0 and block < cfg.blocks:
-                    self.check_production(f"mid-b{block:03d}")
+                        done_types[(path, trial)] = f"after block {block}: {why}"
+                        self.stopped_types[f"{path}/{trial}" if trial else path] = f"after block {block}: {why}"
+            if self.stopped_types:
+                self.stopped = "; ".join(f"{k} {v}" for k, v in self.stopped_types.items())
+            if beside:
+                self.finish_beside(beside)
             if not self.dry:
                 print("CAMPAIGN-DONE", file=self.stream)
         except ProductionChanged as e:
@@ -1651,9 +1822,18 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
                            "production": production, "teardown_leftovers": leftovers, "cleanup_failures": clean_failures,
                            "fetch_failures": self.fetch_failures, "job_failures": self.job_failures,
-                           "blocks_run": self.blocks_run, "stopped": self.stopped,
+                           "blocks_run": self.blocks_run, "units_run": self.units_run, "stopped": self.stopped,
+                           "stopped_types": self.stopped_types,
                            "wall_seconds": round(time.time() - self.t_start, 1),
                            "finished_utc": utc(time.time())}, f, indent=2)
+            sub = os.path.join(self.out, cfg.wl.beside(cfg).name) if cfg.wl.beside(cfg) else None
+            if sub and os.path.isdir(sub):
+                with open(os.path.join(sub, "status.json"), "w") as f:
+                    json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
+                               "production": production, "teardown_leftovers": leftovers,
+                               "cleanup_failures": clean_failures, "fetch_failures": self.fetch_failures,
+                               "job_failures": getattr(self, "beside_failures", []), "blocks_run": 1,
+                               "finished_utc": utc(time.time())}, f, indent=2)
         return status
 
     def verify_teardown(self) -> List[str]:
@@ -1676,17 +1856,25 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             out += [f"{host}: still running: {x}" for x in snap.get("leftover", [])]
         return out
 
+    def block_seconds(self, path: str, trial: str = "") -> float:
+        """Estimated wall seconds of one block of one trial type on a path:
+        its trials (with the gap after each), its extra trials, the per-block
+        restarts and the gap after the block."""
+        cfg = self.cfg
+        trials = len(cfg.arms) * cfg.wl.trials_per_arm
+        return (trials * (cfg.wl.trial_seconds(cfg, path, trial) + cfg.gap) + cfg.wl.extra_block_seconds(cfg, path)
+                + BLOCK_OVERHEAD + cfg.block_gap)
+
     def estimate(self) -> Dict[str, Tuple[float, float]]:
-        """Estimated wall seconds per path: (if stopped at the first look,
-        at the cap), the workload's phases plus the runner's overheads."""
+        """Estimated wall seconds per path: (if every type stops at the first
+        look, at the cap), set-up plus one block of each trial type per round."""
         cfg = self.cfg
         out = {}
-        trials = len(cfg.arms) * cfg.wl.trials_per_arm
         first = cfg.sequential.first if cfg.sequential else cfg.blocks
         for path in cfg.paths():
-            trial = cfg.wl.estimate_seconds(cfg, path) + TRIAL_OVERHEAD + cfg.gap
-            block = trials * trial + cfg.wl.extra_block_seconds(cfg, path) + BLOCK_OVERHEAD + cfg.block_gap
-            out[path] = (SETUP_SECONDS + first * block, SETUP_SECONDS + cfg.blocks * block)
+            block = sum(self.block_seconds(path, t) for t in cfg.wl.trial_types(cfg))
+            once = SETUP_SECONDS + cfg.wl.extra_once_seconds(cfg, path)
+            out[path] = (once + first * block, once + cfg.blocks * block)
         return out
 
     def print_plan(self, slots: List[Slot]) -> None:
@@ -1695,11 +1883,19 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         p(f"# campaign {cfg.name}: workload {cfg.workload}, {cfg.blocks} block(s), seed {cfg.seed}")
         if cfg.sequential:
             sq = cfg.sequential
-            p(f"# sequential: looks after blocks {sq.first}..{sq.cap}, interim alpha {sq.interim_alpha:g}, "
-              f"final alpha {sq.final_alpha:g} (Haybittle-Peto)")
+            p(f"# sequential: looks after blocks {sq.first}..{sq.cap}, one-sided alpha {sq.alpha:g} spent "
+              f"{'by the Pocock-type function' if sq.spending == 'pocock' else 'equally (Bonferroni)'}; "
+              "nominal level per look " + ", ".join(f"{n}: {a:.4f}" for n, a in zip(range(sq.first, sq.cap + 1), sq.levels)))
+        types = cfg.wl.trial_types(cfg)
         for path, (lo, hi) in self.estimate().items():
+            if types != [""]:
+                p(f"# estimated per block on {path}: " + ", ".join(
+                    f"{t} {self.block_seconds(path, t) / 60:.0f} min" for t in types)
+                  + f"; {sum(self.block_seconds(path, t) for t in types) / 60:.0f} min a round")
             span = f"{lo / 60:.0f} min" if lo == hi else f"{lo / 60:.0f} min (stopping at the first look) to {hi / 60:.0f} min (cap)"
             p(f"# estimated wall time on {path}: {span}")
+        for line in cfg.wl.plan_notes(cfg):
+            p(f"# {line}")
         p(f"# work directory on every host: ~/{cfg.work_dir}")
         p(f"# gateway host {cfg.gateway.host} ({cfg.gateway.platform}), clients dial {cfg.gateway.address}")
         for a in cfg.arms:
@@ -1712,18 +1908,10 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         for pr in cfg.production:
             p(f"# production [{pr.name}] on {pr.host}: units {' '.join(pr.units) or '-'}; launchd {' '.join(pr.launchd) or '-'}; "
               f"ports {len(pr.ports)}; processes matching {pr.process_pattern!r}")
-        p("# schedule (block path: slot order; * = cold start of that arm in the block)")
-        cur = None
-        line = ""
-        for s in slots:
-            if (s.block, s.path) != cur:
-                if line:
-                    p(line)
-                cur = (s.block, s.path)
-                line = f"  b{s.block:03d} {s.path}:"
-            line += f" {s.arm}{'*' if s.cold else ''}"
-        if line:
-            p(line)
+        p("# schedule, in run order (block path [type]: slot order; * = cold start of that arm in the block)")
+        for b, path, trial in run_units(cfg, slots):
+            us = [s for s in slots if (s.block, s.path, s.trial) == (b, path, trial)]
+            p(f"  b{b:03d} {path}{' ' + trial if trial else ''}:" + "".join(f" {s.arm}{'*' if s.cold else ''}" for s in us))
 
 
 def _interrupt(signum, frame):

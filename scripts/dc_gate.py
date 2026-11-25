@@ -114,7 +114,9 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     if not shared_window(sus, loaded, duration):
         for k in ("sim_rate", "aggregate_bytes", "worst_leaf_bytes", "jain"):
             m[k] = float("nan")
-    req = [r for r in t.rows if r["phase"] == "requests" and r["kind"] == "requests"]
+    # Request waves of downloads, or W4's one-at-a-time requests (dc-rpc,
+    # request i of every leaf being wave i).
+    req = [r for r in t.rows if r["phase"] == "requests" and r["kind"] in ("requests", "dc-rpc")]
     # An unfinished request is censored at its timeout rather than dropped:
     # dropping it would reward the arm that failed it.
     done = lambda r: float(r["seconds"]) if r["complete"] == "1" else float(request_timeout)
@@ -303,10 +305,13 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     # every loaded leaf and a measured simultaneous rate.
     binding: List[float] = []
     uncalibrated: List[int] = []
+    # calibrate = first (the minimal profile): block 1's solo rates stand for
+    # every block.
+    once = str(dc.get("calibrate")) == "first"
     for b in sorted({t.block for t in ab}):
         rates = {}
         for t in solo:
-            if t.block == b:
+            if t.block == (1 if once else b):
                 leaf = next((r["client"] for r in t.rows), None)
                 bulk = [r for r in t.rows if r["kind"] == "bulk"]
                 # A usable calibration ran backlogged for the window: a short

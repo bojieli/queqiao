@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import math
 import pathlib
 import random
@@ -170,14 +171,63 @@ class Misc(unittest.TestCase):
 
 
 class SequentialStopping(unittest.TestCase):
-    def test_alpha_is_spent_within_the_total(self):
-        sq = st.Sequential(first=6, cap=12, alpha=0.05, interim_alpha=0.001)
-        self.assertEqual(sq.interim_looks, 6)
-        self.assertAlmostEqual(sq.final_alpha, 0.044)
-        self.assertEqual(sq.alpha_at(6), 0.001)
-        self.assertEqual(sq.alpha_at(12), sq.final_alpha)
+    def test_levels_come_from_pocock_type_spending(self):
+        # Design section 15.4: Lan-DeMets Pocock-type spending over the 7
+        # looks (6..12 blocks), total one-sided alpha 0.05.
+        sq = st.Sequential(first=6, cap=12, alpha=0.05)
+        self.assertEqual(sq.looks, 7)
+        self.assertEqual(len(sq.levels), 7)
+        # The first look spends alpha x ln(1 + (e - 1) x 6/12) on its own.
+        self.assertAlmostEqual(sq.alpha_at(6), 0.05 * math.log(1 + (math.e - 1) * 0.5), places=6)
+        self.assertAlmostEqual(st.pocock_spending(1.0, 0.05), 0.05)
+        for n in range(6, 13):
+            self.assertTrue(0.01 < sq.alpha_at(n) < 0.05, (n, sq.alpha_at(n)))
+        self.assertEqual(sq.alpha_at(20), sq.alpha_at(12))       # past the cap: the last look's
+
+    def test_the_levels_spend_exactly_alpha_on_a_random_walk(self):
+        # The nominal levels, applied at every look to a standardised random
+        # walk under the null, cross with total probability alpha.
+        sq = st.Sequential()
+        c = [st.normal_quantile(1 - a) for a in sq.levels]
+        rng = random.Random(5)
+        reps, hits = 40000, 0
+        for _ in range(reps):
+            s = 0.0
+            for n in range(1, 13):
+                s += rng.gauss(0, 1)
+                if n >= 6 and s / math.sqrt(n) > c[n - 6]:
+                    hits += 1
+                    break
+        self.assertAlmostEqual(hits / reps, 0.05, delta=0.005)
+
+    def test_bonferroni_is_the_fallback(self):
+        sq = st.Sequential(spending="bonferroni")
+        self.assertEqual(sq.levels, [0.05 / 7] * 7)
         with self.assertRaises(ValueError):
-            st.Sequential(first=2, cap=60, interim_alpha=0.001)   # 58 interim looks spend more than 0.05
+            st.Sequential(spending="haybittle")
+        with self.assertRaises(ValueError):
+            st.Sequential(alpha=1.5)
+
+    def test_frozen_levels_round_trip_through_a_plan(self):
+        sq = st.Sequential()
+        again = st.Sequential(**json.loads(json.dumps(sq.__dict__)))
+        self.assertEqual(again.levels, sq.levels)
+        with self.assertRaises(ValueError):
+            st.Sequential(levels=[0.05] * 3)                       # not 7 looks
+        with self.assertRaises(ValueError):
+            st.Sequential(levels=[0.9] * 7)                        # spends more than alpha x looks
+
+    def test_a_clear_negative_bound_fails_at_the_first_look(self):
+        sq = st.Sequential()
+        rng = random.Random(8)
+        self.assertEqual(sq.decide([-5 + rng.gauss(0, 1) for _ in range(6)], resamples=2000), "fail")
+
+    def test_undecided_at_the_cap_fails(self):
+        sq = st.Sequential()
+        rng = random.Random(9)
+        murky = [rng.gauss(0.05, 1) for _ in range(12)]
+        self.assertEqual(sq.decide(murky[:11], resamples=2000), "continue")
+        self.assertEqual(sq.decide(murky, resamples=2000), "fail")
 
     def test_upper_bound_known_answer(self):
         self.assertAlmostEqual(st.t_upper_bound([1, 2, 3, 4, 5]), 3 + 2.131847 * math.sqrt(0.5), places=5)
