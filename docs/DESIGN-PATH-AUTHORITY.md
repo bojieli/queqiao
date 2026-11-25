@@ -572,7 +572,7 @@ Configuration accepts exactly the bundles below and rejects any other combinatio
 | 7 | `topology=single` (6) | Client stops isolating. Per-flow rescue still dials; those connections are attachments. | per-flow | not started |
 | 8 | `recovery=carrier` (7, 4) | Carrier manager becomes the single owner of bindings and QUIC replacement; per-flow QUIC rescue dials and lane demotion are disabled by the same switch; the adaptive keepalive schedule is activated; binding deadlines with the skew rule of §10.3 step 4; §10.4. | carrier manager | not started |
 | 9 | DC gate | `dc-long-haul` on the new architecture (§11.3). | carrier manager | not started |
-| 10 | defaults | Flip defaults in one release, gateways first; soak one release. | carrier manager | not started |
+| 10 | defaults | Flip defaults in one release, gateways first; soak one release. Requires the final bundle to pass §15.4 on every path × workload × scenario of §15.3; one failing cell blocks the flip. | carrier manager | not started |
 | 11 | delete | Below. | — | not started |
 
 - **Fixes of present bugs ship on by default, small, beside their bundle.** Two stages found that main violates a bound it claims and fixed it in the default configuration with a minimal, local change: the producer's reservation before reading (#169, stage 3) and the full gateway that refuses its own recovery work (#170, stage 5). Everything that changes policy, rather than restoring a claimed bound, stays behind the switch.
@@ -636,8 +636,20 @@ New deterministic tests, on real fork send loops over an impaired in-process `Pa
 ### 15.3 Live A/B
 
 - **Unit.** One *block* is four trials on one path, in ABBA or BAAB order chosen at random, with both endpoints restarted before the block so no knowledge (`knowledgeLifetime`) carries between blocks, and with cold and warm starts balanced across arms. Blocks are the unit of analysis.
-- **Outcome per arm per block.** Useful bytes delivered within a fixed duration, summed over that arm's two trials and all their flows. A failed flow contributes what it delivered; a total outage contributes zero.
-- **Workloads.** Four concurrent downloads (as ab6), a single flow, and an interactive echo probe under bulk load.
+- **Outcome per arm per block.** Useful bytes delivered within a fixed duration, summed over that arm's two trials and all their flows. A failed flow contributes what it delivered; a total outage contributes zero. A scenario with no bulk component has no primary outcome and is judged on its secondaries alone (§15.4).
+- **Workloads.** Each is run on every path, and each scenario in the table is a separate cell of the gate: its blocks are not pooled with another scenario's. *Under bulk* means, separately, four concurrent downloads and four concurrent uploads already running when measurement starts, because the two directions differ in capacity and loss and are controlled independently.
+
+| Workload | Traffic | Scenarios | Metrics |
+| --- | --- | --- | --- |
+| `bulk` | Four concurrent downloads (as ab6); a single flow | — | Delivered bytes |
+| `browsing` | Bursts of 20–60 parallel short requests, as one page load | Cold (new connections) and warm (connections reused from the previous page); alone and under bulk | First byte and page completion, p50 and p99 |
+| `ssh` | Keystroke echoes on one long-lived TCP connection | Alone; under bulk download; under bulk upload; after a large output burst on the same connection (§6 assigns DATA by the flow's class, so a session reclassified by one burst must be seen) | Echo RTT p50, p99, p99.9 |
+| `video-call` | Bidirectional UDP at 2–4 Mbit/s, one packet per 20 ms each way | Alone; under bulk; under a saturating UDP flow (Q5) | One-way delay p99, jitter, loss after FEC, freezes (gaps over 200 ms) |
+| `upload` | Bulk upstream | Single flow; four concurrent; simultaneous with four downloads | Delivered bytes per direction |
+| `mixed` | `video-call` + `browsing` + bulk at once | Separately with downloads and with uploads as the bulk | Each component's own metrics, judged per scenario |
+| `dc` | The `dc-long-haul` profile | §11.3 | §11.3 |
+
+- **Replaces the echo probe.** The interactive echo probe of earlier campaigns is `ssh` under bulk download.
 - **Product-configuration screen (after stage 2).** {isolated, single connection} × {round-robin, class scheduler} under today's controllers, plus one stream against several on one connection at a fixed connection window. This chooses a configuration; because isolation also changes the number of independent controllers, it does not attribute a result to topology.
 - **Topology under one authority (stage 7's gate).** `topology=single` against isolation with `congestion=path` in both arms. This is the comparison that tests §7. A result against the single connection reopens it.
 - **Credit delay** is measured on the sender's clock alone: time from a chunk's last byte being taken by the carrier to its covering ACK, minus the path's minimum RTT.
@@ -647,7 +659,9 @@ New deterministic tests, on real fork send loops over an impaired in-process `Pa
 - **Primary test.** For each block `b`, the contrast `d_b = candidate_b − 0.90 × main_b` in delivered bytes. The gate passes on a path when the lower bound of the one-sided 95 % confidence interval of the mean contrast is above zero. The contrast is defined for zero outcomes in either arm and needs no ratio of a resampled denominator. A campaign in which more than a pre-registered fraction of main's blocks are zero is void and is rerun. "Point estimate ≥ 0.95 and the interval includes 1" is not accepted.
 - **Sample size, fixed in advance, from a pilot.** A 12-block pilot per path supplies the *variance* of the block contrasts and the mean of main's outcome. Power is computed for the alternative "true ratio 1", whose expected contrast is `0.10 × E[main]`, not for the pilot's observed contrast; the interval is a one-sided t-interval on the block contrasts (bootstrap as a check). The block count for 80 % power is frozen, and the pilot's data are not reused. For orientation only: ab6's Beijing interval for a different statistic (the geometric mean of paired ratios, 0.76 [0.58–0.97] over 12 rounds) corresponds to roughly a hundred blocks.
 - **Initial state per arm.** Each arm runs as its own processes with its own path knowledge. An arm's first trial in a block starts cold (processes restarted) and its second starts from that arm's own first trial, in both ABBA and BAAB, so neither arm inherits the other's state by position.
-- **Secondary, all required, each with a pre-registered one-sided bound:** flow completion; stalls per trial; reissued bytes per source byte; wire bytes per useful byte against main's measured baseline by substrate and direction; interactive p99 under bulk; sender-side credit delay p95; client CPU p90; shadow false-promotion rate.
+- **Secondary, all required, each with a pre-registered one-sided bound:** flow completion; stalls per trial; reissued bytes per source byte; wire bytes per useful byte against main's measured baseline by substrate and direction; sender-side credit delay p95; client CPU p90; shadow false-promotion rate.
+- **Workload secondaries, per path × workload × scenario of §15.3, each with its own pre-registered one-sided bound against main in the same campaign:** `browsing` first-byte and page-completion p50/p99; `ssh` echo RTT p50/p99/p99.9; `video-call` one-way delay p99, jitter, loss after FEC and freezes per minute; `upload` delivered bytes in each direction of the simultaneous scenario, beside the primary on the total; `mixed` each component's metric as above. A latency bound has the form `candidate ≤ (1 + m) × main + a`, with a relative margin `m` and an absolute floor `a` fixed per metric before the pilot, so a metric near zero on main is not failed by noise. Percentiles are computed over each arm's pooled samples in a block, and the block is the unit as for the primary; the `ssh` trial length is set so that a block holds at least 10,000 echoes per arm, the least for which a p99.9 is meaningful.
+- **Pass.** A path × workload × scenario cell passes when its primary (where it has one) and all its secondaries pass. Stage 10 requires every cell (§14).
 
 ## 16. Risks and open questions
 
@@ -661,10 +675,11 @@ New deterministic tests, on real fork send loops over an impaired in-process `Pa
 6. *The policed path is still unbraked.* Unchanged; one compensation loop instead of N.
 7. *Arbitration cost.* One mutex acquisition per packet per attachment; measured on the 1-vCPU client at stage 2.
 8. *Released gateways* give break-before-make recovery, best-effort UDP resume, and no recovery at all when their session limit is saturated, until they are upgraded; gateways are upgraded first.
+9. *The class is only as good as the classifier.* Under `sched=class` a flow's DATA takes its flow's class, and today's classifier latches BULK for life, so an interactive session or a reused browser connection that once carried a burst is served as bulk; heavy UDP is INTERACTIVE (Q5). `docs/AUDIT-CLASSIFIER-WORKLOADS.md` traces each §15.3 workload through the classifier and says which fixes must precede which gate.
 
 **Open questions.**
 
-- **Q1. Weights and allowances** (`w_C : w_I : w_B`, `D`, `V`, the probe window). Latency policy, set by tests 2 and 6 and the interactive probe.
+- **Q1. Weights and allowances** (`w_C : w_I : w_B`, `D`, `V`, the probe window). Latency policy, set by tests 2 and 6 and the `ssh`, `video-call` and `mixed` workloads (§15.3).
 - **Q2. Joint limiting for the hierarchy** (§11.3), needed only if the DC gate fails.
 - **Q3. Fan-out trigger** (§7): which measurement identifies the single-connection ceiling.
 - **Q4. `k_s`, `k_p` and the keepalive floor** (§10.2), from shadow-mode data.
