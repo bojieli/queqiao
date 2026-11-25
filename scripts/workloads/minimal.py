@@ -311,7 +311,6 @@ UPLOAD = 100_000      # U, the LLM prompt
 DC_TRIAL_SECONDS = 60  # the DC gate at minimal size, its own campaign (stage 9)
 # Tail percentiles: their quantile and pooled samples, for the per-block or
 # pooled test of section 15.4.
-LLM_TAILS = {"ttft_net_p95_s": 0.95, "lateness_p99_s": 0.99}
 # The foreground whose span the backgrounds must cover, and over which their
 # rate is taken: every measured workload, the page load included.
 FOREGROUND = ("llm", "term", "call", "browse")
@@ -324,32 +323,6 @@ def wake_session_seconds() -> float:
 
 def wake_params() -> dict:
     return {"conns": WAKE_CONNS, "sync": WAKE_SYNC, "follow": WAKE_FOLLOW}
-
-
-def llm_samples(calls: Sequence[dict]) -> Dict[str, List[float]]:
-    ok = [c for c in calls if not c.get("fail")]
-    late: List[float] = []
-    for c in ok:
-        late += pa.lateness(c["deltas"])
-    return {"ttft_net_p95_s": [c["ttft"] - c["T"] for c in ok if c.get("ttft") is not None], "lateness_p99_s": late}
-
-
-def term_samples(sessions: Sequence[dict]) -> Dict[str, List[float]]:
-    """Echo times before the first burst (a) and after it (c, leaving out
-    keys within 2 s after a burst), as term_metrics splits them."""
-    a: List[float] = []
-    c: List[float] = []
-    for s in sessions:
-        if s.get("fail"):
-            continue
-        bursts = s.get("bursts") or []
-        first = bursts[0] if bursts else float("inf")
-        for sent, echo in s.get("keys") or []:
-            if sent < first:
-                a.append(echo)
-            elif not any(b <= sent < b + pa.AFTER_BURST for b in bursts):
-                c.append(echo)
-    return {"a": a, "c": c}
 
 
 @w.register
@@ -512,11 +485,11 @@ class Minimal(pa._Scenario):
         for t in trials:
             trecs = [x for x in getattr(t, "records", []) if x.get("_phase") == ph and x.get("kind") in FOREGROUND]
             span = pa.fg_span(trecs)
-            bg = [r for r in t.rows if r["phase"] == ph and r["kind"] in ("wl-bgdown", "wl-bgup")]
-            down = [r for r in bg if r["kind"] == "wl-bgdown"]
-            up = [r for r in bg if r["kind"] == "wl-bgup"]
+            precs = [x for x in getattr(t, "records", []) if x.get("_phase") == ph]
+            down, up = pa.progress_flows(precs, "down"), pa.progress_flows(precs, "up")
             flows = 2 if ph == "mixed-67" else 1
-            if span is None or not pa.covered_each(span, down, flows) or (ph == "mixed-all" and not pa.covered_each(span, up, 1)):
+            if span is None or not pa.progress_covered(span, down, flows) or \
+                    (ph == "mixed-all" and not pa.progress_covered(span, up, 1)):
                 return False
         return True
 
@@ -527,9 +500,9 @@ class Minimal(pa._Scenario):
             if not pt:
                 continue
             recs = [r for t in pt for r in getattr(t, "records", []) if r.get("_phase") == ph]
-            for k, v in llm_samples([r for r in recs if r.get("kind") == "llm"]).items():
-                out[f"{ph}.{k}"] = (LLM_TAILS[k], v)
-            ts_ = term_samples([r for r in recs if r.get("kind") == "term"])
+            for k, v in pa.llm_samples([r for r in recs if r.get("kind") == "llm"]).items():
+                out[f"{ph}.{k}"] = (pa.LLM_TAILS[k], v)
+            ts_ = pa.term_samples([r for r in recs if r.get("kind") == "term"])
             if ph == "mixed-67":
                 out[f"{ph}.echo_p99_a_s"] = (0.99, ts_["a"])
                 out[f"{ph}.echo_p99_c_s"] = (0.99, ts_["c"])
@@ -570,18 +543,18 @@ class Minimal(pa._Scenario):
             m.update({f"call_{k}": v for k, v in call.items()})
             m.update(browse_metrics([r for r in recs if r.get("kind") == "browse"]))
         # The primaries: the bulk flows' bytes over the foreground's window.
-        for kind, key in (("wl-bgdown", "bg_down_rate_bps"), ("wl-bgup", "bg_up_rate_bps")):
+        # Read off each flow's progress timeline at the window's ends: bytes
+        # moved in the lead or after the foreground are not credited to it.
+        for direction, key in (("down", "bg_down_rate_bps"), ("up", "bg_up_rate_bps")):
             got = secs = 0.0
-            unknown = False
             for t in trials:
-                trows = [r for r in t.rows if r["phase"] == ph and r["kind"] == kind]
-                unknown |= any(r.get("curl_exit") == pa.SINK_UNKNOWN for r in trows)
-                span = pa.fg_span([x for x in getattr(t, "records", []) if x.get("_phase") == ph
-                                   and x.get("kind") in FOREGROUND])
-                if span and trows:
-                    g, w_ = pa.rate_in_window(trows, span)
+                precs = [x for x in getattr(t, "records", []) if x.get("_phase") == ph]
+                span = pa.fg_span([x for x in precs if x.get("kind") in FOREGROUND])
+                prog = pa.progress_flows(precs, direction)
+                if span and prog:
+                    g, w_ = pa.progress_in_window(prog, span)
                     got, secs = got + g, secs + w_
-            if secs and not unknown:
+            if secs:
                 m[key] = got / secs
         if not self.under_background(ph, recs, rows, trials):
             return {k: nan for k in m}

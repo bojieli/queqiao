@@ -313,6 +313,12 @@ def write_llm_campaign(root, cand_late=0.0, bg_dies=False, blocks=12, seed=5):
                     for i in range(1, 5):
                         rows.append(base + [0, "a", "wl-bgdown", f"b{i}o1", iso(t), iso(end), 200, 10_000_000,
                                             end - t, 28, 0, end - t, f"{t:.3f}", f"{end:.3f}"])
+                        # The flow's progress timeline (wlclient bgprog).
+                        recs.append({"kind": "bgprog", "dir": "down", "flow": i,
+                                     "samples": [[t + k * 0.5, int(10_000_000 * k * 0.5 / (end - t))]
+                                                 for k in range(int((end - t) / 0.5) + 1)],
+                                     "_block": b, "_path": "a", "_slot": slot, "_arm": arm, "_phase": ph,
+                                     "_client": "a", "_job": 0})
                 for k in range(5):
                     c0 = t + 1 + k * 2.0
                     jitter = rng.gauss(0, 0.002)

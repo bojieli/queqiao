@@ -304,7 +304,12 @@ def read_campaign(campaign: str) -> Tuple[dict, Dict[Tuple[int, str, int], Trial
     with open(os.path.join(campaign, "plan.json")) as f:
         plan = json.load(f)
     trials: Dict[Tuple[int, str, int], Trial] = collections.OrderedDict()
-    with open(os.path.join(campaign, "trials.tsv")) as f:
+    tp = os.path.join(campaign, "trials.tsv")
+    if not os.path.exists(tp):
+        # A campaign that ended before its first trial (set-up failed): no
+        # trials is missing evidence, which completeness reports.
+        return plan, trials
+    with open(tp) as f:
         for r in csv.DictReader(f, delimiter="\t"):
             key = (int(r["block"]), r["path"], int(r["slot"]))
             t = trials.get(key)
@@ -807,6 +812,11 @@ def report(campaign: str, gates: dict, interim: bool = False,
     for path in paths:
         pts = {a: [t for t in trials.values() if t.path == path and t.arm == a] for a in arms}
         if not any(pts.values()):
+            # No trial on this path at all: no verdict, not a missing row.
+            for cand in arms[1:]:
+                verdicts[(path, cand, "primary")] = "INCOMPLETE"
+                verdicts[(path, cand, "overall")] = "INCOMPLETE"
+            out += ["", f"### {path}: no trials, so no verdict"]
             continue
         nb = len({t.block for t in trials.values() if t.path == path})
         out += ["", f"### {path}: {nb} blocks", "", "| metric | " + " | ".join(arms) + " |", "|---|" + "---:|" * len(arms)]
@@ -1073,7 +1083,7 @@ def sample_rule(wl, trials, path: str, cand: str, main: str, key: str, kind: str
     import random as _r
     rng = _r.Random(gates["seed"])
     ds = []
-    for _ in range(max(200, gates["resamples"] // 10)):
+    for _ in range(gates["resamples"]):
         c_ = [cs[rng.randrange(len(cs))] for _ in cs]
         m_ = [ms[rng.randrange(len(ms))] for _ in ms]
         ds.append(RULES[kind](statf(c_), statf(m_), values))

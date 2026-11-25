@@ -365,7 +365,7 @@ def pooled_quantile_bounds(cand_blocks: Sequence[Sequence[float]], main_blocks: 
         return contrast(quantile(c, q), quantile(m, q))
     observed = stat(range(n))
     rng = random.Random(seed)
-    reps = max(200, resamples // 10)
+    reps = resamples
     ds = sorted(d for d in (stat([rng.randrange(n) for _ in range(n)]) for _ in range(reps)) if d == d)
     if not ds:
         return observed, float("nan"), float("nan")

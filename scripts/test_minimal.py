@@ -765,7 +765,7 @@ class PooledTails(unittest.TestCase):
         pa_tests.write_llm_campaign(root)
         recs = [json.loads(l) for l in pathlib.Path(root, "measures.jsonl").read_text().splitlines()]
         for r in recs:
-            if r["_arm"] == "cand":
+            if r["_arm"] == "cand" and r.get("kind") == "llm":
                 r["ttft"] += cand_slow
         pathlib.Path(root, "measures.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
 
@@ -773,7 +773,7 @@ class PooledTails(unittest.TestCase):
         def tails(self_, trials, plan):
             out = {}
             for ph in ("single-100k-none", "single-100k-down4"):
-                xs = [r["ttft"] - r["T"] for t in trials for r in t.records if r.get("_phase") == ph]
+                xs = [r["ttft"] - r["T"] for t in trials for r in t.records if r.get("_phase") == ph and r.get("kind") == "llm"]
                 out[f"{ph}.ttft_net_p95_s"] = (0.95, xs)
             return out
         g = an.load_gates()
@@ -918,7 +918,7 @@ class RoundTwoFixes(unittest.TestCase):
             pt.write(root)
 
             def tails(self_, trials, plan):
-                xs = [r["ttft"] - r["T"] for t in trials for r in t.records if r.get("_phase") == "single-100k-none"]
+                xs = [r["ttft"] - r["T"] for t in trials for r in t.records if r.get("_phase") == "single-100k-none" and r.get("kind") == "llm"]
                 if trials and trials[0].arm == "cand" and trials[0].block > 1:
                     xs = []                       # no candidate samples after block 1
                 return {"single-100k-none.ttft_net_p95_s": (0.95, xs)}
@@ -1239,13 +1239,13 @@ class RoundFourFixes(unittest.TestCase):
         T = collections.namedtuple("T", "rows records trial")
         recs = [{"_phase": "mixed-all", "kind": k, "t0": 0.0, "t1": 100.0} for k in ("llm", "term", "call")]
         recs.append({"_phase": "mixed-all", "kind": "browse", "t0": 20.0, "t1": 130.0})
-        bg = [{"phase": "mixed-all", "kind": kind, "flow": "b1o1", "bytes": "100", "http": "200",
-               "t_start": "0", "t_end": "110"} for kind in ("wl-bgdown", "wl-bgup")]
-        t = T(bg, recs, "mixed-all")
-        self.assertFalse(m.under_background("mixed-all", recs, bg, [t]))
-        for r in bg:
-            r["t_end"] = "131"
-        self.assertTrue(m.under_background("mixed-all", recs, bg, [t]))
+        prog = [{"_phase": "mixed-all", "kind": "bgprog", "dir": d_, "flow": 1,
+                 "samples": [[float(x), x * 1000] for x in range(0, 111)]} for d_ in ("down", "up")]
+        t = T([], recs + prog, "mixed-all")
+        self.assertFalse(m.under_background("mixed-all", recs, [], [t]))
+        for p_ in prog:
+            p_["samples"] = [[float(x), x * 1000] for x in range(0, 132)]
+        self.assertTrue(m.under_background("mixed-all", recs, [], [t]))
 
     def test_h2_first_byte_is_the_first_payload_bytes_arrival(self):
         # A 16 KiB frame whose first bytes arrive at once and the rest 0.4 s
@@ -1332,6 +1332,83 @@ class RoundFiveFixes(unittest.TestCase):
             parse(two)
         self.assertIn("one path per campaign", str(cm.exception))
         parse(two.replace("tls = false", "tls = false\nidle_wake = false"))
+
+
+class RoundSixFixes(unittest.TestCase):
+    def test_background_bytes_are_read_inside_the_window(self):
+        # A download moves 9 MB in the 5 s lead, then stalls through the
+        # foreground (5-95 s), then 1 MB more: only what moved inside the
+        # window counts, not 10 MB spread evenly over the object.
+        pa = sys.modules["ab_workload_phase_a"]
+        samples = [[0.0, 0], [5.0, 9_000_000]] + [[5.0 + k * 0.25, 9_000_000] for k in range(1, 361)] + \
+                  [[96.0, 10_000_000]]
+        got, secs = pa.progress_in_window([samples], (5.0, 95.0))
+        self.assertEqual((got, secs), (0.0, 90.0))
+        # And a flow that moved nothing inside the window did not load it.
+        self.assertFalse(pa.progress_covered((5.0, 95.0), [samples], 1))
+        steady = [[k * 0.25, k * 25_000] for k in range(0, 401)]
+        self.assertTrue(pa.progress_covered((5.0, 95.0), [steady], 1))
+        self.assertAlmostEqual(pa.progress_in_window([steady], (5.0, 95.0))[0], 90 * 100_000)
+
+    def test_the_client_records_its_background_progress(self):
+        e2e = EndToEnd()
+        e2e.setUp()
+        try:
+            recs = e2e.client("bgup", "--target", f"127.0.0.1:{e2e.http}", "--flows", "1", "--object-bytes",
+                              "500000", "--duration", "2")
+        finally:
+            e2e.tearDown()
+        prog = [r for r in recs if r.get("kind") == "bgprog"]
+        self.assertEqual([(r["dir"], r["flow"]) for r in prog], [("up", 1)])
+        sm = prog[0]["samples"]
+        self.assertGreater(len(sm), 3)
+        self.assertTrue(all(a[0] <= b[0] and a[1] <= b[1] for a, b in zip(sm, sm[1:])))
+        self.assertGreater(sm[-1][1], 0)
+
+    def test_scenario_workloads_expose_their_tail_samples(self):
+        pa_tests = importlib.import_module("test_phase_a")
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            pa_tests.write_llm_campaign(root)
+            plan, trials = an.read_campaign(root)
+        llm = wl.WORKLOADS["llm"]()
+        b1 = [t for t in trials.values() if t.block == 1 and t.arm == "cand"]
+        tails = llm.block_tails(b1, plan)
+        q, xs = tails["single-100k-none.ttft_net_p95_s"]
+        self.assertEqual((q, len(xs)), (0.95, 10))           # five calls in each of two trials
+
+    def test_pooled_tails_use_the_configured_resamples(self):
+        calls = []
+
+        def contrast(c, m):
+            calls.append(1)
+            return m - c
+        st.pooled_quantile_bounds([[1.0, 2.0]] * 3, [[1.0, 2.0]] * 3, 0.95, contrast, 0.05, 300, 1)
+        self.assertEqual(len(calls), 301)                      # the observed one and every resample
+
+    def test_a_campaign_without_trials_is_incomplete_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            unit_campaign(root, [(1, "a", "bulk")])
+            os.remove(os.path.join(root, "trials.tsv"))
+            pathlib.Path(root, "status.json").write_text(json.dumps({"status": "aborted", "exit": 1,
+                                                                      "production": "unchanged"}))
+            text, v = an.report(root, an.load_gates())
+        self.assertEqual(v[("a", "cand", "overall")], "INCOMPLETE")
+        self.assertIn("the campaign aborted", text)
+
+    def test_upload_receipts_are_kept_only_while_needed(self):
+        srv = load_script(SERVER, "wlserver_for_tests_sink")
+        with srv.SINK_LOCK:
+            srv.SINK.update({"done": {"bytes": 10, "done": False}, "cut": {"bytes": 4, "done": False},
+                             "live": {"bytes": 1, "done": False}})
+            srv.sink_end("done", 10, 10, 100.0)       # complete: no receipt needed
+            srv.sink_end("cut", 4, 10, 100.0)         # interrupted: kept for the report
+            self.assertEqual(set(srv.SINK), {"cut", "live"})
+            srv.sink_sweep(100.0 + srv.SINK_KEEP - 1)
+            self.assertEqual(set(srv.SINK), {"cut", "live"})
+            srv.sink_sweep(100.0 + srv.SINK_KEEP + 1)
+            self.assertEqual(set(srv.SINK), {"live"})          # in progress: kept
 
 
 class ShortAnswers(unittest.TestCase):

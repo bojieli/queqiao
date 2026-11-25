@@ -548,6 +548,39 @@ class Parsing(unittest.TestCase):
         self.assertIn("-transport=quic", camp.gw_cmd(cfg.arms[1], "server-b001-a"))
 
 
+class SnapshotObservation(unittest.TestCase):
+    """The read-only production snapshot against a stub systemctl."""
+
+    def snapshot(self, pid):
+        import tempfile
+        d = tempfile.mkdtemp()
+        stub = os.path.join(d, "systemctl")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\n"
+                    f'case "$*" in *--value*) echo {pid};; '
+                    f'*) printf "LoadState=loaded\\nActiveState=active\\nMainPID={pid}\\nNRestarts=0\\n";; esac\n')
+        os.chmod(stub, 0o755)
+        script = ab.SNAPSHOT_SH.format(work="/nonexistent/qq-ab-x", units="queqiaod", launchd="", pattern="'queqiao'")
+        p = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
+                           env=dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"]))
+        return ab.parse_snapshot(p.stdout)
+
+    def test_an_unreadable_executable_is_not_an_observation(self):
+        # A running unit (nonzero MainPID) whose /proc/<pid>/exe cannot be
+        # read: an observation error, refused before the run and a change
+        # during it -- never two equal empty identities.
+        snap = self.snapshot(4194303)
+        self.assertEqual(snap["unit_errors"], ["queqiaod"])
+        self.assertNotIn("queqiaod", snap["units"])
+        before = dict(snap, unit_errors=[], units={"queqiaod": "x exe=/usr/local/bin/queqiaod sha=" + "a" * 64})
+        self.assertIn("production unit queqiaod can no longer be observed", ab.snapshot_diff(before, snap))
+
+    def test_a_stopped_unit_is_observed(self):
+        snap = self.snapshot(0)
+        self.assertEqual(snap["unit_errors"], [])
+        self.assertIn("MainPID=0", snap["units"]["queqiaod"])
+
+
 class LocalProcesses(unittest.TestCase):
     """Runs the runner's own shell against this machine only: the read-only
     snapshot, and spawn/stop/teardown on processes the test itself starts in
@@ -749,6 +782,35 @@ class LocalProcesses(unittest.TestCase):
         out = subprocess.run(["ps", "-o", "pid=", "-g", str(pgid)], capture_output=True, text=True).stdout.strip()
         self.assertEqual(out, "")
         self.assertEqual(list(pathlib.Path(self.W, "run").glob("job-*.pgid")), [])
+
+    def test_a_job_child_that_ignores_term_is_still_killed(self):
+        # The job's shell exits on TERM; its child ignores TERM and has no
+        # work-directory path in its command line. Teardown must still find
+        # it (by the job's own identity, not its leader or its arguments),
+        # KILL it, and leave no descriptor behind.
+        child = ("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                 "open(__import__('sys').argv[1], 'w').write(str(__import__('os').getpid())); time.sleep(60)")
+        pidfile = os.path.join(self.home, "child.pid")
+        script = self.camp.as_job("local", f"{sys.executable} -c \"{child}\" {pidfile} & wait")
+        done = threading.Event()
+        threading.Thread(target=lambda: (self.host.run(script, timeout=90), done.set()), daemon=True).start()
+        for _ in range(200):
+            if os.path.exists(pidfile) and pathlib.Path(pidfile).read_text():
+                break
+            time.sleep(0.05)
+        pid = int(pathlib.Path(pidfile).read_text())
+        self.assertNotIn(self.W, subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
+                                                text=True).stdout)
+        self.camp.teardown()
+        self.assertFalse(self.alive(pid))
+        self.assertTrue(done.wait(10))
+        self.assertEqual(list(pathlib.Path(self.W, "run").glob("job-*.pgid")), [])
+        ok = {"local": ab.parse_snapshot("listen-ok\nps-ok")}
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok):
+            self.assertEqual([x for x in self.camp.verify_teardown() if "job" in x], [])
+            # A descriptor teardown could not clear names survivors.
+            pathlib.Path(self.W, "run", "job-77.pgid").write_text("1 ab-1 0\n")
+            self.assertTrue([x for x in self.camp.verify_teardown() if "job's processes survived" in x])
 
     def test_a_stale_job_descriptor_is_not_signalled(self):
         # The pid in a left-over descriptor now belongs to another process

@@ -390,12 +390,36 @@ def cmd_term(args) -> None:
 
 # --- backgrounds ----------------------------------------------------------------------
 
+class Progress:
+    """A background flow's bytes over time: (wall-clock s, cumulative bytes)
+    every PROGRESS_EVERY s and at each object's end, so the bytes inside any
+    window are read off the flow's own timeline instead of spread evenly
+    over an object's interval. Recorded as a J record of kind "bgprog"."""
+    EVERY = 0.25
+
+    def __init__(self, direction: str, flow: int):
+        self.dir, self.flow, self.total = direction, flow, 0
+        self.samples = [[round(time.time(), 3), 0]]
+
+    def add(self, n: int, force: bool = False) -> None:
+        self.total += n
+        now = time.time()
+        if force or now - self.samples[-1][0] >= self.EVERY:
+            self.samples.append([round(now, 3), self.total])
+
+    def emit(self) -> None:
+        self.add(0, force=True)
+        record({"kind": "bgprog", "dir": self.dir, "flow": self.flow, "samples": self.samples})
+
+
 def cmd_bgdown(args) -> None:
     """`flows` downloads, each fetching object after object (plain HTTP from
-    the origin) until the window closes or the stop file appears."""
+    the origin) until the window closes or the stop file appears; each
+    flow's received bytes over time are recorded (Progress)."""
     end = time.time() + args.duration
 
     def flow(i):
+        prog = Progress("down", i)
         k = 0
         while time.time() < end and not stopped(args):
             k += 1
@@ -412,23 +436,28 @@ def cmd_bgdown(args) -> None:
                     head += b
                 code = int(head.split(b" ", 2)[1])
                 got = len(head.split(b"\r\n\r\n", 1)[1])
+                prog.add(got)
                 while time.time() < end and not stopped(args):
                     try:
                         b = s.recv(1 << 16)
                     except socket.timeout:
+                        prog.add(0)
                         continue
                     if not b:
                         break
                     got += len(b)
+                    prog.add(len(b))
                 else:
                     err = 28
                 s.close()
             except (OSError, EOFError, ValueError):
                 err = 7
             t1 = time.time()
+            prog.add(0, force=True)
             row(t0, t1, f"b{i}o{k}", code, got, t1 - t0, err)
             if err not in (0,):
                 break
+        prog.emit()
 
     ts = [threading.Thread(target=flow, args=(i,)) for i in range(1, args.flows + 1)]
     for t in ts:
@@ -478,6 +507,9 @@ def cmd_bgup(args) -> None:
     run = os.urandom(6).hex()
 
     def flow(i):
+        # Bytes handed to the tunnel's client over time: they reach the far
+        # side within the client's bounded send window.
+        prog = Progress("up", i)
         k = 0
         while time.time() < end and not stopped(args):
             k += 1
@@ -495,6 +527,7 @@ def cmd_bgup(args) -> None:
                     n = min(len(block), args.object_bytes - sent)
                     s.sendall(block[:n])
                     sent += n
+                    prog.add(n)
                 if not err:
                     r = Reader(s)
                     code = int(r.line().split(b" ", 2)[1])
@@ -512,8 +545,10 @@ def cmd_bgup(args) -> None:
                     row(t0, t1, f"u{i}o{k}", 200, got, t1 - t0, 28)
             else:
                 row(t0, t1, f"u{i}o{k}", code, sent, t1 - t0, err)
+            prog.add(0, force=True)
             if err:
                 break
+        prog.emit()
 
     ts = [threading.Thread(target=flow, args=(i,)) for i in range(1, args.flows + 1)]
     for t in ts:

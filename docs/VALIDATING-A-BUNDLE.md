@@ -74,7 +74,9 @@ built to refuse rather than to trust:
   at first.
 - **Preflight is read-only, and it refuses.** Before anything is copied or
   started, the runner snapshots each host:
-  - each unit's state, MainPID, NRestarts, start time and executable SHA-256;
+  - each unit's state, MainPID, NRestarts, start time and executable SHA-256.
+    A running unit whose executable cannot be read or hashed is not
+    observed: the preflight refuses, and during the run it is a change;
   - each launchd job;
   - every process that matches the pattern;
   - every listening port.
@@ -110,10 +112,15 @@ built to refuse rather than to trust:
 - **Jobs run in their own process groups.** Each trial job (curl, a load
   generator) runs in a process group recorded under `run/`, so teardown stops
   the job and everything it started, even when the runner was interrupted
-  while the job's ssh session was still open. The record holds the group
-  leader's pid and start time. A group is signalled only if that same
-  process still leads it; otherwise the record is reported as stale and left
-  alone. A job that does not run to its end (ssh dropped, timed out, the
+  while the job's ssh session was still open. Every process a job starts
+  inherits a job token in its environment, and the record holds the group,
+  the token and the job's start. Teardown signals exactly the processes that
+  carry the token (on Linux, read from `/proc/<pid>/environ`; where the
+  environment cannot be read, as on macOS, the group's processes that
+  started no earlier than the job), never by command line, whether or not
+  the leader is still alive: TERM, then KILL, then a check that none is
+  left. The record is removed only then; one that remains is reported as a
+  survivor. A malformed record is reported as stale and left alone. A job that does not run to its end (ssh dropped, timed out, the
   generator crashed) is a harness failure, not the arm's, and its block gets
   no verdict.
 - **Teardown always runs**, on success, on error, and on SIGINT or SIGTERM.
@@ -550,7 +557,12 @@ from the model):
 
 - **Primaries.** Only the bulk flows' bytes: A's downloads (over the
   trial's fixed 60 s); B's downloads; C's download and upload, each its own
-  primary; DC's sustained phase. Each is `atleast 0.90` of main, and is void
+  primary; DC's sustained phase. B's and C's are the bytes the background
+  flows moved inside the foreground's window, read off each flow's own
+  progress timeline (bytes received, or handed to the tunnel for an upload,
+  sampled every quarter second), never spread evenly over an object; the
+  same timelines show that every flow was running across the window. Each
+  is `atleast 0.90` of main, and is void
   (rerun) when more than the pre-registered fraction of main's blocks
   delivered nothing.
 - **Generic secondaries** (`[secondary]`), as rules of each trial type

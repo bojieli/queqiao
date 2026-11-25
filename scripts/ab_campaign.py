@@ -610,7 +610,12 @@ for u in {units}; do
   fi
   pid=$(systemctl show "$u" -p MainPID --value 2>/dev/null)
   exe=""; sha=""
-  if [ -n "$pid" ] && [ "$pid" != 0 ]; then exe=$(readlink -f /proc/$pid/exe 2>/dev/null); sha=$( (sha256sum "/proc/$pid/exe" 2>/dev/null || true) | cut -c1-64); fi
+  if [ -n "$pid" ] && [ "$pid" != 0 ]; then
+    exe=$(readlink -f /proc/$pid/exe 2>/dev/null); sha=$( (sha256sum "/proc/$pid/exe" 2>/dev/null || true) | cut -c1-64)
+    # A running unit whose executable cannot be read or hashed is not
+    # observed: two empty identities must never compare as "unchanged".
+    if [ -z "$exe" ] || [ ${{#sha}} -ne 64 ]; then echo "unit-error $u"; continue; fi
+  fi
   echo "unit $u $v exe=$exe sha=$sha"
 done
 for l in {launchd}; do
@@ -833,6 +838,23 @@ def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[T
             order.append(flow)
             got[flow] = (flow, "000", "0", f"{duration:.3f}", "-1", "", "")
     return [got[f] for f in order]
+
+
+# The pids of a job's processes, never by command line: members TOKEN PGID
+# START. On Linux, every process whose environment holds QQ_AB_JOB=TOKEN
+# (inherited by everything the job started, whatever its process group or
+# its leader's fate). Where the environment cannot be read (macOS), the
+# processes of the job's process group that started no earlier than the job.
+JOB_MEMBERS_SH = r'''members() {
+  if [ -d /proc/self ]; then
+    grep -l -z -x -F -- "QQ_AB_JOB=$1" /proc/[0-9]*/environ 2>/dev/null | sed 's#^/proc/##; s#/environ$##' | grep -v -x -F "$$"
+  else
+    ps -ax -o pid=,pgid=,etime= 2>/dev/null | awk -v g="$2" -v t0="$3" -v now="$(date +%s)" -v me="$$" '
+      $2 == g && $1 != me { n = split($3, a, /[-:]/); s = 0; m = 1
+        for (i = n; i >= 1; i--) { s += a[i] * m; m = (i == n || i == n - 1) ? m * 60 : (i == n - 2 ? m * 24 : m) }
+        if (now - s >= t0 - 2) print $1 }'
+  fi
+}'''
 
 
 def wait_owned_script(pid_file: str, port: int) -> str:
@@ -1337,16 +1359,17 @@ rm -f "$f"''', what=f"stop {tag}")
     def as_job(self, host: str, script: str) -> str:
         """Run a job in its own process group, recorded under run/, so that
         teardown can stop it and everything it started (curl, python) even
-        when the runner was interrupted while the job's ssh was in flight."""
+        when the runner was interrupted while the job's ssh was in flight.
+        Every process of the job inherits QQ_AB_JOB=<token>; the descriptor
+        holds the group and that token, and stays while any such process
+        survives the job's own end."""
         W = self.w(host)
         self.job_seq += 1
         f = f"{W}/run/job-{self.job_seq}.pgid"
-        # The descriptor holds the group leader's pid and start time; teardown
-        # signals the group only if a process with that pid and that start
-        # time still leads it, so a reused pid is never signalled.
-        return (f"set -m\n(\n{script}\n) &\nj=$!\n"
-                f"echo \"$j $(ps -o lstart= -p $j | tr -s ' ' | sed 's/^ //;s/ $//')\" > {f}\n"
-                f"wait $j\nrc=$?\nrm -f {f}\nexit $rc")
+        tok = f"{self.token}-{self.job_seq}"
+        return (f"set -m\n{JOB_MEMBERS_SH}\nt0=$(date +%s)\n(\nexport QQ_AB_JOB={tok}\n{script}\n) &\nj=$!\n"
+                f"echo \"$j {tok} $t0\" > {f}\n"
+                f"wait $j\nrc=$?\n[ -n \"$(members {tok} $j $t0)\" ] || rm -f {f}\nexit $rc")
 
     def interim(self, path: str, trial: str = "") -> Tuple[bool, str]:
         """(stop?, summary) for one path x trial type's sequential gate on
@@ -1651,22 +1674,25 @@ rm -f "$f"''', what=f"stop {tag}")
             W = self.w(host)
             try:
                 h.run(self.owned(host) + f'''[ -d {W}/run ] || exit 0
-# Jobs first: each ran in its own process group (as_job), so the group takes
-# its curls and clients with it.
-# A descriptor is "pgid start-time"; act only if that very process still
-# leads its group, else report the descriptor as stale and leave it alone.
-ours() {{ read -r g st < "$1"; [ -n "$g" ] || return 1
-  [ "$(ps -o pgid= -p "$g" 2>/dev/null | tr -d ' ')" = "$g" ] || return 1
-  [ "$(ps -o lstart= -p "$g" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')" = "$st" ]; }}
+# Jobs first. A descriptor is "pgid token": every process the job started
+# carries QQ_AB_JOB=<token> in its environment (as_job), whatever its process
+# group, its leader's fate or its command line. Only those are signalled, and
+# a descriptor goes only once none of its processes is left.
+''' + JOB_MEMBERS_SH + f'''
+desc() {{ read -r g t s < "$1"; case "$g$s" in *[!0-9]*|"") return 1;; esac
+  case "$t" in *[!0-9a-f-]*|"") return 1;; esac; echo "$t $g $s"; }}
 for f in {W}/run/job-*.pgid; do
   [ -f "$f" ] || continue
-  if ours "$f"; then read -r g st < "$f"; kill -TERM -- -"$g" 2>/dev/null; else echo "stale job descriptor $f left alone"; fi
+  d=$(desc "$f") || {{ echo "stale job descriptor $f left alone"; continue; }}
+  ps_=$(members $d); [ -n "$ps_" ] && kill -TERM $ps_ 2>/dev/null
 done
 sleep 1
 for f in {W}/run/job-*.pgid; do
   [ -f "$f" ] || continue
-  ours "$f" && {{ read -r g st < "$f"; kill -KILL -- -"$g" 2>/dev/null; }}
-  rm -f "$f"
+  d=$(desc "$f") || continue
+  ps_=$(members $d); [ -n "$ps_" ] && kill -KILL $ps_ 2>/dev/null
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(members $d)" ] && break; sleep 0.2; done
+  if [ -z "$(members $d)" ]; then rm -f "$f"; else echo "job processes survive: $f: $(members $d | tr '\n' ' ')"; fi
 done
 # Only the processes this campaign spawned (its pid files), each checked to
 # be running from the work directory; anything else that mentions the
@@ -1898,6 +1924,12 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 if port in snap.get("listen", set()):
                     out.append(f"{host}: {what} port {port} is still listening")
             out += [f"{host}: still running: {x}" for x in snap.get("leftover", [])]
+        for host in self.reserved:
+            # Teardown removes a job's descriptor only once none of its
+            # processes is left: one still there names survivors.
+            rc, text = self.hosts[host].run(f"ls {self.w(host)}/run/job-*.pgid 2>/dev/null; true",
+                                            what="verify no job process survived")
+            out += [f"{host}: a job's processes survived teardown ({x.strip()})" for x in text.splitlines() if x.strip()]
         return out
 
     def block_seconds(self, path: str, trial: str = "") -> float:

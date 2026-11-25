@@ -51,6 +51,23 @@ BLOCK = os.urandom(1 << 16)
 # Bytes received per tagged upload, and whether its request has ended.
 SINK: dict = {}
 SINK_LOCK = threading.Lock()
+SINK_KEEP = 120.0   # seconds an interrupted upload's receipt is kept for the client's report
+
+
+def sink_end(tag: str, got: int, want: int, now: float) -> None:
+    """An upload's request ended (SINK_LOCK held). A complete one needs no
+    receipt: forget it now. An interrupted one is kept SINK_KEEP seconds,
+    for the client's report of what arrived."""
+    if got >= want:
+        SINK.pop(tag, None)
+    elif tag in SINK:
+        SINK[tag].update(done=True, ended=now)
+
+
+def sink_sweep(now: float) -> None:
+    """Forget interrupted uploads' receipts older than SINK_KEEP (SINK_LOCK held)."""
+    for tag in [t for t, v in SINK.items() if v.get("done") and now - v.get("ended", now) > SINK_KEEP]:
+        SINK.pop(tag, None)
 # Per call id (4 bytes the client writes at 36..39): (stream, seq) -> the
 # reflector's receive time, for the call's per-direction report; and when
 # the call was last heard from, to forget old calls.
@@ -129,6 +146,7 @@ class HTTP(socketserver.StreamRequestHandler):
             tag = headers.get("x-qq-tag", "") if url.path == "/sink" else ""
             if tag:
                 with SINK_LOCK:
+                    sink_sweep(time.monotonic())
                     SINK[tag] = {"bytes": 0, "done": False}
             try:
                 while got < want:
@@ -147,7 +165,7 @@ class HTTP(socketserver.StreamRequestHandler):
             finally:
                 if tag:
                     with SINK_LOCK:
-                        SINK[tag]["done"] = True
+                        sink_end(tag, got, want, time.monotonic())
             if method == "GET" and url.path == "/call-report":
                 # The call's uplink as the reflector saw it: per stream, every
                 # (seq, receive ms) it got, so the client can tell a packet

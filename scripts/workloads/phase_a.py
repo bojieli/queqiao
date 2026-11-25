@@ -176,6 +176,46 @@ def useful_bg(rows: Sequence[dict]) -> float:
     return float(sum(int(r["bytes"] or 0) for r in rows if r.get("http") == "200"))
 
 
+def _cum_at(samples: Sequence[Sequence[float]], t: float) -> float:
+    """A flow's cumulative bytes at wall-clock t from its progress samples:
+    between two samples (at most a quarter second apart) linear; before the
+    first, none; after the last, all."""
+    if not samples or t <= samples[0][0]:
+        return 0.0
+    for (a, x), (b, y) in zip(samples, samples[1:]):
+        if t <= b:
+            return x + (y - x) * ((t - a) / (b - a) if b > a else 1.0)
+    return float(samples[-1][1])
+
+
+def progress_flows(records: Sequence[dict], direction: str) -> List[List[Sequence[float]]]:
+    """The background flows' progress timelines (wlclient "bgprog" records)."""
+    return [r["samples"] for r in records if r.get("kind") == "bgprog" and r.get("dir") == direction
+            and r.get("samples")]
+
+
+def progress_in_window(flows: Sequence[Sequence[Sequence[float]]], window: Tuple[float, float]) -> Tuple[float, float]:
+    """(bytes, seconds) the background moved inside `window`: each flow's
+    bytes read off its own timeline at the window's two ends, so bytes
+    moved before or after the foreground are never credited to it."""
+    a, b = window
+    got = sum(_cum_at(s, b) - _cum_at(s, a) for s in flows)
+    return got, max(0.0, b - a)
+
+
+def progress_covered(fg: Tuple[float, float], flows: Sequence[Sequence[Sequence[float]]], n: int) -> bool:
+    """All `n` background flows were running across the foreground, by the
+    same evidence the rate is taken from: each flow's timeline spans at
+    least COVERAGE of the foreground window and moved bytes inside it."""
+    if len(flows) < n or fg[1] <= fg[0]:
+        return False
+    for s in flows:
+        inside = max(0.0, min(s[-1][0], fg[1]) - max(s[0][0], fg[0]))
+        if inside < COVERAGE * (fg[1] - fg[0]) or _cum_at(s, fg[1]) - _cum_at(s, fg[0]) <= 0:
+            return False
+    return True
+
+
 SINK_UNKNOWN = "99"   # wlclient: a cut upload whose received bytes could not be learned
 
 
@@ -239,6 +279,38 @@ def class_interactive(trials: Sequence[Any], upload: int, phase: str) -> float:
             inter += int(r["data_bytes_interactive_coded"]) + int(r["data_bytes_interactive_stream"])
             total += sum(int(r[k]) for k in keys)
     return inter / total if total else float("nan")
+
+
+
+# Tail percentiles and their quantiles, for section 15.4's per-block or
+# pooled test (Workload.block_tails).
+LLM_TAILS = {"ttft_net_p95_s": 0.95, "lateness_p99_s": 0.99}
+
+
+def llm_samples(calls: Sequence[dict]) -> Dict[str, List[float]]:
+    ok = [c for c in calls if not c.get("fail")]
+    late: List[float] = []
+    for c in ok:
+        late += lateness(c["deltas"])
+    return {"ttft_net_p95_s": [c["ttft"] - c["T"] for c in ok if c.get("ttft") is not None], "lateness_p99_s": late}
+
+
+def term_samples(sessions: Sequence[dict]) -> Dict[str, List[float]]:
+    """Echo times before the first burst (a) and after it (c, leaving out
+    keys within 2 s after a burst), as term_metrics splits them."""
+    a: List[float] = []
+    c: List[float] = []
+    for s in sessions:
+        if s.get("fail"):
+            continue
+        bursts = s.get("bursts") or []
+        first = bursts[0] if bursts else float("inf")
+        for sent, echo in s.get("keys") or []:
+            if sent < first:
+                a.append(echo)
+            elif not any(b <= sent < b + AFTER_BURST for b in bursts):
+                c.append(echo)
+    return {"a": a, "c": c}
 
 
 
@@ -383,6 +455,31 @@ class _Scenario(w.Workload):
     def extract(self, trial, plan):
         return self.block_extract([trial], plan)
 
+    def block_tails(self, trials: Sequence[Any], plan: dict) -> Dict[str, Tuple[float, List[float]]]:
+        """The raw samples of each phase's tail percentiles (LLM TTFT p95 and
+        lateness p99; keystroke echo p99 before and after the bursts, or the
+        canary's), so a sparse tail is pooled over blocks (section 15.4)."""
+        out: Dict[str, Tuple[float, List[float]]] = {}
+        phases = sorted({r["phase"] for t in trials for r in t.rows})
+        for ph in phases:
+            recs = [x for t in trials for x in getattr(t, "records", []) if x.get("_phase") == ph]
+            calls = [x for x in recs if x.get("kind") == "llm"]
+            if calls:
+                for k, v in llm_samples(calls).items():
+                    out[f"{ph}.{k}"] = (LLM_TAILS[k], v)
+            sessions = [x for x in recs if x.get("kind") == "term"]
+            if sessions:
+                canary = [x for x in sessions if x.get("canary")]
+                if canary:
+                    out[f"{ph}.canary_echo_p99_s"] = (0.99, term_samples(canary)["a"])
+                main = [x for x in sessions if not x.get("canary")]
+                if main:
+                    ts_ = term_samples(main)
+                    out[f"{ph}.echo_p99_a_s"] = (0.99, ts_["a"])
+                    if any(x.get("bursts") for x in main):
+                        out[f"{ph}.echo_p99_c_s"] = (0.99, ts_["c"])
+        return out
+
     def has_evidence(self, ph: str, recs: List[dict]) -> bool:
         """The raw records one trial must have for phase ph."""
         return True
@@ -396,9 +493,10 @@ class _Scenario(w.Workload):
             trecs = [x for x in getattr(t, "records", []) if x.get("_phase") == ph and x.get("kind") in ("llm", "term")
                      and not x.get("canary")]
             span = fg_span(trecs)
-            bg = [r for r in t.rows if r["phase"] == ph and r["kind"] in ("wl-bgdown", "wl-bgup")]
-            flows = 4 if ph.endswith("down4") or ph.startswith("m1") else 1
-            if span is None or not covered_each(span, bg, flows):
+            down = ph.endswith("down4") or ph.startswith("m1")
+            prog = progress_flows([x for x in getattr(t, "records", []) if x.get("_phase") == ph],
+                                  "down" if down else "up")
+            if span is None or not progress_covered(span, prog, 4 if down else 1):
                 return False
         return True
 
@@ -522,15 +620,14 @@ class Mixed(_Scenario):
         # The background's own rate over each trial's foreground window,
         # pooled: bytes in the windows over the windows' length.
         got = secs = 0.0
-        unknown = False
         for t in trials:
-            trows = [r for r in t.rows if r["phase"] == ph and r["kind"] in ("wl-bgdown", "wl-bgup")]
-            unknown |= any(r.get("curl_exit") == SINK_UNKNOWN for r in trows)
-            span = fg_span([x for x in getattr(t, "records", []) if x.get("_phase") == ph and x.get("kind") == "llm"])
-            if span:
-                g, w_ = rate_in_window(trows, span)
+            trecs = [x for x in getattr(t, "records", []) if x.get("_phase") == ph]
+            span = fg_span([x for x in trecs if x.get("kind") == "llm"])
+            prog = progress_flows(trecs, "down") + progress_flows(trecs, "up")
+            if span and prog:
+                g, w_ = progress_in_window(prog, span)
                 got, secs = got + g, secs + w_
-        m["bg_rate_bps"] = got / secs if secs > 0 and not unknown else float("nan")
+        m["bg_rate_bps"] = got / secs if secs > 0 else float("nan")
         if not self.under_background(ph, recs, rows, trials):
             return {k: float("nan") for k in m}
         m["class_interactive"] = class_interactive(trials, prompt_bytes(recs), ph)
