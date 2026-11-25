@@ -556,12 +556,14 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 		if fillErr != nil && !errors.Is(fillErr, ErrUnsupported) {
 			err = fillErr
 		}
-		if n <= size/2 {
-			// Account the reservation at the backing allocation, and do not
-			// keep a mostly-empty one.
+		if n <= size/2 && s.cfg.Memory.TryAcquire(n) {
+			// Do not keep a mostly-empty allocation. The copy needs both
+			// buffers live at once, so the smaller one is reserved before it
+			// exists; if that does not fit now, the original -- already
+			// charged at its allocation -- is kept instead.
 			short := make([]byte, n)
 			copy(short, buf[:n])
-			s.cfg.Memory.Release(size - n)
+			s.cfg.Memory.Release(size)
 			buf, reserved = short, n
 		}
 	}
@@ -814,8 +816,10 @@ func (s *Scheduler) Next(ctx context.Context, laneID uint64, windowBytes int) (*
 				return nil, nil
 			}
 			// Idle means the lane could carry another chunk if one were
-			// ready: below its count limit and with byte room for one.
-			idle = len(s.pending) == 0 && s.hasRoomLocked(laneID, windowBytes, uint64(s.cfg.ChunkSize))
+			// ready: below its count limit and with byte room for one. Only
+			// the autotune reads it, so the legacy path skips the probe.
+			idle = s.cfg.Autotune != nil && len(s.pending) == 0 &&
+				s.hasRoomLocked(laneID, windowBytes, uint64(s.cfg.ChunkSize))
 		}
 		if idle {
 			// This lane could carry more and has nothing to carry. If the
