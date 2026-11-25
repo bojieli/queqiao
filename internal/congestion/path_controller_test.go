@@ -1738,3 +1738,107 @@ func TestTheMoveRTTGuardEndsOnALongRoundTrip(t *testing.T) {
 		t.Fatalf("the new path never learned its round trip (min %v): the guard outlived the attachment's own packet", min)
 	}
 }
+
+// The packet-number boundary outlives the first fresh sample: packets on
+// both sides of a move can share a send time, and a reordered ACK of an old
+// one, arriving after a new one was timed, still carries no sample in.
+func TestTheMoveBoundaryOutlivesTheFirstFreshSample(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	p, gen := movingPC(t, old, next, now, 50*time.Millisecond)
+	rtt := p.a.connRTT.(*fixedRTT)
+	oldPacket := p.send(now, 1200)
+	*gen = 1
+	fresh := p.send(now, 1200) // same send time, after the move
+	if p.a.Controller() != next {
+		t.Fatal("setup: no move")
+	}
+	p.event(now.Add(50*time.Millisecond), []quiccongestion.PacketNumber{fresh}, nil)
+	rtt.min, rtt.smoothed = time.Millisecond, time.Millisecond // the old packet's sample
+	p.event(now.Add(51*time.Millisecond), []quiccongestion.PacketNumber{oldPacket}, nil)
+	next.mu.Lock()
+	min := next.rtt.MinRTT()
+	next.mu.Unlock()
+	if min != 50*time.Millisecond {
+		t.Fatalf("the new path's minimum is %v: a reordered ACK of an old-path packet was sampled", min)
+	}
+}
+
+// A connection whose path changed between choosing its controller and its
+// installation is guarded as after a migration: its RTT does not seed the
+// new controller, and an ACK of a packet already in flight is not sampled.
+func TestAnInstallationOntoAnotherPathIsGuarded(t *testing.T) {
+	chosen, actual := newPCController(), newPCController()
+	now := base()
+	p := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+	p.a = chosen.Attach(func(_, _, _, _ net.Addr) *PathController { return actual }, func() (net.Addr, net.Addr) { return nil, nil })
+	p.inFlight = 1200 // a packet sent before installation
+	p.sizes[0] = 1200
+	p.next = 1
+	p.a.OnAttach(now, p.inFlight, 1200, func() {})
+	p.a.SetRTTStatsProvider(&fixedRTT{min: 5 * time.Millisecond, smoothed: 5 * time.Millisecond})
+	if p.a.Controller() != actual {
+		t.Fatal("setup: the installation did not switch controllers")
+	}
+	actual.mu.Lock()
+	min := actual.rtt.MinRTT()
+	actual.mu.Unlock()
+	if min != 0 {
+		t.Fatalf("the connection seeded the new path's RTT with %v from the old one", min)
+	}
+	p.event(now.Add(5*time.Millisecond), []quiccongestion.PacketNumber{0}, nil)
+	actual.mu.Lock()
+	min = actual.rtt.MinRTT()
+	actual.mu.Unlock()
+	if min != 0 {
+		t.Fatalf("an ACK of a packet sent before installation set the new path's RTT to %v", min)
+	}
+}
+
+// A PTO demotion that releases siblings' resolved outcomes publishes them
+// at once, as an explicit discard does.
+func TestADemotionThatReleasesFatesPublishesTheErasure(t *testing.T) {
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	c.clock = func() monotime.Time { return c.now }
+	now := base()
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	a.send(now, 1200) // holds the head of the send order
+	for range 400 {
+		b.send(now, 1200)
+	}
+	now = now.Add(100 * time.Millisecond)
+	var lost, acked []quiccongestion.PacketNumber
+	for n := range quiccongestion.PacketNumber(400) {
+		if n%2 == 0 {
+			lost = append(lost, n)
+		} else {
+			acked = append(acked, n)
+		}
+	}
+	b.event(now, acked, lost)
+	if e := c.Telemetry().Erasure; e != 0 {
+		t.Fatalf("setup: erasure %.2f published while the head was unresolved", e)
+	}
+	for range pathProbingPTOProbes {
+		now = now.Add(10 * time.Millisecond)
+		a.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
+	}
+	if e := c.Telemetry().Erasure; e < 0.4 {
+		t.Fatalf("after the demotion released half-lost fates the published erasure is %.2f", e)
+	}
+}
+
+// Releasing only records without an outcome -- a discard of a packet nobody
+// measured -- changes no statistic and publishes nothing.
+func TestReleasingNoOutcomePublishesNothing(t *testing.T) {
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	c.clock = func() monotime.Time { return c.now }
+	now := base()
+	a := attachPC(t, c, now)
+	n := a.send(now, 1200)
+	a.inFlight -= 1200
+	a.a.OnDiscarded(now, a.inFlight, a.refs([]quiccongestion.PacketNumber{n}), false, quiccongestion.DiscardPTOProbe)
+	if s := c.Stats(); s.Publications != 0 {
+		t.Fatalf("a discard that released no outcome published %d measurements", s.Publications)
+	}
+}
