@@ -266,3 +266,27 @@ func TestClassArbiterTogglesAfterReplenishmentKeepTheWeights(t *testing.T) {
 		t.Fatalf("BULK share %.3f under toggling CONTROL, want its weight 0.2", share)
 	}
 }
+
+// A class that spends part of its allocation, goes idle and returns within
+// the same round keeps the rest: a sparse ACK after a small one still gets
+// the turn while INTERACTIVE holds credit. It gets no more than that.
+func TestClassArbiterIdleClassKeepsItsUnspentShareForTheRound(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	ci := demandOf(quiccongestion.ClassControl, quiccongestion.ClassInteractive)
+	i := demandOf(quiccongestion.ClassInteractive)
+	a.OnDemand(ci)
+	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassControl {
+		t.Fatalf("turn %v, want CONTROL", p.Turn)
+	}
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassControl: 100}) // a small ACK
+	left := a.Stats().Deficit[quiccongestion.ClassControl]
+	a.OnDemand(i)
+	a.OnSent(simBuilder(a.Permit(arbPacket), i, 0)) // INTERACTIVE, still in credit
+	a.OnDemand(ci)
+	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassControl {
+		t.Fatalf("turn %v: CONTROL lost its unspent share by going idle", p.Turn)
+	}
+	if got := a.Stats().Deficit[quiccongestion.ClassControl]; got > left {
+		t.Fatalf("CONTROL came back with %d, more than the %d it left", got, left)
+	}
+}

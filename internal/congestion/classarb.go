@@ -56,6 +56,11 @@ type ClassArbiter struct {
 	// class last got the quantum it is owed on becoming eligible.
 	round    uint64
 	credited [quiccongestion.NumSendClasses]uint64
+	// held is the credit a class had when it lost demand, kept for the rest
+	// of the round in which it went idle (heldRound) and restored if it is
+	// eligible again within it; it never carries into a later round.
+	held      [quiccongestion.NumSendClasses]int64
+	heldRound [quiccongestion.NumSendClasses]uint64
 }
 
 // NewClassArbiter returns an arbiter with the given weights; a weight below
@@ -80,7 +85,12 @@ func (a *ClassArbiter) SetQuantum(q quiccongestion.ByteCount) {
 func (a *ClassArbiter) OnDemand(d quiccongestion.Demand) {
 	a.mu.Lock()
 	for _, c := range scheduledClasses {
-		if d.Eligible[c] && !a.demand[c] && a.deficit[c] >= 0 && a.credited[c] != a.round+1 {
+		if d.Eligible[c] && !a.demand[c] && a.held[c] > 0 && a.heldRound[c] == a.round {
+			// Back within the round it went idle in: it keeps what it had
+			// not spent of this round's allocation, and nothing more.
+			a.deficit[c] = max(a.deficit[c], a.held[c])
+			a.held[c] = 0
+		} else if d.Eligible[c] && !a.demand[c] && a.deficit[c] >= 0 && a.credited[c] != a.round+1 {
 			// A class that becomes eligible joins the current round with
 			// its quantum, as in deficit round robin, so a sparse ACK does
 			// not wait out another class's whole allocation. Debt is kept,
@@ -145,6 +155,9 @@ func (a *ClassArbiter) normalize() {
 	anyDemand, anyPositive := false, false
 	for _, c := range scheduledClasses {
 		if !a.demand[c] {
+			if a.deficit[c] > 0 {
+				a.held[c], a.heldRound[c] = a.deficit[c], a.round
+			}
 			a.deficit[c] = min(a.deficit[c], 0)
 			continue
 		}
