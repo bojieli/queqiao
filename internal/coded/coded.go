@@ -196,8 +196,10 @@ type Path struct {
 	// adds to it, and the carrier's observer, which settles it, so it has its
 	// own lock; nothing is called while that lock is held except appending
 	// to outcomes.
-	tagMu      sync.Mutex
-	tags       map[uint64][]*frameTrack
+	tagMu sync.Mutex
+	tags  map[uint64][]*frameTrack
+	// tagBytes is each outstanding tag's datagram size, for SourceRate.
+	tagBytes   map[uint64]int
 	tagsClosed bool
 	outcomes   []settled
 	outcomeC   chan struct{}
@@ -427,7 +429,7 @@ func (p *Path) isSettled(track *frameTrack) bool {
 // and records it before the datagram is offered, because the carrier can
 // register it before Send returns. ok is false when the path has closed, in
 // which case tracks have been abandoned.
-func (p *Path) tagFor(tracks []*frameTrack) (tag uint64, ok bool) {
+func (p *Path) tagFor(tracks []*frameTrack, bytes int) (tag uint64, ok bool) {
 	p.tagMu.Lock()
 	if p.tagsClosed {
 		p.tagMu.Unlock()
@@ -437,6 +439,12 @@ func (p *Path) tagFor(tracks []*frameTrack) (tag uint64, ok bool) {
 	p.nextTag++
 	tag = p.nextTag
 	p.tags[tag] = append([]*frameTrack(nil), tracks...)
+	if p.cfg.SourceRate {
+		if p.tagBytes == nil {
+			p.tagBytes = make(map[uint64]int)
+		}
+		p.tagBytes[tag] = bytes
+	}
 	p.tagMu.Unlock()
 	return tag, true
 }
@@ -451,8 +459,16 @@ func (p *Path) onTag(tag uint64, registered bool) {
 		return
 	}
 	delete(p.tags, tag)
-	queued := false
 	now := time.Now()
+	if bytes, ok := p.tagBytes[tag]; ok {
+		delete(p.tagBytes, tag)
+		if registered {
+			// A source symbol counts when a packet carrying it is
+			// registered, not when it entered the send queue.
+			p.source.add(bytes, now)
+		}
+	}
+	queued := false
 	for _, track := range tracks {
 		if track.settled {
 			continue
@@ -810,14 +826,16 @@ func (p *Path) sendSource(esi uint32, vector []byte, tracks []*frameTrack) error
 	d[4] = kindSource
 	binary.BigEndian.PutUint32(d[5:], esi)
 	copy(d[sourceHeader:], vector)
-	if len(tracks) == 0 {
+	tagged, ok := p.carrier.(TaggedCarrier)
+	if len(tracks) == 0 && !(ok && p.cfg.SourceRate) {
 		sent, err := p.put(d)
-		if sent {
-			p.source.add(len(d), time.Now(), p.roundTrip())
+		if sent && p.cfg.SourceRate {
+			// The carrier cannot report registration: acceptance is the
+			// nearest event.
+			p.source.add(len(d), time.Now())
 		}
 		return err
 	}
-	tagged, ok := p.carrier.(TaggedCarrier)
 	if !ok {
 		// Nothing below can say when a packet was built, so acceptance is
 		// the nearest event there is.
@@ -826,12 +844,14 @@ func (p *Path) sendSource(esi uint32, vector []byte, tracks []*frameTrack) error
 			p.abandon(tracks...)
 			return err
 		}
-		p.source.add(len(d), time.Now(), p.roundTrip())
+		if p.cfg.SourceRate {
+			p.source.add(len(d), time.Now())
+		}
 		p.registerUntagged(tracks)
 		return nil
 	}
 	p.observe.Do(func() { tagged.ObserveTags(p.onTag) })
-	tag, ok := p.tagFor(tracks)
+	tag, ok := p.tagFor(tracks, len(d))
 	if !ok {
 		return p.failure()
 	}
@@ -839,8 +859,6 @@ func (p *Path) sendSource(esi uint32, vector []byte, tracks []*frameTrack) error
 	if !sent {
 		// Refused, so the carrier will never report on it.
 		p.onTag(tag, false)
-	} else {
-		p.source.add(len(d), time.Now(), p.roundTrip())
 	}
 	return err
 }
@@ -1247,8 +1265,11 @@ func (p *Path) params() fec.Params {
 // rate is the sending rate the window is sized against.
 func (p *Path) rate() float64 {
 	if p.cfg.SourceRate {
-		if r := p.source.rate(time.Now(), p.roundTrip()); r > 0 {
-			return r
+		rtt := p.roundTrip()
+		if r, ok := p.source.rate(time.Now(), rtt); ok {
+			// A measured sparse lane keeps a sparse window; at least one
+			// symbol a round trip.
+			return max(r, float64(p.symbolBytes())/rtt.Seconds())
 		}
 		return float64(p.symbolBytes()) * 64 / p.roundTrip().Seconds()
 	}
@@ -1421,39 +1442,59 @@ func (p *Path) Close() error {
 
 // sourceMeter is a path's source bytes per second, measured over windows of
 // one round trip: the rate of the last full window, or, once the current
-// window has run a round trip, of that one. Idle time counts, so a sparse
-// lane measures a sparse rate.
+// window has run a round trip, of that one. Idle time within a window counts,
+// so a sparse lane measures a sparse rate; an idle gap of several round
+// trips ends the measurement, so a burst after a pause restarts from the
+// prior rather than from stale traffic. add may run on the carrier's
+// goroutine, so it uses the round trip rate last saw.
 type sourceMeter struct {
-	mu    sync.Mutex
-	start time.Time
-	bytes int
-	last  float64
+	mu      sync.Mutex
+	start   time.Time
+	lastAdd time.Time
+	bytes   int
+	last    float64
+	// measured says last is a measurement, which may be zero: a window
+	// without a source symbol is a sparse lane, not a cold one.
+	measured bool
+	rtt      time.Duration
 }
 
-func (m *sourceMeter) roll(now time.Time, rtt time.Duration) {
+// sourceIdleRTTs is how many round trips without a source symbol end a
+// measurement.
+const sourceIdleRTTs = 4
+
+func (m *sourceMeter) roll(now time.Time) {
+	rtt := m.rtt
+	if rtt <= 0 {
+		rtt = 300 * time.Millisecond
+	}
+	if !m.lastAdd.IsZero() && now.Sub(m.lastAdd) > sourceIdleRTTs*rtt {
+		m.start, m.lastAdd, m.bytes, m.last, m.measured = time.Time{}, time.Time{}, 0, 0, false
+	}
 	if m.start.IsZero() {
-		m.start = now
 		return
 	}
 	if elapsed := now.Sub(m.start); elapsed >= rtt && elapsed > 0 {
-		m.last = float64(m.bytes) / elapsed.Seconds()
+		m.last, m.measured = float64(m.bytes)/elapsed.Seconds(), true
 		m.start, m.bytes = now, 0
 	}
 }
 
-func (m *sourceMeter) add(n int, now time.Time, rtt time.Duration) {
+func (m *sourceMeter) add(n int, now time.Time) {
 	m.mu.Lock()
-	m.roll(now, rtt)
+	m.roll(now)
+	if m.start.IsZero() {
+		m.start = now
+	}
 	m.bytes += n
+	m.lastAdd = now
 	m.mu.Unlock()
 }
 
-func (m *sourceMeter) rate(now time.Time, rtt time.Duration) float64 {
+func (m *sourceMeter) rate(now time.Time, rtt time.Duration) (float64, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.start.IsZero() {
-		return 0
-	}
-	m.roll(now, rtt)
-	return m.last
+	m.rtt = rtt
+	m.roll(now)
+	return m.last, m.measured
 }

@@ -50,3 +50,37 @@ func TestASparseCodedLaneSizesItsWindowFromItsOwnSourceRate(t *testing.T) {
 		peer.Close()
 	}
 }
+
+// A burst followed by an idle gap of several round trips ends the
+// measurement: the next decision sizes from the cold-start prior, not from
+// the stale burst spread over the gap.
+func TestTheSourceRateRestartsAfterAnIdleGap(t *testing.T) {
+	var m sourceMeter
+	rtt := 20 * time.Millisecond
+	t0 := time.Now()
+	_, _ = m.rate(t0, rtt)
+	for i := range 20 {
+		m.add(1000, t0.Add(time.Duration(i)*time.Millisecond))
+	}
+	if r, ok := m.rate(t0.Add(25*time.Millisecond), rtt); !ok || r <= 0 {
+		t.Fatalf("no rate measured over a busy round trip: %.0f", r)
+	}
+	if r, ok := m.rate(t0.Add(time.Second), rtt); ok {
+		t.Fatalf("after an idle second the rate is %.0f B/s; want none, so the prior stands", r)
+	}
+}
+
+// A window without a source symbol, short of the idle reset, is a sparse
+// measurement, not a cold meter: the lane keeps a sparse window.
+func TestAnEmptyWindowIsASparseMeasurementNotAColdMeter(t *testing.T) {
+	var m sourceMeter
+	rtt := 20 * time.Millisecond
+	t0 := time.Now()
+	_, _ = m.rate(t0, rtt)
+	m.add(100, t0)
+	_, _ = m.rate(t0.Add(25*time.Millisecond), rtt) // rolls the window holding the symbol
+	m.add(100, t0.Add(50*time.Millisecond))         // rolls an empty window first
+	if _, ok := m.rate(t0.Add(51*time.Millisecond), rtt); !ok {
+		t.Fatal("an empty window read as no measurement: the lane would size like a cold burst")
+	}
+}

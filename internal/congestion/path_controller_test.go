@@ -1043,3 +1043,140 @@ func TestTheDatagramBurstStatisticIsTheDatagramsOwn(t *testing.T) {
 		t.Fatalf("datagram burst %.2f (%v) against path-wide %.2f", b, ok, path)
 	}
 }
+
+// An admitted turn that builds nothing -- its work does not fit the permit,
+// demand unchanged -- is passed over for that attachment: the connection is
+// woken and its next permit serves another class it has; once every class
+// is passed over it is refused until the earliest hold ends, and a send
+// clears the holds.
+func TestAnEmptyBuildPassesTheTurnToAnotherClass(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassInteractive: true, quiccongestion.ClassBulk: true}})
+	p := a.a.Admit(now, 1200)
+	if !p.OK || p.Turn != quiccongestion.ClassInteractive {
+		t.Fatalf("first permit %+v", p)
+	}
+	wakes := a.wakes
+	a.a.OnEmptyBuild(now, p)
+	if a.wakes == wakes {
+		t.Fatal("the connection was not woken to take another decision")
+	}
+	q := a.a.Admit(now, 1200)
+	if !q.OK || q.Turn != quiccongestion.ClassBulk || q.Fill[quiccongestion.ClassInteractive] != 0 {
+		t.Fatalf("after INTERACTIVE built nothing the permit is %+v; want BULK with no INTERACTIVE fill", q)
+	}
+	a.a.OnEmptyBuild(now, q)
+	r := a.a.Admit(now, 1200)
+	if r.OK || r.RetryAt.IsZero() {
+		t.Fatalf("with every class passed over the permit is %+v; want a refusal with a retry", r)
+	}
+	if s := a.a.Admit(r.RetryAt, 1200); !s.OK {
+		t.Fatalf("still refused once the holds ended: %+v", s)
+	}
+	a.a.OnEmptyBuild(r.RetryAt, quiccongestion.Permit{Turn: quiccongestion.ClassInteractive})
+	a.sendClass(r.RetryAt, 1200, quiccongestion.ClassBulk)
+	if u := a.a.Admit(r.RetryAt, 1200); !u.OK || u.Turn != quiccongestion.ClassInteractive {
+		t.Fatalf("a send did not clear the hold: %+v", u)
+	}
+}
+
+// A debt-keeping balance is settled at the rate it was earned at: a rate
+// that rises after most of an interval has passed does not apply to the
+// whole interval and repay a debt the old rate had not.
+func TestTheBalanceIsSettledBeforeTheRateChanges(t *testing.T) {
+	rate := quiccongestion.ByteCount(100_000)
+	p := newTUICPacer(func() quiccongestion.ByteCount { return rate })
+	p.keepDebt = true
+	t0 := base()
+	p.sentPacket(t0, 40_000) // deep in debt: the bucket starts at its burst allowance
+	t1 := t0.Add(100 * time.Millisecond)
+	p.settle(t1) // 10 kB earned at the old rate
+	rate = 10_000_000
+	if b := p.budget(t1); b > 0 {
+		t.Fatalf("a rate raised at %v repaid the debt earned before it: balance %d", t1.Sub(t0), b)
+	}
+}
+
+// The retry after every class is passed over is the earliest hold still in
+// the future among the classes with demand, not an expired one.
+func TestTheEmptyBuildRetryIsAFutureHold(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassInteractive: true}})
+	a.a.OnEmptyBuild(now, quiccongestion.Permit{Turn: quiccongestion.ClassInteractive})
+	later := now.Add(10 * time.Millisecond) // INTERACTIVE's hold has expired
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	a.a.OnEmptyBuild(later, quiccongestion.Permit{Turn: quiccongestion.ClassBulk})
+	p := a.a.Admit(later, 1200)
+	if p.OK || !p.RetryAt.After(later) {
+		t.Fatalf("with BULK held the permit is %+v; want a refusal until BULK's hold ends", p)
+	}
+}
+
+// Every attachment reports the path's undivided window and rate -- what its
+// connection's flow control may use -- with the controller's identity, so a
+// reader summing over connections counts the path once.
+func TestAttachmentsReportTheUndividedPathWithItsIdentity(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	ta, tb, path := a.a.Telemetry(), b.a.Telemetry(), c.Telemetry()
+	if ta.CongestionWindow != path.CongestionWindow || tb.PacingRate != path.PacingRate {
+		t.Fatalf("an attachment reports a divided window or rate: %d/%d against %d/%d", ta.CongestionWindow, tb.PacingRate, path.CongestionWindow, path.PacingRate)
+	}
+	if ta.Authority == 0 || ta.Authority != tb.Authority {
+		t.Fatalf("authority %d and %d", ta.Authority, tb.Authority)
+	}
+}
+
+// An attachment with no ordinary work asks from its send loop all the same;
+// beside a busy sibling it neither defers, nor wakes the sibling, nor
+// registers as a waiter.
+func TestAnIdleAttachmentDoesNotContend(t *testing.T) {
+	c := newPCController()
+	now := base()
+	idle, busy := attachPC(t, c, now), attachPC(t, c, now)
+	busy.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	window := c.law.GetCongestionWindow()
+	for busy.inFlight+1200 <= window {
+		busy.send(now, 1200)
+	}
+	wakes := busy.wakes
+	for range 10 {
+		if p := idle.a.Admit(now, 1200); p.OK || !p.RetryAt.IsZero() {
+			t.Fatalf("an idle attachment beside a full window got %+v", p)
+		}
+	}
+	busy.event(now.Add(100*time.Millisecond), numbers(0, 3), nil)
+	if busy.wakes != wakes || idle.wakes != 0 {
+		t.Fatalf("idle asking woke the sibling (%d) or registered itself as a waiter (%d)", busy.wakes-wakes, idle.wakes)
+	}
+	if s := c.Stats(); s.RefusedTurn != 0 {
+		t.Fatalf("the idle attachment deferred %d times", s.RefusedTurn)
+	}
+}
+
+// After an unused opportunity the marker is applied before the first packet
+// of the resumed burst is registered: on a drained path no ACK comes between
+// the idle interval and that packet.
+func TestTheFirstPacketAfterAnUnusedOpportunityIsApplicationLimited(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.a.OnDemand(quiccongestion.Demand{})
+	now = now.Add(200 * time.Millisecond)
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	a.send(now, 1200)
+	c.mu.Lock()
+	state, ok := c.law.inner.estimator.packetStates[1]
+	c.mu.Unlock()
+	if !ok || !state.appLimited {
+		t.Fatalf("the first packet after an unused opportunity was registered as a path measurement (state %v)", ok)
+	}
+}

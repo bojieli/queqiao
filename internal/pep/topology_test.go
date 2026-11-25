@@ -54,10 +54,10 @@ func TestTopologyValidator(t *testing.T) {
 			t.Errorf("ValidateTopology(%q, %q, %d) = %v, want ok=%v", c.topology, c.scope, c.fanOut, err, c.ok)
 		}
 	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, CongestionScopePath, ClassifierPhased, TopologySingle); got != "cc-api=v2,sched=class,congestion=path,topology=single,classifier=phased" {
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, ClassifierPhased, CongestionScopePath, TopologySingle); got != "cc-api=v2,sched=class,congestion=path,topology=single,classifier=phased" {
 		t.Errorf("bundle %q", got)
 	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, CongestionScopePath, ClassifierLegacy, TopologyIsolated); got != "cc-api=v2,sched=class,congestion=path" {
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, ClassifierLegacy, CongestionScopePath, TopologyIsolated); got != "cc-api=v2,sched=class,congestion=path" {
 		t.Errorf("isolated topology is the default and not named: %q", got)
 	}
 

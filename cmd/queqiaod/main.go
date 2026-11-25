@@ -1105,7 +1105,7 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("congestion_scope", opts.congestionScope),
 		slog.String("classifier", opts.classifierMode),
 		slog.String("coded_retry", opts.codedRetry),
-		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)), pep.SchedMode(opts.sched), pep.CongestionScope(opts.congestionScope), pep.ClassifierMode(opts.classifierMode), pep.Topology(opts.topology))),
+		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)), pep.SchedMode(opts.sched), pep.ClassifierMode(opts.classifierMode), pep.CongestionScope(opts.congestionScope), pep.Topology(opts.topology))),
 		slog.String("mem", opts.memory),
 		slog.Bool("carrier_shadow", opts.carrierShadow),
 		slog.Uint64("carrier_shadow_ks", uint64(opts.carrierShadowKS)),

@@ -137,6 +137,17 @@ func (p *pacer) timeUntilSend() monotime.Time {
 	return p.timeUntilBudget(p.maxDatagramSize)
 }
 
+// settle carries a debt-keeping balance forward to now at the current rate,
+// so a later change of rate applies only from now: refill earned at the old
+// rate is neither withdrawn by a decrease nor multiplied by an increase.
+func (p *pacer) settle(now monotime.Time) {
+	if !p.keepDebt || p.lastSentTime.IsZero() || !now.After(p.lastSentTime) {
+		return
+	}
+	p.budgetAtLastSent = p.budget(now)
+	p.lastSentTime = now
+}
+
 // timeUntilBudget is when the balance will reach need: one datagram for
 // timeUntilSend, or a caller's own packet size.
 func (p *pacer) timeUntilBudget(need quiccongestion.ByteCount) monotime.Time {

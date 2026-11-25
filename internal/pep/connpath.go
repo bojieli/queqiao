@@ -61,6 +61,27 @@ func pathModelOf(conn *quic.Conn) *connPathModel {
 	return actual.(*connPathModel)
 }
 
+// pathModelOfKey returns the connection's path model reference, creating
+// it on first use with the model for key rather than the peer's, so a
+// connection whose readers belong to another key (congestion=path's
+// principal-scoped model) never creates the peer-keyed one.
+func pathModelOfKey(conn *quic.Conn, key string) *connPathModel {
+	if m, ok := connPathModels.Load(conn); ok {
+		cm := m.(*connPathModel)
+		cm.model.Store(pathmodel.Shared(key))
+		return cm
+	}
+	created := &connPathModel{}
+	created.model.Store(pathmodel.Shared(key))
+	actual, loaded := connPathModels.LoadOrStore(conn, created)
+	if !loaded {
+		context.AfterFunc(conn.Context(), func() { connPathModels.Delete(conn) })
+	} else {
+		actual.(*connPathModel).model.Store(pathmodel.Shared(key))
+	}
+	return actual.(*connPathModel)
+}
+
 // rekeyPathModel points the connection's readers at the model for key.
 func rekeyPathModel(conn *quic.Conn, key string) {
 	pathModelOf(conn).model.Store(pathmodel.Shared(key))
