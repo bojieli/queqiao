@@ -876,3 +876,22 @@ func TestApplicationLimitedIsAnUnusedOpportunity(t *testing.T) {
 		t.Error("a sender without demand while the window was open produced no application-limited samples")
 	}
 }
+
+// The path's delay model takes the connection's ACK-delay-corrected RTT,
+// not the raw time to ACK receipt the event carries: a delayed ACK is not
+// queueing.
+func TestPathRTTIgnoresThePeersAckDelay(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now) // its connection's latest RTT is 100 ms
+	a.send(now, 1200)
+	now = now.Add(300 * time.Millisecond)
+	a.inFlight = 0
+	a.a.OnAckEvent(quiccongestion.AckEvent{Time: now, RTTSample: 300 * time.Millisecond, Acked: a.refs([]quiccongestion.PacketNumber{0})})
+	c.mu.Lock()
+	srtt := c.rtt.SmoothedRTT()
+	c.mu.Unlock()
+	if srtt != 100*time.Millisecond {
+		t.Fatalf("the path's smoothed RTT is %v after a 300 ms raw sample whose corrected value is 100 ms", srtt)
+	}
+}

@@ -203,7 +203,8 @@ func (c *PathController) unused(now monotime.Time) bool {
 		return false
 	}
 	return now.Sub(c.noDemandSince) >= c.packetTime(c.maxPacket) &&
-		c.flight+c.maxPacket <= c.law.GetCongestionWindow()
+		c.flight+c.maxPacket <= c.law.GetCongestionWindow() &&
+		c.law.pacer.budget(now) >= c.maxPacket
 }
 
 // appLimited is the law's application-limited marker under a path
@@ -659,7 +660,7 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	if borrowed {
 		c.stats.debtPermits.Add(1)
 	}
-	a.windowBlocked = false
+	a.windowBlocked, a.pacingBlocked = false, false
 	a.waiting, a.deferred = false, false
 	c.permitSeq++
 	a.lastPermit = c.permitSeq
@@ -726,6 +727,7 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 	if budget := c.law.pacer.budget(now); budget < maxBytes {
 		if budget < maxBytes-debt {
 			c.stats.refusedPacing.Add(1)
+			a.pacingBlocked = true
 			retry := c.law.pacer.timeUntilBudget(maxBytes - debt)
 			if retry.IsZero() || retry.Before(now) {
 				retry = now
@@ -822,8 +824,21 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 	c.advance(now)
 	before := c.flight
 	windowBefore := c.law.GetCongestionWindow()
+	rateBefore := c.law.bandwidth()
 	c.setGauge(a, ev.InFlight)
-	c.rtt.observe(ev.RTTSample)
+	if ev.RTTSample > 0 {
+		// The event's sample is raw: send to ACK receipt. The connection's
+		// own statistics have already removed the peer's reported ACK
+		// delay, so their latest sample is what the path's delay model
+		// takes; a delayed ACK is not queueing.
+		sample := ev.RTTSample
+		if a.connRTT != nil {
+			if latest := a.connRTT.LatestRTT(); latest > 0 {
+				sample = latest
+			}
+		}
+		c.rtt.observe(sample)
+	}
 	c.acked, c.lost = c.acked[:0], c.lost[:0]
 	var resolved quiccongestion.ByteCount
 	progress := false
@@ -907,10 +922,20 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		after := c.law.Telemetry()
 		a.bankCounters(&after, &before)
 	}
+	var wakes []func()
 	if c.flight < before || c.law.GetCongestionWindow() > windowBefore {
-		return c.collectBlocked(a, nil)
+		wakes = c.collectBlocked(a, wakes)
 	}
-	return nil
+	if c.law.bandwidth() > rateBefore {
+		// A higher rate moves every pacing refusal's retry earlier.
+		for o := range c.atts {
+			if o != a && o.pacingBlocked && o.wake != nil {
+				o.pacingBlocked = false
+				wakes = append(wakes, o.wake)
+			}
+		}
+	}
+	return wakes
 }
 
 func (c *PathController) discarded(a *PathAttachment, now monotime.Time, inFlight quiccongestion.ByteCount, refs []quiccongestion.PacketRef) []func() {
@@ -963,6 +988,8 @@ type PathAttachment struct {
 	// it sends first; zero while nobody has deferred to it since it last
 	// sent.
 	claimDeadline monotime.Time
+	// pacingBlocked says its last refusal was for the balance.
+	pacingBlocked bool
 	// unable says it asked and could not use the path's opportunity for a
 	// reason of its own; it holds no claim until it next sends.
 	unable bool
