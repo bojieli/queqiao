@@ -433,7 +433,22 @@ type multipathFlow struct {
 	abortDrainGrace time.Duration
 	bytesUp         atomic.Uint64
 	bytesDown       atomic.Uint64
-	class           atomic.Uint32
+	// class is the class this flow sends with: the classifier's current
+	// class, which under the legacy bundle is its sticky class. everBulk is
+	// the sticky fact "this flow has been BULK", which lane choice and bulk
+	// isolation read.
+	class    atomic.Uint32
+	everBulk atomic.Bool
+	// ackedCum mirrors acked for the classifier, which must not take
+	// replayMu: it is reached from the scheduler's dispatch.
+	ackedCum atomic.Uint64
+	// backlogDrained records that an acknowledgement took the send backlog
+	// to the classifier's threshold or below since the last observation, so
+	// a backlog that dipped between reads is not taken for a continuous one.
+	backlogDrained atomic.Bool
+	// classBytes counts DATA payload this endpoint sent, by class byte (new,
+	// interactive, bulk) and substrate (stream, coded).
+	classBytes [3][2]atomic.Uint64
 	// codingRecoveryEnd bounds a stalled coded send's stream escape. Once the
 	// peer has acknowledged the bytes pending at detection, their recovery is
 	// complete. Newer exchanges remain eligible for coding while feedback is
@@ -524,6 +539,13 @@ type multipathFlow struct {
 	recentStart            time.Time
 	currentUp, currentDown uint64
 	priorUp, priorDown     uint64
+	// sparseCurrent and sparsePrior are the same two buckets for the bytes
+	// sent under the phased bundle's sparse-write rule.
+	sparseCurrent, sparsePrior uint64
+	// clock, when set by a test, replaces time.Now for classification.
+	clock func() time.Time
+	// classifyMu serialises observe: sampling, classifying and publishing.
+	classifyMu sync.Mutex
 
 	replayMu sync.Mutex
 	// closeFrame is this flow's half-close, retained until the peer
@@ -566,7 +588,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 		done: make(chan struct{}), localClosedCh: make(chan struct{}), remoteAbortCh: make(chan struct{}),
 		ackWake: make(chan struct{}, 1), ackErr: make(chan error, 1),
 		stallSignal: make(chan struct{}, 1),
-		classifier:  classifier.New(classifierCfg), started: time.Now(), completionGrace: flowCompletionGrace,
+		classifier:  classifier.New(classifierBacklogFor(classifierCfg, memoryLimits)), started: time.Now(), completionGrace: flowCompletionGrace,
 	}
 	f.idleTimeout = defaultFlowIdleTimeout
 	f.maxLifetime = defaultFlowMaxLifetime
@@ -680,6 +702,10 @@ func (f *multipathFlow) startLane(lane *mpLane) {
 	// reader, as the first version did, meant the writer could already be
 	// asking for it.
 	lane.fc.setCodingPolicy(f.prefersCodingOverRetransmission)
+	lane.fc.setDataObserver(f.noteDataFrame)
+	if f.phased() {
+		lane.fc.setFrameCodingPolicy(f.frameCoding)
+	}
 	if f.openConfirmationRequired.Load() {
 		lane.fc.setOpenSafetyPolicy(func() bool { return f.openConfirmationRequired.Load() })
 	}
@@ -2161,10 +2187,20 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			// This escape lasts only until the bytes pending now are acknowledged:
 			// loss of feedback alone is not evidence against future coded DATA.
 			// Only those byte offsets escape; later exchanges remain coded.
-			for _, lane := range f.healthyLanes() {
-				if lane.fc.codesData() {
+			if f.phased() {
+				// Under the phased classifier what the flow prefers now says
+				// nothing about what is pending: a BULK flow codes its sparse
+				// writes, and a flow that left BULK may have only stream data
+				// outstanding. The scheduler knows which chunks went coded.
+				if f.codedDataOutstanding() {
 					f.escapePendingCoding()
-					break
+				}
+			} else {
+				for _, lane := range f.healthyLanes() {
+					if lane.fc.codesData() {
+						f.escapePendingCoding()
+						break
+					}
 				}
 			}
 			// Coded bytes are pending only if the escape latched a frontier.
@@ -2734,6 +2770,9 @@ func (f *multipathFlow) acknowledgeCoverage(sequence uint64, final bool, ranges 
 		f.ackTrack.Advance(sequence)
 		advanced = f.ackTrack.Add(ranges) || advanced
 	}
+	if advanced && f.phased() {
+		f.noteAckedCoverage()
+	}
 	if end := f.codingRecoveryEnd.Load(); end != 0 &&
 		(f.acked >= end || f.ackTrack != nil && f.ackTrack.Covered(0, end)) {
 		f.codingRecoveryEnd.Store(0)
@@ -3225,8 +3264,7 @@ func (f *multipathFlow) receiveInner(ctx context.Context) error {
 			resetAbortTimer(f.localAbortDrainGrace())
 			return nil
 		}
-		f.observe(len(out), false)
-		f.bytesDown.Add(uint64(len(out)))
+		f.observeCarried(len(out), false)
 
 		return nil
 	}
@@ -3387,14 +3425,7 @@ const exchangeWindow = time.Second
 func (f *multipathFlow) recentBytes(now time.Time, n int, up bool) (uint64, uint64) {
 	f.recentMu.Lock()
 	defer f.recentMu.Unlock()
-	if f.recentStart.IsZero() {
-		f.recentStart = now
-	}
-	if now.Sub(f.recentStart) >= exchangeWindow {
-		f.priorUp, f.priorDown = f.currentUp, f.currentDown
-		f.currentUp, f.currentDown = 0, 0
-		f.recentStart = now
-	}
+	f.advanceRecentLocked(now)
 	// A byte count is never negative, but this is the one place a wrong sign
 	// would wrap the window to something enormous and make every flow look
 	// like a transfer for the next two seconds.
@@ -3408,8 +3439,79 @@ func (f *multipathFlow) recentBytes(now time.Time, n int, up bool) (uint64, uint
 	return f.currentUp + f.priorUp, f.currentDown + f.priorDown
 }
 
+// advanceRecentLocked moves the two buckets on to now, by the time that has
+// actually passed.
+//
+// Rolling once per call, however long ago the accumulating bucket started,
+// broke the contract above: after any idle period the first observation still
+// counted the burst before the idle as "the last exchangeWindow", for another
+// window. A 300 KB request that finished seconds earlier made the first small
+// delta of its response look like a transfer. When two or more windows have
+// passed, both buckets are out of the window and are cleared; the bucket grid
+// advances by whole windows so that the reported figure still covers between
+// one and two windows.
+func (f *multipathFlow) advanceRecentLocked(now time.Time) {
+	if f.recentStart.IsZero() {
+		f.recentStart = now
+		return
+	}
+	elapsed := now.Sub(f.recentStart)
+	if elapsed < exchangeWindow {
+		return
+	}
+	windows := elapsed / exchangeWindow
+	if windows == 1 {
+		f.priorUp, f.priorDown = f.currentUp, f.currentDown
+		f.sparsePrior = f.sparseCurrent
+	} else {
+		f.priorUp, f.priorDown = 0, 0
+		f.sparsePrior = 0
+	}
+	f.currentUp, f.currentDown = 0, 0
+	f.sparseCurrent = 0
+	f.recentStart = f.recentStart.Add(windows * exchangeWindow)
+}
+
+// clockNow is the classifier's clock: time.Now unless a test installed one.
+func (f *multipathFlow) clockNow() time.Time {
+	if f.clock != nil {
+		return f.clock()
+	}
+	return time.Now()
+}
+
+// observeCarried observes n bytes just carried and counts them in the flow's
+// byte totals in the same step, so no other observation can see the one
+// without the other.
+func (f *multipathFlow) observeCarried(n int, up bool) bool {
+	f.classifyMu.Lock()
+	defer f.classifyMu.Unlock()
+	bulk := f.observeLocked(n, up)
+	if n > 0 {
+		if up {
+			f.bytesUp.Add(uint64(n))
+		} else {
+			f.bytesDown.Add(uint64(n))
+		}
+	}
+	return bulk
+}
+
+// observe classifies the flow with n more bytes than its totals hold.
+//
+// Sampling, classifying and publishing are one step. Three goroutines
+// observe (the application reader, the receive loop and the dispatch
+// refresh); an observation sampled before a newer one but applied after it
+// would, for instance, end a backlog stretch the newer one had begun, or
+// publish a class the classifier has already left.
 func (f *multipathFlow) observe(n int, up bool) bool {
-	now := time.Now()
+	f.classifyMu.Lock()
+	defer f.classifyMu.Unlock()
+	return f.observeLocked(n, up)
+}
+
+func (f *multipathFlow) observeLocked(n int, up bool) bool {
+	now := f.clockNow()
 	previousPayload := f.lastPayload.Load()
 	if n > 0 {
 		f.lastActivity.Store(now.UnixNano())
@@ -3458,14 +3560,42 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 		// A recent rate is right for both. A transfer never drops under it; a
 		// conversation never reaches it, whatever its age.
 		SmallBidirectionalBursts: recentUp <= smallExchangeBytes && recentDown <= smallExchangeBytes,
+		// What this endpoint has read from its application and the peer has
+		// not acknowledged. Only the phased classifier reads it.
+		SendBacklog:    saturatingSub(upBytes, f.ackedCum.Load()),
+		BacklogDrained: f.backlogDrained.Swap(false),
+		SmoothedRTT:    time.Duration(f.currentRTTNS.Load()),
+		CarriedPayload: n > 0,
 	}
 	oldClass := classifier.Class(f.class.Load())
 	newClass := f.classifier.Observe(obs)
-	f.class.Store(uint32(protocol.Class(newClass)))
-	if f.metrics != nil && newClass != oldClass {
-		f.metrics.ClassTransition(int(newClass))
+	f.publishClass(newClass)
+	if newClass != oldClass {
+		if f.metrics != nil {
+			f.metrics.ClassTransition(int(newClass))
+		}
+		if f.logger != nil {
+			// The transition record (R3): when, at what age, and to what, so a
+			// trial's class timeline can be rebuilt per flow and endpoint.
+			fields := []any{"session_id", fmt.Sprintf("%x", f.sessionID), "flow_id", f.flowID,
+				"from", oldClass, "to", newClass, "ever_bulk", f.everBulk.Load(), "age", age,
+				"recent_up", recentUp, "recent_down", recentDown, "phased", f.phased()}
+			if f.phased() {
+				// Acknowledged coverage is tracked only under the phased
+				// bundle, so the backlog means nothing on a legacy flow.
+				fields = append(fields, "send_backlog", obs.SendBacklog)
+			}
+			f.logger.Debug("flow class changed", fields...)
+		}
 	}
 	return newClass == classifier.ClassBulk
+}
+
+func saturatingSub(a, b uint64) uint64 {
+	if a < b {
+		return 0
+	}
+	return a - b
 }
 
 // codedSubstrate reports what the coded path under this flow's lanes has done,
