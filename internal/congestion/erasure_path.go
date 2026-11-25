@@ -30,7 +30,10 @@ import (
 // All PathSender calls arrive on the connection's run loop. Telemetry may be
 // called from any goroutine.
 type ErasurePathSender struct {
-	sender atomic.Pointer[ErasureSender]
+	// state is the current sender and the cumulative counters of the
+	// senders it replaced after a path change, published together so the
+	// connection's counters never go backwards or count twice.
+	state atomic.Pointer[erasurePathState]
 
 	// gauge is the connection's bytes in flight as the last event reported it.
 	// Every change of the connection's flight is reported, so it is also the
@@ -49,6 +52,11 @@ type ErasurePathSender struct {
 	attached bool
 }
 
+type erasurePathState struct {
+	sender  *ErasureSender
+	retired ControllerTelemetry
+}
+
 var (
 	_ quiccongestion.PathSender = (*ErasurePathSender)(nil)
 	_ TelemetryProvider         = (*ErasurePathSender)(nil)
@@ -59,14 +67,36 @@ var (
 // or nil to keep the current one.
 func NewErasurePathSender(sender *ErasureSender, rekey func(oldLocal, newLocal, oldRemote, newRemote net.Addr) *ErasureSender) *ErasurePathSender {
 	p := &ErasurePathSender{rekey: rekey}
-	p.sender.Store(sender)
+	p.state.Store(&erasurePathState{sender: sender})
 	return p
 }
 
 // Sender returns the ErasureSender currently driven.
-func (p *ErasurePathSender) Sender() *ErasureSender { return p.sender.Load() }
+func (p *ErasurePathSender) Sender() *ErasureSender { return p.state.Load().sender }
 
-func (p *ErasurePathSender) Telemetry() ControllerTelemetry { return p.Sender().Telemetry() }
+// Telemetry is the current sender's state. Its counters include those of the
+// senders it replaced: they count this connection's events, while the gauges
+// and estimates describe the current path.
+func (p *ErasurePathSender) Telemetry() ControllerTelemetry {
+	st := p.state.Load()
+	t := st.sender.Telemetry()
+	addCounters(&t, &st.retired)
+	return t
+}
+
+// addCounters adds the cumulative counters of from to t.
+func addCounters(t *ControllerTelemetry, from *ControllerTelemetry) {
+	t.Samples += from.Samples
+	t.NonAppSamples += from.NonAppSamples
+	t.AppSamples += from.AppSamples
+	t.StateMisses += from.StateMisses
+	t.ZeroSamples += from.ZeroSamples
+	t.BytesLost += from.BytesLost
+	t.PacketsLost += from.PacketsLost
+	t.PacketsLostObserved += from.PacketsLostObserved
+	t.NonElicitingBytes += from.NonElicitingBytes
+	t.NonElicitingDebited += from.NonElicitingDebited
+}
 
 // OnAttach is the first call.
 func (p *ErasurePathSender) OnAttach(_ monotime.Time, inFlight, maxPacket quiccongestion.ByteCount, wake func()) {
@@ -74,8 +104,10 @@ func (p *ErasurePathSender) OnAttach(_ monotime.Time, inFlight, maxPacket quicco
 	p.gauge = inFlight
 	p.wake = wake
 	// Path MTU discovery may have raised the packet size before the
-	// controller was installed on the run loop.
-	if maxPacket > 0 && maxPacket != p.maxSize {
+	// controller was installed on the run loop. Only a change is applied:
+	// telling the sender the size it was built with would reset its pacer's
+	// packet size, which the per-packet callbacks never did.
+	if maxPacket > 0 && maxPacket != p.Sender().inner.maxDatagramSize {
 		p.SetMaxDatagramSize(maxPacket)
 	}
 }
@@ -159,7 +191,8 @@ func (p *ErasurePathSender) OnPathMigrated(_ monotime.Time, oldLocal, newLocal, 
 	if p.maxSize > 0 {
 		next.SetMaxDatagramSize(p.maxSize)
 	}
-	p.sender.Store(next)
+	// The old sender gets no more events, so its counters are final.
+	p.state.Store(&erasurePathState{sender: next, retired: p.Telemetry()})
 }
 
 func (p *ErasurePathSender) OnDetach(monotime.Time) { p.attached = false }

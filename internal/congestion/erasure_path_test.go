@@ -80,15 +80,35 @@ func TestReverseAckOnlyTrafficDoesNotDrainThePacerUnderCCAPIV2(t *testing.T) {
 	})
 }
 
-// Everything else reaches the control law exactly as the per-packet callbacks
-// delivered it: drive two senders with one trace of ack-eliciting sends,
-// acknowledgements, losses and discards, one through each API, and they agree
-// at every step on window, pacing and state.
+// The differential test. Drive two senders with one trace of packet events,
+// one through the per-packet callbacks (v1, main) and one through
+// ErasurePathSender (v2), and compare flight, sampling and pacing at every
+// step. Both hand the sender the post-send flight, which the inner TUIC
+// sampler converts to pre-send flight itself, and both debit each
+// ack-eliciting packet from the erasure pacer once, so a double subtraction or
+// a double debit in the adapter shows up here.
+//
+// Without ACK-only packets everything is identical. With them the one
+// declared difference appears: v2 does not debit them, so its pacer may admit
+// where v1's refuses -- never the reverse -- and nothing else differs.
 func TestErasurePathSenderDrivesTheSenderLikeTheCallbacks(t *testing.T) {
+	for _, withAckOnly := range []bool{false, true} {
+		name := "eliciting only"
+		if withAckOnly {
+			name = "with ACK-only packets"
+		}
+		t.Run(name, func(t *testing.T) { differentialTrace(t, withAckOnly) })
+	}
+}
+
+func differentialTrace(t *testing.T, withAckOnly bool) {
 	rtt := &fixedRTT{min: 80 * time.Millisecond, smoothed: 90 * time.Millisecond}
 	legacy := NewErasureSender(1200)
 	legacy.SetRTTStatsProvider(rtt)
 	attachedSender := NewErasureSender(1200)
+	// BBR draws its gain-cycle phase from a time-seeded state; the two must
+	// draw the same.
+	attachedSender.inner.randomState = legacy.inner.randomState
 	attached := NewErasurePathSender(attachedSender, nil)
 	attached.SetRTTStatsProvider(rtt)
 	attached.OnAttach(base(), 0, 1200, func() {})
@@ -97,11 +117,22 @@ func TestErasurePathSenderDrivesTheSenderLikeTheCallbacks(t *testing.T) {
 	type outstanding struct {
 		number quiccongestion.PacketNumber
 		bytes  quiccongestion.ByteCount
+		sent   monotime.Time
 	}
 	var flight []outstanding
 	var inFlight quiccongestion.ByteCount
 	var number quiccongestion.PacketNumber
+	var ackOnly, v2Only int
 	now := base()
+	// Outcomes arrive a round trip after the send, so the delivery rate is
+	// a path's and the pacer binds.
+	due := func() int {
+		n := 0
+		for n < len(flight) && now.Sub(flight[n].sent) >= rtt.min {
+			n++
+		}
+		return n
+	}
 	compare := func(step int) {
 		t.Helper()
 		lw, aw := legacy.CanSend(inFlight), attached.Admit(now, 1200)
@@ -110,35 +141,55 @@ func TestErasurePathSenderDrivesTheSenderLikeTheCallbacks(t *testing.T) {
 		}
 		if lw {
 			lp := legacy.HasPacingBudget(now)
-			if lp != aw.OK {
+			switch {
+			case !withAckOnly && lp != aw.OK:
 				t.Fatalf("step %d: pacing disagrees: legacy %v, attached %+v", step, lp, aw)
-			}
-			if !lp && legacy.TimeUntilSend(inFlight) != aw.RetryAt {
+			case !withAckOnly && !lp && legacy.TimeUntilSend(inFlight) != aw.RetryAt:
 				t.Fatalf("step %d: retry time disagrees", step)
+			case lp && !aw.OK:
+				t.Fatalf("step %d: v2's pacer refused where v1's admitted", step)
+			case !lp && aw.OK:
+				v2Only++
 			}
+
 		}
 		lt, at := legacy.Telemetry(), attached.Telemetry()
-		if lt.PacingRate != at.PacingRate || lt.CongestionWindow != at.CongestionWindow || lt.MaxBandwidth != at.MaxBandwidth || lt.Mode != at.Mode || lt.PacketsLost != at.PacketsLost {
-			t.Fatalf("step %d: state disagrees:\nlegacy   %+v\nattached %+v", step, lt, at)
+		lt.NonElicitingDebited, at.NonElicitingDebited = 0, 0
+		if lt != at {
+			t.Fatalf("step %d: flight, sampling or state disagrees:\nlegacy   %+v\nattached %+v", step, lt, at)
 		}
 	}
-	for step := 0; step < 4000; step++ {
-		now = now.Add(time.Duration(rng.IntN(3000)) * time.Microsecond)
-		switch r := rng.IntN(10); {
-		case r < 6 && legacy.CanSend(inFlight) && legacy.HasPacingBudget(now):
-			number++
-			size := quiccongestion.ByteCount(200 + rng.IntN(1000))
-			inFlight += size
-			flight = append(flight, outstanding{number, size})
-			legacy.OnPacketSent(now, inFlight, number, size, true)
-			attached.OnSent(quiccongestion.SentPacket{Space: quiccongestion.SpaceApplication, Number: number, Bytes: size,
-				AckEliciting: true, InFlightCounted: true, Kind: quiccongestion.KindOrdinary, InFlight: inFlight, Time: now})
-		case r < 9 && len(flight) > 0:
+	for step := 0; step < 6000; step++ {
+		now = now.Add(time.Duration(rng.IntN(2000)) * time.Microsecond)
+		switch r := rng.IntN(12); {
+		case withAckOnly && r < 3:
+			// A burst of ACK-only packets, as a receiving connection sends:
+			// reported, never in flight.
+			for range 1 + rng.IntN(40) {
+				number++
+				legacy.OnPacketSent(now, inFlight, number, 40, false)
+				attached.OnSent(quiccongestion.SentPacket{Space: quiccongestion.SpaceApplication, Number: number, Bytes: 40,
+					Kind: quiccongestion.KindAckOnly, Exempt: true, InFlight: inFlight, Time: now})
+				ackOnly++
+			}
+		case r < 8:
+			// A backlogged sender: as many packets as v1 admits, up to a few.
+			for k := 0; k < 4 && legacy.CanSend(inFlight) && legacy.HasPacingBudget(now); k++ {
+				number++
+				size := quiccongestion.ByteCount(200 + rng.IntN(1000))
+				inFlight += size
+				flight = append(flight, outstanding{number, size, now})
+				legacy.OnPacketSent(now, inFlight, number, size, true)
+				attached.OnSent(quiccongestion.SentPacket{Space: quiccongestion.SpaceApplication, Number: number, Bytes: size,
+					AckEliciting: true, InFlightCounted: true, Kind: quiccongestion.KindOrdinary, InFlight: inFlight, Time: now})
+				compare(step)
+			}
+		case r < 11 && due() > 0:
 			prior := inFlight
 			var acked []quiccongestion.AckedPacketInfo
 			var lost []quiccongestion.LostPacketInfo
 			var ackedRefs, lostRefs []quiccongestion.PacketRef
-			n := 1 + rng.IntN(min(len(flight), 8))
+			n := 1 + rng.IntN(min(due(), 8))
 			for _, p := range flight[:n] {
 				inFlight -= p.bytes
 				if rng.IntN(10) < 2 {
@@ -152,7 +203,7 @@ func TestErasurePathSenderDrivesTheSenderLikeTheCallbacks(t *testing.T) {
 			flight = flight[n:]
 			legacy.OnCongestionEventEx(prior, now, acked, lost)
 			attached.OnAckEvent(quiccongestion.AckEvent{Time: now, InFlight: inFlight, Acked: ackedRefs, Lost: lostRefs})
-		case len(flight) > 0:
+		case r == 11 && due() > 0 && rng.IntN(20) == 0:
 			// A PTO probe declaration: the flight shrinks silently for the
 			// callbacks, and is reported as a discard to the PathSender.
 			inFlight -= flight[0].bytes
@@ -163,6 +214,18 @@ func TestErasurePathSenderDrivesTheSenderLikeTheCallbacks(t *testing.T) {
 	}
 	if legacy.Telemetry().Samples == 0 {
 		t.Fatal("the trace produced no delivery samples")
+	}
+	lt, at := legacy.Telemetry(), attached.Telemetry()
+	if withAckOnly {
+		if ackOnly == 0 || lt.NonElicitingDebited != lt.NonElicitingBytes || at.NonElicitingDebited != 0 {
+			t.Fatalf("ACK-only %d; v1 debited %d of %d, v2 debited %d", ackOnly, lt.NonElicitingDebited, lt.NonElicitingBytes, at.NonElicitingDebited)
+		}
+		if v2Only == 0 {
+			t.Fatal("the trace never reached a step where the undebited ACK-only bytes mattered")
+		}
+		t.Logf("%d ACK-only packets; %d steps where only v2's pacer admitted", ackOnly, v2Only)
+	} else if v2Only != 0 {
+		t.Fatalf("pacing differed in %d steps without ACK-only packets", v2Only)
 	}
 }
 
@@ -192,5 +255,20 @@ func TestErasurePathSenderIsKeptAcrossMigration(t *testing.T) {
 	}
 	if next.inner.maxDatagramSize != 1350 || next.rttStats == nil {
 		t.Fatal("the replacement was not configured like the controller it replaced")
+	}
+}
+
+// Counters are the connection's: a replacement after a path change does not
+// make them go backwards.
+func TestErasurePathSenderCountersSurviveAPathChange(t *testing.T) {
+	first := NewErasureSender(1200)
+	attached := NewErasurePathSender(first, func(net.Addr, net.Addr, net.Addr, net.Addr) *ErasureSender { return NewErasureSender(1200) })
+	attached.OnAttach(base(), 0, 1200, func() {})
+	attached.OnSent(quiccongestion.SentPacket{Number: 1, Bytes: 50, Kind: quiccongestion.KindAckOnly, Time: base()})
+	before := attached.Telemetry().NonElicitingBytes
+	attached.OnPathMigrated(base(), nil, nil, nil, nil)
+	attached.OnSent(quiccongestion.SentPacket{Number: 2, Bytes: 50, Kind: quiccongestion.KindAckOnly, Time: base()})
+	if got := attached.Telemetry().NonElicitingBytes; before != 50 || got != 100 {
+		t.Fatalf("non-eliciting bytes %d then %d, want 50 then 100", before, got)
 	}
 }
