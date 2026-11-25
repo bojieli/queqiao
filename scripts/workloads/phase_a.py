@@ -198,6 +198,39 @@ def rate_in_window(rows: Sequence[dict], window: Tuple[float, float]) -> Tuple[f
     return got, max(0.0, b - a)
 
 
+def prompt_bytes(recs: Sequence[dict]) -> int:
+    """The smallest prompt the phase's LLM calls uploaded (U)."""
+    us = [int(r["U"]) for r in recs if r.get("kind") == "llm" and r.get("U")]
+    return min(us) if us else 1 << 62
+
+
+def class_interactive(trials: Sequence[Any], upload: int) -> float:
+    """Class correctness of the LLM's response (W5): the fraction of DATA
+    payload the gateway sent on the LLM's flows with the INTERACTIVE class
+    byte, from its flow completion records (per-flow class telemetry). The
+    LLM's flows are the ones that carried a prompt upward (at least U bytes
+    from the client, less than 4 MB, which no background flow does). NaN when
+    a trial has no such record or no class telemetry."""
+    inter = total = 0
+    for t in trials:
+        # The prompt up (at least U, under 4 MB) and the streamed response
+        # down (at least 40 KB: 400 deltas of about 180 B): a cut background
+        # upload carries the first but gets only a short reply.
+        recs = [r for r in getattr(t, "flow_records", []) or []
+                if upload <= int(r.get("bytes_from_client") or 0) < 4_000_000
+                and 40_000 <= int(r.get("bytes_to_client") or 0) < 4_000_000]
+        if not recs:
+            return float("nan")
+        for r in recs:
+            keys = [f"data_bytes_{c}_{s}" for c in ("new", "interactive", "bulk") for s in ("coded", "stream")]
+            if not all(k in r for k in keys):
+                return float("nan")
+            inter += int(r["data_bytes_interactive_coded"]) + int(r["data_bytes_interactive_stream"])
+            total += sum(int(r[k]) for k in keys)
+    return inter / total if total else float("nan")
+
+
+
 # --- generators ----------------------------------------------------------------------
 
 def _client(campaign: Any, job: w.Job, arm: Any, cmd: str, target_port: int, extra: str) -> str:
@@ -401,9 +434,8 @@ class LLM(_Scenario):
         m = llm_metrics([r for r in recs if r.get("kind") == "llm"])
         if not self.under_background(ph, recs, rows, trials):
             return {k: float("nan") for k in m}
-        # Per-byte class telemetry (WORKLOADS.md R3) does not exist yet: the
-        # class-correctness assertion stays unmeasured until it does.
-        m["class_interactive"] = float("nan")
+        # From the gateway's per-flow class telemetry (the model's R3).
+        m["class_interactive"] = class_interactive(trials, prompt_bytes(recs))
         return m
 
 
@@ -490,5 +522,5 @@ class Mixed(_Scenario):
         m["bg_rate_bps"] = got / secs if secs > 0 and not unknown else float("nan")
         if not self.under_background(ph, recs, rows, trials):
             return {k: float("nan") for k in m}
-        m["class_interactive"] = float("nan")
+        m["class_interactive"] = class_interactive(trials, prompt_bytes(recs))
         return m

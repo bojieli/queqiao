@@ -336,28 +336,6 @@ def term_samples(sessions: Sequence[dict]) -> Dict[str, List[float]]:
     return {"a": a, "c": c}
 
 
-def class_interactive(trials: Sequence[Any], upload: int) -> float:
-    """Class correctness of the LLM's response (W5): the fraction of DATA
-    payload the gateway sent on the LLM's flows with the INTERACTIVE class
-    byte, from its flow completion records (per-flow class telemetry). The
-    LLM's flows are the ones that carried a prompt upward (at least U bytes
-    from the client, less than 4 MB, which no background flow does). NaN when
-    a trial has no such record or no class telemetry."""
-    inter = total = 0
-    for t in trials:
-        recs = [r for r in getattr(t, "flow_records", []) or []
-                if upload <= int(r.get("bytes_from_client") or 0) < 4_000_000]
-        if not recs:
-            return float("nan")
-        for r in recs:
-            keys = [f"data_bytes_{c}_{s}" for c in ("new", "interactive", "bulk") for s in ("coded", "stream")]
-            if not all(k in r for k in keys):
-                return float("nan")
-            inter += int(r["data_bytes_interactive_coded"]) + int(r["data_bytes_interactive_stream"])
-            total += sum(int(r[k]) for k in keys)
-    return inter / total if total else float("nan")
-
-
 @w.register
 class Minimal(pa._Scenario):
     """Trial types A (bulk), B (mixed-67) and C (mixed-all), each a block of
@@ -367,6 +345,29 @@ class Minimal(pa._Scenario):
     report_only = (pa.LLM_REPORT_ONLY + pa.TERM_REPORT_ONLY +
                    ("html_first_byte_p50_s", "sessions_failed", "call_sessions_failed", "call_late_loss_up",
                     "call_late_loss_down", "call_audio_gaps_per_min_up", "call_audio_gaps_per_min_down"))
+
+    # The primaries: only bulk flows' bytes (section 15.3).
+    primaries = ("bulk.goodput_bps", "mixed-67.bg_down_rate_bps", "mixed-all.bg_down_rate_bps",
+                 "mixed-all.bg_up_rate_bps")
+    # Generic secondaries where defined (section 15.4): flow completion and
+    # wire bytes per useful byte need A's bulk flows; the others apply to
+    # every trial. Credit delay and false promotion have no measurement yet.
+    generic = {"bulk": ("completion", "stalls_per_trial", "reissued_per_source", "wire_per_useful", "queue_p90_ms",
+                        "cpu_p90"),
+               "mixed-67": ("stalls_per_trial", "reissued_per_source", "queue_p90_ms", "cpu_p90"),
+               "mixed-all": ("stalls_per_trial", "reissued_per_source", "queue_p90_ms", "cpu_p90")}
+
+    def block_extract(self, trials, plan):
+        out = super().block_extract(trials, plan)
+        for ph, ks in self.generic.items():
+            pt = [t for t in trials if getattr(t, "trial", "") == ph]
+            if not pt:
+                continue
+            for k in ks:
+                vals = [getattr(t, "m", {}).get(k, float("nan")) for t in pt]
+                out[f"{ph}.{k}"] = (sum(vals) / len(vals) if all(v is not None and v == v for v in vals)
+                                    else float("nan"))
+        return out
 
     def read(self, cfg, p):
         cfg.scenario_udp_port = int(p.get("udp_port", "23487"))
@@ -525,12 +526,13 @@ class Minimal(pa._Scenario):
             for t in trials:
                 b = [r for r in t.rows if r["phase"] == "bulk" and r["kind"] == "bulk"]
                 got += sum(int(r["bytes"] or 0) for r in b if r.get("http") == "200")
-                walls = [float(r["wall"]) for r in b if r.get("wall")]
-                secs += max(walls) if walls else 0.0
+                # Over the trial's fixed window, not the job's lifetime: an
+                # arm whose flows died early must not score a higher rate.
+                secs += TRIAL_SECONDS["bulk"] if b else 0.0
             return {"goodput_bps": got / secs if secs else nan}
         m: Dict[str, float] = {}
         m.update(pa.llm_metrics([r for r in recs if r.get("kind") == "llm"]))
-        m["class_interactive"] = class_interactive(trials, UPLOAD)
+        m["class_interactive"] = pa.class_interactive(trials, UPLOAD)
         term = pa.term_metrics([r for r in recs if r.get("kind") == "term"])
         if ph == "mixed-67":
             m.update({k: v for k, v in term.items() if k in ("echo_p99_a_s", "echo_p99_c_s", "latch_ratio", "over1s_a",

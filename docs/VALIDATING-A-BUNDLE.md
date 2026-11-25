@@ -501,7 +501,8 @@ and B at stages 6 and 7, DC at stage 9, C and D at stage 10. A pass carries
 forward to the flip; a trial is rerun on the final bundle only when a later
 stage changes what it exercises. The flip takes the final bundle of each
 candidate arm to be what it ran in the newest campaign (its build: commits,
-or each prebuilt binary's SHA-256 by role and platform; and its flags). A
+or each prebuilt binary's SHA-256 by role and platform; its arm flags; and
+the `[gateway]` and `[client:...]` flags every endpoint ran with). A
 cell measured on the final bundle counts as it is. A cell measured only on
 an earlier build or flag bundle counts only when you name it in `--carry`,
 your statement that no later stage changed what it exercises; the matrix
@@ -542,9 +543,17 @@ Choose the types a campaign runs with `[workload:minimal] trials`:
 What each cell gates (`gates.ini [workload:minimal]`, provisional bounds
 from the model):
 
-- **Primaries.** Only the bulk flows' bytes: A's downloads; B's downloads;
-  C's download and upload, each its own primary; DC's sustained phase.
-  Each is `atleast 0.90` of main.
+- **Primaries.** Only the bulk flows' bytes: A's downloads (over the
+  trial's fixed 60 s); B's downloads; C's download and upload, each its own
+  primary; DC's sustained phase. Each is `atleast 0.90` of main, and is void
+  (rerun) when more than the pre-registered fraction of main's blocks
+  delivered nothing.
+- **Generic secondaries** (`[secondary]`), as rules of each trial type
+  where defined: stalls, reissued bytes, queue p90 and client CPU in every
+  type; flow completion and wire bytes per useful byte in A, whose bulk
+  flows define them. Credit delay and the shadow false-promotion rate have
+  no measurement in any build yet; the report lists them and does not gate
+  them.
 - **B:** the LLM's TTFT p50 and p95, delta lateness p99, stalls and
   freezes per streamed minute, call failures, and class correctness (at
   least 99 % of the response's DATA bytes sent INTERACTIVE, from the
@@ -574,7 +583,8 @@ at the stopping look, and tested with a bootstrap that resamples blocks.
 at once as paired sessions, each on its own gateway and client instances
 (`<arm>-wake`, on the ports after the arms'), which the blocks' restarts do
 not touch. The campaign starts D first and waits until every connection has
-synced, then runs C's first two blocks back to back to cover D's
+synced (if they have not within two minutes, the campaign aborts before any
+block), then runs C's first two blocks back to back to cover D's
 17 minutes, so its wakes happen under the path's load. With
 `idle_wake = auto` (the default) D runs when the campaign has C; `true` runs
 it beside A and B as well (the `classifier=v2` gate). It is written as a
@@ -600,7 +610,11 @@ a look a trial type:
 - otherwise gets one more block. At the 12-block cap a type that has not
   passed fails.
 
-Each trial type stops on its own; the others continue. `status.json`
+Each trial type stops on its own; the others continue. Coverage is counted
+against the blocks a type ran, and a cell passes only when every one of its
+rules passed: undecided or unmeasured leaves it INCOMPLETE. `plan.json`
+freezes the SHA-256 of `gates.ini`; the analyzer gives no verdict under
+another gates file. `status.json`
 records the units run (block, path, type), why each type stopped, and the
 wall time. The analyzer judges each type at its last look, and its tables
 show the bounds at that look's level. Sequential mode is only for workloads
@@ -615,7 +629,9 @@ block per path for all four, 2.6 hours at 6 blocks and 5.2 hours at the
 prints the per-type block time, the campaign's estimate, the look levels,
 and the run order. DC calibrates each loaded leaf alone in its first block
 only (`calibrate = first`), and that block's solo rates stand for every
-block's ancestor-binding check.
+block's ancestor-binding check and leaf identities; every block's carrier
+and leaf evidence is still checked. With 30 requests per arm in a trial,
+DC's request p99 is pooled over blocks and tested by resampling blocks.
 
 **Optional workloads.** The rest of the workload model is available but is
 not a gate:

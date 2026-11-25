@@ -73,7 +73,13 @@ NOT_OWNER = 9
 # `cd -P`/`pwd -P` (symlinks resolved), the not-yet-existing rest appended.
 # Python's normpath then folds '..' and '//'.
 CANON_SH = r'''canon() {
-  p="$1"; rest=""
+  p="$1"; rest=""; n=0
+  # The final component too: a symlink to a production file resolves to it.
+  while [ -L "$p" ] && [ $n -lt 40 ]; do
+    t=$(readlink "$p") || break
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+    n=$((n+1))
+  done
   while [ ! -e "$p" ] && [ "$p" != "/" ] && [ -n "$p" ]; do rest="/$(basename "$p")$rest"; p=$(dirname "$p"); done
   if [ -d "$p" ]; then r=$(cd -P "$p" 2>/dev/null && pwd -P)
   else r="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd -P)/$(basename "$p")"; fi
@@ -511,6 +517,13 @@ def schedule(cfg: Config) -> List[Slot]:
                     seen[ai] = seen.get(ai, 0) + 1
                     out.append(Slot(b, path, n, cfg.arms[ai].name, seen[ai], seen[ai] == 1, trial))
     return out
+
+
+def gates_digest(path: Optional[str] = None) -> str:
+    """SHA-256 of the gates file the analyzers judge by."""
+    p = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "gates.ini")
+    with open(p, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 
 def run_units(cfg: Config, slots: Sequence[Slot]) -> List[Tuple[int, str, str]]:
@@ -1462,8 +1475,10 @@ rm -f "$f"''', what=f"stop {tag}")
             if waiting:
                 time.sleep(2)
         if waiting:
-            self.log(f"{beside.name}: {len(waiting)} session(s) not set up after {beside.ready_seconds:.0f} s; "
-                     "the blocks start anyway and the session is judged on what it recorded")
+            # Its syncs would still be loading the path under the first
+            # measured block: abort rather than measure under unknown traffic.
+            raise RuntimeError(f"{beside.name}: {len(waiting)} session(s) not set up after {beside.ready_seconds:.0f} s; "
+                               "no block was run under its set-up traffic")
 
     def finish_beside(self, beside: Any) -> None:
         """Wait for D's sessions, stop its instances, and write them as a
@@ -1701,7 +1716,14 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                     "dc": cfg.dc.__dict__ if cfg.dc else None,
                     "sequential": cfg.sequential.__dict__ if cfg.sequential else None,
                     "arms": manifest, "schedule": [s.__dict__ for s in slots], "main": cfg.main.name,
-                    "clients": {c.name: {"small": c.small, "platform": c.platform} for c in cfg.clients.values()}}
+                    "clients": {c.name: {"small": c.small, "platform": c.platform, "flags": c.flags}
+                                for c in cfg.clients.values()},
+                    # Behaviour switches every arm's endpoints also get, for
+                    # the flip's final-bundle identity.
+                    "gateway_flags": cfg.gateway.flags,
+                    # The gates in force, frozen before the first block: the
+                    # analyzer refuses a verdict under other ones.
+                    "gates_sha256": gates_digest()}
             if not self.dry:
                 with open(os.path.join(self.out, "plan.json"), "w") as f:
                     json.dump(plan, f, indent=2, default=str)

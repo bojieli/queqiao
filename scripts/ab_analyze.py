@@ -23,6 +23,7 @@ import csv
 import datetime as dt
 import glob
 import gzip
+import hashlib
 import json
 import math
 import os
@@ -80,7 +81,9 @@ def load_gates(path: str = GATES) -> dict:
                 except ValueError:
                     raise SystemExit(f"gates: [{section}] {k}: {v!r} is not a number")
             workloads[section.split(":", 1)[1]] = rules
-    return {"ratio": p.getfloat("ratio"), "alpha": p.getfloat("alpha"), "workloads": workloads,
+    with open(path, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    return {"ratio": p.getfloat("ratio"), "alpha": p.getfloat("alpha"), "workloads": workloads, "sha256": digest,
             "resamples": p.getint("bootstrap_resamples"), "seed": p.getint("bootstrap_seed"),
             "max_zero_main_fraction": p.getfloat("max_zero_main_fraction"),
             "secondary_min_coverage": p.getfloat("secondary_min_coverage", fallback=1.0),
@@ -335,6 +338,8 @@ def fetch_failed(campaign: str) -> List[str]:
         return []
 
 
+# Section 15.4 secondaries with no measurement in any build yet.
+NOT_YET_MEASURED = ("credit_delay_p95_s", "false_promotion_rate")
 LOG_MEASURES = ("queue_p90_ms", "reissued_per_source", "transit_p50_s", "transit_p90_s", "cpu_p90")
 
 
@@ -702,6 +707,12 @@ def report(campaign: str, gates: dict, interim: bool = False,
     EFFECTIVE.clear()
     sq = sequential_of(plan)
     problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run)
+    frozen = plan.get("gates_sha256")
+    if frozen and gates.get("sha256") and frozen != gates["sha256"]:
+        # The rules (and the stopping looks) the campaign ran under are not
+        # the ones given now: no verdict under changed gates.
+        problems.append("gates.ini differs from the one frozen in the campaign's plan (sha256 "
+                        f"{frozen[:12]}); judge it with that file")
     # A sequential campaign that stopped early (on another gate's verdict)
     # leaves its undecided gates undecided, not failed.
     stopped_early = False
@@ -715,7 +726,14 @@ def report(campaign: str, gates: dict, interim: bool = False,
     wl = ab_workloads.get(plan.get("workload", "bulk"))
     for t in trials.values():
         t.m.update(wl.extract(t, plan))
-    rules = gates.get("workloads", {}).get(wl.name, {})
+    rules = dict(gates.get("workloads", {}).get(wl.name, {}))
+    # The generic secondaries that apply to a rule-judged workload's phases,
+    # as rules of those phases with their [secondary] bounds.
+    for ph, ks in getattr(wl, "generic", {}).items():
+        for k in ks:
+            if k in gates["secondary"]:
+                better, margin = gates["secondary"][k]
+                rules.setdefault(f"{ph}.{k}".lower(), (better, (margin,)))
     # The arm's per-block measures, as the workload defines them (pooled or
     # averaged), for the rules.
     block_cache: Dict[Tuple[str, int, str], Dict[str, float]] = {}
@@ -902,8 +920,20 @@ def report(campaign: str, gates: dict, interim: bool = False,
                              [b for b in blocks_here if block_measures(path, b, cand) and block_measures(path, b, main)]
                     c = [block_measures(path, b, cand).get(key, float("nan")) for b in common]
                     m = [block_measures(path, b, main).get(key, float("nan")) for b in common]
-                    need = math.ceil(gates["secondary_min_coverage"] * judged.get(cand, len(common)) - 1e-9)
+                    # Coverage against the blocks this measure's type ran (its
+                    # evidence present or not), not every block on the path.
+                    need = math.ceil(gates["secondary_min_coverage"] *
+                                     (judged.get(cand, len(common)) if wl.primary else len(common)) - 1e-9)
                     measured = [(x, y) for x, y in zip(c, m) if x == x and (y == y or kind in HARD)]
+                    if key in getattr(wl, "primaries", ()) and kind in RULES and m:
+                        # A primary outcome: void, not judged, when too many
+                        # of main's blocks delivered nothing (section 15.4).
+                        zero = sum(1 for y in m if y == y and y == 0) / len(m)
+                        if zero > gates["max_zero_main_fraction"]:
+                            verdicts[(path, cand, f"rule:{key}")] = "VOID"
+                            out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {len(m)} | "
+                                       f"n/a | n/a | n/a | VOID ({zero:.0%} of main's blocks delivered nothing) |")
+                            continue
                     if wl.sample_based:
                         verdict, mean_d, tl, bl, n_ = sample_rule(wl, trials, path, cand, main, key, kind, values, gates)
                         verdicts[(path, cand, f"rule:{key}")] = verdict
@@ -911,14 +941,19 @@ def report(campaign: str, gates: dict, interim: bool = False,
                                    f"{fmt(mean_d, '.4g')} | n/a | {fmt(bl, '.4g')} | {verdict} |")
                         continue
                     dec = None
-                    tails = [(block_tails(path, b, cand).get(key), block_tails(path, b, main).get(key)) for b in common]
-                    if kind in RULES and tails and all(c_ and m_ for c_, m_ in tails) and \
-                            min(min(len(c_[1]), len(m_[1])) for c_, m_ in tails) < tail_min(tails[0][0][0]):
+                    # Only blocks whose measure is valid in both arms and that
+                    # have samples on both sides go into a pooled tail.
+                    valid = [b for b, x, y in zip(common, c, m) if x == x and y == y]
+                    tails = [(block_tails(path, b, cand).get(key), block_tails(path, b, main).get(key)) for b in valid]
+                    tails = [(c_, m_) for c_, m_ in tails if c_ and m_ and c_[1] and m_[1]]
+                    has_tail = any(block_tails(path, b, cand).get(key) for b in common)
+                    if kind in RULES and has_tail and (not tails or
+                            min(min(len(c_[1]), len(m_[1])) for c_, m_ in tails) < tail_min(tails[0][0][0])):
                         # A tail percentile with too few samples per block is
                         # computed over all blocks' pooled samples and tested
                         # by resampling blocks (section 15.4).
                         a_ = sq.alpha_at(len(tails)) if sq else gates["alpha"]
-                        q = tails[0][0][0]
+                        q = tails[0][0][0] if tails else 0.95
                         mean_d, lo_, hi_ = st.pooled_quantile_bounds(
                             [c_[1] for c_, _ in tails], [m_[1] for _, m_ in tails], q,
                             lambda c__, m__: RULES[kind](c__, m__, values), a_, gates["resamples"], gates["seed"])
@@ -955,6 +990,11 @@ def report(campaign: str, gates: dict, interim: bool = False,
         for k in unruled:
             for cand in arms[1:]:
                 verdicts[(path, cand, f"rule:{k}")] = "n/a"
+        unmeasurable = [k for k in gates["secondary"] if getattr(wl, "generic", None)
+                        and k not in {x for ks in wl.generic.values() for x in ks} and k in NOT_YET_MEASURED]
+        if unmeasurable:
+            out += ["", "Generic secondaries the design requires but no build measures yet (stage 0 "
+                    "instrumentation), listed and not gated: " + ", ".join(f"`{k}`" for k in unmeasurable) + "."]
         if unruled:
             out += ["", f"Measures without a rule in gates.ini [workload:{wl.name}] (the verdict stays INCOMPLETE): "
                     + ", ".join(f"`{k}`" for k in unruled)]
@@ -963,6 +1003,8 @@ def report(campaign: str, gates: dict, interim: bool = False,
             prim = verdicts[(path, cand, "primary")]
             sv = [verdicts[(path, cand, k)] for k in secondary] + [verdicts[(path, cand, f"rule:{k}")] for k in rule_keys]
             fails, missing = sv.count("**FAIL**"), sv.count("n/a") + sv.count("undecided")
+            if "VOID" in sv and prim != "INCOMPLETE":
+                prim = "VOID"
             prim_ok = prim == "**PASS**" or (prim == "n/a" and not wl.primary)
             if prim == "undecided":
                 prim, prim_ok = "INCOMPLETE", False
@@ -1161,8 +1203,14 @@ def cell_verdicts(verdicts: dict, path: str, cand: str) -> Dict[str, str]:
     incomplete = verdicts.get((path, cand, "primary")) == "INCOMPLETE"
     out = {}
     for cell, vs in cells.items():
-        out[cell] = ("INCOMPLETE" if incomplete or "n/a" in vs else
-                     "FAIL" if "**FAIL**" in vs else "PASS")
+        # A cell passes only when every one of its rules explicitly passed:
+        # undecided (a sequential campaign stopped on another contrast) or
+        # unmeasured is INCOMPLETE, a void primary voids the cell.
+        out[cell] = ("INCOMPLETE" if incomplete else
+                     "VOID" if "VOID" in vs else
+                     "INCOMPLETE" if "n/a" in vs else
+                     "FAIL" if "**FAIL**" in vs else
+                     "PASS" if all(v in ("pass", "**PASS**") for v in vs) else "INCOMPLETE")
     return out
 
 
@@ -1186,6 +1234,25 @@ def arm_config(e: dict) -> Tuple[Tuple[str, ...], ...]:
     """The arm's configured flags: the same build with another flag bundle is
     another configuration, not the same candidate."""
     return tuple(tuple(e.get(k) or ()) for k in ("flags", "gateway_flags", "client_flags"))
+
+
+def endpoint_switches(plan: dict) -> Tuple[Tuple[str, ...], ...]:
+    """The [gateway] and [client:...] flags every arm's endpoints ran with,
+    without the per-run address ones: two campaigns on the same commits but
+    other behaviour switches are not the same bundle."""
+    def keep(flags):
+        out, skip = [], False
+        for f in flags or ():
+            if skip:
+                skip = False
+                continue
+            if f.split("=", 1)[0] in ("--local-address",):
+                skip = "=" not in f
+                continue
+            out.append(f)
+        return tuple(out)
+    clients = tuple(sorted({keep(c.get("flags")) for c in (plan.get("clients") or {}).values()}))
+    return (keep(plan.get("gateway_flags")),) + tuple(clients)
 
 
 def same_build(a: Tuple[str, object], b: Tuple[str, object]) -> bool:
@@ -1253,12 +1320,14 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
         seen.add(name)
         order = (finished_at(campaign), n_)
         ident: Dict[str, tuple] = {}
+        switches = endpoint_switches(plan)
         for arm, e in plan["arms"].items():
             role = "main" if arm == plan["main"] else "candidate"
             if roles.setdefault(arm, role) != role:
                 problems.append(f"arm `{arm}` is {role} in {base} but {roles[arm]} elsewhere")
             b = build_identity(e)
-            ident[arm] = (b[0], tuple(sorted(b[1].items())) if isinstance(b[1], dict) else b[1], arm_config(e))
+            ident[arm] = (b[0], tuple(sorted(b[1].items())) if isinstance(b[1], dict) else b[1],
+                          arm_config(e) + switches)
             if role == "candidate":
                 candidates.add(arm)
                 if arm not in final or order > final[arm][1]:

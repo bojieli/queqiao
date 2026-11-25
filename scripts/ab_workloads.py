@@ -175,6 +175,13 @@ class Workload:
     trials_per_arm = 2
     # True: judged over its pooled samples (samples()), not per block.
     sample_based = False
+    # A rule-judged workload's primary outcomes ("<phase>.<metric>"), voided
+    # like section 15.4's primary when too many of main's blocks are zero.
+    primaries: Tuple[str, ...] = ()
+    # Section 15.4's generic secondaries ([secondary] in gates.ini) that apply
+    # to a rule-judged workload's phases: phase -> metric names, judged by
+    # their [secondary] bound as rules of that phase.
+    generic: Dict[str, Tuple[str, ...]] = {}
 
     def configure(self, cfg: Any, cp: configparser.ConfigParser) -> None:
         """Read and validate this workload's own config section."""

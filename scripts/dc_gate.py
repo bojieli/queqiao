@@ -143,6 +143,9 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     leaf_med = [x for x in leaf_med if x == x]
     m["spread"] = max(leaf_med) / min(leaf_med) if leaf_med and min(leaf_med) > 0 else float("nan")
     lat = [done(r) for r in req]
+    # The requests themselves, for a p99 pooled over blocks when a block has
+    # fewer than 100 per arm (design section 15.4).
+    m["_lat"] = lat if overlap else []
     m["latency_p50"] = st.quantile(lat, 0.5)
     m["latency_p99"] = st.quantile(lat, 0.99)
     if not overlap:
@@ -237,8 +240,14 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
         return {r["path_key"] for r in rs}
 
     egress_seen = set()
+    # calibrate = first: block 1's solo runs name the leaves for every block;
+    # each block's simultaneous trials are still checked against them.
+    once = str(plan["dc"].get("calibrate")) == "first"
+    first_keys: Dict[str, str] = {}
     for b in sorted({t.block for t in ab}):
         keys: Dict[str, str] = {}
+        if once and b != 1 and not any(t.block == b for t in solo):
+            keys = dict(first_keys)
         for t in [t for t in solo if t.block == b]:
             leaf = next((r["client"] for r in t.rows), "")
             got = check(t, [leaf], f"block {b} solo {leaf}")
@@ -249,6 +258,8 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
             else:
                 keys[leaf] = next(iter(got))
         egress_seen |= {r.get("path_egress") for t in solo if t.block == b for r in in_trial(t)}
+        if b == 1:
+            first_keys = dict(keys)
         if set(keys) != set(loaded):
             continue  # calibration problems are reported by the calibration check
         if len(set(keys.values())) != len(loaded):
@@ -430,6 +441,15 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
             common = sorted(set(cb) & set(lb))
             d = [build(cb[b], lb[b]) for b in common if cb[b] == cb[b] and lb[b] == lb[b]]
             mean_d, tl, bl, ok = st.lower_bounds(d, a, int(r), int(s))
+            if key == "latency_p99" and len(d) == len(common) and len(d) >= 2:
+                samples = lambda arm, b: [x for t in ab if t.arm == arm and t.block == b for x in t.m["_lat"]]
+                cs_, ms_ = [samples(cand, b) for b in common], [samples(main, b) for b in common]
+                if min(len(x) for x in cs_ + ms_) < 100:
+                    # Too few requests per arm in a block for a per-block p99:
+                    # the pooled p99, tested by resampling blocks.
+                    mean_d, lo_, _ = st.pooled_quantile_bounds(cs_, ms_, 0.99, build, a, int(r), int(s))
+                    tl, bl, ok = float("nan"), lo_, lo_ > 0
+                    label = "request latency p99 (pooled over blocks)"
             if len(d) < len(common) or len(d) < 2:
                 # Every judged block must carry the criterion's evidence.
                 unmeasured.append(f"{label}: {len(d)} of {len(common)} blocks measured")

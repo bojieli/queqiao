@@ -32,7 +32,7 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
              cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False, no_solo=(),
              profile="dc-long-haul", fail_requests=(), stagger=(), gw_args=True, nat=False, tcp_leaf=None,
              no_path_key=False, fallback_leaf=None, tcp_lane_leaf=None, empty_egress=False, calibrate=None,
-             request_kind="requests"):
+             request_kind="requests", per_wave=8, tcp_at=None):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -58,7 +58,8 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
             "ctl": "198.51.100.9"}
 
     def flow_record(arm, b, when, leaf):
-        rec = {"time": iso(when), "msg": "remote flow complete", "transport": "tcp" if leaf == tcp_leaf else "quic",
+        tcp = leaf == tcp_leaf or (b, leaf, arm) == tcp_at
+        rec = {"time": iso(when), "msg": "remote flow complete", "transport": "tcp" if tcp else "quic",
                "lane_bytes": {"1": {"Kind": "quic", "Sent": 1000, "Received": 10}}}
         if leaf == tcp_lane_leaf:
             rec["lane_bytes"]["2"] = {"Kind": "tcp", "Sent": 500, "Received": 0}
@@ -99,7 +100,7 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
                     # (block, leaf) is staggered past the others.
                     end = t + 60 + 10 * w + (5 if (b, leaf) in stagger else 0)
                     dur = 30.0 if failed else rt
-                    for r in range(1, 9):
+                    for r in range(1, per_wave + 1):
                         rows.append([b, "dc", slot] + base + ["requests", j, leaf, request_kind, f"w{w}r{r}", iso(t + 60),
                                                               iso(t + 70), "000" if failed else 200, 0 if failed else 307200,
                                                               30 if failed else f"{rt:.4f}", 28 if failed else 0,
@@ -258,6 +259,21 @@ class DCGate(unittest.TestCase):
         # Block 1's binding is still checked against every block's rates.
         text, v = self.run_gate("unbound", no_solo=later, calibrate="first", binding=0.95)
         self.assertEqual(v["cand"], "VOID")
+
+    def test_calibrate_first_still_checks_every_blocks_carrier(self):
+        later = tuple((b, leaf) for b in range(2, 13) for leaf in LOADED)
+        text, v = self.run_gate("tcp4", no_solo=later, calibrate="first", tcp_at=(4, "la", "cand"))
+        self.assertEqual(v["cand"], "VOID", text)
+        self.assertIn("block 4", text)
+
+    def test_a_sparse_p99_is_pooled_over_blocks(self):
+        # Three requests per leaf per trial (as at minimal size): too few for
+        # a per-block p99, so the requests are pooled and blocks resampled.
+        text, v = self.run_gate("sparse", per_wave=1)
+        self.assertIn("request latency p99 (pooled over blocks)", text)
+        self.assertEqual(v["cand"], "PASS", text)
+        text, v = self.run_gate("sparse-slow", per_wave=1, cand_request=1.5)
+        self.assertEqual(v["cand"], "FAIL")
 
     def test_one_at_a_time_requests_are_the_request_phase(self):
         # W4 at minimal size (dc-rpc rows) is judged like the request waves.

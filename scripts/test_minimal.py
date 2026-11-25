@@ -309,7 +309,7 @@ class SequentialAnalysis(unittest.TestCase):
         self.assertFalse(st.overall_stop(dec[("p", "")]))
 
 
-def unit_campaign(root, units_run, missing=()):
+def unit_campaign(root, units_run, missing=(), main_bytes=1):
     """A minimal campaign's skeleton: per unit (block, path, type) four slots
     in the plan and, unless the unit is in `missing`, four trials' rows."""
     os.makedirs(root)
@@ -321,7 +321,8 @@ def unit_campaign(root, units_run, missing=()):
             sched.append({"block": b, "path": p, "slot": base + k, "arm": arm, "trial": ty})
             if (b, p, ty) not in missing:
                 rows.append([b, p, base + k, arm, "x", 1 + (k in (2, 3) and arm == "cand" and k == 3 or k == 4),
-                             int(k in (1, 2)), ty, 0, p, "bulk", "b1o1", iso(t), iso(t + 60), 200, 1, 60, 0, 1, 60,
+                             int(k in (1, 2)), ty, 0, p, "bulk", "b1o1", iso(t), iso(t + 60), 200,
+                             main_bytes if arm == "main" else 1, 60, 0, 1, 60,
                              f"{t:.3f}", f"{t + 60:.3f}", ty])
                 t += 70
     plan = {"main": "main", "workload": "minimal", "paths": ["a"], "schedule": sched, "config": {"duration": 60},
@@ -583,17 +584,21 @@ class ProductionPaths(unittest.TestCase):
             prod = os.path.join(d, "prod")
             os.makedirs(prod)
             os.symlink(prod, os.path.join(d, "alias"))
+            pathlib.Path(prod, "sock").write_text("")
+            os.symlink(os.path.join(prod, "sock"), os.path.join(d, "link.sock"))
             os.makedirs(os.path.join(d, "home"))
             text = BASE.replace("host = gw\naddress", "host = local\naddress").replace("[production:gw]\nhost = gw\npaths = /var/lib/queqiao /usr/local/bin/queqiaod",
                                                                                      f"[production:gw]\nhost = local\npaths = {prod}")
             text = text.replace("[arm:cand]\nbinary_linux_amd64 = /bin/true",
-                                f"[arm:cand]\nbinary_linux_amd64 = /bin/true\ngateway_flags = --cert {d}/alias/x.pem --key {d}/other/k.pem")
+                                f"[arm:cand]\nbinary_linux_amd64 = /bin/true\ngateway_flags = --cert {d}/alias/x.pem --key {d}/other/k.pem --admin-socket {d}/link.sock")
             cfg = parse(text)
             camp = ab.Campaign(cfg, "/o", ".", dry=False, stream=io.StringIO())
             camp.hosts["local"].home = os.path.join(d, "home")
             r = camp.canonical_path_reasons()
-            self.assertEqual(len(r), 1, r)
+            self.assertEqual(len(r), 2, r)
             self.assertIn(f"{d}/alias/x.pem resolves to {prod}/x.pem", r[0])
+            # A symlink as the final component is followed to its target.
+            self.assertIn(f"{d}/link.sock resolves to {prod}/sock", r[1])
             camp.hosts["local"].home = os.path.join(prod, "sub", "..")
             r = camp.canonical_path_reasons()
             self.assertTrue(any("work directory" in x for x in r), r)
@@ -748,12 +753,141 @@ class ClassCorrectness(unittest.TestCase):
         bg = self.flow(500, 0, 50_000_000)                   # a download: not the LLM's
         t1 = T([bg, self.flow(600_000, 99_500, 500)])
         t2 = T([bg, self.flow(100_500, 100_000, 0)])
-        self.assertAlmostEqual(mn.class_interactive([t1, t2], 100_000), 199_500 / 200_000)
+        pa = sys.modules["ab_workload_phase_a"]
+        self.assertAlmostEqual(pa.class_interactive([t1, t2], 100_000), 199_500 / 200_000)
+        # A background upload cut mid-object carried a prompt-sized upload
+        # but no streamed response: not the LLM's flow.
+        cut = self.flow(2_000_000, 0, 60)
+        self.assertAlmostEqual(pa.class_interactive([T([cut] + t1.flow_records)], 100_000), 99_500 / 100_000)
         # A trial without the LLM's record, or without class telemetry, is unmeasured.
-        self.assertNotEqual(mn.class_interactive([t1, T([bg])], 100_000), mn.class_interactive([t1, T([bg])], 100_000))
-        bare = {k: v for k, v in self.flow(100_500, 1, 0).items() if not k.startswith("data_bytes")}
-        x = mn.class_interactive([T([bare])], 100_000)
+        self.assertNotEqual(pa.class_interactive([t1, T([bg])], 100_000), pa.class_interactive([t1, T([bg])], 100_000))
+        bare = {k: v for k, v in self.flow(100_500, 50_000, 0).items() if not k.startswith("data_bytes")}
+        x = pa.class_interactive([T([bare])], 100_000)
         self.assertNotEqual(x, x)
+
+    def test_the_full_profile_reads_the_telemetry_too(self):
+        pa = sys.modules["ab_workload_phase_a"]
+        llm = wl.WORKLOADS["llm"]()
+        recs = [{"kind": "llm", "U": 100_000, "fail": "", "ttft": 0.6, "T": 0.5, "deltas": [[0, 0.6], [25, 0.625]],
+                 "done": 1.0, "N": 2, "c": 0.025}]
+        with mock.patch.object(pa, "class_interactive", return_value=0.995) as ci:
+            m = llm.phase_measures("single-100k-none", recs, [], [])
+        self.assertEqual(m["class_interactive"], 0.995)
+        self.assertEqual(ci.call_args[0][1], 100_000)
+
+
+class RoundTwoFixes(unittest.TestCase):
+    def gates(self):
+        g = an.load_gates()
+        g["resamples"] = 500
+        return g
+
+    def test_coverage_counts_the_blocks_of_the_rules_own_type(self):
+        # bulk stopped at 6 blocks, mixed-67 went on to 7: bulk's rule is
+        # judged on its 6 blocks, not short of the path's 7.
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            unit_campaign(root, [(b, "a", "bulk") for b in range(1, 7)] + [(b, "a", "mixed-67") for b in range(1, 8)])
+            text, v = an.report(root, self.gates())
+        self.assertEqual(v[("a", "cand", "rule:bulk.goodput_bps")], "pass", text)
+
+    def test_generic_secondaries_are_rules_of_each_trial_type(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            unit_campaign(root, [(b, "a", "bulk") for b in range(1, 7)])
+            text, v = an.report(root, self.gates())
+        for k in ("completion", "stalls_per_trial", "wire_per_useful", "cpu_p90"):
+            self.assertIn(("a", "cand", f"rule:bulk.{k}"), v, k)
+        self.assertIn("`credit_delay_p95_s`, `false_promotion_rate`", text)
+        # Unmeasured here (no metrics scraped): not a pass.
+        self.assertEqual(an.cell_verdicts(v, "a", "cand")["bulk"], "INCOMPLETE")
+
+    def test_a_reference_that_delivered_nothing_voids_the_primary(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            unit_campaign(root, [(b, "a", "bulk") for b in range(1, 7)], main_bytes=0)
+            text, v = an.report(root, self.gates())
+        self.assertEqual(v[("a", "cand", "rule:bulk.goodput_bps")], "VOID")
+        self.assertEqual(v[("a", "cand", "overall")], "VOID")
+        self.assertEqual(an.cell_verdicts(v, "a", "cand")["bulk"], "VOID")
+
+    def test_an_undecided_rule_is_not_a_passing_cell(self):
+        v = {("a", "c", "primary"): "n/a", ("a", "c", "rule:bulk.x"): "pass", ("a", "c", "rule:bulk.y"): "undecided"}
+        self.assertEqual(an.cell_verdicts(v, "a", "c")["bulk"], "INCOMPLETE")
+
+    def test_gates_changed_after_the_campaign_froze_them_give_no_verdict(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            unit_campaign(root, [(b, "a", "bulk") for b in range(1, 7)])
+            plan = json.loads(pathlib.Path(root, "plan.json").read_text())
+            plan["gates_sha256"] = "0" * 64
+            pathlib.Path(root, "plan.json").write_text(json.dumps(plan))
+            text, v = an.report(root, self.gates())
+        self.assertIn("gates.ini differs from the one frozen", text)
+        self.assertEqual(v[("a", "cand", "overall")], "INCOMPLETE")
+        self.assertEqual(ab.gates_digest(), an.load_gates()["sha256"])
+
+    def test_bulk_goodput_is_over_the_fixed_window(self):
+        # Flows that died after 5 s do not score 60 s worth of rate.
+        m = wl.WORKLOADS["minimal"]()
+        T = collections.namedtuple("T", "rows records trial")
+        t = T([{"phase": "bulk", "kind": "bulk", "bytes": "600", "http": "200", "wall": "5"}], [], "bulk")
+        self.assertEqual(m.phase_measures("bulk", [], t.rows, [t])["goodput_bps"], 10.0)
+
+    def test_sparse_tails_need_samples_in_both_arms(self):
+        pt = PooledTails()
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "eq")
+            pt.write(root)
+
+            def tails(self_, trials, plan):
+                xs = [r["ttft"] - r["T"] for t in trials for r in t.records if r.get("_phase") == "single-100k-none"]
+                if trials and trials[0].arm == "cand" and trials[0].block > 1:
+                    xs = []                       # no candidate samples after block 1
+                return {"single-100k-none.ttft_net_p95_s": (0.95, xs)}
+            g = an.load_gates()
+            g["resamples"] = 500
+            with mock.patch.object(wl.WORKLOADS["llm"], "block_tails", tails):
+                text, v = an.report(root, g)
+        self.assertEqual(v[("a", "cand", "rule:single-100k-none.ttft_net_p95_s")], "n/a")
+
+    def test_d_not_set_up_aborts_before_any_block(self):
+        cfg = parse(BASE)
+        with tempfile.TemporaryDirectory() as tmp:
+            camp = ab.Campaign(cfg, os.path.join(tmp, "o"), ".", dry=False, stream=io.StringIO())
+            beside = cfg.wl.beside(cfg)
+            beside.ready_seconds = 0.01
+
+            def run(self_, script, timeout=120, what=""):
+                return (1, "") if script.startswith("test -f") else (0, "")
+            with mock.patch.object(ab.Host, "run", run), mock.patch.object(ab.Campaign, "start_gateway"), \
+                    mock.patch.object(ab.Campaign, "start_client"), mock.patch.object(ab.time, "sleep"):
+                with self.assertRaises(RuntimeError):
+                    camp.start_beside(beside)
+            for th in camp.beside_threads:
+                th.join(5)
+
+    def test_endpoint_switches_are_part_of_the_final_bundle(self):
+        pa_tests = importlib.import_module("test_phase_a")
+        g = an.load_gates()
+        g["resamples"] = 500
+        g["workloads"]["llm"] = {k: v for k, v in g["workloads"]["llm"].items() if k != "*.class_interactive"}
+        llm = wl.WORKLOADS["llm"]
+        with tempfile.TemporaryDirectory() as d:
+            a_, b_ = os.path.join(d, "early"), os.path.join(d, "final")
+            pa_tests.write_llm_campaign(a_)
+            pa_tests.write_llm_campaign(b_)
+            plan = json.loads(pathlib.Path(b_, "plan.json").read_text())
+            plan["gateway_flags"] = ["--classifier=phased"]          # same commits, other switch
+            pathlib.Path(b_, "plan.json").write_text(json.dumps(plan))
+            tsv = pathlib.Path(b_, "trials.tsv").read_text().splitlines()
+            pathlib.Path(b_, "trials.tsv").write_text("\n".join(
+                [tsv[0]] + [l for l in tsv[1:] if l.split("\t")[7] != "single-100k-down4"]) + "\n")
+            with mock.patch.object(an, "FLIP_WORKLOADS", ("llm",)), \
+                    mock.patch.object(llm, "report_only", llm.report_only + ("class_interactive",)):
+                text, ok = an.flip_report([a_, b_], g)
+        self.assertFalse(ok)
+        self.assertIn("single-100k-down4 on a for cand ran on an earlier build or other flags", text)
 
 
 class DCAtMinimalSize(unittest.TestCase):
