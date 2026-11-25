@@ -53,12 +53,16 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+# ab_workloads imports this module by name; when this file runs as a script,
+# make that name refer to this very module rather than a second copy.
+sys.modules.setdefault("ab_campaign", sys.modules[__name__])
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 ARM_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 WORK_PREFIX = "qq-ab-"
-WORKLOADS = ("bulk", "single", "interactive", "dc")
 # curl --max-time of one probe request; an unfinished probe counts as this long.
 PROBE_TIMEOUT = 10
 # Seconds between dispatching a DC phase's jobs and their shared start.
@@ -178,19 +182,6 @@ class Production:
 
 
 @dataclass
-class DC:
-    loaded: List[str]
-    control: str
-    bulk_flows_per_leaf: int
-    request_bytes: int
-    requests_per_leaf: int
-    waves: int
-    request_timeout: int
-    control_interval: float
-    calibrate: bool
-
-
-@dataclass
 class Config:
     name: str
     blocks: int
@@ -211,7 +202,8 @@ class Config:
     clients: Dict[str, Client]
     arms: List[Arm]
     production: List[Production]
-    dc: Optional[DC]
+    wl: Any = None                  # the ab_workloads.Workload
+    dc: Any = None                  # the dc workload's parameters
 
     @property
     def work_dir(self) -> str:
@@ -238,7 +230,7 @@ class Config:
     def paths(self) -> List[str]:
         """Clients that are measured paths. The DC workload runs every leaf at
         once, so it has a single path."""
-        return ["dc"] if self.workload == "dc" else list(self.clients)
+        return self.wl.paths(self)
 
     def planned_ports(self) -> Dict[str, List[Tuple[int, str]]]:
         out: Dict[str, List[Tuple[int, str]]] = {}
@@ -247,6 +239,9 @@ class Config:
             out.setdefault(g.host, []).append((g.port_base + a.index, f"gateway {a.name}"))
             out.setdefault(g.host, []).append((g.metrics_port_base + a.index, f"gateway metrics {a.name}"))
         out.setdefault(g.host, []).append((g.origin_port, "origin"))
+        for ep in (self.wl.endpoints(self) if self.wl else []):
+            for port, what in ep.tcp_ports + ep.udp_ports:
+                out.setdefault(g.host, []).append((port, f"{ep.tag} {what}"))
         for c in self.clients.values():
             for a in self.arms:
                 out.setdefault(c.host, []).append((c.socks_port_base + a.index, f"client {c.name} socks {a.name}"))
@@ -269,8 +264,8 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
     if not NAME_RE.match(name):
         raise ConfigError(f"campaign name {name!r} must match {NAME_RE.pattern}")
     workload = c.get("workload", "bulk")
-    if workload not in WORKLOADS:
-        raise ConfigError(f"workload must be one of {', '.join(WORKLOADS)}")
+    import ab_workloads
+    wl = ab_workloads.get(workload)
     g = cp["gateway"]
     for k in ("host", "address"):
         if not g.get(k):
@@ -334,51 +329,25 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
     if not clients:
         raise ConfigError("at least one [client:...] section is required")
 
-    dc = None
-    if workload == "dc":
-        if not cp.has_section("dc"):
-            raise ConfigError("workload = dc needs a [dc] section")
-        d = cp["dc"]
-        dc = DC(loaded=_words(d.get("loaded", "")), control=d.get("control", ""),
-                bulk_flows_per_leaf=d.getint("bulk_flows_per_leaf", 2), request_bytes=d.getint("request_bytes", 307200),
-                requests_per_leaf=d.getint("requests_per_leaf", 8), waves=d.getint("waves", 3),
-                request_timeout=d.getint("request_timeout", 30), control_interval=d.getfloat("control_interval", 1.0),
-                calibrate=_bool(d.get("calibrate", "true")))
-        if len(dc.loaded) < 2:
-            raise ConfigError("[dc] loaded needs at least two leaves")
-        for leaf in dc.loaded + [dc.control]:
-            if leaf not in clients:
-                raise ConfigError(f"[dc] leaf {leaf!r} is not a [client:...] section")
-        for where, fl in [("[gateway] flags", gw.flags)] + [(f"[client:{c.name}] flags", c.flags) for c in clients.values()] + \
-                [(f"[arm:{a.name}]", a.flags + a.gateway_flags + a.client_flags) for a in arms]:
-            if any(f.lstrip("-").split("=", 1)[0] == "path-profile" for f in fl if f.startswith("-")):
-                raise ConfigError(f"{where}: the DC gate runs --path-profile dc-long-haul on both ends; do not set it")
-        if dc.control in dc.loaded:
-            raise ConfigError("[dc] control must not be one of the loaded leaves")
-        leaves = dc.loaded + [dc.control]
-        hosts = [clients[x].host for x in leaves]
-        if len(set(hosts)) != len(hosts):
-            # A leaf is an endpoint pair; two clients on one host share one
-            # source address, are one leaf, and would run two temporary
-            # clients on one host at once.
-            raise ConfigError("[dc] every leaf must be on its own host")
-
     cfg = Config(name=name, blocks=c.getint("blocks", 12), seed=c.getint("seed", 1), workload=workload,
-                 flows=1 if workload == "single" else c.getint("flows", 4), object_bytes=c.getint("object_bytes", 67108864),
+                 flows=c.getint("flows", 4), object_bytes=c.getint("object_bytes", 67108864),
                  duration=c.getint("duration", 90), gap=c.getfloat("gap", 5.0), block_gap=c.getfloat("block_gap", 10.0),
                  probe_bytes=c.getint("probe_bytes", 1024), probe_interval=c.getfloat("probe_interval", 0.5),
                  snapshot_every=c.getint("snapshot_every", 4), lane_trace=_bool(c.get("lane_trace", "true")),
                  log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=15")),
-                 gateway=gw, clients=clients, arms=arms, production=prod, dc=dc)
+                 gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
+    wl.configure(cfg, cp)
+    owned = wl.owned_flags()
+    for where, fl in [("[gateway] flags", gw.flags)] + [(f"[client:{c.name}] flags", c.flags) for c in clients.values()] + \
+            [(f"[arm:{a.name}]", a.flags + a.gateway_flags + a.client_flags) for a in arms]:
+        for f in fl:
+            if f.startswith("-") and f.lstrip("-").split("=", 1)[0] in owned:
+                raise ConfigError(f"{where}: workload {workload} sets --{f.lstrip('-').split('=', 1)[0]} on both ends; "
+                                  "do not set it")
     if cfg.blocks < 1:
         raise ConfigError("blocks must be positive")
     # curl --max-time 0 means no limit, which is not a fixed window.
-    checks = [("duration", cfg.duration), ("flows", cfg.flows), ("object_bytes", cfg.object_bytes),
-              ("probe_bytes", cfg.probe_bytes), ("probe_interval", cfg.probe_interval)]
-    if dc:
-        checks += [("[dc] request_timeout", dc.request_timeout), ("[dc] waves", dc.waves),
-                   ("[dc] requests_per_leaf", dc.requests_per_leaf), ("[dc] bulk_flows_per_leaf", dc.bulk_flows_per_leaf),
-                   ("[dc] request_bytes", dc.request_bytes), ("[dc] control_interval", dc.control_interval)]
+    checks = [("duration", cfg.duration)] + wl.positive(cfg)
     for name, v in checks:
         if not v > 0:
             raise ConfigError(f"{name} must be positive")
@@ -948,10 +917,7 @@ class Campaign:
         return f"{self.w(client.host)}/cl-{client.name}-{arm.name}"
 
     def objects(self) -> List[Tuple[str, int]]:
-        objs = [(f"obj-{self.cfg.object_bytes}", self.cfg.object_bytes), (f"obj-{self.cfg.probe_bytes}", self.cfg.probe_bytes)]
-        if self.cfg.dc:
-            objs.append((f"obj-{self.cfg.dc.request_bytes}", self.cfg.dc.request_bytes))
-        return objs
+        return self.cfg.wl.objects(self.cfg)
 
     def setup(self) -> None:
         cfg, g = self.cfg, self.cfg.gateway
@@ -966,6 +932,14 @@ class Campaign:
         self.spawn(gh, "origin", f"{W}/origin",
                    f"python3 -m http.server {g.origin_port} --bind 127.0.0.1 --directory {W}/origin")
         self.wait_port(gh, g.origin_port, "origin", "origin")
+        for ep in cfg.wl.endpoints(cfg):
+            # A workload's own service on the gateway's loopback, started from
+            # the work directory like every other temporary process.
+            for f in ep.files:
+                gh.put(f, f"{W}/{os.path.basename(f)}")
+            self.spawn(gh, ep.tag, W, ep.command.replace("{W}", W))
+            for port, what in ep.tcp_ports:
+                self.wait_port(gh, port, f"{ep.tag} {what}", ep.tag)
         for arm in cfg.arms:
             d = self.gw_dir(arm)
             self.must(gh, f"mkdir -p {d}/logs", f"gateway directory for {arm.name}")
@@ -1051,8 +1025,7 @@ rm -f "$f"''', what=f"stop {tag}")
         args = [f"{d}/queqiaod", "server", "--state", f"{d}/state", "--listen", f":{g.port_base + arm.index}",
                 "--metrics-listen", f"127.0.0.1:{g.metrics_port_base + arm.index}", "--log-file", f"{d}/logs/{logname}.jsonl",
                 "--log-max-size-mib", str(cfg.log_max_mib), "--log-stderr=false", *flags]
-        if cfg.dc:
-            args += ["--path-profile", "dc-long-haul"]
+        args += cfg.wl.gateway_flags(cfg)
         return " ".join(_q(a) for a in args)
 
     def start_gateway(self, arm: Arm, logname: str, enroll: bool = False) -> None:
@@ -1075,8 +1048,7 @@ rm -f "$f"''', what=f"stop {tag}")
                 "--metrics-listen", f"127.0.0.1:{client.metrics_port_base + arm.index}",
                 "--log-file", f"{d}/logs/{logname}.jsonl", "--log-max-size-mib", str(min(self.cfg.log_max_mib, 256)),
                 "--log-stderr=false", *self.client_flags(client, arm)]
-        if self.cfg.dc:
-            args += ["--path-profile", "dc-long-haul"]
+        args += self.cfg.wl.client_flags(self.cfg)
         return " ".join(_q(a) for a in args)
 
     def start_client(self, client: Client, arm: Arm, logname: str) -> None:
@@ -1122,119 +1094,75 @@ rm -f "$f"''', what=f"stop {tag}")
                 f.write(text)
 
     # -- jobs
-    def job_script(self, client: Client, arm: Arm, kind: str, n: int, duration: float, start_at: int = 0) -> str:
-        """The job's shell. With start_at (a remote epoch second), load jobs
-        wait for it, and request wave w starts at start_at + (w - 1) x
-        request_timeout: a barrier across leaves, so that on a fast path one
-        leaf cannot finish its waves before another starts. It assumes the
-        hosts' clocks are NTP-synchronised."""
-        port = client.socks_port_base + arm.index
-        barrier = f"while [ $(date +%s) -lt {start_at} ]; do sleep 0.1; done; " if start_at else ""
-        url = f"http://127.0.0.1:{self.cfg.gateway.origin_port}/"
-        curl = f"{CURL_ENV} --socks5-hostname 127.0.0.1:{port} -o /dev/null -s -w '%{{http_code}}\\t%{{size_download}}\\t%{{time_total}}\\t%{{exitcode}}'"
-        # Every request prints "start end flow http bytes seconds exit", the
-        # times in milliseconds on this host's clock (NOW_SH), so overlap
-        # with other hosts' load can be shown rather than assumed.
-        row = "printf '%s\\t%s\\t%s\\t%s\\n' \"$t0\" \"$t1\""
-        if kind == "bulk":
-            # Each flow fetches object after object until the window closes,
-            # so it stays backlogged: a fast arm cannot run out of bytes and
-            # be capped at the same total as a slow one.
-            return (NOW_SH + barrier + f"end=$(( $(date +%s) + {int(duration)} )); "
-                    f"for i in $(seq 1 {n}); do ( k=0; while :; do rem=$(( end - $(date +%s) )); [ $rem -gt 0 ] || break; "
-                    f"k=$((k+1)); t0=$(now); r=$({curl} --max-time $rem {url}obj-{self.cfg.object_bytes} 2>/dev/null); t1=$(now); "
-                    f"{row} \"b${{i}}o$k\" \"$r\"; "
-                    f"[ \"${{r##*$'\\t'}}\" = 0 ] && [ \"${{r%%$'\\t'*}}\" = 200 ] || break; done ) & done; wait")
-        if kind == "requests":
-            dc = self.cfg.dc
-            wave = (f"ws=$(( {start_at} + (w - 1) * {dc.request_timeout} )); while [ $(date +%s) -lt $ws ]; do sleep 0.1; done; "
-                    if start_at else "")
-            return (NOW_SH + f"for w in $(seq 1 {dc.waves}); do {wave}for i in $(seq 1 {n}); do ( t0=$(now); r=$({curl} --max-time {dc.request_timeout} "
-                    f"{url}obj-{dc.request_bytes} 2>/dev/null); t1=$(now); {row} \"w${{w}}r$i\" \"$r\" ) & done; wait; done")
-        if kind == "probe":
-            # The probe measures latency under load, so it stops as soon as
-            # the runner drops the stop file after the phase's load finishes.
-            size = self.cfg.dc.request_bytes if self.cfg.dc else self.cfg.probe_bytes
-            interval = self.cfg.dc.control_interval if self.cfg.dc else self.cfg.probe_interval
-            stop = self.stop_file(client, arm)
-            return (NOW_SH + f"end=$(( $(date +%s) + {int(duration)} )); i=0; "
-                    f"while [ $(date +%s) -lt $end ] && [ ! -e {stop} ]; do i=$((i+1)); "
-                    f"t0=$(now); r=$({curl} --max-time {PROBE_TIMEOUT} {url}obj-{size} 2>/dev/null); t1=$(now); {row} \"p$i\" \"$r\"; "
-                    f"sleep {interval}; done; rm -f {stop}")
-        raise ValueError(kind)
+    def job_script(self, client: Client, arm: Arm, kind: str, n: int, duration: float, start_at: int = 0,
+                   params: Optional[dict] = None) -> str:
+        """The shell a registered generator runs for one job."""
+        import ab_workloads
+        job = ab_workloads.Job(client, kind, n, params=dict(params or {}))
+        return ab_workloads.GENERATORS[kind].script(self, job, arm, duration, start_at)
 
     def stop_file(self, client: Client, arm: Arm) -> str:
         return f"{self.w(client.host)}/run/stop-probe-{client.name}-{arm.name}"
 
-    def expected(self, kind: str) -> int:
-        if kind == "bulk":
-            return self.cfg.object_bytes
-        if kind == "requests":
-            return self.cfg.dc.request_bytes
-        return self.cfg.dc.request_bytes if self.cfg.dc else self.cfg.probe_bytes
+    def pause(self, seconds: float) -> None:
+        if not self.dry:
+            time.sleep(seconds)
 
-    def phases(self, path: str) -> List[Tuple[str, float, List[Tuple[Client, str, int]]]]:
-        """(phase name, duration, [(client, job kind, concurrency)]) for one trial."""
-        cfg = self.cfg
-        if cfg.workload == "dc":
-            dc = cfg.dc
-            loaded = [cfg.clients[x] for x in dc.loaded]
-            control = cfg.clients[dc.control]
-            req_time = dc.waves * dc.request_timeout
-            return [("sustained", cfg.duration, [(c, "bulk", dc.bulk_flows_per_leaf) for c in loaded] + [(control, "probe", 1)]),
-                    ("requests", req_time, [(c, "requests", dc.requests_per_leaf) for c in loaded] + [(control, "probe", 1)])]
-        client = cfg.clients[path]
-        jobs = [(client, "bulk", cfg.flows)]
-        if cfg.workload == "interactive":
-            jobs.append((client, "probe", 1))
-        return [("main", cfg.duration, jobs)]
-
-    def run_phase(self, slot: Slot, arm: Arm, phase: str, duration: float, jobs, writer) -> None:
+    def run_phase(self, slot: Slot, arm: Arm, phase: Any, writer) -> None:
+        """Run one ab_workloads.Phase: every job at once, load jobs to the end
+        of the window, the others (measuring under that load) until the load
+        has finished."""
+        import ab_workloads
         results: Dict[int, Tuple[float, float, int, str]] = {}
+        duration = phase.duration
+        gens = [ab_workloads.GENERATORS[j.kind] for j in phase.jobs]
 
-        def go(i, client, kind, n):
+        def go(i, job, gen):
             t0 = time.time()
             try:
-                rc, out = self.hosts[client.host].run(self.job_script(client, arm, kind, n, duration, start_at),
-                                                      timeout=duration + 120 + BARRIER_LEAD, what=f"{phase}: {kind} x{n} via {client.name}/{arm.name}")
+                rc, out = self.hosts[job.client.host].run(gen.script(self, job, arm, duration, start_at),
+                                                          timeout=duration + 120 + BARRIER_LEAD,
+                                                          what=f"{phase.name}: {job.kind} x{job.n} via {job.client.name}/{arm.name}")
             except Exception as e:  # a hung ssh is a failed job, not a dead campaign
                 rc, out = -1, ""
-                self.log(f"job {kind} on {client.name} failed: {e}")
+                self.log(f"job {job.kind} on {job.client.name} failed: {e}")
             results[i] = (t0, time.time(), rc, out)
 
-        # Clear any stop signal before the phase starts, not inside the probe:
-        # a load job that finished before the probe's ssh session began would
-        # otherwise have its stop signal erased.
-        for c, k, n in jobs:
-            if k == "probe":
-                self.hosts[c.host].run(f"rm -f {self.stop_file(c, arm)}", what=f"{phase}: clear the probe stop file on {c.name}")
-        # Several loaded leaves (the DC workload) start on a shared remote
-        # clock, far enough ahead that every ssh session is up by then.
-        start_at = int(time.time()) + BARRIER_LEAD if self.cfg.workload == "dc" else 0
-        threads = [threading.Thread(target=go, args=(i, c, k, n)) for i, (c, k, n) in enumerate(jobs)]
+        # Clear any stop signal before the phase starts, not inside the job:
+        # a load job that finished before a measuring job's ssh session began
+        # would otherwise have its stop signal erased.
+        for j in phase.jobs:
+            if not j.load:
+                self.hosts[j.client.host].run(f"rm -f {self.stop_file(j.client, arm)}",
+                                              what=f"{phase.name}: clear the stop file on {j.client.name}")
+        # Jobs on several hosts that must load the path together start on a
+        # shared remote clock, far enough ahead that every ssh session is up.
+        start_at = int(time.time()) + BARRIER_LEAD if phase.barrier else 0
+        threads = [threading.Thread(target=go, args=(i, j, g)) for i, (j, g) in enumerate(zip(phase.jobs, gens))]
         for t in threads:
             t.start()
-        for t, (c, k, n) in zip(threads, jobs):
-            if k != "probe":
+        for t, j in zip(threads, phase.jobs):
+            if j.load:
                 t.join()
-        for t, (c, k, n) in zip(threads, jobs):
-            if k == "probe":
-                self.hosts[c.host].run(f"touch {self.stop_file(c, arm)}", what=f"{phase}: load finished, stop the probe on {c.name}")
+        for j in phase.jobs:
+            if not j.load:
+                self.hosts[j.client.host].run(f"touch {self.stop_file(j.client, arm)}",
+                                              what=f"{phase.name}: load finished, stop the {j.kind} on {j.client.name}")
         for t in threads:
             t.join()
         if self.dry:
             return
-        for i, (client, kind, n) in enumerate(jobs):
+        for i, (job, gen) in enumerate(zip(phase.jobs, gens)):
             t0, t1, rc, out = results[i]
-            for flow, code, size, secs, ex, ts0, ts1 in job_rows(out, kind, n, self.cfg.dc.waves if self.cfg.dc else 1, duration):
-                complete = int(ex == "0" and code == "200" and size == str(self.expected(kind)))
-                writer([slot.block, slot.path, slot.slot, arm.name, arm.role, slot.arm_trial, int(slot.cold), phase, i,
-                        client.name, kind, flow, utc(t0), utc(t1), code, size, secs, ex, complete, f"{t1 - t0:.3f}", ts0, ts1])
+            want = gen.expected(job)
+            for flow, code, size, secs, ex, ts0, ts1 in gen.parse(out, job, duration):
+                complete = int(ex == "0" and code == "200" and (not want or size == str(want)))
+                writer([slot.block, slot.path, slot.slot, arm.name, arm.role, slot.arm_trial, int(slot.cold), phase.name, i,
+                        job.client.name, job.kind, flow, utc(t0), utc(t1), code, size, secs, ex, complete,
+                        f"{t1 - t0:.3f}", ts0, ts1])
 
     def clients_for(self, path: str) -> List[Client]:
-        if self.cfg.workload == "dc":
-            return [self.cfg.clients[x] for x in self.cfg.dc.loaded + [self.cfg.dc.control]]
-        return [self.cfg.clients[path]]
+        return self.cfg.wl.clients_for(self.cfg, path)
 
     def run_block(self, block: int, path: str, slots: List[Slot], writer) -> None:
         cfg = self.cfg
@@ -1260,8 +1188,8 @@ rm -f "$f"''', what=f"stop {tag}")
             self.scrape(arm, name + "-pre")
             for c in clients:
                 self.scrape_client(c, arm, name + "-pre")
-            for phase, duration, jobs in self.phases(path):
-                self.run_phase(s, arm, phase, duration, jobs, writer)
+            for phase in cfg.wl.phases(cfg, path):
+                self.run_phase(s, arm, phase, writer)
             self.scrape(arm, name + "-post")
             for c in clients:
                 self.scrape_client(c, arm, name + "-post")
@@ -1270,35 +1198,13 @@ rm -f "$f"''', what=f"stop {tag}")
                     self.stop_client(c, arm)
             if not self.dry:
                 time.sleep(cfg.gap)
-        if cfg.dc and cfg.dc.calibrate:
-            self.calibrate(block, path, tagp, writer)
+        cfg.wl.after_block(self, block, path, tagp, writer)
         for c in resident:
             for arm in cfg.arms:
                 self.stop_client(c, arm)
         for arm in cfg.arms:
             self.stop(self.hosts[cfg.gateway.host], f"gw-{arm.name}")
         self.collect(tagp, clients)
-
-    def calibrate(self, block: int, path: str, tagp: str, writer) -> None:
-        """After the block's interleaved trials, run each loaded leaf alone on
-        the main arm. The common ancestor binds only if the leaves together
-        deliver clearly less than the sum of what each delivers alone; the DC
-        analysis voids a campaign in which it does not (dc_gate.ini)."""
-        cfg, arm = self.cfg, self.cfg.main
-        for i, name in enumerate(cfg.dc.loaded):
-            leaf = cfg.clients[name]
-            slot = Slot(block, path, 100 + i, arm.name, 0, False)
-            if leaf.small:
-                self.start_client(leaf, arm, f"client-{tagp}-s{slot.slot}")
-            self.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
-            self.scrape_client(leaf, arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
-            self.run_phase(slot, arm, "solo", cfg.duration, [(leaf, "bulk", cfg.dc.bulk_flows_per_leaf)], writer)
-            self.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
-            self.scrape_client(leaf, arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
-            if leaf.small:
-                self.stop_client(leaf, arm)
-            if not self.dry:
-                time.sleep(cfg.gap)
 
     def collect(self, tagp: str, clients: List[Client]) -> None:
         """Fetch and delete this block's logs: small hosts have little disk."""
@@ -1413,8 +1319,9 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             # corrected rerun is not refused.
             self.release()
             raise
-        plan = {"config": {k: v for k, v in cfg.__dict__.items() if k not in ("gateway", "clients", "arms", "production", "dc")},
-                "workload": cfg.workload, "paths": cfg.paths(), "dc": cfg.dc.__dict__ if cfg.dc else None,
+        plan = {"config": {k: v for k, v in cfg.__dict__.items() if k not in ("gateway", "clients", "arms", "production", "dc", "wl")},
+                "workload": cfg.workload, "analyzer": cfg.wl.analyzer, "paths": cfg.paths(),
+                "dc": cfg.dc.__dict__ if cfg.dc else None,
                 "arms": manifest, "schedule": [s.__dict__ for s in slots], "main": cfg.main.name,
                 "clients": {c.name: {"small": c.small, "platform": c.platform} for c in cfg.clients.values()}}
         if not self.dry:

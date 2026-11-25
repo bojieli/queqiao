@@ -433,6 +433,62 @@ one release. Its gate is Gate 1 run on the release candidate:
 The flip passes only if every path and workload is PASS. INCOMPLETE is not
 PASS.
 
+## Adding a workload
+
+A workload is a generator, an endpoint and a metrics extractor that travel
+together, registered by name in `scripts/ab_workloads.py`. The built-ins are
+`bulk`, `single`, `interactive` and `dc`. A new workload is a module under
+`scripts/workloads/`, imported automatically, that defines four things:
+
+- **Generators.** `generator(name, Generator(script, parse, expected))`.
+  - `script(campaign, job, arm, duration, start_at)` returns the shell a
+    client host runs through the arm's SOCKS5 client. It reaches its own
+    `job.client.socks_port_base + arm.index`.
+  - `parse(output, job, duration)` returns rows of
+    `(flow, http, bytes, seconds, curl_exit, t_start, t_end)`, with
+    millisecond times, for `trials.tsv`.
+  - `expected(job)` is the size of a complete transfer.
+- **A `Workload` subclass under `@register`.**
+  - `phases(cfg, path)` returns the phases of one trial. Each `Phase` lists
+    `Job`s: a generator on a client. A load job (`load=True`) runs for the
+    window. Any other job measures under that load and stops when it ends.
+    `barrier=True` starts the jobs on a shared remote clock.
+  - `configure(cfg, cp)` reads the workload's own `[workload:<name>]`
+    section; `self.params(cp)` returns it.
+  - `positive(cfg)` lists the values that must be positive.
+  - `objects(cfg)` lists the files the HTTP origin serves.
+  - `paths(cfg)` and `clients_for(cfg, path)` choose which clients make a
+    path.
+  - `primary = False` marks a workload that has no byte outcome for the
+    0.90 gate.
+- **Endpoints.** `endpoints(cfg)` returns the services it needs on the
+  gateway host's loopback, each an `Endpoint` with a command run from the
+  work directory and its TCP and UDP ports. The preflight reserves those
+  ports like any other, setup starts the service, and teardown stops it.
+  Files listed in `files` are copied into the work directory first.
+- **Metrics.** `extract(trial, plan)` returns the trial's measures as
+  `"<phase>.<metric>"`. The analyzer judges each one against a rule in
+  `gates.ini`, section `[workload:<name>]`, written as
+  `phase.metric = rule value`. Each rule is a per-block contrast that must
+  be positive at the one-sided 95% level by both the t and the bootstrap
+  bound:
+
+  | Rule | Contrast | For |
+  |---|---|---|
+  | `atleast R` | `cand − R × main` | throughput |
+  | `atmost R` | `R × main − cand` | latency |
+  | `higher M` | `cand − (main − M)` | a rate near 1, such as completion |
+  | `lower M` | `(main + M) − cand` | a rate or latency near 0 |
+
+  Every measure the workload reports must have a rule, and every rule must
+  have evidence in every judged block. Otherwise the verdict is INCOMPLETE.
+  A workload with no rules is never PASS. Mark new bounds provisional
+  until a stage confirms them.
+
+`workload = <name>` in the campaign config selects it. Flags the workload
+sets on both ends (`owned_flags`, such as `dc`'s `--path-profile`) may not
+be set in the config.
+
 ## Tests
 
 ```sh

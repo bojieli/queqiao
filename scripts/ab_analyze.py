@@ -28,10 +28,11 @@ import math
 import os
 import re
 import sys
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
+import ab_workloads  # noqa: E402
 
 GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "gates.ini")
 CLK_TCK = 100  # ticks per second in the runner's CPU samples
@@ -62,12 +63,37 @@ def load_gates(path: str = GATES) -> dict:
             if better not in ("higher", "lower"):
                 raise SystemExit(f"gates: {k}: direction must be higher or lower")
             sec[k] = (better, float(margin))
-    return {"ratio": p.getfloat("ratio"), "alpha": p.getfloat("alpha"),
+    workloads: Dict[str, Dict[str, Tuple[str, float]]] = {}
+    for section in cp.sections():
+        if section.startswith("workload:"):
+            rules = {}
+            for k, v in cp[section].items():
+                parts = v.split()
+                if len(parts) != 2 or parts[0] not in RULES:
+                    raise SystemExit(f"gates: [{section}] {k}: want one of {', '.join(RULES)} and a number")
+                rules[k] = (parts[0], float(parts[1]))
+            workloads[section.split(":", 1)[1]] = rules
+    return {"ratio": p.getfloat("ratio"), "alpha": p.getfloat("alpha"), "workloads": workloads,
             "resamples": p.getint("bootstrap_resamples"), "seed": p.getint("bootstrap_seed"),
             "max_zero_main_fraction": p.getfloat("max_zero_main_fraction"),
             "secondary_min_coverage": p.getfloat("secondary_min_coverage", fallback=1.0),
             "pilot_blocks": w.getint("pilot_blocks"), "power": w.getfloat("power"),
             "true_ratio": w.getfloat("true_ratio"), "secondary": sec}
+
+
+# Per-workload rules ([workload:<name>] in gates.ini): each is a per-block
+# contrast d(cand, main) that must be positive at the one-sided (1 - alpha)
+# level by both the t and the bootstrap lower bound.
+RULES: Dict[str, Callable[[float, float, float], float]] = {
+    "atleast": lambda c, m, v: c - v * m,      # throughput: cand >= v x main
+    "atmost": lambda c, m, v: v * m - c,       # latency: cand <= v x main
+    "higher": lambda c, m, v: c - (m - v),     # a rate near 1: cand >= main - v
+    "lower": lambda c, m, v: (m + v) - c,      # a rate near 0, or a latency near 0: cand <= main + v
+}
+
+
+def rule_contrasts(kind: str, value: float, cand: Sequence[float], main: Sequence[float]) -> List[float]:
+    return [RULES[kind](c, m, value) for c, m in zip(cand, main)]
 
 
 def opener(p: str):
@@ -557,13 +583,19 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
     EFFECTIVE.clear()
     problems, trials = completeness(campaign, plan, trials)
     method = measure(campaign, plan, trials)
+    wl = ab_workloads.get(plan.get("workload", "bulk"))
+    for t in trials.values():
+        t.m.update(wl.extract(t, plan))
+    rules = gates.get("workloads", {}).get(wl.name, {})
     main = plan["main"]
     arms = [main] + [a for a in plan["arms"] if a != main]
     paths = plan["paths"]
     # The interactive probe runs only in the interactive workload; elsewhere
     # that secondary is not applicable rather than unmeasured.
+    # The [secondary] bounds go with the byte outcome; a workload without one
+    # is judged by its own rules only.
     secondary = {k: v for k, v in gates["secondary"].items()
-                 if not (k == "interactive_p99_s" and plan.get("workload") != "interactive")}
+                 if wl.primary and not (k == "interactive_p99_s" and plan.get("workload") != "interactive")}
     out: List[str] = []
     verdicts: dict = {}
     def sha(a: str) -> str:
@@ -616,11 +648,16 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
         if any(t.m.get("interactive_p99_s") == t.m.get("interactive_p99_s") for a in arms for t in pts[a]):
             row("interactive p99, s (median)", [fmt(med(a, "interactive_p99_s"), ".3f") for a in arms])
 
-        out += ["", f"**Primary gate (section 15.4), {path}**", "",
-                "| candidate | blocks | ratio of means | mean contrast, MB | t lower bound, MB | bootstrap lower bound, MB | main zero blocks | verdict |",
-                "|---|---:|---:|---:|---:|---:|---:|---|"]
         judged: Dict[str, int] = {}
-        for cand in arms[1:]:
+        if wl.primary:
+            out += ["", f"**Primary gate (section 15.4), {path}**", "",
+                    "| candidate | blocks | ratio of means | mean contrast, MB | t lower bound, MB | bootstrap lower bound, MB | main zero blocks | verdict |",
+                    "|---|---:|---:|---:|---:|---:|---:|---|"]
+        for cand in arms[1:] if not wl.primary else ():
+            _, _, common = paired(trials, path, main, cand, block_outcome)
+            judged[cand] = len(common)
+            verdicts[(path, cand, "primary")] = "INCOMPLETE" if problems else "n/a"
+        for cand in arms[1:] if wl.primary else ():
             c, m, common = paired(trials, path, main, cand, block_outcome)
             g = st.gate(c, m, ratio=gates["ratio"], alpha=gates["alpha"], resamples=gates["resamples"],
                         seed=gates["seed"], max_zero_main_fraction=gates["max_zero_main_fraction"])
@@ -660,14 +697,29 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
                     verdicts[(path, cand, key)] = verdict
                     out.append(f"| {SECONDARY_LABELS.get(key, key)} | {cand} | {n} | {fmt(mdiff, '.4g')} | "
                                f"{'upper' if upper else 'lower'} {fmt(bound, '.4g')} | {'+' if upper else '-'}{margin:g} | {verdict} |")
+        if rules:
+            out += ["", f"**{wl.name} rules (pre-registered in gates.ini [workload:{wl.name}]), {path}**", "",
+                    "| measure | rule | candidate | blocks | mean contrast | t lower bound | bootstrap lower bound | verdict |",
+                    "|---|---|---|---:|---:|---:|---:|---|"]
+            for key, (kind, value) in rules.items():
+                for cand in arms[1:]:
+                    c, m, common = paired(trials, path, main, cand, lambda ts_, k=key: block_metric(ts_, k))
+                    d = [x for x in rule_contrasts(kind, value, c, m) if x == x]
+                    mean_d, tl, bl, ok = st.lower_bounds(d, gates["alpha"], gates["resamples"], gates["seed"])
+                    need = math.ceil(gates["secondary_min_coverage"] * judged.get(cand, len(common)) - 1e-9)
+                    verdict = "n/a" if len(d) < max(need, 2) else ("pass" if ok else "**FAIL**")
+                    verdicts[(path, cand, f"rule:{key}")] = verdict
+                    out.append(f"| {key} | {kind} {value:g} | {cand} | {len(d)} | {fmt(mean_d, '.4g')} | {fmt(tl, '.4g')} | "
+                               f"{fmt(bl, '.4g')} | {verdict} |")
         for cand in arms[1:]:
             prim = verdicts[(path, cand, "primary")]
-            sv = [verdicts[(path, cand, k)] for k in secondary]
+            sv = [verdicts[(path, cand, k)] for k in secondary] + [verdicts[(path, cand, f"rule:{k}")] for k in rules]
             fails, missing = sv.count("**FAIL**"), sv.count("n/a")
+            prim_ok = prim == "**PASS**" or (prim == "n/a" and not wl.primary)
             overall = ("INCOMPLETE" if problems or prim == "INCOMPLETE" else
                        "VOID" if prim == "VOID" else
-                       "FAIL" if prim != "**PASS**" or fails else
-                       "INCOMPLETE" if missing else "PASS")
+                       "FAIL" if not prim_ok or fails else
+                       "INCOMPLETE" if missing or not sv and not wl.primary else "PASS")
             verdicts[(path, cand, "overall")] = overall
             out += ["", f"**{cand} on {path}: {overall}** (primary {prim.strip('*').lower()}; secondaries "
                     f"{len(sv) - fails - missing} pass, {fails} fail, {missing} not measured"

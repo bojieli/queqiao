@@ -10,11 +10,10 @@ import unittest
 
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
-SPEC = importlib.util.spec_from_file_location("dc_gate", HERE / "dc_gate.py")
-dc = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-sys.modules["dc_gate"] = dc
-SPEC.loader.exec_module(dc)
+# Import by name from scripts/, so every test module shares one copy (the
+# workload registry and the exception classes live in these modules).
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+dc = importlib.import_module("dc_gate")
 
 COLUMNS = ("block", "path", "slot", "arm", "role", "arm_trial", "cold", "phase", "job", "client", "kind", "flow",
            "start_utc", "end_utc", "http", "bytes", "seconds", "curl_exit", "complete", "wall", "t_start", "t_end")

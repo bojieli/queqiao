@@ -6,11 +6,10 @@ import sys
 import unittest
 
 SCRIPT = pathlib.Path(__file__).with_name("ab_stats.py")
-SPEC = importlib.util.spec_from_file_location("ab_stats", SCRIPT)
-st = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-sys.modules["ab_stats"] = st  # dataclasses resolve annotations through sys.modules
-SPEC.loader.exec_module(st)
+# Import by name from scripts/, so every test module shares one copy (the
+# workload registry and the exception classes live in these modules).
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+st = importlib.import_module("ab_stats")
 
 
 class Quantiles(unittest.TestCase):

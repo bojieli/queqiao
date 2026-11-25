@@ -11,11 +11,10 @@ import unittest
 
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
-SPEC = importlib.util.spec_from_file_location("ab_analyze", HERE / "ab_analyze.py")
-an = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-sys.modules["ab_analyze"] = an
-SPEC.loader.exec_module(an)
+# Import by name from scripts/, so every test module shares one copy (the
+# workload registry and the exception classes live in these modules).
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+an = importlib.import_module("ab_analyze")
 
 COLUMNS = ("block", "path", "slot", "arm", "role", "arm_trial", "cold", "phase", "job", "client", "kind", "flow",
            "start_utc", "end_utc", "http", "bytes", "seconds", "curl_exit", "complete", "wall", "t_start", "t_end")

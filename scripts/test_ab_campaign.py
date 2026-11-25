@@ -13,11 +13,10 @@ import unittest
 from unittest import mock
 
 HERE = pathlib.Path(__file__).parent
-SPEC = importlib.util.spec_from_file_location("ab_campaign", HERE / "ab_campaign.py")
-ab = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-sys.modules["ab_campaign"] = ab
-SPEC.loader.exec_module(ab)
+# Import by name from scripts/, so every test module shares one copy (the
+# workload registry and the exception classes live in these modules).
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+ab = importlib.import_module("ab_campaign")
 
 EXAMPLE = HERE / "validation" / "campaign.example.ini"
 DC_EXAMPLE = HERE / "validation" / "dc-campaign.example.ini"
@@ -244,7 +243,7 @@ class Config(unittest.TestCase):
 
     def test_dc_profile_cannot_be_overridden(self):
         text = DC_EXAMPLE.read_text().replace("flags = --cc-api=v2 --sched=class", "flags = --path-profile=wan-shared-bottleneck --cc-api=v2 --sched=class")
-        self.assertRejected(text, "dc-long-haul on both ends")
+        self.assertRejected(text, "workload dc sets --path-profile on both ends")
 
     def test_prebuilt_binaries_must_cover_every_platform(self):
         text = BASE + "[client:mac]\nhost = gw\nplatform = darwin/arm64\nsocks_port_base = 24581\nmetrics_port_base = 24591\n"
