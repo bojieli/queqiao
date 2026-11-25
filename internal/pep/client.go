@@ -2047,7 +2047,7 @@ func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID
 	if kind != TransportQUIC && kind != TransportTCP {
 		return nil, fmt.Errorf("unsupported join transport %q", kind)
 	}
-	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, kind)
+	c.carrierShadow.noteJoinAttempt(ctx, sessionID, flowID, laneID, kind)
 	if kind == TransportQUIC && c.cfg.EnableQUICPool {
 		if lane, poolErr := c.openPooledJoinLane(ctx, sessionID, flowID, laneID); poolErr == nil {
 			return lane, nil
@@ -2070,7 +2070,7 @@ func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID
 // controller, while this pool is the multiplexed control failure domain being
 // rebuilt.
 func (c *Client) openControlPoolJoinLane(ctx context.Context, sessionID [16]byte, flowID, laneID uint64) (*mpLane, error) {
-	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, TransportQUIC)
+	c.carrierShadow.noteJoinAttempt(ctx, sessionID, flowID, laneID, TransportQUIC)
 	lane, err := c.dialLaneMode(ctx, TransportQUIC, sessionID, laneID, true)
 	if err != nil {
 		return nil, err
@@ -2569,7 +2569,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 			if now.Before(nextStallRescue) {
 				continue
 			}
-			if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
+			if err := c.runRescueRound(withShadowRescueTrigger(manageCtx, shadowRescueStall), flow, sessionID, flowID); err != nil {
 				if manageCtx.Err() != nil || flow.doneChanClosed() {
 					return
 				}
@@ -2680,7 +2680,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				recoveryAttempts++
 				lastRecoveryAttempt = now
 				attempt := flow.noteReplacementAttempt()
-				if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
+				if err := c.runRescueRound(withShadowRescueTrigger(manageCtx, shadowRescueOutage), flow, sessionID, flowID); err != nil {
 					err = classifyUnconfirmedRefusal(flow, err)
 					flow.noteReplacementFailure(err)
 					// The flow this belongs to is the whole point of the
@@ -2856,13 +2856,21 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 		}
 		var attempt uint64
 		if replacement {
-			attempt = flow.noteReplacementAttempt()
+			// The manager's select can take a tick that arrived with the
+			// flow's end, and a replacement dialled then reached the gateway
+			// after the completion record had been written without it.
+			var ok bool
+			if attempt, ok = flow.beginReplacementAttempt(); !ok {
+				return false
+			}
 		}
 		pending++
 		go func() {
 			joinCtx := manageCtx
 			if stall != nil {
 				joinCtx = context.WithValue(joinCtx, laneReplacementContextKey{}, *stall)
+				// A stall-driven bundle join is this manager's rescue round.
+				joinCtx = flow.carrierShadow.noteRescue(withShadowRescueTrigger(joinCtx, shadowRescueStall), flow)
 			}
 			lane, joinErr := c.openJoinLane(joinCtx, TransportTCP, sessionID, flowID, laneID)
 			select {
@@ -3120,7 +3128,7 @@ func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessio
 		ctx = context.WithValue(ctx, laneReplacementContextKey{}, *hint)
 	}
 	flow.rescueInFlight.Store(true)
-	flow.carrierShadow.noteRescue(flow)
+	ctx = flow.carrierShadow.noteRescue(ctx, flow)
 	err := c.openParallelRescue(ctx, flow, sessionID, flowID)
 	flow.rescueInFlight.Store(false)
 	// The capacity streak is kept per round rather than per attempt: a round
@@ -3323,7 +3331,7 @@ func (c *Client) openSprayedQUICRescueJoin(ctx context.Context, flow *multipathF
 	if err != nil {
 		return nil, err
 	}
-	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, TransportQUIC)
+	c.carrierShadow.noteJoinAttempt(ctx, sessionID, flowID, laneID, TransportQUIC)
 	lane, err := c.dialJoinLane(ctx, TransportQUIC, sessionID, laneID)
 	if err != nil {
 		return nil, err

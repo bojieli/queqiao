@@ -343,6 +343,13 @@ func countingSink(t *testing.T) string {
 // checks that the rescue keeps the flow on its version: a version-2 flow
 // rescues with REPLACE_LANE, a version-1 flow with the plain JOIN a v0.12
 // gateway understands, and the dual gateway admits both.
+// stallRescueProgressBound is how long a stall-rescue transfer may make no
+// progress at all. The rescue is what is being tested, not the transfer's
+// speed: one 60 s deadline over the whole 24 MiB failed a macOS Intel runner
+// with 99% of an upload delivered (issue #187). A rescue that never comes
+// still fails here, at the first chunk that waits this long.
+const stallRescueProgressBound = 30 * time.Second
+
 func TestStallRescueAcrossWireVersions(t *testing.T) {
 	const size = 24 << 20
 	for _, carrier := range []TransportKind{TransportQUIC, TransportTCP} {
@@ -419,11 +426,11 @@ func TestStallRescueAcrossWireVersions(t *testing.T) {
 				if carrier == TransportQUIC {
 					conn := dialTestSOCKS(t, clientListener.Addr().String(), streamDestination(t, size))
 					defer conn.Close()
-					_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 					received := 0
 					buf := make([]byte, 64*1024)
 					frozen := false
 					for {
+						_ = conn.SetDeadline(time.Now().Add(stallRescueProgressBound))
 						n, err := conn.Read(buf)
 						received += n
 						if !frozen && received >= 2<<20 {
@@ -443,12 +450,12 @@ func TestStallRescueAcrossWireVersions(t *testing.T) {
 				} else {
 					conn := dialTestSOCKS(t, clientListener.Addr().String(), countingSink(t))
 					defer conn.Close()
-					_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 					chunk := make([]byte, 64*1024)
 					for sent := 0; sent < size; sent += len(chunk) {
 						if sent >= 2<<20 && sent < 2<<20+len(chunk) {
 							relay.freeze()
 						}
+						_ = conn.SetDeadline(time.Now().Add(stallRescueProgressBound))
 						if _, err := conn.Write(chunk); err != nil {
 							t.Fatalf("upload stopped at %d of %d bytes: %v", sent, size, err)
 						}
@@ -457,6 +464,7 @@ func TestStallRescueAcrossWireVersions(t *testing.T) {
 						t.Fatal(err)
 					}
 					var count [8]byte
+					_ = conn.SetDeadline(time.Now().Add(stallRescueProgressBound))
 					if _, err := io.ReadFull(conn, count[:]); err != nil {
 						t.Fatalf("upload not confirmed: %v", err)
 					}

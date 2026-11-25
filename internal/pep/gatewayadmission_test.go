@@ -340,6 +340,13 @@ func TestAFullGatewayAdmitsTheJoinAndProbeThatRecoverItsFlows(t *testing.T) {
 
 			// The victim's lane fails; the flow enters its replacement grace.
 			_ = victim.outer.Close()
+			// The JOIN below travels on another connection, so nothing orders
+			// it after the gateway reads the end of this lane. Arriving first,
+			// it finds the flow still at its lane ceiling and is told "lane
+			// unavailable", which a client retries; this case is about the
+			// JOIN that follows the failure, so it waits until the gateway
+			// has seen it.
+			waitForLaneLoss(ctx, t, server, victim.sessionID)
 
 			standby, err := dialRawCarrier(ctx, t, tc.carrier, remote, clientCredentials, tc.wire)
 			if err != nil {
@@ -397,6 +404,36 @@ func TestAFullGatewayAdmitsTheJoinAndProbeThatRecoverItsFlows(t *testing.T) {
 				t.Fatalf("owned admission closed the OPEN without an answer: %v", err)
 			}
 		})
+	}
+}
+
+// waitForLaneLoss waits until the gateway holds no open lane for a flow,
+// which is when it has seen the flow's only lane end.
+func waitForLaneLoss(ctx context.Context, t *testing.T, server *Server, sessionID [16]byte) {
+	t.Helper()
+	server.sessionsMu.RLock()
+	held := server.sessions[sessionID]
+	server.sessionsMu.RUnlock()
+	if held == nil {
+		t.Fatalf("gateway holds no session %x", sessionID)
+	}
+	for {
+		open := 0
+		held.flow.lanesMu.RLock()
+		for _, lane := range held.flow.lanes {
+			if !lane.closed.Load() {
+				open++
+			}
+		}
+		held.flow.lanesMu.RUnlock()
+		if open == 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("gateway still holds %d open lanes for the failed flow: %v", open, ctx.Err())
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }
 
