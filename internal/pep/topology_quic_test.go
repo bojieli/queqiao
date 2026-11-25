@@ -212,7 +212,13 @@ func burstStream(ctx context.Context, conn *quic.Conn, index uint32, size int, c
 	_ = stream.Close()
 }
 
-// messageStream is an LLM response: one 180-byte delta every 25 ms (W5),
+// messageDeltas is how many deltas a message stream sends: three seconds
+// worth, so in a four-second run every one is due at least a second before
+// the run ends.
+const messageDeltas = 120
+
+// messageStream is an LLM response: messageDeltas 180-byte deltas, one every
+// 25 ms (W5),
 // each stamped with the sender's clock, at the given class: INTERACTIVE
 // under classifier=phased, BULK where the legacy classifier latched the flow
 // (docs/AUDIT-CLASSIFIER-WORKLOADS.md F1).
@@ -221,7 +227,10 @@ func messageStream(ctx context.Context, conn *quic.Conn, index uint32, class qui
 	if err != nil {
 		return
 	}
-	defer stream.CancelWrite(0)
+	// Cancelling discards unsent bytes: only an abandoned run cancels; a
+	// finished one closes, so its last delta is delivered.
+	stop := context.AfterFunc(ctx, func() { stream.CancelWrite(0) })
+	defer stop()
 	if _, err := stream.WriteClass(streamHeader(streamKindMessage, index), quiccongestion.ClassControl); err != nil {
 		return
 	}
@@ -230,7 +239,7 @@ func messageStream(ctx context.Context, conn *quic.Conn, index uint32, class qui
 	// write that blocks shows up as lateness of every delta behind it.
 	start := time.Now()
 	var msg [messageSize]byte
-	for i := 1; ; i++ {
+	for i := 1; i <= messageDeltas; i++ {
 		due := start.Add(time.Duration(i) * 25 * time.Millisecond)
 		select {
 		case <-ctx.Done():
@@ -242,6 +251,7 @@ func messageStream(ctx context.Context, conn *quic.Conn, index uint32, class qui
 			return
 		}
 	}
+	_ = stream.Close()
 }
 
 func (b *streamBed) bulkTotals(n int) (total float64, per []float64) {
@@ -397,8 +407,10 @@ func TestNoStreamStarvesOnOneConnection(t *testing.T) {
 			var all []time.Duration
 			for i := range messageStreams {
 				samples := bed.lateness[uint32(i)]
-				if len(samples) < 60 {
-					t.Errorf("message stream %d delivered %d deltas in %v; starved", i, len(samples), run)
+				// Every delta is due a second before the run ends; one that
+				// has not arrived by then is a stalled tail.
+				if len(samples) != messageDeltas {
+					t.Errorf("message stream %d delivered %d of %d deltas within a second of their due time; starved", i, len(samples), messageDeltas)
 				}
 				all = append(all, samples...)
 			}

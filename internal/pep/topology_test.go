@@ -400,8 +400,6 @@ func TestSingleTopologyKeepsConcurrentBulkFlowsOnOneConnection(t *testing.T) {
 				CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath, Classifier: ClassifierPhased,
 			}, cfg)
 			maxAttached := 0
-			started := time.Now()
-			defer func() { t.Logf("downloads took %v", time.Since(started)) }()
 			if err := rig.download(4, func() {
 				deadline := time.Now().Add(2500 * time.Millisecond)
 				for time.Now().Before(deadline) {
@@ -584,6 +582,12 @@ func TestSingleTopologyStaysInsideTheIOSMemoryProfile(t *testing.T) {
 				// connection would have added.
 				t.Fatalf("iOS single-connection windows %+v", w)
 			}
+			// The baseline is taken before the idle flows open, so their
+			// setup counts toward each arm's growth.
+			runtime.GC()
+			var before runtime.MemStats
+			runtime.ReadMemStats(&before)
+			var peak uint64
 			idleListener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -599,10 +603,11 @@ func TestSingleTopologyStaysInsideTheIOSMemoryProfile(t *testing.T) {
 			for range cap(idle) {
 				idle = append(idle, dialTestSOCKS(t, rig.clientAddr, idleListener.Addr().String()))
 			}
-			runtime.GC()
-			var before runtime.MemStats
-			runtime.ReadMemStats(&before)
-			var peak uint64
+			{
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+				peak = m.HeapInuse
+			}
 			maxAttached := 0
 			if err := rig.download(4, func() {
 				deadline := time.Now().Add(3 * time.Second)

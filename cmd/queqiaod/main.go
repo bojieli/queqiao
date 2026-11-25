@@ -663,7 +663,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.IntVar(&opts.maxPendingOpens, "max-pending-opens", 256, "concurrent remote flow opens")
 		fs.BoolVar(&opts.quicPool, "quic-pool", true, "reuse a persistent QUIC connection")
 		fs.StringVar(&opts.topology, "topology", string(pep.TopologyIsolated), "placement of flows on QUIC connections: isolated (a bulk flow sharing the pooled connection moves to a connection of its own), or single (every flow is a stream on one connection per path; requires --congestion-scope=path and --quic-pool)")
-		fs.IntVar(&opts.topologyFanOut, "topology-fanout", 0, "explicit fan-out under --topology=single: at most this many connections per path, the extra ones carrying bulk flows that share the preferred connection (0 or 1 = off)")
+		fs.IntVar(&opts.topologyFanOut, "topology-fanout", 0, "explicit fan-out under --topology=single: bulk flows that share the preferred connection may be placed on up to N-1 extra connections per path (0 or 1 = off); rescue dials and handover generations are not counted")
 		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this client runs in: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.StringVar(&opts.flowMetadataSocket, "flow-metadata-socket", "", "local capture agent socket to ask what produced each flow, so its class is known before it carries anything; empty disables the lookup")
 		fs.Var(&opts.classHints, "class-hint", "declare the class a flow starts in from what produced it, as <match>=<interactive|bulk>; repeatable, first match wins, and it does nothing without --flow-metadata-socket")
