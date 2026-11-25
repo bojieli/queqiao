@@ -2,7 +2,6 @@ package pep
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net"
 	"testing"
@@ -614,7 +613,7 @@ func TestSendBacklogCountsSelectiveCoverageAndDips(t *testing.T) {
 	if _, err := f.acknowledgeCoverage(0, false, [][2]uint64{{16 << 10, 400 << 10}}); err != nil {
 		t.Fatal(err)
 	}
-	backlog, drained := f.ackSample(f.bytesUp.Load())
+	backlog, drained := f.ackSample()
 	if backlog != 16<<10 {
 		t.Fatalf("backlog %d with one 16 KiB gap, want %d", backlog, 16<<10)
 	}
@@ -691,11 +690,14 @@ func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
 		want            uint64
 	}{
 		{"default", base, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 64 << 10},
-		{"48 KiB send bound", base, small, defaultChunkSize, defaultChunkSize, false, 8 << 10},
+		{"48 KiB send bound, legacy: the last 32 KiB read overshoots to 64 KiB", base, small, defaultChunkSize, defaultChunkSize, false, 16 << 10},
+		{"48 KiB send bound, mem=owned: clamped", base, small, defaultChunkSize, defaultChunkSize, true, 8 << 10},
+		{"32 KiB + 1 send bound, legacy", base, flowMemoryLimits{maxSendBytes: 32<<10 + 1, maxOutstanding: 16384}, 32 << 10, 32 << 10, false, 16 << 10},
 		{"two 16 KiB chunks", base, twoChunks, 16 << 10, 16 << 10, false, 8 << 10},
 		{"eight slots of 1 KiB staged reads", base, eightSlots, 32 << 10, stagingBytes, false, 3584},
 		{"ios, legacy memory", base, ios, iosChunkSize, iosChunkSize, false, 64 << 10},
 		{"ios, mem=owned at the autotune floor", base, ios, iosChunkSize, iosChunkSize, true, 24 << 10},
+		{"ios, mem=owned, staged reads", base, ios, iosChunkSize, stagingBytes, true, 32256},
 		{"a profile's lower threshold is kept", 16 << 10, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 16 << 10},
 	} {
 		if got := backlogThresholdFor(c.base, c.limits, c.chunk, c.readSize, c.memOwned); got != c.want {
@@ -705,8 +707,8 @@ func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
 }
 
 // fitBacklogThreshold starts from the profile's threshold, and sizes reads
-// to the staging buffer when the scheduler stages them and the connection
-// cannot take the read deadline that would extend them.
+// to the staging buffer for a flow with shared send memory, whose reads are
+// extended only when the shared budget and the connection allow.
 func TestFitBacklogThresholdUsesTheProfileAndTheReadPath(t *testing.T) {
 	cfg := phasedClassifierConfig(profile.Default().Classifier, ClassifierPhased)
 	cfg.BulkBacklogBytes = 16 << 10
@@ -722,7 +724,7 @@ func TestFitBacklogThresholdUsesTheProfileAndTheReadPath(t *testing.T) {
 
 	limits := defaultFlowMemoryLimits()
 	limits.maxSendBytes, limits.maxOutstanding = 1<<20, 8
-	staged := newMultipathFlowWithMemory(context.Background(), noDeadlineConn{inner}, [16]byte{1}, 2, 32<<10,
+	staged := newMultipathFlowWithMemory(context.Background(), inner, [16]byte{1}, 2, 32<<10,
 		protocol.FlagAckDown, protocol.FlagAckUp, nil, nil, nil, limits, memlimit.New(1<<20), nil,
 		phasedClassifierConfig(profile.Default().Classifier, ClassifierPhased))
 	staged.fitBacklogThreshold()
@@ -731,10 +733,31 @@ func TestFitBacklogThresholdUsesTheProfileAndTheReadPath(t *testing.T) {
 	}
 }
 
-// noDeadlineConn is a connection that cannot take read deadlines.
-type noDeadlineConn struct{ net.Conn }
-
-func (noDeadlineConn) SetReadDeadline(time.Time) error { return errors.New("no deadlines") }
+// An acknowledgement that lands just after an observation counted a refill
+// is judged against the refill: with one chunk still outstanding it is not a
+// drain.
+func TestAnAckAfterARefillIsNotADrain(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	f.chunkSize = 16 << 10
+	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 2
+	f.fitBacklogThreshold()
+	f.observeCarried(16<<10, true) // one chunk outstanding
+	f.replayMu.Lock()
+	f.highestSent = 32 << 10
+	f.replayMu.Unlock()
+	f.afterAckSampleHook = func() {
+		f.afterAckSampleHook = nil
+		// The first chunk is acknowledged once the refill has been counted.
+		if _, err := f.acknowledgeCoverage(16<<10, false, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.observeCarried(16<<10, true) // the refill
+	if backlog, drained := f.ackSample(); drained || backlog != 16<<10 {
+		t.Fatalf("after an ACK of one of two chunks: backlog %d, drained %v; want 16 KiB and no drain", backlog, drained)
+	}
+}
 
 // A flow limited by chunk count -- two 16 KiB chunks, so at most 32 KiB read
 // ahead -- that left BULK and then transfers without a break goes back into

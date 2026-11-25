@@ -2,7 +2,6 @@ package pep
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/bojieli/queqiao/internal/classifier"
 	"github.com/bojieli/queqiao/internal/profile"
@@ -113,7 +112,9 @@ const sparseAllowanceBytes = smallExchangeBytes
 //   - the chunk count (maxOutstanding). A backlogged source fills each read,
 //     so this holds maxOutstanding x readSize bytes, where readSize is a
 //     whole chunk, or only the staging buffer when the scheduler stages
-//     reads and the source cannot do the fill that would extend them;
+//     reads: a staged read is extended only if the connection takes a read
+//     deadline and the shared send memory has a whole chunk free, and under
+//     contention neither is promised;
 //   - under mem=owned, the autotuned retention bound, which can sit at its
 //     startup floor of stripe.DefaultAutotuneStartupChunks chunks.
 //
@@ -131,6 +132,13 @@ func backlogThresholdFor(base uint64, limits flowMemoryLimits, chunkSize, readSi
 		readSize = chunkSize
 	}
 	capacity := limits.maxSendBytes
+	if !memOwned && readSize > 0 && capacity > 0 {
+		// The legacy scheduler admits a whole read whenever retained bytes
+		// are under the limit, so the last read can overshoot it: it holds
+		// the limit rounded up to whole reads. The owned scheduler clamps
+		// its last read to the bound.
+		capacity = (capacity + readSize - 1) / readSize * readSize
+	}
 	if readSize > 0 && limits.maxOutstanding > 0 {
 		capacity = minPositive(capacity, limits.maxOutstanding*readSize)
 	}
@@ -168,21 +176,12 @@ func (f *multipathFlow) fitBacklogThreshold() {
 		return
 	}
 	readSize := f.chunkSize
-	if f.sendMemory != nil && !f.innerTakesReadDeadlines() {
-		// The scheduler stages each read in stagingBytes and cannot extend
-		// it, so a backlogged source still arrives one staging buffer at a
-		// time.
+	if f.sendMemory != nil {
+		// The scheduler stages each read in stagingBytes and extends it only
+		// when it can; size for the reads a contended flow is left with.
 		readSize = min(readSize, stagingBytes)
 	}
 	f.classifier.SetBacklogBytes(backlogThresholdFor(f.classifier.BacklogBytes(), f.memoryLimits, f.chunkSize, readSize, f.memOwned))
-}
-
-// innerTakesReadDeadlines reports whether the application connection
-// supports read deadlines, which is what flowSource.ReadAvailable needs to
-// fill a staged chunk. Clearing the deadline is harmless here: the send loop
-// sets one only around each fill.
-func (f *multipathFlow) innerTakesReadDeadlines() bool {
-	return f.inner != nil && f.inner.SetReadDeadline(time.Time{}) == nil
 }
 
 // phased reports whether this flow runs the phased classifier.
@@ -283,15 +282,38 @@ func (f *multipathFlow) noteAckedCoverage() {
 	}
 }
 
-// ackSample is the classifier's view of acknowledgements for one
-// observation: the send backlog against upBytes, and whether a drain was
-// published since the last sample, read and consumed together.
-func (f *multipathFlow) ackSample(upBytes uint64) (backlog uint64, drained bool) {
+// countAndSample is the classifier's view of one observation of n bytes in
+// direction up: the flow's byte totals including them (added to the totals
+// when publish is set), the send backlog against those totals, and whether a
+// drain was published since the last sample, all under ackMu, which the
+// acknowledgement path also holds when it records a drain.
+func (f *multipathFlow) countAndSample(n int, up, publish bool) (upBytes, downBytes, backlog uint64, drained bool) {
 	f.ackMu.Lock()
 	defer f.ackMu.Unlock()
+	if publish && n > 0 {
+		if up {
+			f.bytesUp.Add(countBytes(n))
+		} else {
+			f.bytesDown.Add(countBytes(n))
+		}
+	}
+	upBytes, downBytes = f.bytesUp.Load(), f.bytesDown.Load()
+	if !publish {
+		if up {
+			upBytes += countBytes(n)
+		} else {
+			downBytes += countBytes(n)
+		}
+	}
 	backlog = saturatingSub(upBytes, f.ackCovered)
 	drained = f.ackDrained
 	f.ackDrained = false
+	return upBytes, downBytes, backlog, drained
+}
+
+// ackSample is countAndSample for no new bytes.
+func (f *multipathFlow) ackSample() (backlog uint64, drained bool) {
+	_, _, backlog, drained = f.countAndSample(0, true, false)
 	return backlog, drained
 }
 

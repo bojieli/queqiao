@@ -447,9 +447,9 @@ type multipathFlow struct {
 	ackMu      sync.Mutex
 	ackCovered uint64
 	ackDrained bool
-	// ackSampleHook, when set by a test, runs just before an observation
-	// samples the acknowledgement state.
-	ackSampleHook func()
+	// ackSampleHook and afterAckSampleHook, when set by a test, run just
+	// before and just after an observation samples the acknowledgement state.
+	ackSampleHook, afterAckSampleHook func()
 	// classBytes counts DATA payload this endpoint sent, by class byte (new,
 	// interactive, bulk) and substrate (stream, coded).
 	classBytes [3][2]atomic.Uint64
@@ -3490,15 +3490,7 @@ func (f *multipathFlow) clockNow() time.Time {
 func (f *multipathFlow) observeCarried(n int, up bool) bool {
 	f.classifyMu.Lock()
 	defer f.classifyMu.Unlock()
-	bulk := f.observeLocked(n, up)
-	if n > 0 {
-		if up {
-			f.bytesUp.Add(uint64(n))
-		} else {
-			f.bytesDown.Add(uint64(n))
-		}
-	}
-	return bulk
+	return f.observeLocked(n, up, true)
 }
 
 // observe classifies the flow with n more bytes than its totals hold.
@@ -3511,10 +3503,15 @@ func (f *multipathFlow) observeCarried(n int, up bool) bool {
 func (f *multipathFlow) observe(n int, up bool) bool {
 	f.classifyMu.Lock()
 	defer f.classifyMu.Unlock()
-	return f.observeLocked(n, up)
+	return f.observeLocked(n, up, false)
 }
 
-func (f *multipathFlow) observeLocked(n int, up bool) bool {
+// observeLocked observes n bytes carried in direction up. With publish, it
+// also adds them to the flow's totals, in the same step as it samples the
+// acknowledgement state, so an acknowledgement is always judged against a
+// byte count that either includes this read or does not, never one the
+// observation has counted and the ACK path has not.
+func (f *multipathFlow) observeLocked(n int, up, publish bool) bool {
 	now := f.clockNow()
 	previousPayload := f.lastPayload.Load()
 	if n > 0 {
@@ -3525,18 +3522,14 @@ func (f *multipathFlow) observeLocked(n int, up bool) bool {
 	if age <= 0 {
 		age = time.Nanosecond
 	}
-	upBytes := f.bytesUp.Load()
-	downBytes := f.bytesDown.Load()
-	if up {
-		upBytes += uint64(n)
-	} else {
-		downBytes += uint64(n)
-	}
-	recentUp, recentDown := f.recentBytes(now, n, up)
 	if f.ackSampleHook != nil {
 		f.ackSampleHook()
 	}
-	sendBacklog, backlogDrained := f.ackSample(upBytes)
+	upBytes, downBytes, sendBacklog, backlogDrained := f.countAndSample(n, up, publish)
+	if f.afterAckSampleHook != nil {
+		f.afterAckSampleHook()
+	}
+	recentUp, recentDown := f.recentBytes(now, n, up)
 	obs := classifier.Observation{
 		BytesUp: upBytes, BytesDown: downBytes,
 		UpRate: float64(upBytes) / age.Seconds(), DownRate: float64(downBytes) / age.Seconds(),
