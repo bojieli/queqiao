@@ -159,6 +159,11 @@ type mpLane struct {
 	rateSampled time.Time
 	rateBytes   float64       // estimated send rate in bytes per second
 	rateRTT     time.Duration // smoothed round-trip time
+
+	// evictOnCommit is a lane a staged control replacement displaces at the
+	// lane ceiling (owned gateway admission). It is retired only when the
+	// replacement commits, after its OPEN_OK; a rolled-back JOIN leaves it.
+	evictOnCommit *mpLane
 }
 
 // laneRateCacheTTL is far below one long-haul RTT, so the scheduler still

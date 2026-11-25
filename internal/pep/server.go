@@ -147,6 +147,11 @@ type Server struct {
 	// frame reader, so the per-connection bound alone would let the total
 	// grow with the connection count.
 	firstFrames chan struct{}
+	// tombstones counts completed sessions kept in sessions for final-ACK
+	// replay (owned admission). They hold no session slot, so the owned
+	// count of live sessions leaves them out, and they have a bound of their
+	// own. Guarded by sessionsMu.
+	tombstones int
 }
 
 type serverFlow struct {
@@ -273,7 +278,14 @@ func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, repla
 			clear(retired)
 			return errLaneLimitReached
 		}
-		retired[victim.id] = victim
+		if s.retireControlOnJoin && lane.control && lane.staged {
+			// A control transfer displaces its victim only on commit, so an
+			// OPEN_OK that cannot be delivered leaves the table as it was.
+			// The staged lane is one over the ceiling until then.
+			lane.evictOnCommit = victim
+		} else {
+			retired[victim.id] = victim
+		}
 	}
 	for id, old := range retired {
 		delete(f.lanes, id)
@@ -302,11 +314,18 @@ func (s *serverFlow) commitControlTransfer(replacement *mpLane) {
 	if !s.retireControlOnJoin || !replacement.control {
 		return
 	}
+	// Also called for the eviction staged at the lane ceiling.
 	f := s.flow
 	s.mu.Lock()
 	f.lanesMu.Lock()
 	var retired []*mpLane
 	if f.lanes[replacement.id] == replacement && !replacement.closed.Load() {
+		if victim := replacement.evictOnCommit; victim != nil && f.lanes[victim.id] == victim && !victim.closed.Load() {
+			delete(f.lanes, victim.id)
+			victim.closed.Store(true)
+			retired = append(retired, victim)
+		}
+		replacement.evictOnCommit = nil
 		for id, old := range f.lanes {
 			if id == replacement.id || old.closed.Load() || !f.laneIsControl(old) {
 				continue
@@ -1306,9 +1325,28 @@ func (s *Server) watchFlowCompletion(ctx context.Context, sessionID [16]byte, se
 func (s *Server) retainCompletedSession(sessionID [16]byte, serverSession *serverFlow) {
 	serverSession.tombstone.Do(func() {
 		serverSession.completed.Store(true)
-		time.AfterFunc(completedSessionLinger, func() {
+		linger := completedSessionLinger
+		counted := false
+		if s.admissionOwned() {
+			// A completed flow gives its slot back at once; its replay
+			// record is bounded separately. Past that bound it is not kept.
+			s.sessionsMu.Lock()
+			if s.tombstones < s.cfg.MaxSessions {
+				s.tombstones++
+				counted = true
+			} else {
+				linger = 0
+			}
+			s.sessionsMu.Unlock()
+		}
+		time.AfterFunc(linger, func() {
 			s.cfg.Logger.Debug("session tombstone expired")
 			s.unregisterSession(sessionID, serverSession)
+			if counted {
+				s.sessionsMu.Lock()
+				s.tombstones--
+				s.sessionsMu.Unlock()
+			}
 		})
 	})
 }
@@ -1723,7 +1761,11 @@ func (s *Server) watchAuthorization(ctx context.Context, flow *serverFlow) {
 func (s *Server) registerSession(id [16]byte, flow *serverFlow) bool {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
-	if len(s.sessions) >= s.cfg.MaxSessions {
+	live := len(s.sessions)
+	if s.admissionOwned() {
+		live -= s.tombstones
+	}
+	if live >= s.cfg.MaxSessions {
 		return false
 	}
 	if _, exists := s.sessions[id]; exists {

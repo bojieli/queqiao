@@ -406,6 +406,10 @@ func (s *udpRelayStore) endLive(token [session.UDPResumeTokenSize]byte, entry *l
 	var kept *flowLease
 	if entry.confirmed || entry.hasAlias {
 		kept = lease.detach()
+	} else {
+		// Released before the parked relay becomes visible, so a
+		// replacement that finds it is admitted against the freed slots.
+		lease.detach().release()
 	}
 	start, retained := s.retainLocked(token, entry.principal, conn, kept, also)
 	s.mu.Unlock()

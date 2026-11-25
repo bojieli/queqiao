@@ -895,11 +895,13 @@ func (p pipeQUICStream) CancelRead(quic.StreamErrorCode) {}
 // only when the replacement's OPEN_OK has been written. An OPEN_OK that
 // cannot be delivered while the old holder is still healthy rolls the JOIN
 // back and leaves the old lane carrying the flow; one that is delivered
-// retires it.
+// retires it. The same holds with a full lane table, where admission has to
+// displace a lane -- and prefers the control holder -- to make room.
 func TestAControlTransferIsCommittedOnlyAfterItsOpenOK(t *testing.T) {
 	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "owner"}
-	for _, delivered := range []bool{false, true} {
-		t.Run(fmt.Sprintf("open-ok-delivered=%v", delivered), func(t *testing.T) {
+	for _, tc := range []struct{ delivered, full bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		delivered := tc.delivered
+		t.Run(fmt.Sprintf("open-ok-delivered=%v/full-table=%v", delivered, tc.full), func(t *testing.T) {
 			server, _ := pendingTestServer()
 			flow := newIsolationTestFlow(t, true)
 			serverSession := newServerFlow(flow, owner, TransportQUIC, 8)
@@ -910,6 +912,17 @@ func TestAControlTransferIsCommittedOnlyAfterItsOpenOK(t *testing.T) {
 				t.Fatal(err)
 			}
 			old.admitted = time.Now().Add(-2 * laneDeadPathDetection)
+			lanesBefore := 1
+			if tc.full {
+				for id := uint64(10); flow.laneCount() < serverSession.maxLanes; id++ {
+					bulk := isolationLane(t, id)
+					if err := serverSession.addLane(bulk); err != nil {
+						t.Fatal(err)
+					}
+					bulk.admitted = old.admitted
+				}
+				lanesBefore = flow.laneCount()
+			}
 			if !server.registerSession(flow.sessionID, serverSession) {
 				t.Fatal("register failed")
 			}
@@ -946,8 +959,8 @@ func TestAControlTransferIsCommittedOnlyAfterItsOpenOK(t *testing.T) {
 				if old.closed.Load() {
 					t.Fatal("a JOIN whose OPEN_OK failed retired the healthy control lane")
 				}
-				if lanes := flow.healthyLanes(); len(lanes) != 1 || lanes[0] != old {
-					t.Fatalf("flow lanes after the failed JOIN: %d, want the old control lane", len(lanes))
+				if got := flow.laneCount(); got != lanesBefore {
+					t.Fatalf("flow holds %d lanes after the failed JOIN, want the %d it had", got, lanesBefore)
 				}
 				return
 			}
@@ -964,6 +977,9 @@ func TestAControlTransferIsCommittedOnlyAfterItsOpenOK(t *testing.T) {
 					t.Fatal("the committed control transfer kept the previous holder")
 				}
 				time.Sleep(time.Millisecond)
+			}
+			if got := flow.laneCount(); got != lanesBefore {
+				t.Fatalf("flow holds %d lanes after the transfer, want %d", got, lanesBefore)
 			}
 			_ = local.Close()
 			<-done
@@ -1138,9 +1154,13 @@ func TestAnUnconfirmedFreshAssociationGivesItsSlotsBack(t *testing.T) {
 	if end := store.endLive(token, entry, relay, lease, true); end != liveParked {
 		t.Fatalf("owner end = %v, want parked", end)
 	}
-	lease.release()
+	// Released by the time the relay is visible, not later by the caller.
 	if released.Load() != 1 {
 		t.Fatalf("a fresh unconfirmed association kept its lease (%d releases)", released.Load())
+	}
+	lease.release()
+	if released.Load() != 1 {
+		t.Fatalf("lease released %d times", released.Load())
 	}
 	if store.claim(token[:], udpTestPrincipal) == nil {
 		t.Fatal("its relay is no longer reclaimable")
@@ -1237,5 +1257,52 @@ func TestAnExpiredParkedRelayReleasesItsLeaseToTheReplacement(t *testing.T) {
 	}
 	if released.Load() != 1 || store.retained() != 0 {
 		t.Fatalf("lease released %d times, %d relays left", released.Load(), store.retained())
+	}
+}
+
+// A completed flow's replay record holds no session slot in owned admission:
+// with MaxSessions=1 the next flow is admitted at once, not after the
+// tombstone's linger. The records have their own bound, past which a
+// completed session is not kept. Legacy admission keeps today's accounting.
+func TestCompletedSessionsDoNotBlockOwnedAdmission(t *testing.T) {
+	credentials, _ := testCertificate(t)
+	for _, mode := range []GatewayAdmission{GatewayAdmissionLegacy, GatewayAdmissionOwned} {
+		t.Run(string(mode), func(t *testing.T) {
+			server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0", Credentials: credentials, MaxSessions: 1, GatewayAdmission: mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := func(id byte) (*serverFlow, [16]byte) {
+				flow := newIsolationTestFlow(t, false)
+				return newServerFlow(flow, identity.Principal{}, TransportQUIC, 8), [16]byte{0x70, id}
+			}
+			first, firstID := session(1)
+			if !server.registerSession(firstID, first) {
+				t.Fatal("first session refused")
+			}
+			server.retainCompletedSession(firstID, first)
+			second, secondID := session(2)
+			admitted := server.registerSession(secondID, second)
+			if mode == GatewayAdmissionLegacy {
+				if admitted {
+					t.Fatal("legacy admission changed: a tombstone no longer counts")
+				}
+				return
+			}
+			if !admitted {
+				t.Fatal("a completed flow's tombstone blocked the next flow")
+			}
+			if server.lookupSession(firstID) == nil {
+				t.Fatal("the tombstone within its bound was not kept")
+			}
+			// Past the tombstone bound a completed session is not kept.
+			server.retainCompletedSession(secondID, second)
+			for deadline := time.Now().Add(2 * time.Second); server.lookupSession(secondID) != nil; {
+				if time.Now().After(deadline) {
+					t.Fatal("a tombstone past its bound was kept")
+				}
+				time.Sleep(time.Millisecond)
+			}
+		})
 	}
 }
