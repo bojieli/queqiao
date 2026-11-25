@@ -655,7 +655,7 @@ func TestAttachmentsShareServiceAndNoneStarves(t *testing.T) {
 			}
 		}
 	}
-	var lo, hi quiccongestion.ByteCount = served[0], served[0]
+	lo, hi := served[0], served[0]
 	for _, s := range served {
 		lo, hi = min(lo, s), max(hi, s)
 	}
