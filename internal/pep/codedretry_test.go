@@ -139,7 +139,7 @@ func (x *codedRetryFixture) write(t *testing.T, ctx context.Context) laneFrame {
 	settled := make(chan coded.Outcome, 1)
 	onCoded := queued.onCoded
 	if onCoded != nil {
-		queued.onCoded = func(o coded.Outcome) { onCoded(o); settled <- o }
+		queued.onCoded = func(o coded.Outcome, at time.Time) { onCoded(o, at); settled <- o }
 	}
 	reliable, err := x.fc.writeContextObserved(ctx, queued.frame, queued.forceReliable, queued.onCoded)
 	if err != nil {
@@ -260,7 +260,7 @@ func TestCodedChunkDelayedInTheQueueIsNotRetriedEarly(t *testing.T) {
 	if onCoded == nil {
 		t.Fatal("a coded chunk under the bundle is not observed")
 	}
-	reliable, err := x.fc.writeContextObserved(ctx, queued.frame, queued.forceReliable, func(o coded.Outcome) { onCoded(o); settled <- o })
+	reliable, err := x.fc.writeContextObserved(ctx, queued.frame, queued.forceReliable, func(o coded.Outcome, at time.Time) { onCoded(o, at); settled <- o })
 	if err != nil || reliable {
 		t.Fatalf("write = %v, %v; want the code", reliable, err)
 	}
@@ -330,7 +330,7 @@ func TestDiscardedCodedDatagramGoesToTheStream(t *testing.T) {
 	queued := <-x.lane.writeQ
 	settled := make(chan coded.Outcome, 1)
 	onCoded := queued.onCoded
-	reliable, err := x.fc.writeContextObserved(ctx, queued.frame, queued.forceReliable, func(o coded.Outcome) { onCoded(o); settled <- o })
+	reliable, err := x.fc.writeContextObserved(ctx, queued.frame, queued.forceReliable, func(o coded.Outcome, at time.Time) { onCoded(o, at); settled <- o })
 	if err != nil || reliable {
 		t.Fatalf("write = %v, %v; want the code", reliable, err)
 	}
@@ -466,7 +466,7 @@ func TestOpenSafetyCopyIsKeptUnderCodedRetry(t *testing.T) {
 		queued := <-x.lane.writeQ
 		settled := make(chan coded.Outcome, 1)
 		onCoded := queued.onCoded
-		reliable, err := x.fc.writeContextObserved(ctx, queued.frame, queued.forceReliable, func(o coded.Outcome) { onCoded(o); settled <- o })
+		reliable, err := x.fc.writeContextObserved(ctx, queued.frame, queued.forceReliable, func(o coded.Outcome, at time.Time) { onCoded(o, at); settled <- o })
 		if err != nil || !reliable {
 			cancel()
 			t.Fatalf("write = %v, %v; want the coded frame plus its stream safety copy", reliable, err)

@@ -346,7 +346,7 @@ func (c *frameConn) Write(f protocol.Frame) error {
 //
 // onCoded, when set, is told what became of a frame the coded path took; it
 // is never called for one it did not.
-func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame, onCoded func(coded.Outcome)) (reliable bool, err error) {
+func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame, onCoded func(coded.Outcome, time.Time)) (reliable bool, err error) {
 	f.Header.Version = c.wireVersion()
 	buf, err := protocol.AppendFrame(nil, f)
 	if err != nil {
@@ -412,7 +412,7 @@ func (c *frameConn) writeContextViaMode(ctx context.Context, f protocol.Frame, f
 
 // writeContextObserved is writeContextViaMode with an observer for a frame
 // that goes to the coded path (see writeCoded).
-func (c *frameConn) writeContextObserved(ctx context.Context, f protocol.Frame, forceReliable bool, onCoded func(coded.Outcome)) (bool, error) {
+func (c *frameConn) writeContextObserved(ctx context.Context, f protocol.Frame, forceReliable bool, onCoded func(coded.Outcome, time.Time)) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, frameWriteTimeout)
 	defer cancel()
 	if !forceReliable && c.bulkFrame(f) {

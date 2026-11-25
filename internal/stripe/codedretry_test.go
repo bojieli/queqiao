@@ -76,6 +76,19 @@ func TestCodedDeadlineStartsAtRegistration(t *testing.T) {
 	}
 }
 
+// The deadline counts from the packet, not from when the report about it
+// reached the scheduler.
+func TestCodedDeadlineCountsFromThePacketNotTheReport(t *testing.T) {
+	f := newCodedRetryFixture(t, true, []byte("response"), 64)
+	first := f.next(0)
+	f.sched.WroteAs(0, first, false)
+	f.sched.RegisteredAgo(0, first, codedRetryAfter/2)
+	f.now = f.now.Add(codedRetryAfter / 2)
+	if n := f.sched.ReissueExpired(); n != 1 {
+		t.Fatalf("ReissueExpired = %d a deadline after the packet, want 1", n)
+	}
+}
+
 // Registration can be reported before the lane writer reports the write: the
 // connection may build the packet while the writer is still returning.
 func TestCodedRegistrationBeforeTheWriteReport(t *testing.T) {

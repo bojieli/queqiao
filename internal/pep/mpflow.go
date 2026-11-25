@@ -204,7 +204,7 @@ type laneFrame struct {
 	forceReliable bool
 	// onCoded, when set, is told what became of the frame if it went to the
 	// coded path; see coded.Path.SendObserved.
-	onCoded func(coded.Outcome)
+	onCoded func(coded.Outcome, time.Time)
 }
 
 type inboundEvent struct {

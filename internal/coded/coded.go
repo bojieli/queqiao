@@ -293,14 +293,16 @@ const (
 
 // SendObserved is SendContext for a frame whose fate the caller needs to
 // know. If it returns nil, notify is called exactly once, with Registered or
-// Abandoned, and never while the caller's SendObserved is still running a
+// Abandoned and the time that was decided -- for Registered, when the last
+// symbol's packet was registered, which can be a little earlier than the
+// call -- and never while the caller's SendObserved is still running a
 // lock of the caller's; if it returns an error the frame was not queued and
 // notify is never called. notify must not block: it can be called on the
 // carrier's packet-sending goroutine.
 //
 // Over a carrier that cannot report registration (one that is not a
 // TaggedCarrier) a symbol counts as registered once the carrier accepts it.
-func (p *Path) SendObserved(ctx context.Context, frame []byte, notify func(Outcome)) error {
+func (p *Path) SendObserved(ctx context.Context, frame []byte, notify func(Outcome, time.Time)) error {
 	if notify == nil {
 		return p.SendContext(ctx, frame)
 	}
@@ -357,7 +359,7 @@ type queuedFrame struct {
 // once its outcome is decided, so it is reported once. Both are guarded by
 // the path's tagMu once the frame has been handed to emit.
 type frameTrack struct {
-	notify    func(Outcome)
+	notify    func(Outcome, time.Time)
 	remaining int
 	settled   bool
 }
@@ -365,6 +367,7 @@ type frameTrack struct {
 type settled struct {
 	track   *frameTrack
 	outcome Outcome
+	at      time.Time
 }
 
 // abandonQueued abandons every observed frame still waiting in the queue of a
@@ -394,8 +397,9 @@ func (p *Path) abandon(tracks ...*frameTrack) {
 		}
 	}
 	p.tagMu.Unlock()
+	now := time.Now()
 	for _, track := range report {
-		track.notify(Abandoned)
+		track.notify(Abandoned, now)
 	}
 }
 
@@ -428,6 +432,7 @@ func (p *Path) onTag(tag uint64, registered bool) {
 	}
 	delete(p.tags, tag)
 	queued := false
+	now := time.Now()
 	for _, track := range tracks {
 		if track.settled {
 			continue
@@ -436,13 +441,13 @@ func (p *Path) onTag(tag uint64, registered bool) {
 			// A frame missing any one of its symbols is not the code's to
 			// repair: the receiver may never reassemble it.
 			track.settled = true
-			p.outcomes = append(p.outcomes, settled{track: track, outcome: Abandoned})
+			p.outcomes = append(p.outcomes, settled{track: track, outcome: Abandoned, at: now})
 			queued = true
 			continue
 		}
 		if track.remaining--; track.remaining <= 0 {
 			track.settled = true
-			p.outcomes = append(p.outcomes, settled{track: track, outcome: Registered})
+			p.outcomes = append(p.outcomes, settled{track: track, outcome: Registered, at: now})
 			queued = true
 		}
 	}
@@ -469,13 +474,14 @@ func (p *Path) deliverOutcomes() {
 		}
 		p.tagMu.Lock()
 		if stopping {
+			now := time.Now()
 			p.tagsClosed = true
 			for tag, tracks := range p.tags {
 				delete(p.tags, tag)
 				for _, track := range tracks {
 					if !track.settled {
 						track.settled = true
-						p.outcomes = append(p.outcomes, settled{track: track, outcome: Abandoned})
+						p.outcomes = append(p.outcomes, settled{track: track, outcome: Abandoned, at: now})
 					}
 				}
 			}
@@ -484,7 +490,7 @@ func (p *Path) deliverOutcomes() {
 		p.outcomes = nil
 		p.tagMu.Unlock()
 		for _, one := range batch {
-			one.track.notify(one.outcome)
+			one.track.notify(one.outcome, one.at)
 		}
 		if stopping {
 			return
@@ -656,7 +662,10 @@ func (p *Path) sendFragments(frame []byte, limit int, track *frameTrack) error {
 	count := (len(frame) + limit - 1) / limit
 	if count > maxFragments {
 		if track != nil {
+			// A failure of this frame, not of the path: the path keeps
+			// sending, so frames queued behind it still get their outcome.
 			p.abandon(track)
+			return nil
 		}
 		return fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, len(frame))
 	}
@@ -817,8 +826,9 @@ func (p *Path) registerUntagged(tracks []*frameTrack) {
 		}
 	}
 	p.tagMu.Unlock()
+	now := time.Now()
 	for _, track := range report {
-		track.notify(Registered)
+		track.notify(Registered, now)
 	}
 }
 

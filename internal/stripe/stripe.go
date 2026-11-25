@@ -1550,7 +1550,12 @@ func (s *Scheduler) substrateChangedLocked(a *attempt, reliable bool) {
 // unreliable attempt's bytes has been registered for sending. The attempt's
 // recovery deadline starts now. A report for an attempt that has been retired
 // is ignored: the attempt identity is not reused.
-func (s *Scheduler) Registered(laneID uint64, chunk *Chunk) {
+func (s *Scheduler) Registered(laneID uint64, chunk *Chunk) { s.RegisteredAgo(laneID, chunk, 0) }
+
+// RegisteredAgo is Registered for a registration that happened age ago: the
+// report can reach the scheduler a little after the packet was built, and the
+// deadline counts from the packet, not from the report.
+func (s *Scheduler) RegisteredAgo(laneID uint64, chunk *Chunk, age time.Duration) {
 	if chunk == nil || !s.cfg.CodedRetry {
 		return
 	}
@@ -1567,7 +1572,7 @@ func (s *Scheduler) Registered(laneID uint64, chunk *Chunk) {
 	}
 	a.deadline = time.Time{}
 	if after := s.retransmitAfter(); after > 0 {
-		a.deadline = s.cfg.Now().Add(after)
+		a.deadline = s.cfg.Now().Add(after - max(age, 0))
 	}
 }
 

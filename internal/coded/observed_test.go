@@ -17,13 +17,21 @@ type taggedCarrier struct {
 	tags     []uint64
 	untagged int
 	refuse   bool
-	closed   chan struct{}
-	once     sync.Once
+	// gate, when set, holds untagged sends until it is closed.
+	gate   chan struct{}
+	closed chan struct{}
+	once   sync.Once
 }
 
 func newTaggedCarrier() *taggedCarrier { return &taggedCarrier{closed: make(chan struct{})} }
 
 func (c *taggedCarrier) Send([]byte) error {
+	c.mu.Lock()
+	gate := c.gate
+	c.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.untagged++
@@ -88,7 +96,7 @@ func (c *taggedCarrier) waitHeld(t *testing.T, n int) {
 
 type outcomes chan Outcome
 
-func (o outcomes) notify(outcome Outcome) { o <- outcome }
+func (o outcomes) notify(outcome Outcome, _ time.Time) { o <- outcome }
 
 func (o outcomes) none(t *testing.T) {
 	t.Helper()
@@ -135,31 +143,65 @@ func TestObservedFrameIsRegisteredWithItsLastSymbol(t *testing.T) {
 	got.none(t)
 }
 
-// Small frames packed into symbols are each told when theirs is registered.
-// Frames sent without an observer never make a tagged datagram.
-func TestPackedObservedFramesAreEachRegistered(t *testing.T) {
+// Small observed frames packed into one symbol share its datagram's tag, and
+// each is told when that one datagram is registered. Frames sent without an
+// observer never make a tagged datagram.
+func TestPackedObservedFramesShareOneTag(t *testing.T) {
 	carrier := newTaggedCarrier()
+	gate := make(chan struct{})
+	carrier.gate = gate
 	path := New(carrier, Config{})
 	defer path.Close()
-	first, second := make(outcomes, 1), make(outcomes, 1)
+	// The send loop is held inside the carrier sending an unobserved frame,
+	// so both observed frames are queued before it can drain again.
 	if err := path.Send([]byte("plain")); err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, path)
+	for len(path.pending) > 0 {
+		time.Sleep(100 * time.Microsecond)
+	}
+	first, second := make(outcomes, 1), make(outcomes, 1)
+	if err := path.SendObserved(context.Background(), []byte("one"), first.notify); err != nil {
+		t.Fatal(err)
+	}
+	if err := path.SendObserved(context.Background(), []byte("two"), second.notify); err != nil {
+		t.Fatal(err)
+	}
+	close(gate)
+	carrier.waitHeld(t, 1)
+	time.Sleep(5 * time.Millisecond)
+	if held := carrier.held(); held != 1 {
+		t.Fatalf("two small frames took %d tagged datagrams, want one", held)
+	}
 	carrier.mu.Lock()
 	plain := carrier.untagged
 	carrier.mu.Unlock()
-	if plain == 0 || carrier.held() != 0 {
-		t.Fatal("an unobserved frame was tagged")
+	if plain == 0 {
+		t.Fatal("the unobserved frame did not go untagged")
 	}
-	// Queue both before the send loop can drain, so they pack together.
-	path.pending <- queuedFrame{data: []byte("one"), track: &frameTrack{notify: first.notify}}
-	path.pending <- queuedFrame{data: []byte("two"), track: &frameTrack{notify: second.notify}}
-	carrier.waitHeld(t, 1)
-	time.Sleep(5 * time.Millisecond)
-	carrier.settle(carrier.held(), true)
+	carrier.settle(1, true)
 	first.want(t, Registered)
 	second.want(t, Registered)
+}
+
+// A frame the path cannot fragment is that frame's failure, not the path's:
+// it is abandoned, and a frame behind it is still sent and reported.
+func TestUnfragmentableObservedFrameDoesNotStopThePath(t *testing.T) {
+	carrier := newTaggedCarrier()
+	path := New(carrier, Config{SymbolBytes: 1})
+	defer path.Close()
+	huge, small := make(outcomes, 1), make(outcomes, 1)
+	frame := make([]byte, (maxFragments+1)*path.symbolPayload())
+	if err := path.SendObserved(context.Background(), frame, huge.notify); err != nil {
+		t.Fatal(err)
+	}
+	huge.want(t, Abandoned)
+	if err := path.SendObserved(context.Background(), []byte("ok"), small.notify); err != nil {
+		t.Fatal(err)
+	}
+	carrier.waitHeld(t, 1)
+	carrier.settle(carrier.held(), true)
+	small.want(t, Registered)
 }
 
 // A discarded datagram abandons every frame it carries part of, at once and

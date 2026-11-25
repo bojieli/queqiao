@@ -621,9 +621,9 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 	if sched := f.scheduler.Load(); sched != nil {
 		queued.onWritten = func(reliable bool) { sched.WroteAs(lane.id, chunk, reliable) }
 		if f.codedRetrySticky && !chunk.Reliable {
-			queued.onCoded = func(outcome coded.Outcome) {
+			queued.onCoded = func(outcome coded.Outcome, at time.Time) {
 				if outcome == coded.Registered {
-					sched.Registered(lane.id, chunk)
+					sched.RegisteredAgo(lane.id, chunk, time.Since(at))
 					return
 				}
 				sched.Abandoned(lane.id, chunk)
