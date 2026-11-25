@@ -103,10 +103,13 @@ func TestSchedValidatorRequiresCCAPIV2(t *testing.T) {
 			t.Errorf("ValidateSched(%q, %q) = %v, disagrees with the constructors", c.sched, c.api, exported)
 		}
 	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, SchedClass, CongestionScopeConnection); got != "cc-api=v2,sched=class" {
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, CongestionScopeConnection); got != "cc-api=v2,sched=class" {
 		t.Errorf("bundle %q", got)
 	}
-	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, SchedLegacy, CongestionScopeConnection); got != "legacy" {
+	if got := Bundle(CCAPIV2, MemoryOwned, CodedRetrySticky, GatewayAdmissionOwned, SchedClass, CongestionScopeConnection); got != "cc-api=v2,sched=class,coded-retry=sticky,mem=owned,gateway-admission=owned" {
+		t.Errorf("bundle %q", got)
+	}
+	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedLegacy, CongestionScopeConnection); got != "legacy" {
 		t.Errorf("bundle %q, want legacy", got)
 	}
 }
@@ -311,7 +314,7 @@ func TestCongestionScopeValidatorRequiresStagesOneAndTwo(t *testing.T) {
 			t.Errorf("ValidateCongestionScope(%q, %q, %q) = %v, disagrees", c.scope, c.api, c.sched, exported)
 		}
 	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, SchedClass, CongestionScopePath); got != "cc-api=v2,sched=class,congestion=path" {
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, CongestionScopePath); got != "cc-api=v2,sched=class,congestion=path" {
 		t.Errorf("bundle %q", got)
 	}
 	certificate, credentials := testCertificate(t)

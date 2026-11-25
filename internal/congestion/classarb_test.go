@@ -266,3 +266,71 @@ func TestClassArbiterTogglesAfterReplenishmentKeepTheWeights(t *testing.T) {
 		t.Fatalf("BULK share %.3f under toggling CONTROL, want its weight 0.2", share)
 	}
 }
+
+// A class that spends part of its allocation, goes idle and returns within
+// the same round keeps the rest: a sparse ACK after a small one still gets
+// the turn while INTERACTIVE holds credit. It gets no more than that.
+func TestClassArbiterIdleClassKeepsItsUnspentShareForTheRound(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	ci := demandOf(quiccongestion.ClassControl, quiccongestion.ClassInteractive)
+	i := demandOf(quiccongestion.ClassInteractive)
+	a.OnDemand(ci)
+	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassControl {
+		t.Fatalf("turn %v, want CONTROL", p.Turn)
+	}
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassControl: 100}) // a small ACK
+	left := a.Stats().Deficit[quiccongestion.ClassControl]
+	a.OnDemand(i)
+	a.OnSent(simBuilder(a.Permit(arbPacket), i, 0)) // INTERACTIVE, still in credit
+	a.OnDemand(ci)
+	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassControl {
+		t.Fatalf("turn %v: CONTROL lost its unspent share by going idle", p.Turn)
+	}
+	if got := a.Stats().Deficit[quiccongestion.ClassControl]; got > left {
+		t.Fatalf("CONTROL came back with %d, more than the %d it left", got, left)
+	}
+}
+
+// Bytes charged to a class while it is idle -- a PTO probe retransmitting
+// its data -- come off the credit it gets back: 500 held, 1000 sent while
+// idle, leaves a 500-byte debt.
+func TestClassArbiterIdleDebitComesOffHeldCredit(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	ci := demandOf(quiccongestion.ClassControl, quiccongestion.ClassInteractive)
+	a.OnDemand(ci)
+	a.Permit(arbPacket)
+	spend := quiccongestion.ByteCount(a.Stats().Deficit[quiccongestion.ClassControl] - 500)
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassControl: spend})
+	a.OnDemand(demandOf(quiccongestion.ClassInteractive)) // 500 held
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassControl: 1000})
+	a.OnDemand(ci)
+	if got := a.Stats().Deficit[quiccongestion.ClassControl]; got > -500 {
+		t.Fatalf("CONTROL deficit %d after a 1000-byte idle charge against 500 held, want -500 or less", got)
+	}
+}
+
+// An idle class's retransmission is paid from the credit it held for the
+// round, so when the round ends before it returns, it comes back without a
+// debt it never ran up.
+func TestClassArbiterIdleChargeWithinHeldCreditLeavesNoDebtAcrossRounds(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	cb := demandOf(quiccongestion.ClassControl, quiccongestion.ClassBulk)
+	bulk := demandOf(quiccongestion.ClassBulk)
+	a.OnDemand(cb)
+	a.Permit(arbPacket)
+	spend := quiccongestion.ByteCount(a.Stats().Deficit[quiccongestion.ClassControl] - 500)
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassControl: spend})
+	a.OnDemand(bulk) // 500 held
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassControl: 300})
+	// BULK runs the round out and replenishment starts another.
+	for range 20 {
+		a.OnSent(simBuilder(a.Permit(arbPacket), bulk, 0))
+	}
+	a.OnDemand(cb)
+	if got := a.Stats().Deficit[quiccongestion.ClassControl]; got < 0 {
+		t.Fatalf("CONTROL returned with a %d-byte debt it never ran up", -got)
+	}
+	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassControl {
+		t.Fatalf("turn %v: the returning ACK waits behind BULK", p.Turn)
+	}
+}
