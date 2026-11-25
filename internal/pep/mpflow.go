@@ -362,7 +362,11 @@ type multipathFlow struct {
 	// a handshake. Only the endpoint that opens replacements can tell them
 	// apart, and only while it is trying. The other endpoint reports zeroes,
 	// which is the true answer there: it opens nothing.
-	replacementAttempts    atomic.Uint64
+	replacementAttempts atomic.Uint64
+	// replacementAdmitMu orders beginReplacementAttempt against the close of
+	// done, so an attempt is either counted and started before the flow ends
+	// or neither.
+	replacementAdmitMu     sync.Mutex
 	replacementFailureMu   sync.Mutex
 	replacementFailures    uint64
 	replacementLastFailure string
@@ -2329,7 +2333,9 @@ func (f *multipathFlow) telemetryLoop(stop <-chan struct{}) {
 func (f *multipathFlow) signalDone() {
 	if f.done != nil {
 		f.doneOnce.Do(func() {
+			f.replacementAdmitMu.Lock()
 			close(f.done)
+			f.replacementAdmitMu.Unlock()
 			if f.ackTrack != nil {
 				f.ackTrack.Close()
 			}
@@ -2544,6 +2550,21 @@ func (f *multipathFlow) replacementLogFields() []any {
 // lines carry as `attempt`: the last one logged for a flow equals the
 // `lane_replacement_attempts` on its completion record.
 func (f *multipathFlow) noteReplacementAttempt() uint64 { return f.replacementAttempts.Add(1) }
+
+// beginReplacementAttempt is noteReplacementAttempt for a manager that has not
+// yet checked whether the flow has ended, and reports whether the attempt may
+// start. A flow that has ended starts none and counts none. The check and the
+// count are one step against the close of done, and the completion record is
+// written only after done closes, so the record counts exactly the attempts
+// that started.
+func (f *multipathFlow) beginReplacementAttempt() (uint64, bool) {
+	f.replacementAdmitMu.Lock()
+	defer f.replacementAdmitMu.Unlock()
+	if f.doneChanClosed() {
+		return 0, false
+	}
+	return f.noteReplacementAttempt(), true
+}
 
 // noteReplacementFailure records that one such attempt did not produce a lane.
 // A non-failed attempt may have succeeded or may still be in flight when

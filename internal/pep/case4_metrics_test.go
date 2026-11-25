@@ -3,6 +3,8 @@ package pep
 import (
 	"testing"
 	"time"
+
+	"github.com/bojieli/queqiao/internal/metrics"
 )
 
 // policerQueueDelay needs a measured baseline. A newly installed controller
@@ -41,5 +43,66 @@ func TestPolicerQueueDelayRequiresMeasuredBaseline(t *testing.T) {
 					tc.smoothed, tc.minimum, got, valid, tc.want, tc.valid)
 			}
 		})
+	}
+}
+
+// sustained reports whether count of total samples is more than a quarter:
+// what TestCase4APolicedPathIsStillUnbraked requires before a queue or a
+// brake counts, so that one host stall is not read as the path (issue #187).
+func sustained(count, total int) bool { return count > total/4 }
+
+// brakeTally counts delay-brake readings from polls that had a live
+// controller. QUICControllerSamples is cumulative, so it stays nonzero after
+// the flow ends; a poll without a live controller reports a default zero
+// brake, which is not a reading that the brake was off.
+type brakeTally struct{ readings, braked int }
+
+func (b *brakeTally) observe(s metrics.Snapshot) {
+	if s.QUICControllerKind == "" {
+		return
+	}
+	b.readings++
+	if s.QUICDelayBrake > 0 {
+		b.braked++
+	}
+}
+
+func (b brakeTally) sustained() bool { return sustained(b.braked, b.readings) }
+
+func TestBrakeTallyCountsOnlyLiveControllerReadings(t *testing.T) {
+	live := func(brake float64) metrics.Snapshot {
+		return metrics.Snapshot{QUICControllerKind: "test", QUICDelayBrake: brake, QUICControllerSamples: 10}
+	}
+	// After the flow: the cumulative sample count persists, the controller
+	// does not.
+	gone := metrics.Snapshot{QUICControllerSamples: 10}
+
+	var braked brakeTally
+	for range 3 {
+		braked.observe(live(0.5))
+	}
+	for range 9 {
+		braked.observe(gone)
+	}
+	if braked.readings != 3 || !braked.sustained() {
+		t.Fatalf("three braked live readings among nine dead polls: %+v, sustained=%v; want 3 readings, sustained", braked, braked.sustained())
+	}
+
+	var spike brakeTally
+	spike.observe(live(0.07))
+	for range 11 {
+		spike.observe(live(0))
+	}
+	if spike.sustained() {
+		t.Fatalf("one braked reading in twelve counted as sustained: %+v", spike)
+	}
+
+	for _, tc := range []struct {
+		count, total int
+		want         bool
+	}{{0, 12, false}, {1, 12, false}, {3, 12, false}, {4, 12, true}, {1, 3, true}, {0, 0, false}} {
+		if got := sustained(tc.count, tc.total); got != tc.want {
+			t.Errorf("sustained(%d, %d) = %v, want %v", tc.count, tc.total, got, tc.want)
+		}
 	}
 }
