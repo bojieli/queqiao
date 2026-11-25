@@ -60,6 +60,21 @@ type Carrier interface {
 	Close() error
 }
 
+// TaggedCarrier is a Carrier that can say when a datagram was registered in a
+// packet, or that it never will be (design §5 change 12). The path tags only
+// datagrams carrying a source symbol of a frame sent with SendObserved; every
+// other datagram goes through Send, so a path that is never asked to observe
+// a frame behaves exactly as it does over an untagged carrier.
+//
+// ObserveTags is called once, before the first SendTagged, with a function
+// that must be told each tagged datagram's outcome exactly once. It may be
+// called on the carrier's own goroutine and must not be blocked by it.
+type TaggedCarrier interface {
+	Carrier
+	SendTagged(d []byte, tag uint64) error
+	ObserveTags(func(tag uint64, registered bool))
+}
+
 // SizedCarrier is a Carrier that knows how large a datagram it will accept. A
 // carrier that does not implement it is taken at the Config's word.
 type SizedCarrier interface {
@@ -146,7 +161,7 @@ type Path struct {
 	cfg     Config
 	carrier Carrier
 
-	pending  chan []byte
+	pending  chan queuedFrame
 	received chan []byte
 
 	// The sending side belongs to one goroutine, and nothing else touches it.
@@ -163,6 +178,22 @@ type Path struct {
 	burstRepairs int
 	tail         map[int]int
 	tailAt       int64
+	// packedTracks are the observed frames in packed, waiting for the symbol
+	// that will carry them. Like packed, they belong to the send loop.
+	packedTracks []*frameTrack
+	nextTag      uint64
+
+	// tags maps an outstanding tagged datagram to the observed frames it
+	// carries a source symbol of. It is shared between the send loop, which
+	// adds to it, and the carrier's observer, which settles it, so it has its
+	// own lock; nothing is called while that lock is held except appending
+	// to outcomes.
+	tagMu      sync.Mutex
+	tags       map[uint64][]*frameTrack
+	tagsClosed bool
+	outcomes   []settled
+	outcomeC   chan struct{}
+	observe    sync.Once
 
 	// The receiving side belongs to the receive loop, held under mu only
 	// because Stats reads what it writes.
@@ -212,16 +243,19 @@ func New(carrier Carrier, cfg Config) *Path {
 	cfg = cfg.withDefaults()
 	p := &Path{
 		cfg: cfg, carrier: carrier,
-		pending:   make(chan []byte, cfg.Pending),
+		pending:   make(chan queuedFrame, cfg.Pending),
 		received:  make(chan []byte, cfg.Pending),
 		encoder:   fec.NewWindowEncoder(initialWindow),
 		decoder:   fec.NewWindowDecoder(),
 		estimator: lossmodel.New(lossmodel.Config{ReorderTolerance: 32}),
 		done:      make(chan struct{}),
+		tags:      make(map[uint64][]*frameTrack),
+		outcomeC:  make(chan struct{}, 1),
 	}
-	p.wg.Add(2)
+	p.wg.Add(3)
 	go p.sendLoop()
 	go p.receiveLoop()
+	go p.deliverOutcomes()
 	return p
 }
 
@@ -237,6 +271,45 @@ func (p *Path) Send(frame []byte) error {
 }
 
 func (p *Path) SendContext(ctx context.Context, frame []byte) error {
+	return p.send(ctx, frame, nil)
+}
+
+// Outcome is what became of a frame sent with SendObserved.
+type Outcome uint8
+
+const (
+	// Registered says every source symbol carrying the frame was registered
+	// in a packet: the frame has left this endpoint, and from now on only the
+	// code can repair it. It is the moment a coded attempt's recovery
+	// deadline starts (design §8.1), which a frame waiting in this path's
+	// queue or in the connection's datagram queue has not reached.
+	Registered Outcome = iota + 1
+	// Abandoned says at least one source symbol carrying the frame will never
+	// be sent: the carrier refused or discarded it, or the path closed first.
+	// The code does not own the frame's bytes, and its caller must send them
+	// some other way.
+	Abandoned
+)
+
+// SendObserved is SendContext for a frame whose fate the caller needs to
+// know. If it returns nil, notify is called exactly once, with Registered or
+// Abandoned and the time that was decided -- for Registered, when the last
+// symbol's packet was registered, which can be a little earlier than the
+// call -- and never while the caller's SendObserved is still running a
+// lock of the caller's; if it returns an error the frame was not queued and
+// notify is never called. notify must not block: it can be called on the
+// carrier's packet-sending goroutine.
+//
+// Over a carrier that cannot report registration (one that is not a
+// TaggedCarrier) a symbol counts as registered once the carrier accepts it.
+func (p *Path) SendObserved(ctx context.Context, frame []byte, notify func(Outcome, time.Time)) error {
+	if notify == nil {
+		return p.SendContext(ctx, frame)
+	}
+	return p.send(ctx, frame, &frameTrack{notify: notify})
+}
+
+func (p *Path) send(ctx context.Context, frame []byte, track *frameTrack) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -254,12 +327,182 @@ func (p *Path) SendContext(ctx context.Context, frame []byte) error {
 	queued := make([]byte, len(frame))
 	copy(queued, frame)
 	select {
-	case p.pending <- queued:
+	case p.pending <- queuedFrame{data: queued, track: track}:
+		if track != nil {
+			// The path can close between the check above and this send, and
+			// a frame queued after the send loop has stopped would never be
+			// taken. Whoever sees the path closed with frames still queued
+			// abandons them: the send loop as it stops, or this.
+			select {
+			case <-p.done:
+				// Not on this goroutine: a caller may hold a lock its
+				// observer takes, and this may settle other callers' frames.
+				go p.abandonQueued()
+			default:
+			}
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-p.done:
 		return p.failure()
+	}
+}
+
+// queuedFrame is a frame waiting for the send loop, with its observer if it
+// has one.
+type queuedFrame struct {
+	data  []byte
+	track *frameTrack
+}
+
+// frameTrack follows one observed frame to its outcome. remaining counts the
+// source symbols carrying it that have not been registered; settled is set
+// once its outcome is decided, so it is reported once. Both are guarded by
+// the path's tagMu once the frame has been handed to emit.
+type frameTrack struct {
+	notify    func(Outcome, time.Time)
+	remaining int
+	settled   bool
+}
+
+type settled struct {
+	track   *frameTrack
+	outcome Outcome
+	at      time.Time
+}
+
+// abandonQueued abandons every observed frame still waiting in the queue of a
+// closed path. Frames without an observer are dropped as they always were.
+func (p *Path) abandonQueued() {
+	for {
+		select {
+		case queued := <-p.pending:
+			if queued.track != nil {
+				p.abandon(queued.track)
+			}
+		default:
+			return
+		}
+	}
+}
+
+// abandon settles frames that never reached the carrier, on the caller's
+// goroutine.
+func (p *Path) abandon(tracks ...*frameTrack) {
+	p.tagMu.Lock()
+	var report []*frameTrack
+	for _, track := range tracks {
+		if !track.settled {
+			track.settled = true
+			report = append(report, track)
+		}
+	}
+	p.tagMu.Unlock()
+	now := time.Now()
+	for _, track := range report {
+		track.notify(Abandoned, now)
+	}
+}
+
+func (p *Path) isSettled(track *frameTrack) bool {
+	p.tagMu.Lock()
+	defer p.tagMu.Unlock()
+	return track.settled
+}
+
+// tagFor allocates a tag for a datagram carrying a source symbol of tracks,
+// and records it before the datagram is offered, because the carrier can
+// register it before Send returns. ok is false when the path has closed, in
+// which case tracks have been abandoned.
+func (p *Path) tagFor(tracks []*frameTrack) (tag uint64, ok bool) {
+	p.tagMu.Lock()
+	if p.tagsClosed {
+		p.tagMu.Unlock()
+		p.abandon(tracks...)
+		return 0, false
+	}
+	p.nextTag++
+	tag = p.nextTag
+	p.tags[tag] = append([]*frameTrack(nil), tracks...)
+	p.tagMu.Unlock()
+	return tag, true
+}
+
+// onTag settles one tagged datagram. It runs on the carrier's goroutine, so it
+// only records what happened; deliverOutcomes tells the frames' owners.
+func (p *Path) onTag(tag uint64, registered bool) {
+	p.tagMu.Lock()
+	defer p.tagMu.Unlock()
+	tracks, ok := p.tags[tag]
+	if !ok {
+		return
+	}
+	delete(p.tags, tag)
+	queued := false
+	now := time.Now()
+	for _, track := range tracks {
+		if track.settled {
+			continue
+		}
+		if !registered {
+			// A frame missing any one of its symbols is not the code's to
+			// repair: the receiver may never reassemble it.
+			track.settled = true
+			p.outcomes = append(p.outcomes, settled{track: track, outcome: Abandoned, at: now})
+			queued = true
+			continue
+		}
+		if track.remaining--; track.remaining <= 0 {
+			track.settled = true
+			p.outcomes = append(p.outcomes, settled{track: track, outcome: Registered, at: now})
+			queued = true
+		}
+	}
+	if queued {
+		select {
+		case p.outcomeC <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// deliverOutcomes tells observed frames' owners what became of them, off the
+// carrier's goroutine. When the path stops it abandons every frame whose
+// symbols the carrier still holds -- nothing will report on them now -- and
+// delivers what is left, so every observed frame gets exactly one outcome.
+func (p *Path) deliverOutcomes() {
+	defer p.wg.Done()
+	for {
+		stopping := false
+		select {
+		case <-p.outcomeC:
+		case <-p.done:
+			stopping = true
+		}
+		p.tagMu.Lock()
+		if stopping {
+			now := time.Now()
+			p.tagsClosed = true
+			for tag, tracks := range p.tags {
+				delete(p.tags, tag)
+				for _, track := range tracks {
+					if !track.settled {
+						track.settled = true
+						p.outcomes = append(p.outcomes, settled{track: track, outcome: Abandoned, at: now})
+					}
+				}
+			}
+		}
+		batch := p.outcomes
+		p.outcomes = nil
+		p.tagMu.Unlock()
+		for _, one := range batch {
+			one.track.notify(one.outcome, one.at)
+		}
+		if stopping {
+			return
+		}
 	}
 }
 
@@ -307,10 +550,16 @@ func (p *Path) Receive() ([]byte, error) {
 // retransmission would.
 func (p *Path) sendLoop() {
 	defer p.wg.Done()
+	// Observed frames this loop holds when it stops will never be sent.
+	defer func() {
+		p.abandon(p.packedTracks...)
+		p.packedTracks = nil
+		p.abandonQueued()
+	}()
 	var tail *time.Timer
 	var tailC <-chan time.Time
 	for {
-		var frame []byte
+		var frame queuedFrame
 		select {
 		case <-p.done:
 			return
@@ -323,7 +572,7 @@ func (p *Path) sendLoop() {
 		case frame = <-p.pending:
 		}
 		for {
-			if err := p.appendFrame(frame); err != nil {
+			if err := p.appendFrame(frame.data, frame.track); err != nil {
 				return
 			}
 			select {
@@ -385,37 +634,71 @@ const (
 // frames and one that carries a fragment, because that is what would make one
 // symbol's loss cost another symbol's frames. Small frames share a symbol with
 // their neighbours; a large one occupies symbols of its own.
-func (p *Path) appendFrame(frame []byte) error {
+func (p *Path) appendFrame(frame []byte, track *frameTrack) error {
 	limit := p.symbolPayload()
 	if frameHeader+len(frame) > limit {
 		if err := p.flushPacked(); err != nil {
+			if track != nil {
+				p.abandon(track)
+			}
 			return err
 		}
-		return p.sendFragments(frame, limit)
+		return p.sendFragments(frame, limit, track)
 	}
 	if len(p.packed)+frameHeader+len(frame) > limit {
 		if err := p.flushPacked(); err != nil {
+			if track != nil {
+				p.abandon(track)
+			}
 			return err
 		}
 	}
 	var head [frameHeader]byte
 	binary.BigEndian.PutUint32(head[:], uint32(len(frame)))
 	p.packed = append(append(p.packed, head[:]...), frame...)
+	if track != nil {
+		track.remaining = 1
+		p.packedTracks = append(p.packedTracks, track)
+	}
 	return nil
 }
 
 // sendFragments spreads one large frame over symbols of its own. Their count
 // is what tells the receiver how many to wait for, and their identifiers are
 // consecutive, so any one of them names the group.
-func (p *Path) sendFragments(frame []byte, limit int) error {
+func (p *Path) sendFragments(frame []byte, limit int, track *frameTrack) error {
 	count := (len(frame) + limit - 1) / limit
 	if count > maxFragments {
-		return fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, len(frame))
+		// A failure of this frame, not of the path. Returning an error here
+		// used to stop the send loop without closing the path, which then
+		// accepted frames nobody would ever send; it is dropped like any
+		// datagram the carrier refuses, and an observed one is abandoned.
+		p.oversize.Add(1)
+		if track != nil {
+			p.abandon(track)
+		}
+		return nil
+	}
+	var tracks []*frameTrack
+	if track != nil {
+		// Counted before the first symbol goes, because the carrier can
+		// register that one before the next is built.
+		track.remaining = count
+		tracks = []*frameTrack{track}
 	}
 	for i := 0; i < count; i++ {
 		end := min((i+1)*limit, len(frame))
-		if err := p.emit(frame[i*limit:end], i, count); err != nil {
+		if err := p.emit(frame[i*limit:end], i, count, tracks); err != nil {
+			if track != nil {
+				p.abandon(track)
+			}
 			return err
+		}
+		if track != nil && i+1 < count && p.isSettled(track) {
+			// A symbol of this frame was refused or discarded, so it is
+			// abandoned and its owner is already sending it another way.
+			// Its remaining symbols would only compete with that.
+			return nil
 		}
 	}
 	return nil
@@ -429,14 +712,22 @@ func (p *Path) flushPacked() error {
 	if len(p.packed) == 0 {
 		return nil
 	}
-	err := p.emit(p.packed, 0, 1)
+	tracks := p.packedTracks
+	p.packedTracks = nil
+	err := p.emit(p.packed, 0, 1, tracks)
 	p.packed = p.packed[:0]
+	if err != nil {
+		p.abandon(tracks...)
+	}
 	return err
 }
 
 // emit codes one symbol, sends it, and sends whatever repairs the running rate
 // has earned by it.
-func (p *Path) emit(payload []byte, index, count int) error {
+//
+// tracks are the observed frames this symbol carries; when there are any the
+// datagram is tagged, so that their owners learn when it was registered.
+func (p *Path) emit(payload []byte, index, count int, tracks []*frameTrack) error {
 	vector := make([]byte, symbolHeader+len(payload))
 	binary.BigEndian.PutUint16(vector, uint16(len(payload)))
 	binary.BigEndian.PutUint16(vector[2:], uint16(index))
@@ -446,7 +737,7 @@ func (p *Path) emit(payload []byte, index, count int) error {
 	code := p.coding()
 	p.encoder.SetCapacity(code.capacity)
 	esi := p.encoder.Add(vector)
-	if err := p.sendSource(esi, vector); err != nil {
+	if err := p.sendSource(esi, vector, tracks); err != nil {
 		return err
 	}
 	p.burstSymbols++
@@ -501,14 +792,60 @@ func (p *Path) tailRepairs(symbols int) int {
 	return want
 }
 
-func (p *Path) sendSource(esi uint32, vector []byte) error {
+func (p *Path) sendSource(esi uint32, vector []byte, tracks []*frameTrack) error {
 	d := make([]byte, sourceHeader+len(vector))
 	binary.BigEndian.PutUint32(d, p.take())
 	d[4] = kindSource
 	binary.BigEndian.PutUint32(d[5:], esi)
 	copy(d[sourceHeader:], vector)
-	_, err := p.put(d)
+	if len(tracks) == 0 {
+		_, err := p.put(d)
+		return err
+	}
+	tagged, ok := p.carrier.(TaggedCarrier)
+	if !ok {
+		// Nothing below can say when a packet was built, so acceptance is
+		// the nearest event there is.
+		sent, err := p.put(d)
+		if !sent {
+			p.abandon(tracks...)
+			return err
+		}
+		p.registerUntagged(tracks)
+		return nil
+	}
+	p.observe.Do(func() { tagged.ObserveTags(p.onTag) })
+	tag, ok := p.tagFor(tracks)
+	if !ok {
+		return p.failure()
+	}
+	sent, err := p.putTagged(tagged, d, tag)
+	if !sent {
+		// Refused, so the carrier will never report on it.
+		p.onTag(tag, false)
+	}
 	return err
+}
+
+// registerUntagged counts one accepted symbol for each frame, reporting those
+// it completes on the caller's goroutine.
+func (p *Path) registerUntagged(tracks []*frameTrack) {
+	p.tagMu.Lock()
+	var report []*frameTrack
+	for _, track := range tracks {
+		if track.settled {
+			continue
+		}
+		if track.remaining--; track.remaining <= 0 {
+			track.settled = true
+			report = append(report, track)
+		}
+	}
+	p.tagMu.Unlock()
+	now := time.Now()
+	for _, track := range report {
+		track.notify(Registered, now)
+	}
 }
 
 // sendRepair emits one repair over the newest count symbols, or over the whole
@@ -553,16 +890,19 @@ func (p *Path) untake() { p.nextSeq-- }
 
 // put hands one datagram to the carrier and reports whether it reached it.
 func (p *Path) put(d []byte) (bool, error) {
-	switch err := p.carrier.Send(d); {
+	return p.settle(p.carrier.Send(d))
+}
+
+func (p *Path) putTagged(carrier TaggedCarrier, d []byte, tag uint64) (bool, error) {
+	return p.settle(carrier.SendTagged(d, tag))
+}
+
+func (p *Path) settle(err error) (bool, error) {
+	switch {
 	case err == nil:
 		p.sent.Add(1)
 		return true, nil
 	case errors.Is(err, ErrDatagramTooLarge):
-		// The path's estimate moved under us. Losing this datagram is cheaper
-		// than losing the connection, and the next symbol is sized from the
-		// carrier's revised limit. The symbol it carried is still lost -- the
-		// session above re-issues it -- but it was lost here rather than on
-		// the wire, so the peer must not be shown a gap for it.
 		p.oversize.Add(1)
 		p.untake()
 		return false, nil
