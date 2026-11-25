@@ -106,6 +106,11 @@ type ServerConfig struct {
 	// lets package integration tests reproduce loss of a specific logical
 	// frame without depending on encrypted QUIC packet layout.
 	testLaneWriteHook func(protocol.Frame) error
+
+	// CarrierShadow runs the carrier-liveness observer beside today's
+	// recovery; see CarrierShadowConfig. Off by default; it never changes a
+	// decision.
+	CarrierShadow CarrierShadowConfig
 }
 
 type Server struct {
@@ -162,6 +167,9 @@ type Server struct {
 	// count of live sessions leaves them out, and they have a bound of their
 	// own. Guarded by sessionsMu.
 	tombstones int
+
+	// carrierShadow is the carrier-liveness observer; nil when it is off.
+	carrierShadow *carrierShadow
 }
 
 type serverFlow struct {
@@ -460,6 +468,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
 		return nil, err
 	}
+	if err := cfg.CarrierShadow.resolve(); err != nil {
+		return nil, err
+	}
 	if cfg.AdaptiveMinBytesSec == 0 {
 		cfg.AdaptiveMinBytesSec = defaultAdaptiveMinBytesPerSec
 	}
@@ -510,6 +521,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		principalConns: make(map[string]*principalConnections),
 		firstFrames:    make(chan struct{}, handshakes),
 	}
+	server.carrierShadow = newCarrierShadow(cfg.CarrierShadow, carrierShadowGateway, cfg.Logger, cfg.Metrics)
 	return server, nil
 }
 
@@ -1190,6 +1202,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow.classifier = classifier.New(s.classifierConfig())
 	flow.memOwned = s.cfg.Memory == MemoryOwned
 	flow.codedRetrySticky = s.cfg.CodedRetry == CodedRetrySticky
+	flow.carrierShadow = s.carrierShadow
 	// Wire version 1 requires range acknowledgements on both endpoints.
 	flow.ackRanges.Store(true)
 	flow.idleTimeout = s.cfg.FlowIdleTimeout
@@ -1522,6 +1535,10 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 	// here rather than expiring underneath the handshake it was waiting for.
 	// The grace is per outage, so a rescue that dials several JOINs in
 	// parallel extends it once per arriving JOIN, each one fresh evidence.
+	if s.carrierShadow != nil {
+		// The deadline in force when the JOIN arrived, before it extends it.
+		s.carrierShadow.noteJoinArrival(serverSession.flow, laneID, serverSession.flow.replacementDeadlineTime())
+	}
 	if !serverSession.completed.Load() && serverSession.flow.extendReplacementOutage(time.Now(), laneReplacementWait) {
 		s.metrics.LaneGraceExtended()
 		s.cfg.Logger.Debug("lane replacement grace extended by rescue join", "lane", laneID, "flow_id", open.Header.FlowID)

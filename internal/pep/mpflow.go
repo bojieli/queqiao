@@ -252,6 +252,9 @@ type multipathFlow struct {
 	memOwned bool
 	// codedRetrySticky selects the coded-retry bundle (CodedRetrySticky).
 	codedRetrySticky bool
+	// carrierShadow is the endpoint's carrier-liveness observer, nil when it
+	// is off. It only records; nothing here reads what it computes.
+	carrierShadow *carrierShadow
 
 	sendAckFlag uint16
 	recvAckFlag uint16
@@ -630,6 +633,7 @@ func (f *multipathFlow) addLaneLocked(lane *mpLane) {
 	}
 	lane.admitted = time.Now()
 	f.lanes[lane.id] = lane
+	f.carrierShadow.bindLane(f, lane)
 	f.lanesJoined.Add(1)
 	if lane.id >= f.nextJoinID {
 		f.nextJoinID = lane.id + 1
@@ -1357,6 +1361,12 @@ func (f *multipathFlow) laneRetransmits(laneID uint64) bool {
 // goroutines, and notifies the flow-level recovery coordinator. A failed lane
 // is never selected again, even if a buffered write completes later.
 func (f *multipathFlow) failLane(lane *mpLane, err error) {
+	// The carrier is read before the lane is closed: closing a dedicated
+	// lane closes its connection.
+	var shadow carrierObservation
+	if f.carrierShadow != nil && lane != nil && !lane.closed.Load() {
+		shadow = f.carrierShadow.observeLane(lane)
+	}
 	if lane != nil && lane.fc != nil && !lane.closed.Load() {
 		if observer, ok := lane.fc.transport().(interface{ transportFailed(error) }); ok {
 			observer.transportFailed(err)
@@ -1365,7 +1375,7 @@ func (f *multipathFlow) failLane(lane *mpLane, err error) {
 	if !f.closeFailedLane(lane) {
 		return
 	}
-	f.reportLaneFailure(lane, err)
+	f.reportLaneFailure(lane, err, shadow)
 }
 
 // closeFailedLane atomically removes a broken lane from transport and
@@ -1391,7 +1401,7 @@ func (f *multipathFlow) closeFailedLane(lane *mpLane) bool {
 
 // reportLaneFailure exports and coordinates a lane already transitioned by
 // closeFailedLane.
-func (f *multipathFlow) reportLaneFailure(lane *mpLane, err error) {
+func (f *multipathFlow) reportLaneFailure(lane *mpLane, err error, shadow carrierObservation) {
 	// A failing flow's peer closes its lanes on the first RESET it reads,
 	// possibly while the others are still being written: expected teardown.
 	if f.finished.Load() || f.terminating.Load() {
@@ -1413,6 +1423,7 @@ func (f *multipathFlow) reportLaneFailure(lane *mpLane, err error) {
 		f.metrics.LaneFailure()
 	}
 	f.laneFailures.Add(1)
+	f.carrierShadow.noteLaneFailure(f, lane, err, shadow)
 	if f.logger != nil {
 		coded, stream := f.dataSubstrates()
 		f.logger.Debug("multipath lane failed", "flow_id", f.flowID, "lane_id", lane.id,
@@ -2143,10 +2154,21 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			// This escape lasts only until the bytes pending now are acknowledged:
 			// loss of feedback alone is not evidence against future coded DATA.
 			// Only those byte offsets escape; later exchanges remain coded.
+			escapedCoding := false
 			for _, lane := range f.healthyLanes() {
 				if lane.fc.codesData() {
 					f.escapePendingCoding()
+					escapedCoding = true
 					break
+				}
+			}
+			// The shadow observer looks at the data lane before it is demoted.
+			var shadowLane *mpLane
+			if f.carrierShadow != nil {
+				if lanes := f.healthyLanes(); len(lanes) > 0 {
+					if data := f.dataLane(preferUnsuspectedLanes(lanes)); len(data) > 0 {
+						shadowLane = data[0]
+					}
 				}
 			}
 			spare := f.suspectDataLanes()
@@ -2162,6 +2184,9 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 					"send_stalled", stalledSend,
 					"healthy_spare", spare, "lanes", f.laneCount(),
 					"bytes_up", f.bytesUp.Load(), "bytes_down", f.bytesDown.Load())
+			}
+			if f.carrierShadow != nil {
+				f.carrierShadow.noteStall(f, shadowLane, sendSince, threshold, escapedCoding, spare)
 			}
 		}
 		// The manager's own backoff paces the dials; this pacing only keeps a
@@ -2627,6 +2652,7 @@ func (f *multipathFlow) replacementBudget(now time.Time, grace time.Duration) ti
 			}
 		}
 		if f.replacementDeadline.CompareAndSwap(0, now.Add(grace).UnixNano()) {
+			f.carrierShadow.noteOutage(f, now, grace)
 			return grace
 		}
 	}
@@ -2634,7 +2660,20 @@ func (f *multipathFlow) replacementBudget(now time.Time, grace time.Duration) ti
 
 // endReplacementOutage forgets the current outage's deadline, so the next one
 // starts from a full grace.
-func (f *multipathFlow) endReplacementOutage() { f.replacementDeadline.Store(0) }
+func (f *multipathFlow) endReplacementOutage() {
+	if deadline := f.replacementDeadline.Swap(0); deadline != 0 && f.carrierShadow != nil {
+		f.carrierShadow.noteOutageEnd(f, time.Unix(0, deadline))
+	}
+}
+
+// replacementDeadlineTime is the current outage's grace deadline, zero when
+// the flow is not in an outage.
+func (f *multipathFlow) replacementDeadlineTime() time.Time {
+	if deadline := f.replacementDeadline.Load(); deadline != 0 {
+		return time.Unix(0, deadline)
+	}
+	return time.Time{}
+}
 
 // extendReplacementOutage restarts the current outage's grace from now, and
 // reports whether there was an outage to extend. It exists for the endpoint
