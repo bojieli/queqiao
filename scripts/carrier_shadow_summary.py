@@ -139,9 +139,9 @@ class Endpoint:
         # The latest timestamp of any record, shadow or not: where the
         # capture really ends, for deciding what is censored.
         self.capture_end = 0.0
-        # The endpoint's runtime configuration record (the last one read):
-        # whether the observer ran, and its thresholds.
-        self.config: dict[str, Any] | None = None
+        # Each process's runtime configuration record: whether the observer
+        # ran there, and its thresholds.
+        self.configs: dict[Any, dict[str, Any]] = {}
 
     def load(self, paths: list[str], offset_s: float = 0.0) -> None:
         for path in paths:
@@ -152,7 +152,7 @@ class Endpoint:
                         self.capture_end = max(self.capture_end, stamp - offset_s)
                     msg = record.get("msg")
                     if msg == "runtime configuration":
-                        self.config = record
+                        self.configs[record.get("pid", path)] = record
                         continue
                     if not isinstance(msg, str) or not msg.startswith("carrier shadow"):
                         continue
@@ -256,14 +256,19 @@ def promotion_rate(endpoint: Endpoint, rows: list[dict[str, Any]], thresholds: C
     progressed. None when the observer cannot be shown to have run, when
     k_p is not known, or when no promotion was resolved (a zero
     denominator)."""
-    config = endpoint.config
-    observed = config.get("carrier_shadow") is True if config is not None else bool(endpoint.records)
-    if config is not None:
-        ks = int(config.get("carrier_shadow_ks") or 0) or 2
-        kp = int(config.get("carrier_shadow_kp") or 0) or max(4, ks)
+    configs = list(endpoint.configs.values())
+    if configs:
+        # Every process must have run the observer, at one k_p: the rows
+        # pool every process's episodes, so they are read at one threshold.
+        observed = all(c.get("carrier_shadow") is True for c in configs)
+        kps = set()
+        for c in configs:
+            ks = int(c.get("carrier_shadow_ks") or 0) or 2
+            kps.add(int(c.get("carrier_shadow_kp") or 0) or max(4, ks))
     else:
+        observed = bool(endpoint.records)
         kps = {k[1] for k in thresholds if isinstance(k[1], int)}
-        kp = kps.pop() if len(kps) == 1 else None
+    kp = next(iter(kps)) if len(kps) == 1 else None
     row = rows[min(kp, BUCKETS) - 1] if observed and kp else None
     return {"observer": observed, "k_p": kp,
             "promotions_resolved": None if row is None else row["recovered"] + row["dead"],
@@ -789,7 +794,8 @@ def render(report: dict[str, Any], out) -> None:
         if not cal["observer"]:
             rate = "not measured: the observer did not run"
         elif cal["false_promotion_rate"] is None:
-            rate = f"none resolved at k_p={cal['k_p']} (zero denominator)" if cal["k_p"] else "k_p unknown"
+            rate = (f"none resolved at k_p={cal['k_p']} (zero denominator)" if cal["k_p"] else
+                    "not measured: k_p unknown or differs between processes")
         else:
             rate = f"{cal['false_promotion_rate']:.3f} of {cal['promotions_resolved']} at k_p={cal['k_p']}"
         print(f"   false-promotion rate: {rate}", file=out)

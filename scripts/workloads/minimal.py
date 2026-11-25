@@ -427,6 +427,10 @@ class Minimal(pa._Scenario):
             cfg.minimal_stage = int(stage)
         else:
             raise ab.ConfigError("[workload:minimal] stage: auto, 6, 7 or 10")
+        if cfg.minimal_stage < 10 and "mixed-all" in cfg.minimal_trials:
+            # C gates stage 10 only, with stage 10's generic secondaries.
+            raise ab.ConfigError("[workload:minimal] stage: trial type mixed-all (C) gates stage 10; "
+                                 "use stage = 10 or auto")
         iw = p.get("idle_wake", "auto").strip().lower()
         if iw not in ("auto", "true", "false"):
             raise ab.ConfigError("[workload:minimal] idle_wake: auto, true or false")
@@ -561,7 +565,7 @@ class Minimal(pa._Scenario):
                 continue
             h = gm.pool([m.get("_credit_hist") for m in ms])
             if h is not None:
-                out[f"{ph}.credit_delay_p95_s"] = (0.95, gm.samples(h))
+                out[f"{ph}.credit_delay_p95_s"] = (0.95, gm.Tail(h))
             ev = gm.outcomes(gm.pooled_promotions([m.get("_promotions") for m in ms]))
             if ev is not None:
                 out[f"{ph}.false_promotion_rate"] = (None, ev)

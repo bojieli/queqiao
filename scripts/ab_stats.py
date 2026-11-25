@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 __all__ = [
     "mean", "stdev", "quantile", "median", "contrasts", "t_cdf", "t_quantile",
@@ -347,18 +347,25 @@ def bounds(d: Sequence[float], alpha: float, resamples: int = 20000, seed: int =
 
 def pooled_quantile_bounds(cand_blocks: Sequence[Sequence[float]], main_blocks: Sequence[Sequence[float]], q: float,
                            contrast: Callable[[float, float], float], alpha: float, resamples: int = 20000,
-                           seed: int = 1):
+                           seed: int = 1, combine: Optional[Callable[[Sequence[Any], float], float]] = None):
     """A tail percentile over all blocks' pooled samples: the contrast of the
     arms' pooled q-quantiles, and its one-sided (lower, upper) bounds at
     level alpha from a bootstrap that resamples blocks (both arms' samples
     of a block together), so the blocks stay the unit of analysis. Returns
     (observed, lower, upper). With q None the statistic is the pooled mean
-    (a proportion over events given as 0/1 samples)."""
+    (a proportion over events given as 0/1 samples). With `combine`, each
+    block is one opaque item (a histogram) and combine(items, q) is the
+    pooled statistic."""
     n = len(cand_blocks)
     if n == 0 or n != len(main_blocks):
         return float("nan"), float("nan"), float("nan")
 
     def stat(idx):
+        if combine is not None:
+            c_, m_ = [cand_blocks[i] for i in idx], [main_blocks[i] for i in idx]
+            if not any(len(x) for x in c_) or not any(len(x) for x in m_):
+                return float("nan")
+            return contrast(combine(c_, q), combine(m_, q))
         c = [x for i in idx for x in cand_blocks[i]]
         m = [x for i in idx for x in main_blocks[i]]
         if not c or not m:

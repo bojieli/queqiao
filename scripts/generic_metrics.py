@@ -95,6 +95,23 @@ def quantile(q: float, h: Optional[Histogram]) -> float:
     return lo_bound
 
 
+class Tail:
+    """A block's credit delay histogram standing for its samples in a pooled
+    tail (section 15.4): its length is its sample count, and blocks are
+    combined by summing their buckets, so the pooled statistic is the same
+    interpolated quantile a block's own measure is."""
+
+    def __init__(self, h: Histogram) -> None:
+        self.h = h
+
+    def __len__(self) -> int:
+        return int(round(self.h[-1][1])) if self.h else 0
+
+    @staticmethod
+    def quantile(blocks: Sequence["Tail"], q: float) -> float:
+        return quantile(q, pool([b.h for b in blocks]))
+
+
 def samples(h: Optional[Histogram]) -> List[float]:
     """The histogram as samples, each bucket's spread evenly inside it (the
     +Inf bucket's at the last finite bound), so pooled tails can be

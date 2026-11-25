@@ -610,9 +610,13 @@ from the model):
   are rules of every trial type in a stage-10 campaign, and are reported
   without being gated at stages 6 and 7. `[workload:minimal] stage` sets the
   stage: `auto`, the default, is 10 when the campaign runs C and 7
-  otherwise. Run every endpoint of both arms with `--carrier-shadow` at
-  stage 10, or the false-promotion rate is unmeasured and the cell is
-  INCOMPLETE. D is judged on its own rules only (design section 15.4).
+  otherwise; C cannot run below stage 10. Run every endpoint of both arms
+  with `--carrier-shadow` at stage 10, or the false-promotion rate is
+  unmeasured and the cell is INCOMPLETE. A cell from a campaign below stage
+  10 never stands as the final bundle's own evidence at the flip: it counts
+  only when carried forward (`--carry`), so a rerun on the final bundle
+  sets `stage = 10`. D is judged on its own rules only (design section
+  15.4).
 - **B:** the LLM's TTFT p50 and p95, delta lateness p99, stalls and
   freezes per streamed minute, call failures, and class correctness (at
   least 99 % of the response's DATA bytes sent INTERACTIVE, from the

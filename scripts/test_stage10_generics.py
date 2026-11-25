@@ -237,5 +237,108 @@ class Gating(unittest.TestCase):
             tm.parse(tm.BASE.replace("[workload:minimal]", "[workload:minimal]\nstage = 9"))
 
 
+class RoundTwo(unittest.TestCase):
+    def test_c_cannot_run_below_stage_10(self):
+        with self.assertRaises(tm.ab.ConfigError):
+            tm.parse(tm.BASE.replace("[workload:minimal]", "[workload:minimal]\ntrials = mixed-all\nstage = 7"))
+
+    def test_a_stage_7_cell_is_not_the_final_bundles_own_evidence(self):
+        # The same build and flags at stage 7 and at stage 10: only the
+        # stage-10 campaign gated the new secondaries, so a stage-7 cell on
+        # the final build counts only when carried forward.
+        with tempfile.TemporaryDirectory() as d:
+            dirs = {}
+            for stage in (7, 10):
+                root = dirs[stage] = os.path.join(d, f"s{stage}")
+                os.makedirs(root)
+                pathlib.Path(root, "plan.json").write_text(json.dumps(
+                    {"workload": "minimal", "main": "main", "paths": ["a"], "config": {"minimal_stage": stage},
+                     "arms": {"main": {"commit": "a" * 40, "flags": []}, "cand": {"commit": "b" * 40, "flags": []}}}))
+                pathlib.Path(root, "status.json").write_text(json.dumps({"finished_utc": f"2026-06-0{stage // 5}"}))
+            v = {("a", "cand", "primary"): "n/a", ("a", "cand", "rule:bulk.x"): "pass"}
+            with unittest.mock.patch.object(an, "report", return_value=("", v)), \
+                    unittest.mock.patch.object(an, "FLIP_WORKLOADS", ("minimal",)), \
+                    unittest.mock.patch.object(an, "FLIP_PROFILES", dict(an.FLIP_PROFILES, minimal={"minimal": ("bulk",)})):
+                text, ok = an.flip_report([dirs[10]], gates())
+                self.assertTrue(ok, text)
+                text, ok = an.flip_report([dirs[7]], gates())
+                self.assertFalse(ok, text)
+                text, ok = an.flip_report([dirs[7]], gates(), carry=["bulk"])
+                self.assertTrue(ok, text)
+                self.assertIn("carried forward", text)
+
+    def test_a_sparse_p95_is_the_pooled_histograms(self):
+        # Ten blocks, one sample each in (1 s, 1.5 s]: the pooled statistic
+        # is the histogram's interpolated p95, not a bucket midpoint.
+        h = gm.credit_histogram([(histogram([]), histogram([1.2]))])
+        blocks = [gm.Tail(h)] * 10
+        obs, lo, hi = st.pooled_quantile_bounds(blocks, blocks, 0.95, lambda c, m: c, 0.05, 50, 1,
+                                                combine=gm.Tail.quantile)
+        self.assertAlmostEqual(obs, gm.quantile(0.95, gm.pool([h] * 10)))
+        self.assertAlmostEqual(obs, 1.475)
+
+    def test_the_full_profiles_false_promotions_are_event_weighted(self):
+        # A byte-primary campaign: the rate is pooled over blocks' events, and
+        # with no promotion it is reported, not a missing measure.
+        def trials(cand_counts, main_counts):
+            T = an.Trial
+            out = {}
+            for b, (cc, mc) in enumerate(zip(cand_counts, main_counts), start=1):
+                for slot, (arm, counts) in enumerate((("main", mc), ("cand", cc)), start=1):
+                    t = T(b, "a", slot, arm, "x", 1, False)
+                    t.m["_promotions"] = counts
+                    out[(b, "a", slot)] = t
+            return out
+        ev = lambda ts_: gm.outcomes(gm.pooled_promotions([t.m.get("_promotions") for t in ts_]))
+        tr = trials([(1, 1)] + [(0, 50)] * 5, [(0, 1)] + [(0, 50)] * 5)
+        c, m, common = an.paired(tr, "a", "main", "cand", ev)
+        verdict, d_, lo, n_c, n_m = an.proportion_verdict(list(zip(c, m)), 6, lambda x, y: an.RULES["lower"](x, y, (0.01,)),
+                                                          None, gates(), False)
+        self.assertEqual((n_c, n_m), (251, 251))
+        self.assertAlmostEqual(d_, 0.01 - 1 / 251)       # one false of 251, not a block mean of 1/6
+        verdict, *_ = an.proportion_verdict([([], [])] * 6, 6, lambda x, y: 0.0, None, gates(), False)
+        self.assertEqual(verdict, "reported")
+
+    def test_a_zero_denominator_abstains_at_a_look(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            campaign(root, stage=10)
+            v = {("a", "cand", "primary"): "n/a", ("a", "cand", "rule:bulk.x"): "pass",
+                 ("a", "cand", "rule:bulk.false_promotion_rate"): "reported"}
+            with unittest.mock.patch.object(an, "report", return_value=("", v)):
+                dec = an.interim_decisions(root, gates())
+        self.assertEqual(dec[("a", "bulk")], ["pass"])
+
+    def test_a_small_clients_slot_has_its_own_configuration(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            campaign(root, stage=10, cand_false=(0, 2), main_false=(0, 2))
+            plan = json.loads(pathlib.Path(root, "plan.json").read_text())
+            plan["clients"] = {"a": {"small": True}}
+            pathlib.Path(root, "plan.json").write_text(json.dumps(plan))
+            # Only slot 2's own record exists for the candidate's client.
+            for b in range(1, 7):
+                tag = f"b{b:03d}-a-bulk"
+                os.rename(os.path.join(root, "logs", "cl-a-cand", f"client-{tag}.jsonl"),
+                          os.path.join(root, "logs", "cl-a-cand", f"client-{tag}-s2.jsonl"))
+            _, v = an.report(root, gates())
+        self.assertEqual(v[("a", "cand", "rule:bulk.false_promotion_rate")], "n/a")
+
+    def test_the_summary_needs_one_k_p_across_processes(self):
+        with tempfile.TemporaryDirectory() as d:
+            logs = []
+            for pid, kp in ((1, 2), (2, 4)):
+                log = os.path.join(d, f"{pid}.jsonl")
+                with open(log, "w") as f:
+                    f.write(json.dumps({"time": "2026-06-01T00:00:00Z", "msg": "runtime configuration", "pid": pid,
+                                        "carrier_shadow": True, "carrier_shadow_kp": kp}) + "\n")
+                logs.append(log)
+            ep = shadow.Endpoint("client")
+            ep.load(logs)
+            cal = shadow.calibration(ep)
+        self.assertIsNone(cal["k_p"])
+        self.assertIsNone(cal["false_promotion_rate"])
+
+
 if __name__ == "__main__":
     unittest.main()
