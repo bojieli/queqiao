@@ -159,7 +159,7 @@ func (f *multipathFlow) sendClass(sparse bool) protocol.Class {
 	if sparse && f.phased() {
 		return protocol.ClassInteractive
 	}
-	return protocol.Class(f.class.Load())
+	return protocol.Class(f.class.Load()) // #nosec G115 -- f.class only ever stores a protocol.Class.
 }
 
 // codingForClass is the coding preference of a frame of the given class.
