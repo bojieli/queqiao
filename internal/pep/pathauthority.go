@@ -52,6 +52,29 @@ func newClientPathPrincipal() string {
 	return clientPathPrincipal + ":" + strconv.FormatUint(clientPathPrincipals.Add(1), 10)
 }
 
+// pathRekey returns the migration callback of an attachment whose key is
+// now current: it resolves the principal and the addresses again, compares
+// the whole key, and on a change returns the new key's controller after
+// pointing the connection's readers (follow) at its model. It is called
+// only on the connection's run loop.
+func pathRekey(principal func() string, current string, initial quiccongestion.ByteCount, follow func(next string)) func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
+	return func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
+		_, nextAddrs := resolvePath(newLocal, newRemote)
+		nextWho := principal()
+		next := nextWho + "|" + nextAddrs
+		if next == current {
+			return nil
+		}
+		current = next
+		// Resolve the controller first: a lookup may sweep an expired entry
+		// and its model, and the readers must follow the model the
+		// controller reports to.
+		c := pathAuthorities.controller(nextWho, nextAddrs, initial)
+		follow(next)
+		return c
+	}
+}
+
 // pathPrincipalNow is the client's identity in path keys for a connection
 // dialled now: its principal and the generation of its uplink. The key's
 // address part distinguishes uplinks by source address; the generation
@@ -59,7 +82,7 @@ func newClientPathPrincipal() string {
 // A port-only rebinding changes neither.
 func (c *Client) pathPrincipalNow() string {
 	if c.pathPrincipal == "" {
-		return ""
+		return clientPathPrincipal
 	}
 	return c.pathPrincipal + "@" + strconv.FormatUint(c.uplinkGeneration.Load(), 10)
 }
@@ -134,28 +157,27 @@ func (r *pathAuthorityRegistry) forget() {
 // the path key -- a new remote host or a new local uplink -- moves the
 // attachment, with the connection's flight, to that path's controller; a
 // port-only rebinding keeps it.
-func attachPathController(conn *quic.Conn, cfg congestionConfig, principal string) wancongestion.TelemetryProvider {
-	_, current := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
+//
+// principal is read at installation and at every migration, not once when
+// the dial began: a client's uplink generation can move while a dial is in
+// flight, and every connection on one physical path must resolve the same
+// key. A migration compares the whole key, principal included.
+func attachPathController(conn *quic.Conn, cfg congestionConfig, principal func() string) wancongestion.TelemetryProvider {
+	_, addrs := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
+	who := principal()
+	current := who + "|" + addrs
 	initial := conn.InitialPacketSize()
-	controller := pathAuthorities.controller(principal, current, initial)
+	controller := pathAuthorities.controller(who, addrs, initial)
 	// The connection's FEC and probe readers read the model the law reports
 	// to: the principal's.
-	readers := pathModelOfKey(conn, principal+"|"+current)
-	// rekey is called only on the connection's run loop.
-	rekey := func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
-		_, next := resolvePath(newLocal, newRemote)
-		if next == current {
-			return nil
-		}
-		current = next
-		// Resolve the controller first: a lookup may sweep an expired entry
-		// and its model, and the readers must follow the model the
-		// controller reports to.
-		c := pathAuthorities.controller(principal, next, initial)
-		rekeyPathModel(conn, principal+"|"+next)
-		return c
-	}
+	readers := pathModelOfKey(conn, current)
+	rekey := pathRekey(principal, current, initial, func(next string) { rekeyPathModel(conn, next) })
 	attachment := controller.Attach(rekey, func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
+	if cfg.generation != nil {
+		// An uplink change that keeps this connection's addresses is no
+		// migration; the attachment follows the generation itself.
+		attachment.SetGeneration(cfg.generation)
+	}
 	// PROBING follows the transport's own progress export (§4.4, §10.2).
 	attachment.SetTransportProgress(func() wancongestion.TransportProgress {
 		st := conn.ConnectionStats()

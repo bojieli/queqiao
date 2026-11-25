@@ -425,8 +425,8 @@ func TestLatePathProofReborrowsBeforeSendingOPEN(t *testing.T) {
 }
 
 func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	serverCtx, stopServer := context.WithCancel(context.Background())
+	defer stopServer()
 	serverCred, clientCred := testCertificate(t)
 	serverTLS, err := identity.ServerTLSConfig(serverCred, protocol.DataALPN, false)
 	if err != nil {
@@ -439,13 +439,13 @@ func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
 	defer listener.Close()
 	go func() {
 		for {
-			conn, err := listener.Accept(ctx)
+			conn, err := listener.Accept(serverCtx)
 			if err != nil {
 				return
 			}
 			go func() {
 				for {
-					stream, err := conn.AcceptStream(ctx)
+					stream, err := conn.AcceptStream(serverCtx)
 					if err != nil {
 						return
 					}
@@ -459,6 +459,11 @@ func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(c.closeQUICPool)
+	// The bound starts after the setup above: building the test PKI writes
+	// and syncs its store, which takes seconds on a loaded machine and used
+	// to spend most of a bound that was meant for the borrows below.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	cfg := congestionConfig{kind: defaultCongestion()}
 	held, err := c.dialPooledQUICLane(ctx, cfg)
 	if err != nil {

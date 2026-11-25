@@ -256,6 +256,12 @@ type multipathFlow struct {
 	// carrierShadow is the endpoint's carrier-liveness observer, nil when it
 	// is off. It only records; nothing here reads what it computes.
 	carrierShadow *carrierShadow
+	// shadowOutage identifies the current outage to the observer, so its
+	// end record names the outage it ends; zero when none is recorded.
+	// With the observer on, shadowOutageMu makes opening or ending an
+	// outage and publishing its identity one step; off, it is never taken.
+	shadowOutageMu sync.Mutex
+	shadowOutage   uint64
 
 	sendAckFlag uint16
 	recvAckFlag uint16
@@ -357,7 +363,11 @@ type multipathFlow struct {
 	// a handshake. Only the endpoint that opens replacements can tell them
 	// apart, and only while it is trying. The other endpoint reports zeroes,
 	// which is the true answer there: it opens nothing.
-	replacementAttempts    atomic.Uint64
+	replacementAttempts atomic.Uint64
+	// replacementAdmitMu orders beginReplacementAttempt against the close of
+	// done, so an attempt is either counted and started before the flow ends
+	// or neither.
+	replacementAdmitMu     sync.Mutex
 	replacementFailureMu   sync.Mutex
 	replacementFailures    uint64
 	replacementLastFailure string
@@ -2220,16 +2230,8 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			}
 			// Coded bytes are pending only if the escape latched a frontier.
 			escapedCoding := f.codingRecoveryEnd.Load() != 0
-			// The shadow observer looks at the data lane before it is demoted.
-			var shadowLane *mpLane
-			if f.carrierShadow != nil {
-				if lanes := f.healthyLanes(); len(lanes) > 0 {
-					if data := f.dataLane(preferUnsuspectedLanes(lanes)); len(data) > 0 {
-						shadowLane = data[0]
-					}
-				}
-			}
-			spare := f.suspectDataLanes()
+			// The shadow observer looks at the lane the watchdog demotes.
+			spare, shadowLane := f.suspectDataLanes()
 			if f.metrics != nil {
 				f.metrics.FlowStallDetected()
 				if spare {
@@ -2260,9 +2262,11 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 				// in this episode so the peer can replace the current lane.
 				f.suspectDataLanes()
 			}
+			requested := time.Now() // before the manager can answer it
 			select {
 			case f.stallSignal <- struct{}{}:
 				lastSignal = now
+				f.carrierShadow.noteRescueRequest(f, requested)
 			default:
 			}
 		}
@@ -2297,11 +2301,13 @@ func (f *multipathFlow) recoverChunkReliably(offset uint64) bool {
 // suspectDataLanes marks the lanes currently carrying the flow's data as
 // stall-suspected and reports whether a non-suspected healthy lane remains to
 // take over new writes at once -- the warm-spare case, where the switch costs
-// one scheduler poll rather than a handshake.
-func (f *multipathFlow) suspectDataLanes() bool {
+// one scheduler poll rather than a handshake. demoted is the data lane it
+// marked, the one the rescue replaces, so that the carrier-shadow observer
+// looks at the lane the watchdog acted on, not one it selected separately.
+func (f *multipathFlow) suspectDataLanes() (spare bool, demoted *mpLane) {
 	lanes := f.healthyLanes()
 	if len(lanes) == 0 {
-		return false
+		return false, nil
 	}
 	data := f.dataLane(preferUnsuspectedLanes(lanes))
 	for _, lane := range data {
@@ -2310,14 +2316,15 @@ func (f *multipathFlow) suspectDataLanes() bool {
 	if len(data) > 0 {
 		// QUIC has one data lane. Keeping the explicit identity also makes a
 		// zero-numbered initial lane unambiguous to the replacement JOIN.
-		f.setRescueReplacement(data[0].id)
+		demoted = data[0]
+		f.setRescueReplacement(demoted.id)
 	}
 	for _, lane := range f.healthyLanes() {
 		if !lane.suspected.Load() {
-			return true
+			return true, demoted
 		}
 	}
-	return false
+	return false, demoted
 }
 
 // stallSignals exposes the watchdog's rescue request to the lane manager.
@@ -2341,7 +2348,9 @@ func (f *multipathFlow) telemetryLoop(stop <-chan struct{}) {
 func (f *multipathFlow) signalDone() {
 	if f.done != nil {
 		f.doneOnce.Do(func() {
+			f.replacementAdmitMu.Lock()
 			close(f.done)
+			f.replacementAdmitMu.Unlock()
 			if f.ackTrack != nil {
 				f.ackTrack.Close()
 			}
@@ -2557,6 +2566,21 @@ func (f *multipathFlow) replacementLogFields() []any {
 // `lane_replacement_attempts` on its completion record.
 func (f *multipathFlow) noteReplacementAttempt() uint64 { return f.replacementAttempts.Add(1) }
 
+// beginReplacementAttempt is noteReplacementAttempt for a manager that has not
+// yet checked whether the flow has ended, and reports whether the attempt may
+// start. A flow that has ended starts none and counts none. The check and the
+// count are one step against the close of done, and the completion record is
+// written only after done closes, so the record counts exactly the attempts
+// that started.
+func (f *multipathFlow) beginReplacementAttempt() (uint64, bool) {
+	f.replacementAdmitMu.Lock()
+	defer f.replacementAdmitMu.Unlock()
+	if f.doneChanClosed() {
+		return 0, false
+	}
+	return f.noteReplacementAttempt(), true
+}
+
 // noteReplacementFailure records that one such attempt did not produce a lane.
 // A non-failed attempt may have succeeded or may still be in flight when
 // the flow record is emitted. The peer's refusal is also a returned error.
@@ -2628,6 +2652,11 @@ func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Dur
 		// before telling it what is already known.
 		f.replacementTimeouts.Add(1)
 		return errLaneReplacementTimeout
+	}
+	// The timer runs to the outage's published deadline, not for a budget
+	// read some time ago: whatever ran since cannot extend the grace.
+	if deadline := f.replacementDeadlineTime(); !deadline.IsZero() {
+		remaining = min(remaining, time.Until(deadline))
 	}
 	timer := time.NewTimer(remaining)
 	defer timer.Stop()
@@ -2709,8 +2738,24 @@ func (f *multipathFlow) replacementBudget(now time.Time, grace time.Duration) ti
 				continue
 			}
 		}
-		if f.replacementDeadline.CompareAndSwap(0, now.Add(grace).UnixNano()) {
-			f.carrierShadow.noteOutage(f, now, grace)
+		if f.carrierShadow == nil {
+			if f.replacementDeadline.CompareAndSwap(0, now.Add(grace).UnixNano()) {
+				return grace
+			}
+			continue
+		}
+		f.shadowOutageMu.Lock()
+		opened := f.replacementDeadline.CompareAndSwap(0, now.Add(grace).UnixNano())
+		var id uint64
+		if opened {
+			id = shadowOutageSeq.Add(1)
+			f.shadowOutage = id
+		}
+		f.shadowOutageMu.Unlock()
+		if opened {
+			// Off the recovery path: a slow log sink must not lengthen the
+			// grace. The record carries its own observation time.
+			go f.carrierShadow.noteOutage(f, id, now, grace)
 			return grace
 		}
 	}
@@ -2719,10 +2764,21 @@ func (f *multipathFlow) replacementBudget(now time.Time, grace time.Duration) ti
 // endReplacementOutage forgets the current outage's deadline, so the next one
 // starts from a full grace.
 func (f *multipathFlow) endReplacementOutage() {
-	if deadline := f.replacementDeadline.Swap(0); deadline != 0 && f.carrierShadow != nil {
+	if f.carrierShadow == nil {
+		f.replacementDeadline.Swap(0)
+		return
+	}
+	f.shadowOutageMu.Lock()
+	deadline := f.replacementDeadline.Swap(0)
+	id := f.shadowOutage
+	if deadline != 0 {
+		f.shadowOutage = 0
+	}
+	f.shadowOutageMu.Unlock()
+	if deadline != 0 {
 		// The caller may hold the lane admission lock: log off it.
 		ended := time.Now()
-		go f.carrierShadow.noteOutageEnd(f, ended, time.Unix(0, deadline))
+		go f.carrierShadow.noteOutageEnd(f, id, ended, time.Unix(0, deadline))
 	}
 }
 

@@ -1340,3 +1340,172 @@ func TestControlUsesItsDebtWhenTheBulkClaimantCannotSend(t *testing.T) {
 		t.Fatalf("CONTROL beside a BULK claimant that cannot send got %+v; want CONTROL on the debt", p)
 	}
 }
+
+// A loss corrected before the estimator observes it moves between the fate
+// counts: the totals agree with what the estimator counts.
+func TestACorrectedLossMovesBetweenTheFateCounts(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	b.send(now, 1200) // an unresolved predecessor holds the record in the ring
+	a.send(now, 1200)
+	now = now.Add(100 * time.Millisecond)
+	a.event(now, nil, []quiccongestion.PacketNumber{0})
+	a.a.OnAckEvent(quiccongestion.AckEvent{Time: now, Spurious: a.refs([]quiccongestion.PacketNumber{0})})
+	if s := c.Stats(); s.Lost != 0 || s.Delivered != 1 {
+		t.Fatalf("after a correction: lost %d, delivered %d; want 0 and 1", s.Lost, s.Delivered)
+	}
+}
+
+// Sustained CONTROL beside a live BULK claimant, the window full: each ACK
+// frees one packet. CONTROL may go past the claim once, on its debt, while
+// BULK cannot send; after that the claimant gets the next opening, so BULK
+// keeps a share however long CONTROL keeps asking.
+func TestRepeatedControlBorrowingDoesNotStarveALiveClaim(t *testing.T) {
+	c := newPCController()
+	now := base()
+	bulk, ctrl := attachPC(t, c, now), attachPC(t, c, now)
+	bulk.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	ctrl.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	type pkt struct {
+		conn *pcConn
+		n    quiccongestion.PacketNumber
+	}
+	var queue []pkt
+	window := c.law.GetCongestionWindow()
+	for bulk.inFlight+1200 <= window {
+		bulk.sendClass(now, 1200, quiccongestion.ClassBulk)
+		queue = append(queue, pkt{bulk, bulk.next - 1})
+	}
+	// BULK owns the turn: CONTROL has spent its credit.
+	c.arb.OnSent([4]quiccongestion.ByteCount{quiccongestion.ClassControl: 1 << 20})
+	sent := map[quiccongestion.SendClass]int{}
+	try := func(p *pcConn) {
+		if permit := p.a.Admit(now, 1200); permit.OK {
+			p.sendClass(now, 1200, permit.Turn)
+			queue = append(queue, pkt{p, p.next - 1})
+			sent[permit.Turn]++
+		}
+	}
+	for range 200 {
+		now = now.Add(5 * time.Millisecond)
+		// One packet is acknowledged: the oldest.
+		head := queue[0]
+		queue = queue[1:]
+		head.conn.event(now, []quiccongestion.PacketNumber{head.n}, nil)
+		try(ctrl) // the CONTROL sender asks first every time
+		try(bulk)
+	}
+	t.Logf("sent: control %d, bulk %d", sent[quiccongestion.ClassControl], sent[quiccongestion.ClassBulk])
+	if sent[quiccongestion.ClassBulk] < 60 {
+		t.Fatalf("a live BULK claim was starved by repeated CONTROL borrowing: control %d, bulk %d", sent[quiccongestion.ClassControl], sent[quiccongestion.ClassBulk])
+	}
+	if sent[quiccongestion.ClassControl] == 0 {
+		t.Fatal("CONTROL never went past a claim its holder could not use")
+	}
+}
+
+// The claimant is judged by its own packet size: with exactly one of its
+// packets of window left, a 1,200-byte BULK claimant can use its turn, and a
+// CONTROL caller building 1,500-byte packets is not let past it.
+func TestTheClaimantIsJudgedByItsOwnPacketSize(t *testing.T) {
+	c := newPCController()
+	now := base()
+	bulk := attachPC(t, c, now)
+	ctrl := &pcConn{t: t, a: c.Attach(nil, nil), sizes: make(map[quiccongestion.PacketNumber]quiccongestion.ByteCount)}
+	ctrl.a.OnAttach(now, 0, 1500, func() { ctrl.wakes++ })
+	bulk.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	window := c.law.GetCongestionWindow()
+	for bulk.inFlight+2400 <= window {
+		bulk.sendClass(now, 1200, quiccongestion.ClassBulk)
+	}
+	bulk.sendClass(now, window-1200-bulk.inFlight, quiccongestion.ClassBulk) // exactly 1,200 bytes left
+	now = now.Add(time.Second)
+	c.arb.OnSent([4]quiccongestion.ByteCount{quiccongestion.ClassControl: 1 << 20})
+	ctrl.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	wakes := bulk.wakes
+	if p := ctrl.a.Admit(now, 1500); p.OK {
+		t.Fatalf("CONTROL went past a claimant that could send its own packet: %+v", p)
+	} else if p.RetryAt.IsZero() || !p.RetryAt.After(now) {
+		t.Fatalf("the caller was refused as for the window, not deferred to the claimant: %+v", p)
+	}
+	if bulk.wakes == wakes {
+		t.Fatal("the claimant that can send was not woken")
+	}
+	if p := bulk.a.Admit(now, 1200); !p.OK || p.Turn != quiccongestion.ClassBulk {
+		t.Fatalf("the claimant could not use its turn: %+v", p)
+	}
+}
+
+// The idle interval is marked once, when demand resumes: the burst's first
+// ACK does not mark it again, so packets sent after it, with demand
+// continuous since the resume, are measurements of the path.
+func TestAResumedBurstIsMarkedOnce(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.a.OnDemand(quiccongestion.Demand{})
+	now = now.Add(200 * time.Millisecond)
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	for range 5 {
+		a.send(now, 1200)
+	}
+	now = now.Add(50 * time.Millisecond)
+	a.event(now, numbers(0, 1), nil)
+	a.send(now, 1200)
+	c.mu.Lock()
+	state, ok := c.law.inner.estimator.packetStates[6]
+	c.mu.Unlock()
+	if !ok || state.appLimited {
+		t.Fatalf("a packet sent after the burst's first ACK, with demand continuous, was marked application-limited (state %v)", ok)
+	}
+}
+
+// A CONTROL attachment that cannot use a bypass -- PROBING, its probe
+// window full -- is not charged one: the claimant's single bypass is still
+// there for a sibling that can.
+func TestABypassIsChargedOnlyWhenGranted(t *testing.T) {
+	c := newPCController()
+	now := base()
+	bulk, stuck, ctrl := attachPC(t, c, now), attachPC(t, c, now), attachPC(t, c, now)
+	bulk.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	window := c.law.GetCongestionWindow()
+	for bulk.inFlight+1200 <= window {
+		bulk.sendClass(now, 1200, quiccongestion.ClassBulk)
+	}
+	for range pathProbingPTOProbes {
+		stuck.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
+	}
+	now = now.Add(time.Second)
+	c.arb.OnSent([4]quiccongestion.ByteCount{quiccongestion.ClassControl: 1 << 20})
+	stuck.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	if p := stuck.a.Admit(now, 1200); p.OK {
+		t.Fatalf("a PROBING attachment with a full probe window was admitted: %+v", p)
+	}
+	ctrl.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	if p := ctrl.a.Admit(now, 1200); !p.OK || p.Turn != quiccongestion.ClassControl {
+		t.Fatalf("the healthy CONTROL attachment found the bypass spent by one that got no permit: %+v", p)
+	}
+}
+
+// Migration leaves an attachment's bypass standing behind: it starts on the
+// new controller with none.
+func TestABypassDoesNotFollowAMigration(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	a := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+	a.a = old.Attach(func(_, _, _, _ net.Addr) *PathController { return next }, nil)
+	a.a.OnAttach(now, 0, 1200, func() {})
+	old.mu.Lock()
+	a.a.bypassed = true
+	old.mu.Unlock()
+	a.a.OnPathMigrated(now, nil, nil, nil, nil)
+	next.mu.Lock()
+	defer next.mu.Unlock()
+	if a.a.bypassed {
+		t.Fatal("a bypass charged on the old controller followed the attachment to the new one")
+	}
+}

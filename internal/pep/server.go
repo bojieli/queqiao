@@ -980,7 +980,7 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 		}
 		controller = attachPathController(conn, congestionConfig{
 			kind: s.cfg.Congestion, ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched, scope: s.cfg.CongestionScope,
-		}, gatewayPathPrincipal(principal))
+		}, func() string { return gatewayPathPrincipal(principal) })
 	}
 	s.metrics.DataConnectionAccepted(wire)
 	auth := &quicAuthState{principal: principal}

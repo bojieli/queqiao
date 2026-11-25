@@ -126,7 +126,7 @@ func (b *pathBed) counter(remote string) *atomic.Int64 {
 func (b *pathBed) dial() (*quic.Conn, *wancongestion.PathAttachment) {
 	conn := b.clientTLS()
 	cfg := pathScopeConfig
-	cfg.principal = b.principal
+	cfg.principal = func() string { return b.principal }
 	att, ok := configureQUICController(conn, cfg).(*wancongestion.PathAttachment)
 	if !ok {
 		b.t.Fatal("congestion=path did not install a path attachment")
@@ -454,7 +454,7 @@ func TestTwoClientsInOneProcessHaveTheirOwnControllers(t *testing.T) {
 	var atts []*wancongestion.PathAttachment
 	for _, p := range []string{one, two} {
 		cfg := pathScopeConfig
-		cfg.principal = p
+		cfg.principal = func() string { return p }
 		att, ok := configureQUICController(bed.clientTLS(), cfg).(*wancongestion.PathAttachment)
 		if !ok {
 			t.Fatal("no path attachment")
@@ -511,7 +511,7 @@ func TestAnUplinkChangeWithTheSameAddressStartsANewController(t *testing.T) {
 	bed := newPathBed(t, pathsim.Config{OneWayDelay: time.Millisecond, Seed: 17})
 	dial := func() *wancongestion.PathAttachment {
 		cfg := pathScopeConfig
-		cfg.principal = client.pathPrincipalNow()
+		cfg.principal = client.pathPrincipalNow
 		att, ok := configureQUICController(bed.clientTLS(), cfg).(*wancongestion.PathAttachment)
 		if !ok {
 			t.Fatal("no path attachment")
@@ -522,12 +522,39 @@ func TestAnUplinkChangeWithTheSameAddressStartsANewController(t *testing.T) {
 	if before.Controller() != again.Controller() {
 		t.Fatal("two connections on one uplink got different controllers")
 	}
+	// A dial whose configuration was taken before the change and that is
+	// installed after it -- an attempt that outlived an uplink reset.
+	captured := pathScopeConfig
+	captured.principal = client.pathPrincipalNow
+	late := bed.clientTLS()
+	waitAttached(t, before.Controller(), 2)
+	oldPrincipal := client.pathPrincipalNow()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	client.onUplinkChanged(ctx)
 	after := dial()
 	if after.Controller() == before.Controller() {
 		t.Fatal("after an uplink change with the same source address the new connection reuses the old network's controller")
+	}
+	if att := configureQUICController(late, captured).(*wancongestion.PathAttachment); att.Controller() != after.Controller() {
+		t.Fatal("a connection installed after the uplink change resolved the old generation's controller")
+	}
+	// A migration after the change -- with the addresses unchanged --
+	// moves a connection to the current generation's controller, the one a
+	// connection dialled after the change got: the whole key is compared.
+	// The rekey is exercised on its own, with the client's principal before
+	// the change, as the run loop would call it.
+	conn := bed.clientTLS()
+	local, remote := conn.LocalAddr(), conn.RemoteAddr()
+	_, addrs := resolvePath(local, remote)
+	var followed string
+	rekey := pathRekey(client.pathPrincipalNow, oldPrincipal+"|"+addrs, 1200, func(next string) { followed = next })
+	if c := rekey(local, local, remote, remote); c != after.Controller() || followed != client.pathPrincipalNow()+"|"+addrs {
+		t.Fatalf("a migration after the uplink change moved the connection to %p, readers following %q; want the current generation's %p", c, followed, after.Controller())
+	}
+	same := pathRekey(client.pathPrincipalNow, client.pathPrincipalNow()+"|"+addrs, 1200, func(string) {})
+	if same(local, local, remote, remote) != nil {
+		t.Fatal("a migration that kept the whole key moved the connection")
 	}
 }
 
@@ -569,5 +596,72 @@ func TestAGatewayClosesADataConnectionItCannotAttach(t *testing.T) {
 	case <-conn.Context().Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("the gateway kept a data connection it could not attach to its path controller")
+	}
+}
+
+// A resume and a change to a network with the same address seen on one
+// tick still start a new uplink generation before the path is prewarmed.
+func TestAResumeWithAnUplinkChangeStartsANewGeneration(t *testing.T) {
+	_, credentials := testCertificate(t)
+	client, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
+		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	before := client.pathPrincipalNow()
+	client.onUplinkTick(ctx, true, false, "", "")
+	if client.pathPrincipalNow() != before {
+		t.Fatal("a resume without a change started a new generation")
+	}
+	client.onUplinkTick(ctx, true, true, "10.0.0.2|en0|1|10.0.0.1", "10.0.0.2|en0|1|10.0.0.254")
+	if client.pathPrincipalNow() == before {
+		t.Fatal("a resume that saw a same-address network change kept the old generation")
+	}
+}
+
+// A dedicated, unpooled connection that survives a same-address uplink
+// change -- no migration, so no rekey from QUIC -- moves to the new
+// generation's controller at its own next callbacks, on its run loop.
+func TestASurvivingConnectionFollowsTheUplinkGeneration(t *testing.T) {
+	pathAuthorities.forget()
+	_, credentials := testCertificate(t)
+	client, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
+		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bed := newPathBed(t, pathsim.Config{OneWayDelay: time.Millisecond, Seed: 18})
+	cfg := pathScopeConfig
+	cfg.principal = client.pathPrincipalNow
+	cfg.generation = client.uplinkGeneration.Load
+	conn := bed.clientTLS()
+	surviving := configureQUICController(conn, cfg).(*wancongestion.PathAttachment)
+	old := surviving.Controller()
+	waitAttached(t, old, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client.onUplinkChanged(ctx)
+	current := configureQUICController(bed.clientTLS(), cfg).(*wancongestion.PathAttachment).Controller()
+	if current == old {
+		t.Fatal("setup: the uplink change did not start a new controller")
+	}
+	// Traffic on the surviving connection drives its callbacks.
+	sendCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	go bulk(sendCtx, conn)
+	for surviving.Controller() != current {
+		if sendCtx.Err() != nil {
+			t.Fatal("a connection that survived the uplink change kept spending the old generation's controller")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if old.Attachments() != 0 {
+		t.Fatalf("the old controller still has %d attachments", old.Attachments())
 	}
 }

@@ -86,12 +86,10 @@ type PathController struct {
 	// permitSeq counts permits issued.
 	permitSeq uint64
 	// noDemandSince is when the path last ran out of eligible demand, zero
-	// while some attachment has demand; opportunity records an interval
-	// without demand, at least a packet time long, in which the window was
-	// open: an unused admission opportunity (§4.2), consumed by the next
-	// event that marks the sampler.
+	// while some attachment has demand. An interval without demand, at
+	// least a packet time of it with the window and the balance open, is an
+	// unused admission opportunity (§4.2).
 	noDemandSince monotime.Time
-	opportunity   bool
 	// unusedTime is how much of the time since noDemandSince the path could
 	// have admitted a packet -- window open and balance covering one --
 	// accrued up to accruedAt. Time window-blocked or repaying debt is not
@@ -171,7 +169,7 @@ type pathControllerCounters struct {
 	samples, unsampledDebited, nonEliciting       atomic.Uint64
 	exemptBytes                                   atomic.Uint64
 	refusedWindow, refusedPacing, refusedTurn     atomic.Uint64
-	lapsedClaims, debtPermits                     atomic.Uint64
+	lapsedClaims, debtPermits, controlBypasses    atomic.Uint64
 	demotions, promotions                         atomic.Uint64
 }
 
@@ -264,16 +262,14 @@ func (c *PathController) accrue(now monotime.Time) {
 }
 
 // appLimited is the law's application-limited marker under a path
-// controller: an unused opportunity since the last marking, or one in
-// progress. A sender that always has eligible demand -- held back only by
+// controller: an unused opportunity in progress. One that ended when demand
+// resumed was marked then (noteDemand). A sender that always has eligible demand -- held back only by
 // the path's window, its pacer or a sibling's turn -- is never marked; one
 // whose queue empties only between writes for less than a packet time is
 // not either. A sender blocked on peer flow control or a full send queue
 // has no eligible demand, and is.
 func (c *PathController) appLimited() bool {
-	o := c.opportunity || c.unused()
-	c.opportunity = false
-	return o
+	return c.unused()
 }
 
 var pathControllerIDs atomic.Uint64
@@ -454,6 +450,14 @@ func (c *PathController) resolve(pseq quiccongestion.PacketNumber, f fate) {
 	}
 }
 
+// correct flips a lost record the estimator has not yet observed to
+// delivered, moving it between the fate counts with it.
+func (c *PathController) correct(r *fateRecord) {
+	r.fate = fateDelivered
+	c.stats.lost.Add(^uint64(0))
+	c.stats.delivered.Add(1)
+}
+
 // advance expires what has waited past the horizon and lets the estimator
 // observe every resolved fate at the front of the send order, in order.
 func (c *PathController) advance(now monotime.Time) {
@@ -558,10 +562,11 @@ func (c *PathController) noteDemand(union quiccongestion.Demand, now monotime.Ti
 	switch {
 	case any && !c.noDemandSince.IsZero():
 		if c.unused() {
-			c.opportunity = true
 			// Marked now, before the first packet of the resumed burst is
 			// registered: the sampler takes a packet's marker at send, and
-			// on a drained path no ACK may come between.
+			// on a drained path no ACK may come between. Marked once: the
+			// opportunity is consumed here, so the burst's first ACK does
+			// not mark it again and extend the phase over the burst.
 			c.law.inner.estimator.markAppLimited()
 		}
 		c.noDemandSince, c.unusedTime = 0, 0
@@ -636,6 +641,8 @@ func (c *PathController) attach(a *PathAttachment, now monotime.Time, inFlight, 
 	// joins it.
 	c.accrue(c.clamp(now))
 	c.atts[a] = struct{}{}
+	// Nothing of its standing on another controller carries over.
+	a.bypassed = false
 	for cl, e := range a.demand.Eligible {
 		if e {
 			c.byClass[cl][a] = struct{}{}
@@ -691,7 +698,7 @@ func (c *PathController) detach(a *PathAttachment, now monotime.Time) []func() {
 		delete(c.byClass[cl], a)
 	}
 	a.claimDeadline = 0
-	a.waiting, a.unable = false, false
+	a.waiting, a.unable, a.bypassed = false, false, false
 	delete(c.atts, a)
 	if len(c.atts) == 0 {
 		// Published before the count, so a sweep that sees no attachment
@@ -776,6 +783,7 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 		return quiccongestion.Permit{RetryAt: a.earliestUnstick(now)}, wakes
 	}
 	turn := c.arb.Select()
+	var bypassed []*PathAttachment
 	if turn != quiccongestion.ClassExempt && !own[turn] && !c.claimed(a, turn, now) {
 		for o := range c.byClass[turn] {
 			if o != a && o.usable(now)[turn] {
@@ -786,15 +794,16 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 			}
 		}
 		turn = c.arb.SelectAmong(own)
-	} else if turn != quiccongestion.ClassExempt && !own[turn] && !c.fits(now, turn, maxBytes) {
-		// The claimants of the path's turn could not send it now either
-		// (its class has no room in the window or the balance), so their
-		// claim gives them nothing this attachment would take. If its own
-		// work fits -- CONTROL on the control debt, above all -- it is
-		// served now rather than waiting for the flight to drain.
-		if mine := c.arb.SelectAmong(own); mine != quiccongestion.ClassExempt && c.fits(now, mine, maxBytes) {
-			turn = mine
-		}
+	} else if bypassed = c.controlBypass(a, own, turn, now, maxBytes); len(bypassed) > 0 {
+		// CONTROL goes past a live claim its holders cannot use now; the
+		// deficits are left as they are, and nothing else rides on it.
+		turn = quiccongestion.ClassControl
+	}
+	if len(bypassed) == 0 && turn != quiccongestion.ClassExempt && !own[turn] && c.claimantReady(a, turn, now) {
+		// A claimant can send the path's turn now with its own packet, even
+		// if this attachment's would not fit: that is a deferral to it --
+		// it is woken and has a packet time -- not a window refusal.
+		return c.deferTo(a, turn, now, maxBytes, wakes)
 	}
 	// The window and the balance, for the turn the path would serve now.
 	borrowed, refusal := c.admissible(a, now, turn, maxBytes)
@@ -809,26 +818,7 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 		return *refusal, wakes
 	}
 	if c.claimed(a, turn, now) {
-		var retry monotime.Time
-		for o := range c.byClass[turn] {
-			if !c.claims(o, a, turn, now) {
-				continue
-			}
-			if o.claimDeadline.IsZero() {
-				o.claimDeadline = now.Add(c.packetTime(maxBytes))
-			}
-			if retry.IsZero() || o.claimDeadline.Before(retry) {
-				retry = o.claimDeadline
-			}
-			if o.wake != nil {
-				wakes = append(wakes, o.wake)
-			}
-		}
-		c.stats.refusedTurn.Add(1)
-		a.waiting = true
-		c.markDeferred(a, true)
-		a.claimDeadline = 0
-		return quiccongestion.Permit{RetryAt: retry}, wakes
+		return c.deferTo(a, turn, now, maxBytes, wakes)
 	}
 	if !own[turn] && turn != quiccongestion.ClassExempt {
 		// Every claim on the path's turn lapsed: this attachment is served
@@ -848,7 +838,12 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	c.markDeferred(a, false)
 	c.permitSeq++
 	a.lastPermit = c.permitSeq
-	p := c.arb.PermitTurn(turn, maxBytes, !borrowed)
+	// Admitted: a bypass of its claim has been followed by its opportunity.
+	a.bypassed = false
+	if len(bypassed) > 0 {
+		c.commitBypass(bypassed)
+	}
+	p := c.arb.PermitTurn(turn, maxBytes, !borrowed && len(bypassed) == 0)
 	for cl := range p.Fill {
 		if !own[cl] {
 			// Nothing of a class this attachment cannot build fills it.
@@ -924,6 +919,102 @@ func (c *PathController) claimed(a *PathAttachment, turn quiccongestion.SendClas
 // admissible checks the window, against the path's flight or a PROBING
 // attachment's own, and the balance, for a packet of the given turn. A
 // CONTROL turn may borrow the control debt; borrowed says it did.
+// controlBypass decides whether a's CONTROL work may go past the live claim
+// of the path's turn, and records it if so. Two properties, no more:
+//
+//   - CONTROL is not held behind claimants that cannot use the turn now:
+//     none of them could send a packet of its own size, against its own
+//     window (a PROBING claimant's probe window) and the balance, while
+//     CONTROL fits on the control debt. A claimant whose ability is unknown
+//     keeps its claim.
+//   - A live claim is not starved: each claimant is bypassed at most once
+//     until it is next admitted, so CONTROL then waits for the window like
+//     anyone else and the claimant gets the opening it was waiting for. A
+//     dead claimant -- one that never asks again -- costs CONTROL that one
+//     drain: with the window open, its claim lapses after a packet time
+//     like any other unused claim.
+//
+// It decides only; the bypass is charged (commitBypass) when the permit is
+// actually granted.
+func (c *PathController) controlBypass(a *PathAttachment, own [quiccongestion.NumSendClasses]bool, turn quiccongestion.SendClass, now monotime.Time, maxBytes quiccongestion.ByteCount) []*PathAttachment {
+	if turn == quiccongestion.ClassExempt || turn == quiccongestion.ClassControl || own[turn] || !own[quiccongestion.ClassControl] {
+		return nil
+	}
+	if !c.fits(now, quiccongestion.ClassControl, maxBytes) {
+		return nil
+	}
+	var claimants []*PathAttachment
+	for o := range c.byClass[turn] {
+		if !c.claims(o, a, turn, now) {
+			continue
+		}
+		if o.bypassed || o.maxPacket <= 0 || c.claimantCanSend(o, now) {
+			return nil
+		}
+		claimants = append(claimants, o)
+	}
+	return claimants
+}
+
+// commitBypass charges a granted bypass to the claimants it went past.
+func (c *PathController) commitBypass(claimants []*PathAttachment) {
+	for _, o := range claimants {
+		o.bypassed = true
+	}
+	c.stats.controlBypasses.Add(1)
+}
+
+// deferTo refuses a for the claim others hold on turn: each claimant is
+// woken and its claim deadline started, and a retries at the earliest one.
+func (c *PathController) deferTo(a *PathAttachment, turn quiccongestion.SendClass, now monotime.Time, maxBytes quiccongestion.ByteCount, wakes []func()) (quiccongestion.Permit, []func()) {
+	var retry monotime.Time
+	for o := range c.byClass[turn] {
+		if !c.claims(o, a, turn, now) {
+			continue
+		}
+		if o.claimDeadline.IsZero() {
+			o.claimDeadline = now.Add(c.packetTime(maxBytes))
+		}
+		if retry.IsZero() || o.claimDeadline.Before(retry) {
+			retry = o.claimDeadline
+		}
+		if o.wake != nil {
+			wakes = append(wakes, o.wake)
+		}
+	}
+	c.stats.refusedTurn.Add(1)
+	a.waiting = true
+	c.markDeferred(a, true)
+	a.claimDeadline = 0
+	return quiccongestion.Permit{RetryAt: retry}, wakes
+}
+
+// claimantReady says whether some claimant of turn against a could send
+// its own packet now.
+func (c *PathController) claimantReady(a *PathAttachment, turn quiccongestion.SendClass, now monotime.Time) bool {
+	for o := range c.byClass[turn] {
+		if c.claims(o, a, turn, now) && o.maxPacket > 0 && c.claimantCanSend(o, now) {
+			return true
+		}
+	}
+	return false
+}
+
+// claimantCanSend says whether o could send an ordinary packet of its own
+// size now: its window -- the path's, or a PROBING attachment's own probe
+// window -- and the balance.
+func (c *PathController) claimantCanSend(o *PathAttachment, now monotime.Time) bool {
+	size := o.maxPacket
+	if o.probing {
+		if o.gauge+size > pathProbeWindowPackets*c.maxPacket {
+			return false
+		}
+	} else if c.flight+size > c.law.GetCongestionWindow() {
+		return false
+	}
+	return c.law.pacer.budget(now) >= size
+}
+
 // fits says whether an ordinary packet of the given turn would pass the
 // path's window and balance now, as admissible decides for a COUNTED
 // attachment, without recording anything.
@@ -1115,7 +1206,7 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		if !ref.lost {
 			c.resolve(ref.pseq, fateDelivered)
 		} else if rec := c.record(ref.pseq); rec != nil && rec.fate == fateLost {
-			rec.fate = fateDelivered
+			c.correct(rec)
 			c.stats.spurious.Add(1)
 		}
 		c.acked = append(c.acked, quiccongestion.AckedPacketInfo{PacketNumber: ref.pseq, BytesAcked: ref.bytes})
@@ -1141,7 +1232,7 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		// yet; beyond that the loss stands there. The sampler still has the
 		// state, so the bytes count as delivered.
 		if rec := c.record(ref.pseq); rec != nil && rec.fate == fateLost {
-			rec.fate = fateDelivered
+			c.correct(rec)
 		}
 		c.acked = append(c.acked, quiccongestion.AckedPacketInfo{PacketNumber: ref.pseq, BytesAcked: ref.bytes})
 		resolved += ref.bytes
@@ -1253,10 +1344,17 @@ type PathAttachment struct {
 	// it sends first; zero while nobody has deferred to it since it last
 	// sent.
 	claimDeadline monotime.Time
+	// generation reads the endpoint's uplink generation; seenGeneration is
+	// the one this attachment last resolved its key with. Run loop only.
+	generation     func() uint64
+	seenGeneration uint64
 	// progress reads the connection's transport progress; progressEpoch is
 	// the epoch last seen.
 	progress      func() TransportProgress
 	progressEpoch uint64
+	// bypassed says CONTROL went past this attachment's claim and it has
+	// not been admitted since: no further bypass until it is.
+	bypassed bool
 	// stuckUntil is, per class, until when a turn this attachment could not
 	// build is passed over for it (OnEmptyBuild).
 	stuckUntil [quiccongestion.NumSendClasses]monotime.Time
@@ -1400,6 +1498,7 @@ func (a *PathAttachment) OnDemand(d quiccongestion.Demand) {
 }
 
 func (a *PathAttachment) Admit(now monotime.Time, maxBytes quiccongestion.ByteCount) quiccongestion.Permit {
+	a.followGeneration(now)
 	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
@@ -1423,6 +1522,7 @@ func (a *PathAttachment) OnSent(s quiccongestion.SentPacket) {
 }
 
 func (a *PathAttachment) OnAckEvent(ev quiccongestion.AckEvent) {
+	a.followGeneration(ev.Time)
 	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
@@ -1512,6 +1612,34 @@ type TransportProgress struct {
 // progress after which an attachment is PROBING.
 const pathProbingPTOExpiries = 2
 
+// SetGeneration gives the attachment its endpoint's uplink generation. The
+// generation is part of the path key, and an uplink change that keeps the
+// connection's addresses produces no migration: so the attachment compares
+// it at its own callbacks, on its run loop, and moves to the path's current
+// controller when it changed. It must be called before installation.
+func (a *PathAttachment) SetGeneration(read func() uint64) {
+	a.generation = read
+	a.seenGeneration = read()
+}
+
+// followGeneration re-attaches a, on its run loop, if its endpoint's uplink
+// generation moved since it last looked.
+func (a *PathAttachment) followGeneration(now monotime.Time) {
+	if a.generation == nil || !a.attached {
+		return
+	}
+	g := a.generation()
+	if g == a.seenGeneration {
+		return
+	}
+	a.seenGeneration = g
+	if a.addrs == nil {
+		return
+	}
+	local, remote := a.addrs()
+	a.OnPathMigrated(now, local, local, remote, remote)
+}
+
 // SetTransportProgress gives the attachment its connection's progress
 // export. With it, PROBING follows the transport's own evidence -- which
 // also sees a late acknowledgement of a packet retired for a PTO probe,
@@ -1581,9 +1709,10 @@ func (a *PathAttachment) SetRTTStatsProvider(provider quiccongestion.RTTStatsPro
 }
 
 func (a *PathAttachment) SetMaxDatagramSize(size quiccongestion.ByteCount) {
-	a.maxPacket = size
 	c := a.ctl.Load()
 	c.mu.Lock()
+	// Under the lock: a sibling's admission reads it (controlBypass).
+	a.maxPacket = size
 	c.notePacketSize(size)
 	c.mu.Unlock()
 }

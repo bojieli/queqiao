@@ -204,20 +204,31 @@ func (c *Client) watchUplink(ctx context.Context, known string) {
 			pathEvent = false
 		}
 		from, changed := state.observe(current, unavailable)
-		if resumed {
-			c.prewarmPath(ctx)
-			continue
-		}
-		if !changed {
-			continue
-		}
-		c.cfg.Logger.Info("uplink changed", "from", from, "to", current)
-		c.onUplinkChanged(ctx)
+		c.onUplinkTick(ctx, resumed, changed, from, current)
 	}
 }
 
 // onUplinkChanged abandons what belonged to the old path and measures the new
 // one before anything needs it.
+// onUplinkTick acts on one observation of the uplink: a resume prewarms
+// the path, and a change replaces the pool. A change seen on the same tick
+// as a resume is handled as a change: the new uplink generation is
+// published first, and only then is the pool -- including anything a
+// borrower installed since the resume closed it -- closed and prewarmed, so
+// no connection of the old generation is left pooled beside the new
+// network's.
+func (c *Client) onUplinkTick(ctx context.Context, resumed, changed bool, from, current string) {
+	if resumed && !changed {
+		c.prewarmPath(ctx)
+		return
+	}
+	if !changed {
+		return
+	}
+	c.cfg.Logger.Info("uplink changed", "from", from, "to", current)
+	c.onUplinkChanged(ctx)
+}
+
 func (c *Client) onUplinkChanged(ctx context.Context) {
 	// Connections dialled from now on belong to a new path controller,
 	// whatever the new uplink's address (congestion=path).
