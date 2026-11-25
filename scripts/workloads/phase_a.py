@@ -89,7 +89,7 @@ def llm_metrics(calls: Sequence[dict]) -> Dict[str, float]:
         "freezes_per_min": sum(1 for x in g if x >= FREEZE) / minutes if minutes > 0 else nan,
         "stall_time_ratio": sum(max(0.0, x - STALL_EXCESS) for x in g) / streamed if streamed > 0 else nan,
         "completion_excess_p50_s": q(excess, 0.5),
-        "upload_R_p50_s": q([c["R"] for c in ok if c.get("R") is not None], 0.5),
+        "upload_r_p50_s": q([c["R"] for c in ok if c.get("R") is not None], 0.5),
         "connect_p50_s": q([c["connect"] for c in calls if c.get("connect") is not None], 0.5),
         "call_failures": (len(calls) - len(ok)) / len(calls),
     }
@@ -176,6 +176,28 @@ def useful_bg(rows: Sequence[dict]) -> float:
     return float(sum(int(r["bytes"] or 0) for r in rows if r.get("http") == "200"))
 
 
+SINK_UNKNOWN = "99"   # wlclient: a cut upload whose received bytes could not be learned
+
+
+def rate_in_window(rows: Sequence[dict], window: Tuple[float, float]) -> Tuple[float, float]:
+    """(useful bytes, seconds) the background delivered within `window`:
+    each transfer's bytes prorated over its own interval and clipped to the
+    window. The window is the foreground's span, so two arms whose
+    foregrounds take different times are compared as rates, not as totals
+    over different durations."""
+    a, b = window
+    got = 0.0
+    for r in rows:
+        if r.get("http") != "200" or not r.get("t_start") or not r.get("t_end"):
+            continue
+        s, e = float(r["t_start"]), float(r["t_end"])
+        n = float(r["bytes"] or 0)
+        if e <= s:
+            continue
+        got += n * max(0.0, min(e, b) - max(s, a)) / (e - s)
+    return got, max(0.0, b - a)
+
+
 # --- generators ----------------------------------------------------------------------
 
 def _client(campaign: Any, job: w.Job, arm: Any, cmd: str, target_port: int, extra: str) -> str:
@@ -241,7 +263,7 @@ def _words(v: str) -> List[str]:
 
 
 LLM_REPORT_ONLY = ("lateness_p50_s", "lateness_p95_s", "lateness_max_s", "gap_p99_s", "gap_max_s",
-                   "stall_time_ratio", "completion_excess_p50_s", "upload_R_p50_s", "connect_p50_s")
+                   "stall_time_ratio", "completion_excess_p50_s", "upload_r_p50_s", "connect_p50_s")
 TERM_REPORT_ONLY = ("echo_p50_a_s", "echo_p95_a_s", "echo_p50_c_s", "echo_p95_c_s")
 
 
@@ -439,14 +461,27 @@ class Mixed(_Scenario):
         return out
 
     def has_evidence(self, ph, recs):
-        return any(r.get("kind") == "llm" for r in recs) and any(r.get("kind") == "term" and r.get("canary") for r in recs)
+        # A canary counts only if it measured something: a session that
+        # failed to connect, or returned no echo, is not evidence.
+        return any(r.get("kind") == "llm" for r in recs) and \
+            any(r.get("kind") == "term" and r.get("canary") and not r.get("fail") and r.get("keys") for r in recs)
 
     def phase_measures(self, ph, recs, rows, trials):
         m = llm_metrics([r for r in recs if r.get("kind") == "llm"])
         canary = term_metrics([r for r in recs if r.get("kind") == "term" and r.get("canary")])
         m["canary_echo_p99_s"] = canary.get("echo_p99_a_s", float("nan"))
-        bg = [r for r in rows if r["kind"] in ("wl-bgdown", "wl-bgup")]
-        m["bg_bytes"] = useful_bg(bg) / max(1, len(trials))
+        # The background's own rate over each trial's foreground window,
+        # pooled: bytes in the windows over the windows' length.
+        got = secs = 0.0
+        unknown = False
+        for t in trials:
+            trows = [r for r in t.rows if r["phase"] == ph and r["kind"] in ("wl-bgdown", "wl-bgup")]
+            unknown |= any(r.get("curl_exit") == SINK_UNKNOWN for r in trows)
+            span = fg_span([x for x in getattr(t, "records", []) if x.get("_phase") == ph and x.get("kind") == "llm"])
+            if span:
+                g, w_ = rate_in_window(trows, span)
+                got, secs = got + g, secs + w_
+        m["bg_rate_bps"] = got / secs if secs > 0 and not unknown else float("nan")
         if not self.under_background(ph, recs, rows, trials):
             return {k: float("nan") for k in m}
         m["class_interactive"] = float("nan")

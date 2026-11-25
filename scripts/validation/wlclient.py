@@ -153,10 +153,15 @@ def llm_call(sock, reader: Reader, args, upload: int, seed: int) -> dict:
         if n == 0:
             reader.line()
             break
+        if first_byte is None:
+            # TTFT is the first byte of event 1, not its completion: a split
+            # first chunk must not charge its tail to TTFT.
+            if not reader.buf:
+                reader.fill()
+            first_byte = time.monotonic()
         data = reader.exact(n)
         reader.line()
-        now = time.monotonic()
-        first_byte = first_byte if first_byte is not None else now
+        now = time.monotonic()        # the delta is complete: its receive time r_i
         size += n
         for ev in data.split(b"\n\n"):
             if not ev.startswith(b"data: ") or ev.startswith(b"data: [DONE]"):
@@ -288,16 +293,22 @@ def cmd_term(args) -> None:
         now = time.monotonic() - c0
         if now >= args.duration:
             break
-        if not args.canary and now >= next_burst:
+        try:
+            if not args.canary and now >= next_burst:
+                with wlock:
+                    sock.sendall(b"B" + struct.pack(">HI", 4, args.burst_bytes))
+                rec["bursts"].append(round(now, 6))
+                next_burst += args.burst_every
+            seq += 1
+            with LOCK:
+                pending[seq] = time.monotonic() - c0
             with wlock:
-                sock.sendall(b"B" + struct.pack(">HI", 4, args.burst_bytes))
-            rec["bursts"].append(round(now, 6))
-            next_burst += args.burst_every
-        seq += 1
-        with LOCK:
-            pending[seq] = time.monotonic() - c0
-        with wlock:
-            sock.sendall(b"K" + struct.pack(">H", 36) + struct.pack(">I", seq) + b"k" * 32)
+                sock.sendall(b"K" + struct.pack(">H", 36) + struct.pack(">I", seq) + b"k" * 32)
+        except (OSError, ssl.SSLError) as e:
+            # A write that fails (reset, timeout) ends the session as a
+            # failure, recorded like a read-side one: the arm's, not the harness's.
+            fail.append(f"{type(e).__name__}: {e}"[:200])
+            break
         time.sleep(max(args.floor, rng.expovariate(1.0 / args.mean_gap)))
     time.sleep(min(2.0, args.timeout))         # let the last echoes arrive
     done.set()
@@ -368,21 +379,57 @@ def cmd_bgdown(args) -> None:
         t.join()
 
 
+SINK_UNKNOWN = 99   # a cut upload whose received bytes could not be learned
+
+
+def sink_report(args, tag: str, tries: int = 6) -> "int | None":
+    """Bytes the far side's sink received for one tagged upload, once that
+    request has ended there; None if it cannot be learned."""
+    for _ in range(tries):
+        time.sleep(0.5)
+        try:
+            s = open_conn(args, 10)
+            s.settimeout(10)
+            s.sendall(f"GET /sink-report?tag={tag} HTTP/1.1\r\nHost: wlserver\r\nContent-Length: 0\r\n\r\n".encode())
+            r = Reader(s)
+            status = r.line()
+            length = 0
+            while True:
+                h = r.line()
+                if not h:
+                    break
+                if h.lower().startswith(b"content-length:"):
+                    length = int(h.split(b":", 1)[1])
+            body = r.exact(length) if length else b""
+            s.close()
+            if b" 200 " not in status + b" ":
+                continue
+            rep = json.loads(body)
+            if rep.get("done"):
+                return int(rep["bytes"])
+        except (OSError, EOFError, ValueError, ssl.SSLError):
+            continue
+    return None
+
+
 def cmd_bgup(args) -> None:
     """`flows` uploads to the far side's sink, each posting object after
     object until the window closes or the stop file appears."""
     end = time.time() + args.duration
     block = os.urandom(1 << 16)
+    run = os.urandom(6).hex()
 
     def flow(i):
         k = 0
         while time.time() < end and not stopped(args):
             k += 1
             t0, sent, code, err = time.time(), 0, 0, 0
+            tag = f"{run}-{i}-{k}"
             try:
                 s = open_conn(args, 10)
                 s.settimeout(10)
-                s.sendall(f"POST /sink HTTP/1.1\r\nHost: wlserver\r\nContent-Length: {args.object_bytes}\r\n\r\n".encode())
+                s.sendall(f"POST /sink HTTP/1.1\r\nHost: wlserver\r\nContent-Length: {args.object_bytes}\r\n"
+                          f"X-QQ-Tag: {tag}\r\n\r\n".encode())
                 while sent < args.object_bytes:
                     if time.time() >= end or stopped(args):
                         err = 28
@@ -397,7 +444,16 @@ def cmd_bgup(args) -> None:
             except (OSError, EOFError, ValueError, ssl.SSLError):
                 err = 7
             t1 = time.time()
-            row(t0, t1, f"u{i}o{k}", code, sent, t1 - t0, err)
+            if err == 28:
+                # Cut by the window: count what the sink received, not what
+                # this side handed to its socket. Unknown is recorded as such.
+                got = sink_report(args, tag)
+                if got is None:
+                    row(t0, t1, f"u{i}o{k}", 0, 0, t1 - t0, SINK_UNKNOWN)
+                else:
+                    row(t0, t1, f"u{i}o{k}", 200, got, t1 - t0, 28)
+            else:
+                row(t0, t1, f"u{i}o{k}", code, sent, t1 - t0, err)
             if err:
                 break
 

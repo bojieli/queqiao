@@ -60,7 +60,7 @@ class LLMMetrics(unittest.TestCase):
         m = pa.llm_metrics(calls)
         self.assertAlmostEqual(m["ttft_net_p50_s"], 0.3)             # 0.1..0.5 net of T = 0.5
         self.assertAlmostEqual(m["call_failures"], 1 / 6)
-        self.assertAlmostEqual(m["upload_R_p50_s"], 0.2)
+        self.assertAlmostEqual(m["upload_r_p50_s"], 0.2)
         self.assertAlmostEqual(m["connect_p50_s"], 0.3)
 
     def test_completion_excess(self):
@@ -97,6 +97,19 @@ class TermMetrics(unittest.TestCase):
 class Coverage(unittest.TestCase):
     def rows(self, spans):
         return [{"t_start": f"{a:.3f}", "t_end": f"{b:.3f}"} for a, b in spans]
+
+    def test_background_rate_is_over_the_foreground_window(self):
+        # Same 10 MB/s background, foregrounds of 45 s and 60 s: equal rates,
+        # though the raw totals differ by a third.
+        rows = lambda a, b, rate: [{"http": "200", "t_start": f"{a:.3f}", "t_end": f"{b:.3f}", "bytes": str(int(rate * (b - a)))}]
+        g1, w1 = pa.rate_in_window(rows(0, 100, 10e6), (10, 55))
+        g2, w2 = pa.rate_in_window(rows(0, 100, 10e6), (10, 70))
+        self.assertAlmostEqual(g1 / w1, 10e6)
+        self.assertAlmostEqual(g2 / w2, 10e6)
+        self.assertNotAlmostEqual(g1, g2)
+        # Only the part of a transfer inside the window counts.
+        g, w = pa.rate_in_window(rows(50, 150, 1e6), (0, 100))
+        self.assertAlmostEqual(g, 50e6)
 
     def test_every_background_flow_must_span_the_foreground(self):
         rows = lambda flow, a, b, n=1000: {"flow": flow, "t_start": f"{a:.3f}", "t_end": f"{b:.3f}", "bytes": str(n)}
@@ -137,6 +150,86 @@ host = gw
 [production:c1]
 host = c1
 """
+
+
+class Evidence(unittest.TestCase):
+    def test_a_failed_canary_is_not_evidence(self):
+        mixed = wl.WORKLOADS["mixed"]()
+        llm = {"kind": "llm"}
+        self.assertTrue(mixed.has_evidence("m1-100k", [llm, {"kind": "term", "canary": True, "fail": "", "keys": [[1, 0.1]]}]))
+        self.assertFalse(mixed.has_evidence("m1-100k", [llm, {"kind": "term", "canary": True, "fail": "ConnectionRefusedError",
+                                                             "keys": []}]))
+        self.assertFalse(mixed.has_evidence("m1-100k", [llm, {"kind": "term", "canary": True, "fail": "", "keys": []}]))
+
+
+class ClientInProcess(unittest.TestCase):
+    """wlclient's own code paths with a scripted socket."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("wlclient_t", CLIENT)
+        self.wc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.wc)
+        self.out = io.StringIO()
+        p = mock.patch.object(self.wc.sys, "stdout", self.out)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def records(self):
+        return [json.loads(l[2:]) for l in self.out.getvalue().splitlines() if l.startswith("J\t")]
+
+    def test_a_write_error_records_a_failed_session(self):
+        class Sock:
+            def __init__(self):
+                self.ev = threading.Event()
+
+            def settimeout(self, t):
+                pass
+
+            def sendall(self, b):
+                raise ConnectionResetError("reset by peer")
+
+            def recv(self, n):
+                self.ev.wait(5)
+                raise OSError("closed")
+
+            def close(self):
+                self.ev.set()
+        args = self.wc.main.__globals__["argparse"].Namespace(
+            delay=0, seed=1, timeout=1, duration=5, canary=True, burst_at=0, burst_every=0, burst_bytes=0,
+            mean_gap=0.01, floor=0.01, stop_file="")
+        with mock.patch.object(self.wc, "open_conn", return_value=Sock()):
+            self.wc.cmd_term(args)
+        recs = self.records()
+        self.assertEqual(len(recs), 1)
+        self.assertIn("ConnectionResetError", recs[0]["fail"])
+
+    def test_ttft_is_the_first_payload_byte(self):
+        # The first event arrives split: 10 bytes, then 0.3 s later the rest.
+        ev = b'data: {"i":0,"s":1000.0,"R":0.1,"p":"x"}\n\n'
+        chunk = b"%x\r\n" % len(ev) + ev + b"\r\n"
+        head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        cut = chunk.index(b"\r\n") + 2 + 10
+        script = [head + chunk[:cut], ("sleep", 0.3), chunk[cut:] + b"0\r\n\r\n"]
+
+        class Sock:
+            def settimeout(self, t):
+                pass
+
+            def sendall(self, b):
+                pass
+
+            def recv(self, n):
+                item = script.pop(0)
+                if isinstance(item, tuple):
+                    time.sleep(item[1])
+                    item = script.pop(0)
+                return item
+        s = Sock()
+        args = self.wc.main.__globals__["argparse"].Namespace(think_ms=0, deltas=1, cadence_ms=25, timeout=5)
+        r = self.wc.llm_call(s, self.wc.Reader(s), args, 10, seed=1)
+        self.assertLess(r["ttft"], 0.2)                  # the first byte, before the 0.3 s stall
+        self.assertGreater(r["deltas"][0][1], 0.25)      # the delta itself completed after it
 
 
 class Plans(unittest.TestCase):
@@ -203,7 +296,8 @@ def write_llm_campaign(root, cand_late=0.0, bg_dies=False, blocks=12, seed=5):
     rng = random.Random(seed)
     os.makedirs(root)
     plan = {"main": "main", "workload": "llm", "paths": ["a"], "schedule": [], "config": {"duration": 90},
-            "arms": {"main": {"role": "main", "flags": []}, "cand": {"role": "candidate", "flags": []}},
+            "arms": {"main": {"role": "main", "flags": [], "commit": "a" * 40},
+                     "cand": {"role": "candidate", "flags": [], "commit": "b" * 40}},
             "clients": {"a": {"small": True}}}
     rows, recs = [], []
     t = 1_780_000_000.0
@@ -270,7 +364,7 @@ class Report(unittest.TestCase):
         self.assertEqual(r["llm"]["*.ttft_net_p95_s"], ("atmost", (1.15, 0.05)))
         self.assertEqual(r["llm"]["*.class_interactive"], ("floor", (0.99,)))
         self.assertEqual(r["term"]["*.latch_ratio"], ("ceiling", (1.15,)))
-        self.assertEqual(r["mixed"]["*.bg_bytes"], ("atleast", (0.90,)))
+        self.assertEqual(r["mixed"]["*.bg_rate_bps"], ("atleast", (0.90,)))
 
     def test_every_cell_is_judged_and_class_telemetry_is_required(self):
         root = os.path.join(self.tmp.name, "eq")
@@ -331,7 +425,7 @@ class Flip(unittest.TestCase):
         write_llm_campaign(good)
         text, ok = an.flip_report([good], self.gates)
         self.assertFalse(ok)                                   # bulk, term, ... are missing
-        self.assertIn("Missing workloads", text)
+        self.assertIn("Missing:", text)
         with mock.patch.object(an, "FLIP_WORKLOADS", ("llm",)):
             text, ok = an.flip_report([good], self.gates)
             self.assertTrue(ok, text)
@@ -367,9 +461,42 @@ class Flip(unittest.TestCase):
             text, ok = an.flip_report([good, other], self.gates)
             self.assertIn("| llm | b | cand |", text)
             self.assertTrue(ok, text)   # llm on both paths
+            # Different candidates per campaign: each covers only part of the
+            # matrix, so neither passes it.
+            other2 = os.path.join(self.tmp.name, "candb")
+            write_llm_campaign(other2)
+            p2 = json.loads(pathlib.Path(other2, "plan.json").read_text())
+            p2["arms"]["candB"] = p2["arms"].pop("cand")
+            for sl in p2["schedule"]:
+                sl["arm"] = "candB" if sl["arm"] == "cand" else sl["arm"]
+            pathlib.Path(other2, "plan.json").write_text(json.dumps(p2))
+            tsv = pathlib.Path(other2, "trials.tsv").read_text().replace("\tcand\t", "\tcandB\t")
+            pathlib.Path(other2, "trials.tsv").write_text(tsv)
+            recs = [json.loads(l) for l in pathlib.Path(other2, "measures.jsonl").read_text().splitlines()]
+            pathlib.Path(other2, "measures.jsonl").write_text(
+                "".join(json.dumps(dict(r, _arm="candB" if r["_arm"] == "cand" else r["_arm"])) + "\n" for r in recs))
+            with mock.patch.object(an, "FLIP_WORKLOADS", ("llm", "bulk")):
+                b2 = os.path.join(self.tmp.name, "bulkcand")
+                write_llm_campaign(b2)
+                bp = json.loads(pathlib.Path(b2, "plan.json").read_text())
+                bp["workload"] = "bulk"
+                pathlib.Path(b2, "plan.json").write_text(json.dumps(bp))
+                text, ok = an.flip_report([good, b2, other2], self.gates)
+                self.assertFalse(ok)
+                self.assertIn("for candB", text)
+
             with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(an, "load_gates", return_value=self.gates):
                 self.assertEqual(an.main([late, "--flip"]), 1)
                 self.assertEqual(an.main([good, "--flip"]), 0)
+
+    def test_prebuilt_binaries_are_compared_by_digest(self):
+        a = {"binaries": {"gateway": {"platform": "linux/amd64", "sha256": "1" * 64},
+                          "client:p": {"platform": "linux/amd64", "sha256": "2" * 64}}}
+        b = {"binaries": {"gateway": {"platform": "linux/amd64", "sha256": "1" * 64},
+                          "client:q": {"platform": "linux/amd64", "sha256": "3" * 64}}}
+        self.assertTrue(an.same_build(an.build_identity(a), an.build_identity(a)))
+        self.assertFalse(an.same_build(an.build_identity(a), an.build_identity(b)))   # another client binary
+        self.assertFalse(an.same_build(an.build_identity({}), an.build_identity({})))   # nothing to compare
 
 
 # --- end to end on this machine: wlserver, a tiny SOCKS5 proxy, wlclient ----------------
@@ -556,8 +683,14 @@ class EndToEnd(unittest.TestCase):
         t0 = time.time()
         _, rows = self.client("bgup", "--target", f"127.0.0.1:{self.http}", "--flows", "1", "--duration", "30",
                               "--object-bytes", "100000000", "--stop-file", stop, tls=False)
-        self.assertLess(time.time() - t0, 10)
+        self.assertLess(time.time() - t0, 15)
         self.assertTrue(rows and rows[-1][2].startswith("u1o"))
+        # The upload the stop cut counts what the sink received, as a 200
+        # with the window's exit (28); never the bytes handed to the socket.
+        last = rows[-1]
+        self.assertEqual((last[3], last[6]), ("200", "28"))
+        self.assertGreater(int(last[4]), 0)
+        self.assertLess(int(last[4]), 100_000_000)
 
 
 if __name__ == "__main__":

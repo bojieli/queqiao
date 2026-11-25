@@ -17,7 +17,11 @@ HTTP/1.1, keep-alive (port --http):
   cadence_ms, each written and flushed on its own as an HTTP chunk. Event i
   is `data: {"i": i, "s": <server monotonic ms>, ["R": <s>,] "p": "<pad>"}`,
   180 +/- 60 bytes in all, sizes fixed by the seed. Then `data: [DONE]`.
-* `POST /sink` -- reads and discards the body (the upload background).
+* `POST /sink` -- reads and discards the body (the upload background). With
+  an `X-QQ-Tag` header, the bytes received for that upload are kept, also
+  when the client stops partway, and `GET /sink-report?tag=T` returns
+  `{"bytes": n, "done": true|false}` (done once the request has ended), so
+  a cut upload counts the bytes that actually arrived.
 
 Terminal (port --term), binary records `type(1) length(2, big-endian) payload`:
 
@@ -43,6 +47,9 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 PAD = "x" * 400
+# Bytes received per tagged upload, and whether its request has ended.
+SINK: dict = {}
+SINK_LOCK = threading.Lock()
 
 
 def mono_ms() -> float:
@@ -104,15 +111,38 @@ class HTTP(socketserver.StreamRequestHandler):
             want = int(headers.get("content-length") or 0)
             got = 0
             first = last = None
-            while got < want:
-                b = self.rfile.read1(min(65536, want - got)) if hasattr(self.rfile, "read1") else self.rfile.read(min(65536, want - got))
-                if not b:
-                    return
-                now = time.monotonic()
-                first = first if first is not None else now
-                last = now
-                got += len(b)
             url = urlsplit(target)
+            tag = headers.get("x-qq-tag", "") if url.path == "/sink" else ""
+            if tag:
+                with SINK_LOCK:
+                    SINK[tag] = {"bytes": 0, "done": False}
+            try:
+                while got < want:
+                    b = self.rfile.read1(min(65536, want - got)) if hasattr(self.rfile, "read1") else self.rfile.read(min(65536, want - got))
+                    if not b:
+                        return
+                    now = time.monotonic()
+                    first = first if first is not None else now
+                    last = now
+                    got += len(b)
+                    if tag:
+                        with SINK_LOCK:
+                            SINK[tag]["bytes"] = got
+            except (OSError, ssl.SSLError):
+                return
+            finally:
+                if tag:
+                    with SINK_LOCK:
+                        SINK[tag]["done"] = True
+            if method == "GET" and url.path == "/sink-report":
+                q = {k: v[0] for k, v in parse_qs(url.query).items()}
+                with SINK_LOCK:
+                    rep = dict(SINK.get(q.get("tag", ""), {}))
+                body = json.dumps(rep).encode() if rep else b""
+                self.wfile.write((b"HTTP/1.1 200 OK" if rep else b"HTTP/1.1 404 Not Found") +
+                                 b"\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+                self.wfile.flush()
+                continue
             if method == "POST" and url.path == "/llm":
                 q = {k: v[0] for k, v in parse_qs(url.query).items()}
                 R = (last - first) if first is not None else 0.0

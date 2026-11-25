@@ -470,10 +470,13 @@ one release. Its gate is Gate 1 run on the release candidate:
 The flip passes only if every path × workload × cell of every candidate is
 PASS. INCOMPLETE is not PASS. `ab_analyze.py --flip` judges a set of
 campaign directories, prints that matrix, and exits non-zero unless it
-passes. It also fails in three other cases: a required workload has no
-campaign; a workload is missing on a path that another campaign measured;
-or the campaigns did not all test the same reference and candidate builds,
-in which case they are not one release:
+passes. Coverage is checked before any verdict: every candidate must have
+a campaign on every path in every required workload. A candidate tested in
+only some campaigns fails the flip rather than passing on the rows that
+exist. The campaigns must also be one release: each arm must be the same
+build, in the same role, everywhere. For arms built from refs that means
+the same commits; for prebuilt binaries, the same SHA-256 for each role and
+platform.
 
 ```sh
 ./scripts/ab_analyze.py --flip ~/campaigns/rc-bulk ~/campaigns/rc-single ~/campaigns/rc-interactive \
@@ -490,7 +493,7 @@ and 7 campaigns, is built:
 |---|---|---|
 | `llm` (W5, LLM streaming) | `<sequence>-<U>k-<background>`, for sequences single (cold connection per call), loop (5 turns on one connection, each turn's prompt 8 KB larger) and swarm (8 looping agents, staggered over 2 s); prompts of 100 and 400 KB; backgrounds none, down4 and up1 | TTFT net of think time, p50 and p95; delta lateness p99; stalls (gap ≥ 0.5 s) and freezes (≥ 2 s) per streamed minute; call failures; delta bytes sent INTERACTIVE |
 | `term` (W6, SSH keystrokes with output bursts) | `term-<background>` | echo p99 before the first burst (phase A) and after it (phase C, leaving out keystrokes within 2 s of a burst); fraction of echoes over 1 s; the latch ratio p99(C) / p99(A) |
-| `mixed` (M1, M2) | `m1-<U>k` (single calls under four downloads), `m2-<U>k` (under one upload) | the `llm` measures, a phase-A keystroke canary's echo p99, and the background's own bytes |
+| `mixed` (M1, M2) | `m1-<U>k` (single calls under four downloads), `m2-<U>k` (under one upload) | the `llm` measures, a phase-A keystroke canary's echo p99, and the background's own rate over the foreground's window |
 
 How these campaigns run:
 
@@ -517,10 +520,19 @@ How these campaigns run:
   when it ends. Every one of its flows (four downloads, or one upload) must
   have moved bytes across at least 90% of the foreground's real span, in
   every trial. Otherwise that cell is unmeasured.
+- **Background rate.** The background's bytes are counted within the
+  foreground's own window, each transfer's bytes prorated over its interval,
+  and judged as a rate. So arms whose calls take different times compare
+  like with like. An upload that the window cuts counts the bytes the far
+  side's sink received for it (`/sink-report`). If that cannot be learned,
+  the trial's background rate is unmeasured.
+- **TTFT.** It is taken when the first byte of the first event's payload
+  arrives. Each delta's receive time is when that delta is complete.
 - **Evidence per trial.** Each trial must have its own records for a cell
   before the trials are pooled. A call the phase never reached counts as a
   failed call, and a keystroke whose echo never came is counted at the time
-  waited, not dropped.
+  waited, not dropped. A terminal write that fails ends the session as a
+  failure. A canary counts only if it measured echoes.
 - **Pooling.** An arm's per-block statistic pools its two trials' raw
   samples before taking quantiles.
 - **Provisional bounds.** Every bound comes from the workload model and is

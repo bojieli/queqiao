@@ -786,7 +786,8 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
         unruled: List[str] = []
         for k in keys:
             metric = k.split(".", 1)[-1]
-            rule = rules.get(k) or rules.get(f"*.{metric}")
+            # gates.ini keys are lowercased by configparser; match likewise.
+            rule = rules.get(k.lower()) or rules.get(f"*.{metric.lower()}")
             if rule:
                 judged_rules[k] = rule
             elif metric not in wl.report_only:
@@ -797,8 +798,9 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
         phases_here = sorted({r["phase"] for t in trials.values() if t.path == path for r in t.rows})
         for rk, rule in rules.items():
             wanted = [f"{ph}.{rk[2:]}" for ph in phases_here] if rk.startswith("*.") else [rk]
+            have = {k.lower() for k in judged_rules}
             for k in wanted:
-                if k not in judged_rules and (rk.startswith("*.") or k.split(".", 1)[0] in phases_here):
+                if k.lower() not in have and (rk.startswith("*.") or k.split(".", 1)[0] in phases_here):
                     judged_rules[k] = rule
         if keys:
             out += ["", f"**{wl.name} measures, per block (mean over blocks), {path}**", "",
@@ -956,59 +958,92 @@ def cell_verdicts(verdicts: dict, path: str, cand: str) -> Dict[str, str]:
     return out
 
 
+def build_identity(e: dict) -> Tuple[str, object]:
+    """What an arm ran: its resolved commits when it was built from refs,
+    else its prebuilt binaries' SHA-256 by role (gateway, client) and
+    platform, as the manifest recorded them."""
+    g = e.get("gateway_commit") or e.get("commit") or ""
+    c = e.get("client_commit") or e.get("commit") or ""
+    if g or c:
+        return "commits", (g, c)
+    digests: Dict[Tuple[str, str], str] = {}
+    for end, b in (e.get("binaries") or {}).items():
+        role = "gateway" if end == "gateway" else "client"
+        if isinstance(b, dict) and b.get("sha256"):
+            digests[(role, b.get("platform", ""))] = b["sha256"]
+    return "binaries", digests
+
+
+def same_build(a: Tuple[str, object], b: Tuple[str, object]) -> bool:
+    if a[0] != b[0]:
+        return False
+    if a[0] == "commits":
+        return a[1] == b[1]
+    # Binaries: every role and platform both campaigns used must match, and
+    # there must be at least one to compare.
+    common = set(a[1]) & set(b[1])
+    return bool(common) and all(a[1][k] == b[1][k] for k in common)
+
+
 def flip_report(campaigns: Sequence[str], gates: dict) -> Tuple[str, bool]:
-    """The stage-10 default flip: every path x workload x cell of every
-    candidate must PASS, and every required workload must be there."""
+    """The stage-10 default flip over a set of campaigns. One release: each
+    arm the same build, in the same role, everywhere. Full coverage: every
+    candidate on every path in every required workload. Then every cell of
+    every one of those must PASS."""
     rows: List[Tuple[str, str, str, str, str]] = []
     seen = set()
     mismatch: List[str] = []
-    builds: Dict[str, Tuple[str, str]] = {}
-    paths_of: Dict[str, set] = collections.defaultdict(set)
-
-    def build(e: dict) -> Tuple[str, str]:
-        g = e.get("gateway_commit") or e.get("commit") or e.get("gateway_ref") or e.get("ref") or ""
-        c = e.get("client_commit") or e.get("commit") or e.get("client_ref") or e.get("ref") or ""
-        return g, c
-
+    builds: Dict[str, Tuple[str, object]] = {}
+    roles: Dict[str, str] = {}
+    paths_all: set = set()
+    candidates: set = set()
     for campaign in campaigns:
+        base = os.path.basename(os.path.normpath(campaign))
         with open(os.path.join(campaign, "plan.json")) as f:
             plan = json.load(f)
         name = plan.get("workload", "bulk")
         seen.add(name)
-        # One release: the same reference and candidate builds, by arm name,
-        # in every campaign.
         for arm, e in plan["arms"].items():
-            b = build(e)
-            if arm in builds and builds[arm] != b:
-                mismatch.append(f"arm `{arm}` is a different build in {os.path.basename(os.path.normpath(campaign))}")
+            role = "main" if arm == plan["main"] else "candidate"
+            if roles.setdefault(arm, role) != role:
+                mismatch.append(f"arm `{arm}` is {role} in {base} but {roles[arm]} elsewhere")
+            b = build_identity(e)
+            if arm in builds and not same_build(builds[arm], b):
+                mismatch.append(f"arm `{arm}` is a different build in {base}")
             builds.setdefault(arm, b)
-        if name != "dc":
-            paths_of[name] |= set(plan["paths"])
+            if role == "candidate":
+                candidates.add(arm)
         if name == "dc":
             import dc_gate
             _, v = dc_gate.evaluate(campaign, dc_gate.load_bounds())
             for cand, verdict in v.items():
                 rows.append((name, "dc", cand, "dc-gate", verdict))
             continue
+        paths_all |= set(plan["paths"])
         _, v = report(campaign, gates)
-        main_ = plan["main"]
         for path in plan["paths"]:
-            for cand in [a for a in plan["arms"] if a != main_]:
+            for cand in [a for a in plan["arms"] if a != plan["main"]]:
                 for cell, verdict in sorted(cell_verdicts(v, path, cand).items()):
                     rows.append((name, path, cand, cell, verdict))
-    missing = [w_ for w_ in FLIP_WORKLOADS if w_ not in seen]
-    # Every workload on every path any campaign measured.
-    all_paths = set().union(*paths_of.values()) if paths_of else set()
-    for name, ps in sorted(paths_of.items()):
-        for p_ in sorted(all_paths - ps):
-            missing.append(f"{name} on {p_}")
+    if len({a for a, r in roles.items() if r == "main"}) > 1:
+        mismatch.append("the campaigns do not share one reference arm: "
+                        + ", ".join(sorted(a for a, r in roles.items() if r == "main")))
+    # Coverage before verdicts: a combination with no row is missing, not
+    # passed by the rows that happen to exist.
+    have = {(w_, p_, c_) for w_, p_, c_, _, _ in rows}
+    missing: List[str] = []
+    for w_ in sorted(set(FLIP_WORKLOADS) | (seen - {"dc"})):
+        for p_ in sorted(paths_all):
+            for c_ in sorted(candidates):
+                if (w_, p_, c_) not in have:
+                    missing.append(f"{w_} on {p_} for {c_}")
     ok = bool(rows) and not missing and not mismatch and all(r[4] == "PASS" for r in rows)
     out = ["## Stage-10 default flip", "",
            "Every path x workload x cell of every candidate must PASS (DESIGN-PATH-AUTHORITY.md section 14, stage 10; "
            "WORKLOADS.md 6).", "", "| workload | path | candidate | cell | verdict |", "|---|---|---|---|---|"]
     out += [f"| {w_} | {p_} | {c_} | {cell} | {v_ if v_ == 'PASS' else '**' + v_ + '**'} |" for w_, p_, c_, cell, v_ in rows]
     if missing:
-        out += ["", "Missing workloads: " + ", ".join(f"`{m}`" for m in missing) + "."]
+        out += ["", "Missing: " + ", ".join(f"`{m}`" for m in missing) + "."]
     if mismatch:
         out += ["", "Not one release: " + "; ".join(mismatch) + "."]
     out += ["", f"**Flip: {'PASS' if ok else 'NOT PASSED'}.**"]
