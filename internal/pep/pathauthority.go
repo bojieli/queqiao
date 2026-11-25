@@ -121,7 +121,7 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal strin
 	controller := pathAuthorities.controller(principal, current, initial)
 	// The connection's FEC and probe readers read the model the law reports
 	// to: the principal's.
-	rekeyPathModel(conn, principal+"|"+current)
+	readers := pathModelOfKey(conn, principal+"|"+current)
 	// rekey is called only on the connection's run loop.
 	rekey := func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
 		_, next := resolvePath(newLocal, newRemote)
@@ -145,7 +145,7 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal strin
 	// The coded path reads the datagrams' own burst statistic, from
 	// whichever controller the connection is attached to now, and sizes its
 	// window from its own source rate.
-	pathModelOf(conn).setDatagramBurst(func() (float64, bool) { return attachment.Controller().DatagramBurstFactor() })
+	readers.setDatagramBurst(func() (float64, bool) { return attachment.Controller().DatagramBurstFactor() })
 	markPathScoped(conn)
 	markClassScheduled(conn)
 	conn.SetCongestionControl(attachment)

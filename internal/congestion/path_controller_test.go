@@ -1081,3 +1081,37 @@ func TestAnEmptyBuildPassesTheTurnToAnotherClass(t *testing.T) {
 		t.Fatalf("a send did not clear the hold: %+v", u)
 	}
 }
+
+// A debt-keeping balance is settled at the rate it was earned at: a rate
+// that rises after most of an interval has passed does not apply to the
+// whole interval and repay a debt the old rate had not.
+func TestTheBalanceIsSettledBeforeTheRateChanges(t *testing.T) {
+	rate := quiccongestion.ByteCount(100_000)
+	p := newTUICPacer(func() quiccongestion.ByteCount { return rate })
+	p.keepDebt = true
+	t0 := base()
+	p.sentPacket(t0, 40_000) // deep in debt: the bucket starts at its burst allowance
+	t1 := t0.Add(100 * time.Millisecond)
+	p.settle(t1) // 10 kB earned at the old rate
+	rate = 10_000_000
+	if b := p.budget(t1); b > 0 {
+		t.Fatalf("a rate raised at %v repaid the debt earned before it: balance %d", t1.Sub(t0), b)
+	}
+}
+
+// The retry after every class is passed over is the earliest hold still in
+// the future among the classes with demand, not an expired one.
+func TestTheEmptyBuildRetryIsAFutureHold(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassInteractive: true}})
+	a.a.OnEmptyBuild(now, quiccongestion.Permit{Turn: quiccongestion.ClassInteractive})
+	later := now.Add(10 * time.Millisecond) // INTERACTIVE's hold has expired
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	a.a.OnEmptyBuild(later, quiccongestion.Permit{Turn: quiccongestion.ClassBulk})
+	p := a.a.Admit(later, 1200)
+	if p.OK || !p.RetryAt.After(later) {
+		t.Fatalf("with BULK held the permit is %+v; want a refusal until BULK's hold ends", p)
+	}
+}

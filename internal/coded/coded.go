@@ -826,16 +826,16 @@ func (p *Path) sendSource(esi uint32, vector []byte, tracks []*frameTrack) error
 	d[4] = kindSource
 	binary.BigEndian.PutUint32(d[5:], esi)
 	copy(d[sourceHeader:], vector)
-	if len(tracks) == 0 {
+	tagged, ok := p.carrier.(TaggedCarrier)
+	if len(tracks) == 0 && !(ok && p.cfg.SourceRate) {
 		sent, err := p.put(d)
 		if sent && p.cfg.SourceRate {
-			// Nothing observes this symbol's registration: acceptance is
-			// the nearest event.
+			// The carrier cannot report registration: acceptance is the
+			// nearest event.
 			p.source.add(len(d), time.Now())
 		}
 		return err
 	}
-	tagged, ok := p.carrier.(TaggedCarrier)
 	if !ok {
 		// Nothing below can say when a packet was built, so acceptance is
 		// the nearest event there is.
@@ -1265,8 +1265,11 @@ func (p *Path) params() fec.Params {
 // rate is the sending rate the window is sized against.
 func (p *Path) rate() float64 {
 	if p.cfg.SourceRate {
-		if r := p.source.rate(time.Now(), p.roundTrip()); r > 0 {
-			return r
+		rtt := p.roundTrip()
+		if r, ok := p.source.rate(time.Now(), rtt); ok {
+			// A measured sparse lane keeps a sparse window; at least one
+			// symbol a round trip.
+			return max(r, float64(p.symbolBytes())/rtt.Seconds())
 		}
 		return float64(p.symbolBytes()) * 64 / p.roundTrip().Seconds()
 	}
@@ -1450,7 +1453,10 @@ type sourceMeter struct {
 	lastAdd time.Time
 	bytes   int
 	last    float64
-	rtt     time.Duration
+	// measured says last is a measurement, which may be zero: a window
+	// without a source symbol is a sparse lane, not a cold one.
+	measured bool
+	rtt      time.Duration
 }
 
 // sourceIdleRTTs is how many round trips without a source symbol end a
@@ -1463,13 +1469,13 @@ func (m *sourceMeter) roll(now time.Time) {
 		rtt = 300 * time.Millisecond
 	}
 	if !m.lastAdd.IsZero() && now.Sub(m.lastAdd) > sourceIdleRTTs*rtt {
-		m.start, m.lastAdd, m.bytes, m.last = time.Time{}, time.Time{}, 0, 0
+		m.start, m.lastAdd, m.bytes, m.last, m.measured = time.Time{}, time.Time{}, 0, 0, false
 	}
 	if m.start.IsZero() {
 		return
 	}
 	if elapsed := now.Sub(m.start); elapsed >= rtt && elapsed > 0 {
-		m.last = float64(m.bytes) / elapsed.Seconds()
+		m.last, m.measured = float64(m.bytes)/elapsed.Seconds(), true
 		m.start, m.bytes = now, 0
 	}
 }
@@ -1485,10 +1491,10 @@ func (m *sourceMeter) add(n int, now time.Time) {
 	m.mu.Unlock()
 }
 
-func (m *sourceMeter) rate(now time.Time, rtt time.Duration) float64 {
+func (m *sourceMeter) rate(now time.Time, rtt time.Duration) (float64, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.rtt = rtt
 	m.roll(now)
-	return m.last
+	return m.last, m.measured
 }

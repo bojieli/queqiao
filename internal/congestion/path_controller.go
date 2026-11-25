@@ -698,7 +698,7 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	// refused until the earliest hold ends.
 	own := a.usable(now)
 	if hasDemand(a.demand) && !hasDemand(quiccongestion.Demand{Eligible: own}) {
-		return quiccongestion.Permit{RetryAt: a.earliestUnstick()}, wakes
+		return quiccongestion.Permit{RetryAt: a.earliestUnstick(now)}, wakes
 	}
 	turn := c.arb.Select()
 	if turn != quiccongestion.ClassExempt && !own[turn] && !c.claimed(a, turn, now) {
@@ -782,10 +782,16 @@ func (a *PathAttachment) usable(now monotime.Time) [quiccongestion.NumSendClasse
 	return own
 }
 
-func (a *PathAttachment) earliestUnstick() monotime.Time {
+// earliestUnstick is the earliest future hold among the classes with demand
+// that are blocking admission now.
+func (a *PathAttachment) earliestUnstick(now monotime.Time) monotime.Time {
 	var at monotime.Time
-	for _, until := range a.stuckUntil {
-		if !until.IsZero() && (at.IsZero() || until.Before(at)) {
+	for _, cl := range scheduledClasses {
+		until := a.stuckUntil[cl]
+		if !a.demand.Eligible[cl] || until.IsZero() || !now.Before(until) {
+			continue
+		}
+		if at.IsZero() || until.Before(at) {
 			at = until
 		}
 	}
@@ -958,8 +964,10 @@ func (c *PathController) promote(a *PathAttachment) {
 func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent) []func() {
 	now := c.clamp(ev.Time)
 	// What the path could have sent until now is judged on the state before
-	// this event changes it.
+	// this event changes it, and the balance is settled at the rate it was
+	// earned at before the event moves the rate.
 	c.accrue(now)
+	c.law.pacer.settle(now)
 	// Deadlines are enforced before outcomes are accepted, so an
 	// acknowledgement past the horizon is not credited merely because no
 	// other callback came first.
