@@ -66,7 +66,8 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 	var lanes int64
 	var lastMode uint32
 	var maxQueue, maxQueueSmoothed, maxQueueMin time.Duration
-	var validQueueSamples, pendingQueueSamples, queuedSamples, samples, brakedSamples int
+	var validQueueSamples, pendingQueueSamples, queuedSamples int
+	var brakes brakeTally
 	var queueSamples []time.Duration
 	var maxBrake float64
 	var lastLoss float64
@@ -99,14 +100,7 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 		} else {
 			pendingQueueSamples++
 		}
-		// Only a poll with controller telemetry says anything about the
-		// brake: without it the zero is a default, not a reading.
-		if s.QUICControllerSamples > 0 {
-			samples++
-			if s.QUICDelayBrake > 0 {
-				brakedSamples++
-			}
-		}
+		brakes.observe(s)
 		if s.QUICDelayBrake > maxBrake {
 			maxBrake = s.QUICDelayBrake
 		}
@@ -153,11 +147,11 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 	// it was shown (issue #187). The queue a brake could act on, and the
 	// braking this case says is missing, are sustained, so each has to show
 	// in more than a quarter of the samples to count.
-	if queuedSamples > validQueueSamples/4 || brakedSamples > samples/4 {
+	if sustained(queuedSamples, validQueueSamples) || brakes.sustained() {
 		t.Errorf("a policer produced queue above %v in %d of %d samples (worst %v) and a brake in %d of %d "+
 			"(strongest %.4f); if it now queues, this is no longer the unbraked case and the design "+
 			"document should say so",
-			policerQueueBound, queuedSamples, validQueueSamples, maxQueue, brakedSamples, samples, maxBrake)
+			policerQueueBound, queuedSamples, validQueueSamples, maxQueue, brakes.braked, brakes.readings, maxBrake)
 	}
 	// The overdrive this case records, after the compensation was bounded and a
 	// stale peak stopped being re-seeded: 42x became 7.3x became 2.4x. It is
