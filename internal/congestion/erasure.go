@@ -1381,6 +1381,16 @@ func (e *ErasureSender) HasPacingBudget(now monotime.Time) bool {
 }
 
 func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
+	// A packet that elicits no acknowledgement is not charged to the pacer.
+	// quic-go sends ACK-only packets past it -- a pacing- or window-limited
+	// connection still acknowledges what it receives -- but reports them
+	// here, and the delivery sampler credits them nothing, since they are not
+	// in flight. Charged anyway, a download's reverse acknowledgements spend
+	// the upstream pacer's whole budget on bytes its rate estimate never sees:
+	// measured live, the client's upstream lane sent about 700 such packets a
+	// second against a share-capped pacer of 44 kB/s, and the download's flow
+	// acknowledgements -- stream data, which must wait for a full datagram's
+	// budget -- spent seconds behind them.
 	if retransmittable {
 		if e.denied {
 			e.heldSends.Add(1)
@@ -1390,11 +1400,10 @@ func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 		if bytesInFlight > e.limitPeak {
 			e.limitPeak = bytesInFlight
 		}
+		e.pacer.sentPacket(sentTime, bytes)
 	} else {
 		e.ackOnlyBytes.Add(uint64(bytes))
-		e.ackOnlyCharged.Add(uint64(bytes))
 	}
-	e.pacer.sentPacket(sentTime, bytes)
 	if bytesInFlight > e.rampPeak {
 		e.rampPeak = bytesInFlight
 	}
