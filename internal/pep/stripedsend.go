@@ -272,7 +272,12 @@ func (l *mpLane) authority() uint64 {
 // flowSource adapts the application connection to the scheduler's reader,
 // keeping the classification and half-close handling that used to live in the
 // send loop.
-type flowSource struct{ flow *multipathFlow }
+type flowSource struct {
+	flow *multipathFlow
+	// filling is set while ReadAvailable extends a staged read, so each
+	// socket read is counted without being judged full or short on its own.
+	filling bool
+}
 
 const (
 	// stagingBytes is each flow's private read buffer when a shared send
@@ -293,7 +298,14 @@ func (s *flowSource) ReadAvailable(p []byte) (int, error) {
 		return 0, stripe.ErrUnsupported
 	}
 	defer s.flow.inner.SetReadDeadline(time.Time{})
+	s.filling = true
 	total := 0
+	// Fullness is the completed fill's, however many socket reads it took
+	// and including one that timed out with nothing.
+	defer func() {
+		s.filling = false
+		s.flow.noteStagedFill(total == len(p))
+	}()
 	for total < len(p) {
 		n, err := s.Read(p[total:])
 		total += n
@@ -314,7 +326,11 @@ func (s *flowSource) ReadAvailable(p []byte) (int, error) {
 func (s *flowSource) Read(p []byte) (int, error) {
 	n, err := s.flow.inner.Read(p)
 	if n > 0 {
-		s.flow.observeCarriedRead(n, true, len(p))
+		bufLen := len(p)
+		if s.filling {
+			bufLen = -1
+		}
+		s.flow.observeCarriedRead(n, true, bufLen)
 	}
 	if err != nil {
 		// HTTP clients often close a fully-consumed SOCKS socket without a TCP

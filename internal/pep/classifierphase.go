@@ -223,6 +223,7 @@ func (f *multipathFlow) fitBacklogThreshold() {
 	threshold, refill := backlogThresholdFor(f.classifier.BacklogBytes(), f.memoryLimits, f.chunkSize, readSize, f.memOwned)
 	f.classifier.SetBacklogBytes(threshold)
 	f.ackMu.Lock()
+	f.refillTracking = true
 	f.refillMode, f.fullReadBytes, f.refillThreshold = refill, readSize, threshold
 	f.ackMu.Unlock()
 }
@@ -324,12 +325,13 @@ func (f *multipathFlow) noteAckedCoverage() {
 	if saturatingSub(f.bytesUp.Load(), covered) > threshold {
 		return
 	}
-	if !f.refillMode {
+	if !f.refillTracking {
 		f.ackDrained = true
 		return
 	}
 	// The room this opened is a drain only if no full read takes it at
-	// once; countAndSample decides.
+	// once; countAndSample decides. This holds at any threshold: one
+	// coalesced acknowledgement can release a whole flight.
 	if !f.drainPending {
 		f.drainPending, f.drainPendingAt = true, now
 	}
@@ -348,7 +350,8 @@ func (f *multipathFlow) noteAckedCoverage() {
 //
 // bufLen is the buffer the read had room for, so a read that filled it is a
 // full read whatever its size; zero means unknown, and fullReadBytes stands
-// in for it.
+// in for it; negative means the read is part of a staged fill, whose
+// fullness noteStagedFill reports once the fill completes.
 func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool, bufLen int) (upBytes, downBytes, backlog uint64, drained bool) {
 	f.ackMu.Lock()
 	defer f.ackMu.Unlock()
@@ -368,34 +371,75 @@ func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool, b
 		}
 	}
 	backlog = saturatingSub(upBytes, f.ackCovered)
-	if f.refillMode {
-		if up && n > 0 {
+	if f.refillTracking {
+		if up && n > 0 && bufLen >= 0 {
 			full := n >= f.fullReadBytes
 			if bufLen > 0 {
 				full = n >= bufLen
 			}
-			if f.drainPending && !(full && now.Sub(f.drainPendingAt) <= refillWindow) {
-				f.ackDrained = true
-			}
-			f.drainPending = false
-			f.lastReadFull = full
+			f.noteReadLocked(now, full)
 		} else if f.drainPending && now.Sub(f.drainPendingAt) > refillWindow {
-			f.ackDrained, f.drainPending = true, false
+			f.drainLocked()
 		}
 		switch {
-		case !f.lastReadFull:
-			backlog = 0
-		case f.drainPending || backlog > f.refillThreshold:
-			// Still behind, or a refill is due within the window: an
+		case f.lastReadFull && (f.drainPending || f.continuing || backlog > f.refillThreshold):
+			// Still behind; or a refill is due within the window, and an
 			// observation of something else -- receive-side bytes, a
-			// re-examination -- does not end the stretch before the
-			// refill has had its chance.
+			// re-examination -- does not end the stretch before it has had
+			// its chance; or a prompt full refill took the room, however
+			// small that refill is beside the threshold.
 			backlog = max(backlog, f.refillThreshold+1)
+		case f.refillMode:
+			// Below the floor bytes outstanding say nothing; only full
+			// reads do.
+			backlog = 0
 		}
 	}
 	drained = f.ackDrained
 	f.ackDrained = false
 	return upBytes, downBytes, backlog, drained
+}
+
+// noteReadLocked records one completed read: whether it filled the buffer it
+// was offered, and whether it took, within refillWindow, the room a pending
+// drain opened.
+func (f *multipathFlow) noteReadLocked(now time.Time, full bool) {
+	if f.drainPending {
+		if full && now.Sub(f.drainPendingAt) <= refillWindow {
+			f.drainPending, f.continuing = false, true
+		} else {
+			f.drainLocked()
+		}
+	}
+	if !full {
+		f.continuing = false
+	}
+	f.lastReadFull = full
+}
+
+// drainLocked records a drain: the backlog stretch ends.
+func (f *multipathFlow) drainLocked() {
+	f.ackDrained, f.drainPending, f.continuing = true, false, false
+}
+
+// noteStagedFill reports the completed staged read: the scheduler's staging
+// read and the fill that extends it are one read of the chunk, whatever
+// number of socket reads the fill took, and it filled its buffer only if the
+// fill did. The socket reads themselves were counted as they came, without a
+// fullness of their own.
+func (f *multipathFlow) noteStagedFill(full bool) {
+	f.ackMu.Lock()
+	defer f.ackMu.Unlock()
+	if !full && f.continuing {
+		// The staging read took the room as a full read and kept the
+		// stretch going; the completed read was short, so the source had
+		// drained after all.
+		f.drainLocked()
+	}
+	if !f.refillTracking {
+		return
+	}
+	f.lastReadFull = full
 }
 
 // ackSample is countAndSample for no new bytes.

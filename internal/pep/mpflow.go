@@ -463,14 +463,21 @@ type multipathFlow struct {
 	// pending since drainPendingAt becomes a drain unless a read of at least
 	// fullReadBytes follows within refillWindow, and lastReadFull says whether
 	// the latest read filled its buffer. All under ackMu.
-	refillMode    bool
-	fullReadBytes int
-	// refillThreshold is the classifier's threshold in refill mode, the
-	// backlog reported while a full-read stretch is unbroken.
+	//
+	// refillTracking is set for every phased flow once its threshold is
+	// fitted: a drain is then always held pending for refillWindow, because
+	// one coalesced acknowledgement can release a whole flight whatever the
+	// threshold. refillThreshold is the fitted threshold; continuing says a
+	// prompt full refill has taken the room the last drain opened, so the
+	// stretch goes on even if what is outstanding is below the threshold.
+	refillTracking  bool
+	refillMode      bool
+	fullReadBytes   int
 	refillThreshold uint64
 	drainPending    bool
 	drainPendingAt  time.Time
 	lastReadFull    bool
+	continuing      bool
 	// ackSampleHook and afterAckSampleHook, when set by a test, run just
 	// before and just after an observation samples the acknowledgement state.
 	ackSampleHook, afterAckSampleHook func()
