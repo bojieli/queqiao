@@ -575,6 +575,11 @@ type runtimeOptions struct {
 	codedRetry string
 	// classifierMode is the flow-classifier bundle (workload model R1).
 	classifierMode string
+	// topology and topologyFanOut are a client's placement of flows on
+	// QUIC connections (design §7, §14 stage 7). A gateway leaves them
+	// empty.
+	topology       string
+	topologyFanOut int
 	// carrierShadow runs the carrier-liveness observer (design §10, §14
 	// stage 0 and the groundwork of stage 8). It only records.
 	carrierShadow                    bool
@@ -657,6 +662,8 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.StringVar(&opts.localAddress, "local-address", "auto", "outer source: auto, IP, or if:NAME")
 		fs.IntVar(&opts.maxPendingOpens, "max-pending-opens", 256, "concurrent remote flow opens")
 		fs.BoolVar(&opts.quicPool, "quic-pool", true, "reuse a persistent QUIC connection")
+		fs.StringVar(&opts.topology, "topology", string(pep.TopologyIsolated), "placement of flows on QUIC connections: isolated (a bulk flow sharing the pooled connection moves to a connection of its own), or single (every flow is a stream on one connection per path; requires --congestion-scope=path and --quic-pool)")
+		fs.IntVar(&opts.topologyFanOut, "topology-fanout", 0, "explicit fan-out under --topology=single: at most this many connections per path, the extra ones carrying bulk flows that share the preferred connection (0 or 1 = off)")
 		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this client runs in: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.StringVar(&opts.flowMetadataSocket, "flow-metadata-socket", "", "local capture agent socket to ask what produced each flow, so its class is known before it carries anything; empty disables the lookup")
 		fs.Var(&opts.classHints, "class-hint", "declare the class a flow starts in from what produced it, as <match>=<interactive|bulk>; repeatable, first match wins, and it does nothing without --flow-metadata-socket")
@@ -777,6 +784,17 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	}
 	if err := pep.ValidateCodedRetry(pep.CodedRetryMode(opts.codedRetry), pep.CCAPIVersion(opts.ccAPI)); err != nil {
 		return fmt.Errorf("--coded-retry: %w", err)
+	}
+	if client {
+		if opts.topology == "" {
+			return errors.New("--topology must be isolated or single")
+		}
+		if err := pep.ValidateTopology(pep.Topology(opts.topology), pep.CongestionScope(opts.congestionScope), opts.topologyFanOut); err != nil {
+			return fmt.Errorf("--topology: %w", err)
+		}
+		if opts.topology == string(pep.TopologySingle) && !opts.quicPool {
+			return errors.New("--topology=single requires --quic-pool")
+		}
 	}
 	if err := pep.ValidateClassifier(pep.ClassifierMode(opts.classifierMode), bundleProfile); err != nil {
 		return fmt.Errorf("--classifier: %w", err)
@@ -1087,7 +1105,7 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("congestion_scope", opts.congestionScope),
 		slog.String("classifier", opts.classifierMode),
 		slog.String("coded_retry", opts.codedRetry),
-		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)), pep.SchedMode(opts.sched), pep.CongestionScope(opts.congestionScope), pep.ClassifierMode(opts.classifierMode))),
+		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)), pep.SchedMode(opts.sched), pep.CongestionScope(opts.congestionScope), pep.ClassifierMode(opts.classifierMode), pep.Topology(opts.topology))),
 		slog.String("mem", opts.memory),
 		slog.Bool("carrier_shadow", opts.carrierShadow),
 		slog.Uint64("carrier_shadow_ks", uint64(opts.carrierShadowKS)),
@@ -1111,6 +1129,8 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 			slog.String("local_address", opts.localAddress),
 			slog.Int("max_pending_opens", opts.maxPendingOpens),
 			slog.Bool("quic_pool", opts.quicPool),
+			slog.String("topology", opts.topology),
+			slog.Int("topology_fanout", opts.topologyFanOut),
 			slog.String("path_profile", opts.resolvedProfile.Name),
 			slog.String("path_profile_level", string(opts.resolvedProfile.Level)),
 			slog.Bool("wait_for_open_ack", opts.waitForOpenAck),
