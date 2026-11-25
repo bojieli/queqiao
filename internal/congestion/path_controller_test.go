@@ -1356,3 +1356,77 @@ func TestACorrectedLossMovesBetweenTheFateCounts(t *testing.T) {
 		t.Fatalf("after a correction: lost %d, delivered %d; want 0 and 1", s.Lost, s.Delivered)
 	}
 }
+
+// Sustained CONTROL beside a live BULK claimant, the window full: each ACK
+// frees one packet. CONTROL may go past the claim once, on its debt, while
+// BULK cannot send; after that the claimant gets the next opening, so BULK
+// keeps a share however long CONTROL keeps asking.
+func TestRepeatedControlBorrowingDoesNotStarveALiveClaim(t *testing.T) {
+	c := newPCController()
+	now := base()
+	bulk, ctrl := attachPC(t, c, now), attachPC(t, c, now)
+	bulk.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	ctrl.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	type pkt struct {
+		conn *pcConn
+		n    quiccongestion.PacketNumber
+	}
+	var queue []pkt
+	window := c.law.GetCongestionWindow()
+	for bulk.inFlight+1200 <= window {
+		bulk.sendClass(now, 1200, quiccongestion.ClassBulk)
+		queue = append(queue, pkt{bulk, bulk.next - 1})
+	}
+	// BULK owns the turn: CONTROL has spent its credit.
+	c.arb.OnSent([4]quiccongestion.ByteCount{quiccongestion.ClassControl: 1 << 20})
+	sent := map[quiccongestion.SendClass]int{}
+	try := func(p *pcConn) {
+		if permit := p.a.Admit(now, 1200); permit.OK {
+			p.sendClass(now, 1200, permit.Turn)
+			queue = append(queue, pkt{p, p.next - 1})
+			sent[permit.Turn]++
+		}
+	}
+	for range 200 {
+		now = now.Add(5 * time.Millisecond)
+		// One packet is acknowledged: the oldest.
+		head := queue[0]
+		queue = queue[1:]
+		head.conn.event(now, []quiccongestion.PacketNumber{head.n}, nil)
+		try(ctrl) // the CONTROL sender asks first every time
+		try(bulk)
+	}
+	t.Logf("sent: control %d, bulk %d", sent[quiccongestion.ClassControl], sent[quiccongestion.ClassBulk])
+	if sent[quiccongestion.ClassBulk] < 60 {
+		t.Fatalf("a live BULK claim was starved by repeated CONTROL borrowing: control %d, bulk %d", sent[quiccongestion.ClassControl], sent[quiccongestion.ClassBulk])
+	}
+	if sent[quiccongestion.ClassControl] == 0 {
+		t.Fatal("CONTROL never went past a claim its holder could not use")
+	}
+}
+
+// The claimant is judged by its own packet size: with exactly one of its
+// packets of window left, a 1,200-byte BULK claimant can use its turn, and a
+// CONTROL caller building 1,500-byte packets is not let past it.
+func TestTheClaimantIsJudgedByItsOwnPacketSize(t *testing.T) {
+	c := newPCController()
+	now := base()
+	bulk := attachPC(t, c, now)
+	ctrl := &pcConn{t: t, a: c.Attach(nil, nil), sizes: make(map[quiccongestion.PacketNumber]quiccongestion.ByteCount)}
+	ctrl.a.OnAttach(now, 0, 1500, func() { ctrl.wakes++ })
+	bulk.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	window := c.law.GetCongestionWindow()
+	for bulk.inFlight+2400 <= window {
+		bulk.sendClass(now, 1200, quiccongestion.ClassBulk)
+	}
+	bulk.sendClass(now, window-1200-bulk.inFlight, quiccongestion.ClassBulk) // exactly 1,200 bytes left
+	now = now.Add(time.Second)
+	c.arb.OnSent([4]quiccongestion.ByteCount{quiccongestion.ClassControl: 1 << 20})
+	ctrl.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	if p := ctrl.a.Admit(now, 1500); p.OK {
+		t.Fatalf("CONTROL went past a claimant that could send its own packet: %+v", p)
+	}
+	if p := bulk.a.Admit(now, 1200); !p.OK || p.Turn != quiccongestion.ClassBulk {
+		t.Fatalf("the claimant could not use its turn: %+v", p)
+	}
+}

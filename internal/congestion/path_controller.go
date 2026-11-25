@@ -171,7 +171,7 @@ type pathControllerCounters struct {
 	samples, unsampledDebited, nonEliciting       atomic.Uint64
 	exemptBytes                                   atomic.Uint64
 	refusedWindow, refusedPacing, refusedTurn     atomic.Uint64
-	lapsedClaims, debtPermits                     atomic.Uint64
+	lapsedClaims, debtPermits, controlBypasses    atomic.Uint64
 	demotions, promotions                         atomic.Uint64
 }
 
@@ -784,6 +784,7 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 		return quiccongestion.Permit{RetryAt: a.earliestUnstick(now)}, wakes
 	}
 	turn := c.arb.Select()
+	bypass := false
 	if turn != quiccongestion.ClassExempt && !own[turn] && !c.claimed(a, turn, now) {
 		for o := range c.byClass[turn] {
 			if o != a && o.usable(now)[turn] {
@@ -794,15 +795,11 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 			}
 		}
 		turn = c.arb.SelectAmong(own)
-	} else if turn != quiccongestion.ClassExempt && !own[turn] && !c.fits(now, turn, maxBytes) {
-		// The claimants of the path's turn could not send it now either
-		// (its class has no room in the window or the balance), so their
-		// claim gives them nothing this attachment would take. If its own
-		// work fits -- CONTROL on the control debt, above all -- it is
-		// served now rather than waiting for the flight to drain.
-		if mine := c.arb.SelectAmong(own); mine != quiccongestion.ClassExempt && c.fits(now, mine, maxBytes) {
-			turn = mine
-		}
+	} else if c.controlBypass(a, own, turn, now, maxBytes) {
+		// CONTROL goes past a live claim its holders cannot use now; the
+		// deficits are left as they are, and nothing else rides on it.
+		turn = quiccongestion.ClassControl
+		bypass = true
 	}
 	// The window and the balance, for the turn the path would serve now.
 	borrowed, refusal := c.admissible(a, now, turn, maxBytes)
@@ -856,7 +853,9 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	c.markDeferred(a, false)
 	c.permitSeq++
 	a.lastPermit = c.permitSeq
-	p := c.arb.PermitTurn(turn, maxBytes, !borrowed)
+	// Admitted: a bypass of its claim has been followed by its opportunity.
+	a.bypassed = false
+	p := c.arb.PermitTurn(turn, maxBytes, !borrowed && !bypass)
 	for cl := range p.Fill {
 		if !own[cl] {
 			// Nothing of a class this attachment cannot build fills it.
@@ -932,6 +931,62 @@ func (c *PathController) claimed(a *PathAttachment, turn quiccongestion.SendClas
 // admissible checks the window, against the path's flight or a PROBING
 // attachment's own, and the balance, for a packet of the given turn. A
 // CONTROL turn may borrow the control debt; borrowed says it did.
+// controlBypass decides whether a's CONTROL work may go past the live claim
+// of the path's turn, and records it if so. Two properties, no more:
+//
+//   - CONTROL is not held behind claimants that cannot use the turn now:
+//     none of them could send a packet of its own size, against its own
+//     window (a PROBING claimant's probe window) and the balance, while
+//     CONTROL fits on the control debt. A claimant whose ability is unknown
+//     keeps its claim.
+//   - A live claim is not starved: each claimant is bypassed at most once
+//     until it is next admitted, so CONTROL then waits for the window like
+//     anyone else and the claimant gets the opening it was waiting for. A
+//     dead claimant -- one that never asks again -- costs CONTROL that one
+//     drain: with the window open, its claim lapses after a packet time
+//     like any other unused claim.
+func (c *PathController) controlBypass(a *PathAttachment, own [quiccongestion.NumSendClasses]bool, turn quiccongestion.SendClass, now monotime.Time, maxBytes quiccongestion.ByteCount) bool {
+	if turn == quiccongestion.ClassExempt || turn == quiccongestion.ClassControl || own[turn] || !own[quiccongestion.ClassControl] {
+		return false
+	}
+	if !c.fits(now, quiccongestion.ClassControl, maxBytes) {
+		return false
+	}
+	var claimants []*PathAttachment
+	for o := range c.byClass[turn] {
+		if !c.claims(o, a, turn, now) {
+			continue
+		}
+		if o.bypassed || o.maxPacket <= 0 || c.claimantCanSend(o, now) {
+			return false
+		}
+		claimants = append(claimants, o)
+	}
+	if len(claimants) == 0 {
+		return false
+	}
+	for _, o := range claimants {
+		o.bypassed = true
+	}
+	c.stats.controlBypasses.Add(1)
+	return true
+}
+
+// claimantCanSend says whether o could send an ordinary packet of its own
+// size now: its window -- the path's, or a PROBING attachment's own probe
+// window -- and the balance.
+func (c *PathController) claimantCanSend(o *PathAttachment, now monotime.Time) bool {
+	size := o.maxPacket
+	if o.probing {
+		if o.gauge+size > pathProbeWindowPackets*c.maxPacket {
+			return false
+		}
+	} else if c.flight+size > c.law.GetCongestionWindow() {
+		return false
+	}
+	return c.law.pacer.budget(now) >= size
+}
+
 // fits says whether an ordinary packet of the given turn would pass the
 // path's window and balance now, as admissible decides for a COUNTED
 // attachment, without recording anything.
@@ -1265,6 +1320,9 @@ type PathAttachment struct {
 	// the epoch last seen.
 	progress      func() TransportProgress
 	progressEpoch uint64
+	// bypassed says CONTROL went past this attachment's claim and it has
+	// not been admitted since: no further bypass until it is.
+	bypassed bool
 	// stuckUntil is, per class, until when a turn this attachment could not
 	// build is passed over for it (OnEmptyBuild).
 	stuckUntil [quiccongestion.NumSendClasses]monotime.Time
@@ -1589,9 +1647,10 @@ func (a *PathAttachment) SetRTTStatsProvider(provider quiccongestion.RTTStatsPro
 }
 
 func (a *PathAttachment) SetMaxDatagramSize(size quiccongestion.ByteCount) {
-	a.maxPacket = size
 	c := a.ctl.Load()
 	c.mu.Lock()
+	// Under the lock: a sibling's admission reads it (controlBypass).
+	a.maxPacket = size
 	c.notePacketSize(size)
 	c.mu.Unlock()
 }

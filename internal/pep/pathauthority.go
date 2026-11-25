@@ -52,6 +52,29 @@ func newClientPathPrincipal() string {
 	return clientPathPrincipal + ":" + strconv.FormatUint(clientPathPrincipals.Add(1), 10)
 }
 
+// pathRekey returns the migration callback of an attachment whose key is
+// now current: it resolves the principal and the addresses again, compares
+// the whole key, and on a change returns the new key's controller after
+// pointing the connection's readers (follow) at its model. It is called
+// only on the connection's run loop.
+func pathRekey(principal func() string, current string, initial quiccongestion.ByteCount, follow func(next string)) func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
+	return func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
+		_, nextAddrs := resolvePath(newLocal, newRemote)
+		nextWho := principal()
+		next := nextWho + "|" + nextAddrs
+		if next == current {
+			return nil
+		}
+		current = next
+		// Resolve the controller first: a lookup may sweep an expired entry
+		// and its model, and the readers must follow the model the
+		// controller reports to.
+		c := pathAuthorities.controller(nextWho, nextAddrs, initial)
+		follow(next)
+		return c
+	}
+}
+
 // pathPrincipalNow is the client's identity in path keys for a connection
 // dialled now: its principal and the generation of its uplink. The key's
 // address part distinguishes uplinks by source address; the generation
@@ -148,22 +171,7 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal func(
 	// The connection's FEC and probe readers read the model the law reports
 	// to: the principal's.
 	readers := pathModelOfKey(conn, current)
-	// rekey is called only on the connection's run loop.
-	rekey := func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
-		_, nextAddrs := resolvePath(newLocal, newRemote)
-		nextWho := principal()
-		next := nextWho + "|" + nextAddrs
-		if next == current {
-			return nil
-		}
-		current = next
-		// Resolve the controller first: a lookup may sweep an expired entry
-		// and its model, and the readers must follow the model the
-		// controller reports to.
-		c := pathAuthorities.controller(nextWho, nextAddrs, initial)
-		rekeyPathModel(conn, next)
-		return c
-	}
+	rekey := pathRekey(principal, current, initial, func(next string) { rekeyPathModel(conn, next) })
 	attachment := controller.Attach(rekey, func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
 	// PROBING follows the transport's own progress export (§4.4, §10.2).
 	attachment.SetTransportProgress(func() wancongestion.TransportProgress {

@@ -527,10 +527,7 @@ func TestAnUplinkChangeWithTheSameAddressStartsANewController(t *testing.T) {
 	captured := pathScopeConfig
 	captured.principal = client.pathPrincipalNow
 	late := bed.clientTLS()
-	// A connection attached before the change, to migrate after it.
-	movingConn := bed.clientTLS()
-	moving := configureQUICController(movingConn, captured).(*wancongestion.PathAttachment)
-	waitAttached(t, before.Controller(), 3)
+	waitAttached(t, before.Controller(), 2)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	client.onUplinkChanged(ctx)
@@ -541,13 +538,23 @@ func TestAnUplinkChangeWithTheSameAddressStartsANewController(t *testing.T) {
 	if att := configureQUICController(late, captured).(*wancongestion.PathAttachment); att.Controller() != after.Controller() {
 		t.Fatal("a connection installed after the uplink change resolved the old generation's controller")
 	}
-	// Its migration -- with its addresses unchanged -- moves it to the
-	// current generation's controller: the whole key is compared.
-	local, remote := movingConn.LocalAddr(), movingConn.RemoteAddr()
-	moving.OnPathMigrated(0, local, local, remote, remote)
-	beforeConn := moving
-	if beforeConn.Controller() != after.Controller() {
-		t.Fatal("a migration after the uplink change kept the old generation's controller")
+	// A migration after the change -- with the addresses unchanged --
+	// moves a connection to the current generation's controller: the whole
+	// key is compared. The rekey is exercised on its own, as the run loop
+	// would call it.
+	conn := bed.clientTLS()
+	local, remote := conn.LocalAddr(), conn.RemoteAddr()
+	_, addrs := resolvePath(local, remote)
+	var followed string
+	rekey := pathRekey(func() string { return "gen-before" }, "gen-before|"+addrs, 1200, func(next string) { followed = next })
+	if rekey(local, local, remote, remote) != nil {
+		t.Fatal("a migration with the same key moved the connection")
+	}
+	generation := "gen-before"
+	rekey = pathRekey(func() string { return generation }, generation+"|"+addrs, 1200, func(next string) { followed = next })
+	generation = "gen-after"
+	if c := rekey(local, local, remote, remote); c == nil || followed != "gen-after|"+addrs {
+		t.Fatalf("a migration after the generation changed did not move the connection (readers follow %q)", followed)
 	}
 }
 
@@ -589,5 +596,29 @@ func TestAGatewayClosesADataConnectionItCannotAttach(t *testing.T) {
 	case <-conn.Context().Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("the gateway kept a data connection it could not attach to its path controller")
+	}
+}
+
+// A resume and a change to a network with the same address seen on one
+// tick still start a new uplink generation before the path is prewarmed.
+func TestAResumeWithAnUplinkChangeStartsANewGeneration(t *testing.T) {
+	_, credentials := testCertificate(t)
+	client, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
+		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	before := client.pathPrincipalNow()
+	client.onUplinkTick(ctx, true, false, "", "")
+	if client.pathPrincipalNow() != before {
+		t.Fatal("a resume without a change started a new generation")
+	}
+	client.onUplinkTick(ctx, true, true, "10.0.0.2|en0|1|10.0.0.1", "10.0.0.2|en0|1|10.0.0.254")
+	if client.pathPrincipalNow() == before {
+		t.Fatal("a resume that saw a same-address network change kept the old generation")
 	}
 }
