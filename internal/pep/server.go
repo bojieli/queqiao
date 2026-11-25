@@ -83,6 +83,15 @@ type ServerConfig struct {
 	// single version emulates a gateway that speaks only that one, and is how
 	// a deployment retires a version once its clients have moved.
 	AcceptWire []byte
+	// GatewayAdmission selects what the session limit counts; see
+	// GatewayAdmission. Empty is legacy.
+	GatewayAdmission GatewayAdmission
+	// testReleasedAdmission emulates a released gateway's admission exactly:
+	// a stream that finds no session slot is closed before its first frame
+	// is read, and no standby connection is admitted past a full bound. It
+	// exists so tests can show the degraded path against released gateways
+	// (design §10.2) and is false in production.
+	testReleasedAdmission bool
 	// testLaneWriteHook is intentionally unexported and nil in production. It
 	// lets package integration tests reproduce loss of a specific logical
 	// frame without depending on encrypted QUIC packet layout.
@@ -123,6 +132,15 @@ type Server struct {
 	// so the replacement association keeps the source address the destination
 	// has been talking to.
 	udpRelays *udpRelayStore
+
+	// handshakes bounds TLS/TCP connections between accept and admission:
+	// in owned mode every one, in legacy mode those accepted past a full
+	// session limit to be read as a JOIN or PROBE.
+	handshakes chan struct{}
+	// principalConns counts each principal's admitted QUIC data connections,
+	// so one standby can be admitted beside them when the bound is full.
+	connMu         sync.Mutex
+	principalConns map[string]*principalConnections
 }
 
 type serverFlow struct {
@@ -138,6 +156,11 @@ type serverFlow struct {
 	completed   atomic.Bool
 	tombstone   sync.Once
 	mu          sync.Mutex
+
+	// retireControlOnJoin: a RESERVE_CONTROL JOIN retires the lane that held
+	// the control role, rather than adding beside it (owned admission;
+	// design §10.3 step 1).
+	retireControlOnJoin bool
 }
 
 // quicAuthState carries the immutable device principal established by the
@@ -233,6 +256,13 @@ func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, repla
 		}
 		if (handoff && old.kind != TransportTCP) || (replaceLane && replacedLaneID != lane.id && id == replacedLaneID) {
 			retired[id] = old
+		} else if s.retireControlOnJoin && lane.control && id != lane.id && f.laneIsControl(old) &&
+			(old.suspected.Load() || time.Since(old.admitted) >= laneDeadPathDetection) {
+			// RESERVE_CONTROL replaces a failed control generation, so the
+			// lane that held the role is retired with the admission. A young
+			// holder is a rescue that just won, and keeps the protection
+			// eviction gives it; the client closes the old stream itself.
+			retired[id] = old
 		} else {
 			remaining++
 		}
@@ -314,6 +344,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.MaxSessions > maxConfiguredSessions {
 		return nil, fmt.Errorf("maximum sessions must not exceed %d", maxConfiguredSessions)
 	}
+	admission, err := ParseGatewayAdmission(string(cfg.GatewayAdmission))
+	if err != nil {
+		return nil, err
+	}
+	cfg.GatewayAdmission = admission
 	acceptWire, err := resolveWireVersions(cfg.AcceptWire)
 	if err != nil {
 		return nil, fmt.Errorf("accepted wire versions: %w", err)
@@ -371,6 +406,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	budget := limiter.New(limiter.Config{TotalBytesPerSec: cfg.AggregateBytesPerSec, ReserveBytesPerSec: cfg.InteractiveReserveBytesPerSec})
 	cfg.ChunkSize = chunkSizeForBudget(cfg.ChunkSize, budget)
+	handshakes := tcpRecoveryLanes
+	if cfg.GatewayAdmission == GatewayAdmissionOwned {
+		handshakes = cfg.MaxSessions
+	}
 	server := &Server{
 		cfg:          cfg,
 		semaphore:    make(chan struct{}, cfg.MaxSessions),
@@ -382,6 +421,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		budget:       budget,
 		metrics:      cfg.Metrics,
 		udpRelays:    newUDPRelayStore(),
+
+		handshakes:     make(chan struct{}, handshakes),
+		principalConns: make(map[string]*principalConnections),
 	}
 	return server, nil
 }
@@ -523,29 +565,65 @@ func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error
 			_ = raw.Close()
 			return fmt.Errorf("configure accepted TLS/TCP congestion control: %w", err)
 		}
+		// A TLS/TCP connection carries exactly one stream, so its admission
+		// is its stream's. In owned mode the bound taken here covers only the
+		// handshake and the first frame; the session limit is charged at OPEN.
+		if s.admissionOwned() {
+			if !tryAcquire(s.handshakes) {
+				_ = raw.Close()
+				s.cfg.Logger.Warn("remote TLS/TCP handshake limit reached")
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.handleTCP(ctx, tls.Server(raw, tlsConfig), streamAdmission{release: func() { <-s.handshakes }})
+			}()
+			continue
+		}
 		select {
 		case s.semaphore <- struct{}{}:
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				defer func() { <-s.semaphore }()
-				s.handleTCP(ctx, tls.Server(raw, tlsConfig))
+				s.handleTCP(ctx, tls.Server(raw, tlsConfig), streamAdmission{charged: true})
 			}()
 		default:
+			// Every slot is held. The JOIN that would recover one of those
+			// flows, or a PROBE, needs none, so the connection is read under a
+			// small separate bound before anything else is refused (#170).
+			if !s.cfg.testReleasedAdmission && tryAcquire(s.handshakes) {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					s.handleTCP(ctx, tls.Server(raw, tlsConfig), streamAdmission{recoveryOnly: true, release: func() { <-s.handshakes }})
+				}()
+				continue
+			}
 			_ = raw.Close()
 			s.cfg.Logger.Warn("remote session limit reached")
 		}
 	}
 }
 
-func (s *Server) handleTCP(ctx context.Context, conn *tls.Conn) {
+func (s *Server) handleTCP(ctx context.Context, conn *tls.Conn, admission streamAdmission) {
 	defer conn.Close()
+	if admission.release != nil {
+		release := sync.OnceFunc(admission.release)
+		defer release()
+		admission.release = release
+	}
 	_ = conn.SetDeadline(time.Now().Add(handshakeBound(conn, s.cfg.HandshakeTimeout)))
 	if err := conn.HandshakeContext(ctx); err != nil {
 		s.cfg.Logger.Debug("remote TLS handshake failed", "error", err)
 		return
 	}
 	state := conn.ConnectionState()
+	if admission.recoveryOnly && (state.NegotiatedProtocol == identity.EnrollmentALPN || state.NegotiatedProtocol == identity.RenewalALPN) {
+		// Read past a full session limit only to find a JOIN or a PROBE.
+		return
+	}
 	if state.NegotiatedProtocol == identity.EnrollmentALPN {
 		if s.cfg.Enrollment != nil {
 			if !s.admitEnrollment() {
@@ -581,7 +659,7 @@ func (s *Server) handleTCP(ctx context.Context, conn *tls.Conn) {
 		return
 	}
 	s.metrics.DataConnectionAccepted(wire)
-	s.handleSession(ctx, conn, principal, nil)
+	s.handleSession(ctx, conn, principal, nil, admission)
 }
 
 func (s *Server) serveQUIC(ctx context.Context) error {
@@ -652,10 +730,16 @@ func (s *Server) ServePacketConn(ctx context.Context, packetConn net.PacketConn)
 			}
 			return fmt.Errorf("accept QUIC lane: %w", acceptErr)
 		}
-		if !s.admitConnection() {
+		// The listener returns connections whose mutual TLS handshake is
+		// complete, so the bound is charged to an authorised principal.
+		ticket, admitted := s.admitQUICConnection(conn.ConnectionState().TLS)
+		if !admitted {
 			_ = conn.CloseWithError(0x100, "server connection limit reached")
 			s.cfg.Logger.Warn("remote QUIC connection limit reached")
 			continue
+		}
+		if ticket.standby {
+			s.cfg.Logger.Debug("remote QUIC standby connection admitted past the connection limit")
 		}
 		// Session admission is performed per QUIC stream in handleQUIC. Holding
 		// one slot from that session semaphore for the lifetime of a multiplexed
@@ -665,7 +749,7 @@ func (s *Server) ServePacketConn(ctx context.Context, packetConn net.PacketConn)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer s.releaseConnection()
+			defer s.releaseQUICConnection(ticket)
 			s.handleQUIC(ctx, conn)
 		}()
 	}
@@ -755,25 +839,64 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	}
 	s.metrics.DataConnectionAccepted(wire)
 	auth := &quicAuthState{principal: principal}
+	// firstFrames and probes are this connection's own bounds (§10.5): the
+	// streams whose first frame is being read or whose JOIN is being
+	// admitted, and the PROBEs that hold no session slot.
+	firstFrames := make(chan struct{}, firstFrameStreams)
+	probes := make(chan struct{}, probeStreams)
+	owned := s.admissionOwned()
 	// Mutual TLS authenticates the whole QUIC connection before any stream is
 	// accepted. Every stream therefore begins directly with OPEN or JOIN.
 	dispatch := func(lane streamConn) bool {
+		if owned {
+			// The accept loop has already taken this stream's first-frame
+			// slot; the session limit is charged at OPEN.
+			wg.Add(1)
+			go func(lane streamConn) {
+				defer wg.Done()
+				s.handleSession(ctx, lane, principal, auth, streamAdmission{release: func() { <-firstFrames }, probes: probes})
+			}(lane)
+			return true
+		}
 		select {
 		case s.semaphore <- struct{}{}:
 			wg.Add(1)
 			go func(lane streamConn) {
 				defer wg.Done()
 				defer func() { <-s.semaphore }()
-				s.handleSession(ctx, lane, principal, auth)
+				s.handleSession(ctx, lane, principal, auth, streamAdmission{charged: true})
 			}(lane)
 			return true
 		default:
+			// Every slot is held, typically by the flows this stream may be
+			// trying to recover. A JOIN or a PROBE needs no slot, so the first
+			// frame is read under the connection's own bound before anything
+			// is refused (#170).
+			if !s.cfg.testReleasedAdmission && tryAcquire(firstFrames) {
+				wg.Add(1)
+				go func(lane streamConn) {
+					defer wg.Done()
+					s.handleSession(ctx, lane, principal, auth, streamAdmission{recoveryOnly: true, release: func() { <-firstFrames }, probes: probes})
+				}(lane)
+				return true
+			}
 			_ = lane.Close()
 			s.cfg.Logger.Warn("remote session limit reached")
 			return false
 		}
 	}
 	for {
+		if owned {
+			// Wait for room rather than refuse: streams beyond the bound stay
+			// in QUIC's accept queue, and only this connection waits.
+			select {
+			case firstFrames <- struct{}{}:
+			case <-ctx.Done():
+				return
+			case <-conn.Context().Done():
+				return
+			}
+		}
 		// Waiting for another stream is not a handshake operation. Applying the
 		// per-stream authentication timeout here used to close the entire QUIC
 		// connection after ten seconds without a *new* stream, even while an
@@ -782,6 +905,9 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 		// outer connection is bounded by QUIC's idle timeout and server shutdown.
 		stream, err := acceptQUICStream(ctx, conn, controller)
 		if err != nil {
+			if owned {
+				<-firstFrames
+			}
 			if ctx.Err() == nil {
 				s.cfg.Logger.Debug("accept QUIC stream failed", "error", err)
 			}
@@ -791,8 +917,15 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	}
 }
 
-func (s *Server) handleSession(ctx context.Context, conn streamConn, principal identity.Principal, auth *quicAuthState) {
+func (s *Server) handleSession(ctx context.Context, conn streamConn, principal identity.Principal, auth *quicAuthState, admission streamAdmission) {
 	defer conn.Close()
+	// The first-frame bound is released once this stream is admitted or
+	// refused, and at the latest when it ends.
+	releaseFirstFrame := func() {}
+	if admission.release != nil {
+		releaseFirstFrame = sync.OnceFunc(admission.release)
+		defer releaseFirstFrame()
+	}
 	if auth != nil {
 		auth.flows.Add(1)
 		defer auth.flows.Add(-1)
@@ -813,6 +946,17 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		return
 	}
 	if open.Header.Type == protocol.TypeProbe {
+		if !admission.charged && admission.probes != nil {
+			// A PROBE holds no session slot. It is charged to its
+			// connection's probe allowance instead; its work is fixed by
+			// PROTOCOL.md §14 and its time by the handshake deadline.
+			if !tryAcquire(admission.probes) {
+				s.cfg.Logger.Debug("remote probe allowance reached")
+				return
+			}
+			defer func() { <-admission.probes }()
+			releaseFirstFrame()
+		}
 		s.handlePathProbe(fc, open)
 		return
 	}
@@ -838,7 +982,16 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: open.Header.SessionID, FlowID: open.Header.FlowID, Class: protocol.ClassBulk}, Payload: session.ResetPayload(session.ResetProtocol, "invalid lane join")})
 			return
 		}
-		s.handleLaneJoinOpenWithReplacement(ctx, conn, fc, principal, open.Header.SessionID, laneID, replacedLaneID, replaceLane, open)
+		// A JOIN is charged to the flow it joins, within that flow's lane
+		// ceiling, and never to the session limit. It stays under the
+		// first-frame bound until it has been admitted or refused.
+		s.admitLaneJoin(ctx, conn, fc, principal, open.Header.SessionID, laneID, replacedLaneID, replaceLane, open, releaseFirstFrame)
+		return
+	}
+	if admission.recoveryOnly {
+		// Read past a full session limit only to find a JOIN or a PROBE. An
+		// OPEN is refused exactly as it was before it was read.
+		s.cfg.Logger.Warn("remote session limit reached")
 		return
 	}
 	sessionID := open.Header.SessionID
@@ -847,17 +1000,44 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetProtocol, "invalid flow open")})
 		return
 	}
+	// lease is what this logical flow holds against the gateway's limits.
+	lease := &flowLease{}
+	defer func() { lease.release() }()
+	udpResume, udpResumable := session.DecodeUDPResumeOpen(open.Payload)
+	if s.admissionOwned() && udpResumable && len(udpResume) > 0 {
+		// A replacement naming a relay that a live association of this
+		// principal still holds takes the relay over, with the session and
+		// account slots that association was charged (§11.2).
+		if relay, moved := s.udpRelays.transfer(ctx, udpResume, principal, s.udpTransferWait()); relay != nil {
+			releaseFirstFrame()
+			lease = moved
+			s.handleUDPAssociation(ctx, conn, fc, principal, sessionID, open.Header.FlowID, udpResume, true, lease, relay)
+			return
+		}
+	}
+	if !admission.charged {
+		// Owned admission: the session limit counts logical flows, charged
+		// here at OPEN. The refusal is FLOW_LIMIT, a code every wire version
+		// knows and the answer a peer already gets for an account's limit.
+		if !tryAcquire(s.semaphore) {
+			s.cfg.Logger.Warn("remote session limit reached")
+			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetFlowLimit, "remote session limit reached")})
+			return
+		}
+		lease.add(func() { <-s.semaphore })
+	}
+	releaseFirstFrame()
 	if refusal := s.admitAccountFlow(principal); refusal != nil {
 		s.refuseAccountFlow(fc, sessionID, open.Header.FlowID, principal, refusal)
 		return
 	}
-	defer s.releaseAccountFlow(principal)
+	lease.add(func() { s.releaseAccountFlow(principal) })
 	if session.IsUDPAssociation(open.Payload) {
-		s.handleUDPAssociation(ctx, conn, fc, principal, sessionID, open.Header.FlowID, nil, false)
+		s.handleUDPAssociation(ctx, conn, fc, principal, sessionID, open.Header.FlowID, nil, false, lease, nil)
 		return
 	}
-	if token, resumable := session.DecodeUDPResumeOpen(open.Payload); resumable {
-		s.handleUDPAssociation(ctx, conn, fc, principal, sessionID, open.Header.FlowID, token, true)
+	if udpResumable {
+		s.handleUDPAssociation(ctx, conn, fc, principal, sessionID, open.Header.FlowID, udpResume, true, lease, nil)
 		return
 	}
 	destination, err := session.DecodeDestination(open.Payload)
@@ -902,6 +1082,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	initialKind := transportKindForConn(conn)
 	serverSession := newServerFlow(flow, principal, initialKind, s.cfg.TCPFallbackLanes)
 	serverSession.wire = fc.wire
+	serverSession.retireControlOnJoin = s.admissionOwned()
 	flow.wire = fc.wire
 	openLane := &mpLane{
 		id: laneID, kind: initialKind, fc: fc, writeHook: s.cfg.testLaneWriteHook,
@@ -1122,6 +1303,14 @@ func (s *Server) handleLaneJoinOpen(ctx context.Context, conn streamConn, fc *fr
 }
 
 func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn streamConn, fc *frameConn, principal identity.Principal, sessionID [16]byte, laneID, replacedLaneID uint64, replaceLane bool, open protocol.Frame) {
+	s.admitLaneJoin(ctx, conn, fc, principal, sessionID, laneID, replacedLaneID, replaceLane, open, func() {})
+}
+
+// admitLaneJoin is the JOIN handler. admitted is called once the lane has
+// been admitted and acknowledged, before the handler settles into holding
+// it, so a bound that covers only admission is released then; every refusal
+// returns, and the caller releases it on return.
+func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameConn, principal identity.Principal, sessionID [16]byte, laneID, replacedLaneID uint64, replaceLane bool, open protocol.Frame, admitted func()) {
 	if session.IsZeroSessionID(sessionID) || laneID == 0 || open.Header.FlowID == 0 {
 		s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinInvalidIdentity, session.ResetProtocol, "invalid lane join identity")
 		return
@@ -1309,6 +1498,7 @@ func (s *Server) handleLaneJoinOpenWithReplacement(ctx context.Context, conn str
 		}})
 	}
 	cancelWrite()
+	admitted()
 	// A retired lane must release its admission slot while the logical flow
 	// continues on its replacement. Waiting only for the flow leaks slots.
 	select {

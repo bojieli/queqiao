@@ -1,0 +1,764 @@
+package pep
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/apernet/quic-go"
+	"github.com/bojieli/queqiao/internal/identity"
+	"github.com/bojieli/queqiao/internal/protocol"
+	"github.com/bojieli/queqiao/internal/session"
+)
+
+// admissionGateway runs a real gateway on loopback for the admission tests and
+// returns it with the address to dial.
+func admissionGateway(t *testing.T, ctx context.Context, carrier TransportKind, cfg ServerConfig) (*Server, string) {
+	t.Helper()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.DestinationPolicy = DestinationPolicy{AllowPrivate: true, DialTimeout: 2 * time.Second}
+	cfg.EnableQUIC = carrier == TransportQUIC
+	cfg.EnableTCP = carrier == TransportTCP
+	cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg.HandshakeTimeout = 3 * time.Second
+	// PACKET frames stay on the stream the raw test client reads.
+	cfg.UDPOnStream = true
+	released := cfg.testReleasedAdmission
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.cfg.testReleasedAdmission = released
+	done := make(chan struct{})
+	if carrier == TransportTCP {
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { defer close(done); _ = server.ServeListener(ctx, listener) }()
+		t.Cleanup(func() { <-done })
+		return server, listener.Addr().String()
+	}
+	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { defer close(done); _ = server.ServePacketConn(ctx, packetConn) }()
+	t.Cleanup(func() { <-done })
+	return server, packetConn.LocalAddr().String()
+}
+
+// rawCarrier is one authenticated client connection that opens lanes on
+// demand: streams of one QUIC connection, or one TLS/TCP connection per lane.
+type rawCarrier struct {
+	t           *testing.T
+	carrier     TransportKind
+	remote      string
+	credentials identity.ClientCredentials
+	wire        []byte
+	conn        *quic.Conn
+}
+
+func dialRawCarrier(ctx context.Context, t *testing.T, carrier TransportKind, remote string, credentials identity.ClientCredentials, wire byte) (*rawCarrier, error) {
+	c := &rawCarrier{t: t, carrier: carrier, remote: remote, credentials: credentials, wire: []byte{wire}}
+	if carrier == TransportQUIC {
+		conn, _, err := dialQUICConnection(ctx, remote, credentials, c.wire, 3*time.Second, "", nil, nil, flowWindows{}, hopDialConfig{})
+		if err != nil {
+			return nil, err
+		}
+		c.conn = conn
+		t.Cleanup(func() { _ = conn.CloseWithError(0, "test done") })
+	}
+	return c, nil
+}
+
+func (c *rawCarrier) lane(ctx context.Context) (*frameConn, streamConn, error) {
+	if c.carrier == TransportTCP {
+		outer, err := dialTCP(ctx, c.remote, c.credentials, c.wire, 3*time.Second, "", nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		c.t.Cleanup(func() { _ = outer.Close() })
+		return newFrameConn(outer), outer, nil
+	}
+	stream, err := c.conn.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	outer := &quicStreamConn{stream: stream, conn: c.conn}
+	c.t.Cleanup(func() { _ = outer.Close() })
+	return newFrameConn(outer), outer, nil
+}
+
+// exchange writes a lane's first frame and reads its answer within a bound.
+func exchange(ctx context.Context, c *rawCarrier, frame protocol.Frame) (protocol.Frame, *frameConn, streamConn, error) {
+	fc, outer, err := c.lane(ctx)
+	if err != nil {
+		return protocol.Frame{}, nil, nil, err
+	}
+	_ = outer.SetDeadline(time.Now().Add(4 * time.Second))
+	if err := fc.Write(frame); err != nil {
+		return protocol.Frame{}, fc, outer, err
+	}
+	response, err := fc.Read()
+	_ = outer.SetDeadline(time.Time{})
+	return response, fc, outer, err
+}
+
+func openFrame(t *testing.T, sessionID [16]byte, flowID uint64, destination string) protocol.Frame {
+	t.Helper()
+	payload, err := session.EncodeDestination(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeOpen, SessionID: sessionID, FlowID: flowID, Class: protocol.ClassNew,
+	}, Payload: payload}
+}
+
+func joinFrame(sessionID [16]byte, flowID, laneID uint64) protocol.Frame {
+	return protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeJoin, SessionID: sessionID, FlowID: flowID, Class: protocol.ClassBulk,
+	}, Payload: encodeLaneID(laneID)}
+}
+
+// probe runs one PROBE exchange on a new lane and closes it, as a client's
+// verification does.
+func probe(ctx context.Context, c *rawCarrier) (protocol.Frame, error) {
+	echo, _, outer, err := exchange(ctx, c, probeFrame())
+	if outer != nil {
+		_ = outer.Close()
+	}
+	return echo, err
+}
+
+func probeFrame() protocol.Frame {
+	return protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeProbe, SessionID: [16]byte{0x70}, Class: protocol.ClassNew,
+	}, Payload: []byte{1}}
+}
+
+// knownResetCode is the PROTOCOL.md §15 table, which both wire versions share
+// and outside which a version-1 peer must never be sent a code.
+func knownResetCode(code session.ResetCode) bool {
+	return code >= session.ResetProtocol && code <= session.ResetTransport
+}
+
+// destinationKind is what the flows filling the gateway are doing.
+type destinationKind int
+
+const (
+	idleFlows destinationKind = iota
+	activeFlows
+)
+
+// admissionDestination is an echo server, or, for active transfers, a server
+// that sends without pause for as long as its connection lives.
+func admissionDestination(t *testing.T, kind destinationKind) string {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				if kind == idleFlows {
+					_, _ = io.Copy(conn, conn)
+					return
+				}
+				go func() { _, _ = io.Copy(io.Discard, conn) }()
+				chunk := bytes.Repeat([]byte{'a'}, 16*1024)
+				for {
+					if _, err := conn.Write(chunk); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return listener.Addr().String()
+}
+
+// drain reads a lane until it ends, so an active transfer keeps moving.
+func drain(fc *frameConn) {
+	go func() {
+		for {
+			if _, err := fc.Read(); err != nil {
+				return
+			}
+		}
+	}()
+}
+
+// readUntilData reads frames from a lane until a DATA frame arrives.
+func readUntilData(fc *frameConn, outer streamConn, within time.Duration) (protocol.Frame, error) {
+	_ = outer.SetDeadline(time.Now().Add(within))
+	defer func() { _ = outer.SetDeadline(time.Time{}) }()
+	for {
+		frame, err := fc.Read()
+		if err != nil {
+			return protocol.Frame{}, err
+		}
+		if frame.Header.Type == protocol.TypeData {
+			return frame, nil
+		}
+		if frame.Header.Type == protocol.TypeReset {
+			return frame, fmt.Errorf("RESET %d %q", resetCode(frame.Payload), frame.Payload)
+		}
+	}
+}
+
+type admissionCase struct {
+	name    string
+	carrier TransportKind
+	mode    GatewayAdmission
+	wire    byte
+	kind    destinationKind
+	// pooled puts every flow on one QUIC connection, so only the stream
+	// layer is full; otherwise each flow has its own connection, as an
+	// isolating client's do, and the connection bound is full as well.
+	pooled bool
+}
+
+func admissionCases() []admissionCase {
+	var cases []admissionCase
+	for _, mode := range []GatewayAdmission{GatewayAdmissionLegacy, GatewayAdmissionOwned} {
+		for _, carrier := range []TransportKind{TransportQUIC, TransportTCP} {
+			for _, wire := range protocol.SupportedVersions() {
+				for _, kind := range []destinationKind{idleFlows, activeFlows} {
+					name := "idle"
+					if kind == activeFlows {
+						name = "active"
+					}
+					for _, pooled := range []bool{false, true} {
+						if pooled && carrier != TransportQUIC {
+							continue
+						}
+						topology := "isolated"
+						if pooled {
+							topology = "pooled"
+						}
+						cases = append(cases, admissionCase{
+							name:    fmt.Sprintf("%s/%s/wire%d/%s/%s", mode, carrier, wire, name, topology),
+							carrier: carrier, mode: mode, wire: wire, kind: kind, pooled: pooled,
+						})
+					}
+				}
+			}
+		}
+	}
+	return cases
+}
+
+// Issue #170, design §10.5 and §15 test 12. Every session slot, and on QUIC
+// every connection slot, is held by established flows, idle or transferring.
+// One flow's lane fails. Its JOIN must still be admitted and carry the flow,
+// and a PROBE on the client's standby connection must be answered; a new OPEN
+// is refused. Main refused all three, so the flow waited out its grace and
+// failed while holding its slot. Every RESET seen is one the lane's wire
+// version knows.
+func TestAFullGatewayAdmitsTheJoinAndProbeThatRecoverItsFlows(t *testing.T) {
+	serverCredentials, clientCredentials := testCertificate(t)
+	const maxSessions = 4
+	for _, tc := range admissionCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+			defer cancel()
+			destination := admissionDestination(t, tc.kind)
+			server, remote := admissionGateway(t, ctx, tc.carrier, ServerConfig{
+				Credentials: serverCredentials, MaxSessions: maxSessions, GatewayAdmission: tc.mode,
+			})
+			checkReset := func(what string, frame protocol.Frame) {
+				t.Helper()
+				if frame.Header.Type == protocol.TypeReset && !knownResetCode(resetCode(frame.Payload)) {
+					t.Fatalf("%s: RESET code %d is outside the table wire %d knows", what, resetCode(frame.Payload), tc.wire)
+				}
+				if frame.Header.Type != 0 && frame.Header.Version != tc.wire {
+					t.Fatalf("%s: answer on wire %d, want %d", what, frame.Header.Version, tc.wire)
+				}
+			}
+
+			// One flow per connection, as an isolating client does, fills the
+			// connection bound as well as the session bound; a pooled client
+			// fills only the session bound.
+			type opened struct {
+				sessionID [16]byte
+				flowID    uint64
+				fc        *frameConn
+				outer     streamConn
+			}
+			flows := make([]opened, maxSessions)
+			var carrier *rawCarrier
+			for i := range flows {
+				if carrier == nil || !tc.pooled {
+					var err error
+					if carrier, err = dialRawCarrier(ctx, t, tc.carrier, remote, clientCredentials, tc.wire); err != nil {
+						t.Fatal(err)
+					}
+				}
+				sessionID := [16]byte{0x5a, byte(i + 1)}
+				response, fc, outer, err := exchange(ctx, carrier, openFrame(t, sessionID, uint64(100+i), destination))
+				if err != nil || response.Header.Type != protocol.TypeOpenOK {
+					t.Fatalf("flow %d open answered %+v, %v", i, response.Header, err)
+				}
+				flows[i] = opened{sessionID: sessionID, flowID: uint64(100 + i), fc: fc, outer: outer}
+				if tc.kind == activeFlows && i != 0 {
+					drain(fc)
+				}
+			}
+			victim := flows[0]
+			if tc.kind == activeFlows {
+				// The transfer is under way before its lane fails.
+				if _, err := readUntilData(victim.fc, victim.outer, 3*time.Second); err != nil {
+					t.Fatalf("active flow carried no data before the failure: %v", err)
+				}
+			}
+			waitForSessions(t, server, maxSessions)
+
+			// The victim's lane fails; the flow enters its replacement grace.
+			_ = victim.outer.Close()
+
+			standby, err := dialRawCarrier(ctx, t, tc.carrier, remote, clientCredentials, tc.wire)
+			if err != nil {
+				t.Fatalf("standby connection refused: %v", err)
+			}
+			if tc.carrier == TransportQUIC {
+				// The PROBE that verifies the standby connection.
+				echo, err := probe(ctx, standby)
+				if err != nil {
+					t.Fatalf("PROBE on the standby connection was not answered: %v", err)
+				}
+				checkReset("probe", echo)
+				if echo.Header.Type != protocol.TypeProbe || len(echo.Payload) != 1 || echo.Payload[0] != 1 {
+					t.Fatalf("PROBE answered %+v", echo.Header)
+				}
+			}
+
+			// The JOIN that rebinds the failed flow.
+			joined, fc, outer, err := exchange(ctx, standby, joinFrame(victim.sessionID, victim.flowID, 1))
+			if err != nil {
+				t.Fatalf("JOIN of a flow the full gateway holds was not answered: %v", err)
+			}
+			checkReset("join", joined)
+			if joined.Header.Type != protocol.TypeOpenOK {
+				t.Fatalf("JOIN answered type %d %q, want OPEN_OK", joined.Header.Type, joined.Payload)
+			}
+			// And the flow is carried on the new lane.
+			if tc.kind == idleFlows {
+				if err := fc.Write(protocol.Frame{Header: protocol.Header{
+					Version: protocol.Version, Type: protocol.TypeData, SessionID: victim.sessionID,
+					FlowID: victim.flowID, Class: protocol.ClassInteractive,
+				}, Payload: []byte("still here")}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			data, err := readUntilData(fc, outer, 5*time.Second)
+			if err != nil {
+				t.Fatalf("rejoined flow carried nothing: %v", err)
+			}
+			if tc.kind == idleFlows && string(data.Payload) != "still here" {
+				t.Fatalf("rejoined flow echoed %q", data.Payload)
+			}
+
+			// A new flow does not get a slot the established ones hold.
+			refused, _, _, err := exchange(ctx, standby, openFrame(t, [16]byte{0x5b}, 999, destination))
+			if err == nil {
+				checkReset("open", refused)
+				if refused.Header.Type == protocol.TypeOpenOK {
+					t.Fatal("a new OPEN was admitted past the session limit")
+				}
+				if tc.mode == GatewayAdmissionOwned && (refused.Header.Type != protocol.TypeReset || resetCode(refused.Payload) != session.ResetFlowLimit) {
+					t.Fatalf("owned admission refused the OPEN with %+v %q, want FLOW_LIMIT", refused.Header, refused.Payload)
+				}
+			} else if tc.mode == GatewayAdmissionOwned {
+				t.Fatalf("owned admission closed the OPEN without an answer: %v", err)
+			}
+		})
+	}
+}
+
+// waitForSessions waits until the gateway's session table holds n flows.
+func waitForSessions(t *testing.T, server *Server, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		server.sessionsMu.RLock()
+		got := len(server.sessions)
+		server.sessionsMu.RUnlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("gateway holds %d sessions, want %d", got, n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A released gateway is the degraded path of design §10.2: with MaxSessions=1
+// and one confirmed flow, the flow's own JOIN is refused because it needs the
+// slot the flow holds. The case is stated as unrecoverable against released
+// gateways, and this keeps it observed rather than hidden. The emulation is
+// what lets the client-side tests of later stages run against a released
+// gateway.
+func TestAReleasedGatewayAtItsSessionLimitRefusesTheRescueJoin(t *testing.T) {
+	serverCredentials, clientCredentials := testCertificate(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	destination := admissionDestination(t, idleFlows)
+	_, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{
+		Credentials: serverCredentials, MaxSessions: 1, testReleasedAdmission: true,
+	})
+	carrier, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := [16]byte{0x5c}
+	response, _, outer, err := exchange(ctx, carrier, openFrame(t, sessionID, 7, destination))
+	if err != nil || response.Header.Type != protocol.TypeOpenOK {
+		t.Fatalf("open answered %+v, %v", response.Header, err)
+	}
+	_ = outer.Close()
+	// The connection is alive; only the flow's stream failed.
+	if answer, _, _, err := exchange(ctx, carrier, joinFrame(sessionID, 7, 1)); err == nil {
+		t.Fatalf("released gateway answered the rescue JOIN at its session limit: %+v", answer.Header)
+	}
+	// The handshake may complete before the gateway closes the connection;
+	// a stream on it must not be served.
+	if standby, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version); err == nil {
+		if answer, err := probe(ctx, standby); err == nil {
+			t.Fatalf("released gateway served a standby past its connection limit: %+v", answer.Header)
+		}
+	}
+}
+
+// In owned admission the session limit counts logical flows. Lanes a flow
+// adds by JOIN, and PROBEs, do not consume it; a refused OPEN is told
+// FLOW_LIMIT; and the slot comes back when the flow ends.
+func TestOwnedAdmissionCountsFlowsNotStreams(t *testing.T) {
+	serverCredentials, clientCredentials := testCertificate(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	destination := admissionDestination(t, idleFlows)
+	_, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{
+		Credentials: serverCredentials, MaxSessions: 2, GatewayAdmission: GatewayAdmissionOwned,
+	})
+	carrier, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Probes first: several, sequentially, none of them a flow.
+	for i := range 4 {
+		echo, err := probe(ctx, carrier)
+		if err != nil || echo.Header.Type != protocol.TypeProbe {
+			t.Fatalf("probe %d answered %+v, %v", i, echo.Header, err)
+		}
+	}
+	var lanes []streamConn
+	for i := range 2 {
+		sessionID := [16]byte{0x5d, byte(i)}
+		open := openFrame(t, sessionID, uint64(10+i), destination)
+		// A flow with a control lane has room for a data lane beside it.
+		open.Header.Flags = protocol.FlagReserveControl
+		response, _, outer, err := exchange(ctx, carrier, open)
+		if err != nil || response.Header.Type != protocol.TypeOpenOK {
+			t.Fatalf("flow %d open answered %+v, %v", i, response.Header, err)
+		}
+		lanes = append(lanes, outer)
+		// A second lane for the same flow is charged to the flow.
+		joined, _, _, err := exchange(ctx, carrier, joinFrame(sessionID, uint64(10+i), 1))
+		if err != nil || joined.Header.Type != protocol.TypeOpenOK {
+			t.Fatalf("flow %d extra lane answered %+v %q, %v", i, joined.Header, joined.Payload, err)
+		}
+	}
+	refused, _, _, err := exchange(ctx, carrier, openFrame(t, [16]byte{0x5e}, 20, destination))
+	if err != nil || refused.Header.Type != protocol.TypeReset || resetCode(refused.Payload) != session.ResetFlowLimit {
+		t.Fatalf("third flow answered %+v %q, %v; want FLOW_LIMIT", refused.Header, refused.Payload, err)
+	}
+	echo, err := probe(ctx, carrier)
+	if err != nil || echo.Header.Type != protocol.TypeProbe {
+		t.Fatalf("probe at the session limit answered %+v, %v", echo.Header, err)
+	}
+	_ = lanes
+}
+
+func TestGatewayAdmissionConfiguration(t *testing.T) {
+	credentials, _ := testCertificate(t)
+	for _, value := range []string{"", "legacy", " Owned "} {
+		if _, err := ParseGatewayAdmission(value); err != nil {
+			t.Fatalf("%q refused: %v", value, err)
+		}
+	}
+	server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0", Credentials: credentials})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if server.cfg.GatewayAdmission != GatewayAdmissionLegacy {
+		t.Fatalf("default admission = %q, want legacy", server.cfg.GatewayAdmission)
+	}
+	if _, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0", Credentials: credentials, GatewayAdmission: "shared"}); err == nil {
+		t.Fatal("an unknown gateway admission was accepted")
+	}
+}
+
+// A full connection bound still admits one standby beside a principal's
+// existing data connections, and only one; a principal holding none gets
+// nothing past the bound.
+func TestAStandbyConnectionIsAdmittedBesideAPrincipalsConnections(t *testing.T) {
+	serverCredentials, clientCredentials := testCertificate(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	server, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{Credentials: serverCredentials, MaxSessions: 1})
+	first, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if echo, err := probe(ctx, first); err != nil || echo.Header.Type != protocol.TypeProbe {
+		t.Fatalf("first connection probe: %+v %v", echo.Header, err)
+	}
+	standby, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if echo, err := probe(ctx, standby); err != nil || echo.Header.Type != protocol.TypeProbe {
+		t.Fatalf("standby probe past a full connection bound: %+v %v", echo.Header, err)
+	}
+	third, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
+	if err == nil {
+		if echo, err := probe(ctx, third); err == nil {
+			t.Fatalf("a second standby was admitted: %+v", echo.Header)
+		}
+	}
+	server.connMu.Lock()
+	defer server.connMu.Unlock()
+	for _, p := range server.principalConns {
+		if p.connections != 2 || !p.standby {
+			t.Fatalf("principal holds %d connections, standby %v; want 2 and true", p.connections, p.standby)
+		}
+	}
+}
+
+// openUDPAssociation opens a resumable UDP association on a lane and returns
+// the lane and the token its relay will answer to next.
+func openRawUDPAssociation(ctx context.Context, t *testing.T, carrier *rawCarrier, sessionID [16]byte, flowID uint64, resume []byte) (protocol.Frame, *frameConn, streamConn) {
+	t.Helper()
+	payload, err := session.EncodeUDPResumeOpen(resume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, fc, outer, err := exchange(ctx, carrier, protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeOpen, SessionID: sessionID, FlowID: flowID, Class: protocol.ClassInteractive,
+	}, Payload: payload})
+	if err != nil {
+		t.Fatalf("UDP association open: %v", err)
+	}
+	return response, fc, outer
+}
+
+// udpRelaySource sends one datagram through an association and reports the
+// source address the destination saw it from.
+func udpRelaySource(t *testing.T, fc *frameConn, sessionID [16]byte, flowID, sequence uint64, target *net.UDPConn) string {
+	t.Helper()
+	payload, err := session.EncodeUDPPacket(target.LocalAddr().String(), []byte("ping"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.Write(protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypePacket, SessionID: sessionID, FlowID: flowID,
+		Sequence: sequence, Class: protocol.ClassInteractive,
+	}, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	_ = target.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, from, err := target.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("destination saw no datagram: %v", err)
+	}
+	return from.String()
+}
+
+// Design §11.2 and §15 test 16. The client closes a UDP association's lane and
+// then sends the resume OPEN, but the close may not arrive, and when it does
+// the old handler parks the relay only after joining its workers. An owned
+// gateway hands a relay still held by a live association to its replacement,
+// with the association's session and account slots: at MaxSessions=1 the
+// replacement needs no second slot, and the destination keeps seeing the same
+// source address. A legacy gateway resumes only a parked relay, so with the
+// close not delivered the replacement gets a fresh one (best effort, as
+// documented).
+func TestALiveUDPRelayIsHandedToItsReplacement(t *testing.T) {
+	serverCredentials, clientCredentials := testCertificate(t)
+	target, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	for _, tc := range []struct {
+		name        string
+		mode        GatewayAdmission
+		maxSessions int
+		closeFirst  bool
+		wantResumed bool
+	}{
+		{"owned/close-lost", GatewayAdmissionOwned, 1, false, true},
+		{"owned/close-arrived", GatewayAdmissionOwned, 1, true, true},
+		{"legacy/close-lost", GatewayAdmissionLegacy, 2, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			server, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{
+				Credentials: serverCredentials, MaxSessions: tc.maxSessions, GatewayAdmission: tc.mode,
+			})
+			carrier, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := [16]byte{0x60}
+			response, fc, outer := openRawUDPAssociation(ctx, t, carrier, first, 1, nil)
+			if response.Header.Type != protocol.TypeOpenOK {
+				t.Fatalf("association answered %+v %q", response.Header, response.Payload)
+			}
+			_, token, ok := session.DecodeUDPResumeGrant(response.Payload)
+			if !ok {
+				t.Fatal("no resume grant")
+			}
+			before := udpRelaySource(t, fc, first, 1, 0, target)
+			if tc.closeFirst {
+				_ = outer.Close()
+			}
+			second := [16]byte{0x61}
+			response, fc, _ = openRawUDPAssociation(ctx, t, carrier, second, 2, token[:])
+			if response.Header.Type != protocol.TypeOpenOK {
+				t.Fatalf("replacement answered %+v %q", response.Header, response.Payload)
+			}
+			resumed, _, ok := session.DecodeUDPResumeGrant(response.Payload)
+			if !ok {
+				t.Fatal("no resume grant on the replacement")
+			}
+			if resumed != tc.wantResumed {
+				t.Fatalf("resumed = %v, want %v", resumed, tc.wantResumed)
+			}
+			after := udpRelaySource(t, fc, second, 2, 0, target)
+			if tc.wantResumed && after != before {
+				t.Fatalf("relay source moved from %s to %s", before, after)
+			}
+			if tc.mode == GatewayAdmissionOwned {
+				// Exactly one session slot is held: the one transferred.
+				if got := len(server.semaphore); got != 1 {
+					t.Fatalf("%d session slots held after the transfer, want 1", got)
+				}
+			}
+		})
+	}
+}
+
+// The handoff itself, against the store's race: an association that ends at
+// the same moment its replacement claims it either hands the relay over or
+// parks it, never both and never neither.
+func TestALiveRelayIsEitherHandedOverOrParked(t *testing.T) {
+	for i := range 200 {
+		store := newUDPRelayStore()
+		token, err := newUDPResumeToken()
+		if err != nil {
+			t.Fatal(err)
+		}
+		relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease := &flowLease{}
+		released := 0
+		lease.add(func() { released++ })
+		stopped := make(chan struct{})
+		entry := store.publishLive(token, udpTestPrincipal, func() { close(stopped) })
+		var wg sync.WaitGroup
+		var handed bool
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Even rounds: the owner ends because it was claimed. Odd
+			// rounds: it ends on its own, racing the claim.
+			if i%2 == 0 {
+				<-stopped
+			}
+			handed = store.endLive(token, entry, relay, lease)
+			if !handed {
+				store.retain(token, udpTestPrincipal, relay)
+				lease.release()
+			}
+		}()
+		got, moved := store.transfer(context.Background(), token[:], udpTestPrincipal, time.Second)
+		wg.Wait()
+		switch {
+		case got != nil && handed:
+			moved.release()
+		case got == nil && !handed:
+			if store.claim(token[:], udpTestPrincipal) == nil {
+				t.Fatal("relay neither handed over nor parked")
+			}
+		default:
+			t.Fatalf("handed=%v but transfer returned %v", handed, got != nil)
+		}
+		if released != 1 {
+			t.Fatalf("lease released %d times, want 1", released)
+		}
+		_ = relay.Close()
+		store.closeAll()
+	}
+}
+
+// Design §10.3 step 1: a RESERVE_CONTROL JOIN replaces a failed control
+// generation. A released gateway with room in the lane table adds the new
+// lane beside the old one, which stays schedulable until it fails; an owned
+// gateway retires the previous holder of the control role as part of the
+// admission. A holder younger than the eviction protection is a rescue that
+// just won and is kept either way.
+func TestAControlJoinRetiresThePreviousControlLaneInOwnedAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		retire      bool
+		age         time.Duration
+		wantRetired bool
+	}{
+		{"legacy", false, 2 * laneDeadPathDetection, false},
+		{"owned", true, 2 * laneDeadPathDetection, true},
+		{"owned/young-holder", true, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flow := newIsolationTestFlow(t, true)
+			serverSession := newServerFlow(flow, identity.Principal{}, TransportQUIC, 8)
+			serverSession.retireControlOnJoin = tc.retire
+			old := isolationLane(t, 0)
+			old.control = true
+			if err := serverSession.addLane(old); err != nil {
+				t.Fatal(err)
+			}
+			old.admitted = time.Now().Add(-tc.age)
+			replacement := isolationLane(t, 1)
+			replacement.control = true
+			if err := serverSession.addLane(replacement); err != nil {
+				t.Fatalf("control JOIN refused: %v", err)
+			}
+			if got := old.closed.Load(); got != tc.wantRetired {
+				t.Fatalf("previous control lane retired = %v, want %v", got, tc.wantRetired)
+			}
+			if replacement.closed.Load() {
+				t.Fatal("the replacement control lane was closed")
+			}
+		})
+	}
+}

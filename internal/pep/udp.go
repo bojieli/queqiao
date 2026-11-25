@@ -706,14 +706,20 @@ func runClientUDPDownlink(ctx context.Context, udpConn *net.UDPConn, fc *frameCo
 	}
 }
 
-func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *frameConn, principal identity.Principal, sessionID [16]byte, flowID uint64, resume []byte, resumable bool) {
+// handleUDPAssociation serves one UDP association. lease is what the
+// association holds against the gateway's limits; adopted, when not nil, is a
+// relay taken over from the live association it replaces (§11.2), whose lease
+// this one already carries.
+func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *frameConn, principal identity.Principal, sessionID [16]byte, flowID uint64, resume []byte, resumable bool, lease *flowLease, adopted serverUDPRelay) {
 	// A token this association asks to reclaim names a relay whose lane died.
 	// Claiming is best effort: if the token is unknown, spent, or expired,
 	// this is an ordinary open with a fresh socket, which is exactly the
 	// behaviour that existed before resume did.
 	var udpConn serverUDPRelay
 	resumed := false
-	if resumable && len(resume) > 0 {
+	if adopted != nil {
+		udpConn, resumed = adopted, true
+	} else if resumable && len(resume) > 0 {
 		if held := s.udpRelays.claim(resume, principal); held != nil {
 			udpConn, resumed = held, true
 		}
@@ -742,11 +748,31 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		grant = minted
 	}
 
+	// assocCtx ends the association. It exists before the OPEN_OK so that a
+	// replacement taking this relay over can stop the association whenever
+	// it arrives.
+	assocCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// In owned admission a live association is published under the token its
+	// replacement will present, so the replacement can take the relay over
+	// without waiting for this one to notice that its lane is gone.
+	var live *liveRelay
+	if resumable && s.admissionOwned() {
+		live = s.udpRelays.publishLive(grant, principal, cancel)
+	}
+
 	// How this association ends decides what happens to its socket. A clean
 	// dissociation or a refused open closes it; a transport failure parks it,
-	// because that is the case a replacement is coming for.
+	// because that is the case a replacement is coming for. A replacement
+	// that has already claimed the live relay takes it, and the lease, in
+	// place of either; this runs after the workers below have been joined.
 	retain := false
 	defer func() {
+		if live != nil && s.udpRelays.endLive(grant, live, udpConn, lease) {
+			s.cfg.Logger.Debug("UDP association relay handed to its replacement",
+				"relay", udpConn.LocalAddr().String())
+			return
+		}
 		if resumable && retain {
 			s.cfg.Logger.Debug("UDP association relay retained for a replacement",
 				"relay", udpConn.LocalAddr().String(), "resumed", resumed)
@@ -764,8 +790,6 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
-	assocCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	frames := make(chan protocol.Frame, 32)
 	frameErr := make(chan error, 1)

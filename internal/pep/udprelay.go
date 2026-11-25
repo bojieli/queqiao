@@ -1,6 +1,7 @@
 package pep
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"sync"
@@ -43,6 +44,11 @@ type udpRelayStore struct {
 
 	mu     sync.Mutex
 	relays map[[session.UDPResumeTokenSize]byte]retainedRelay
+	// live names relays still held by a running association, under the
+	// token that association granted (owned admission only). An entry is
+	// bounded by the association that published it, which is bounded by
+	// the session limit.
+	live map[[session.UDPResumeTokenSize]byte]*liveRelay
 	// sweeping is true while a goroutine is expiring entries. Retain and
 	// claim each sweep as they go, which is enough while an association is
 	// failing; this covers the case where they stop. It starts on the first
@@ -71,6 +77,7 @@ func newUDPRelayStore() *udpRelayStore {
 func newUDPRelayStoreWith(grace time.Duration, maximum int) *udpRelayStore {
 	return &udpRelayStore{
 		relays:  map[[session.UDPResumeTokenSize]byte]retainedRelay{},
+		live:    map[[session.UDPResumeTokenSize]byte]*liveRelay{},
 		grace:   grace,
 		maximum: maximum,
 	}
@@ -193,4 +200,106 @@ func (s *udpRelayStore) retained() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.relays)
+}
+
+// liveRelay is a relay its association still holds, published so that the
+// association's replacement can take it over (design §11.2). The client
+// always closes the old association's lane before it sends the resume OPEN,
+// but that close may never arrive, and even when it does the old handler
+// parks the relay only after its workers have been joined. A replacement
+// that finds the relay live therefore fences the old handler: it stops the
+// association, waits for the handler's deferred cleanup to join its workers,
+// and is handed the relay and the association's lease instead of the relay
+// being parked or closed.
+type liveRelay struct {
+	principal identity.Principal
+	// stop ends the owning association.
+	stop context.CancelFunc
+	// claimed is set, under the store lock, by the replacement that fenced
+	// the owner; abandoned, by one that gave up waiting.
+	claimed   bool
+	abandoned bool
+	// handed is closed once conn and lease belong to the replacement.
+	handed chan struct{}
+	conn   serverUDPRelay
+	lease  *flowLease
+}
+
+// publishLive records a running association's relay under the token it
+// granted.
+func (s *udpRelayStore) publishLive(token [session.UDPResumeTokenSize]byte, principal identity.Principal, stop context.CancelFunc) *liveRelay {
+	if s == nil {
+		return nil
+	}
+	entry := &liveRelay{principal: principal, stop: stop, handed: make(chan struct{})}
+	s.mu.Lock()
+	if s.live == nil {
+		s.live = map[[session.UDPResumeTokenSize]byte]*liveRelay{}
+	}
+	s.live[token] = entry
+	s.mu.Unlock()
+	return entry
+}
+
+// endLive withdraws a live relay as its association ends. It reports true
+// when a replacement had claimed it: the relay and the lease are then the
+// replacement's, and the caller must neither park nor close the relay. Under
+// the store lock, so a claim either sees the entry and is handed the relay,
+// or misses it and finds the relay parked (or gone) instead.
+func (s *udpRelayStore) endLive(token [session.UDPResumeTokenSize]byte, entry *liveRelay, conn serverUDPRelay, lease *flowLease) bool {
+	if s == nil || entry == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.live[token] == entry {
+		delete(s.live, token)
+	}
+	if !entry.claimed || entry.abandoned || conn == nil {
+		return false
+	}
+	entry.conn = conn
+	entry.lease = lease.detach()
+	close(entry.handed)
+	return true
+}
+
+// transfer takes over the relay a live association of the same principal
+// holds under token, waiting at most wait for that association to stop. It
+// returns nil when no such association exists, or when it did not stop in
+// time; the caller then opens as before, which also finds a relay parked
+// under the same token. The token is consumed by the attempt.
+func (s *udpRelayStore) transfer(ctx context.Context, token []byte, principal identity.Principal, wait time.Duration) (serverUDPRelay, *flowLease) {
+	if s == nil || len(token) != session.UDPResumeTokenSize {
+		return nil, nil
+	}
+	var key [session.UDPResumeTokenSize]byte
+	copy(key[:], token)
+	s.mu.Lock()
+	entry := s.live[key]
+	if entry == nil || entry.claimed || subtle.ConstantTimeCompare(key[:], token) != 1 || !samePrincipal(entry.principal, principal) {
+		s.mu.Unlock()
+		return nil, nil
+	}
+	entry.claimed = true
+	delete(s.live, key)
+	s.mu.Unlock()
+	entry.stop()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-entry.handed:
+		return entry.conn, entry.lease
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-entry.handed:
+		return entry.conn, entry.lease
+	default:
+	}
+	entry.abandoned = true
+	return nil, nil
 }
