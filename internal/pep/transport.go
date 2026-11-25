@@ -1094,13 +1094,18 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 		// bottleneck from only its own delivered rate, so the aggregate
 		// overshot by however many lanes there were. Live, four lanes
 		// delivered about 8 Mbit/s where one delivered 11.
-		controller := wancongestion.NewErasureSenderOn(
-			conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
 		if cfg.ccAPI == CCAPIV2 {
-			attached := wancongestion.NewErasurePathSender(controller, erasureRekey(conn, cfg, peerKey(conn)))
+			// One resolution of the path names both the model and the key a
+			// migration is compared against.
+			egress, key := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
+			controller := wancongestion.NewErasureSenderOn(
+				conn.InitialPacketSize(), pathModelForKey(key, egress, cfg.hierarchicalPath, cfg.discoverGrouping))
+			attached := wancongestion.NewErasurePathSender(controller, erasureRekey(conn, cfg, key))
 			conn.SetCongestionControl(attached)
 			return attached
 		}
+		controller := wancongestion.NewErasureSenderOn(
+			conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
 		conn.SetCongestionControl(controller)
 		return controller
 	case CongestionBrutal:
@@ -1132,12 +1137,12 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 // old addresses to the new uplink too.
 func erasureRekey(conn *quic.Conn, cfg congestionConfig, current string) func(oldLocal, newLocal, oldRemote, newRemote net.Addr) *wancongestion.ErasureSender {
 	return func(_, newLocal, _, newRemote net.Addr) *wancongestion.ErasureSender {
-		next := pathKey(newLocal, newRemote)
+		egress, next := resolvePath(newLocal, newRemote)
 		if next == current {
 			return nil
 		}
 		current = next
-		return wancongestion.NewErasureSenderOn(conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
+		return wancongestion.NewErasureSenderOn(conn.InitialPacketSize(), pathModelForKey(next, egress, cfg.hierarchicalPath, cfg.discoverGrouping))
 	}
 }
 
@@ -1164,11 +1169,16 @@ func erasureRekey(conn *quic.Conn, cfg congestionConfig, current string) func(ol
 // over the same uplink starts from what the first measured about it, and a
 // congested peer does not throttle traffic to a healthy one.
 func pathModelFor(conn *quic.Conn, hierarchical, discover bool) pathmodel.Model {
-	key := peerKey(conn)
+	return pathModelForKey(peerKey(conn), egressOf(conn), hierarchical, discover)
+}
+
+// pathModelForKey selects the model for a resolved path key and egress, so a
+// caller that also remembers the key resolves the route once.
+func pathModelForKey(key, egress string, hierarchical, discover bool) pathmodel.Model {
 	if !hierarchical {
 		return pathmodel.Shared(key)
 	}
-	k := pathmodel.Key{Egress: egressOf(conn), Dest: key}
+	k := pathmodel.Key{Egress: egress, Dest: key}
 	if discover {
 		return pathmodel.SharedChainRegrouping(k)
 	}
@@ -1197,6 +1207,15 @@ func peerKey(conn *quic.Conn) string {
 // name, which is the one thing this key exists to prevent. When it is
 // unspecified the routing table is asked instead, which is where the answer
 // was all along.
+// resolvePath resolves a path's egress and key with one routing lookup.
+func resolvePath(local, remote net.Addr) (egress, key string) {
+	egress = addressHost(local)
+	if isUnspecifiedHost(egress) {
+		egress = routeSource(remote)
+	}
+	return egress, egress + "->" + addressHost(remote)
+}
+
 func pathKey(local, remote net.Addr) string {
 	source := addressHost(local)
 	if isUnspecifiedHost(source) {

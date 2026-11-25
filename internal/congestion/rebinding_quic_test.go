@@ -2,7 +2,6 @@ package congestion
 
 import (
 	"context"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -157,6 +156,7 @@ func rebindDuringDownload(t *testing.T, v2 bool) (before, after uint64) {
 	}
 
 	stop := make(chan struct{})
+	var received atomic.Int64
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -184,10 +184,20 @@ func rebindDuringDownload(t *testing.T, v2 bool) (before, after uint64) {
 		if err != nil {
 			return
 		}
-		_, _ = io.Copy(io.Discard, stream)
+		buf := make([]byte, 32<<10)
+		for {
+			n, err := stream.Read(buf)
+			received.Add(int64(n))
+			if err != nil {
+				return
+			}
+		}
 	}()
 
 	time.Sleep(time.Second)
+	if sender.Telemetry().Samples == 0 || received.Load() == 0 {
+		t.Fatal("the download was not running before the rebinding")
+	}
 	remote := server.RemoteAddr().String()
 	relay.rebind(t)
 	deadline := time.Now().Add(5 * time.Second)
@@ -200,8 +210,12 @@ func rebindDuringDownload(t *testing.T, v2 bool) (before, after uint64) {
 	// Give the switch a moment to settle, then measure.
 	time.Sleep(50 * time.Millisecond)
 	before = sender.Telemetry().Samples
+	bytesBefore := received.Load()
 	time.Sleep(time.Second)
 	after = sender.Telemetry().Samples
+	if received.Load() == bytesBefore {
+		t.Fatal("the download stopped after the rebinding")
+	}
 	close(stop)
 	_ = server.CloseWithError(0, "")
 	_ = client.CloseWithError(0, "")
