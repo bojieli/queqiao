@@ -706,14 +706,20 @@ func runClientUDPDownlink(ctx context.Context, udpConn *net.UDPConn, fc *frameCo
 	}
 }
 
-func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *frameConn, principal identity.Principal, sessionID [16]byte, flowID uint64, resume []byte, resumable bool) {
+// handleUDPAssociation serves one UDP association. lease is what the
+// association holds against the gateway's limits; adopted, when not nil, is a
+// relay taken over from the live association it replaces (§11.2), whose lease
+// this one already carries.
+func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *frameConn, principal identity.Principal, sessionID [16]byte, flowID uint64, resume []byte, resumable bool, lease *flowLease, adopted serverUDPRelay) {
 	// A token this association asks to reclaim names a relay whose lane died.
 	// Claiming is best effort: if the token is unknown, spent, or expired,
 	// this is an ordinary open with a fresh socket, which is exactly the
 	// behaviour that existed before resume did.
 	var udpConn serverUDPRelay
 	resumed := false
-	if resumable && len(resume) > 0 {
+	if adopted != nil {
+		udpConn, resumed = adopted, true
+	} else if resumable && len(resume) > 0 {
 		if held := s.udpRelays.claim(resume, principal); held != nil {
 			udpConn, resumed = held, true
 		}
@@ -742,11 +748,48 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		grant = minted
 	}
 
+	// assocCtx ends the association. It exists before the OPEN_OK so that a
+	// replacement taking this relay over can stop the association whenever
+	// it arrives.
+	assocCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// In owned admission a live association is published under the token its
+	// replacement will present, so the replacement can take the relay over
+	// without waiting for this one to notice that its lane is gone.
+	var live *liveRelay
+	if resumable && s.admissionOwned() {
+		live = s.udpRelays.publishLive(grant, principal, cancel)
+		if resumed && len(resume) > 0 {
+			// Only a relay actually reclaimed through that token answers to
+			// it; a fresh one has nothing to resume there.
+			s.udpRelays.aliasLive(live, resume)
+		}
+	}
+
 	// How this association ends decides what happens to its socket. A clean
 	// dissociation or a refused open closes it; a transport failure parks it,
-	// because that is the case a replacement is coming for.
+	// because that is the case a replacement is coming for. A replacement
+	// that has already claimed the live relay takes it, and the lease, in
+	// place of either; this runs after the workers below have been joined.
 	retain := false
 	defer func() {
+		if live != nil {
+			switch s.udpRelays.endLive(grant, live, udpConn, lease, resumable && retain) {
+			case liveHanded:
+				s.cfg.Logger.Debug("UDP association relay handed to its replacement",
+					"relay", udpConn.LocalAddr().String())
+				return
+			case liveParked:
+				s.cfg.Logger.Debug("UDP association relay retained for a replacement",
+					"relay", udpConn.LocalAddr().String(), "resumed", resumed)
+				return
+			case liveDropped:
+				s.cfg.Logger.Debug("UDP association relay not retained: the store is full")
+				return
+			}
+			_ = udpConn.Close()
+			return
+		}
 		if resumable && retain {
 			s.cfg.Logger.Debug("UDP association relay retained for a replacement",
 				"relay", udpConn.LocalAddr().String(), "resumed", resumed)
@@ -760,12 +803,22 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	if resumable {
 		openOK.Payload = session.EncodeUDPResumeGrant(resumed, grant)
 	}
-	if err := fc.Write(openOK); err != nil {
+	// The acknowledgement keeps the stream's handshake deadline, as it
+	// always has, and is interrupted when the association ends first: on
+	// shutdown, in every mode, and in owned admission when a replacement
+	// takes this relay over and must not wait out a stalled write.
+	stopInterrupt := context.AfterFunc(assocCtx, func() { _ = conn.SetDeadline(time.Now()) })
+	ackErr := fc.Write(openOK)
+	stopInterrupt()
+	if ackErr != nil {
+		// The lane went before the client could learn the new grant. A
+		// relay it reclaimed is kept for the retry, which presents the old
+		// token; a fresh one has nothing worth keeping. (Owned admission:
+		// only there does the relay answer to the old token.)
+		retain = resumed && live != nil
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
-	assocCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	frames := make(chan protocol.Frame, 32)
 	frameErr := make(chan error, 1)
@@ -846,6 +899,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	defer lifetimeTimer.Stop()
 	defer authorizationTicker.Stop()
 	failed := false
+	confirmed := false
 	var endErr error
 	resetIdle := func() {
 		if !idleTimer.Stop() {
@@ -859,6 +913,10 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	for {
 		select {
 		case frame := <-frames:
+			if live != nil && !confirmed {
+				confirmed = true
+				s.udpRelays.confirmLive(live)
+			}
 			if frame.Header.SessionID != sessionID || frame.Header.FlowID != flowID {
 				endErr = errors.New("invalid UDP association frame")
 				failed = true

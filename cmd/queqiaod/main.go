@@ -589,6 +589,9 @@ type runtimeOptions struct {
 	// wireVersions is --accept-wire on a gateway and --wire-versions on a
 	// client: the data-plane wire versions accepted or offered.
 	wireVersions string
+	// gatewayAdmission is --gateway-admission: what a gateway's session limit
+	// counts (pep.GatewayAdmission).
+	gatewayAdmission string
 }
 
 func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
@@ -658,6 +661,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this gateway serves: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.BoolVar(&opts.allowPrivate, "allow-private-destinations", false, "allow private and link-local destinations")
 		fs.StringVar(&opts.outboundSOCKS5, "outbound-socks5", "", "optional loopback SOCKS5 upstream for destination traffic")
+		fs.StringVar(&opts.gatewayAdmission, "gateway-admission", string(pep.GatewayAdmissionLegacy), "what the session limit counts: legacy (every stream, with JOIN and PROBE still admitted when full) or owned (logical flows, charged at OPEN)")
 	}
 }
 
@@ -680,6 +684,11 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 			flagName = "--wire-versions"
 		}
 		return fmt.Errorf("%s: %w", flagName, err)
+	}
+	if !client {
+		if _, err := pep.ParseGatewayAdmission(opts.gatewayAdmission); err != nil {
+			return fmt.Errorf("--gateway-admission: %w", err)
+		}
 	}
 	if opts.listen == "" || opts.maxSessions < 1 || opts.maxSessions > 1<<16 {
 		return errors.New("listen address and max-sessions (1-65536) are required")
@@ -920,6 +929,7 @@ func runServer(args []string) (returnErr error) {
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
 		Logger: logger, UDPOnStream: opts.udpOnStream, Profile: serverProfile,
 		HopPortCount: opts.hopPortCount, AcceptWire: mustWireVersions(opts.wireVersions),
+		GatewayAdmission: pep.GatewayAdmission(opts.gatewayAdmission),
 	})
 	if err != nil {
 		return err
@@ -1032,7 +1042,7 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("transport", opts.transport),
 		slog.String("congestion", opts.congestion),
 		slog.String("cc_api", opts.ccAPI),
-		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry))),
+		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)))),
 		slog.String("coded_retry", opts.codedRetry),
 		slog.String("mem", opts.memory),
 		slog.Int("max_sessions", opts.maxSessions),
@@ -1065,6 +1075,7 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 			slog.String("tcp_congestion", opts.tcpCongestion),
 			slog.Bool("allow_private_destinations", opts.allowPrivate),
 			slog.String("outbound_socks5", opts.outboundSOCKS5),
+			slog.String("gateway_admission", effectiveGatewayAdmission(opts.gatewayAdmission)),
 		)
 	}
 	logger.LogAttrs(context.Background(), slog.LevelInfo, "runtime configuration", attrs...)
@@ -1326,4 +1337,14 @@ func parseInvitationPaths(values []string) ([]identity.InvitationPath, error) {
 		routes = append(routes, route)
 	}
 	return routes, nil
+}
+
+// effectiveGatewayAdmission is the admission mode a gateway runs, as its
+// configuration record states it: the default is named, not left empty.
+func effectiveGatewayAdmission(value string) string {
+	admission, err := pep.ParseGatewayAdmission(value)
+	if err != nil {
+		return value
+	}
+	return string(admission)
 }

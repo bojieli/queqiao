@@ -298,6 +298,25 @@ func TestWireVersionFlags(t *testing.T) {
 	}
 }
 
+func TestGatewayAdmissionIsValidatedAtStartup(t *testing.T) {
+	if opts := parseRuntimeForTest(t, false); effectiveGatewayAdmission(opts.gatewayAdmission) != "legacy" {
+		t.Fatalf("default gateway admission = %q, want legacy", opts.gatewayAdmission)
+	}
+	if opts := parseRuntimeForTest(t, false, "--gateway-admission", "owned"); opts.gatewayAdmission != "owned" {
+		t.Fatalf("gateway admission = %q, want owned", opts.gatewayAdmission)
+	}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var opts runtimeOptions
+	bindRuntimeFlags(fs, &opts, false)
+	if err := fs.Parse([]string{"--gateway-admission", "shared"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRuntime(opts, false); err == nil {
+		t.Fatal("an unknown gateway admission was accepted")
+	}
+}
+
 // An unsupported bundle is refused by flag validation, before the process
 // logs its configuration or renews anything.
 func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
