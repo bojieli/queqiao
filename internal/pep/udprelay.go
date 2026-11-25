@@ -31,6 +31,11 @@ type retainedRelay struct {
 	// replacement that takes the relay over, or released when the relay is
 	// closed instead.
 	lease *flowLease
+	// also is a second token the same relay answers to: the one its
+	// association was opened with, while the client may not yet hold the
+	// association's own grant. Taking the relay under either removes both.
+	also    [session.UDPResumeTokenSize]byte
+	hasAlso bool
 }
 
 // drop closes a retained relay and releases whatever it held.
@@ -111,7 +116,7 @@ func (s *udpRelayStore) retain(token [session.UDPResumeTokenSize]byte, principal
 		return
 	}
 	s.mu.Lock()
-	start, _ := s.retainLocked(token, principal, conn, nil)
+	start, _ := s.retainLocked(token, principal, conn, nil, nil)
 	s.mu.Unlock()
 	if start {
 		go s.sweep()
@@ -121,14 +126,35 @@ func (s *udpRelayStore) retain(token [session.UDPResumeTokenSize]byte, principal
 // retainLocked parks a relay, with the lease it keeps, and reports whether
 // the caller must start the sweeper and whether the relay was kept. A full
 // store closes the relay and releases the lease.
-func (s *udpRelayStore) retainLocked(token [session.UDPResumeTokenSize]byte, principal identity.Principal, conn serverUDPRelay, lease *flowLease) (start, kept bool) {
+//
+// also, when not nil, is a second token the relay answers to. A token
+// already in use names a relay that cannot be reclaimed through it any
+// more; that relay is dropped, with its lease, rather than overwritten.
+func (s *udpRelayStore) retainLocked(token [session.UDPResumeTokenSize]byte, principal identity.Principal, conn serverUDPRelay, lease *flowLease, also *[session.UDPResumeTokenSize]byte) (start, kept bool) {
 	now := time.Now()
 	s.sweepLocked(now)
+	keys := [][session.UDPResumeTokenSize]byte{token}
+	if also != nil {
+		keys = append(keys, *also)
+	}
+	for _, k := range keys {
+		if held, ok := s.relays[k]; ok {
+			s.removeLocked(k, held)
+			held.drop()
+		}
+	}
 	if len(s.relays) >= s.maximum {
 		retainedRelay{conn: conn, lease: lease}.drop()
 		return false, false
 	}
-	s.relays[token] = retainedRelay{conn: conn, expires: now.Add(s.grace), principal: principal, lease: lease}
+	entry := retainedRelay{conn: conn, expires: now.Add(s.grace), principal: principal, lease: lease}
+	if also != nil && *also != token {
+		paired := entry
+		paired.also, paired.hasAlso = token, true
+		s.relays[*also] = paired
+		entry.also, entry.hasAlso = *also, true
+	}
+	s.relays[token] = entry
 	start = !s.sweeping
 	s.sweeping = true
 	return start, true
@@ -180,7 +206,7 @@ func (s *udpRelayStore) claim(token []byte, principal identity.Principal) server
 	if !ok {
 		return nil
 	}
-	delete(s.relays, key)
+	s.removeLocked(key, held)
 	if subtle.ConstantTimeCompare(key[:], token) != 1 || now.After(held.expires) || !samePrincipal(held.principal, principal) {
 		held.drop()
 		return nil
@@ -191,10 +217,21 @@ func (s *udpRelayStore) claim(token []byte, principal identity.Principal) server
 	return held.conn
 }
 
+// removeLocked withdraws a retained relay under key and under the other
+// token it answers to, if any.
+func (s *udpRelayStore) removeLocked(key [session.UDPResumeTokenSize]byte, held retainedRelay) {
+	delete(s.relays, key)
+	if held.hasAlso {
+		if other, ok := s.relays[held.also]; ok && other.conn == held.conn {
+			delete(s.relays, held.also)
+		}
+	}
+}
+
 func (s *udpRelayStore) sweepLocked(now time.Time) {
 	for token, held := range s.relays {
 		if now.After(held.expires) {
-			delete(s.relays, token)
+			s.removeLocked(token, held)
 			held.drop()
 		}
 	}
@@ -208,7 +245,7 @@ func (s *udpRelayStore) closeAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for token, held := range s.relays {
-		delete(s.relays, token)
+		s.removeLocked(token, held)
 		held.drop()
 	}
 }
@@ -333,10 +370,13 @@ func (s *udpRelayStore) endLive(token [session.UDPResumeTokenSize]byte, entry *l
 	if entry.hasAlias && s.live[entry.alias] == entry {
 		delete(s.live, entry.alias)
 	}
+	// Until the client has shown it holds the new grant, it may retry with
+	// either token: the one it opened with, if the OPEN_OK was lost, or the
+	// new one, if it was read but nothing followed it. The relay answers to
+	// both.
+	var also *[session.UDPResumeTokenSize]byte
 	if !entry.confirmed && entry.hasAlias {
-		// The client never showed it received the new grant; it will retry
-		// with the token it still has.
-		token = entry.alias
+		also = &entry.alias
 	}
 	if entry.claimed && !entry.abandoned {
 		entry.conn = conn
@@ -349,7 +389,7 @@ func (s *udpRelayStore) endLive(token [session.UDPResumeTokenSize]byte, entry *l
 		s.mu.Unlock()
 		return liveClosed
 	}
-	start, kept := s.retainLocked(token, entry.principal, conn, lease.detach())
+	start, kept := s.retainLocked(token, entry.principal, conn, lease.detach(), also)
 	s.mu.Unlock()
 	if start {
 		go s.sweep()
@@ -382,12 +422,12 @@ func (s *udpRelayStore) transfer(ctx context.Context, token []byte, principal id
 		if time.Now().After(held.expires) {
 			// Expired, if not yet swept: its slots go back before the
 			// caller is admitted on its own.
-			delete(s.relays, key)
+			s.removeLocked(key, held)
 			s.mu.Unlock()
 			held.drop()
 			return nil, nil
 		}
-		delete(s.relays, key)
+		s.removeLocked(key, held)
 		s.mu.Unlock()
 		return held.conn, held.lease
 	}

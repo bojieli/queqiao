@@ -944,11 +944,17 @@ func TestAnExpiredParkedRelayReleasesItsLeaseToTheReplacement(t *testing.T) {
 	}
 }
 
-// A replacement's OPEN_OK can be lost with its lane, leaving the client with
-// only the token it presented. Its retry with that token must still take the
-// relay and the slots over; at MaxSessions=1 anything else is a FLOW_LIMIT
-// refusal by the gateway's own stranded reservation.
+// A replacement's lane can die before the client has sent anything on it.
+// If its OPEN_OK was lost, the client holds only the token it presented; if
+// it was read, it holds the new grant. Either retry must take the relay and
+// the slots over; at MaxSessions=1 anything else is a FLOW_LIMIT refusal by
+// the gateway's own stranded reservation.
 func TestALostResumeGrantCanBeRetriedWithTheOldToken(t *testing.T) {
+	t.Run("grant-lost", func(t *testing.T) { testResumeRetry(t, false) })
+	t.Run("grant-read", func(t *testing.T) { testResumeRetry(t, true) })
+}
+
+func testResumeRetry(t *testing.T, grantRead bool) {
 	serverCredentials, clientCredentials := testCertificate(t)
 	target, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -984,11 +990,21 @@ func TestALostResumeGrantCanBeRetriedWithTheOldToken(t *testing.T) {
 	}, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond)
+	retryToken := token
+	if grantRead {
+		_ = outer.SetDeadline(time.Now().Add(3 * time.Second))
+		answer, err := lost.Read()
+		if err != nil || answer.Header.Type != protocol.TypeOpenOK {
+			t.Fatalf("replacement answered %+v, %v", answer.Header, err)
+		}
+		_, retryToken, _ = session.DecodeUDPResumeGrant(answer.Payload)
+	} else {
+		time.Sleep(100 * time.Millisecond)
+	}
 	_ = outer.Close()
-	// The retry presents the only token the client has.
+	// The retry presents the token the client has.
 	for attempt := 0; ; attempt++ {
-		response, fc, _ = openRawUDPAssociation(ctx, t, carrier, [16]byte{0x65}, 3, token[:])
+		response, fc, _ = openRawUDPAssociation(ctx, t, carrier, [16]byte{0x65}, 3, retryToken[:])
 		if response.Header.Type == protocol.TypeOpenOK {
 			break
 		}
@@ -1004,4 +1020,71 @@ func TestALostResumeGrantCanBeRetriedWithTheOldToken(t *testing.T) {
 	if after := udpRelaySource(t, fc, [16]byte{0x65}, 3, 0, target); after != before {
 		t.Fatalf("relay source moved from %s to %s", before, after)
 	}
+}
+
+// Until the client has shown it holds a replacement's grant, the relay
+// answers to both the token the replacement was opened with and its own
+// grant; taking it under either takes it under both. A token reused by
+// another retention drops the relay it named, with its lease, instead of
+// overwriting it.
+func TestAnUnconfirmedReplacementIsParkedUnderBothTokens(t *testing.T) {
+	newToken := func() [session.UDPResumeTokenSize]byte {
+		token, err := newUDPResumeToken()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return token
+	}
+	newRelay := func() *net.UDPConn {
+		relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = relay.Close() })
+		return relay
+	}
+	countedLease := func() (*flowLease, *atomic.Int32) {
+		lease := &flowLease{}
+		var released atomic.Int32
+		lease.add(func() { released.Add(1) })
+		return lease, &released
+	}
+	for _, viaOld := range []bool{true, false} {
+		store := newUDPRelayStore()
+		old, grant := newToken(), newToken()
+		lease, released := countedLease()
+		entry := store.publishLive(grant, udpTestPrincipal, func() {})
+		store.aliasLive(entry, old[:])
+		if end := store.endLive(grant, entry, newRelay(), lease, true); end != liveParked {
+			t.Fatalf("owner end = %v, want parked", end)
+		}
+		lease.release()
+		first, second := grant, old
+		if viaOld {
+			first, second = old, grant
+		}
+		got, moved := store.transfer(context.Background(), first[:], udpTestPrincipal, time.Second)
+		if got == nil {
+			t.Fatalf("viaOld=%v: the relay was not reclaimed", viaOld)
+		}
+		if again, _ := store.transfer(context.Background(), second[:], udpTestPrincipal, time.Second); again != nil || store.retained() != 0 {
+			t.Fatalf("viaOld=%v: the relay was reclaimed twice (%d left)", viaOld, store.retained())
+		}
+		moved.release()
+		if released.Load() != 1 {
+			t.Fatalf("viaOld=%v: lease released %d times", viaOld, released.Load())
+		}
+	}
+
+	store := newUDPRelayStore()
+	token := newToken()
+	firstLease, firstReleased := countedLease()
+	store.mu.Lock()
+	store.retainLocked(token, udpTestPrincipal, newRelay(), firstLease, nil)
+	store.retainLocked(token, udpTestPrincipal, newRelay(), &flowLease{}, nil)
+	store.mu.Unlock()
+	if firstReleased.Load() != 1 || store.retained() != 1 {
+		t.Fatalf("a colliding retention released the first lease %d times, %d relays held", firstReleased.Load(), store.retained())
+	}
+	store.closeAll()
 }

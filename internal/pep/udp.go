@@ -759,7 +759,9 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	var live *liveRelay
 	if resumable && s.admissionOwned() {
 		live = s.udpRelays.publishLive(grant, principal, cancel)
-		if len(resume) > 0 {
+		if resumed && len(resume) > 0 {
+			// Only a relay actually reclaimed through that token answers to
+			// it; a fresh one has nothing to resume there.
 			s.udpRelays.aliasLive(live, resume)
 		}
 	}
@@ -802,6 +804,11 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		openOK.Payload = session.EncodeUDPResumeGrant(resumed, grant)
 	}
 	if err := fc.Write(openOK); err != nil {
+		// The lane went before the client could learn the new grant. A
+		// relay it reclaimed is kept for the retry, which presents the old
+		// token; a fresh one has nothing worth keeping. (Owned admission:
+		// only there does the relay answer to the old token.)
+		retain = resumed && live != nil
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
