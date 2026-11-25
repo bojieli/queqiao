@@ -1430,3 +1430,57 @@ func TestTheClaimantIsJudgedByItsOwnPacketSize(t *testing.T) {
 		t.Fatalf("the claimant could not use its turn: %+v", p)
 	}
 }
+
+// The idle interval is marked once, when demand resumes: the burst's first
+// ACK does not mark it again, so packets sent after it, with demand
+// continuous since the resume, are measurements of the path.
+func TestAResumedBurstIsMarkedOnce(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.a.OnDemand(quiccongestion.Demand{})
+	now = now.Add(200 * time.Millisecond)
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	for range 5 {
+		a.send(now, 1200)
+	}
+	now = now.Add(50 * time.Millisecond)
+	a.event(now, numbers(0, 1), nil)
+	a.send(now, 1200)
+	c.mu.Lock()
+	state, ok := c.law.inner.estimator.packetStates[6]
+	c.mu.Unlock()
+	if !ok || state.appLimited {
+		t.Fatalf("a packet sent after the burst's first ACK, with demand continuous, was marked application-limited (state %v)", ok)
+	}
+}
+
+// A CONTROL attachment that cannot use a bypass -- PROBING, its probe
+// window full -- is not charged one: the claimant's single bypass is still
+// there for a sibling that can.
+func TestABypassIsChargedOnlyWhenGranted(t *testing.T) {
+	c := newPCController()
+	now := base()
+	bulk, stuck, ctrl := attachPC(t, c, now), attachPC(t, c, now), attachPC(t, c, now)
+	bulk.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	window := c.law.GetCongestionWindow()
+	for bulk.inFlight+1200 <= window {
+		bulk.sendClass(now, 1200, quiccongestion.ClassBulk)
+	}
+	for range pathProbingPTOProbes {
+		stuck.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
+	}
+	now = now.Add(time.Second)
+	c.arb.OnSent([4]quiccongestion.ByteCount{quiccongestion.ClassControl: 1 << 20})
+	stuck.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	if p := stuck.a.Admit(now, 1200); p.OK {
+		t.Fatalf("a PROBING attachment with a full probe window was admitted: %+v", p)
+	}
+	ctrl.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	if p := ctrl.a.Admit(now, 1200); !p.OK || p.Turn != quiccongestion.ClassControl {
+		t.Fatalf("the healthy CONTROL attachment found the bypass spent by one that got no permit: %+v", p)
+	}
+}

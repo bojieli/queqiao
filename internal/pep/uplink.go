@@ -212,15 +212,13 @@ func (c *Client) watchUplink(ctx context.Context, known string) {
 // one before anything needs it.
 // onUplinkTick acts on one observation of the uplink: a resume prewarms
 // the path, and a change replaces the pool. A change seen on the same tick
-// as a resume still starts a new uplink generation before the prewarm, so
-// the prewarmed connection does not join the old network's path controller
-// when the new one hands out the same address.
+// as a resume is handled as a change: the new uplink generation is
+// published first, and only then is the pool -- including anything a
+// borrower installed since the resume closed it -- closed and prewarmed, so
+// no connection of the old generation is left pooled beside the new
+// network's.
 func (c *Client) onUplinkTick(ctx context.Context, resumed, changed bool, from, current string) {
-	if resumed {
-		if changed {
-			c.cfg.Logger.Info("uplink changed across a resume", "from", from, "to", current)
-			c.uplinkGeneration.Add(1)
-		}
+	if resumed && !changed {
 		c.prewarmPath(ctx)
 		return
 	}
