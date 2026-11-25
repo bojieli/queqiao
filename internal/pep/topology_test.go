@@ -468,6 +468,7 @@ func TestSingleTopologyRescuesAFlowThatLosesItsLane(t *testing.T) {
 	rig := newTopologyRig(t, ServerConfig{
 		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath, Classifier: ClassifierPhased,
 	}, cfg)
+	var maxAttached, maxControllers int
 	if err := rig.download(2, func() {
 		time.Sleep(800 * time.Millisecond)
 		var failed *mpLane
@@ -486,12 +487,43 @@ func TestSingleTopologyRescuesAFlowThatLosesItsLane(t *testing.T) {
 		if err := failed.fc.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Error(err)
 		}
+		// The rescue round races a stream on the pooled connection
+		// against dedicated dials; each dial that completes its handshake
+		// is an attachment of the client's one path controller.
+		deadline := time.Now().Add(1500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			controllers, n := pathAttachments(rig.client.pathPrincipal + "|")
+			maxControllers = max(maxControllers, controllers)
+			maxAttached = max(maxAttached, n)
+			time.Sleep(5 * time.Millisecond)
+		}
 	}); err != nil {
 		t.Fatal(err)
 	}
 	s := clientMetrics.Snapshot()
 	controllers, _ := pathAttachments(rig.client.pathPrincipal + "|")
-	t.Logf("lane replacements %d, bulk isolations %d, client controllers %d", s.LaneReplacements, s.BulkIsolations, controllers)
+	t.Logf("lane replacements %d, bulk isolations %d, client controllers %d (at most %d), attachments at most %d",
+		s.LaneReplacements, s.BulkIsolations, controllers, maxControllers, maxAttached)
+	if maxControllers != 1 {
+		t.Fatalf("during the rescue the client's connections spread over %d controllers", maxControllers)
+	}
+	// On loopback the pooled candidate wins the race before a dedicated
+	// dial finishes its handshake, so dial one directly, as a rescue
+	// round's sprayed attempt does: it is a second attachment of the same
+	// controller, not a second controller.
+	_, before := pathAttachments(rig.client.pathPrincipal + "|")
+	lane, err := rig.client.dialJoinLane(context.Background(), TransportQUIC, [16]byte{7}, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the rescue dial to attach", func() bool {
+		_, n := pathAttachments(rig.client.pathPrincipal + "|")
+		return n == before+1
+	})
+	if controllers, _ := pathAttachments(rig.client.pathPrincipal + "|"); controllers != 1 {
+		t.Fatalf("a dedicated rescue connection made %d controllers", controllers)
+	}
+	_ = lane.fc.Close()
 	if s.LaneReplacements == 0 {
 		t.Fatal("the flow completed without a rescue; the lane was not lost")
 	}
