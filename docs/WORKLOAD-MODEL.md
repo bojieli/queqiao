@@ -27,9 +27,9 @@ The owner approved a minimal, representative live evaluation: live runs total ab
 - **D** is scored on: no silent deaths (hard); every wake at 1 and 5 min delivered within 5 s (hard); delivered count at 16 min ≥ main's; push and send wake penalty p50 within W9a's bound. The p95, max, death modes and idle EOF times are reported. W9a's repeated cycles, six sessions, p99 and idle cost belong to the opt-in matrix.
 - **Statistics.** Arms are interleaved in randomised ABBA or BAAB blocks: 6 blocks, then one block at a time with the one-sided test re-run and corrected for repeated looks, until decided or 12 blocks (design §15.4). D is one paired session per path, not a block sequence.
 
-**Moved out of the live gates.** These are deterministic or emulated tests in CI, on `internal/pathsim`, measured against the legacy bundle on the same seeded path. None is written yet.
+**Moved out of the live gates.** These are deterministic or emulated tests in CI, on `internal/pathsim`, measured against the legacy bundle on the same seeded path. They are in `internal/pep/workload_*_test.go`: each runs the legacy bundle and the flip bundle (every merged switch on) through a real client and gateway. W9b, W8 on its clean path, W10 and W11 apply their bounds in `-short`; W8's lossy path and M5's bounds run in the full suite (`deep.yml`, release candidates), because their measures follow a nested controller's sawtooth and need its 30 s to be stable. W9b's clock reaches the flow idle limit and classification; the binding deadline and keepalive schedule read it when they are built.
 
-| Entry | Test (to be written) | Asserts |
+| Entry | Test | Asserts |
 | --- | --- | --- |
 | W9b | `TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock` | every cell of idle target (5–60 min, including 29/31/45/60) × heartbeat mode × wake direction: delivery below the flow idle timeout, the documented outcome above it, and EOF or RST at both applications within 5 s (no silent death). Needs an injected clock in the flow idle timer, binding deadline and keepalive schedule. It reproduces timer behaviour; attributing the production 900 s EOF to a middlebox or the destination needs live endpoint traces (optional) |
 | W8 | `TestTunnelledQUICDownloadOnAnEmulatedPath` | W8's bounds for download and page: goodput, inner loss, wire bytes per useful byte |

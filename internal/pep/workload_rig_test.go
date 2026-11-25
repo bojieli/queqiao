@@ -252,11 +252,15 @@ func (c *socksPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	return len(p), nil
 }
 
-func (c *socksPacketConn) Close() error                       { return c.association.Close() }
-func (c *socksPacketConn) LocalAddr() net.Addr                { return c.association.local.LocalAddr() }
-func (c *socksPacketConn) SetDeadline(t time.Time) error      { return c.association.local.SetDeadline(t) }
-func (c *socksPacketConn) SetReadDeadline(t time.Time) error  { return c.association.local.SetReadDeadline(t) }
-func (c *socksPacketConn) SetWriteDeadline(t time.Time) error { return c.association.local.SetWriteDeadline(t) }
+func (c *socksPacketConn) Close() error                  { return c.association.Close() }
+func (c *socksPacketConn) LocalAddr() net.Addr           { return c.association.local.LocalAddr() }
+func (c *socksPacketConn) SetDeadline(t time.Time) error { return c.association.local.SetDeadline(t) }
+func (c *socksPacketConn) SetReadDeadline(t time.Time) error {
+	return c.association.local.SetReadDeadline(t)
+}
+func (c *socksPacketConn) SetWriteDeadline(t time.Time) error {
+	return c.association.local.SetWriteDeadline(t)
+}
 
 // durationQuantile is the nearest-rank q-quantile of samples; zero when there
 // are none.

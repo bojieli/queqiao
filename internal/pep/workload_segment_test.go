@@ -82,9 +82,11 @@ type segmentOutcome struct {
 //
 // The arms run at once, each on its own client, gateway and emulated path,
 // so whatever else the host is doing slows both alike. The full form is the
-// model's: 15 segments over 60 s. -short halves the segment and its period,
-// keeping the bitrate and an idle gap of over ten credit rounds before each
-// fetch, and fetches 6.
+// model's: 15 segments over 60 s on a path with 1 % loss. -short halves the
+// segment and its period, keeping the bitrate and an idle gap of ten credit
+// rounds before each fetch, on the same path without the loss, and fetches
+// 11: the fewest for which p10 is not the single slowest segment, which in
+// either arm is now and then the first, cold one.
 //
 // This test found that mem=owned's retention bound decayed through every
 // pause to its startup allowance, so each segment began again from it; see
@@ -92,12 +94,13 @@ type segmentOutcome struct {
 func TestSegmentFetchOnAnEmulatedPath(t *testing.T) {
 	requireStableImpairmentClock(t)
 	size, period, segments := 1500*1000, 4*time.Second, 15
-	if testing.Short() {
-		size, period, segments = 750*1000, 2*time.Second, 6
-	}
 	path := pathsim.Config{
 		OneWayDelay: 60 * time.Millisecond, LossRate: 0.01, Seed: 10,
 		RateBytesPerSec: 20e6 / 8, PolicerRefillPeriod: 8 * time.Millisecond,
+	}
+	if testing.Short() {
+		size, period, segments = 750*1000, 2*time.Second, 11
+		path.LossRate = 0
 	}
 
 	arms := workloadArms()
@@ -146,10 +149,12 @@ func TestSegmentFetchOnAnEmulatedPath(t *testing.T) {
 	}
 	for i, arm := range arms {
 		o := outcomes[i]
-		t.Logf("%s: segment time p50 %v max %v; p10 throughput %.2f Mbit/s; rebuffer %.2f %%",
-			arm.name, durationQuantile(o.times, 0.5).Round(time.Millisecond),
-			durationQuantile(o.times, 1).Round(time.Millisecond),
-			floatQuantile(o.throughput, 0.10)*8/1e6, 100*o.rebuffer)
+		rounded := make([]time.Duration, len(o.times))
+		for k, d := range o.times {
+			rounded[k] = d.Round(time.Millisecond)
+		}
+		t.Logf("%s: segment times %v; p10 throughput %.2f Mbit/s; rebuffer %.2f %%",
+			arm.name, rounded, floatQuantile(o.throughput, 0.10)*8/1e6, 100*o.rebuffer)
 	}
 	legacy, flip := outcomes[0], outcomes[1]
 	if got, floor := floatQuantile(flip.throughput, 0.10), 0.90*floatQuantile(legacy.throughput, 0.10); got < floor {

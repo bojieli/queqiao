@@ -676,7 +676,7 @@ New deterministic tests, on real fork send loops over an impaired in-process `Pa
 | M6 | Idle wake under load | D beside C; idle-socket memory on the iOS profile: test 14 of §15.1 |
 | M7 | Day-in-the-life soak | optional |
 
-- **Deterministic replacements** run in CI on `internal/pathsim`; the model's minimal live plan names them (still to be written). They gate stage 10 together with the live trials. Optional runs are reported, never gated.
+- **Deterministic replacements** run in CI on `internal/pathsim`; the model's minimal live plan names them (`internal/pep/workload_*_test.go`). They gate stage 10 together with the live trials. Optional runs are reported, never gated.
 - **Replaces the echo probe.** The interactive echo probe of earlier campaigns is B's keystrokes before the burst, under bulk downloads.
 - **Classifier first.** The workload model and `docs/AUDIT-CLASSIFIER-WORKLOADS.md` find that today's classifier mislabels W3-h2, W5, W6 and W9 (F1–F3). Its fixes R1–R3 land first and are on in both arms of the stage 6/7 campaigns, or those gates measure the label instead of the change. The switch that carries them is itself gated on A, B and D.
 - **Product-configuration screen (after stage 2).** {isolated, single connection} × {round-robin, class scheduler} under today's controllers, plus one stream against several on one connection at a fixed connection window. This chooses a configuration; because isolation also changes the number of independent controllers, it does not attribute a result to topology.
