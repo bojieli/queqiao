@@ -1,6 +1,10 @@
 package pep
 
-import "github.com/bojieli/queqiao/internal/classifier"
+import (
+	"sync"
+
+	"github.com/bojieli/queqiao/internal/classifier"
+)
 
 // Topology (design docs/DESIGN-PATH-AUTHORITY.md §7, §14 stage 7).
 //
@@ -70,8 +74,7 @@ func (c *Client) secondConnectionWanted(snapshot flowSnapshot) bool {
 	return snapshot.Class == classifier.ClassBulk || shouldPrewarmBulkLane(snapshot)
 }
 
-// singleConnectionWindows is the receive windows of a client that keeps its
-// flows on one connection.
+// Receive-window credit for the preferred connection.
 //
 // Under isolation each of up to maxBulk bulk flows had a connection, and so a
 // connection-level receive window, of its own; on one connection they share
@@ -82,37 +85,77 @@ func (c *Client) secondConnectionWanted(snapshot flowSnapshot) bool {
 // bound before the streams' windows do: on Android's 1 MiB streams and 4 MiB
 // connection, eight bulk flows reach 4 MiB in flight on one connection
 // against 6 MiB across the pooled connection and the two isolated ones. So
-// the connection ceiling grows by one stream window (at most half a
-// connection window) for every isolated connection single topology does not
-// open, which restores the receive
-// capacity isolation had without exceeding the receive commitment it made
-// (each of those connections could hold a whole connection window). It never
-// grows past the desktop ceiling. A fixed window (initial equal to maximum)
-// stays fixed at the new value; an auto-tuned one keeps its initial value.
-func singleConnectionWindows(w flowWindows, notOpened int) flowWindows {
-	if notOpened <= 0 {
+// the preferred connection's ceiling grows by one stream window for every
+// isolated connection single topology does not open, which restores the
+// receive capacity isolation had.
+//
+// That growth is credit drawn from one client-wide ledger, not a property of
+// each dial. A retired generation keeps draining while a flow still borrows
+// it, so successive supersessions can leave several preferred connections
+// alive at once, and each carries whatever it was dialled with for life. The
+// ledger holds at most the unopened connections' own windows, k x connection,
+// across every live preferred connection: so the sum over every live
+// connection on the path -- preferred generations, draining or current, at
+// their base window plus their credit, and fan-out, bulk and rescue
+// connections at the base window -- never exceeds what isolation could hold
+// on the same connections plus its k bulk connections. A dial takes what is
+// left, up to its full growth; a connection's credit returns when it closes.
+// After a handover whose predecessor still drains, the replacement may
+// therefore start with less than the full growth; the next preferred
+// connection after the drain ends gets it back.
+
+// windowCredit is the ledger.
+type windowCredit struct {
+	mu   sync.Mutex
+	held uint64
+}
+
+// reservePreferredWindows returns the receive windows for a new preferred
+// (pooled control) connection, with the credit it was granted, and the
+// function that returns that credit, which the caller runs when the
+// connection ends (or at once if the dial fails). Without topology=single it
+// is the configured windows and a no-op.
+func (c *Client) reservePreferredWindows() (flowWindows, func()) {
+	w := c.windows()
+	unopened := c.memoryLimits.maxBulkConnections - c.fanOutConnections()
+	if !c.singleTopology() || unopened <= 0 {
+		return w, func() {}
+	}
+	_, _, streamMax, connectionMax, _ := w.resolved()
+	want := uint64(unopened) * min(streamMax, connectionMax)
+	budget := uint64(unopened) * connectionMax
+	if connectionMax >= maxConnectionReceiveWindow {
+		return w, func() {}
+	}
+	want = min(want, maxConnectionReceiveWindow-connectionMax)
+	c.windowCredit.mu.Lock()
+	grant := min(want, budget-min(budget, c.windowCredit.held))
+	c.windowCredit.held += grant
+	c.windowCredit.mu.Unlock()
+	if grant == 0 {
+		return w, func() {}
+	}
+	var once sync.Once
+	return growConnectionWindow(w, grant), func() {
+		once.Do(func() {
+			c.windowCredit.mu.Lock()
+			c.windowCredit.held -= grant
+			c.windowCredit.mu.Unlock()
+		})
+	}
+}
+
+// growConnectionWindow raises the connection receive ceiling by extra. A
+// fixed window (initial equal to maximum) stays fixed at the new value; an
+// auto-tuned one keeps its initial value.
+func growConnectionWindow(w flowWindows, extra uint64) flowWindows {
+	if extra == 0 {
 		return w
 	}
-	_, connection, streamMax, connectionMax, _ := w.resolved()
-	// Each unopened connection is credited one stream window, but never
-	// more than half a connection window: a handover keeps the draining
-	// generation beside its replacement, and two grown windows,
-	// 2·(connection + k·perFlow), must still fit inside what isolation
-	// could hold across the same two generations and its k bulk
-	// connections, 2·connection + k·connection. The mobile profiles' streams
-	// are well under half their connection windows, so this binds only on
-	// configurations where a stream may fill most of a connection.
-	perFlow := min(streamMax, connectionMax/2)
-	grown := connectionMax + uint64(notOpened)*perFlow
-	if grown > maxConnectionReceiveWindow {
-		grown = maxConnectionReceiveWindow
-	}
-	if grown <= connectionMax {
-		return w
-	}
+	_, connection, _, connectionMax, _ := w.resolved()
 	if connection == connectionMax {
-		w.connection = grown
+		w.connection = connectionMax + extra
 	}
-	w.maxConnection = grown
+	w.maxConnection = connectionMax + extra
 	return w
 }

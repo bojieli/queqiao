@@ -144,6 +144,8 @@ func TestSingleTopologyIsolatesOnlyForAnExplicitFanOut(t *testing.T) {
 // mobile profiles' fixed windows the one connection's ceiling covers what the
 // pooled connection and the isolated ones could hold together, for any
 // number of bulk flows, and never more than the isolated topology committed.
+// (The bound over several live generations is
+// TestPreferredWindowCreditIsBoundedOverEveryLiveGeneration.)
 func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 	const (
 		kib = 1024
@@ -158,12 +160,19 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 		// mobile/core/resources.go.
 		{"ios", flowWindows{stream: 64 * kib, maxStream: 64 * kib, connection: 2 * mib, maxConnection: 2 * mib, maxStreams: 32}, 1},
 		{"android", flowWindows{stream: mib, maxStream: mib, connection: 4 * mib, maxConnection: 4 * mib, maxStreams: 64}, 2},
-		// A stream allowed the whole connection window: growth is capped
-		// at half a connection per unopened connection.
+		// A stream allowed the whole connection window.
 		{"stream equals connection", flowWindows{stream: mib, maxStream: mib, connection: mib, maxConnection: mib, maxStreams: 64}, 1},
 	} {
 		t.Run(p.name, func(t *testing.T) {
-			single := singleConnectionWindows(p.windows, p.maxBulk)
+			client := &Client{cfg: ClientConfig{
+				Topology:            TopologySingle,
+				StreamReceiveWindow: p.windows.stream, MaxStreamReceiveWindow: p.windows.maxStream,
+				ConnectionReceiveWindow: p.windows.connection, MaxConnectionReceiveWindow: p.windows.maxConnection,
+				MaxIncomingStreams: p.windows.maxStreams,
+			}}
+			client.memoryLimits.maxBulkConnections = p.maxBulk
+			single, release := client.reservePreferredWindows()
+			defer release()
 			if err := single.validate(); err != nil {
 				t.Fatal(err)
 			}
@@ -182,25 +191,22 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 				pooled := flows - own
 				isolated := min(uint64(pooled)*streamMax, connMax) + uint64(own)*min(streamMax, connMax)
 				one := min(uint64(flows)*streamMax, sConnMax)
-				if one < isolated && one < maxConnectionReceiveWindow && streamMax*2 <= connMax {
+				if one < isolated && one < maxConnectionReceiveWindow {
 					t.Errorf("%d bulk flows: one connection can hold %d bytes in flight, isolated %d", flows, one, isolated)
 				}
 			}
 			if commitment := connMax * uint64(1+p.maxBulk); sConnMax > commitment {
 				t.Errorf("one connection's window %d exceeds the isolated topology's commitment %d", sConnMax, commitment)
 			}
-			// During a handover the draining generation and its
-			// replacement both carry the grown window; isolation's
-			// worst case is the same two generations plus its bulk
-			// connections.
-			if overlap, isolated := 2*sConnMax, connMax*uint64(2+p.maxBulk); overlap > isolated {
-				t.Errorf("two overlapping generations hold %d, isolation %d", overlap, isolated)
-			}
 			t.Logf("connection window %d..%d -> %d..%d", conn, connMax, sConn, sConnMax)
 		})
 	}
-	if w := singleConnectionWindows(flowWindows{}, isolatedBulkConns); w != (flowWindows{}) {
+	desktop := &Client{cfg: ClientConfig{Topology: TopologySingle}}
+	desktop.memoryLimits.maxBulkConnections = isolatedBulkConns
+	if w, release := desktop.reservePreferredWindows(); w != desktop.windows() {
 		t.Fatalf("desktop windows changed: %+v", w)
+	} else {
+		release()
 	}
 }
 
@@ -616,7 +622,8 @@ func TestSingleTopologyStaysInsideTheIOSMemoryProfile(t *testing.T) {
 				CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath, Classifier: ClassifierPhased,
 				MaxSessions: 2048,
 			}, cfg)
-			w := rig.client.preferredWindows()
+			w, release := rig.client.reservePreferredWindows()
+			release()
 			if topology == TopologySingle && rig.client.windows().connection != 2*1024*1024 {
 				t.Fatal("a secondary connection would get the preferred connection's grown window")
 			}
@@ -688,5 +695,96 @@ func TestSingleTopologyStaysInsideTheIOSMemoryProfile(t *testing.T) {
 	}
 	if growth[TopologySingle] > growth[TopologyIsolated]+4<<20 {
 		t.Errorf("the load grew the heap by %d KiB on one connection, %d KiB isolated", growth[TopologySingle]>>10, growth[TopologyIsolated]>>10)
+	}
+}
+
+// The receive-window credit topology=single gives the preferred connection
+// is bounded over every live connection on the path, not per connection. A
+// retired generation drains for as long as a flow still borrows it, so
+// repeated supersessions can leave several generations alive at once. Their
+// connection windows together, beside the base window each connection
+// carries anyway, must not exceed the credit of the bulk connections the
+// topology does not open: what isolation could have held on those same
+// connections plus its bulk pool. The configuration is the one where the
+// cap matters most, a stream allowed the whole connection window. Once the
+// drained generations close, their credit returns.
+func TestPreferredWindowCreditIsBoundedOverEveryLiveGeneration(t *testing.T) {
+	pathAuthorities.forget()
+	const mib = 1024 * 1024
+	certificate, roots := testCertificate(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, Logger: logger,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true},
+		CCAPI:             CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.ServePacketConn(ctx, packetConn) }()
+	cfg := newBundleClientConfig(TopologySingle)
+	cfg.ListenAddr, cfg.RemoteAddr, cfg.Credentials, cfg.Logger = "127.0.0.1:0", packetConn.LocalAddr().String(), roots, logger
+	cfg.StreamReceiveWindow, cfg.MaxStreamReceiveWindow = mib, mib
+	cfg.ConnectionReceiveWindow, cfg.MaxConnectionReceiveWindow = mib, mib
+	limits := iosMemoryLimits() // one bulk connection: one connection's credit
+	cfg.MemoryLimits, cfg.ChunkSize = limits, iosChunkSize
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.closeQUICPool()
+	ccfg := congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2, sched: SchedClass, scope: CongestionScopePath, principal: client.pathPrincipal}
+
+	const generations = 3
+	var live []*controlQUICGeneration
+	for i := range generations {
+		g, err := client.acquireControlQUICGeneration(ctx, ccfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		live = append(live, g)
+		if i < generations-1 {
+			// Its borrow is a flow that keeps it draining after it is
+			// superseded.
+			client.supersedeSilentGeneration(g, nil)
+		}
+	}
+	var total uint64
+	for i, g := range live {
+		if g.conn.Context().Err() != nil {
+			t.Fatalf("generation %d closed; it should still be draining", i)
+		}
+		w := g.conn.Config().MaxConnectionReceiveWindow
+		t.Logf("generation %d: connection window %d KiB", i, w>>10)
+		total += w
+	}
+	bound := uint64(generations)*mib + uint64(limits.MaxBulkConnections)*mib
+	if total > bound {
+		t.Fatalf("%d live generations advertise %d KiB of connection window, over the %d KiB isolation could hold on them and its bulk pool",
+			generations, total>>10, bound>>10)
+	}
+
+	// The drained generations close when their flows leave, and their credit
+	// is available to the next preferred connection.
+	for _, g := range live {
+		g.releaseBorrow()
+	}
+	client.retireControlQUICGeneration(live[generations-1], "test")
+	for i, g := range live {
+		waitFor(t, 5*time.Second, fmt.Sprintf("generation %d to close", i), func() bool { return g.conn.Context().Err() != nil })
+	}
+	fresh, err := client.acquireControlQUICGeneration(ctx, ccfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.releaseBorrow()
+	if w := fresh.conn.Config().MaxConnectionReceiveWindow; w != 2*mib {
+		t.Fatalf("after the drained generations closed the preferred connection got %d KiB, want the whole credit (%d KiB)", w>>10, 2*mib>>10)
 	}
 }
