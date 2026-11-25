@@ -155,7 +155,10 @@ func (e *tuicBandwidthEstimator) onSentPacket(now monotime.Time, number quiccong
 		e.lastAckedSentTime = now
 		e.totalSentAtAck = e.totalSent
 	}
-	if len(e.packetStates) >= tuicMaxSendStates {
+	// A retireByFate table is bounded by its owner, which retires a state
+	// whenever it gives up on the packet's fate; pruning here would delete
+	// states whose fates the owner still accepts.
+	if !e.retireByFate && len(e.packetStates) >= tuicMaxSendStates {
 		e.pruneStates()
 	}
 	if !e.lowestKnown {

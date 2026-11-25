@@ -610,7 +610,7 @@ func testQUICOneLaneSOCKSEndToEndScoped(t *testing.T, ccAPI CCAPIVersion, sched 
 		pathAuthorities.mu.Lock()
 		for name, c := range pathAuthorities.controllers {
 			switch {
-			case strings.HasPrefix(name, clientPathPrincipal+"|"):
+			case strings.HasPrefix(name, clientPathPrincipal+":"):
 				clientSide += c.Attachments()
 			case strings.HasPrefix(name, "principal:"):
 				gatewaySide += c.Attachments()

@@ -236,6 +236,10 @@ type Client struct {
 	// agent is configured, which is the default.
 	flowMeta *flowmeta.Lookup
 	cfg      ClientConfig
+	// pathPrincipal names this client's identity in path keys under
+	// congestion=path; empty in a client built without NewClient, which
+	// then shares the process-wide client label.
+	pathPrincipal string
 	// observedRTT caches the most recent lane's measured round trip (nanoseconds) so
 	// the adaptive fallback grace can scale with the path. Updated on every
 	// authenticated lane; zero until the first dial.
@@ -725,8 +729,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("client profile: %w", err)
 	}
 	client := &Client{
-		flowMeta: flowmeta.New(cfg.FlowMetadataSocket, cfg.FlowMetadataTimeout),
-		cfg:      cfg, udpHealth: newUDPHealth(cfg.UDPFailureThreshold, cfg.UDPCooldown),
+		pathPrincipal: newClientPathPrincipal(),
+		flowMeta:      flowmeta.New(cfg.FlowMetadataSocket, cfg.FlowMetadataTimeout),
+		cfg:           cfg, udpHealth: newUDPHealth(cfg.UDPFailureThreshold, cfg.UDPCooldown),
 		credentials: cfg.Credentials, budget: budget,
 		metrics: cfg.Metrics, sessionLimit: cfg.SessionLimit, pendingOpens: make(chan struct{}, cfg.MaxPendingOpens),
 		sendMemory: sendMemory, receiveMemory: receiveMemory, memoryLimits: memoryLimits,
@@ -1707,7 +1712,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 			discoverGrouping: c.cfg.Profile.DiscoverGrouping,
 			kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 			adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-			ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope,
+			ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipal,
 		}
 		if pooled {
 			outer, err = c.dialPooledQUICLane(ctx, ccfg)
@@ -2318,7 +2323,7 @@ func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
 		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope,
+		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipal,
 	})
 	c.cfg.Logger.Debug("bulk QUIC pool authenticated", "duration", time.Since(started))
 	return entry, nil

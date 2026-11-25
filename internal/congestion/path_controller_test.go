@@ -2,6 +2,7 @@ package congestion
 
 import (
 	"math/rand/v2"
+	"net"
 	"testing"
 	"time"
 
@@ -643,5 +644,63 @@ func TestAttachmentsShareServiceAndNoneStarves(t *testing.T) {
 	// admitted ahead of it once it is queued.
 	if worst > 0 {
 		t.Errorf("%d bulk packets were admitted ahead of a waiting interactive packet", worst)
+	}
+}
+
+// A connection that moves to another path's controller takes nothing of
+// itself with it in the old one: its held losses are retired there, so the
+// old controller never touches the attachment's records again (which the new
+// controller's lock now guards).
+func TestMigratingAttachmentLeavesNoHeldLossBehind(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	a := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+	a.a = old.Attach(func(_, _, _, _ net.Addr) *PathController { return next }, nil)
+	a.a.OnAttach(now, 0, 1200, func() {})
+	sibling := attachPC(t, old, now)
+	a.send(now, 1200)
+	now = now.Add(100 * time.Millisecond)
+	a.event(now, nil, []quiccongestion.PacketNumber{0})
+	if old.Stats().Held != 1 {
+		t.Fatal("no held loss to leave behind")
+	}
+	a.a.OnPathMigrated(now, nil, nil, nil, nil)
+	if a.a.Controller() != next {
+		t.Fatal("the attachment did not move")
+	}
+	if s := old.Stats(); s.Held != 0 || s.SamplerStates != 0 {
+		t.Fatalf("the old controller kept %d held losses and %d sampler states of a departed attachment", s.Held, s.SamplerStates)
+	}
+	sibling.send(now.Add(time.Minute), 1200)
+}
+
+// An acknowledgement past the fate horizon is not credited, whether or not
+// any other callback came first to expire it.
+func TestAnAcknowledgementPastTheHorizonIsNotCredited(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.send(now, 1200)
+	now = now.Add(time.Minute)
+	a.event(now, []quiccongestion.PacketNumber{0}, nil)
+	if s := c.Stats(); s.Expired != 1 || s.Delivered != 0 || s.SamplerDelivered != 0 {
+		t.Fatalf("expired %d delivered %d (%d bytes); want the packet expired and nothing credited", s.Expired, s.Delivered, s.SamplerDelivered)
+	}
+}
+
+// A controller nothing ever attached to is idle from its creation, so a
+// registry can forget it.
+func TestANeverAttachedControllerIsIdle(t *testing.T) {
+	c := newPCController()
+	if _, idle := c.IdleSince(); !idle {
+		t.Fatal("a controller with no attachment ever is not idle")
+	}
+	a := attachPC(t, c, base())
+	if _, idle := c.IdleSince(); idle {
+		t.Fatal("an attached controller is idle")
+	}
+	a.a.OnDetach(base())
+	if _, idle := c.IdleSince(); !idle {
+		t.Fatal("a controller whose last attachment detached is not idle")
 	}
 }

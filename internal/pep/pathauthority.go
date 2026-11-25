@@ -2,7 +2,9 @@ package pep
 
 import (
 	"net"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -33,10 +35,20 @@ const pathKnowledgeLifetime = 10 * time.Minute
 // controllers to forget.
 const pathAuthoritySweepEvery = time.Minute
 
-// clientPathPrincipal names the client's own principal in a path key. A
-// client has one identity at a time, and a gateway's keys always carry a
-// principal, so the two never collide in one process.
+// clientPathPrincipal is the prefix of a client's own principal in a path
+// key. Each Client gets its own (see newClientPathPrincipal): one daemon can
+// run several credential profiles, and two of them reaching the same gateway
+// over the same uplink are different devices whose budgets must not mix. A
+// gateway's keys always carry "principal:", so the two never collide in one
+// process.
 const clientPathPrincipal = "client"
+
+var clientPathPrincipals atomic.Uint64
+
+// newClientPathPrincipal names one Client's identity in path keys.
+func newClientPathPrincipal() string {
+	return clientPathPrincipal + ":" + strconv.FormatUint(clientPathPrincipals.Add(1), 10)
+}
 
 // gatewayPathPrincipal names an authorised principal in a path key.
 func gatewayPathPrincipal(p identity.Principal) string {
@@ -66,8 +78,10 @@ func (r *pathAuthorityRegistry) controller(principal, key, egress string, cfg co
 	if c, ok := r.controllers[name]; ok {
 		return c
 	}
+	// The model is the principal's too: its pooled erasure sets the law's
+	// compensation, and one device's loss must not move another's rate.
 	c := wancongestion.NewPathController(initialPacketSize,
-		pathModelForKey(key, egress, cfg.hierarchicalPath, cfg.discoverGrouping), wancongestion.DefaultClassWeights)
+		pathModelForKey(name, egress, cfg.hierarchicalPath, cfg.discoverGrouping), wancongestion.DefaultClassWeights)
 	r.controllers[name] = c
 	return c
 }
@@ -88,6 +102,9 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal strin
 	egress, current := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
 	initial := conn.InitialPacketSize()
 	controller := pathAuthorities.controller(principal, current, egress, cfg, initial)
+	// The connection's FEC and probe readers read the model the law reports
+	// to: the principal's.
+	rekeyPathModel(conn, principal+"|"+current)
 	// rekey is called only on the connection's run loop.
 	rekey := func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
 		egress, next := resolvePath(newLocal, newRemote)
@@ -96,7 +113,7 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal strin
 		}
 		current = next
 		// The connection's other readers of the path follow it too.
-		rekeyPathModel(conn, next)
+		rekeyPathModel(conn, principal+"|"+next)
 		return pathAuthorities.controller(principal, next, egress, cfg, initial)
 	}
 	attachment := controller.Attach(rekey, func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })

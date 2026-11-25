@@ -84,6 +84,7 @@ type PathController struct {
 	// deciding how long the path's knowledge stands.
 	attached   atomic.Int64
 	lastDetach atomic.Int64 // UnixNano
+	created    time.Time
 }
 
 type fate uint8
@@ -168,6 +169,7 @@ func NewPathController(initialPacketSize quiccongestion.ByteCount, path pathmode
 		nextPseq:  1,
 		ringBase:  1,
 		maxPacket: law.inner.maxDatagramSize,
+		created:   time.Now(),
 	}
 	law.SetRTTStatsProvider(&c.rtt)
 	return c
@@ -187,15 +189,17 @@ func (c *PathController) Attach(rekey func(oldLocal, newLocal, oldRemote, newRem
 // Attachments is the number of attachments currently attached.
 func (c *PathController) Attachments() int { return int(c.attached.Load()) }
 
-// IdleSince reports when the last attachment detached, and false while any
-// is attached or none ever detached.
+// IdleSince reports when the last attachment detached -- or, if none ever
+// attached, when the controller was created -- and false while any is
+// attached. A controller whose installation never happened (the connection
+// closed first, or chose another path) is therefore idle from its creation.
 func (c *PathController) IdleSince() (time.Time, bool) {
 	if c.attached.Load() > 0 {
 		return time.Time{}, false
 	}
 	ns := c.lastDetach.Load()
 	if ns == 0 {
-		return time.Time{}, false
+		return c.created, true
 	}
 	return time.Unix(0, ns), true
 }
@@ -443,6 +447,19 @@ func (c *PathController) detach(a *PathAttachment, now monotime.Time) []func() {
 	for key := range a.pkts {
 		c.discard(a, key)
 	}
+	// Its held losses go too: after a migration the attachment's map is
+	// written under another controller's lock, so nothing here may keep a
+	// reference to it.
+	kept := c.lostHeld[:0]
+	for _, h := range c.lostHeld {
+		if h.att == a {
+			c.law.inner.estimator.retire(h.pseq)
+			continue
+		}
+		kept = append(kept, h)
+	}
+	clear(c.lostHeld[len(kept):])
+	c.lostHeld = kept
 	if !a.probing {
 		c.flight -= a.gauge
 	}
@@ -657,6 +674,10 @@ func (c *PathController) promote(a *PathAttachment) {
 
 func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent) []func() {
 	now := c.clamp(ev.Time)
+	// Deadlines are enforced before outcomes are accepted, so an
+	// acknowledgement past the horizon is not credited merely because no
+	// other callback came first.
+	c.advance(now)
 	before := c.flight
 	windowBefore := c.law.GetCongestionWindow()
 	c.setGauge(a, ev.InFlight)

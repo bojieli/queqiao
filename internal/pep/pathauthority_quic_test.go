@@ -434,3 +434,28 @@ func TestAGatewayAttachesEveryDataConnectionOfADeviceToOneController(t *testing.
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// Two clients in one daemon -- two credential profiles -- are two
+// principals: their connections to the same gateway over the same uplink
+// attach to different controllers, with different path models.
+func TestTwoClientsInOneProcessHaveTheirOwnControllers(t *testing.T) {
+	pathAuthorities.forget()
+	bed := newPathBed(t, pathsim.Config{OneWayDelay: time.Millisecond, Seed: 15})
+	one, two := newClientPathPrincipal(), newClientPathPrincipal()
+	if one == two {
+		t.Fatal("two clients share a principal")
+	}
+	var atts []*wancongestion.PathAttachment
+	for _, p := range []string{one, two} {
+		cfg := pathScopeConfig
+		cfg.principal = p
+		att, ok := configureQUICController(bed.clientTLS(), cfg).(*wancongestion.PathAttachment)
+		if !ok {
+			t.Fatal("no path attachment")
+		}
+		atts = append(atts, att)
+	}
+	if atts[0].Controller() == atts[1].Controller() {
+		t.Fatal("two clients' connections share one controller")
+	}
+}
