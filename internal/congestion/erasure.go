@@ -130,13 +130,13 @@ type ErasureSender struct {
 	share  atomic.Uint64
 	member pathmodel.Member
 
-	// nonEliciting counts the bytes of packets that elicit no
-	// acknowledgement (QUIC ACK-only packets), and nonElicitingDebited the
-	// part of them charged to the pacer, counted where it is charged: all of
-	// it through the per-packet callbacks, none of it through
-	// ErasurePathSender.
-	nonEliciting        atomic.Uint64
-	nonElicitingDebited atomic.Uint64
+	// The bytes of packets that elicit no acknowledgement (QUIC ACK-only
+	// packets), counted by how they were accounted: debited from the pacer
+	// through the per-packet callbacks, not debited through
+	// ErasurePathSender. A connection uses one of the two, so the published
+	// total and debited figures are always consistent.
+	nonElicitingDebited   atomic.Uint64
+	nonElicitingUndebited atomic.Uint64
 }
 
 type packetOutcome struct {
@@ -524,7 +524,6 @@ func (e *ErasureSender) HasPacingBudget(now monotime.Time) bool {
 func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
 	if !retransmittable {
 		e.nonElicitingDebited.Add(byteTotal(bytes))
-		e.nonEliciting.Add(byteTotal(bytes))
 	}
 	e.pacer.sentPacket(sentTime, bytes)
 	e.inner.OnPacketSent(sentTime, bytesInFlight, number, bytes, retransmittable)
@@ -544,7 +543,7 @@ func byteTotal(b quiccongestion.ByteCount) uint64 {
 // such a packet nothing, so charging it limits traffic by an estimate that was
 // not measured on it; see ErasurePathSender.
 func (e *ErasureSender) onNonElicitingSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount) {
-	e.nonEliciting.Add(byteTotal(bytes))
+	e.nonElicitingUndebited.Add(byteTotal(bytes))
 	e.inner.OnPacketSent(sentTime, bytesInFlight, number, bytes, false)
 }
 
@@ -702,7 +701,7 @@ func (e *ErasureSender) Telemetry() ControllerTelemetry {
 	// controller's state.
 	t.DelayBrake = float64(e.delayBrake.Load()) / partsPerMillion
 	t.NonElicitingDebited = e.nonElicitingDebited.Load()
-	t.NonElicitingBytes = e.nonEliciting.Load()
+	t.NonElicitingBytes = t.NonElicitingDebited + e.nonElicitingUndebited.Load()
 	arrival := e.arrivalRate()
 	t.PacingRate = uint64(float64(t.PacingRate) / arrival)
 	t.CongestionWindow = uint64(float64(t.CongestionWindow) / arrival)

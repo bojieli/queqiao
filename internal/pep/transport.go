@@ -424,9 +424,8 @@ type quicStreamConn struct {
 // site that builds a lane having to thread it through.
 func (c *quicStreamConn) bulkPath() *coded.Path { return c.bulk }
 
-// pathIdentity is the uplink and peer this lane runs between, which is what
-// its measurements are recorded against.
-func (c *quicStreamConn) pathIdentity() string { return peerKey(c.conn) }
+// pathModel is the connection's path model reference; it follows a rekey.
+func (c *quicStreamConn) pathModel() pathmodel.Model { return pathModelOf(c.conn) }
 
 func (c *quicStreamConn) transportStats() laneTransportStats {
 	if c == nil || c.conn == nil {
