@@ -341,11 +341,11 @@ func (m *carrierMachine) endRecoveredEpisodes(events []carrierEvent, s carrierSa
 	m.inEpisode, m.episodeMax = false, 0
 	// One event per episode, highest peak first: reach[n-1]-reach[n] of them
 	// peaked at exactly n.
-	for n := len(reach); n >= 1; n-- {
-		exactly := reach[n-1]
-		if n < len(reach) {
-			exactly -= min(exactly, reach[n])
-		}
+	var above uint64 // episodes that reached the next level up
+	for i := len(reach) - 1; i >= 0; i-- {
+		n := i + 1
+		exactly := reach[i] - min(reach[i], above)
+		above = reach[i]
 		for range exactly {
 			event := carrierEvent{Kind: carrierEpisodeEnd, At: s.At, PTOs: uint32(n), Outcome: episodeRecovered, Epoch: s.Progress.Epoch}
 			if n == len(reach) {
