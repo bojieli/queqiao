@@ -69,6 +69,9 @@ type Session struct {
 	runErr    error
 	resources mobileResourceLimits
 	mode      string
+	// memoryMode is the memory-ownership bundle the next run starts with
+	// (SetMemoryBundle). Empty is legacy.
+	memoryMode atomic.Value
 	// Copied into the maintenance goroutine when a run starts. Tests shorten
 	// these on their own Session; keeping them per-session prevents one test
 	// from changing the clock under a still-stopping session.
@@ -252,6 +255,27 @@ func (s *Session) SetRoutingRules(text string) string {
 	return string(encoded)
 }
 
+// SetMemoryBundle selects the memory-ownership bundle the next Start uses:
+// "legacy" (the default) or "owned", which grants the shared send budget to
+// waiting flows in turn and tunes each flow's retention
+// from its own flow credit. Any other value is refused and changes nothing.
+// A running tunnel keeps the bundle it started with.
+func (s *Session) SetMemoryBundle(mode string) error {
+	parsed, err := pep.ParseMemoryMode(mode)
+	if err != nil {
+		return err
+	}
+	s.memoryMode.Store(parsed)
+	return nil
+}
+
+func (s *Session) memoryBundle() pep.MemoryMode {
+	if mode, ok := s.memoryMode.Load().(pep.MemoryMode); ok {
+		return mode
+	}
+	return pep.MemoryLegacy
+}
+
 // SetCountrySet hands the core a packed country set for GEOIP rules to consult.
 //
 // The clients own the file -- it ships inside the iOS extension bundle and the
@@ -399,6 +423,7 @@ func (s *Session) start(opts sessionOptions) error {
 		StreamReceiveWindow: limits.streamWindow, ConnectionReceiveWindow: limits.connectionWindow,
 		MaxStreamReceiveWindow: limits.streamWindow, MaxConnectionReceiveWindow: limits.connectionWindow,
 		MaxIncomingStreams: limits.maxIncomingStreams, MemoryLimits: &limits.memory,
+		Memory:  s.memoryBundle(),
 		Metrics: registry, Logger: logger,
 	})
 	if err != nil {

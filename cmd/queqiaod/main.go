@@ -564,8 +564,10 @@ type runtimeOptions struct {
 	// resolvedProfile is the deployment policy, parsed once at flag time so
 	// that an unknown name fails before anything starts rather than being
 	// silently replaced by the default.
-	resolvedProfile                                             profile.Profile
-	congestion                                                  string
+	resolvedProfile profile.Profile
+	congestion      string
+	// memory is the memory-ownership bundle (design §14 stage 3).
+	memory                                                      string
 	brutalBytesPerSec, adaptiveMinBytesSec, adaptiveMaxBytesSec uint64
 	aggregateBytesPerSec, interactiveReserveBytesPerSec         uint64
 	fallbackDelay, fallbackGrace, udpCooldown                   time.Duration
@@ -612,6 +614,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.BoolVar(&opts.udpOnStream, "udp-on-stream", false, "carry UDP packets on streams instead of QUIC datagrams")
 	fs.IntVar(&opts.hopPortCount, "hop-port-count", 0, "number of UDP ports to listen on for port hopping (0/1 = disabled)")
 	fs.StringVar(&opts.congestion, "congestion", string(pep.CongestionErasure), "QUIC congestion controller")
+	fs.StringVar(&opts.memory, "mem", string(pep.MemoryLegacy), "memory-ownership bundle: legacy, or owned (fair shared send-memory grants and the credit-driven retention bound)")
 	fs.Uint64Var(&opts.brutalBytesPerSec, "brutal-bytes-per-sec", 0, "Brutal fixed byte rate")
 	fs.Uint64Var(&opts.adaptiveMinBytesSec, "adaptive-min-bytes-per-sec", 64*1024, "Adaptive minimum byte rate")
 	fs.Uint64Var(&opts.adaptiveMaxBytesSec, "adaptive-max-bytes-per-sec", 200*1024*1024, "Adaptive maximum byte rate")
@@ -711,6 +714,9 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	}
 	if opts.adaptiveMinBytesSec == 0 || opts.adaptiveMaxBytesSec < opts.adaptiveMinBytesSec {
 		return errors.New("invalid adaptive byte-rate bounds")
+	}
+	if _, err := pep.ParseMemoryMode(opts.memory); err != nil {
+		return fmt.Errorf("--mem: %w", err)
 	}
 	if opts.congestion == string(pep.CongestionBrutal) && opts.brutalBytesPerSec == 0 {
 		return errors.New("--brutal-bytes-per-sec is required with brutal congestion")
@@ -887,6 +893,7 @@ func runServer(args []string) (returnErr error) {
 		EnableQUIC:        opts.transport == string(pep.TransportQUIC) || opts.transport == string(pep.TransportAuto),
 		TCPFallbackLanes:  opts.tcpFallbackLanes, TCPCongestion: opts.tcpCongestion,
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
+		Memory:              pep.MemoryMode(opts.memory),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
 		Logger: logger, UDPOnStream: opts.udpOnStream, Profile: serverProfile,
@@ -1002,6 +1009,7 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("listen", opts.listen),
 		slog.String("transport", opts.transport),
 		slog.String("congestion", opts.congestion),
+		slog.String("mem", opts.memory),
 		slog.Int("max_sessions", opts.maxSessions),
 		slog.Uint64("max_payload_bytes", uint64(protocol.MaxPayload)),
 		slog.Int("chunk_size_bytes", opts.chunkSize),

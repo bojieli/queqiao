@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"time"
 
 	"github.com/bojieli/queqiao/internal/protocol"
@@ -146,6 +147,39 @@ func (f *multipathFlow) retentionBytes() int {
 	return minFlowRetentionBytes
 }
 
+// creditRound is one flow-credit round trip: the slowest healthy lane's
+// round trip plus the receiver's ACK coalescing delay (G1). It paces the
+// owned-memory retention autotune; zero before any lane has an RTT sample.
+func (f *multipathFlow) creditRound() time.Duration {
+	longest := time.Duration(0)
+	for _, lane := range f.healthyLanes() {
+		if _, rtt := lane.sendRate(); rtt > longest {
+			longest = rtt
+		}
+	}
+	if longest <= 0 {
+		return 0
+	}
+	return longest + ackCoalesceDelay
+}
+
+// readyLimit is the write-ahead bound on READY bytes under the owned-memory
+// bundle: what the lanes that will carry this flow's data may queue ahead of
+// their transports -- the same candidates dispatch uses, so a pooled control
+// lane beside an isolated data lane does not count. With no lane, READY bytes
+// stay within one lane's minimum, and the no-progress budget ends the flow if
+// no binding arrives.
+func (f *multipathFlow) readyLimit() int {
+	total := 0
+	bulk := f.carriesBulk()
+	if candidates, err := f.laneCandidates(bulk); err == nil {
+		for _, lane := range candidates {
+			total += lane.windowBytes()
+		}
+	}
+	return max(total, minLaneQueueBytes)
+}
+
 // reissueDelay is how long a chunk waits before it is presumed lost, which is
 // a property of the path rather than a constant.
 //
@@ -215,6 +249,43 @@ func (l *mpLane) congestionState() (cwnd, inFlight int) {
 // send loop.
 type flowSource struct{ flow *multipathFlow }
 
+const (
+	// stagingBytes is each flow's private read buffer when a shared send
+	// budget is configured. It is static footprint: 1 KiB per session is
+	// 1 MiB at iOS's 1,024 sessions.
+	stagingBytes = 1024
+	// availableReadWait bounds how long filling a reserved chunk may wait for
+	// bytes the application has not written yet. A read deadline in the past
+	// would not do: Go's poller reports it expired before trying the socket.
+	availableReadWait = time.Millisecond
+)
+
+// ReadAvailable fills p with bytes the application has already written,
+// waiting at most availableReadWait for more. The scheduler calls it while
+// holding a shared reservation, so it must never wait on the application.
+func (s *flowSource) ReadAvailable(p []byte) (int, error) {
+	if err := s.flow.inner.SetReadDeadline(time.Now().Add(availableReadWait)); err != nil {
+		return 0, stripe.ErrUnsupported
+	}
+	defer s.flow.inner.SetReadDeadline(time.Time{})
+	total := 0
+	for total < len(p) {
+		n, err := s.Read(p[total:])
+		total += n
+		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				return total, nil
+			}
+			return total, err
+		}
+		if n == 0 {
+			break
+		}
+	}
+	return total, nil
+}
+
 func (s *flowSource) Read(p []byte) (int, error) {
 	n, err := s.flow.inner.Read(p)
 	if n > 0 {
@@ -250,6 +321,14 @@ func (s *flowSource) Read(p []byte) (int, error) {
 func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 	defer close(f.sendDone)
 
+	retention := f.retentionBytes
+	var autotune *stripe.Autotune
+	if f.memOwned {
+		// The owned-memory bundle replaces the summed congestion windows with
+		// the flow's own credit-driven bound (design §8.3).
+		retention = nil
+		autotune = &stripe.Autotune{Round: f.creditRound, ReadyLimit: f.readyLimit}
+	}
 	sched := stripe.New(&flowSource{flow: f}, stripe.Config{
 		ChunkSize:      f.chunkSize,
 		LaneWindow:     min(maxLaneChunkWindow, f.memoryLimits.maxOutstanding),
@@ -261,7 +340,9 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		// bounded by what its transport has not yet taken.
 		MaxOutstandingBytes:  f.memoryLimits.maxSendBytes,
 		Memory:               f.sendMemory,
-		Retention:            f.retentionBytes,
+		StagingBytes:         stagingBytes,
+		Retention:            retention,
+		Autotune:             autotune,
 		RetransmitAfter:      f.reissueDelay,
 		ReliableReissueBurst: f.reliableReissueBurst(),
 		// A lane carrying its data over coded datagrams does not retransmit
@@ -367,7 +448,7 @@ func (f *multipathFlow) runLanePuller(ctx context.Context, lane *mpLane, sched *
 		if lane.closed.Load() || f.doneChanClosed() {
 			return
 		}
-		bulk := protocol.Class(f.class.Load()) == protocol.ClassBulk
+		bulk := f.carriesBulk()
 		if !f.laneCarriesData(lane, bulk) {
 			select {
 			case <-time.After(laneEligibilityPoll):
@@ -491,6 +572,12 @@ func (f *multipathFlow) watchChunkCompletion(ctx context.Context, sched *stripe.
 			return
 		}
 	}
+}
+
+// carriesBulk reports whether the flow is currently classified as bulk, which
+// decides the lanes its data may use.
+func (f *multipathFlow) carriesBulk() bool {
+	return protocol.Class(f.class.Load()) == protocol.ClassBulk
 }
 
 // laneCarriesData reports whether this lane is the one carrying this flow's
