@@ -29,6 +29,9 @@ type shadowTrace struct {
 	epoch  uint64
 	last   time.Time
 	events []carrierEvent
+	// The transport's completed-episode counters.
+	episodes uint64
+	reaching [metrics.CarrierShadowPTOBuckets]uint64
 }
 
 func newShadowTrace(t *testing.T, ks, kp uint32) *shadowTrace {
@@ -44,7 +47,7 @@ func (s *shadowTrace) step(progress bool, ptos uint32) []carrierEvent {
 		s.epoch++
 		s.last = s.now
 	}
-	s.events = s.m.observe(carrierSample{At: s.now, Progress: carrierProgress{Epoch: s.epoch, LastProgress: s.last, PTOExpiries: ptos}}, s.events[:0])
+	s.events = s.m.observe(carrierSample{At: s.now, Progress: carrierProgress{Epoch: s.epoch, LastProgress: s.last, PTOExpiries: ptos, Episodes: s.episodes, EpisodesReaching: s.reaching}}, s.events[:0])
 	return s.events
 }
 
@@ -259,7 +262,7 @@ func TestCarrierShadowConfig(t *testing.T) {
 	var off *carrierShadow
 	off.bindLane(nil, nil)
 	off.noteStall(nil, nil, time.Time{}, 0, false, false)
-	off.noteRescue(nil)
+	off.noteRescue(context.Background(), nil)
 	if obs := off.observeLane(nil); obs.tracked {
 		t.Fatal("a disabled observer observed")
 	}
@@ -399,10 +402,13 @@ func TestCarrierShadowLabelsCodedTailStallALiveCarrier(t *testing.T) {
 	if got.Stalls[metrics.CarrierShadowReplaceCarrier] != 0 || got.Transitions[metrics.CarrierShadowSuspect] != 0 {
 		t.Fatalf("a live carrier was suspected: %+v", got)
 	}
+	if request := findLogRecord(t, logs.String(), "carrier shadow rescue requested"); request["flow_id"] != float64(7) {
+		t.Fatalf("rescue request record = %v", request)
+	}
 	record := findLogRecord(t, logs.String(), "carrier shadow stall")
 	for key, want := range map[string]any{
 		"carrier_state": "active", "transport_acked": true, "design_remedy": "wait_move_coded",
-		"legacy_remedy": "demote_and_rescue_dial", "escape_coded": true, "flow_id": float64(7),
+		"legacy_remedy": "demote_and_request_rescue", "escape_coded": true, "flow_id": float64(7),
 	} {
 		if record[key] != want {
 			t.Fatalf("stall record %s = %v, want %v; record %v", key, record[key], want, record)
@@ -435,7 +441,7 @@ func TestCarrierShadowLabelsStallOnSilentCarrierForReplacement(t *testing.T) {
 		t.Fatalf("shadow stalls = %+v, want one replace_carrier without transport progress", got)
 	}
 	record := findLogRecord(t, logs.String(), "carrier shadow stall")
-	if record["carrier_state"] != "replace" || record["legacy_remedy"] != "demote_and_rescue_dial" || record["endpoint"] != "client" {
+	if record["carrier_state"] != "replace" || record["legacy_remedy"] != "demote_and_request_rescue" || record["endpoint"] != "client" {
 		t.Fatalf("stall record = %v", record)
 	}
 	// A lane failure on the silent carrier is carrier evidence too; once the
@@ -516,7 +522,7 @@ func BenchmarkCarrierShadowSample(b *testing.B) {
 		b.Fatal(err)
 	}
 	observer := newCarrierShadow(cfg, carrierShadowClient, nil, metrics.New())
-	carrier := observer.track(&quicStreamConn{conn: conn})
+	carrier := observer.track(&quicStreamConn{conn: conn}, carrierProgress{})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -581,5 +587,158 @@ func TestCarrierShadowRemediesAndEpisodeAccounting(t *testing.T) {
 	// A stale snapshot from before that progress changes nothing.
 	if events := trace.m.observe(carrierSample{At: trace.now, Progress: carrierProgress{Epoch: trace.epoch - 1, PTOExpiries: 0}}, nil); len(events) != 0 || trace.m.epoch != trace.epoch {
 		t.Fatalf("stale snapshot applied: %+v", events)
+	}
+}
+
+// recoverAfter acknowledges after the transport closed episodes with these
+// peaks since the last sample, and counted them as the fork's progress export
+// does.
+func (s *shadowTrace) recoverAfter(peaks ...uint32) []carrierEvent {
+	s.t.Helper()
+	for _, peak := range peaks {
+		s.episodes++
+		for n := uint32(0); n < min(peak, metrics.CarrierShadowPTOBuckets); n++ {
+			s.reaching[n]++
+		}
+	}
+	s.now = s.now.Add(100 * time.Millisecond)
+	s.epoch++
+	s.last = s.now.Add(-10 * time.Millisecond)
+	p := carrierProgress{Epoch: s.epoch, LastProgress: s.last, Episodes: s.episodes, EpisodesReaching: s.reaching}
+	s.events = s.m.observe(carrierSample{At: s.now, Progress: p}, s.events[:0])
+	return s.events
+}
+
+// The sampler sees two expiries; the transport reaches four and is
+// acknowledged before the next sample (a delayed ACK, or a short RTT). The
+// episode is closed at the peak the transport counted, not at the last
+// sampled count, and an episode that opened and closed between two samples
+// is counted too.
+func TestCarrierShadowCountsPeaksTheSamplerMissed(t *testing.T) {
+	trace := newShadowTrace(t, 2, 4)
+	trace.step(true, 0)
+	trace.wantState(metrics.CarrierShadowActive)
+	trace.step(false, 2)
+	episodes := episodesOf(trace.recoverAfter(4))
+	if len(episodes) != 1 || episodes[0].PTOs != 4 || episodes[0].Outcome != episodeRecovered || episodes[0].BetweenSamples {
+		t.Fatalf("episodes = %+v, want one recovered at 4", episodes)
+	}
+	if episodes[0].SinceProgress <= 0 {
+		t.Fatalf("the followed episode lost its duration: %+v", episodes[0])
+	}
+	for n := 0; n < 4; n++ {
+		if trace.m.reached[n] != 1 || trace.m.recovered[n] != 1 {
+			t.Fatalf("level %d: reached %d recovered %d, want 1 and 1", n+1, trace.m.reached[n], trace.m.recovered[n])
+		}
+	}
+	if trace.m.reached[4] != 0 || trace.m.episodes != 1 {
+		t.Fatalf("over-counted: reached %v, episodes %d", trace.m.reached, trace.m.episodes)
+	}
+	// Two episodes the sampler never saw, between two samples.
+	episodes = episodesOf(trace.recoverAfter(3, 1))
+	if len(episodes) != 2 || episodes[0].PTOs != 3 || episodes[1].PTOs != 1 || !episodes[0].BetweenSamples {
+		t.Fatalf("unsampled episodes = %+v", episodes)
+	}
+	if trace.m.reached[0] != 3 || trace.m.recovered[2] != 2 || trace.m.episodes != 3 {
+		t.Fatalf("reached %v recovered %v episodes %d", trace.m.reached, trace.m.recovered, trace.m.episodes)
+	}
+	// A transport without the counters is followed by samples, as before.
+	trace = newShadowTrace(t, 2, 4)
+	trace.step(true, 0)
+	trace.step(false, 2)
+	if episodes := episodesOf(trace.step(true, 0)); len(episodes) != 1 || episodes[0].PTOs != 2 {
+		t.Fatalf("sampled episode = %+v", episodes)
+	}
+}
+
+// slowHandler is a log sink that takes delay to write each record.
+type slowHandler struct {
+	slog.Handler
+	delay time.Duration
+}
+
+func (h slowHandler) Handle(ctx context.Context, r slog.Record) error {
+	time.Sleep(h.delay)
+	return h.Handler.Handle(ctx, r)
+}
+
+// The outage record is written off the recovery path: with the observer on
+// and a slow log sink, a flow without a lane still fails at its published
+// grace deadline, not the grace plus the time the write took.
+func TestCarrierShadowOutageRecordDoesNotExtendTheGrace(t *testing.T) {
+	shadowCfg := CarrierShadowConfig{Enabled: true}
+	if err := shadowCfg.resolve(); err != nil {
+		t.Fatal(err)
+	}
+	var logs lockedBuffer
+	flow := newStallTestFlow(t, metrics.New())
+	flow.carrierShadow = newCarrierShadow(shadowCfg, carrierShadowGateway,
+		slog.New(slowHandler{Handler: slog.NewJSONHandler(&logs, nil), delay: 400 * time.Millisecond}), nil)
+	const grace = 100 * time.Millisecond
+	started := time.Now()
+	err := flow.waitForHealthyLane(context.Background(), grace)
+	waited := time.Since(started)
+	if !errors.Is(err, errLaneReplacementTimeout) {
+		t.Fatalf("err = %v", err)
+	}
+	if deadline := started.Add(grace); waited > grace+250*time.Millisecond {
+		t.Fatalf("waited %s for a %s grace (deadline %s): the shadow record extended it", waited, grace, deadline.Format(time.StampMilli))
+	}
+	record := waitForRecord(t, &logs, "carrier shadow outage", 2*time.Second, func(map[string]any) bool { return true })
+	if ms, ok := record["deadline_unix_ms"].(float64); !ok || int64(ms) > started.Add(grace+50*time.Millisecond).UnixMilli() {
+		t.Fatalf("outage record = %v", record)
+	}
+}
+
+// Episodes that end between a carrier being watched and its first sample are
+// counted from the counters read at registration. An episode whose recovery
+// sample saw several packets acknowledged has only an upper bound on its
+// duration; one acknowledged packet makes it exact.
+func TestCarrierShadowSeedsCountersAndBoundsDurations(t *testing.T) {
+	m := newCarrierMachine(2, 4)
+	m.seed(carrierProgress{Epoch: 10, Episodes: 5})
+	var reach [metrics.CarrierShadowPTOBuckets]uint64
+	reach[0], reach[1] = 1, 1
+	start := time.Unix(1_000_000, 0)
+	events := m.observe(carrierSample{At: start, Progress: carrierProgress{Epoch: 12, LastProgress: start, Episodes: 6, EpisodesReaching: reach}}, nil)
+	if episodes := episodesOf(events); len(episodes) != 1 || episodes[0].PTOs != 2 || !episodes[0].BetweenSamples {
+		t.Fatalf("an episode before the first sample = %+v", episodes)
+	}
+	if m.reached[1] != 1 || m.recovered[1] != 1 {
+		t.Fatalf("reached %v recovered %v", m.reached, m.recovered)
+	}
+
+	for _, acked := range []uint64{1, 3} {
+		trace := newShadowTrace(t, 2, 4)
+		trace.step(true, 0)
+		trace.step(false, 2)
+		trace.epoch += acked - 1 // recoverAfter acknowledges one more
+		episodes := episodesOf(trace.recoverAfter(2))
+		if len(episodes) != 1 || episodes[0].DurationUpperBound != (acked > 1) {
+			t.Fatalf("%d acknowledged: episodes = %+v", acked, episodes)
+		}
+	}
+}
+
+// The transport's last bucket counts its peak or more: a single episode
+// takes its exact peak from the transport, several are marked lower bounds.
+func TestCarrierShadowPeakPastTheLastBucket(t *testing.T) {
+	trace := newShadowTrace(t, 2, 4)
+	trace.step(true, 0)
+	trace.step(false, 3)
+	trace.episodes++
+	for n := range trace.reaching {
+		trace.reaching[n]++
+	}
+	trace.now = trace.now.Add(100 * time.Millisecond)
+	trace.epoch++
+	events := trace.m.observe(carrierSample{At: trace.now, Progress: carrierProgress{Epoch: trace.epoch, LastProgress: trace.now,
+		Episodes: trace.episodes, EpisodesReaching: trace.reaching, LastEpisodePeak: 19}}, nil)
+	if episodes := episodesOf(events); len(episodes) != 1 || episodes[0].PTOs != 19 || episodes[0].PeakLowerBound {
+		t.Fatalf("one episode past the last bucket = %+v", episodes)
+	}
+	episodes := episodesOf(trace.recoverAfter(20, 18))
+	if len(episodes) != 2 || episodes[0].PTOs != metrics.CarrierShadowPTOBuckets || !episodes[0].PeakLowerBound || !episodes[1].PeakLowerBound {
+		t.Fatalf("two episodes past the last bucket = %+v", episodes)
 	}
 }

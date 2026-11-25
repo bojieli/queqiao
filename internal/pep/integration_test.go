@@ -192,14 +192,37 @@ func TestTLSOneLaneSOCKSEndToEnd(t *testing.T) {
 }
 
 func TestUDPAssociateSOCKSEndToEnd(t *testing.T) {
-	runUDPAssociateSOCKSEndToEnd(t, TransportTCP)
+	runUDPAssociateSOCKSEndToEnd(t, TransportTCP, nil, nil)
 }
 
 func TestUDPAssociateQUICSOCKSEndToEnd(t *testing.T) {
-	runUDPAssociateSOCKSEndToEnd(t, TransportQUIC)
+	runUDPAssociateSOCKSEndToEnd(t, TransportQUIC, nil, nil)
 }
 
-func runUDPAssociateSOCKSEndToEnd(t *testing.T, transport TransportKind) {
+// A carrier that only UDP associations use is watched by the carrier-shadow
+// observer on both endpoints, once per connection.
+func TestUDPAssociationCarrierIsShadowed(t *testing.T) {
+	shadow := CarrierShadowConfig{Enabled: true, Interval: 10 * time.Millisecond}
+	runUDPAssociateSOCKSEndToEnd(t, TransportQUIC, &shadow, func(client *Client, server *Server) {
+		for name, observer := range map[string]*carrierShadow{"client": client.carrierShadow, "gateway": server.carrierShadow} {
+			if got := observer.activeCarriers(); got != 1 {
+				t.Fatalf("%s watches %d carriers, want the association's one", name, got)
+			}
+		}
+	})
+}
+
+// runUDPAssociateSOCKSEndToEnd relays one datagram through a SOCKS5 UDP
+// association. With shadow, both endpoints run the carrier-shadow observer,
+// and inspect sees them while the association is live.
+func runUDPAssociateSOCKSEndToEnd(t *testing.T, transport TransportKind, shadow *CarrierShadowConfig, inspect func(*Client, *Server)) {
+	var shadowCfg CarrierShadowConfig
+	if shadow != nil {
+		shadowCfg = *shadow
+		if err := shadowCfg.resolve(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	destination, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
 		t.Fatal(err)
@@ -232,6 +255,7 @@ func runUDPAssociateSOCKSEndToEnd(t *testing.T, transport TransportKind) {
 	server, err := NewServer(ServerConfig{
 		ListenAddr: serverAddr, Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableTCP: transport != TransportQUIC, EnableQUIC: transport != TransportTCP, Logger: logger,
+		CarrierShadow: shadowCfg,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -242,6 +266,7 @@ func runUDPAssociateSOCKSEndToEnd(t *testing.T, transport TransportKind) {
 	}
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: serverAddr, Credentials: roots, Transport: transport, EnableQUICPool: transport == TransportQUIC, Logger: logger,
+		CarrierShadow: shadowCfg,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -308,6 +333,9 @@ func runUDPAssociateSOCKSEndToEnd(t *testing.T, transport TransportKind) {
 	}
 	if string(got.Payload) != "udp-echo" {
 		t.Fatalf("UDP payload %q", got.Payload)
+	}
+	if inspect != nil {
+		inspect(client, server)
 	}
 	cancel()
 	for range 2 {
