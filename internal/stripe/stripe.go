@@ -35,6 +35,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -451,7 +452,7 @@ func (s *Scheduler) produce() {
 			n, err = s.src.Read(buf)
 		} else {
 			var ok bool
-			buf, n, reserved, err, ok = s.readStaged(staging[:min(len(staging), allowance)], allowance)
+			buf, n, reserved, ok, err = s.readStaged(staging[:min(len(staging), allowance)], allowance)
 			if !ok {
 				return
 			}
@@ -485,19 +486,19 @@ func (s *Scheduler) waitForRoom() (int, bool) {
 			s.autotuneLocked(s.cfg.Now())
 			ready := s.readyBytesLocked()
 			if limit := s.readyLimit(); limit > 0 {
-				if ready >= uint64(limit) {
+				if ready >= byteCount(limit) {
 					s.tune.waiting = false
 					s.produced.Wait()
 					continue
 				}
-				allowance = min(allowance, limit-int(ready))
+				allowance = min(allowance, limit-intCount(ready))
 			}
 			// Each logical byte is charged once, however many attempts
 			// carry it or whether a retry is also waiting in the ready set:
 			// what the bound limits is retained source bytes.
 			retained = s.uniqueBytes + ready
-			if retained < uint64(s.tune.bound) {
-				allowance = min(allowance, s.tune.bound-int(retained))
+			if retained < byteCount(s.tune.bound) {
+				allowance = min(allowance, s.tune.bound-intCount(retained))
 			}
 		}
 		if retained >= uint64(s.readAheadLimit()) {
@@ -519,10 +520,10 @@ func (s *Scheduler) waitForRoom() (int, bool) {
 // readStaged blocks on the application holding no shared memory, then
 // reserves exactly the allocation the bytes in hand need. ok is false when
 // the scheduler closed while it waited for memory.
-func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, err error, ok bool) {
+func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, ok bool, err error) {
 	n, err = s.src.Read(staging)
 	if n <= 0 {
-		return nil, 0, 0, err, true
+		return nil, 0, 0, true, err
 	}
 	size := n
 	filler, canFill := s.src.(AvailableReader)
@@ -543,7 +544,7 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 			s.ready.Broadcast()
 		}
 		s.mu.Unlock()
-		return nil, 0, 0, nil, false
+		return nil, 0, 0, false, nil
 	}
 	buf = make([]byte, size)
 	copy(buf, staging[:n])
@@ -567,7 +568,7 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 			buf, reserved = short, n
 		}
 	}
-	return buf, n, reserved, err, true
+	return buf, n, reserved, true, err
 }
 
 // publish files what one read produced. It reports false when the producer
@@ -584,7 +585,7 @@ func (s *Scheduler) publish(buf []byte, n, reserved int, err error) bool {
 		s.nextOffset += uint64(n)
 		s.stats.SourceBytes += uint64(n)
 		s.pending = append(s.pending, chunk)
-		s.readyBytes += uint64(n)
+		s.readyBytes += byteCount(n)
 	} else {
 		s.cfg.Memory.Release(reserved)
 	}
@@ -631,6 +632,22 @@ func (s *Scheduler) retainedBytes() uint64 {
 		total += uint64(len(chunk.Data))
 	}
 	return total
+}
+
+// byteCount converts a byte count held as an int; a negative one is zero.
+func byteCount(n int) uint64 {
+	if n <= 0 {
+		return 0
+	}
+	return uint64(n) // #nosec G115 -- n is positive, and every int fits in uint64.
+}
+
+// intCount converts a byte count to int, saturating.
+func intCount(n uint64) int {
+	if n > math.MaxInt {
+		return math.MaxInt
+	}
+	return int(n) // #nosec G115 -- bounded by math.MaxInt just above.
 }
 
 // readyBytesLocked is Q: bytes read and not yet dispatched. A chunk waiting
@@ -712,7 +729,7 @@ func (s *Scheduler) closeRoundLocked() {
 		for _, u := range t.history[:t.rounds] {
 			peak = max(peak, u)
 		}
-		target := int(min(2*peak, uint64(ceiling)))
+		target := intCount(min(2*peak, byteCount(ceiling)))
 		target = max(target, floor)
 		switch {
 		case target < t.bound:
@@ -819,7 +836,7 @@ func (s *Scheduler) Next(ctx context.Context, laneID uint64, windowBytes int) (*
 			// ready: below its count limit and with byte room for one. Only
 			// the autotune reads it, so the legacy path skips the probe.
 			idle = s.cfg.Autotune != nil && len(s.pending) == 0 &&
-				s.hasRoomLocked(laneID, windowBytes, uint64(s.cfg.ChunkSize))
+				s.hasRoomLocked(laneID, windowBytes, byteCount(s.cfg.ChunkSize))
 		}
 		if idle {
 			// This lane could carry more and has nothing to carry. If the

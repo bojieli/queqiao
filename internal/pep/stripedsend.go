@@ -171,7 +171,7 @@ func (f *multipathFlow) creditRound() time.Duration {
 // no binding arrives.
 func (f *multipathFlow) readyLimit() int {
 	total := 0
-	bulk := protocol.Class(f.class.Load()) == protocol.ClassBulk
+	bulk := f.carriesBulk()
 	if candidates, err := f.laneCandidates(bulk); err == nil {
 		for _, lane := range candidates {
 			total += lane.windowBytes()
@@ -448,7 +448,7 @@ func (f *multipathFlow) runLanePuller(ctx context.Context, lane *mpLane, sched *
 		if lane.closed.Load() || f.doneChanClosed() {
 			return
 		}
-		bulk := protocol.Class(f.class.Load()) == protocol.ClassBulk
+		bulk := f.carriesBulk()
 		if !f.laneCarriesData(lane, bulk) {
 			select {
 			case <-time.After(laneEligibilityPoll):
@@ -572,6 +572,12 @@ func (f *multipathFlow) watchChunkCompletion(ctx context.Context, sched *stripe.
 			return
 		}
 	}
+}
+
+// carriesBulk reports whether the flow is currently classified as bulk, which
+// decides the lanes its data may use.
+func (f *multipathFlow) carriesBulk() bool {
+	return protocol.Class(f.class.Load()) == protocol.ClassBulk
 }
 
 // laneCarriesData reports whether this lane is the one carrying this flow's
