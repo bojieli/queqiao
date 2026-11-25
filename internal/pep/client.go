@@ -438,7 +438,7 @@ type controlQUICGeneration struct {
 	verified     time.Time
 	proofEpoch   uint64
 	probe        *controlPathProbe
-	lossPath     *pathmodel.PathModel
+	lossPath     pathmodel.Model
 	prefixBudget prefixRepairBudget
 	pendingOpens map[*controlPoolStreamConn]pendingOpen
 	id           uint64
@@ -1881,7 +1881,7 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 		generation = &controlQUICGeneration{borrowing: borrowing, stopBorrowing: stopBorrowing,
 			id: attempt.epoch, conn: conn, packet: packet, verified: time.Now(),
 			controller: configureQUICController(conn, ccfg),
-			lossPath:   pathmodel.Shared(peerKey(conn)),
+			lossPath:   pathModelOf(conn),
 		}
 		go generation.watchLiveness(func(g *controlQUICGeneration) { c.supersedeSilentGeneration(g, &ccfg) })
 	}

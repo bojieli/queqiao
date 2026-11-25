@@ -1101,6 +1101,7 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 			controller := wancongestion.NewErasureSenderOn(
 				conn.InitialPacketSize(), pathModelForKey(key, egress, cfg.hierarchicalPath, cfg.discoverGrouping))
 			attached := wancongestion.NewErasurePathSender(controller, erasureRekey(conn, cfg, key))
+			attached.SetAddresses(func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
 			conn.SetCongestionControl(attached)
 			return attached
 		}
@@ -1142,6 +1143,8 @@ func erasureRekey(conn *quic.Conn, cfg congestionConfig, current string) func(ol
 			return nil
 		}
 		current = next
+		// The connection's other readers of the path follow it too.
+		rekeyPathModel(conn, next)
 		return wancongestion.NewErasureSenderOn(conn.InitialPacketSize(), pathModelForKey(next, egress, cfg.hierarchicalPath, cfg.discoverGrouping))
 	}
 }
@@ -1169,7 +1172,8 @@ func erasureRekey(conn *quic.Conn, cfg congestionConfig, current string) func(ol
 // over the same uplink starts from what the first measured about it, and a
 // congested peer does not throttle traffic to a healthy one.
 func pathModelFor(conn *quic.Conn, hierarchical, discover bool) pathmodel.Model {
-	return pathModelForKey(peerKey(conn), egressOf(conn), hierarchical, discover)
+	egress, key := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
+	return pathModelForKey(key, egress, hierarchical, discover)
 }
 
 // pathModelForKey selects the model for a resolved path key and egress, so a
@@ -1183,16 +1187,6 @@ func pathModelForKey(key, egress string, hierarchical, discover bool) pathmodel.
 		return pathmodel.SharedChainRegrouping(k)
 	}
 	return pathmodel.SharedChain(k)
-}
-
-// egressOf names the local side of the connection, which is the segment every
-// flow from this host shares regardless of where it is going.
-func egressOf(conn *quic.Conn) string {
-	source := addressHost(conn.LocalAddr())
-	if isUnspecifiedHost(source) {
-		source = routeSource(conn.RemoteAddr())
-	}
-	return source
 }
 
 func peerKey(conn *quic.Conn) string {

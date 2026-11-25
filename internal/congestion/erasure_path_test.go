@@ -272,3 +272,21 @@ func TestErasurePathSenderCountersSurviveAPathChange(t *testing.T) {
 		t.Fatalf("non-eliciting bytes %d then %d, want 50 then 100", before, got)
 	}
 }
+
+// A migration between choosing the sender and its installation on the run
+// loop is caught at attachment.
+func TestErasurePathSenderRevalidatesThePathAtAttach(t *testing.T) {
+	first, second := NewErasureSender(1200), NewErasureSender(1200)
+	moved := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 9), Port: 443}
+	attached := NewErasurePathSender(first, func(_, _, _, newRemote net.Addr) *ErasureSender {
+		if newRemote.String() == moved.String() {
+			return second
+		}
+		return nil
+	})
+	attached.SetAddresses(func() (net.Addr, net.Addr) { return &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1)}, moved })
+	attached.OnAttach(base(), 0, 1200, func() {})
+	if attached.Sender() != second {
+		t.Fatal("the sender chosen before a migration stayed installed")
+	}
+}

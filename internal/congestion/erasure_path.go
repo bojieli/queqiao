@@ -41,7 +41,11 @@ type ErasurePathSender struct {
 	// carried.
 	gauge quiccongestion.ByteCount
 
-	rekey   func(oldLocal, newLocal, oldRemote, newRemote net.Addr) *ErasureSender
+	rekey func(oldLocal, newLocal, oldRemote, newRemote net.Addr) *ErasureSender
+	// addrs, if set, reports the connection's current addresses. It is read
+	// at attachment, on the run loop, so a migration between choosing the
+	// sender and installing it is not missed.
+	addrs   func() (local, remote net.Addr)
 	rtt     quiccongestion.RTTStatsProvider
 	maxSize quiccongestion.ByteCount
 	wake    func()
@@ -70,6 +74,10 @@ func NewErasurePathSender(sender *ErasureSender, rekey func(oldLocal, newLocal, 
 	p.state.Store(&erasurePathState{sender: sender})
 	return p
 }
+
+// SetAddresses gives the sender a way to read the connection's current
+// addresses at attachment; see OnPathMigrated.
+func (p *ErasurePathSender) SetAddresses(addrs func() (local, remote net.Addr)) { p.addrs = addrs }
 
 // Sender returns the ErasureSender currently driven.
 func (p *ErasurePathSender) Sender() *ErasureSender { return p.state.Load().sender }
@@ -103,6 +111,14 @@ func (p *ErasurePathSender) OnAttach(_ monotime.Time, inFlight, maxPacket quicco
 	p.attached = true
 	p.gauge = inFlight
 	p.wake = wake
+	// The connection may have migrated after the sender was chosen and
+	// before this installation on the run loop: revalidate the path.
+	if p.addrs != nil && p.rekey != nil {
+		local, remote := p.addrs()
+		if next := p.rekey(local, local, remote, remote); next != nil {
+			p.replace(next)
+		}
+	}
 	// Path MTU discovery may have raised the packet size before the
 	// controller was installed on the run loop. Only a change is applied:
 	// telling the sender the size it was built with would reset its pacer's
@@ -181,10 +197,13 @@ func (p *ErasurePathSender) OnPathMigrated(_ monotime.Time, oldLocal, newLocal, 
 	if p.rekey == nil {
 		return
 	}
-	next := p.rekey(oldLocal, newLocal, oldRemote, newRemote)
-	if next == nil {
-		return
+	if next := p.rekey(oldLocal, newLocal, oldRemote, newRemote); next != nil {
+		p.replace(next)
 	}
+}
+
+// replace makes next the sender, keeping the connection's counters.
+func (p *ErasurePathSender) replace(next *ErasureSender) {
 	if p.rtt != nil {
 		next.SetRTTStatsProvider(p.rtt)
 	}

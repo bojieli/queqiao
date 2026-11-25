@@ -173,6 +173,17 @@ func TestCCAPISelectsHowTheErasureControllerIsDriven(t *testing.T) {
 				}
 				time.Sleep(5 * time.Millisecond)
 			}
+			// The connection's other path readers (coded FEC, the control
+			// generation's erasure test) share one reference that follows a
+			// rekey, and only a rekey.
+			readers := pathModelOf(conn)
+			if readers != pathModelOf(conn) || readers.model.Load() != pathmodel.Shared(peerKey(conn)) {
+				t.Fatal("the connection's path readers do not share its current model")
+			}
+			rekeyPathModel(conn, "elsewhere->"+conn.RemoteAddr().String())
+			if readers.model.Load() != pathmodel.Shared("elsewhere->"+conn.RemoteAddr().String()) {
+				t.Fatal("the readers did not follow the rekey")
+			}
 			// A migration whose resolved key differs from the one the
 			// controller was chosen for gets a controller for the new path.
 			rekey := erasureRekey(conn, congestionConfig{kind: CongestionErasure, ccAPI: api}, "another-uplink->"+conn.RemoteAddr().String())

@@ -2,8 +2,8 @@ github.com/andybalholm/brotli v1.2.7 h1:UgafRPGMam5ySHfRkhthMqOFA6IFoeF3D7mWIDLj
 github.com/andybalholm/brotli v1.2.7/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e h1:5mgtR5gwIgBKMiGI1QdXldZZ+SNor06Nbu1wCBulQBg=
 github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e/go.mod h1:x7qxEvX6MCVtDuBKHj3E+88+BtrbEMuAL5qGUKItjW8=
-github.com/bojieli/quic-go v0.61.1-0.20261125043153-dc1a11c1c8fa h1:GwDCY9TmQ6A4QiS37hzNxF3ND/zyvIcfTKL27UvdlR8=
-github.com/bojieli/quic-go v0.61.1-0.20261125043153-dc1a11c1c8fa/go.mod h1:x7qxEvX6MCVtDuBKHj3E+88+BtrbEMuAL5qGUKItjW8=
+github.com/bojieli/quic-go v0.61.1-0.20261125051601-4d1049cb1f84 h1:l1rvpEmZjQvu7BG9p/AiWJUuo9ulgoq1TS85B5C1HMs=
+github.com/bojieli/quic-go v0.61.1-0.20261125051601-4d1049cb1f84/go.mod h1:x7qxEvX6MCVtDuBKHj3E+88+BtrbEMuAL5qGUKItjW8=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
