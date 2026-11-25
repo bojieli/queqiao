@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/apernet/quic-go"
+	"github.com/bojieli/queqiao/internal/identity"
 )
 
 // The validation harness confirms which path-tree leaves a gateway saw, and
