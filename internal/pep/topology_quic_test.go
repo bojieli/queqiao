@@ -297,6 +297,9 @@ func TestBulkStreamsOnOneConnectionMatchIsolatedConnections(t *testing.T) {
 			cancel()
 			total, per := bed.bulkTotals(n)
 			rate := total / run.Seconds()
+			if rate < 0.5*float64(path.RateBytesPerSec) {
+				t.Fatalf("n=%d one connection=%v: %.2f MB/s on a %.2f MB/s path; no working arm to compare", n, oneConnection, rate/1e6, float64(path.RateBytesPerSec)/1e6)
+			}
 			t.Logf("n=%d one connection=%v: aggregate %.2f MB/s, per stream %v", n, oneConnection, rate/1e6, per)
 			for i, got := range per {
 				if got < 0.5*total/float64(n) || got > 2*total/float64(n) {
@@ -365,6 +368,11 @@ func TestNoStreamStarvesOnOneConnection(t *testing.T) {
 			<-ctx.Done()
 
 			total, per := bed.bulkTotals(bulkStreams)
+			// The bulk class keeps its weight beside the page and the
+			// deltas: well over a third of the path.
+			if total/run.Seconds() < 0.4*float64(path.RateBytesPerSec) {
+				t.Errorf("bulk delivered %.2f MB/s beside interactive load on a %.2f MB/s path", total/run.Seconds()/1e6, float64(path.RateBytesPerSec)/1e6)
+			}
 			for i, got := range per {
 				if got < 0.5*total/bulkStreams {
 					t.Errorf("bulk stream %d delivered %.0f of %.0f bytes", i, got, total)

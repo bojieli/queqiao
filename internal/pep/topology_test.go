@@ -564,7 +564,10 @@ func TestSingleTopologyStaysInsideTheIOSMemoryProfile(t *testing.T) {
 				CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath, Classifier: ClassifierPhased,
 				MaxSessions: 2048,
 			}, cfg)
-			w := rig.client.windows()
+			w := rig.client.preferredWindows()
+			if topology == TopologySingle && rig.client.windows().connection != 2*1024*1024 {
+				t.Fatal("a secondary connection would get the preferred connection's grown window")
+			}
 			if topology == TopologySingle && (w.connection != 2*1024*1024+64*1024 || w.maxConnection != w.connection) {
 				// Grown by the one stream window isolation's second
 				// connection would have added.

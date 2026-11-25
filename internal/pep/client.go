@@ -876,8 +876,17 @@ func (c *Client) windows() flowWindows {
 		maxStream: c.cfg.MaxStreamReceiveWindow, maxConnection: c.cfg.MaxConnectionReceiveWindow,
 		maxStreams: c.cfg.MaxIncomingStreams, codedQueue: c.memoryLimits.eventQueue,
 	}
+	return w
+}
+
+// preferredWindows is the receive windows of the pooled control generation,
+// the one connection a path carries under topology=single. Only it grows to
+// cover the isolated connections the topology does not open; fan-out, bulk
+// and dedicated rescue connections keep the configured windows, so the
+// client's total receive commitment never exceeds isolation's.
+func (c *Client) preferredWindows() flowWindows {
+	w := c.windows()
 	if c.singleTopology() {
-		// The isolated connections this topology does not open.
 		w = singleConnectionWindows(w, c.memoryLimits.maxBulkConnections-c.fanOutConnections())
 	}
 	return w
@@ -1947,7 +1956,7 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 }
 
 func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDial, ccfg congestionConfig) {
-	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.WireVersions, c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
+	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.WireVersions, c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.preferredWindows(), c.hopDialConfig())
 	var generation *controlQUICGeneration
 	if err == nil {
 		borrowing, stopBorrowing := context.WithCancelCause(conn.Context())
