@@ -643,19 +643,21 @@ New deterministic tests, on real fork send loops over an impaired in-process `Pa
 | --- | --- | --- | --- |
 | **A `bulk`** | stages 6/7 | 4 bulk downloads | 60 s |
 | **B `mixed-6/7`** | stages 6/7 | a 5-turn LLM loop (100 KB prompt) and terminal keystrokes with one 300 KB burst, under 2 bulk downloads | 90 s |
-| **DC** | stage 9 | the §11.3 gate at minimal size: 10 transactional requests (ASR and TTS alternating, the first cold), then the sustained-goodput and multi-leaf fairness workload | 60 s |
+| **DC** | stage 9 | the §11.3 gate at minimal size: 10 transactional requests (ASR and TTS alternating, the first on a cold app connection), then the sustained-goodput and multi-leaf fairness workload | 60 s |
 | **C `mixed-all`** | stage 10 | concurrently: a video-call UDP stream, one browsing burst, one LLM call, terminal keystrokes, 1 bulk download and 1 bulk upload; metrics per class and per direction | 120 s |
-| **D `idle-wake`** | stage 10 | 50 idle connections after a 200 KB sync, each woken once at 1, 5 or 16 min (crossing the 15-minute boundary), push and send alternating; run once per path, beside C | about 17 min |
+| **D `idle-wake`** | stage 10 (and `classifier=v2`) | 50 idle connections per arm after a 200 KB sync, each woken once at 1, 5 or 16 min (crossing the 15-minute boundary), push and send alternating; run once per path, beside C (beside A and B for `classifier=v2`) | about 17 min |
 
-- **One trial, every metric.** In B and C every workload's metrics come from the same trial as the bulk primary, so one block yields all of them.
-- **D** does not contend, so its arms run concurrently as paired sessions on their own client and gateway instances, which C's block restarts do not touch. It overlaps C's first blocks and adds no wall time.
+- **One trial, every metric.** In B and C every workload's metrics come from the same trial as the bulk primary, so one block yields all of them. The model's Minimal live plan fixes each trial's generator parameters and which metrics each trial gates.
+- **Primary per trial.** Only bulk flows count: B's downloads; C's download and upload, each its own primary; DC's sustained phase. A has nothing else.
+- **Each trial type runs once per path, at its gate.** A pass carries forward to the flip; a trial is rerun on the final bundle only when a later stage changes what it exercises.
+- **D** barely contends after its sync, so its arms run concurrently as paired sessions on their own client and gateway instances, which C's block restarts do not touch. Its syncs finish before C's first trial, and C's first two blocks run back to back to cover its 17 minutes, so its wakes happen under shared-link load (M6) at no extra wall time. Same-tunnel idle memory under load is test 14 of §15.1, not D.
 - **Directions.** Upload traffic appears wherever a workload's reverse direction carries its acknowledgements or its request (B's LLM requests, C's bulk upload), because the two directions differ in capacity and loss and are controlled independently.
 - **Coverage of the model's entries.**
 
 | ID | Workload | Covered by |
 | --- | --- | --- |
-| W1 | Bulk download | A (four flows); C (one flow). `speedtest` variant: optional |
-| W2 | Bulk upload | C (desktop profile). iOS memory profile: deterministic test 14 of §15.1 |
+| W1 | Bulk download | A (four flows); C (one flow). Standalone one-flow and `speedtest` variants: optional |
+| W2 | Bulk upload | C (desktop profile). iOS memory profile: optional |
 | W3 | Browsing fan-out | C (one burst). The h1/h2 × cold/warm sweep: optional |
 | W4 | Transactional burst | DC |
 | W5 | LLM streaming call | B (loop; turn 1 opens a cold app connection); C (single call). Swarm: optional |
@@ -671,7 +673,7 @@ New deterministic tests, on real fork send loops over an impaired in-process `Pa
 | M3 | Agent swarm | optional |
 | M4 | Call + browsing + bulk | C |
 | M5 | Heavy and thin UDP together | deterministic test, emulated path (with W8) |
-| M6 | Idle wake under load | D beside C |
+| M6 | Idle wake under load | D beside C; idle-socket memory on the iOS profile: test 14 of §15.1 |
 | M7 | Day-in-the-life soak | optional |
 
 - **Deterministic replacements** run in CI on `internal/pathsim`; the model's minimal live plan names them (still to be written). They gate stage 10 together with the live trials. Optional runs are reported, never gated.
@@ -689,13 +691,14 @@ New deterministic tests, on real fork send loops over an impaired in-process `Pa
   - **fails** when a hard assertion fails, or when the upper bound of the primary or of any secondary contrast is below zero;
   - otherwise gets one more block. At the 12-block cap a trial type that has not passed fails.
 
-  Each trial type stops on its own; the others continue. The interval is a one-sided t-interval on the block contrasts (bootstrap as a check). No separate pilot is run: the model's provisional bounds (margins `m`, slacks `a`) are frozen before the first gated block, and changing one after any block has been seen voids the campaign.
+  Each trial type stops on its own; the others continue. The interval is a one-sided t-interval on the block contrasts (bootstrap as a check). No separate pilot is run: the model's provisional bounds (margins `m`, slacks `a`) and the candidate's configuration, including the Q1 weights, are frozen before the first gated block; changing either after any block has been seen voids the campaign.
+- **Control.** "main" in these contrasts is the comparison's registered control: main for `classifier=v2`; main with `classifier=v2` for stage 6; isolation with `congestion=path` for stage 7 (§15.3); the legacy bundle for DC (§11.3); main for the flip.
 - **Initial state per arm.** Each arm runs as its own processes with its own path knowledge. An arm's first trial in a block starts cold (processes restarted) and its second starts from that arm's own first trial, in both ABBA and BAAB, so neither arm inherits the other's state by position.
 - **Secondary, all required, each with a pre-registered one-sided bound:** flow completion; stalls per trial; reissued bytes per source byte; wire bytes per useful byte against main's measured baseline by substrate and direction; sender-side credit delay p95; client CPU p90; shadow false-promotion rate.
-- **Workload secondaries.** Each metric the model gates for a workload inside a trial (§15.3) is a required secondary of that trial, per path, with its own pre-registered one-sided bound against main in the same campaign; a metric the model marks as reported is not gated. For a metric where smaller is better the contrast is `d_b = (m × main_b + a) − candidate_b`, with a multiplicative margin `m` and an absolute slack `a` fixed per metric before the first gated block, so that a metric near zero on main is not failed by noise. Percentiles are computed over each arm's pooled samples in a block. A tail percentile is used only when a block holds enough samples for it. Hard assertions in the model (class correctness, delivery with heartbeat, no silent deaths) are pass/fail, not statistical. Survival counts are reported with exact binomial intervals.
-- **D (`idle-wake`)** is one paired session per path, not a block sequence. It passes when its hard assertions hold (every wake delivered within 5 s, including at 16 min; no silent deaths) and its wake-penalty p50 is within the model's W9a bound of main's from the same session; the p95 and max are reported.
+- **Workload secondaries.** Each metric the model gates for a workload inside a trial (§15.3) is a required secondary of that trial, per path, with its own pre-registered one-sided bound against main in the same campaign; a metric the model marks as reported is not gated. For a metric where smaller is better the contrast is `d_b = (m × main_b + a) − candidate_b`, with a multiplicative margin `m` and an absolute slack `a` fixed per metric before the first gated block, so that a metric near zero on main is not failed by noise. Percentiles are computed over each arm's pooled samples in a block. A tail percentile is gated per block only when the block holds at least 20 samples per arm for a p95 and 100 for a p99; otherwise it is computed over all blocks' pooled samples at the stopping look and tested with a bootstrap that resamples blocks (this is how DC's p99 latency is tested). Generic secondaries apply where defined; a rate with a zero denominator is reported, not gated. Hard assertions in the model (class correctness, delivery, no silent deaths) and absolute ceilings (W6's latch ratio ≤ 1.15) are pass/fail, not statistical; absolute targets (W9a's RTT targets) are reported. Survival counts are reported with exact binomial intervals.
+- **D (`idle-wake`)** is one paired session per path, not a block sequence. It passes when its hard assertions hold (no silent deaths; every wake at 1 and 5 min delivered within 5 s), its delivered count at 16 min is at least main's, and its wake-penalty p50 is within the model's W9a bound of main's from the same session; the p95, max and death modes are reported. Generic secondaries do not apply to D.
 - **Pass.** A path × trial type passes under the rule above. Stage 10 requires A, B, C, D and DC on every path, and the deterministic replacements in CI (§14).
-- **Budget.** A block of A, B, C and DC together takes about 26 min with restarts, so 6–7 blocks is 2.5–3 h per path; the 12-block cap bounds the worst case at about 5 h.
+- **Budget.** One block each of A, B, C and DC takes about 26 min with restarts, so 6–7 blocks of each is 2.5–3 h per path when each trial type runs once; the 12-block cap bounds that at about 5 h. Reruns on the final bundle add their own cost.
 
 ## 16. Risks and open questions
 
