@@ -144,7 +144,10 @@ func (b *Budget) acquireFairLocked(ctx context.Context, request int64) error {
 	b.mu.Unlock()
 	select {
 	case <-g.ready:
-		return nil
+		if ctx.Err() == nil {
+			return nil
+		}
+		// Granted and cancelled together: cancellation wins.
 	case <-ctx.Done():
 	}
 	b.mu.Lock()

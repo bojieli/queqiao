@@ -222,6 +222,11 @@ const (
 	DefaultAutotuneStartupChunks = 4
 	// autotuneHistory is how many rounds of max U the bound decays toward.
 	autotuneHistory = 4
+	// autotuneMaxCatchUp bounds how many elapsed rounds one lazy update
+	// replays. The history fills in autotuneHistory rounds and each later
+	// round halves the remaining distance, so this reaches the floor from any
+	// int-sized bound.
+	autotuneMaxCatchUp = autotuneHistory + 64
 )
 
 // DefaultConfig returns bounds suitable for a long-haul path.
@@ -423,7 +428,8 @@ func (s *Scheduler) produce() {
 		staging = make([]byte, s.cfg.StagingBytes)
 	}
 	for {
-		if !s.waitForRoom() {
+		allowance, ok := s.waitForRoom()
+		if !ok {
 			return
 		}
 		var (
@@ -433,7 +439,7 @@ func (s *Scheduler) produce() {
 			err      error
 		)
 		if staging == nil {
-			buf = make([]byte, s.cfg.ChunkSize)
+			buf = make([]byte, allowance)
 			// One Read rather than ReadFull: a chunk is at most ChunkSize,
 			// not exactly it. Waiting for a full buffer would hold a small
 			// write -- a request, an interactive turn -- until enough later
@@ -442,7 +448,7 @@ func (s *Scheduler) produce() {
 			n, err = s.src.Read(buf)
 		} else {
 			var ok bool
-			buf, n, reserved, err, ok = s.readStaged(staging)
+			buf, n, reserved, err, ok = s.readStaged(staging[:min(len(staging), allowance)], allowance)
 			if !ok {
 				return
 			}
@@ -453,28 +459,43 @@ func (s *Scheduler) produce() {
 	}
 }
 
-// waitForRoom blocks until the flow's bounds admit another read. It reports
-// false once the scheduler is closed.
-func (s *Scheduler) waitForRoom() bool {
+// waitForRoom blocks until the flow's bounds admit another read, and returns
+// the most that read may take: ChunkSize, or under Autotune what is left of
+// the retention and READY allowances. It reports false once the scheduler is
+// closed.
+func (s *Scheduler) waitForRoom() (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for {
 		if s.closed {
-			return false
+			return 0, false
 		}
 		if len(s.pending)+len(s.live) >= s.cfg.MaxOutstanding {
 			s.produced.Wait()
 			continue
 		}
+		allowance := s.cfg.ChunkSize
+		retained := s.retainedBytes()
 		if s.cfg.Autotune != nil {
 			s.autotuneLocked(s.cfg.Now())
-			if limit := s.readyLimit(); limit > 0 && s.readyBytesLocked() >= uint64(limit) {
-				s.tune.waiting = false
-				s.produced.Wait()
-				continue
+			ready := s.readyBytesLocked()
+			if limit := s.readyLimit(); limit > 0 {
+				if ready >= uint64(limit) {
+					s.tune.waiting = false
+					s.produced.Wait()
+					continue
+				}
+				allowance = min(allowance, limit-int(ready))
+			}
+			// Each logical byte is charged once, however many attempts
+			// carry it or whether a retry is also waiting in the ready set:
+			// what the bound limits is retained source bytes.
+			retained = s.uniqueBytes + ready
+			if retained < uint64(s.tune.bound) {
+				allowance = min(allowance, s.tune.bound-int(retained))
 			}
 		}
-		if s.retainedBytes() >= uint64(s.readAheadLimit()) {
+		if retained >= uint64(s.readAheadLimit()) {
 			if s.cfg.Autotune != nil {
 				s.tune.waiting = true
 				s.tune.blocked = true
@@ -486,14 +507,14 @@ func (s *Scheduler) waitForRoom() bool {
 			continue
 		}
 		s.tune.waiting = false
-		return true
+		return allowance, true
 	}
 }
 
 // readStaged blocks on the application holding no shared memory, then
 // reserves exactly the allocation the bytes in hand need. ok is false when
 // the scheduler closed while it waited for memory.
-func (s *Scheduler) readStaged(staging []byte) (buf []byte, n, reserved int, err error, ok bool) {
+func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, err error, ok bool) {
 	n, err = s.src.Read(staging)
 	if n <= 0 {
 		return nil, 0, 0, err, true
@@ -502,9 +523,9 @@ func (s *Scheduler) readStaged(staging []byte) (buf []byte, n, reserved int, err
 	filler, canFill := s.src.(AvailableReader)
 	// A read that filled the staging buffer suggests more is waiting; one
 	// that did not has drained the source and the chunk is what it is.
-	fill := canFill && err == nil && n == len(staging) && s.cfg.ChunkSize > n
+	fill := canFill && err == nil && n == len(staging) && allowance > n
 	if fill {
-		size = s.cfg.ChunkSize
+		size = allowance
 	}
 	if acquireErr := s.cfg.Memory.Acquire(s.producerCtx, size); acquireErr != nil {
 		s.mu.Lock()
@@ -660,8 +681,9 @@ func (s *Scheduler) autotuneLocked(now time.Time) {
 	}
 	round := s.autotuneRound()
 	for i := 0; now.Sub(s.tune.roundStart) >= round; i++ {
-		if i >= autotuneHistory {
-			// Every further empty round is the same as the last one.
+		if i >= autotuneMaxCatchUp {
+			// Every further empty round is the same as the last, and by
+			// now the bound has reached where they would take it.
 			s.tune.roundStart = now
 			break
 		}
@@ -776,7 +798,9 @@ func (s *Scheduler) Next(ctx context.Context, laneID uint64, windowBytes int) (*
 			} else if s.doneLocked() {
 				return nil, nil
 			}
-			idle = len(s.pending) == 0
+			// Idle means the lane could carry another chunk if one were
+			// ready: below its count limit and with byte room for one.
+			idle = len(s.pending) == 0 && s.hasRoomLocked(laneID, windowBytes, uint64(s.cfg.ChunkSize))
 		}
 		if idle {
 			// This lane could carry more and has nothing to carry. If the

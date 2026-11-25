@@ -133,6 +133,7 @@ func TestIdleProducersHoldNoSharedMemory(t *testing.T) {
 				idleSources = append(idleSources, src)
 				s := New(src, cfg)
 				defer s.Close()
+				defer src.close()
 			}
 			waitUntil(t, "idle producers to block on their applications", func() bool {
 				for _, src := range idleSources {
@@ -221,6 +222,7 @@ func TestStagedChunksFillFromAvailableBytes(t *testing.T) {
 type blockingReader struct {
 	data    []byte
 	blocked chan struct{}
+	stop    chan struct{}
 	once    sync.Once
 	check   func()
 }
@@ -235,7 +237,8 @@ func (r *blockingReader) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	r.once.Do(func() { close(r.blocked) })
-	select {}
+	<-r.stop
+	return 0, io.EOF
 }
 
 // A source without AvailableReader publishes what one ordinary Read returned
@@ -244,7 +247,8 @@ func TestSourceWithoutAvailableReadNeverBlocksHoldingAReservation(t *testing.T) 
 	const chunkSize = 16 * 1024
 	memory := memlimit.New(1024 * 1024)
 	var current atomic.Pointer[Scheduler]
-	src := &blockingReader{data: bytes.Repeat([]byte{1}, 5000), blocked: make(chan struct{})}
+	src := &blockingReader{data: bytes.Repeat([]byte{1}, 5000), blocked: make(chan struct{}), stop: make(chan struct{})}
+	defer close(src.stop)
 	src.check = func() {
 		s := current.Load()
 		if s == nil {
@@ -509,7 +513,8 @@ func TestRetentionBoundDecaysTowardUse(t *testing.T) {
 // READY bytes are limited by the write-ahead bound, separately from the
 // retention bound: a flow with no lane reads at most that much.
 func TestReadyBytesAreLimitedByTheWriteAheadBound(t *testing.T) {
-	const limit = 3 * tuneChunk
+	// Not a multiple of the chunk: the last read takes only what is left.
+	const limit = 3*tuneChunk + 100
 	s := New(infiniteSource{}, Config{
 		ChunkSize: tuneChunk, LaneWindow: 1024, MaxOutstanding: 1024, MaxOutstandingBytes: tuneMax,
 		Autotune: &Autotune{Startup: tuneMax, ReadyLimit: func() int { return limit }},
@@ -519,5 +524,62 @@ func TestReadyBytesAreLimitedByTheWriteAheadBound(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if ready := s.ReadyBytes(); ready != limit {
 		t.Fatalf("READY bytes %d, want %d", ready, limit)
+	}
+}
+
+// The retention bound must not stay inflated across a long idle gap that
+// is observed only once: one lazy update replays every elapsed round.
+func TestRetentionBoundDecaysAcrossOneLongIdleGap(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	s := newTunedScheduler(t, clock)
+	ctx, cancel := context.WithCancel(context.Background())
+	lane := startLane(ctx, s)
+	for range 8 {
+		waitBlockedOnBound(t, s)
+		clock.advance(tuneRound)
+		lane.completeAll(s)
+	}
+	if peak := s.RetentionBound(); peak != tuneMax {
+		t.Fatalf("bound reached only %d", peak)
+	}
+	cancel()
+	<-lane.done
+	lane.completeAll(s)
+	clock.advance(time.Hour)
+	if bound, startup := s.RetentionBound(), DefaultAutotuneStartupChunks*tuneChunk; bound != startup {
+		t.Fatalf("after an hour idle the bound is %d, want %d", bound, startup)
+	}
+}
+
+// Retries are charged once: a retained chunk re-offered after its lane died
+// is not counted again against the bound, so it does not stop the producer.
+func TestRetriesAreChargedOnceAgainstTheRetentionBound(t *testing.T) {
+	src := newAvailableSource()
+	defer src.close()
+	src.write(bytes.Repeat([]byte{9}, 8*tuneChunk))
+	s := New(src, Config{
+		ChunkSize: tuneChunk, LaneWindow: 1024, MaxOutstanding: 1024, MaxOutstandingBytes: tuneMax,
+		Autotune: &Autotune{Startup: 2 * tuneChunk},
+	})
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first, err := s.Next(ctx, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "the bound to fill", func() bool { return s.ReadyBytes() == tuneChunk })
+	s.RetireLane(1)
+	// The retry sits in the ready set and is still live; nothing more was
+	// retained, so the producer's view of the bound is unchanged.
+	s.mu.Lock()
+	retained := s.uniqueBytes + s.readyBytesLocked()
+	s.mu.Unlock()
+	if retained != 2*tuneChunk {
+		t.Fatalf("retained %d after a retry, want %d", retained, 2*tuneChunk)
+	}
+	again, err := s.Next(ctx, 2, 0)
+	if err != nil || again.Offset != first.Offset {
+		t.Fatalf("retry not offered first: %v %v", again, err)
 	}
 }

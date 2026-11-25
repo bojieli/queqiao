@@ -150,9 +150,10 @@ func TestFairBudgetStarvesNoWaiter(t *testing.T) {
 		c := counts[i].Load()
 		lo, hi = min(lo, c), max(hi, c)
 	}
-	// Round-robin of one chunk per waiting flow: counts differ by at most the
-	// grants in flight when the run stopped.
-	if lo == 0 || hi-lo > holding+1 {
+	// FIFO orders the requests that are queued; how soon a worker requeues
+	// is the scheduler's business. So assert only that nobody is starved:
+	// every flow gets a fair fraction of the turns.
+	if lo < rounds/4 {
 		t.Fatalf("grants per flow range %d..%d over %d flows", lo, hi, flows)
 	}
 	if got := b.Snapshot(); got.Used != 0 || got.Peak > got.Capacity {
