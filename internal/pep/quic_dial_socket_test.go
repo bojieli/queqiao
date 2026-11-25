@@ -19,15 +19,28 @@ import (
 // several thousand dual-stack binds collided about once in every 30 on macOS.
 // Linux never gives out such a port, so there it passes either way.
 func TestAQUICDialSocketNeverSharesAPortWithAnIPv4Socket(t *testing.T) {
-	const holders, dials = 600, 3000
-	held := make(map[int]bool, holders)
+	const holders, dials, spare = 600, 3000, 32
+	// As many holders as the descriptor limit allows, less a few spare for
+	// the dial sockets and the runtime when the limit is what stopped it.
+	var conns []net.PacketConn
 	for range holders {
 		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 		if err != nil {
-			t.Fatal(err)
+			for range min(spare, len(conns)) {
+				_ = conns[len(conns)-1].Close()
+				conns = conns[:len(conns)-1]
+			}
+			break
 		}
+		conns = append(conns, conn)
+	}
+	held := make(map[int]bool, len(conns))
+	for _, conn := range conns {
 		t.Cleanup(func() { _ = conn.Close() })
 		held[conn.LocalAddr().(*net.UDPAddr).Port] = true
+	}
+	if len(conns) < 100 {
+		t.Skipf("descriptors for only %d IPv4 holders", len(conns))
 	}
 	gateway := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
 	network, address := quicDialSocket(":0", gateway)

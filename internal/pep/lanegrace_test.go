@@ -665,10 +665,15 @@ func TestAReplacementThatStartsIsInTheCompletionRecord(t *testing.T) {
 		}
 		flow.signalDone()
 		recorded := replacementFields(flow)["lane_replacement_attempts"].(uint64)
+		var admitted uint64
 		for attempt := range started {
 			if attempt > recorded {
 				t.Fatalf("replacement %d started after a completion record that counts %d", attempt, recorded)
 			}
+			admitted++
+		}
+		if admitted != recorded {
+			t.Fatalf("the completion record counts %d replacements; %d started", recorded, admitted)
 		}
 	}
 }
