@@ -142,3 +142,34 @@ class CarrierShadowSummaryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CarrierShadowCensoringTest(unittest.TestCase):
+    def test_unresolved_stall_and_measured_grace(self):
+        client = [
+            rec(1.0, "carrier shadow stall", endpoint="client", session_id=SESSION, flow_id=9, carrier_id=4,
+                carrier_state="active", transport_epoch=3, transport_acked=False, design_remedy="wait",
+                legacy_remedy="demote_and_rescue_dial"),
+            rec(1.5, "carrier shadow rescue started", endpoint="client", session_id=SESSION, flow_id=9),
+        ]
+        gateway = [
+            rec(2.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=9, grace=10_000_000_000),
+            rec(3.0, "carrier shadow join arrived", endpoint="gateway", session_id=SESSION, flow_id=9, lane_id=1),
+            rec(3.1, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=9),
+            # Ordinary logging continues long after.
+            {"time": at(300), "msg": "performance snapshot"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for name, records in (("c", client), ("g", gateway)):
+                path = pathlib.Path(directory) / f"{name}.jsonl"
+                path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+                paths.append(str(path))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                MODULE.main(["--client", paths[0], "--gateway", paths[1], "--json"])
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["stalls"]["client"]["outcomes"], {"unresolved: no later evidence about the carrier": 1})
+        deadline = report["recovery_deadline"]
+        self.assertEqual(deadline["grace_s"], 10.0)
+        self.assertAlmostEqual(deadline["latest_handoff_start_s"], 10.0 - 0.0 - 1.5, places=3)

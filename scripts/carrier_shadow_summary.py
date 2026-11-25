@@ -132,11 +132,17 @@ class Endpoint:
         self.name = name
         self.records: list[dict[str, Any]] = []
         self.skipped: Counter = Counter()
+        # The latest timestamp of any record, shadow or not: where the
+        # capture really ends, for deciding what is censored.
+        self.capture_end = 0.0
 
     def load(self, paths: list[str], offset_s: float = 0.0) -> None:
         for path in paths:
             with open(path, encoding="utf-8", errors="replace") as stream:
                 for record in read_records(stream, self.skipped):
+                    stamp = parse_instant(record.get("time"))
+                    if stamp is not None:
+                        self.capture_end = max(self.capture_end, stamp - offset_s)
                     msg = record.get("msg")
                     if not isinstance(msg, str) or not msg.startswith("carrier shadow"):
                         continue
@@ -240,13 +246,18 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
                 break
             same.append(t)
         failure = next((t for t in same if t.get("to") in ("replace", "dead")), None)
+        newer = len(same) < len(following)
         if failure is not None:
             outcomes[f"carrier reached {failure.get('to')} after the stall"] += 1
             later_failure_delay.append(failure["_t"] - stall["_t"])
-        elif any(t.get("to") == "closed" for t in same):
+        elif stall.get("carrier_state") == "closed" or any(t.get("to") == "closed" for t in same):
             outcomes["carrier closed by an endpoint (censored)"] += 1
-        else:
+        elif newer or stall.get("transport_acked") is True:
+            # Progress in a newer epoch, or QUIC acknowledging at the stall
+            # itself: the carrier was live.
             outcomes["carrier stayed live: design would not rescue"] += 1
+        else:
+            outcomes["unresolved: no later evidence about the carrier"] += 1
     lane_failures = Counter((r.get("carrier_state"), r.get("design_remedy")) for r in endpoint.of(LANE_FAILED))
     return {
         "stalls": sum(by_kind.values()),
@@ -296,7 +307,8 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
     outages: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     for record in gateway.of(OUTAGE):
         outages[flow_key(record)].append(record)
-    capture_end = max((r["_t"] for r in gateway.records), default=0.0)
+    capture_end = gateway.capture_end
+    graces: list[float] = []
 
     skew: list[float] = []
     observation_skew: list[float] = []
@@ -310,6 +322,7 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
         for index, outage in enumerate(records):
             start = outage["_t"]
             grace = seconds(outage.get("grace")) or grace_s
+            graces.append(grace)
             deadline = start + grace
             next_start = records[index + 1]["_t"] if index + 1 < len(records) else math.inf
             end = next((t for t in sorted(ended.get(key, [])) if start <= t < next_start), None)
@@ -366,7 +379,11 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
         high_transit = quantiles(transit)["max" if few else "p99"]
         result["S_s"] = max(0.0, -low_skew)
         result["J_s"] = high_transit
-        result["latest_handoff_start_s"] = grace_s - result["S_s"] - result["J_s"]
+        # The grace the gateways actually ran; the smallest if they differ.
+        grace = min(graces) if graces else grace_s
+        result["grace_s"] = grace
+        result["graces_seen_s"] = sorted(set(graces))
+        result["latest_handoff_start_s"] = grace - result["S_s"] - result["J_s"]
         result["latest_handoff_basis"] = "min skew, max transit" if few else "p10 skew, p99 transit"
     return result
 

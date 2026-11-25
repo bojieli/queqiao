@@ -419,7 +419,7 @@ func TestCarrierShadowLabelsStallOnSilentCarrierForReplacement(t *testing.T) {
 	if err := shadowCfg.resolve(); err != nil {
 		t.Fatal(err)
 	}
-	observer := newCarrierShadow(shadowCfg, carrierShadowGateway, slog.New(slog.NewJSONHandler(&logs, nil)), registry)
+	observer := newCarrierShadow(shadowCfg, carrierShadowClient, slog.New(slog.NewJSONHandler(&logs, nil)), registry)
 	flow := newStallTestFlow(t, registry)
 	carrier := &fakeCarrier{}
 	capture := newAckCaptureConn(0, nil)
@@ -435,7 +435,7 @@ func TestCarrierShadowLabelsStallOnSilentCarrierForReplacement(t *testing.T) {
 		t.Fatalf("shadow stalls = %+v, want one replace_carrier without transport progress", got)
 	}
 	record := findLogRecord(t, logs.String(), "carrier shadow stall")
-	if record["carrier_state"] != "replace" || record["legacy_remedy"] != "demote" || record["endpoint"] != "gateway" {
+	if record["carrier_state"] != "replace" || record["legacy_remedy"] != "demote_and_rescue_dial" || record["endpoint"] != "client" {
 		t.Fatalf("stall record = %v", record)
 	}
 	// A lane failure on the silent carrier is carrier evidence too; once the
@@ -537,6 +537,19 @@ func TestCarrierShadowRemediesAndEpisodeAccounting(t *testing.T) {
 	}
 	if got := designStallRemedy(carrierObservation{tracked: true, state: metrics.CarrierShadowReplace}, false); got != metrics.CarrierShadowReplaceCarrier {
 		t.Fatalf("stall on REPLACE = %s", got)
+	}
+	// Only the client dials or rebinds; the gateway waits for its JOIN.
+	for _, state := range []metrics.CarrierShadowState{metrics.CarrierShadowSuspect, metrics.CarrierShadowReplace, metrics.CarrierShadowDead} {
+		obs := carrierObservation{tracked: true, state: state}
+		if got := designStallRemedyFor(carrierShadowGateway, obs, false); got != metrics.CarrierShadowAwaitClient {
+			t.Fatalf("gateway stall on %s = %s", state, got)
+		}
+	}
+	if got := designLaneFailureRemedyFor(carrierShadowGateway, carrierObservation{tracked: true, state: metrics.CarrierShadowActive}); got != metrics.CarrierShadowAwaitClient {
+		t.Fatalf("gateway lane failure on a live carrier = %s", got)
+	}
+	if got := designStallRemedyFor(carrierShadowGateway, carrierObservation{tracked: true, state: metrics.CarrierShadowActive}, true); got != metrics.CarrierShadowWaitMoveCoded {
+		t.Fatalf("gateway coded stall on a live carrier = %s", got)
 	}
 	if (carrierObservation{tracked: true, state: metrics.CarrierShadowDead}).live() {
 		t.Fatal("a dead carrier is live")

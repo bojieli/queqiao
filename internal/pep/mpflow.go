@@ -2154,14 +2154,14 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			// This escape lasts only until the bytes pending now are acknowledged:
 			// loss of feedback alone is not evidence against future coded DATA.
 			// Only those byte offsets escape; later exchanges remain coded.
-			escapedCoding := false
 			for _, lane := range f.healthyLanes() {
 				if lane.fc.codesData() {
 					f.escapePendingCoding()
-					escapedCoding = true
 					break
 				}
 			}
+			// Coded bytes are pending only if the escape latched a frontier.
+			escapedCoding := f.codingRecoveryEnd.Load() != 0
 			// The shadow observer looks at the data lane before it is demoted.
 			var shadowLane *mpLane
 			if f.carrierShadow != nil {

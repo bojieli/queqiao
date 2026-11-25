@@ -66,6 +66,10 @@ const (
 	// CarrierShadowWaitUnbound: a stream failed on a SUSPECT carrier. The
 	// flow is unbound until its carrier recovers or is replaced.
 	CarrierShadowWaitUnbound
+	// CarrierShadowAwaitClient: gateway evidence the design answers only by
+	// waiting, within the replacement grace, for the client's JOIN: a
+	// gateway never dials or rebinds (§10.1).
+	CarrierShadowAwaitClient
 	// CarrierShadowCarrierClosed: an application on either end had already
 	// closed the carrier, so the event is that decision's consequence, not
 	// evidence about the path.
@@ -74,7 +78,7 @@ const (
 	CarrierShadowRemedies
 )
 
-var carrierShadowRemedyNames = [CarrierShadowRemedies]string{"replace_carrier", "rebind_stream", "wait_move_coded", "wait", "untracked", "dial_standby", "wait_unbound", "carrier_closed"}
+var carrierShadowRemedyNames = [CarrierShadowRemedies]string{"replace_carrier", "rebind_stream", "wait_move_coded", "wait", "untracked", "dial_standby", "wait_unbound", "await_client", "carrier_closed"}
 
 func (r CarrierShadowRemedy) String() string {
 	if r < 0 || r >= CarrierShadowRemedies {

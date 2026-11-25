@@ -440,7 +440,8 @@ func (o *carrierShadow) run() {
 			batch = append(batch, c)
 		}
 		o.mu.Unlock()
-		for _, c := range batch {
+		for i, c := range batch {
+			batch[i] = nil // a retired carrier must not stay reachable from here
 			if obs := o.sample(c); obs.state == metrics.CarrierShadowDead || obs.state == metrics.CarrierShadowClosed {
 				o.mu.Lock()
 				if o.carriers[c.src.carrierKey()] == c {
@@ -572,6 +573,16 @@ func (o *carrierShadow) bindLane(f *multipathFlow, lane *mpLane) {
 // replace the carrier if the carrier is silent, otherwise move coded bytes to
 // the stream and wait.
 func designStallRemedy(obs carrierObservation, coded bool) metrics.CarrierShadowRemedy {
+	return designStallRemedyFor(carrierShadowClient, obs, coded)
+}
+
+// designStallRemedyFor is role-aware: only the client dials or replaces
+// (§10.1), so a gateway's carrier evidence is answered by waiting for the
+// client's JOIN.
+func designStallRemedyFor(role string, obs carrierObservation, coded bool) metrics.CarrierShadowRemedy {
+	if role == carrierShadowGateway && obs.tracked && obs.state != metrics.CarrierShadowActive && obs.state != metrics.CarrierShadowClosed {
+		return metrics.CarrierShadowAwaitClient
+	}
 	switch {
 	case !obs.tracked:
 		return metrics.CarrierShadowUntracked
@@ -591,6 +602,15 @@ func designStallRemedy(obs carrierObservation, coded bool) metrics.CarrierShadow
 // designLaneFailureRemedy is what §10.4 does about a stream that failed
 // definitively: rebind it on its live carrier, or replace a silent carrier.
 func designLaneFailureRemedy(obs carrierObservation) metrics.CarrierShadowRemedy {
+	return designLaneFailureRemedyFor(carrierShadowClient, obs)
+}
+
+// designLaneFailureRemedyFor is role-aware: a gateway whose stream fails puts
+// the flow in its replacement grace and waits for the client (§10.4).
+func designLaneFailureRemedyFor(role string, obs carrierObservation) metrics.CarrierShadowRemedy {
+	if role == carrierShadowGateway && obs.tracked && obs.state != metrics.CarrierShadowClosed {
+		return metrics.CarrierShadowAwaitClient
+	}
 	switch {
 	case !obs.tracked:
 		return metrics.CarrierShadowUntracked
@@ -628,7 +648,7 @@ func (o *carrierShadow) noteStall(f *multipathFlow, lane *mpLane, pendingSince t
 		return
 	}
 	obs := o.observeLane(lane)
-	remedy := designStallRemedy(obs, coded)
+	remedy := designStallRemedyFor(o.role, obs, coded)
 	// The transport counts as acknowledging when it acknowledged an eliciting
 	// packet within the window the watchdog used to declare the flow silent,
 	// or has nothing unacknowledged at all (a flow blocked on credit sends
@@ -661,7 +681,7 @@ func (o *carrierShadow) noteLaneFailure(f *multipathFlow, lane *mpLane, err erro
 	if o == nil {
 		return
 	}
-	remedy := designLaneFailureRemedy(obs)
+	remedy := designLaneFailureRemedyFor(o.role, obs)
 	o.metrics.CarrierShadowLaneFailure(remedy)
 	o.logger.Info("carrier shadow lane failed", append(o.flowFields(f),
 		"lane_id", lane.id, "carrier_id", obs.id, "carrier_state", carrierStateLabel(obs),
