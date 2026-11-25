@@ -144,16 +144,32 @@ def covered(fg: Tuple[float, float], bg_rows: Sequence[dict]) -> bool:
 
 
 def fg_span(records: Sequence[dict]) -> Optional[Tuple[float, float]]:
+    """The foreground's wall-clock span: each record's t0 to its real end
+    (t1), connection setup and failed calls included."""
     ends = []
     for r in records:
         t0 = r.get("t0")
         if t0 is None:
+            continue
+        if r.get("t1") is not None:
+            ends.append((t0, float(r["t1"])))
             continue
         dur = r.get("done") or (r["keys"][-1][0] + r["keys"][-1][1] if r.get("keys") else 0)
         ends.append((t0, t0 + float(dur or 0)))
     if not ends:
         return None
     return min(a for a, _ in ends), max(b for _, b in ends)
+
+
+def covered_each(fg: Tuple[float, float], bg_rows: Sequence[dict], flows: int) -> bool:
+    """Every one of the background's `flows` flows was transferring across
+    the foreground: per flow, its rows that moved bytes must cover it. One
+    surviving download of four is not a four-download background."""
+    by_flow: Dict[str, List[dict]] = {}
+    for r in bg_rows:
+        if int(r.get("bytes") or 0) > 0:
+            by_flow.setdefault(r["flow"].split("o", 1)[0], []).append(r)
+    return len(by_flow) >= flows and all(covered(fg, rs) for rs in by_flow.values())
 
 
 def useful_bg(rows: Sequence[dict]) -> float:
@@ -282,12 +298,22 @@ class _Scenario(w.Workload):
         for ph in phases:
             recs = [rec for t in trials for rec in getattr(t, "records", []) if rec.get("_phase") == ph]
             rows = [r for t in trials for r in t.rows if r["phase"] == ph]
-            for k, v in self.phase_measures(ph, recs, rows, trials).items():
+            m = self.phase_measures(ph, recs, rows, trials)
+            # Before pooling: every trial must carry this phase's evidence, or
+            # one trial's records would stand in for the block.
+            if not all(self.has_evidence(ph, [x for x in getattr(t, "records", []) if x.get("_phase") == ph])
+                       for t in trials):
+                m = {k: float("nan") for k in m}
+            for k, v in m.items():
                 out[f"{ph}.{k}"] = v
         return out
 
     def extract(self, trial, plan):
         return self.block_extract([trial], plan)
+
+    def has_evidence(self, ph: str, recs: List[dict]) -> bool:
+        """The raw records one trial must have for phase ph."""
+        return True
 
     def under_background(self, ph: str, recs: List[dict], rows: List[dict], trials: Sequence[Any]) -> bool:
         """For a phase with a background: did it run across the foreground
@@ -299,7 +325,8 @@ class _Scenario(w.Workload):
                      and not x.get("canary")]
             span = fg_span(trecs)
             bg = [r for r in t.rows if r["phase"] == ph and r["kind"] in ("wl-bgdown", "wl-bgup")]
-            if span is None or not covered(span, bg):
+            flows = 4 if ph.endswith("down4") or ph.startswith("m1") else 1
+            if span is None or not covered_each(span, bg, flows):
                 return False
         return True
 
@@ -339,6 +366,9 @@ class LLM(_Scenario):
                     out.append(w.Phase(f"{seq}-{kb}k-{bg}", cfg.scenario_phase_seconds, jobs))
         return out
 
+    def has_evidence(self, ph, recs):
+        return any(r.get("kind") == "llm" for r in recs)
+
     def phase_measures(self, ph, recs, rows, trials):
         m = llm_metrics([r for r in recs if r.get("kind") == "llm"])
         if not self.under_background(ph, recs, rows, trials):
@@ -368,6 +398,9 @@ class Term(_Scenario):
             out.append(w.Phase(f"term-{bg}", max(cfg.scenario_phase_seconds, cfg.term["seconds"] + 30),
                                self.background(cfg, client, bg) + [w.Job(client, "wl-term", 1, params=params)]))
         return out
+
+    def has_evidence(self, ph, recs):
+        return any(r.get("kind") == "term" and not r.get("canary") for r in recs)
 
     def phase_measures(self, ph, recs, rows, trials):
         m = term_metrics([r for r in recs if r.get("kind") == "term"])
@@ -404,6 +437,9 @@ class Mixed(_Scenario):
                                    + [w.Job(client, "wl-term", 1, load=False, params=canary),
                                       w.Job(client, "wl-llm", 1, params=call)]))
         return out
+
+    def has_evidence(self, ph, recs):
+        return any(r.get("kind") == "llm" for r in recs) and any(r.get("kind") == "term" and r.get("canary") for r in recs)
 
     def phase_measures(self, ph, recs, rows, trials):
         m = llm_metrics([r for r in recs if r.get("kind") == "llm"])

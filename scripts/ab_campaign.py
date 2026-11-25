@@ -758,6 +758,7 @@ class Campaign:
         self.production_changed = False
         self.measures_path = None if dry else os.path.join(self.out, "measures.jsonl")
         self.job_seq = 0
+        self.job_failures: List[dict] = []
         self.token = "dry-run-token" if dry else os.urandom(16).hex()
         self.started = False
 
@@ -1144,7 +1145,12 @@ rm -f "$f"''', what=f"stop {tag}")
         W = self.w(host)
         self.job_seq += 1
         f = f"{W}/run/job-{self.job_seq}.pgid"
-        return (f"set -m\n(\n{script}\n) &\nj=$!\necho $j > {f}\nwait $j\nrc=$?\nrm -f {f}\nexit $rc")
+        # The descriptor holds the group leader's pid and start time; teardown
+        # signals the group only if a process with that pid and that start
+        # time still leads it, so a reused pid is never signalled.
+        return (f"set -m\n(\n{script}\n) &\nj=$!\n"
+                f"echo \"$j $(ps -o lstart= -p $j | tr -s ' ' | sed 's/^ //;s/ $//')\" > {f}\n"
+                f"wait $j\nrc=$?\nrm -f {f}\nexit $rc")
 
     def pause(self, seconds: float) -> None:
         if not self.dry:
@@ -1196,6 +1202,13 @@ rm -f "$f"''', what=f"stop {tag}")
             return
         for i, (job, gen) in enumerate(zip(phase.jobs, gens)):
             t0, t1, rc, out = results[i]
+            if rc != 0:
+                # The generator did not run to its end (ssh dropped, timed out,
+                # crashed): a harness failure, not the arm's. Its block gets no
+                # verdict; its rows are still written for diagnosis.
+                self.job_failures.append({"block": slot.block, "path": slot.path, "slot": slot.slot, "arm": arm.name,
+                                          "phase": phase.name, "client": job.client.name, "kind": job.kind, "exit": rc})
+                self.log(f"job {job.kind} on {job.client.name} ({phase.name}) exited {rc}: its block will have no verdict")
             want = gen.expected(job)
             # A generator's raw records ("J<TAB>{json}" lines) go to
             # measures.jsonl, keyed to the trial and phase, for the workload's
@@ -1324,16 +1337,19 @@ rm -f "$f"''', what=f"stop {tag}")
                 h.run(self.owned(host) + f'''[ -d {W}/run ] || exit 0
 # Jobs first: each ran in its own process group (as_job), so the group takes
 # its curls and clients with it.
+# A descriptor is "pgid start-time"; act only if that very process still
+# leads its group, else report the descriptor as stale and leave it alone.
+ours() {{ read -r g st < "$1"; [ -n "$g" ] || return 1
+  [ "$(ps -o pgid= -p "$g" 2>/dev/null | tr -d ' ')" = "$g" ] || return 1
+  [ "$(ps -o lstart= -p "$g" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')" = "$st" ]; }}
 for f in {W}/run/job-*.pgid; do
   [ -f "$f" ] || continue
-  g=$(cat "$f")
-  [ "$(ps -o pgid= -p "$g" 2>/dev/null | tr -d ' ')" = "$g" ] && kill -TERM -- -"$g" 2>/dev/null
+  if ours "$f"; then read -r g st < "$f"; kill -TERM -- -"$g" 2>/dev/null; else echo "stale job descriptor $f left alone"; fi
 done
 sleep 1
 for f in {W}/run/job-*.pgid; do
   [ -f "$f" ] || continue
-  g=$(cat "$f")
-  [ "$(ps -o pgid= -p "$g" 2>/dev/null | tr -d ' ')" = "$g" ] && kill -KILL -- -"$g" 2>/dev/null
+  ours "$f" && {{ read -r g st < "$f"; kill -KILL -- -"$g" 2>/dev/null; }}
   rm -f "$f"
 done
 # Only the processes this campaign spawned (its pid files), each checked to
@@ -1489,7 +1505,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             with open(os.path.join(self.out, "status.json"), "w") as f:
                 json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
                            "production": production, "teardown_leftovers": leftovers, "cleanup_failures": clean_failures,
-                           "fetch_failures": self.fetch_failures, "finished_utc": utc(time.time())}, f, indent=2)
+                           "fetch_failures": self.fetch_failures, "job_failures": self.job_failures,
+                           "finished_utc": utc(time.time())}, f, indent=2)
         return status
 
     def verify_teardown(self) -> List[str]:

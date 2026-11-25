@@ -98,6 +98,17 @@ class Coverage(unittest.TestCase):
     def rows(self, spans):
         return [{"t_start": f"{a:.3f}", "t_end": f"{b:.3f}"} for a, b in spans]
 
+    def test_every_background_flow_must_span_the_foreground(self):
+        rows = lambda flow, a, b, n=1000: {"flow": flow, "t_start": f"{a:.3f}", "t_end": f"{b:.3f}", "bytes": str(n)}
+        four = [rows(f"b{i}o1", 5, 70) for i in range(1, 5)]
+        self.assertTrue(pa.covered_each((10, 60), four, 4))
+        # Three downloads failed at once (no bytes); one alone covers.
+        one = [rows("b1o1", 5, 70)] + [rows(f"b{i}o1", 5, 70, 0) for i in range(2, 5)]
+        self.assertFalse(pa.covered_each((10, 60), one, 4))
+
+    def test_the_foreground_span_uses_its_real_end(self):
+        self.assertEqual(pa.fg_span([{"t0": 100.0, "t1": 112.5, "done": 10.0}]), (100.0, 112.5))
+
     def test_a_background_must_span_the_foreground(self):
         self.assertTrue(pa.covered((10, 60), self.rows([(5, 30), (30.2, 70)])))   # back-to-back objects
         self.assertFalse(pa.covered((10, 60), self.rows([(5, 20)])))              # died early
@@ -281,6 +292,17 @@ class Report(unittest.TestCase):
         self.assertEqual(v[("a", "cand", "rule:single-100k-none.lateness_p99_s")], "**FAIL**")
         self.assertEqual(v[("a", "cand", "overall")], "FAIL")
 
+    def test_a_trial_without_its_records_leaves_the_cell_unmeasured(self):
+        # One trial of block 3 lost its raw records: the other trial's must
+        # not stand in for the block.
+        root = os.path.join(self.tmp.name, "lost")
+        write_llm_campaign(root)
+        recs = [json.loads(l) for l in pathlib.Path(root, "measures.jsonl").read_text().splitlines()]
+        recs = [r for r in recs if not (r["_block"] == 3 and r["_slot"] == 2 and r["_phase"] == "single-100k-none")]
+        pathlib.Path(root, "measures.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
+        _, v = an.report(root, self.without_class_rule())
+        self.assertEqual(v[("a", "cand", "rule:single-100k-none.lateness_p99_s")], "n/a")
+
     def test_a_background_that_died_leaves_its_cell_unmeasured(self):
         root = os.path.join(self.tmp.name, "bgdied")
         write_llm_campaign(root, bg_dies=True)
@@ -319,6 +341,32 @@ class Flip(unittest.TestCase):
             text, ok = an.flip_report([late], self.gates)
             self.assertFalse(ok)
             self.assertIn("| llm | a | cand | single-100k-none | **FAIL** |", text)
+            # Every workload on every path, and one release across campaigns.
+            other = os.path.join(self.tmp.name, "otherpath")
+            write_llm_campaign(other)
+            plan = json.loads(pathlib.Path(other, "plan.json").read_text())
+            plan["paths"] = ["b"]
+            for sl in plan["schedule"]:
+                sl["path"] = "b"
+            pathlib.Path(other, "plan.json").write_text(json.dumps(plan))
+            tsv = pathlib.Path(other, "trials.tsv").read_text().splitlines()
+            pathlib.Path(other, "trials.tsv").write_text("\n".join(
+                [tsv[0]] + ["\t".join(f[:1] + ["b"] + f[2:]) for f in (l.split("\t") for l in tsv[1:])]) + "\n")
+            recs = [json.loads(l) for l in pathlib.Path(other, "measures.jsonl").read_text().splitlines()]
+            pathlib.Path(other, "measures.jsonl").write_text("".join(json.dumps(dict(r, _path="b")) + "\n" for r in recs))
+            with mock.patch.object(an, "FLIP_WORKLOADS", ("llm", "bulk")):
+                bulk = os.path.join(self.tmp.name, "bulkonly")
+                write_llm_campaign(bulk)
+                bplan = json.loads(pathlib.Path(bulk, "plan.json").read_text())
+                bplan["workload"] = "bulk"
+                bplan["arms"]["cand"]["commit"] = "f" * 40
+                pathlib.Path(bulk, "plan.json").write_text(json.dumps(bplan))
+                text, ok = an.flip_report([good, bulk], self.gates)
+                self.assertFalse(ok)
+                self.assertIn("arm `cand` is a different build", text)
+            text, ok = an.flip_report([good, other], self.gates)
+            self.assertIn("| llm | b | cand |", text)
+            self.assertTrue(ok, text)   # llm on both paths
             with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(an, "load_gates", return_value=self.gates):
                 self.assertEqual(an.main([late, "--flip"]), 1)
                 self.assertEqual(an.main([good, "--flip"]), 0)
@@ -460,6 +508,46 @@ class EndToEnd(unittest.TestCase):
         self.assertGreater(len(s["keys"]), 30)
         m = pa.term_metrics(recs)
         self.assertLess(m["echo_p99_a_s"], 0.5)
+
+    def test_turns_the_phase_did_not_reach_are_failed_calls(self):
+        self.start(tls=False)
+        recs, rows = self.client("llm", "--target", f"127.0.0.1:{self.http}", "--sequence", "loop", "--turns", "4",
+                                 "--upload", "1000", "--think-ms", "600", "--deltas", "5", "--cadence-ms", "10",
+                                 "--turn-gap", "0.1", "--duration", "1", tls=False)
+        self.assertEqual(len(recs), 4)
+        skipped = [r for r in recs if r["fail"].startswith("not run")]
+        self.assertTrue(skipped)
+        self.assertGreater(pa.llm_metrics(recs)["call_failures"], 0)
+
+    def test_unanswered_keystrokes_are_censored_not_dropped(self):
+        self.start(tls=False)
+        # A listener that accepts and never echoes.
+        mute = socket.socket()
+        mute.bind(("127.0.0.1", 0))
+        mute.listen(4)
+        held = []
+        threading.Thread(target=lambda: held.append(mute.accept()), daemon=True).start()
+        recs, _ = self.client("term", "--target", f"127.0.0.1:{mute.getsockname()[1]}", "--duration", "1",
+                              "--canary", "--mean-gap", "0.05", "--floor", "0.02", "--timeout", "5", tls=False)
+        mute.close()
+        s = recs[0]
+        self.assertGreater(s["unanswered"], 5)
+        self.assertEqual(len(s["keys"]), s["unanswered"])
+        self.assertGreater(pa.term_metrics(recs)["echo_p99_a_s"], 1.9)
+
+    def test_a_stalled_tls_handshake_does_not_block_others(self):
+        if not shutil.which("openssl"):
+            self.skipTest("openssl not available")
+        self.start(tls=True)
+        stall = socket.create_connection(("127.0.0.1", self.http))    # connects, never handshakes
+        try:
+            t0 = time.time()
+            recs, _ = self.client("llm", "--target", f"127.0.0.1:{self.http}", "--calls", "1", "--upload", "1000",
+                                  "--think-ms", "10", "--deltas", "3", "--cadence-ms", "10", tls=True)
+            self.assertEqual(recs[0]["fail"], "")
+            self.assertLess(time.time() - t0, 10)
+        finally:
+            stall.close()
 
     def test_backgrounds_stop_on_the_stop_file(self):
         self.start(tls=False)

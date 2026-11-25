@@ -59,7 +59,7 @@ def socks_connect(socks: str, target: str, timeout: float) -> socket.socket:
     s = socket.create_connection((sh, int(sp)), timeout=timeout)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     s.sendall(b"\x05\x01\x00")
-    if s.recv(2) != b"\x05\x00":
+    if _exact(s, 2) != b"\x05\x00":
         raise OSError("socks: no acceptable auth method")
     addr = th.encode()
     s.sendall(b"\x05\x01\x00\x03" + bytes([len(addr)]) + addr + struct.pack(">H", int(tp)))
@@ -178,12 +178,17 @@ def llm_agent(args, agent: int, t_origin: float) -> None:
     n = args.turns if loop else args.calls
     sock = reader = None
     for k in range(n):
-        if stopped(args) or time.time() > args.deadline:
-            break
         upload = args.upload + (k * args.growth if loop else 0)
         t0 = time.time()
         rec = {"kind": "llm", "seq": args.sequence, "agent": agent, "turn": k, "U": upload, "t0": round(t0, 3),
                "T": args.think_ms / 1000.0, "N": args.deltas, "c": args.cadence_ms / 1000.0, "fail": ""}
+        if stopped(args) or time.time() > args.deadline:
+            # A call the schedule did not reach is a failed call, so an arm
+            # that finishes one of five is not scored like one that finishes all.
+            rec.update(fail="not run: the phase ended first", t1=round(t0, 3))
+            record(rec)
+            row(t0, t0, f"c{agent}t{k}", 0, 0, 0.0, 1)
+            continue
         cold = sock is None
         try:
             if cold:
@@ -201,6 +206,7 @@ def llm_agent(args, agent: int, t_origin: float) -> None:
             rec["fail"] = f"{type(e).__name__}: {e}"[:200]
             ok = False
         t1 = time.time()
+        rec["t1"] = round(t1, 3)        # the call's real wall-clock end, for background coverage
         record(rec)
         row(t0, t1, f"c{agent}t{k}", 200 if ok else 0, rec.get("bytes", 0), t1 - t0, 0 if ok else 1)
         if not ok or not loop:
@@ -295,13 +301,20 @@ def cmd_term(args) -> None:
         time.sleep(max(args.floor, rng.expovariate(1.0 / args.mean_gap)))
     time.sleep(min(2.0, args.timeout))         # let the last echoes arrive
     done.set()
-    rec["unanswered"] = len(pending)
+    # A keystroke whose echo never came is censored at the time waited, not
+    # dropped: dropping it would leave the slowest keys out of p99.
+    end = time.monotonic() - c0
+    with LOCK:
+        for sent in pending.values():
+            rec["keys"].append([round(sent, 6), round(end - sent, 6)])
+        rec["unanswered"] = len(pending)
     rec["fail"] = fail[0] if fail else ""
     try:
         sock.close()
     except OSError:
         pass
     t1 = time.time()
+    rec["t1"] = round(t1, 3)
     record(rec)
     row(t0, t1, "k0", 0 if rec["fail"] else 200, len(rec["keys"]), t1 - t0, 1 if rec["fail"] else 0)
 

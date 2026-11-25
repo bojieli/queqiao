@@ -80,7 +80,21 @@ def read_headers(f) -> tuple:
     return method, target, headers
 
 
+def handshake(handler) -> None:
+    """TLS in the connection's own thread, bounded: a slow handshake must not
+    stall the accept loop and every connection behind it."""
+    ctx = handler.server.context
+    if ctx:
+        handler.request.settimeout(15)
+        handler.request = ctx.wrap_socket(handler.request, server_side=True)
+        handler.request.settimeout(None)
+
+
 class HTTP(socketserver.StreamRequestHandler):
+    def setup(self):
+        handshake(self)
+        super().setup()
+
     def handle(self):
         self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         while True:
@@ -140,6 +154,9 @@ def read_exact(sock, n: int) -> bytes:
 
 
 class Term(socketserver.BaseRequestHandler):
+    def setup(self):
+        handshake(self)
+
     def handle(self):
         s = self.request
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -170,11 +187,8 @@ class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.context = context
         super().__init__(addr, handler)
 
-    def get_request(self):
-        sock, addr = super().get_request()
-        if self.context:
-            sock = self.context.wrap_socket(sock, server_side=True)
-        return sock, addr
+    def handle_error(self, request, client_address):
+        pass  # a failed handshake or a dropped client is the client's to record
 
 
 def prefer_tls13(ctx: ssl.SSLContext) -> None:

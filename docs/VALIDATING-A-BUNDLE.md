@@ -87,7 +87,12 @@ built to refuse rather than to trust:
 - **Jobs run in their own process groups.** Each trial job (curl, a load
   generator) runs in a process group recorded under `run/`, so teardown stops
   the job and everything it started, even when the runner was interrupted
-  while the job's ssh session was still open.
+  while the job's ssh session was still open. The record holds the group
+  leader's pid and start time. A group is signalled only if that same
+  process still leads it; otherwise the record is reported as stale and left
+  alone. A job that does not run to its end (ssh dropped, timed out, the
+  generator crashed) is a harness failure, not the arm's, and its block gets
+  no verdict.
 - **Teardown always runs**, on success, on error, and on SIGINT or SIGTERM.
   It stops every temporary process, checks that no planned port is still
   listening, and removes the work directory (pass `--keep-remote` to keep it).
@@ -465,7 +470,10 @@ one release. Its gate is Gate 1 run on the release candidate:
 The flip passes only if every path × workload × cell of every candidate is
 PASS. INCOMPLETE is not PASS. `ab_analyze.py --flip` judges a set of
 campaign directories, prints that matrix, and exits non-zero unless it
-passes. It also fails if a required workload has no campaign:
+passes. It also fails in three other cases: a required workload has no
+campaign; a workload is missing on a path that another campaign measured;
+or the campaigns did not all test the same reference and candidate builds,
+in which case they are not one release:
 
 ```sh
 ./scripts/ab_analyze.py --flip ~/campaigns/rc-bulk ~/campaigns/rc-single ~/campaigns/rc-interactive \
@@ -506,8 +514,13 @@ How these campaigns run:
   is `(r_i − s_i) − min_j (r_j − s_j)` per call, so the unknown clock offset
   cancels.
 - **Backgrounds.** A background starts 5 s before the foreground and stops
-  when it ends. It must have run across at least 90% of the foreground's
-  span in every trial; otherwise that cell is unmeasured.
+  when it ends. Every one of its flows (four downloads, or one upload) must
+  have moved bytes across at least 90% of the foreground's real span, in
+  every trial. Otherwise that cell is unmeasured.
+- **Evidence per trial.** Each trial must have its own records for a cell
+  before the trials are pooled. A call the phase never reached counts as a
+  failed call, and a keystroke whose echo never came is counted at the time
+  waited, not dropped.
 - **Pooling.** An arm's per-block statistic pools its two trials' raw
   samples before taking quantiles.
 - **Provisional bounds.** Every bound comes from the workload model and is

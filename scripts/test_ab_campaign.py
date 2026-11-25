@@ -740,12 +740,25 @@ class LocalProcesses(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertTrue(files)
-        pgid = int(files[0].read_text())
+        pgid = int(files[0].read_text().split()[0])
         self.camp.teardown()
         self.assertTrue(done.wait(10), "the job's shell did not end")
         out = subprocess.run(["ps", "-o", "pid=", "-g", str(pgid)], capture_output=True, text=True).stdout.strip()
         self.assertEqual(out, "")
         self.assertEqual(list(pathlib.Path(self.W, "run").glob("job-*.pgid")), [])
+
+    def test_a_stale_job_descriptor_is_not_signalled(self):
+        # The pid in a left-over descriptor now belongs to another process
+        # (a different start time): teardown must leave it alone.
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        self.procs.append(other)
+        # Its identity cannot be confirmed: a bare pid (the old format, or a
+        # truncated write) and, separately, a start time that does not match.
+        pathlib.Path(self.W, "run", "job-8.pgid").write_text(f"{other.pid}\n")
+        pathlib.Path(self.W, "run", "job-9.pgid").write_text(f"{other.pid} Thu Jan  1 00:00:00 1970\n")
+        self.camp.teardown()
+        time.sleep(0.3)
+        self.assertTrue(self.alive(other.pid))
 
     def test_teardown_leftovers_are_reported(self):
         snap = {"local": ab.parse_snapshot("listen-ok\nps-ok\nlisten udp 23471\nleftover 99 " + self.W + "/gw-main/queqiaod server\n")}

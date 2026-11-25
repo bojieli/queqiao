@@ -330,6 +330,7 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
     verdict becomes INCOMPLETE.
     """
     problems: List[str] = []
+    failed_jobs: List[dict] = []
     try:
         with open(os.path.join(campaign, "status.json")) as f:
             status = json.load(f)
@@ -343,6 +344,7 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
         if status.get("fetch_failures"):
             problems.append(f"{len(status['fetch_failures'])} log file(s) could not be fetched; the log-derived "
                             "measures of the affected trials are withheld")
+        failed_jobs = status.get("job_failures") or []
     planned: Dict[Tuple[int, str], set] = collections.defaultdict(set)
     for sl in plan.get("schedule", []):
         planned[(sl["block"], sl["path"])].add(sl["slot"])
@@ -351,6 +353,13 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
         if slot < 100:
             have[(b, p)].add(slot)
     bad = sorted(k for k, slots in planned.items() if not slots <= have.get(k, set()))
+    # A block in which a generator did not run to its end has harness
+    # evidence, not the arm's: left out like a missing trial.
+    broken = sorted({(j["block"], j["path"]) for j in failed_jobs})
+    if broken:
+        problems.append(f"{len(broken)} block(s) had a job that did not run to its end "
+                        f"(first: block {broken[0][0]} on {broken[0][1]}); they are left out")
+        bad = sorted(set(bad) | set(broken))
     if bad:
         problems.append(f"{len(bad)} of {len(planned)} planned blocks are missing trials "
                         f"(first: block {bad[0][0]} on {bad[0][1]}); they are left out")
@@ -952,11 +961,29 @@ def flip_report(campaigns: Sequence[str], gates: dict) -> Tuple[str, bool]:
     candidate must PASS, and every required workload must be there."""
     rows: List[Tuple[str, str, str, str, str]] = []
     seen = set()
+    mismatch: List[str] = []
+    builds: Dict[str, Tuple[str, str]] = {}
+    paths_of: Dict[str, set] = collections.defaultdict(set)
+
+    def build(e: dict) -> Tuple[str, str]:
+        g = e.get("gateway_commit") or e.get("commit") or e.get("gateway_ref") or e.get("ref") or ""
+        c = e.get("client_commit") or e.get("commit") or e.get("client_ref") or e.get("ref") or ""
+        return g, c
+
     for campaign in campaigns:
         with open(os.path.join(campaign, "plan.json")) as f:
             plan = json.load(f)
         name = plan.get("workload", "bulk")
         seen.add(name)
+        # One release: the same reference and candidate builds, by arm name,
+        # in every campaign.
+        for arm, e in plan["arms"].items():
+            b = build(e)
+            if arm in builds and builds[arm] != b:
+                mismatch.append(f"arm `{arm}` is a different build in {os.path.basename(os.path.normpath(campaign))}")
+            builds.setdefault(arm, b)
+        if name != "dc":
+            paths_of[name] |= set(plan["paths"])
         if name == "dc":
             import dc_gate
             _, v = dc_gate.evaluate(campaign, dc_gate.load_bounds())
@@ -970,13 +997,20 @@ def flip_report(campaigns: Sequence[str], gates: dict) -> Tuple[str, bool]:
                 for cell, verdict in sorted(cell_verdicts(v, path, cand).items()):
                     rows.append((name, path, cand, cell, verdict))
     missing = [w_ for w_ in FLIP_WORKLOADS if w_ not in seen]
-    ok = bool(rows) and not missing and all(r[4] == "PASS" for r in rows)
+    # Every workload on every path any campaign measured.
+    all_paths = set().union(*paths_of.values()) if paths_of else set()
+    for name, ps in sorted(paths_of.items()):
+        for p_ in sorted(all_paths - ps):
+            missing.append(f"{name} on {p_}")
+    ok = bool(rows) and not missing and not mismatch and all(r[4] == "PASS" for r in rows)
     out = ["## Stage-10 default flip", "",
            "Every path x workload x cell of every candidate must PASS (DESIGN-PATH-AUTHORITY.md section 14, stage 10; "
            "WORKLOADS.md 6).", "", "| workload | path | candidate | cell | verdict |", "|---|---|---|---|---|"]
     out += [f"| {w_} | {p_} | {c_} | {cell} | {v_ if v_ == 'PASS' else '**' + v_ + '**'} |" for w_, p_, c_, cell, v_ in rows]
     if missing:
         out += ["", "Missing workloads: " + ", ".join(f"`{m}`" for m in missing) + "."]
+    if mismatch:
+        out += ["", "Not one release: " + "; ".join(mismatch) + "."]
     out += ["", f"**Flip: {'PASS' if ok else 'NOT PASSED'}.**"]
     return "\n".join(out) + "\n", ok
 
