@@ -105,6 +105,12 @@ def metrics(campaign: str, name: str) -> Dict[str, float]:
     return out
 
 
+def useful(row: dict) -> int:
+    """Bytes of the requested object: an HTTP 200 body, whole or partial.
+    An error page is bytes on the wire, not useful bytes."""
+    return int(row["bytes"] or 0) if row.get("http") == "200" else 0
+
+
 class Trial:
     def __init__(self, block: int, path: str, slot: int, arm: str, role: str, arm_trial: int, cold: bool):
         self.block, self.path, self.slot, self.arm, self.role = block, path, slot, arm, role
@@ -122,7 +128,7 @@ class Trial:
         return [r for r in self.rows if r["kind"] == "bulk"]
 
     def useful_bytes(self) -> int:
-        return sum(int(r["bytes"] or 0) for r in self.bulk())
+        return sum(useful(r) for r in self.bulk())
 
 
 def read_campaign(campaign: str) -> Tuple[dict, Dict[Tuple[int, str, int], Trial]]:
@@ -319,7 +325,11 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         t.m["loss"] = d("queqiao_quic_loss_observed_packets_total") / sent if sent and sent == sent else float("nan")
         t.m["stalls_per_trial"] = d("queqiao_flow_stalls_detected_total")
         wire = d("queqiao_quic_bytes_sent")
-        t.m["tcp_fallbacks"] = d("queqiao_fallbacks_total")
+        # TCP fallback is counted on the client, not the gateway.
+        cpre = [metrics(campaign, f"{t.tag}-s{t.slot}-{t.arm}-pre-client-{c}") for c in [t.path]]
+        cpost = [metrics(campaign, f"{t.tag}-s{t.slot}-{t.arm}-post-client-{c}") for c in [t.path]]
+        t.m["tcp_fallbacks"] = sum(b.get("queqiao_fallbacks_total", float("nan")) - a.get("queqiao_fallbacks_total", float("nan"))
+                                   for a, b in zip(cpre, cpost))
         # QUIC bytes only: a trial that moved data over TCP fallback has no
         # comparable wire count, so it is not measured rather than flattered.
         t.m["wire_per_useful"] = (wire / useful if useful and t.m["tcp_fallbacks"] == 0 else float("nan"))
@@ -593,6 +603,8 @@ def pilot_report(campaign: str, gates: dict) -> Tuple[str, dict]:
                                         true_ratio=gates["true_ratio"])
             except ValueError:
                 n = None
+            except OverflowError:
+                n = "more than 100000: the paths' variance is too large for this gate"
             res[(path, cand)] = n
             note = "" if len(common) >= gates["pilot_blocks"] else f" (pilot has fewer than {gates['pilot_blocks']} blocks)"
             out.append(f"| {path} | {cand} | {len(common)} | {fmt(em / 1e6, '.1f')} | {fmt(sd / 1e6, '.2f')} | "

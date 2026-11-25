@@ -26,7 +26,7 @@ def iso(t):
 
 
 def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blocks=12, seed=3,
-             cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False):
+             cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False, no_solo=()):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -73,6 +73,8 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
                                                           200, 307200, f"{ctl:.4f}", 0, 1, 60])
             t += 80
         for j, leaf in enumerate(LOADED):
+            if (b, leaf) in no_solo:
+                continue
             for i in (1, 2):
                 rows.append([b, "dc", 100 + j, "legacy", "main", 0, 0, "solo", 0, leaf, "bulk", f"b{i}", iso(t),
                              iso(t + 60), 200, int(level / binding / 2), 60, 28, 0, 60])
@@ -175,6 +177,11 @@ class DCGate(unittest.TestCase):
         text, v = dc.evaluate(root, self.bounds)
         self.assertIn("sum of solo rates, mean over 12 blocks): 0.33", text)
         self.assertNotEqual(v["cand"], "VOID")
+
+    def test_every_judged_block_needs_its_own_calibration(self):
+        text, v = self.run_gate("uncal", no_solo=((7, "lb"),))
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("lack a usable solo calibration of every loaded leaf (first: block 7)", text)
 
     def test_unfinished_campaign_gets_no_verdict(self):
         root = os.path.join(self.tmp.name, "unfinished")

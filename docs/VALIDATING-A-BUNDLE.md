@@ -61,8 +61,11 @@ built to refuse rather than to trust:
   - a host's listening ports could not be read (it needs `ss` on Linux and
     `lsof` elsewhere; an empty list is never trusted);
   - a process from an earlier campaign with the same name is still running.
-- **One directory per host.** Everything temporary lives under
-  `~/qq-ab-<name>`. Every process is started from there with a pid file. A
+- **One directory per host, reserved.** Everything temporary lives under
+  `~/qq-ab-<name>`. After the read-only preflight, the runner claims that
+  directory on every host with an atomic `mkdir` and an owner token. A second
+  invocation with the same name is refused, and teardown and cleanup act only
+  on directories whose token is their own. Every process is started from there with a pid file. A
   process is signalled only after its command line has been checked to
   contain that directory, so a stale pid file can never reach a production
   process. Nothing uses `pkill`.
@@ -156,7 +159,8 @@ first trial. On a small host the client is restarted for every trial, but the
 gateway keeps its state, and the gateway is the sender for these downloads.
 
 The outcome per arm per block is the useful bytes delivered within `duration`
-seconds, summed over the arm's two trials and all their flows. A failed flow
+seconds, summed over the arm's two trials and all their flows. Useful bytes
+are HTTP 200 body bytes, whole or partial; an error page counts as zero. A failed flow
 counts what it delivered. A flow that printed nothing counts as zero; it is
 not dropped.
 
@@ -172,7 +176,9 @@ campaign, then:
 
 The pilot table gives, per path and candidate, the blocks needed for 80%
 power when the true ratio is 1, using the pilot's contrast variance and its
-mean main outcome. Freeze the largest number as `blocks`. Do not reuse the
+mean main outcome. If no block count up to 100,000 reaches that power, the
+table says so instead of printing a number. Freeze the largest number as
+`blocks`. Do not reuse the
 pilot's blocks, and change the campaign `name` so the new campaign gets its
 own directory.
 
@@ -245,7 +251,9 @@ A secondary is judged only when it was measured in both arms in every block
 the primary gate judged (`secondary_min_coverage`). A block counts as
 measured only if every trial in it has the measure. A trial in which any flow
 fell back to TCP has no QUIC-only wire count, so it leaves wire cost
-unmeasured rather than flattering it. Sender-side credit delay p95 and the
+unmeasured rather than flattering it. Fallback is read from the client's own
+`/metrics`, which the runner scrapes around every trial, because the client
+is where fallback is counted. Sender-side credit delay p95 and the
 shadow false-promotion rate need the stage 0 instrumentation. They are listed
 as required and reported as not measured, so until that instrumentation
 lands, no campaign reaches an overall PASS.
@@ -293,7 +301,11 @@ and each client host is one leaf under a shared ancestor. The DC campaign
     fetches per loaded leaf, the shape of the profile's own relay
     measurement.
 - **Calibration:** at the end of every block, each loaded leaf runs alone on
-  the legacy arm.
+  the legacy arm. Every judged block needs its own usable calibration of every
+  loaded leaf; otherwise the campaign is INCOMPLETE.
+- **The temporary account** has no device or flow limit of its own, so the
+  gateway's `--max-sessions` is the only admission limit. A campaign then
+  measures the path rather than account admission.
 
 ### The criteria
 

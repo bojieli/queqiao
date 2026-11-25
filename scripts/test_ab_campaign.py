@@ -120,6 +120,7 @@ class DryRun(unittest.TestCase):
         out = io.StringIO()
         camp = ab.Campaign(cfg, "<out>", ".", dry=True, stream=out)
         camp.stop(camp.hosts["gw"], "gw-main")
+        camp.reserve()
         camp.teardown()
         text = out.getvalue()
         self.assertIn('grep -q -F -- "~/qq-ab-t1/"', text)
@@ -345,7 +346,7 @@ class LocalProcesses(unittest.TestCase):
         self.host = self.camp.hosts["local"]
         self.host.home = self.home
         self.W = self.camp.w("local")
-        os.makedirs(os.path.join(self.W, "run"))
+        self.camp.reserve()
         self.procs = []
 
     def tearDown(self):
@@ -401,6 +402,23 @@ class LocalProcesses(unittest.TestCase):
         rc, out = self.host.run(ab.origin_script(self.W, objs))
         self.assertEqual(rc, 0, out)
         self.assertEqual(os.path.getsize(os.path.join(self.W, "origin", "obj-1000")), 1000)
+
+    def test_a_second_invocation_with_the_same_name_is_refused(self):
+        other = ab.Campaign(self.cfg, os.path.join(self.home, "out2"), ".", dry=False, stream=io.StringIO())
+        other.hosts["local"].home = self.home
+        with self.assertRaises(ab.Refused):
+            other.reserve()
+        self.assertTrue(os.path.isdir(self.W))  # the first campaign's directory is untouched
+        # Neither its teardown nor its cleanup touches a directory it does not own.
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", f"{self.W}/marker"])
+        self.procs.append(victim)
+        pathlib.Path(self.W, "run", "v.pid").write_text(str(victim.pid))
+        other.reserved = ["local"]
+        other.teardown()
+        other.clean()
+        time.sleep(0.3)
+        self.assertTrue(self.alive(victim.pid))
+        self.assertTrue(os.path.isdir(self.W))
 
     def test_teardown_leftovers_are_reported(self):
         snap = {"local": ab.parse_snapshot("listen-ok\nlisten udp 23471\nleftover 99 " + self.W + "/gw-main/queqiaod server\n")}

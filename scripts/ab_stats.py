@@ -287,7 +287,9 @@ def blocks_for_power(contrast_sd: float, main_mean: float, ratio: float = 0.90, 
     (true_ratio - ratio) * E[main], not for the pilot's observed contrast).
 
     Uses the standard approximation n >= ((t_{1-a,n-1} + t_{power,n-1}) * sd / delta)^2
-    and returns the smallest n >= 2 that satisfies it.
+    and returns the smallest n >= 2 that satisfies it. Raises OverflowError
+    when no n up to max_blocks does, rather than recommending a campaign
+    known to miss the requested power.
     """
     delta = (true_ratio - ratio) * main_mean
     if not (delta > 0):
@@ -300,7 +302,7 @@ def blocks_for_power(contrast_sd: float, main_mean: float, ratio: float = 0.90, 
         need = (t_quantile(1 - alpha, n - 1) + t_quantile(power, n - 1)) * contrast_sd / delta
         if math.sqrt(n) >= need:
             return n
-    return max_blocks
+    raise OverflowError(f"more than {max_blocks} blocks would be needed")
 
 
 def jain(xs: Sequence[float]) -> float:

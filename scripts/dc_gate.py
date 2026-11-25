@@ -24,7 +24,7 @@ from typing import Dict, List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
-from ab_analyze import PROBE_TIMEOUT, Trial, completeness, fmt, read_campaign  # noqa: E402
+from ab_analyze import PROBE_TIMEOUT, Trial, completeness, fmt, read_campaign, useful  # noqa: E402
 
 BOUNDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "dc_gate.ini")
 
@@ -45,7 +45,7 @@ def leaf_rate(rows: List[dict]) -> float:
     of its flows. A rate, not a byte total, so that objects finishing inside
     the window cannot make a shared bottleneck look unshared."""
     secs = max((float(r["seconds"]) for r in rows), default=0.0)
-    return sum(int(r["bytes"] or 0) for r in rows) / secs if secs > 0 else float("nan")
+    return sum(useful(r) for r in rows) / secs if secs > 0 else float("nan")
 
 
 def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: float) -> Dict[str, float]:
@@ -54,7 +54,7 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     m["sim_rate"] = sum(leaf_rate([r for r in sus if r["client"] == leaf]) for leaf in loaded)
     m["sus_flows"] = len(sus)
     m["sus_finished"] = sum(1 for r in sus if r["complete"] == "1")
-    per_leaf = {leaf: float(sum(int(r["bytes"] or 0) for r in sus if r["client"] == leaf)) for leaf in loaded}
+    per_leaf = {leaf: float(sum(useful(r) for r in sus if r["client"] == leaf)) for leaf in loaded}
     m["aggregate_bytes"] = sum(per_leaf.values())
     m["worst_leaf_bytes"] = min(per_leaf.values()) if per_leaf else float("nan")
     m["jain"] = st.jain(list(per_leaf.values()))
@@ -108,12 +108,26 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
 
     # Validity: did the shared ancestor bind? Legacy's simultaneous rate per
     # block against the sum of the leaves' solo rates in the same block.
+    # Every judged block needs its own calibration: a usable solo rate for
+    # every loaded leaf and a measured simultaneous rate.
     binding: List[float] = []
-    for b in sorted({t.block for t in solo}):
-        solo_rate = sum(leaf_rate([r for r in t.rows if r["kind"] == "bulk"]) for t in solo if t.block == b)
+    uncalibrated: List[int] = []
+    for b in sorted({t.block for t in ab}):
+        rates = {}
+        for t in solo:
+            if t.block == b:
+                leaf = next((r["client"] for r in t.rows), None)
+                rates[leaf] = leaf_rate([r for r in t.rows if r["kind"] == "bulk"])
         sim = [t.m["sim_rate"] for t in ab if t.block == b and t.arm == main]
-        if solo_rate > 0 and sim:
-            binding.append(st.mean(sim) / solo_rate)
+        ok = (set(loaded) <= set(rates) and all(rates[x] == rates[x] and rates[x] > 0 for x in loaded)
+              and sim and all(x == x for x in sim))
+        if not ok:
+            uncalibrated.append(b)
+            continue
+        binding.append(st.mean(sim) / sum(rates[x] for x in loaded))
+    if uncalibrated:
+        problems = problems + [f"{len(uncalibrated)} block(s) lack a usable solo calibration of every loaded leaf "
+                               f"(first: block {uncalibrated[0]})"]
     binding_mean = st.mean(binding)
     bound_ok = binding_mean == binding_mean and binding_mean <= bounds["binding_max"]
     # The sustained outcome is bytes within the window; if the objects ran

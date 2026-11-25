@@ -79,11 +79,14 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
             os.makedirs(md, exist_ok=True)
             with open(os.path.join(md, name + "-pre.txt"), "w") as f:
                 f.write("queqiao_quic_packets_sent 0\nqueqiao_quic_loss_observed_packets_total 0\n"
-                        "queqiao_quic_bytes_sent 0\nqueqiao_flow_stalls_detected_total 5\nqueqiao_fallbacks_total 2\n")
+                        "queqiao_quic_bytes_sent 0\nqueqiao_flow_stalls_detected_total 5\n")
+            with open(os.path.join(md, name + "-pre-client-p.txt"), "w") as f:
+                f.write("queqiao_fallbacks_total 2\n")
+            with open(os.path.join(md, name + "-post-client-p.txt"), "w") as f:
+                f.write(f"queqiao_fallbacks_total {2 + (0 if arm == 'main' else cand_fallbacks)}\n")
             with open(os.path.join(md, name + "-post.txt"), "w") as f:
                 f.write(f"queqiao_quic_packets_sent 1000\nqueqiao_quic_loss_observed_packets_total 100\n"
-                        f"queqiao_quic_bytes_sent {useful * 1.3}\nqueqiao_flow_stalls_detected_total {5 + (3 if arm == 'main' else cand_stalls)}\n"
-                        f"queqiao_fallbacks_total {2 + (0 if arm == 'main' else cand_fallbacks)}\n")
+                        f"queqiao_quic_bytes_sent {useful * 1.3}\nqueqiao_flow_stalls_detected_total {5 + (3 if arm == 'main' else cand_stalls)}\n")
             srv = os.path.join(root, "logs", f"gw-{arm}")
             cli = os.path.join(root, "logs", f"cl-p-{arm}")
             os.makedirs(srv, exist_ok=True)
@@ -223,6 +226,16 @@ class Analyzer(unittest.TestCase):
         self.assertTrue(all(t.m["wire_per_useful"] != t.m["wire_per_useful"] for t in cand))
         _, v = an.report(root, self.measurable)
         self.assertEqual(v[("p", "cand", "wire_per_useful")], "n/a")
+
+    def test_http_error_bodies_are_not_useful_bytes(self):
+        t = an.Trial(1, "p", 1, "main", "main", 1, True)
+        t.rows = [{"kind": "bulk", "http": "200", "bytes": "100"}, {"kind": "bulk", "http": "404", "bytes": "50"},
+                  {"kind": "bulk", "http": "000", "bytes": "0"}]
+        self.assertEqual(t.useful_bytes(), 100)
+
+    def test_power_beyond_the_limit_is_reported_not_capped(self):
+        with self.assertRaises(OverflowError):
+            an.st.blocks_for_power(1e9, 1.0, max_blocks=50)
 
     def test_incomplete_overrides_a_failing_verdict_too(self):
         _, v = an.report(self.campaign("badnostatus", cand_ratio=0.6, status=None), self.gates)

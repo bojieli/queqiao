@@ -676,6 +676,8 @@ class Campaign:
         self.before: Dict[str, dict] = {}
         self.active_small: Dict[str, str] = {}   # host -> running temporary client tag
         self.fetch_failures: List[str] = []
+        self.reserved: List[str] = []
+        self.token = "dry-run-token" if dry else os.urandom(16).hex()
         self.started = False
 
     # paths on a host
@@ -739,10 +741,39 @@ class Campaign:
                   f"a process under ~/{self.cfg.work_dir}/ is already running:", file=self.stream)
             for host, ports in self.cfg.planned_ports().items():
                 print(f"    {host}: " + ", ".join(f"{p} ({w})" for p, w in ports), file=self.stream)
+            self.reserve()
             return
         reasons = refusal_reasons(self.cfg, self.before)
         if reasons:
             raise Refused("\n".join(reasons))
+        self.reserve()
+
+    def reserve(self) -> None:
+        """Claim ~/qq-ab-<name> on every host with an atomic mkdir and an
+        owner token. A second invocation with the same name finds the
+        directory and is refused; teardown and cleanup act only on
+        directories this invocation owns."""
+        for host in self.cfg.hosts():
+            W = self.w(host)
+            rc, out = self.hosts[host].run(f"mkdir {W} || exit 3\nmkdir {W}/run && printf %s {self.token} > {W}/.owner",
+                                           what="reserve the work directory")
+            if rc != 0 and not self.dry:
+                self.release()
+                raise Refused(f"{host}: {W} already exists (another campaign with this name, or a kept one); "
+                              "remove it after checking nothing of it is running")
+            self.reserved.append(host)
+
+    def owned(self, host: str) -> str:
+        """Shell guard: exit unless this invocation owns the work directory."""
+        W = self.w(host)
+        return f'[ "$(cat {W}/.owner 2>/dev/null)" = "{self.token}" ] || {{ echo "not owner of {W}"; exit 0; }}\n'
+
+    def release(self) -> None:
+        for host in list(self.reserved):
+            W = self.w(host)
+            self.hosts[host].run(self.owned(host) + f"rm -f {W}/.owner; rmdir {W}/run {W} 2>/dev/null; true",
+                                 what="release an unused reservation")
+            self.reserved.remove(host)
 
     # -- builds
     def refs(self) -> Dict[str, List[str]]:
@@ -836,10 +867,13 @@ class Campaign:
             self.must(gh, f"mkdir -p {d}/logs", f"gateway directory for {arm.name}")
             gh.put(self.binary(arm, g.platform, "gateway"), f"{d}/queqiaod")
             # Fresh provider state every campaign: a kept work directory from
-            # an earlier run must not supply this one's identity or users.
+            # an earlier run must not supply this one's identity or users. The
+            # account has no device or flow limit of its own (0: every device,
+            # the gateway's --max-sessions), so a campaign measures the path,
+            # not account admission.
             self.must(gh, f"chmod +x {d}/queqiaod\ncd {d} && rm -rf ./state && ./queqiaod provider init --state ./state "
                       f"--name {cfg.work_dir}-{arm.name} --endpoint {g.address}:{g.port_base + arm.index} >/dev/null && "
-                      f"./queqiaod provider add-user --state ./state --name ab >/dev/null",
+                      f"./queqiaod provider add-user --state ./state --name ab --max-flows 0 --max-clients 0 >/dev/null",
                       f"temporary provider state for {arm.name}")
         # Enrollment needs a running gateway; start each, enroll every client, stop.
         for arm in cfg.arms:
@@ -941,6 +975,17 @@ rm -f "$f"''', what=f"stop {tag}")
         if self.active_small.get(client.host) == tag:
             del self.active_small[client.host]
 
+    def scrape_client(self, client: Client, arm: Arm, name: str) -> None:
+        """The client's counters around a trial: TCP fallback is counted on
+        the client, so the gateway's QUIC bytes alone cannot show it."""
+        rc, text = self.hosts[client.host].run(
+            f"curl -s --max-time 10 http://127.0.0.1:{client.metrics_port_base + arm.index}/metrics | grep -E '^queqiao_' || true",
+            what=f"scrape client {client.name}/{arm.name} metrics ({name})")
+        if not self.dry:
+            os.makedirs(os.path.join(self.out, "metrics"), exist_ok=True)
+            with open(os.path.join(self.out, "metrics", f"{name}-client-{client.name}.txt"), "w") as f:
+                f.write(text)
+
     def scrape(self, arm: Arm, name: str) -> None:
         gh = self.hosts[self.cfg.gateway.host]
         rc, text = gh.run(f"curl -s --max-time 10 http://127.0.0.1:{self.cfg.gateway.metrics_port_base + arm.index}/metrics "
@@ -968,7 +1013,7 @@ rm -f "$f"''', what=f"stop {tag}")
             size = self.cfg.dc.request_bytes if self.cfg.dc else self.cfg.probe_bytes
             interval = self.cfg.dc.control_interval if self.cfg.dc else self.cfg.probe_interval
             stop = self.stop_file(client, arm)
-            return (f"rm -f {stop}; end=$(( $(date +%s) + {int(duration)} )); i=0; "
+            return (f"end=$(( $(date +%s) + {int(duration)} )); i=0; "
                     f"while [ $(date +%s) -lt $end ] && [ ! -e {stop} ]; do i=$((i+1)); "
                     f"r=$({curl} --max-time {PROBE_TIMEOUT} {url}obj-{size} 2>/dev/null); printf '%s\\t%s\\t%s\\n' \"$(date +%s)\" \"p$i\" \"$r\"; "
                     f"sleep {interval}; done; rm -f {stop}")
@@ -1013,6 +1058,12 @@ rm -f "$f"''', what=f"stop {tag}")
                 self.log(f"job {kind} on {client.name} failed: {e}")
             results[i] = (t0, time.time(), rc, out)
 
+        # Clear any stop signal before the phase starts, not inside the probe:
+        # a load job that finished before the probe's ssh session began would
+        # otherwise have its stop signal erased.
+        for c, k, n in jobs:
+            if k == "probe":
+                self.hosts[c.host].run(f"rm -f {self.stop_file(c, arm)}", what=f"{phase}: clear the probe stop file on {c.name}")
         threads = [threading.Thread(target=go, args=(i, c, k, n)) for i, (c, k, n) in enumerate(jobs)]
         for t in threads:
             t.start()
@@ -1060,9 +1111,13 @@ rm -f "$f"''', what=f"stop {tag}")
                     self.start_client(c, arm, f"client-{tagp}-s{s.slot}")
             name = f"{tagp}-s{s.slot}-{arm.name}"
             self.scrape(arm, name + "-pre")
+            for c in clients:
+                self.scrape_client(c, arm, name + "-pre")
             for phase, duration, jobs in self.phases(path):
                 self.run_phase(s, arm, phase, duration, jobs, writer)
             self.scrape(arm, name + "-post")
+            for c in clients:
+                self.scrape_client(c, arm, name + "-post")
             for c in clients:
                 if c.small:
                     self.stop_client(c, arm)
@@ -1117,8 +1172,13 @@ rm -f "$f"''', what=f"stop {tag}")
         # NAME.jsonl[.N][.gz], NAME.cpu, or NAME-sSLOT.*: never another path
         # whose label merely starts with this one. Labels are [a-z0-9_-], so
         # the prefix needs no regex escaping.
-        rc, out = host.run(f"cd {remote_dir} 2>/dev/null && ls -1 2>/dev/null | grep -E '^{prefix}(\\.|-s[0-9]+\\.)'; true",
+        rc, out = host.run(f"cd {remote_dir} || exit 3\nls -1 | grep -E '^{prefix}(\\.|-s[0-9]+\\.)'\nexit 0",
                            what=f"list {prefix} logs")
+        if rc != 0 and not self.dry:
+            # A failed listing is not an empty one: keep the work directory.
+            self.fetch_failures.append(f"{host.dest}:{remote_dir}/{prefix}* (listing failed, exit {rc})")
+            self.log(f"could not list {host.dest}:{remote_dir}; its logs stay on the host")
+            return
         names = [x.strip() for x in out.splitlines() if x.strip().startswith(prefix)] if not self.dry else [prefix + ".*"]
         for n in names:
             ok = host.get(f"{remote_dir}/{n}", os.path.join(local_dir, n)) or \
@@ -1146,11 +1206,13 @@ rm -f "$f"''', what=f"stop {tag}")
     # -- teardown
     def teardown(self) -> None:
         self.log("teardown")
-        for host in self.cfg.hosts():
+        # Only directories this invocation reserved, and only while it still
+        # owns them: never another campaign's processes.
+        for host in self.reserved:
             h = self.hosts[host]
             W = self.w(host)
             try:
-                h.run(f'''[ -d {W}/run ] || exit 0
+                h.run(self.owned(host) + f'''[ -d {W}/run ] || exit 0
 for f in {W}/run/*.pid; do
   [ -f "$f" ] || continue
   p=$(cat "$f")
@@ -1174,9 +1236,11 @@ ps -eo pid=,args= | grep -F -- "{W}/" | grep -v -F grep || true''', what="stop e
                 self.log(f"listener check on {host} failed: {e}")
 
     def clean(self) -> None:
-        for host in self.cfg.hosts():
+        for host in list(self.reserved):
             W = self.w(host)
-            self.hosts[host].run(f"case {W} in */{self.cfg.work_dir}) rm -rf {W};; esac", what="remove the work directory")
+            self.hosts[host].run(self.owned(host) + f"case {W} in */{self.cfg.work_dir}) rm -rf {W};; esac",
+                                 what="remove the work directory")
+            self.reserved.remove(host)
 
     # -- driver
     def run(self, clean: bool = True, dry_blocks: int = 1) -> int:
