@@ -1,6 +1,7 @@
 package pep
 
 import (
+	"context"
 	"sync"
 
 	"github.com/bojieli/queqiao/internal/classifier"
@@ -104,45 +105,91 @@ func (c *Client) secondConnectionWanted(snapshot flowSnapshot) bool {
 // therefore start with less than the full growth; the next preferred
 // connection after the drain ends gets it back.
 
-// windowCredit is the ledger.
+// windowCredit is the ledger: the credit each live preferred connection
+// holds. A holder whose connection has ended holds nothing, whether or not
+// the callback that removes it has run yet, so a replacement dialled the
+// moment its predecessor closes is sized as if the predecessor were gone.
 type windowCredit struct {
-	mu   sync.Mutex
-	held uint64
+	mu      sync.Mutex
+	holders map[*creditHold]struct{}
+}
+
+// creditHold is one preferred connection's share of the ledger.
+type creditHold struct {
+	ledger *windowCredit
+	grant  uint64
+	// conn is the connection's lifetime once dialled; nil while the dial
+	// is in progress, when the hold counts as live.
+	conn context.Context
+}
+
+// held sums the credit of holders whose connections have not ended. The
+// caller holds mu.
+func (l *windowCredit) held() uint64 {
+	var sum uint64
+	for h := range l.holders {
+		if h.conn != nil && h.conn.Err() != nil {
+			delete(l.holders, h)
+			continue
+		}
+		sum += h.grant
+	}
+	return sum
+}
+
+// bind ties the hold to the connection it sized: the credit returns when
+// that connection ends.
+func (h *creditHold) bind(conn context.Context) {
+	if h == nil {
+		return
+	}
+	h.ledger.mu.Lock()
+	h.conn = conn
+	h.ledger.mu.Unlock()
+	context.AfterFunc(conn, h.release)
+}
+
+// release returns the credit at once: the dial failed, or the connection
+// ended.
+func (h *creditHold) release() {
+	if h == nil {
+		return
+	}
+	h.ledger.mu.Lock()
+	delete(h.ledger.holders, h)
+	h.ledger.mu.Unlock()
 }
 
 // reservePreferredWindows returns the receive windows for a new preferred
-// (pooled control) connection, with the credit it was granted, and the
-// function that returns that credit, which the caller runs when the
-// connection ends (or at once if the dial fails). Without topology=single it
-// is the configured windows and a no-op.
-func (c *Client) reservePreferredWindows() (flowWindows, func()) {
+// (pooled control) connection, grown by the credit it was granted, and the
+// hold on that credit, which the caller binds to the connection once dialled
+// or releases if the dial fails. Without topology=single it is the configured
+// windows and a nil hold.
+func (c *Client) reservePreferredWindows() (flowWindows, *creditHold) {
 	w := c.windows()
 	unopened := c.memoryLimits.maxBulkConnections - c.fanOutConnections()
 	if !c.singleTopology() || unopened <= 0 {
-		return w, func() {}
+		return w, nil
 	}
 	_, _, streamMax, connectionMax, _ := w.resolved()
-	want := uint64(unopened) * min(streamMax, connectionMax)
-	budget := uint64(unopened) * connectionMax
 	if connectionMax >= maxConnectionReceiveWindow {
-		return w, func() {}
+		return w, nil
 	}
-	want = min(want, maxConnectionReceiveWindow-connectionMax)
-	c.windowCredit.mu.Lock()
-	grant := min(want, budget-min(budget, c.windowCredit.held))
-	c.windowCredit.held += grant
-	c.windowCredit.mu.Unlock()
+	want := min(uint64(unopened)*min(streamMax, connectionMax), maxConnectionReceiveWindow-connectionMax)
+	budget := uint64(unopened) * connectionMax
+	l := &c.windowCredit
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	grant := min(want, budget-min(budget, l.held()))
 	if grant == 0 {
-		return w, func() {}
+		return w, nil
 	}
-	var once sync.Once
-	return growConnectionWindow(w, grant), func() {
-		once.Do(func() {
-			c.windowCredit.mu.Lock()
-			c.windowCredit.held -= grant
-			c.windowCredit.mu.Unlock()
-		})
+	if l.holders == nil {
+		l.holders = make(map[*creditHold]struct{})
 	}
+	h := &creditHold{ledger: l, grant: grant}
+	l.holders[h] = struct{}{}
+	return growConnectionWindow(w, grant), h
 }
 
 // growConnectionWindow raises the connection receive ceiling by extra. A

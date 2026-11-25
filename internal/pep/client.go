@@ -1950,15 +1950,15 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 }
 
 func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDial, ccfg congestionConfig) {
-	windows, releaseCredit := c.reservePreferredWindows()
+	windows, credit := c.reservePreferredWindows()
 	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.WireVersions, c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, windows, c.hopDialConfig())
 	var generation *controlQUICGeneration
 	if err != nil {
-		releaseCredit()
+		credit.release()
 	} else {
 		// The connection's window is fixed at dial; its credit returns to
 		// the ledger only when it ends.
-		context.AfterFunc(conn.Context(), releaseCredit)
+		credit.bind(conn.Context())
 	}
 	if err == nil {
 		borrowing, stopBorrowing := context.WithCancelCause(conn.Context())

@@ -171,8 +171,8 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 				MaxIncomingStreams: p.windows.maxStreams,
 			}}
 			client.memoryLimits.maxBulkConnections = p.maxBulk
-			single, release := client.reservePreferredWindows()
-			defer release()
+			single, hold := client.reservePreferredWindows()
+			defer hold.release()
 			if err := single.validate(); err != nil {
 				t.Fatal(err)
 			}
@@ -203,10 +203,10 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 	}
 	desktop := &Client{cfg: ClientConfig{Topology: TopologySingle}}
 	desktop.memoryLimits.maxBulkConnections = isolatedBulkConns
-	if w, release := desktop.reservePreferredWindows(); w != desktop.windows() {
+	if w, hold := desktop.reservePreferredWindows(); w != desktop.windows() {
 		t.Fatalf("desktop windows changed: %+v", w)
 	} else {
-		release()
+		hold.release()
 	}
 }
 
@@ -622,8 +622,8 @@ func TestSingleTopologyStaysInsideTheIOSMemoryProfile(t *testing.T) {
 				CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath, Classifier: ClassifierPhased,
 				MaxSessions: 2048,
 			}, cfg)
-			w, release := rig.client.reservePreferredWindows()
-			release()
+			w, hold := rig.client.reservePreferredWindows()
+			hold.release()
 			if topology == TopologySingle && rig.client.windows().connection != 2*1024*1024 {
 				t.Fatal("a secondary connection would get the preferred connection's grown window")
 			}
@@ -786,5 +786,39 @@ func TestPreferredWindowCreditIsBoundedOverEveryLiveGeneration(t *testing.T) {
 	defer fresh.releaseBorrow()
 	if w := fresh.conn.Config().MaxConnectionReceiveWindow; w != 2*mib {
 		t.Fatalf("after the drained generations closed the preferred connection got %d KiB, want the whole credit (%d KiB)", w>>10, 2*mib>>10)
+	}
+}
+
+// A replacement dialled the moment its predecessor's connection ends gets
+// the predecessor's credit back even if the callback that removes the hold
+// has not run yet: an ended connection holds nothing.
+func TestEndedConnectionHoldsNoWindowCredit(t *testing.T) {
+	const mib = 1024 * 1024
+	client := &Client{cfg: ClientConfig{
+		Topology:            TopologySingle,
+		StreamReceiveWindow: mib, MaxStreamReceiveWindow: mib,
+		ConnectionReceiveWindow: mib, MaxConnectionReceiveWindow: mib,
+	}}
+	client.memoryLimits.maxBulkConnections = 1
+	first, hold := client.reservePreferredWindows()
+	if first.maxConnection != 2*mib || hold == nil {
+		t.Fatalf("first preferred connection got %d", first.maxConnection)
+	}
+	// The predecessor's connection ends; its removal callback is not run
+	// (as if it were still scheduled).
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	client.windowCredit.mu.Lock()
+	hold.conn = ended
+	client.windowCredit.mu.Unlock()
+	second, next := client.reservePreferredWindows()
+	defer next.release()
+	if second.maxConnection != 2*mib {
+		t.Fatalf("a replacement dialled after its predecessor ended got %d KiB, want the whole credit", second.maxConnection>>10)
+	}
+	// While a holder is live, the credit is not granted twice.
+	third, none := client.reservePreferredWindows()
+	if third.maxConnection != mib || none != nil {
+		t.Fatalf("a second live preferred connection got %d KiB beside a live holder", third.maxConnection>>10)
 	}
 }
