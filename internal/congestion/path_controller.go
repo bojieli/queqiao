@@ -99,6 +99,9 @@ type PathController struct {
 	// clock reads the time of a demand change, which carries none. It is
 	// monotime.Now; a simulation substitutes its own.
 	clock func() monotime.Time
+	// unpublished says the estimator observed fates since its figures were
+	// last published.
+	unpublished bool
 	// flightGauge mirrors flight for telemetry readers.
 	flightGauge atomic.Int64
 	// datagrams is the loss estimator over datagram-bearing samples only,
@@ -458,6 +461,42 @@ func (c *PathController) correct(r *fateRecord) {
 	c.stats.delivered.Add(1)
 }
 
+// publishObserved publishes the estimator's figures if it observed fates
+// outside an acknowledgement event -- a discard or a detach that unblocked
+// the send order -- so the erasure the coded readers size from is current
+// without waiting for the next ACK.
+//
+// The balance is settled at the old rate first, as an ACK event does, and
+// siblings refused for the balance are woken if the rate rose.
+func (c *PathController) publishObserved(a *PathAttachment, now monotime.Time, wakes []func()) []func() {
+	if !c.unpublished {
+		return wakes
+	}
+	c.unpublished = false
+	c.law.pacer.settle(now)
+	rateBefore, windowBefore := c.law.bandwidth(), c.law.GetCongestionWindow()
+	c.law.publishMeasurement()
+	if c.law.bandwidth() > rateBefore {
+		wakes = c.collectPacing(a, wakes)
+	}
+	if c.law.GetCongestionWindow() > windowBefore {
+		wakes = c.collectBlocked(a, wakes)
+	}
+	return wakes
+}
+
+// collectPacing returns the wakers of attachments refused for the balance,
+// except a, and clears their flag: the rate rose, so their retry is late.
+func (c *PathController) collectPacing(a *PathAttachment, wakes []func()) []func() {
+	for o := range c.pacingWaiters {
+		if o != a && o.wake != nil {
+			c.markPacing(o, false)
+			wakes = append(wakes, o.wake)
+		}
+	}
+	return wakes
+}
+
 // advance expires what has waited past the horizon and lets the estimator
 // observe every resolved fate at the front of the send order, in order.
 func (c *PathController) advance(now monotime.Time) {
@@ -476,6 +515,7 @@ func (c *PathController) advance(now monotime.Time) {
 			}
 			c.law.inner.estimator.retire(c.ringBase)
 		}
+		c.unpublished = true
 		switch r.fate {
 		case fateDelivered:
 			c.law.estimator.ObserveOutcome(true)
@@ -710,7 +750,8 @@ func (c *PathController) detach(a *PathAttachment, now monotime.Time) []func() {
 	c.noteDemand(union, now)
 	c.arb.OnDemand(union)
 	c.advance(now)
-	wakes := c.collectBlocked(a, nil)
+	wakes := c.publishObserved(a, now, nil)
+	wakes = c.collectBlocked(a, wakes)
 	return c.collectWaiting(a, wakes)
 }
 
@@ -948,7 +989,7 @@ func (c *PathController) controlBypass(a *PathAttachment, own [quiccongestion.Nu
 		if !c.claims(o, a, turn, now) {
 			continue
 		}
-		if o.bypassed || o.maxPacket <= 0 || c.claimantCanSend(o, now) {
+		if o.bypassed || o.maxPacket <= 0 || c.claimantCanSend(o, now, turn) {
 			return nil
 		}
 		claimants = append(claimants, o)
@@ -993,26 +1034,31 @@ func (c *PathController) deferTo(a *PathAttachment, turn quiccongestion.SendClas
 // its own packet now.
 func (c *PathController) claimantReady(a *PathAttachment, turn quiccongestion.SendClass, now monotime.Time) bool {
 	for o := range c.byClass[turn] {
-		if c.claims(o, a, turn, now) && o.maxPacket > 0 && c.claimantCanSend(o, now) {
+		if c.claims(o, a, turn, now) && o.maxPacket > 0 && c.claimantCanSend(o, now, turn) {
 			return true
 		}
 	}
 	return false
 }
 
-// claimantCanSend says whether o could send an ordinary packet of its own
-// size now: its window -- the path's, or a PROBING attachment's own probe
-// window -- and the balance.
-func (c *PathController) claimantCanSend(o *PathAttachment, now monotime.Time) bool {
+// claimantCanSend says whether o could send a packet of its own size of the
+// turn now, with the allowance admission would give it: its window -- the
+// path's, or a PROBING attachment's own probe window -- and the balance,
+// both less the control debt on a CONTROL turn.
+func (c *PathController) claimantCanSend(o *PathAttachment, now monotime.Time, turn quiccongestion.SendClass) bool {
 	size := o.maxPacket
+	debt := quiccongestion.ByteCount(0)
+	if turn == quiccongestion.ClassControl {
+		debt = pathControlDebtPackets * c.maxPacket
+	}
 	if o.probing {
 		if o.gauge+size > pathProbeWindowPackets*c.maxPacket {
 			return false
 		}
-	} else if c.flight+size > c.law.GetCongestionWindow() {
+	} else if c.flight+size > c.law.GetCongestionWindow()+debt {
 		return false
 	}
-	return c.law.pacer.budget(now) >= size
+	return c.law.pacer.budget(now) >= size-debt
 }
 
 // fits says whether an ordinary packet of the given turn would pass the
@@ -1074,6 +1120,9 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []func() {
 	now := c.clamp(s.Time)
 	c.accrue(now)
+	if a.staleRTT && a.movedFrom < 0 && s.Space == quiccongestion.SpaceApplication {
+		a.movedFrom = s.Number
+	}
 	var wakes []func()
 	before := c.flight
 	c.setGauge(a, s.InFlight)
@@ -1172,21 +1221,23 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 	c.setGauge(a, ev.InFlight)
 	// The flight and the window moved: work that did not fit may now.
 	a.stuckUntil = [quiccongestion.NumSendClasses]monotime.Time{}
-	if ev.RTTSample > 0 {
-		// The event's sample is raw: send to ACK receipt. The connection's
-		// own statistics have already removed the peer's reported ACK
-		// delay, so their latest sample is what the path's delay model
-		// takes; a delayed ACK is not queueing.
-		sample := ev.RTTSample
-		if a.connRTT != nil {
-			if latest := a.connRTT.LatestRTT(); latest > 0 {
-				sample = latest
-			}
-		}
-		c.rtt.observe(sample)
-	}
 	c.acked, c.lost = c.acked[:0], c.lost[:0]
 	var resolved quiccongestion.ByteCount
+	// largestOwn says the largest application packet this event newly
+	// acknowledges -- the one its RTT sample times -- was sent after the
+	// move. Ownership is by packet number, not by the fate map, whose
+	// records can expire before a long round trip's ACK arrives; and it is
+	// worked out only while the guard needs it.
+	largestOwn := false
+	if a.staleRTT && ev.RTTSample > 0 && a.movedFrom >= 0 {
+		largestPN := quiccongestion.PacketNumber(-1)
+		for _, r := range ev.Acked {
+			if r.Space == quiccongestion.SpaceApplication && r.Number > largestPN {
+				largestPN = r.Number
+			}
+		}
+		largestOwn = largestPN >= a.movedFrom
+	}
 	progress := false
 	for _, r := range ev.Acked {
 		if r.Space == quiccongestion.SpaceApplication {
@@ -1251,6 +1302,26 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		c.lost = append(c.lost, quiccongestion.LostPacketInfo{PacketNumber: ref.pseq, BytesLost: ref.bytes})
 		resolved += ref.bytes
 	}
+	// After a move to another controller, an RTT sample may time a packet
+	// sent on the old uplink; the path's delay model takes none until an
+	// event's sample times one of this attachment's own packets on this
+	// controller: the sample is the largest newly acknowledged packet's.
+	if a.staleRTT && ev.RTTSample > 0 && largestOwn {
+		a.staleRTT = false
+	}
+	if ev.RTTSample > 0 && !a.staleRTT {
+		// The event's sample is raw: send to ACK receipt. The connection's
+		// own statistics have already removed the peer's reported ACK
+		// delay, so their latest sample is what the path's delay model
+		// takes; a delayed ACK is not queueing.
+		sample := ev.RTTSample
+		if a.connRTT != nil {
+			if latest := a.connRTT.LatestRTT(); latest > 0 {
+				sample = latest
+			}
+		}
+		c.rtt.observe(sample)
+	}
 	if progress && a.progress == nil {
 		a.ptoSinceProgress = 0
 		c.promote(a)
@@ -1262,6 +1333,7 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		// that plus what this event resolved of its samples.
 		before := c.law.Telemetry()
 		c.law.afterOutcomes(c.flight+resolved, now, c.acked, c.lost)
+		c.unpublished = false
 		// The event's movement of the cumulative counters is this
 		// attachment's, and only its: a connection's published counters
 		// must count each loss and sample of the path once.
@@ -1293,11 +1365,12 @@ func (c *PathController) discarded(a *PathAttachment, now monotime.Time, inFligh
 		c.discard(a, packetKey{space: r.Space, number: r.Number})
 	}
 	c.advance(now)
+	wakes := c.publishObserved(a, now, nil)
 	c.law.recordInFlight(c.flight)
 	if c.flight < before {
-		return c.collectBlocked(a, nil)
+		wakes = c.collectBlocked(a, wakes)
 	}
-	return nil
+	return wakes
 }
 
 func (c *PathController) setDemand(a *PathAttachment, d quiccongestion.Demand) []func() {
@@ -1352,6 +1425,12 @@ type PathAttachment struct {
 	// the epoch last seen.
 	progress      func() TransportProgress
 	progressEpoch uint64
+	// staleRTT says the attachment moved controllers and no RTT sample has
+	// yet timed one of its packets on this one: samples still time packets
+	// of the path it left. movedFrom is its first application packet number
+	// on this controller, -1 until it sends one.
+	staleRTT  bool
+	movedFrom quiccongestion.PacketNumber
 	// bypassed says CONTROL went past this attachment's claim and it has
 	// not been admitted since: no further bypass until it is.
 	bypassed bool
@@ -1462,7 +1541,9 @@ func (a *PathAttachment) attachTo(c *PathController, now monotime.Time, inFlight
 	a.ctl.Store(c)
 	c.mu.Lock()
 	a.epoch = attachmentEpochs.Add(1)
-	if a.connRTT != nil && c.rtt.fallback == nil {
+	if a.connRTT != nil && c.rtt.fallback == nil && !a.staleRTT {
+		// A connection that moved here from another path does not seed
+		// this one's round trip: its statistics are the old path's.
 		c.rtt.fallback = a.connRTT
 	}
 	c.attach(a, now, inFlight, a.maxPacket)
@@ -1511,6 +1592,9 @@ func (a *PathAttachment) Admit(now monotime.Time, maxBytes quiccongestion.ByteCo
 }
 
 func (a *PathAttachment) OnSent(s quiccongestion.SentPacket) {
+	// A packet built without admission (a PTO probe) after an uplink change
+	// is charged to the current path's controller too.
+	a.followGeneration(s.Time)
 	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
@@ -1558,6 +1642,8 @@ func (a *PathAttachment) OnPathMigrated(now monotime.Time, oldLocal, newLocal, o
 	old.mu.Lock()
 	gauge := a.gauge
 	wakes := old.detach(a, now)
+	// Its packets in flight were sent on the path it left.
+	a.staleRTT, a.movedFrom = true, -1
 	old.mu.Unlock()
 	runWakes(wakes)
 	a.attachTo(next, now, gauge)
