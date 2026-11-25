@@ -183,8 +183,9 @@ type congestionConfig struct {
 	// controller only once it is known; see attachPathController.
 	provisional bool
 	// principal names the sending endpoint's identity in its path key under
-	// congestion=path; see newClientPathPrincipal.
-	principal string
+	// congestion=path, read at installation and at each migration; see
+	// Client.pathPrincipalNow.
+	principal func() string
 }
 
 type udpHealth struct {
@@ -1156,8 +1157,8 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 				return provisionalPathController(conn)
 			}
 			principal := cfg.principal
-			if principal == "" {
-				principal = clientPathPrincipal
+			if principal == nil {
+				principal = func() string { return clientPathPrincipal }
 			}
 			return attachPathController(conn, cfg, principal)
 		}

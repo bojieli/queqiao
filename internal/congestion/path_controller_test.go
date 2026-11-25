@@ -1340,3 +1340,19 @@ func TestControlUsesItsDebtWhenTheBulkClaimantCannotSend(t *testing.T) {
 		t.Fatalf("CONTROL beside a BULK claimant that cannot send got %+v; want CONTROL on the debt", p)
 	}
 }
+
+// A loss corrected before the estimator observes it moves between the fate
+// counts: the totals agree with what the estimator counts.
+func TestACorrectedLossMovesBetweenTheFateCounts(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	b.send(now, 1200) // an unresolved predecessor holds the record in the ring
+	a.send(now, 1200)
+	now = now.Add(100 * time.Millisecond)
+	a.event(now, nil, []quiccongestion.PacketNumber{0})
+	a.a.OnAckEvent(quiccongestion.AckEvent{Time: now, Spurious: a.refs([]quiccongestion.PacketNumber{0})})
+	if s := c.Stats(); s.Lost != 0 || s.Delivered != 1 {
+		t.Fatalf("after a correction: lost %d, delivered %d; want 0 and 1", s.Lost, s.Delivered)
+	}
+}

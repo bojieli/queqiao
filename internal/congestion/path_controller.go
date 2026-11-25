@@ -454,6 +454,14 @@ func (c *PathController) resolve(pseq quiccongestion.PacketNumber, f fate) {
 	}
 }
 
+// correct flips a lost record the estimator has not yet observed to
+// delivered, moving it between the fate counts with it.
+func (c *PathController) correct(r *fateRecord) {
+	r.fate = fateDelivered
+	c.stats.lost.Add(^uint64(0))
+	c.stats.delivered.Add(1)
+}
+
 // advance expires what has waited past the horizon and lets the estimator
 // observe every resolved fate at the front of the send order, in order.
 func (c *PathController) advance(now monotime.Time) {
@@ -1115,7 +1123,7 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		if !ref.lost {
 			c.resolve(ref.pseq, fateDelivered)
 		} else if rec := c.record(ref.pseq); rec != nil && rec.fate == fateLost {
-			rec.fate = fateDelivered
+			c.correct(rec)
 			c.stats.spurious.Add(1)
 		}
 		c.acked = append(c.acked, quiccongestion.AckedPacketInfo{PacketNumber: ref.pseq, BytesAcked: ref.bytes})
@@ -1141,7 +1149,7 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		// yet; beyond that the loss stands there. The sampler still has the
 		// state, so the bytes count as delivered.
 		if rec := c.record(ref.pseq); rec != nil && rec.fate == fateLost {
-			rec.fate = fateDelivered
+			c.correct(rec)
 		}
 		c.acked = append(c.acked, quiccongestion.AckedPacketInfo{PacketNumber: ref.pseq, BytesAcked: ref.bytes})
 		resolved += ref.bytes

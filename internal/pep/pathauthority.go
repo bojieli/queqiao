@@ -59,7 +59,7 @@ func newClientPathPrincipal() string {
 // A port-only rebinding changes neither.
 func (c *Client) pathPrincipalNow() string {
 	if c.pathPrincipal == "" {
-		return ""
+		return clientPathPrincipal
 	}
 	return c.pathPrincipal + "@" + strconv.FormatUint(c.uplinkGeneration.Load(), 10)
 }
@@ -134,16 +134,25 @@ func (r *pathAuthorityRegistry) forget() {
 // the path key -- a new remote host or a new local uplink -- moves the
 // attachment, with the connection's flight, to that path's controller; a
 // port-only rebinding keeps it.
-func attachPathController(conn *quic.Conn, cfg congestionConfig, principal string) wancongestion.TelemetryProvider {
-	_, current := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
+//
+// principal is read at installation and at every migration, not once when
+// the dial began: a client's uplink generation can move while a dial is in
+// flight, and every connection on one physical path must resolve the same
+// key. A migration compares the whole key, principal included.
+func attachPathController(conn *quic.Conn, cfg congestionConfig, principal func() string) wancongestion.TelemetryProvider {
+	_, addrs := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
+	who := principal()
+	current := who + "|" + addrs
 	initial := conn.InitialPacketSize()
-	controller := pathAuthorities.controller(principal, current, initial)
+	controller := pathAuthorities.controller(who, addrs, initial)
 	// The connection's FEC and probe readers read the model the law reports
 	// to: the principal's.
-	readers := pathModelOfKey(conn, principal+"|"+current)
+	readers := pathModelOfKey(conn, current)
 	// rekey is called only on the connection's run loop.
 	rekey := func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
-		_, next := resolvePath(newLocal, newRemote)
+		_, nextAddrs := resolvePath(newLocal, newRemote)
+		nextWho := principal()
+		next := nextWho + "|" + nextAddrs
 		if next == current {
 			return nil
 		}
@@ -151,8 +160,8 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal strin
 		// Resolve the controller first: a lookup may sweep an expired entry
 		// and its model, and the readers must follow the model the
 		// controller reports to.
-		c := pathAuthorities.controller(principal, next, initial)
-		rekeyPathModel(conn, principal+"|"+next)
+		c := pathAuthorities.controller(nextWho, nextAddrs, initial)
+		rekeyPathModel(conn, next)
 		return c
 	}
 	attachment := controller.Attach(rekey, func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
