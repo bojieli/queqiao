@@ -100,6 +100,20 @@ func (s *innerQUICServer) stats() quic.ConnectionStats {
 	return total
 }
 
+// waitInnerQuiet waits, for at most 10 s, until the inner server has sent
+// nothing for 500 ms.
+func waitInnerQuiet(s *innerQUICServer) {
+	last := s.stats().PacketsSent
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(500 * time.Millisecond)
+		now := s.stats().PacketsSent
+		if now == last {
+			return
+		}
+		last = now
+	}
+}
+
 // dialInnerQUIC dials the inner server through a UDP association of rig, as
 // a QUIC application behind a SOCKS client does.
 func dialInnerQUIC(ctx context.Context, t *testing.T, rig *workloadRig, server *innerQUICServer) (*quic.Conn, error) {
@@ -148,6 +162,8 @@ func innerGetFor(ctx context.Context, conn *quic.Conn, size int, limit time.Dura
 	_ = stream.Close()
 	if limit > 0 {
 		_ = stream.SetReadDeadline(start.Add(limit))
+	} else if deadline, ok := ctx.Deadline(); ok {
+		_ = stream.SetReadDeadline(deadline)
 	}
 	n, err := io.Copy(io.Discard, stream)
 	elapsed := time.Since(start)
@@ -279,6 +295,9 @@ func runTunnelledQUIC(t *testing.T, path pathsim.Config, size, pages int) []w8Ou
 			st := conn.ConnectionStats()
 			o.queueing = st.SmoothedRTT - st.MinRTT
 
+			// A capped download's sender learns of the cancellation a round
+			// trip later; let it drain so none of it is charged to the pages.
+			waitInnerQuiet(servers[i])
 			pageSentBefore, pageWireBefore := servers[i].stats(), rigs[i].wireBytes()
 			pageBytes := 0
 			for p := range pages {

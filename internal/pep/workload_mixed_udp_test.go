@@ -171,8 +171,9 @@ type m5Direction struct {
 type m5Outcome struct {
 	audio        [2]m5Direction // uplink, downlink
 	keystrokes   []time.Duration
-	heavyGoodput float64 // during the thin measurements
-	pathDrops    uint64  // the emulated bottleneck's own drops, both directions
+	heavyGoodput float64       // during the thin measurements
+	heavyGap     time.Duration // the longest the heavy download moved nothing during them
+	pathDrops    uint64        // the emulated bottleneck's own drops, both directions
 }
 
 // M5. Heavy UDP beside thin UDP and coded stream chunks
@@ -224,7 +225,14 @@ func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 	// lateness p99 up, lateness p99 down, keystroke echo p99.
 	measures := make([][5][]float64, len(arms))
 	for block := range blocks {
-		outcomes := runM5Block(t, echoListener.Addr().String(), measure, playout)
+		// A subtest per block, so each block's clients, gateways and paths
+		// are torn down before the next starts.
+		var outcomes []m5Outcome
+		if !t.Run(fmt.Sprintf("block%d", block), func(t *testing.T) {
+			outcomes = runM5Block(t, echoListener.Addr().String(), measure, playout)
+		}) {
+			t.FailNow()
+		}
 		for i, arm := range arms {
 			o := outcomes[i]
 			for d, name := range []string{"uplink", "downlink"} {
@@ -243,8 +251,9 @@ func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 			measures[i][4] = append(measures[i][4], durationQuantile(o.keystrokes, 0.99).Seconds())
 			// A heavy flow that stalled would leave the thin flows nothing
 			// to compete with: the measurement would not be M5.
-			if o.heavyGoodput < 1e6/8 {
-				t.Fatalf("%s: the heavy download moved %.2f Mbit/s during the measurements", arm.name, o.heavyGoodput*8/1e6)
+			if o.heavyGoodput < 1e6/8 || o.heavyGap > 2*time.Second {
+				t.Fatalf("%s: the heavy download moved %.2f Mbit/s during the measurements and stopped for up to %v",
+					arm.name, o.heavyGoodput*8/1e6, o.heavyGap.Round(time.Millisecond))
 			}
 		}
 	}
@@ -361,6 +370,28 @@ func runM5Arm(t *testing.T, rig *workloadRig, server *innerQUICServer, far *audi
 
 	upBefore, downBefore := rig.relay.Stats()
 	heavyBefore, start := heavy.Load(), time.Now()
+	// Sample the heavy download's progress throughout, so a download that
+	// stalled part way cannot pass for competition.
+	sampling := make(chan struct{})
+	sampled := make(chan time.Duration, 1)
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		last, lastMoved, longest := heavy.Load(), time.Now(), time.Duration(0)
+		for {
+			select {
+			case <-sampling:
+				sampled <- max(longest, time.Since(lastMoved))
+				return
+			case now := <-ticker.C:
+				if n := heavy.Load(); n != last {
+					last, lastMoved = n, now
+				} else {
+					longest = max(longest, now.Sub(lastMoved))
+				}
+			}
+		}
+	}()
 	var thin sync.WaitGroup
 	var keyErr error
 	thin.Add(2)
@@ -374,6 +405,8 @@ func runM5Arm(t *testing.T, rig *workloadRig, server *innerQUICServer, far *audi
 		o.keystrokes, keyErr = runKeystrokes(keys, measure)
 	}()
 	thin.Wait()
+	close(sampling)
+	o.heavyGap = <-sampled
 	o.heavyGoodput = float64(heavy.Load()-heavyBefore) / time.Since(start).Seconds()
 	upAfter, downAfter := rig.relay.Stats()
 	o.pathDrops = upAfter.PacketsDropped - upBefore.PacketsDropped + downAfter.PacketsDropped - downBefore.PacketsDropped

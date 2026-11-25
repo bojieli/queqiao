@@ -3,6 +3,7 @@ package pep
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -33,8 +34,21 @@ type workloadArm struct {
 }
 
 // legacyArm is every switch off: today's behaviour and the registered
-// control of the stage-10 gate.
-var legacyArm = workloadArm{name: "legacy", client: func(*ClientConfig) {}, server: func(*ServerConfig) {}}
+// control of the stage-10 gate. Each switch is set explicitly, so the control
+// stays the legacy bundle on a build whose defaults have flipped.
+var legacyArm = workloadArm{
+	name: "legacy",
+	client: func(c *ClientConfig) {
+		c.CCAPI, c.Sched, c.CongestionScope = CCAPIV1, SchedLegacy, CongestionScopeConnection
+		c.Topology, c.Classifier = TopologyIsolated, ClassifierLegacy
+		c.CodedRetry, c.Memory = CodedRetryLegacy, MemoryLegacy
+	},
+	server: func(s *ServerConfig) {
+		s.CCAPI, s.Sched, s.CongestionScope = CCAPIV1, SchedLegacy, CongestionScopeConnection
+		s.Classifier, s.CodedRetry, s.Memory = ClassifierLegacy, CodedRetryLegacy, MemoryLegacy
+		s.GatewayAdmission = GatewayAdmissionLegacy
+	},
+}
 
 // flipArm is every switch of the path-authority migration that is merged,
 // on: what the default flip measures. A stage that adds a switch adds it
@@ -133,6 +147,38 @@ func newWorkloadRig(t *testing.T, path pathsim.Config, arm workloadArm, setup fu
 		t: t, socks: clientListener.Addr().String(), relay: relay,
 		client: client, server: server, clientMetrics: clientMetrics, serverMetrics: serverMetrics,
 	}
+}
+
+// dialSOCKS opens a SOCKS CONNECT to destination through the tunnel at
+// proxy, returning an error rather than failing the test, for workers.
+func dialSOCKS(proxy, destination string) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", proxy, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (net.Conn, error) {
+		_ = conn.Close()
+		return nil, err
+	}
+	addr, err := net.ResolveTCPAddr("tcp", destination)
+	if err != nil {
+		return fail(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	request := append([]byte{5, 1, 0, 5, 1, 0, 1}, addr.IP.To4()...)
+	request = binary.BigEndian.AppendUint16(request, uint16(addr.Port))
+	if _, err := conn.Write(request); err != nil {
+		return fail(err)
+	}
+	var reply [2 + 10]byte
+	if _, err := io.ReadFull(conn, reply[:]); err != nil {
+		return fail(err)
+	}
+	if reply[0] != 5 || reply[1] != 0 || reply[3] != 0 {
+		return fail(fmt.Errorf("SOCKS CONNECT refused: %v", reply))
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
 }
 
 // dial opens a SOCKS CONNECT to destination through the tunnel.

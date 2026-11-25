@@ -242,7 +242,11 @@ func TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					conn := dialTestSOCKS(t, rig.socks, listener.Addr().String())
+					conn, err := dialSOCKS(rig.socks, listener.Addr().String())
+					if err != nil {
+						errs <- fmt.Errorf("%v: %w", cell, err)
+						return
+					}
 					var header [idleCellHeader]byte
 					binary.BigEndian.PutUint32(header[:], uint32(i))
 					if _, err := conn.Write(header[:]); err != nil {
