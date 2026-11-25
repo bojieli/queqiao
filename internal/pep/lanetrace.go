@@ -79,7 +79,7 @@ func traceLane(f *multipathFlow, laneID uint64, stats laneTransportStats) {
 		// congestion.ControllerTelemetry.
 		"share", c.Share, "capped", c.ShareCapped, "upace", c.UncappedPacing, "applimited", c.AppLimited,
 		"aobytes", c.AckOnlyBytes, "aocharged", c.AckOnlyCharged, "ackedb", c.AckedBytes,
-		"pdeny", c.PacingDenials, "wdeny", c.WindowDenials, "held", c.HeldSends,
+		"pdeny", c.PacingDenials, "wdeny", c.WindowDenials, "held_sends", c.HeldSends,
 		// Reissued bytes by cause and by the replaced attempt's substrate.
 		"rs_lane", reissue.Bytes[stripe.ReissueLane], "rs_timer", reissue.Bytes[stripe.ReissueTimer],
 		"rs_gap", reissue.Bytes[stripe.ReissueGap], "rs_rescue", reissue.Bytes[stripe.ReissueRescue],
@@ -162,7 +162,7 @@ func (f *multipathFlow) traceACKSent(sequence uint64, gap, repeat bool, start ti
 			c := provider.transportStats().controller
 			attrs = append(attrs, "pacing", c.PacingRate, "upace", c.UncappedPacing, "share", c.Share,
 				"capped", c.ShareCapped, "inflight", c.BytesInFlight, "cwnd", c.CongestionWindow,
-				"pdeny", c.PacingDenials, "wdeny", c.WindowDenials, "held", c.HeldSends,
+				"pdeny", c.PacingDenials, "wdeny", c.WindowDenials, "held_sends", c.HeldSends,
 				"aobytes", c.AckOnlyBytes, "aocharged", c.AckOnlyCharged, "ackedb", c.AckedBytes,
 				"applimited", c.AppLimited)
 		}

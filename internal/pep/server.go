@@ -203,11 +203,18 @@ func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, repla
 	f := s.flow
 	f.lanesMu.Lock()
 	retired := make(map[uint64]*mpLane)
+	// rescued marks the retirements a rescue's replacement asked for, as
+	// against a handoff or an eviction at capacity, for Stats.Reissue.
+	rescued := make(map[uint64]bool)
 	defer func() {
 		f.lanesMu.Unlock()
 		for _, old := range retired {
 			if sched := f.scheduler.Load(); sched != nil {
-				sched.RetireLaneFor(old.id, stripe.ReissueRescue)
+				cause := stripe.ReissueLane
+				if rescued[old.id] {
+					cause = stripe.ReissueRescue
+				}
+				sched.RetireLaneFor(old.id, cause)
 			}
 			if old.fc != nil {
 				_ = old.fc.Close()
@@ -234,6 +241,7 @@ func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, repla
 		}
 		if (handoff && old.kind != TransportTCP) || (replaceLane && replacedLaneID != lane.id && id == replacedLaneID) {
 			retired[id] = old
+			rescued[id] = !(handoff && old.kind != TransportTCP)
 		} else {
 			remaining++
 		}

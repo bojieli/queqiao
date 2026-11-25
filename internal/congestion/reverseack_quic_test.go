@@ -130,15 +130,23 @@ func TestSparseStreamWritesAmidReverseAcksArriveOnTime(t *testing.T) {
 	)
 	cfg := pathsim.Config{OneWayDelay: oneWay, RateBytesPerSec: 3e6, LossRate: 0.01, Seed: 5}
 	upstream, downstream := pathmodel.NewPathModel(), pathmodel.NewPathModel()
+	type pair struct{ client, server *quic.Conn }
+	pairs := make([]pair, downloads)
+	for i := range pairs {
+		cfg.Seed = int64(5 + i)
+		pairs[i].client, pairs[i].server = reverseAckPair(t, cfg, upstream, downstream)
+	}
+	// The clock starts once every connection is up, so each download and
+	// each sender of messages runs the whole interval.
 	start := time.Now()
 	var mu sync.Mutex
 	var latencies []time.Duration
+	downloaded := make([]int64, downloads)
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithTimeout(context.Background(), duration+10*time.Second)
 	defer cancel()
-	for i := 0; i < downloads; i++ {
-		cfg.Seed = int64(5 + i)
-		client, server := reverseAckPair(t, cfg, upstream, downstream)
+	for i, p := range pairs {
+		client, server := p.client, p.server
 		// Stream reads and writes do not watch ctx. Closing the connections
 		// when it expires turns a transfer that stopped making progress --
 		// the regression this test is for -- into a bounded failure.
@@ -169,7 +177,20 @@ func TestSparseStreamWritesAmidReverseAcksArriveOnTime(t *testing.T) {
 			if err != nil {
 				return
 			}
-			_, _ = io.Copy(io.Discard, stream)
+			// Count only what arrives during the measured interval: the
+			// reverse acknowledgements it elicits are the condition under test.
+			buf := make([]byte, 64<<10)
+			for {
+				n, err := stream.Read(buf)
+				if since := time.Since(start); since >= warmup && since < duration {
+					mu.Lock()
+					downloaded[i] += int64(n)
+					mu.Unlock()
+				}
+				if err != nil {
+					return
+				}
+			}
 		}()
 		// The acknowledgements: timestamped messages up a client stream.
 		up, err := client.OpenStreamSync(ctx)
@@ -222,5 +243,15 @@ func TestSparseStreamWritesAmidReverseAcksArriveOnTime(t *testing.T) {
 	}
 	if len(latencies) < expected*8/10 {
 		t.Errorf("only %d of about %d messages arrived", len(latencies), expected)
+	}
+	// The downloads must have been running, or there were no reverse
+	// acknowledgements for the messages to compete with: each should carry a
+	// fair part of the path's rate through the measured interval.
+	for i, n := range downloaded {
+		rate := float64(n) / (duration - warmup).Seconds()
+		t.Logf("download %d: %.2f MB/s during the measurement", i, rate/1e6)
+		if rate < float64(cfg.RateBytesPerSec)/float64(downloads)/4 {
+			t.Errorf("download %d carried %.2f MB/s during the measurement; the reverse traffic under test was not there", i, rate/1e6)
+		}
 	}
 }
