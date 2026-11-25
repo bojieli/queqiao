@@ -159,6 +159,12 @@ type mpLane struct {
 	rateSampled time.Time
 	rateBytes   float64       // estimated send rate in bytes per second
 	rateRTT     time.Duration // smoothed round-trip time
+
+	// evictOnCommit are the lanes a staged control replacement displaces
+	// (owned gateway admission): one named by REPLACE_LANE, or the victim
+	// at the lane ceiling. They are retired only when the replacement
+	// commits, after its OPEN_OK; a rolled-back JOIN leaves them.
+	evictOnCommit []*mpLane
 }
 
 // laneRateCacheTTL is far below one long-haul RTT, so the scheduler still

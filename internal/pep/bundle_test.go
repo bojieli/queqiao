@@ -103,10 +103,13 @@ func TestSchedValidatorRequiresCCAPIV2(t *testing.T) {
 			t.Errorf("ValidateSched(%q, %q) = %v, disagrees with the constructors", c.sched, c.api, exported)
 		}
 	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, SchedClass); got != "cc-api=v2,sched=class" {
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass); got != "cc-api=v2,sched=class" {
 		t.Errorf("bundle %q", got)
 	}
-	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, SchedLegacy); got != "legacy" {
+	if got := Bundle(CCAPIV2, MemoryOwned, CodedRetrySticky, GatewayAdmissionOwned, SchedClass); got != "cc-api=v2,sched=class,coded-retry=sticky,mem=owned,gateway-admission=owned" {
+		t.Errorf("bundle %q", got)
+	}
+	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedLegacy); got != "legacy" {
 		t.Errorf("bundle %q, want legacy", got)
 	}
 }
