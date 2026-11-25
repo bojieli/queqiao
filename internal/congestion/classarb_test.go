@@ -395,3 +395,32 @@ func TestClassArbiterPassesOverAStuckTurn(t *testing.T) {
 		t.Fatalf("turn %v after a packet was sent, want INTERACTIVE back", p.Turn)
 	}
 }
+
+// A class whose work keeps failing to fit does not starve its siblings: with
+// INTERACTIVE holding credit but never building, CONTROL and BULK share the
+// path by weight.
+func TestClassArbiterStuckClassLeavesSiblingsTheirWeights(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	now := monotime.Now()
+	all := demandOf(quiccongestion.ClassControl, quiccongestion.ClassInteractive, quiccongestion.ClassBulk)
+	a.OnDemand(all)
+	sendable := demandOf(quiccongestion.ClassControl, quiccongestion.ClassBulk)
+	for range 5000 {
+		p := a.PermitAt(now, arbPacket)
+		if !p.OK {
+			t.Fatalf("refused with sendable work: %+v", p)
+		}
+		if p.Turn == quiccongestion.ClassInteractive {
+			a.OnEmptyBuild(now, p.Turn) // its datagram never fits
+			continue
+		}
+		a.OnSent(simBuilder(p, sendable, 0))
+	}
+	s := a.Stats().Served
+	if s[quiccongestion.ClassBulk] == 0 {
+		t.Fatal("BULK was starved while INTERACTIVE could not build")
+	}
+	if share := float64(s[quiccongestion.ClassBulk]) / float64(s[quiccongestion.ClassBulk]+s[quiccongestion.ClassControl]); share < 0.15 {
+		t.Fatalf("BULK share %.3f against CONTROL, want about its weight 0.2", share)
+	}
+}

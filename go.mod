@@ -17,4 +17,4 @@ require (
 	golang.org/x/crypto v0.57.0 // indirect
 )
 
-replace github.com/apernet/quic-go => github.com/bojieli/quic-go v0.61.1-0.20261125101006-50b847cee09c
+replace github.com/apernet/quic-go => github.com/bojieli/quic-go v0.61.1-0.20261125101756-f0fcc95866e7

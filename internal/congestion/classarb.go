@@ -172,19 +172,29 @@ func (a *ClassArbiter) PermitAt(now monotime.Time, maxBytes quiccongestion.ByteC
 		}
 	}
 	if turn == quiccongestion.ClassExempt {
-		// Every class with credit is passed over: give the turn to one with
-		// demand that is not, if any, before the round's credit says so.
+		// Every class with credit is passed over. The others are
+		// arbitrated by weight among themselves: replenished as if the
+		// passed-over classes had no demand, so no sendable class is left
+		// without a turn or a fill while another's work does not fit.
+		var eligible [quiccongestion.NumSendClasses]bool
 		var retry monotime.Time
 		for _, c := range scheduledClasses {
 			if !a.demand[c] {
 				continue
 			}
 			if !a.stuckAt(now, c) {
-				turn = c
-				break
+				eligible[c] = true
+				continue
 			}
 			if u := a.stuckUntil[c]; retry.IsZero() || u.Before(retry) {
 				retry = u
+			}
+		}
+		a.replenish(eligible)
+		for _, c := range scheduledClasses {
+			if eligible[c] && a.deficit[c] > 0 {
+				turn = c
+				break
 			}
 		}
 		if turn == quiccongestion.ClassExempt && !retry.IsZero() {
@@ -192,12 +202,9 @@ func (a *ClassArbiter) PermitAt(now monotime.Time, maxBytes quiccongestion.ByteC
 			// expires, which also schedules the retry.
 			return quiccongestion.Permit{RetryAt: retry}
 		}
-	}
-	if turn == quiccongestion.ClassExempt {
-		// No class has demand: an EXEMPT turn with no fill, so a packet
-		// that carries only an ACK charges no class. Work the demand query
-		// missed is found after the empty build refreshes demand.
-		return p
+		if turn == quiccongestion.ClassExempt {
+			return p
+		}
 	}
 	p.Turn = turn
 	a.turns[turn]++
@@ -250,11 +257,30 @@ func (a *ClassArbiter) normalize() {
 	if !anyDemand || anyPositive {
 		return
 	}
+	a.replenish(a.demand)
+}
+
+// replenish adds the fewest whole rounds of quanta to the classes marked
+// eligible that makes one of them positive, if none is. It must be called
+// with the lock held.
+func (a *ClassArbiter) replenish(eligible [quiccongestion.NumSendClasses]bool) {
+	found := false
+	for _, c := range scheduledClasses {
+		if eligible[c] {
+			if a.deficit[c] > 0 {
+				return
+			}
+			found = true
+		}
+	}
+	if !found {
+		return
+	}
 	// The fewest whole rounds after which some class with demand is
 	// positive.
 	rounds := int64(-1)
 	for _, c := range scheduledClasses {
-		if !a.demand[c] {
+		if !eligible[c] {
 			continue
 		}
 		step := a.weights[c] * a.quantum
@@ -265,7 +291,7 @@ func (a *ClassArbiter) normalize() {
 	}
 	a.round++
 	for _, c := range scheduledClasses {
-		if a.demand[c] {
+		if eligible[c] {
 			a.deficit[c] += rounds * a.weights[c] * a.quantum
 			// This round's quantum is given: a demand toggle within the
 			// round earns no second one.
