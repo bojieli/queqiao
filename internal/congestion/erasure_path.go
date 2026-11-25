@@ -73,8 +73,10 @@ func (p *ErasurePathSender) OnAttach(_ monotime.Time, inFlight, maxPacket quicco
 	p.attached = true
 	p.gauge = inFlight
 	p.wake = wake
-	if maxPacket > 0 && p.maxSize == 0 {
-		p.maxSize = maxPacket
+	// Path MTU discovery may have raised the packet size before the
+	// controller was installed on the run loop.
+	if maxPacket > 0 && maxPacket != p.maxSize {
+		p.SetMaxDatagramSize(maxPacket)
 	}
 }
 
@@ -103,8 +105,10 @@ func (p *ErasurePathSender) Admit(now monotime.Time, maxBytes quiccongestion.Byt
 // OnSent registers a packet as it was built.
 func (p *ErasurePathSender) OnSent(s quiccongestion.SentPacket) {
 	p.gauge = s.InFlight
-	if s.Kind == quiccongestion.KindPathProbe {
-		// Path probes are outside the flight and never reached the controller.
+	if s.Kind == quiccongestion.KindPathProbe && !s.InFlightCounted {
+		// Probes sent outside the flight never reached the controller. A
+		// path-validation packet on the current path is in flight and is
+		// accounted like any other.
 		return
 	}
 	e := p.Sender()

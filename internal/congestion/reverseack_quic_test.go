@@ -163,6 +163,7 @@ func runReverseAckDownloads(t *testing.T, v2 bool) (p50, p90 time.Duration, clie
 	var mu sync.Mutex
 	var latencies []time.Duration
 	var controllers []TelemetryProvider
+	var conns []*quic.Conn
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithTimeout(context.Background(), duration+10*time.Second)
 	defer cancel()
@@ -170,6 +171,13 @@ func runReverseAckDownloads(t *testing.T, v2 bool) (p50, p90 time.Duration, clie
 		cfg.Seed = int64(5 + i)
 		client, server, controller := reverseAckPair(t, cfg, upstream, downstream, v2)
 		controllers = append(controllers, controller)
+		conns = append(conns, client, server)
+		// Bound every stream operation below by the test's deadline.
+		stopAfter := context.AfterFunc(ctx, func() {
+			_ = client.CloseWithError(0, "deadline")
+			_ = server.CloseWithError(0, "deadline")
+		})
+		defer stopAfter()
 		bulk, err := server.OpenStreamSync(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -235,6 +243,13 @@ func runReverseAckDownloads(t *testing.T, v2 bool) (p50, p90 time.Duration, clie
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	if len(latencies) == 0 {
 		t.Fatal("no message arrived after the warm-up")
+	}
+	// Read the counters once nothing sends any more.
+	for _, c := range conns {
+		_ = c.CloseWithError(0, "")
+	}
+	for _, c := range conns {
+		<-c.Context().Done()
 	}
 	for _, c := range controllers {
 		tel := c.Telemetry()
