@@ -497,6 +497,12 @@ func (c *quicStreamConn) writeClass(p []byte, class quiccongestion.SendClass) (i
 	return c.stream.Write(p)
 }
 
+// classed says whether this lane's connection schedules classes.
+func (c *quicStreamConn) classed() bool {
+	_, ok := c.classScheduled()
+	return ok
+}
+
 // setBoost sets the stream's boost property, and reports whether the
 // connection schedules classes at all.
 func (c *quicStreamConn) setBoost(on bool) bool {
