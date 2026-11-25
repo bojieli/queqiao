@@ -992,8 +992,29 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 	return nil, nil, errors.Join(failures...)
 }
 
+// quicDialSocket names the socket a QUIC dial to remoteAddr listens on. A dial
+// with no local binding gets the wildcard of the gateway's own address family,
+// not a dual-stack socket. On macOS the kernel can give a dual-stack socket an
+// ephemeral port that an IPv4 socket elsewhere on the host already holds, and
+// the older IPv4 socket then receives every datagram sent to that port: the
+// gateway answers the handshake, the answers go to the other socket, and the
+// dial retransmits its first flight into silence until it times out. A socket
+// of the remote's own family is allocated from the same table as those IPv4
+// sockets, so it cannot be given a port one of them holds.
+func quicDialSocket(listenAddress string, remoteAddr *net.UDPAddr) (network, address string) {
+	if listenAddress != ":0" {
+		// A local binding names an address, which fixes the family.
+		return "udp", listenAddress
+	}
+	if remoteAddr.IP.To4() != nil {
+		return "udp4", "0.0.0.0:0"
+	}
+	return "udp6", "[::]:0"
+}
+
 func dialQUICAddress(dialCtx context.Context, remote string, remoteAddr *net.UDPAddr, tlsCfg *tls.Config, listenAddress string, composed func(string, string, syscall.RawConn) error, observeTransientWrite func(error), windows flowWindows, hop hopDialConfig) (*quic.Conn, net.PacketConn, error) {
-	packetConn, err := (&net.ListenConfig{Control: composed}).ListenPacket(dialCtx, "udp", listenAddress)
+	network, address := quicDialSocket(listenAddress, remoteAddr)
+	packetConn, err := (&net.ListenConfig{Control: composed}).ListenPacket(dialCtx, network, address)
 	if err != nil {
 		return nil, nil, err
 	}
