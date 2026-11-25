@@ -482,7 +482,13 @@ for l in {launchd}; do
   v=$(launchctl list 2>/dev/null | awk -v l="$l" '$3==l{{print $1, $2}}')
   if [ -n "$v" ]; then echo "launchd $l $v"; else echo "unit-error $l"; fi
 done
-ps -eo pid=,lstart=,args= 2>/dev/null | grep -i -E -- {pattern} | grep -v -F -- "$W/" | grep -v -E 'grep|ps -eo' | sed 's/^ */proc /'
+# "ps-ok" only when the process table was actually read: an empty list from
+# a failed ps must not read as "no production processes".
+if procs=$(ps -eo pid=,lstart=,args= 2>/dev/null) && [ -n "$procs" ]; then
+  echo ps-ok
+  printf '%s\n' "$procs" | grep -i -E -- {pattern} | grep -v -F -- "$W/" | grep -v -E 'grep|ps -eo' | sed 's/^ */proc /'
+  printf '%s\n' "$procs" | grep -F -- "$W/" | grep -v -F 'grep' | awk '{{$2=$3=$4=$5=$6=""; print}}' | sed 's/^ */leftover /;s/  */ /g'
+fi
 # "listen-ok" only when the listener table was actually read; without it the
 # preflight refuses, rather than trusting an empty list.
 if [ "$os" = Linux ]; then
@@ -497,7 +503,6 @@ elif command -v lsof >/dev/null 2>&1; then
     printf '%s\n' "$l" | awk 'NR>1{{print $8, $9}}' | sed -E 's/^([A-Z]+) .*:([0-9]+)$/listen \1 \2/' | tr 'A-Z' 'a-z'
   fi
 fi
-ps -eo pid=,args= 2>/dev/null | grep -F -- "$W/" | grep -v -F 'grep' | sed 's/^ */leftover /'
 exit 0
 '''
 
@@ -528,6 +533,7 @@ def parse_snapshot(text: str) -> dict:
         elif kind == "os":
             snap["os"] = rest.strip()
     snap["listen_ok"] = any(line.strip() == "listen-ok" for line in text.splitlines())
+    snap["ps_ok"] = any(line.strip() == "ps-ok" for line in text.splitlines())
     return snap
 
 
@@ -559,6 +565,8 @@ def refusal_reasons(cfg: Config, snaps: Dict[str, dict]) -> List[str]:
         snap = snaps.get(host, {})
         if not snap.get("listen_ok"):
             reasons.append(f"{host}: could not read the listening ports (need ss on Linux, lsof elsewhere)")
+        if not snap.get("ps_ok"):
+            reasons.append(f"{host}: could not read the process table (ps -eo pid=,lstart=,args=)")
         listening = snap.get("listen", set())
         for port, what in ports:
             if port in declared.get(host, {}):
@@ -1297,12 +1305,22 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             except Exception as e:
                 self.log(f"listener check on {host} failed: {e}")
 
-    def clean(self) -> None:
+    def clean(self) -> List[str]:
+        """Remove every reserved work directory; returns the hosts where that
+        failed, which stay reserved (and are reported) rather than assumed clean."""
+        failed: List[str] = []
         for host in list(self.reserved):
             W = self.w(host)
-            self.hosts[host].run(self.owned(host) + f"case {W} in */{self.cfg.work_dir}) rm -rf {W};; esac",
-                                 what="remove the work directory")
+            try:
+                rc, out = self.hosts[host].run(self.owned(host) + f"case {W} in */{self.cfg.work_dir}) rm -rf {W};; esac\n"
+                                               f"[ ! -e {W} ]", what="remove the work directory")
+            except Exception as e:
+                rc, out = -1, f"{type(e).__name__}: {e}"
+            if rc != 0 and not self.dry:
+                failed.append(f"{host}: {W} could not be removed ({out.strip()[:200]})")
+                continue
             self.reserved.remove(host)
+        return failed
 
     # -- driver
     def run(self, clean: bool = True, dry_blocks: int = 1) -> int:
@@ -1374,6 +1392,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             if tsv:
                 tsv.close()
             leftovers: List[str] = []
+            clean_failures: List[str] = []
             try:
                 self.teardown()
                 leftovers = self.verify_teardown()
@@ -1384,7 +1403,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             elif self.fetch_failures:
                 self.log(f"{len(self.fetch_failures)} log file(s) could not be fetched; the work directories are kept")
             elif clean:
-                self.clean()
+                clean_failures = self.clean()
             for sig, h in prev.items():
                 signal.signal(sig, h)
         production_unknown = False
@@ -1402,12 +1421,15 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         production = "changed" if self.production_changed else "unknown" if production_unknown else "unchanged"
         if leftovers and status == 0:
             status = 5
+        if clean_failures:
+            self.log("cleanup failed:\n  " + "\n  ".join(clean_failures))
+            status = status or 7
         if not self.dry:
             # The analyzers issue a verdict only for a campaign that finished,
             # cleaned up after itself and left production as it found it.
             with open(os.path.join(self.out, "status.json"), "w") as f:
                 json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
-                           "production": production, "teardown_leftovers": leftovers,
+                           "production": production, "teardown_leftovers": leftovers, "cleanup_failures": clean_failures,
                            "fetch_failures": self.fetch_failures, "finished_utc": utc(time.time())}, f, indent=2)
         return status
 

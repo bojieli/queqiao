@@ -60,7 +60,8 @@ built to refuse rather than to trust:
   - a planned temporary port is declared or already listening;
   - a host's listening ports could not be read (it needs `ss` on Linux and
     `lsof` elsewhere; an empty list is never trusted);
-  - a declared unit or launchd job cannot be observed;
+  - a declared unit or launchd job cannot be observed, or the process table
+    cannot be read;
   - a home directory contains anything but `[A-Za-z0-9._/-]`;
   - a process from an earlier campaign with the same name is still running.
 - **One directory per host, reserved.** Everything temporary lives under
@@ -232,7 +233,9 @@ A campaign directory holds:
   last two makes the runner keep the remote work directories, and a teardown
   leftover makes it exit with status 5. If the final production snapshot
   cannot be taken, the campaign is recorded as aborted with production
-  `unknown`, and the runner exits with status 6.
+  `unknown`, and the runner exits with status 6. A work directory that cannot
+  be removed stays reserved, is listed under `cleanup_failures`, and the
+  runner exits with status 7.
 
 The analyzer adds `per_trial.tsv` and `summary.md`.
 
@@ -338,13 +341,20 @@ and each client host is one leaf under a shared ancestor. The DC campaign
   millisecond times; otherwise latency and spread are unmeasured. This also
   relies on NTP-synchronised clocks.
 - **A shared sustained window:** every loaded leaf must have been
-  transferring together for at least 90% of the window. A leaf whose ssh
+  transferring together for at least 90% of the window. This is measured on
+  each leaf's actual transfer intervals, intersected across leaves; a leaf
+  that transferred at both ends of the window and idled in between did not
+  compete. A leaf whose ssh
   session missed the barrier runs late and alone, and its bytes are not
   service it received while competing. Otherwise that trial's aggregate,
   worst-leaf, fairness and binding measures are unmeasured.
 - **Calibration:** at the end of every block, each loaded leaf runs alone on
   the legacy arm. Every judged block needs its own usable calibration of every
-  loaded leaf; otherwise the campaign is INCOMPLETE.
+  loaded leaf, otherwise the campaign is INCOMPLETE. A calibration is usable
+  only if it ran backlogged for the window, because a short burst followed by
+  a failure would inflate the solo rate. With no usable calibration at all
+  (or `calibrate = false`), the binding is not measured, and the verdict is
+  INCOMPLETE rather than VOID.
 - **The temporary account** has no device or flow limit of its own, so the
   gateway's `--max-sessions` is the only admission limit. A campaign then
   measures the path rather than account admission.
@@ -486,13 +496,19 @@ together, registered by name in `scripts/ab_workloads.py`. The built-ins are
 
   | Rule | Contrast | For |
   |---|---|---|
-  | `atleast R` | `cand − R × main` | throughput |
-  | `atmost R` | `R × main − cand` | latency |
+  | `atleast R [A]` | `cand − (R × main − A)` | throughput |
+  | `atmost R [A]` | `(R × main + A) − cand` | latency, "≤ main × R + A" |
   | `higher M` | `cand − (main − M)` | a rate near 1, such as completion |
   | `lower M` | `(main + M) − cand` | a rate or latency near 0 |
+  | `floor V` | candidate ≥ V in every judged block | a hard assertion |
+  | `ceiling V` | candidate ≤ V in every judged block | a hard assertion |
 
-  Every measure the workload reports must have a rule, and every rule must
-  have evidence in every judged block. Otherwise the verdict is INCOMPLETE.
+  A key `*.metric` applies to that measure in every phase. Every measure the
+  workload reports must have a rule, unless the workload lists it in
+  `report_only`, and every rule must have evidence in every judged block.
+  Otherwise the verdict is INCOMPLETE. `block_extract(trials, plan)` gives
+  an arm's per-block measures. By default it is the mean of `extract` over
+  the arm's trials; a workload may pool their raw samples instead.
   A workload with no rules is never PASS. Mark new bounds provisional
   until a stage confirms them.
 

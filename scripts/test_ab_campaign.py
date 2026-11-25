@@ -89,6 +89,11 @@ class DryRun(unittest.TestCase):
         probe = next(l for l in text.splitlines() if "stop-probe-leaf-ctl" in l and "while [ $(date +%s) -lt $end ]" in l)
         self.assertRegex(probe, r"while \[ \$\(date \+%s\) -lt \d+ \]; do sleep 0.1; done; end=")
 
+    def test_bulk_windows_have_a_subsecond_deadline(self):
+        _, text = self.run_dry(EXAMPLE)
+        self.assertIn("end=$(awk -v n=\"$(now)\" 'BEGIN{printf \"%.3f\", n + 90.0}')", text)
+        self.assertIn("--max-time $rem", text)
+
     def test_dc_leaves_start_on_a_shared_barrier(self):
         _, text = self.run_dry(DC_EXAMPLE)
         self.assertRegex(text, r"while \[ \$\(date \+%s\) -lt \d+ \]; do sleep 0.1; done; end=")
@@ -257,6 +262,7 @@ class Config(unittest.TestCase):
 
 SNAP = """os Linux
 listen-ok
+ps-ok
 unit queqiaod active 1234 0 99999 exe=/usr/local/bin/queqiaod sha=abc
 proc 1234 Tue Nov 24 09:28:24 2026 /usr/local/bin/queqiaod server --listen :12540
 listen udp 12540
@@ -287,32 +293,39 @@ class Safety(unittest.TestCase):
 
     def test_clean_hosts_are_not_refused(self):
         cfg = parse(BASE)
-        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\nlisten-ok\n")}
+        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\nlisten-ok\nps-ok\n")}
         self.assertEqual(ab.refusal_reasons(cfg, snaps), [])
 
     def test_unreadable_listener_table_is_refused(self):
         cfg = parse(BASE)
-        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\n")}
+        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\nps-ok\n")}
         r = ab.refusal_reasons(cfg, snaps)
         self.assertEqual(len(r), 1)
         self.assertIn("c1: could not read the listening ports", r[0])
 
+    def test_unreadable_process_table_is_refused(self):
+        cfg = parse(BASE)
+        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\nlisten-ok\n")}
+        r = ab.refusal_reasons(cfg, snaps)
+        self.assertEqual(len(r), 1)
+        self.assertIn("c1: could not read the process table", r[0])
+
     def test_listening_planned_port_is_refused(self):
         cfg = parse(BASE)
-        snaps = {"gw": ab.parse_snapshot(SNAP + "listen tcp 23472\n"), "c1": ab.parse_snapshot("listen-ok\n")}
+        snaps = {"gw": ab.parse_snapshot(SNAP + "listen tcp 23472\n"), "c1": ab.parse_snapshot("listen-ok\nps-ok\n")}
         r = ab.refusal_reasons(cfg, snaps)
         self.assertEqual(len(r), 1)
         self.assertIn("23472 is already listening", r[0])
 
     def test_declared_production_port_is_refused(self):
         cfg = parse(BASE.replace("ports = 443 12540-12549", "ports = 443 23470-23480"))
-        r = ab.refusal_reasons(cfg, {"gw": ab.parse_snapshot("listen-ok"), "c1": ab.parse_snapshot("listen-ok")})
+        r = ab.refusal_reasons(cfg, {"gw": ab.parse_snapshot("listen-ok\nps-ok"), "c1": ab.parse_snapshot("listen-ok\nps-ok")})
         self.assertTrue(any("declared production port" in x for x in r), r)
         self.assertTrue(any("origin port 23480" in x for x in r), r)
 
     def test_unobservable_production_unit_is_refused(self):
         cfg = parse(BASE)
-        snaps = {"gw": ab.parse_snapshot("listen-ok\nunit-error queqiaod\n"), "c1": ab.parse_snapshot("listen-ok")}
+        snaps = {"gw": ab.parse_snapshot("listen-ok\nps-ok\nunit-error queqiaod\n"), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
         self.assertTrue(any("cannot be observed" in x for x in ab.refusal_reasons(cfg, snaps)))
         d = ab.snapshot_diff(ab.parse_snapshot(SNAP), ab.parse_snapshot(SNAP + "unit-error other\n"))
         self.assertTrue(any("can no longer be observed" in x for x in d))
@@ -326,7 +339,7 @@ class Safety(unittest.TestCase):
     def test_leftover_campaign_process_is_refused(self):
         cfg = parse(BASE)
         snaps = {"gw": ab.parse_snapshot(""),
-                 "c1": ab.parse_snapshot("leftover 42 /root/qq-ab-t1/cl-a-main/queqiaod client\n")}
+                 "c1": ab.parse_snapshot("listen-ok\nps-ok\nleftover 42 /root/qq-ab-t1/cl-a-main/queqiaod client\n")}
         self.assertTrue(any("earlier campaign" in x for x in ab.refusal_reasons(cfg, snaps)))
 
     def test_a_host_failing_during_reservation_releases_the_others(self):
@@ -354,12 +367,12 @@ class Safety(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             camp = ab.Campaign(parse(BASE), os.path.join(tmp, "out"), ".", dry=False, stream=io.StringIO())
-            changed = {"gw": ab.parse_snapshot(SNAP.replace("active 1234 0", "active 5678 1")), "c1": ab.parse_snapshot("listen-ok")}
-            same = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("listen-ok")}
+            changed = {"gw": ab.parse_snapshot(SNAP.replace("active 1234 0", "active 5678 1")), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
+            same = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
             snaps = iter([same, changed, same])  # before, mid-run, after: the change came and went
 
             def snapshot_all(self_, tag):
-                return next(snaps) if tag != "teardown" else {"gw": ab.parse_snapshot("listen-ok"), "c1": ab.parse_snapshot("listen-ok")}
+                return next(snaps) if tag != "teardown" else {"gw": ab.parse_snapshot("listen-ok\nps-ok"), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
 
             def run_block(self_, *a, **k):
                 self_.check_production("mid")
@@ -367,7 +380,7 @@ class Safety(unittest.TestCase):
                     mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
                     mock.patch.object(ab.Campaign, "setup"), mock.patch.object(ab.Campaign, "record_effective"), \
                     mock.patch.object(ab.Campaign, "run_block", run_block), mock.patch.object(ab.Campaign, "teardown"), \
-                    mock.patch.object(ab.Campaign, "clean"), mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), \
+                    mock.patch.object(ab.Campaign, "clean", return_value=[]), mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), \
                     mock.patch.object(ab.time, "sleep"):
                 rc = camp.run()
             status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
@@ -395,23 +408,58 @@ class Safety(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             camp = ab.Campaign(parse(BASE), os.path.join(tmp, "out"), ".", dry=False, stream=io.StringIO())
-            same = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("listen-ok")}
+            same = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
 
             def snapshot_all(self_, tag):
                 if tag == "after":
                     raise ab.Refused("gw: snapshot failed (exit 255)")
-                return same if tag != "teardown" else {"gw": ab.parse_snapshot("listen-ok"), "c1": ab.parse_snapshot("listen-ok")}
+                return same if tag != "teardown" else {"gw": ab.parse_snapshot("listen-ok\nps-ok"), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
             with mock.patch.object(ab.Campaign, "snapshot_all", snapshot_all), \
                     mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
                     mock.patch.object(ab.Campaign, "setup"), mock.patch.object(ab.Campaign, "record_effective"), \
                     mock.patch.object(ab.Campaign, "run_block"), mock.patch.object(ab.Campaign, "teardown"), \
-                    mock.patch.object(ab.Campaign, "clean"), mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), \
+                    mock.patch.object(ab.Campaign, "clean", return_value=[]), mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), \
                     mock.patch.object(ab.time, "sleep"):
                 rc = camp.run()
             status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
         self.assertEqual(rc, 6)
         self.assertEqual(status["status"], "aborted")
         self.assertEqual(status["production"], "unknown")
+
+    def test_a_cleanup_failure_reaches_the_status(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            camp = ab.Campaign(parse(BASE), os.path.join(tmp, "out"), ".", dry=False, stream=io.StringIO())
+            same = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
+            with mock.patch.object(ab.Campaign, "snapshot_all", return_value=same), \
+                    mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
+                    mock.patch.object(ab.Campaign, "setup"), mock.patch.object(ab.Campaign, "record_effective"), \
+                    mock.patch.object(ab.Campaign, "run_block"), mock.patch.object(ab.Campaign, "teardown"), \
+                    mock.patch.object(ab.Campaign, "verify_teardown", return_value=[]), \
+                    mock.patch.object(ab.Campaign, "clean", return_value=["gw: ~/qq-ab-t1 could not be removed"]), \
+                    mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), mock.patch.object(ab.time, "sleep"):
+                rc = camp.run()
+            status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
+        self.assertEqual(rc, 7)
+        self.assertEqual(status["status"], "aborted")
+        self.assertEqual(status["cleanup_failures"], ["gw: ~/qq-ab-t1 could not be removed"])
+
+    def test_clean_keeps_a_directory_it_could_not_remove(self):
+        cfg = parse(BASE)
+        camp = ab.Campaign(cfg, "/o", ".", dry=False, stream=io.StringIO())
+        camp.reserved = ["gw", "c1"]
+        for h in camp.hosts.values():
+            h.home = "/home/u"
+
+        def run(host_self, script, timeout=120, what=""):
+            if host_self.dest == "gw":
+                raise subprocess.TimeoutExpired("ssh", 120)
+            return 0, ""
+        with mock.patch.object(ab.Host, "run", run):
+            failed = camp.clean()
+        self.assertEqual(len(failed), 1)
+        self.assertIn("gw:", failed[0])
+        self.assertEqual(camp.reserved, ["gw"])     # c1 was cleaned anyway
 
     def test_refused_campaign_starts_nothing(self):
         cfg = parse(BASE)
@@ -613,10 +661,16 @@ class LocalProcesses(unittest.TestCase):
         camp.hosts["local"].home = self.home
         camp.cfg = cfg
         cfg.name = "t2"
-        with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\n")}), \
+        # preflight resolves $HOME through the shell: point it at the test's
+        # directory, so the reservation and its release happen there.
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\nps-ok\n")}), \
+                mock.patch.dict(os.environ, {"HOME": self.home}), \
+                mock.patch.object(ab.Campaign, "reserve", wraps=camp.reserve) as reserve, \
                 mock.patch.object(ab.Campaign, "build", side_effect=subprocess.CalledProcessError(1, "go")):
             with self.assertRaises(subprocess.CalledProcessError):
                 camp.run()
+        reserve.assert_called_once()
+        self.assertEqual(camp.hosts["local"].home, self.home)
         self.assertFalse(os.path.exists(os.path.join(self.home, "qq-ab-t2")))
         cfg.name = "t1"
 
@@ -656,12 +710,12 @@ class LocalProcesses(unittest.TestCase):
         self.assertEqual(len(self.camp.fetch_failures), 1)
 
     def test_teardown_leftovers_are_reported(self):
-        snap = {"local": ab.parse_snapshot("listen-ok\nlisten udp 23471\nleftover 99 " + self.W + "/gw-main/queqiaod server\n")}
+        snap = {"local": ab.parse_snapshot("listen-ok\nps-ok\nlisten udp 23471\nleftover 99 " + self.W + "/gw-main/queqiaod server\n")}
         with mock.patch.object(ab.Campaign, "snapshot_all", return_value=snap):
             left = self.camp.verify_teardown()
         self.assertTrue(any("gateway main port 23471 is still listening" in x for x in left), left)
         self.assertTrue(any("still running: 99" in x for x in left), left)
-        with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\n")}):
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\nps-ok\n")}):
             self.assertEqual(self.camp.verify_teardown(), [])
 
     def test_cpu_sampler_reads_a_busy_process(self):

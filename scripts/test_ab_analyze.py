@@ -272,6 +272,35 @@ class Analyzer(unittest.TestCase):
         self.assertIsNone(res[("p", "cand")])
         self.assertIn("VOID", text)
 
+    def test_an_http_error_is_a_failure_not_a_cap(self):
+        rows = [{"flow": "b1o1", "complete": "0", "curl_exit": "0", "http": "404", "seconds": "0.2",
+                 "t_start": "10.000", "t_end": "10.200", "client": "p"}]
+        self.assertEqual(an.capped_flows(rows, 20), 0)
+        self.assertFalse(an.flow_ok(rows))
+
+    def test_capping_is_checked_per_client(self):
+        # The same flow name on two leaves: one ran the whole window, the
+        # other ran out of bytes after 5 s. Grouped together the cap hides.
+        full = {"flow": "b1o1", "complete": "0", "curl_exit": "28", "http": "200", "seconds": "60",
+                "t_start": "0.000", "t_end": "60.000", "client": "la"}
+        short = {"flow": "b1o1", "complete": "1", "curl_exit": "0", "http": "200", "seconds": "5",
+                 "t_start": "0.000", "t_end": "5.000", "client": "lb"}
+        self.assertEqual(an.capped_by_client([short, full], 60), 1)
+
+    def test_a_pilot_with_zero_main_blocks_recommends_nothing(self):
+        text, res = an.pilot_report(self.campaign("zeropilot", cand_ratio=1.0, zero_main=(1, 2)), self.gates)
+        self.assertIsNone(res[("p", "cand")])
+        self.assertIn("delivered nothing", text)
+
+    def test_crossover_arms_show_both_commits(self):
+        root = self.campaign("xover", cand_ratio=1.0)
+        plan = json.loads(pathlib.Path(root, "plan.json").read_text())
+        plan["arms"]["cand"] = {"role": "candidate", "flags": [], "ref": "origin/main", "gateway_ref": "origin/main",
+                                "client_ref": "feat/x", "gateway_commit": "a" * 40, "client_commit": "c" * 40}
+        pathlib.Path(root, "plan.json").write_text(json.dumps(plan))
+        text, _ = an.report(root, self.measurable)
+        self.assertIn("gateway aaaaaaaaaaaa, client cccccccccccc", text)
+
     def test_looped_flow_completion(self):
         row = lambda f, c, e, h="200": {"flow": f, "complete": c, "curl_exit": e, "http": h}
         self.assertTrue(an.flow_ok([row("b1o1", "1", "0"), row("b1o2", "0", "28")]))

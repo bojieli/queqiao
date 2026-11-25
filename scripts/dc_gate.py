@@ -52,17 +52,49 @@ def leaf_rate(rows: List[dict]) -> float:
     return sum(useful(r) for r in rows) / secs if secs > 0 else float("nan")
 
 
+def merge(intervals: List[Tuple[float, float]], join: float = 0.5) -> List[Tuple[float, float]]:
+    """Union of intervals; ones less than `join` seconds apart (a flow's
+    back-to-back objects) are joined."""
+    out: List[List[float]] = []
+    for a, b in sorted(intervals):
+        if out and a <= out[-1][1] + join:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def intersect(x: List[Tuple[float, float]], y: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    out = []
+    for a, b in x:
+        for c, d in y:
+            lo, hi = max(a, c), min(b, d)
+            if hi > lo:
+                out.append((lo, hi))
+    return merge(out, 0.0)
+
+
+def active(rows: List[dict]) -> List[Tuple[float, float]]:
+    """When these rows were actually transferring: the union of their
+    millisecond intervals, each shrunk by the clock uncertainty."""
+    return merge([(a + OVERLAP_MIN, b - OVERLAP_MIN) for a, b in (x for x in (span(r) for r in rows) if x)
+                  if b - a > 2 * OVERLAP_MIN])
+
+
 def shared_window(rows: List[dict], leaves: List[str], duration: float, share: float = 0.9) -> bool:
-    """Every leaf was transferring together for at least `share` of the
-    window, on millisecond times less the clock uncertainty."""
-    iv = []
+    """Every leaf was transferring at the same time for at least `share` of
+    the window: the intersection, across leaves, of each leaf's actual
+    transfer intervals (not its first-to-last span, which would count a
+    leaf idle in the middle as competing)."""
+    if duration <= 0:
+        return True
+    common = None
     for leaf in leaves:
-        sp = [x for x in (span(r) for r in rows if r["client"] == leaf) if x]
-        if not sp:
+        iv = active([r for r in rows if r["client"] == leaf])
+        if not iv:
             return False
-        iv.append((min(a for a, _ in sp), max(b for _, b in sp)))
-    common = min(b for _, b in iv) - max(a for a, _ in iv) - 2 * OVERLAP_MIN
-    return duration <= 0 or common >= share * duration
+        common = iv if common is None else intersect(common, iv)
+    return sum(b - a for a, b in (common or [])) >= share * duration - 2 * OVERLAP_MIN
 
 
 def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: float, duration: float = 0.0) -> Dict[str, float]:
@@ -268,7 +300,11 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
         for t in solo:
             if t.block == b:
                 leaf = next((r["client"] for r in t.rows), None)
-                rates[leaf] = leaf_rate([r for r in t.rows if r["kind"] == "bulk"])
+                bulk = [r for r in t.rows if r["kind"] == "bulk"]
+                # A usable calibration ran backlogged for the window: a short
+                # burst that then failed would inflate the solo rate.
+                sustained = shared_window(bulk, [leaf], duration) and capped_flows(bulk, duration) == 0
+                rates[leaf] = leaf_rate(bulk) if sustained else float("nan")
         sim = [t.m["sim_rate"] for t in ab if t.block == b and t.arm == main]
         ok = (set(loaded) <= set(rates) and all(rates[x] == rates[x] and rates[x] > 0 for x in loaded)
               and sim and all(x == x for x in sim))
@@ -280,7 +316,12 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
         evidence_missing = evidence_missing + [f"{len(uncalibrated)} block(s) lack a usable solo calibration of every "
                                                f"loaded leaf (first: block {uncalibrated[0]})"]
     binding_mean = st.mean(binding)
-    bound_ok = binding_mean == binding_mean and binding_mean <= bounds["binding_max"]
+    # VOID only for a measured ratio over the bound; no ratio at all (no
+    # usable calibration, or calibrate = false) is missing evidence.
+    bound_ok = not (binding_mean == binding_mean) or binding_mean <= bounds["binding_max"]
+    if not binding:
+        evidence_missing = evidence_missing + ["no usable solo calibration: the ancestor's binding was not measured "
+                                               "(set [dc] calibrate = true)"]
     # The sustained outcome is bytes within the window; if a flow ran out of
     # bytes first, the arms are capped at the object size and look alike.
     capped = sum(int(t.m["capped"]) for t in ab)

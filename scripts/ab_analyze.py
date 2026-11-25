@@ -69,9 +69,16 @@ def load_gates(path: str = GATES) -> dict:
             rules = {}
             for k, v in cp[section].items():
                 parts = v.split()
-                if len(parts) != 2 or parts[0] not in RULES:
-                    raise SystemExit(f"gates: [{section}] {k}: want one of {', '.join(RULES)} and a number")
-                rules[k] = (parts[0], float(parts[1]))
+                kinds = list(RULES) + list(HARD)
+                if parts and parts[0] in ("atmost", "atleast") and len(parts) in (2, 3):
+                    pass
+                elif len(parts) != 2 or parts[0] not in kinds:
+                    raise SystemExit(f"gates: [{section}] {k}: want one of {', '.join(kinds)} and a number "
+                                     "(atmost/atleast take an optional absolute slack)")
+                try:
+                    rules[k] = (parts[0], tuple(float(x) for x in parts[1:]))
+                except ValueError:
+                    raise SystemExit(f"gates: [{section}] {k}: {v!r} is not a number")
             workloads[section.split(":", 1)[1]] = rules
     return {"ratio": p.getfloat("ratio"), "alpha": p.getfloat("alpha"), "workloads": workloads,
             "resamples": p.getint("bootstrap_resamples"), "seed": p.getint("bootstrap_seed"),
@@ -84,16 +91,25 @@ def load_gates(path: str = GATES) -> dict:
 # Per-workload rules ([workload:<name>] in gates.ini): each is a per-block
 # contrast d(cand, main) that must be positive at the one-sided (1 - alpha)
 # level by both the t and the bootstrap lower bound.
-RULES: Dict[str, Callable[[float, float, float], float]] = {
-    "atleast": lambda c, m, v: c - v * m,      # throughput: cand >= v x main
-    "atmost": lambda c, m, v: v * m - c,       # latency: cand <= v x main
-    "higher": lambda c, m, v: c - (m - v),     # a rate near 1: cand >= main - v
-    "lower": lambda c, m, v: (m + v) - c,      # a rate near 0, or a latency near 0: cand <= main + v
+# v is (multiplier,) or (multiplier, absolute slack) for atleast/atmost, as
+# in WORKLOADS.md 3.0's "m x main + a"; (margin,) for higher/lower.
+RULES: Dict[str, Callable[[float, float, Tuple[float, ...]], float]] = {
+    "atleast": lambda c, m, v: c - (v[0] * m - (v[1] if len(v) > 1 else 0.0)),  # throughput: cand >= m x main - a
+    "atmost": lambda c, m, v: (v[0] * m + (v[1] if len(v) > 1 else 0.0)) - c,   # latency: cand <= m x main + a
+    "higher": lambda c, m, v: c - (m - v[0]),     # a rate near 1: cand >= main - v
+    "lower": lambda c, m, v: (m + v[0]) - c,      # a rate near 0, or a latency near 0: cand <= main + v
+}
+# Hard assertions on the candidate alone, in every judged block ("not
+# statistical", WORKLOADS.md): floor v (cand >= v), ceiling v (cand <= v).
+HARD: Dict[str, Callable[[float, Tuple[float, ...]], bool]] = {
+    "floor": lambda c, v: c >= v[0],
+    "ceiling": lambda c, v: c <= v[0],
 }
 
 
-def rule_contrasts(kind: str, value: float, cand: Sequence[float], main: Sequence[float]) -> List[float]:
-    return [RULES[kind](c, m, value) for c, m in zip(cand, main)]
+def rule_contrasts(kind: str, value, cand: Sequence[float], main: Sequence[float]) -> List[float]:
+    v = value if isinstance(value, tuple) else (float(value),)
+    return [RULES[kind](c, m, v) for c, m in zip(cand, main)]
 
 
 def opener(p: str):
@@ -202,6 +218,13 @@ def flow_ok(rows: List[dict]) -> bool:
     return last["complete"] == "1" or (looped and last.get("http") == "200" and last.get("curl_exit") == "28")
 
 
+def capped_by_client(rows: List[dict], duration: float) -> int:
+    """capped_flows per client: flow names repeat across clients (b1o1 on
+    every leaf), so they are grouped one client at a time."""
+    clients = sorted({r.get("client", "") for r in rows})
+    return sum(capped_flows([r for r in rows if r.get("client", "") == c], duration) for c in clients)
+
+
 def capped_flows(rows: List[dict], duration: float) -> int:
     """Bulk flows that ran out of bytes before the window closed: the last
     object finished (curl exit 0) and the flow was active for clearly less
@@ -212,7 +235,9 @@ def capped_flows(rows: List[dict], duration: float) -> int:
     slack = max(2.0, 0.05 * duration)
     for rs in flow_rows(rows).values():
         last = rs[-1]
-        if last.get("curl_exit") != "0":
+        # Only a flow whose last object arrived whole ran out of bytes; an
+        # HTTP error or a failed transfer is a failure of the arm, not a cap.
+        if last.get("curl_exit") != "0" or last.get("complete") != "1":
             continue
         spans = [span(r) for r in rs]
         active = (spans[-1][1] - spans[0][0]) if all(spans) else sum(float(r["seconds"] or 0) for r in rs)
@@ -448,7 +473,7 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         t.m["flows"] = len(flows)
         t.m["ok"] = sum(1 for rs in flows.values() if flow_ok(rs))
         t.m["completion"] = t.m["ok"] / len(flows) if flows else float("nan")
-        t.m["capped"] = capped_flows(bulk, float(plan.get("config", {}).get("duration") or 0))
+        t.m["capped"] = capped_by_client(bulk, float(plan.get("config", {}).get("duration") or 0))
         sent = d("queqiao_quic_packets_sent")
         t.m["loss"] = d("queqiao_quic_loss_observed_packets_total") / sent if sent and sent == sent else float("nan")
         t.m["stalls_per_trial"] = d("queqiao_flow_stalls_detected_total")
@@ -590,6 +615,16 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
     for t in trials.values():
         t.m.update(wl.extract(t, plan))
     rules = gates.get("workloads", {}).get(wl.name, {})
+    # The arm's per-block measures, as the workload defines them (pooled or
+    # averaged), for the rules.
+    block_cache: Dict[Tuple[str, int, str], Dict[str, float]] = {}
+
+    def block_measures(path: str, block: int, arm: str) -> Dict[str, float]:
+        k = (path, block, arm)
+        if k not in block_cache:
+            ts_ = [t for t in trials.values() if t.path == path and t.block == block and t.arm == arm]
+            block_cache[k] = wl.block_extract(ts_, plan) if ts_ else {}
+        return block_cache[k]
     main = plan["main"]
     arms = [main] + [a for a in plan["arms"] if a != main]
     paths = plan["paths"]
@@ -602,12 +637,13 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
     out: List[str] = []
     verdicts: dict = {}
     def sha(a: str) -> str:
+        """What the arm ran: its resolved endpoint commits, both when they differ."""
         e = plan["arms"][a]
-        if e.get("commit") or e.get("ref"):
-            return (e.get("commit") or e.get("ref"))[:12]
-        if e.get("gateway_ref"):
-            return f"gateway {(e.get('gateway_commit') or e['gateway_ref'])[:12]}, client {(e.get('client_commit') or e['client_ref'])[:12]}"
-        return ""
+        g = e.get("gateway_commit") or e.get("gateway_ref") or e.get("commit") or e.get("ref") or ""
+        c = e.get("client_commit") or e.get("client_ref") or e.get("commit") or e.get("ref") or ""
+        if g != c:
+            return f"gateway {g[:12]}, client {c[:12]}"
+        return g[:12]
     out.append(f"## Live A/B: {os.path.basename(os.path.normpath(campaign))}")
     out.append("")
     out.append("Arms: " + "; ".join(f"`{a}` ({plan['arms'][a]['role']}, {sha(a) or 'binary'}"
@@ -700,23 +736,59 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
                     verdicts[(path, cand, key)] = verdict
                     out.append(f"| {SECONDARY_LABELS.get(key, key)} | {cand} | {n} | {fmt(mdiff, '.4g')} | "
                                f"{'upper' if upper else 'lower'} {fmt(bound, '.4g')} | {'+' if upper else '-'}{margin:g} | {verdict} |")
-        if rules:
+        # Expand the rules against the measures this path reported: "*.m"
+        # applies to measure m of every phase. A reported measure without a
+        # rule (and not report-only) leaves the workload INCOMPLETE.
+        blocks_here = sorted({t.block for t in trials.values() if t.path == path})
+        keys = sorted({k for b in blocks_here for a_ in arms for k in block_measures(path, b, a_)})
+        judged_rules: Dict[str, Tuple[str, Tuple[float, ...]]] = {}
+        unruled: List[str] = []
+        for k in keys:
+            metric = k.split(".", 1)[-1]
+            rule = rules.get(k) or rules.get(f"*.{metric}")
+            if rule:
+                judged_rules[k] = rule
+            elif metric not in wl.report_only:
+                unruled.append(k)
+        if keys:
+            out += ["", f"**{wl.name} measures, per block (mean over blocks), {path}**", "",
+                    "| measure | " + " | ".join(arms) + " |", "|---|" + "---:|" * len(arms)]
+            for k in keys:
+                cells = [fmt(st.mean([block_measures(path, b, a_).get(k, float("nan")) for b in blocks_here]), ".4g")
+                         for a_ in arms]
+                tag = "" if k in judged_rules else (" (report only)" if k not in unruled else " (**no rule**)")
+                out.append(f"| {k}{tag} | " + " | ".join(cells) + " |")
+        if judged_rules:
             out += ["", f"**{wl.name} rules (pre-registered in gates.ini [workload:{wl.name}]), {path}**", "",
                     "| measure | rule | candidate | blocks | mean contrast | t lower bound | bootstrap lower bound | verdict |",
                     "|---|---|---|---:|---:|---:|---:|---|"]
-            for key, (kind, value) in rules.items():
+            for key, (kind, values) in judged_rules.items():
                 for cand in arms[1:]:
-                    c, m, common = paired(trials, path, main, cand, lambda ts_, k=key: block_metric(ts_, k))
-                    d = [x for x in rule_contrasts(kind, value, c, m) if x == x]
-                    mean_d, tl, bl, ok = st.lower_bounds(d, gates["alpha"], gates["resamples"], gates["seed"])
+                    common = [b for b in blocks_here if block_measures(path, b, cand) and block_measures(path, b, main)]
+                    c = [block_measures(path, b, cand).get(key, float("nan")) for b in common]
+                    m = [block_measures(path, b, main).get(key, float("nan")) for b in common]
                     need = math.ceil(gates["secondary_min_coverage"] * judged.get(cand, len(common)) - 1e-9)
-                    verdict = "n/a" if len(d) < max(need, 2) else ("pass" if ok else "**FAIL**")
+                    measured = [(x, y) for x, y in zip(c, m) if x == x and (y == y or kind in HARD)]
+                    if kind in HARD:
+                        ok = bool(measured) and all(HARD[kind](x, values) for x, _ in measured)
+                        mean_d, tl, bl = float("nan"), float("nan"), float("nan")
+                    else:
+                        d = rule_contrasts(kind, values, [x for x, _ in measured], [y for _, y in measured])
+                        mean_d, tl, bl, ok = st.lower_bounds(d, gates["alpha"], gates["resamples"], gates["seed"])
+                    verdict = "n/a" if len(measured) < max(need, 2) else ("pass" if ok else "**FAIL**")
                     verdicts[(path, cand, f"rule:{key}")] = verdict
-                    out.append(f"| {key} | {kind} {value:g} | {cand} | {len(d)} | {fmt(mean_d, '.4g')} | {fmt(tl, '.4g')} | "
-                               f"{fmt(bl, '.4g')} | {verdict} |")
+                    out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {len(measured)} | "
+                               f"{fmt(mean_d, '.4g')} | {fmt(tl, '.4g')} | {fmt(bl, '.4g')} | {verdict} |")
+        for k in unruled:
+            for cand in arms[1:]:
+                verdicts[(path, cand, f"rule:{k}")] = "n/a"
+        if unruled:
+            out += ["", f"Measures without a rule in gates.ini [workload:{wl.name}] (the verdict stays INCOMPLETE): "
+                    + ", ".join(f"`{k}`" for k in unruled)]
+        rule_keys = list(judged_rules) + unruled
         for cand in arms[1:]:
             prim = verdicts[(path, cand, "primary")]
-            sv = [verdicts[(path, cand, k)] for k in secondary] + [verdicts[(path, cand, f"rule:{k}")] for k in rules]
+            sv = [verdicts[(path, cand, k)] for k in secondary] + [verdicts[(path, cand, f"rule:{k}")] for k in rule_keys]
             fails, missing = sv.count("**FAIL**"), sv.count("n/a")
             prim_ok = prim == "**PASS**" or (prim == "n/a" and not wl.primary)
             overall = ("INCOMPLETE" if problems or prim == "INCOMPLETE" else
@@ -754,7 +826,7 @@ def pilot_report(campaign: str, gates: dict) -> Tuple[str, dict]:
     duration = float(plan.get("config", {}).get("duration") or 0)
     for t in trials.values():
         t.m["useful_bytes"] = t.useful_bytes()
-        t.m["capped"] = capped_flows(t.bulk(), duration)
+        t.m["capped"] = capped_by_client([r for r in t.bulk() if r["phase"] in ("main", "sustained")], duration)
     main = plan["main"]
     arms = [a for a in plan["arms"] if a != main]
     out = [f"## Pilot: {os.path.basename(os.path.normpath(campaign))}", "",
@@ -774,6 +846,13 @@ def pilot_report(campaign: str, gates: dict) -> Tuple[str, dict]:
                 continue
             capped = sum(int(t.m["capped"]) for t in trials.values()
                          if t.path == path and t.arm in (main, cand) and t.block in set(common))
+            zero = sum(1 for x in m if x == 0) / len(m)
+            if zero > gates["max_zero_main_fraction"]:
+                # The primary gate would void this data; do not size from it.
+                res[(path, cand)] = None
+                out.append(f"| {path} | {cand} | {len(common)} | n/a | n/a | VOID: {zero:.0%} of main's blocks "
+                           "delivered nothing; rerun the pilot |")
+                continue
             if capped:
                 res[(path, cand)] = None
                 out.append(f"| {path} | {cand} | {len(common)} | n/a | n/a | VOID: {capped} bulk flow(s) ran out of "

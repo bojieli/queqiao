@@ -324,6 +324,43 @@ class DCGate(unittest.TestCase):
         self.assertEqual(m["waves_overlap"], 0.0)
         self.assertNotEqual(m["latency_p50"], m["latency_p50"])
 
+    def test_a_leaf_idle_in_the_middle_did_not_compete(self):
+        # Two short transfers at the ends of the window span it, but the
+        # leaf was idle in between: not concurrent load.
+        root = os.path.join(self.tmp.name, "gap")
+        write_dc(root, blocks=2)
+        plan, trials = dc.read_campaign(root)
+        t = next(t for t in trials.values() if t.arm == "legacy" and t.slot < 100)
+        rows = [r for r in t.rows if r["client"] == "lb" and r["phase"] == "sustained"]
+        start = float(rows[0]["t_start"])
+        rows[0]["t_end"] = ms(start + 3)
+        rows[1]["t_start"], rows[1]["t_end"] = ms(start + 57), ms(start + 60)
+        m = dc.dc_measures(t, LOADED, "ctl", 30, 60)
+        self.assertNotEqual(m["jain"], m["jain"])
+
+    def test_a_solo_burst_that_failed_is_not_a_calibration(self):
+        root = os.path.join(self.tmp.name, "shortsolo")
+        write_dc(root)
+        path = os.path.join(root, "trials.tsv")
+        lines = pathlib.Path(path).read_text().splitlines()
+        out = [lines[0]]
+        for line in lines[1:]:
+            f = line.split("\t")
+            if f[7] == "solo" and f[9] == "la":
+                # 2 s of transfer, then a failure: a high but unsustained rate.
+                f[16], f[17], f[18], f[21] = "2", "7", "0", ms(float(f[20]) + 2)
+            out.append("\t".join(f))
+        pathlib.Path(path).write_text("\n".join(out) + "\n")
+        text, v = dc.evaluate(root, self.bounds)
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("lack a usable solo calibration", text)
+
+    def test_no_calibration_at_all_is_missing_evidence_not_void(self):
+        text, v = self.run_gate("nocal", no_solo=tuple((b, leaf) for b in range(1, 13) for leaf in LOADED))
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("binding was not measured", text)
+        self.assertNotIn("add load", text)
+
     def test_unfinished_campaign_gets_no_verdict(self):
         root = os.path.join(self.tmp.name, "unfinished")
         write_dc(root)

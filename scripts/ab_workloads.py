@@ -129,6 +129,10 @@ class Workload:
     """Defaults describe one measured path per client and no extra endpoint."""
     name = ""
     section = ""                    # its config section; "" means [workload:<name>]
+    # Measure names (the part after "<phase>.") reported for context but not
+    # judged. Every other extracted measure must have a rule in gates.ini,
+    # or the workload's verdict is INCOMPLETE.
+    report_only: Tuple[str, ...] = ()
     analyzer = "ab_analyze"         # or "dc_gate"
     # True: the section 15.4 primary gate on useful bytes (and the
     # [secondary] bounds) applies; False: only the [workload:<name>] rules.
@@ -179,6 +183,18 @@ class Workload:
         """Per-trial measures, "<phase>.<metric>", for the rules in gates.ini."""
         return {}
 
+    def block_extract(self, trials: Sequence[Any], plan: dict) -> Dict[str, float]:
+        """An arm's measures for one block. By default the mean of its
+        trials' measures, NaN unless every trial has the measure; a workload
+        may instead pool its trials' raw samples."""
+        per = [self.extract(t, plan) for t in trials]
+        keys = set().union(*per) if per else set()
+        out = {}
+        for k in keys:
+            vals = [p.get(k, float("nan")) for p in per]
+            out[k] = sum(vals) / len(vals) if vals and all(v == v for v in vals) else float("nan")
+        return out
+
 
 # --- built-in generators ------------------------------------------------------------
 
@@ -206,8 +222,12 @@ def bulk_script(campaign: Any, job: Job, arm: Any, duration: float, start_at: in
     the same total as a slow one."""
     url, curl = _curl(campaign, job, arm)
     obj = job.params.get("object_bytes", campaign.cfg.object_bytes)
-    return (ab.NOW_SH + _barrier(start_at) + f"end=$(( $(date +%s) + {int(duration)} )); "
-            f"for i in $(seq 1 {job.n}); do ( k=0; while :; do rem=$(( end - $(date +%s) )); [ $rem -gt 0 ] || break; "
+    # One sub-second deadline for every flow; each object gets exactly the
+    # time left (curl takes a fractional --max-time).
+    return (ab.NOW_SH + _barrier(start_at) + f"end=$(awk -v n=\"$(now)\" 'BEGIN{{printf \"%.3f\", n + {float(duration)}}}'); "
+            f"for i in $(seq 1 {job.n}); do ( k=0; while :; do "
+            f"rem=$(awk -v e=\"$end\" -v n=\"$(now)\" 'BEGIN{{r = e - n; if (r < 0.05) print 0; else printf \"%.3f\", r}}'); "
+            f"[ \"$rem\" != 0 ] || break; "
             f"k=$((k+1)); t0=$(now); r=$({curl} --max-time $rem {url}obj-{obj} 2>/dev/null); t1=$(now); "
             f"{_ROW} \"b${{i}}o$k\" \"$r\"; "
             f"[ \"${{r##*$'\\t'}}\" = 0 ] && [ \"${{r%%$'\\t'*}}\" = 200 ] || break; done ) & done; wait")

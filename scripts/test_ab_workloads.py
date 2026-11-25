@@ -147,7 +147,7 @@ class Plugins(unittest.TestCase):
     def gates(self):
         g = an.load_gates()
         g["resamples"] = 2000
-        g["workloads"] = {"toy": {"main.echo_p99_s": ("atmost", 1.10)}}
+        g["workloads"] = {"toy": {"main.echo_p99_s": ("atmost", (1.10,))}}
         return g
 
     def test_rules_judge_a_plugins_measures(self):
@@ -163,6 +163,36 @@ class Plugins(unittest.TestCase):
         self.assertEqual(v[("a", "cand", "rule:main.echo_p99_s")], "**FAIL**")
         self.assertEqual(v[("a", "cand", "overall")], "FAIL")
 
+    def test_a_measure_without_a_rule_withholds_the_verdict(self):
+        # The plugin reports echo_p99_s; give the gates a rule for another
+        # measure only. A passing rule must not hide an unjudged measure.
+        root = os.path.join(self.tmp.name, "unruled")
+        self.write_campaign(root, 1.0)
+        g = self.gates()
+        g["workloads"] = {"toy": {"main.other_s": ("atmost", (1.10,))}}
+        text, v = an.report(root, g)
+        self.assertEqual(v[("a", "cand", "overall")], "INCOMPLETE")
+        self.assertIn("no rule", text)
+        # Declared report-only, it is shown and not judged.
+        toy = wl.WORKLOADS["toy"]
+        with mock.patch.object(toy, "report_only", ("echo_p99_s",)):
+            g["workloads"] = {"toy": {}}
+            text, v = an.report(root, g)
+        self.assertIn("main.echo_p99_s (report only)", text)
+        self.assertNotIn(("a", "cand", "rule:main.echo_p99_s"), v)
+        self.assertEqual(v[("a", "cand", "overall")], "INCOMPLETE")   # nothing judged is not a pass
+
+    def test_wildcard_and_hard_rules(self):
+        root = os.path.join(self.tmp.name, "wild")
+        self.write_campaign(root, 1.0)
+        g = self.gates()
+        g["workloads"] = {"toy": {"*.echo_p99_s": ("ceiling", (1.0,))}}
+        _, v = an.report(root, g)
+        self.assertEqual(v[("a", "cand", "rule:main.echo_p99_s")], "pass")
+        g["workloads"] = {"toy": {"*.echo_p99_s": ("ceiling", (0.01,))}}
+        _, v = an.report(root, g)
+        self.assertEqual(v[("a", "cand", "rule:main.echo_p99_s")], "**FAIL**")
+
     def test_a_workload_with_no_rules_is_not_passed(self):
         root = os.path.join(self.tmp.name, "norules")
         self.write_campaign(root, 1.0)
@@ -175,6 +205,10 @@ class Plugins(unittest.TestCase):
 class Rules(unittest.TestCase):
     def test_rule_contrasts(self):
         self.assertEqual(an.rule_contrasts("atleast", 0.9, [90, 100], [100, 100]), [0.0, 10.0])
+        # "m x main + a" (WORKLOADS.md 3.0): 1.15 x 0.2 + 0.05 = 0.28.
+        self.assertAlmostEqual(an.rule_contrasts("atmost", (1.15, 0.05), [0.27], [0.2])[0], 0.01)
+        self.assertTrue(an.HARD["floor"](0.995, (0.99,)))
+        self.assertFalse(an.HARD["ceiling"](1.2, (1.15,)))
         self.assertAlmostEqual(an.rule_contrasts("atmost", 1.1, [0.11], [0.1])[0], 0.0)
         self.assertAlmostEqual(an.rule_contrasts("higher", 0.02, [0.97], [1.0])[0], -0.01)
         self.assertAlmostEqual(an.rule_contrasts("lower", 0.005, [0.004], [0.0])[0], 0.001)
@@ -186,7 +220,10 @@ class Rules(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 an.load_gates(str(p))
             p.write_text(pathlib.Path(an.GATES).read_text() + "\n[workload:x]\nmain.a = atmost 1.10\n")
-            self.assertEqual(an.load_gates(str(p))["workloads"]["x"], {"main.a": ("atmost", 1.10)})
+            self.assertEqual(an.load_gates(str(p))["workloads"]["x"], {"main.a": ("atmost", (1.10,))})
+            p.write_text(pathlib.Path(an.GATES).read_text() + "\n[workload:x]\n*.a = atmost 1.15 0.05\nmain.b = floor 0.99\n")
+            self.assertEqual(an.load_gates(str(p))["workloads"]["x"],
+                             {"*.a": ("atmost", (1.15, 0.05)), "main.b": ("floor", (0.99,))})
 
 
 if __name__ == "__main__":
