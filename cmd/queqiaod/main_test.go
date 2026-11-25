@@ -351,3 +351,32 @@ func TestMemoryBundleIsValidatedAtStartup(t *testing.T) {
 		}
 	}
 }
+
+// The coded-retry bundle (design §14 stage 4) requires cc-api=v2, and any
+// other spelling is refused at start-up.
+func TestCodedRetryBundleIsValidatedAtStartup(t *testing.T) {
+	for _, client := range []bool{true, false} {
+		if opts := parseRuntimeForTest(t, client); opts.codedRetry != "legacy" {
+			t.Fatalf("default coded-retry bundle = %q", opts.codedRetry)
+		}
+		if opts := parseRuntimeForTest(t, client, "--cc-api=v2", "--coded-retry=sticky"); opts.codedRetry != "sticky" {
+			t.Fatalf("coded-retry bundle = %q", opts.codedRetry)
+		}
+		for _, args := range [][]string{
+			{"--coded-retry=sticky"},
+			{"--cc-api=v1", "--coded-retry=sticky"},
+			{"--cc-api=v2", "--coded-retry=eager"},
+		} {
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			var opts runtimeOptions
+			bindRuntimeFlags(fs, &opts, client)
+			if err := fs.Parse(args); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateRuntime(opts, client); err == nil {
+				t.Errorf("client=%v %v accepted", client, args)
+			}
+		}
+	}
+}

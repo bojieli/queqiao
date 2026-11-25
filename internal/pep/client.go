@@ -169,7 +169,10 @@ type ClientConfig struct {
 	CCAPI CCAPIVersion
 	// Sched selects how a QUIC connection orders the classes of work it
 	// sends; see SchedMode. Empty is legacy. Class requires CCAPI v2.
-	Sched                         SchedMode
+	Sched SchedMode
+	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
+	// is legacy.
+	CodedRetry                    CodedRetryMode
 	BrutalBytesPerSec             uint64
 	AdaptiveMinBytesSec           uint64
 	AdaptiveMaxBytesSec           uint64
@@ -651,6 +654,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := validateSched(&cfg.Sched, cfg.CCAPI); err != nil {
 		return nil, err
 	}
+	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
+		return nil, err
+	}
 	if cfg.AdaptiveMinBytesSec == 0 {
 		cfg.AdaptiveMinBytesSec = defaultAdaptiveMinBytesPerSec
 	}
@@ -1043,6 +1049,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
 	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
 	flowSession.memOwned = c.cfg.Memory == MemoryOwned
+	flowSession.codedRetrySticky = c.cfg.CodedRetry == CodedRetrySticky
 	flowSession.wire = flow.fc.wire
 	c.declareClass(ctx, inner, flowSession)
 	flowSession.ackRanges.Store(true)

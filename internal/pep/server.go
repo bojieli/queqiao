@@ -62,7 +62,10 @@ type ServerConfig struct {
 	CCAPI CCAPIVersion
 	// Sched selects how a QUIC connection orders the classes of work it
 	// sends; see SchedMode. Empty is legacy. Class requires CCAPI v2.
-	Sched                         SchedMode
+	Sched SchedMode
+	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
+	// is legacy.
+	CodedRetry                    CodedRetryMode
 	BrutalBytesPerSec             uint64
 	AdaptiveMinBytesSec           uint64
 	AdaptiveMaxBytesSec           uint64
@@ -360,6 +363,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, err
 	}
 	if err := validateSched(&cfg.Sched, cfg.CCAPI); err != nil {
+		return nil, err
+	}
+	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
 		return nil, err
 	}
 	if cfg.AdaptiveMinBytesSec == 0 {
@@ -913,6 +919,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
 	flow.classifier = classifier.New(s.classifierConfig())
 	flow.memOwned = s.cfg.Memory == MemoryOwned
+	flow.codedRetrySticky = s.cfg.CodedRetry == CodedRetrySticky
 	// Wire version 1 requires range acknowledgements on both endpoints.
 	flow.ackRanges.Store(true)
 	flow.idleTimeout = s.cfg.FlowIdleTimeout

@@ -425,7 +425,17 @@ func TestQUICOneLaneSOCKSEndToEndUnderSchedClass(t *testing.T) {
 	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, SchedClass)
 }
 
-func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedMode) {
+// The coded-retry bundle starts, both ends, on top of cc-api=v2, and carries
+// the same flows.
+func TestQUICOneLaneSOCKSEndToEndUnderCodedRetry(t *testing.T) {
+	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, "", CodedRetrySticky)
+}
+
+func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedMode, codedRetry ...CodedRetryMode) {
+	var retry CodedRetryMode
+	if len(codedRetry) > 0 {
+		retry = codedRetry[0]
+	}
 	destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -442,7 +452,7 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedM
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
-		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond, CCAPI: ccAPI, Sched: sched,
+		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond, CCAPI: ccAPI, Sched: sched, CodedRetry: retry,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -453,7 +463,7 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedM
 	}
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true, Logger: logger,
-		Metrics: metrics.New(), CCAPI: ccAPI, Sched: sched,
+		Metrics: metrics.New(), CCAPI: ccAPI, Sched: sched, CodedRetry: retry,
 	})
 	if err != nil {
 		t.Fatal(err)
