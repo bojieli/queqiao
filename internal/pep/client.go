@@ -2823,7 +2823,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 			}
 			// Reactive isolation, or under topology=single only an explicit
 			// fan-out (§7).
-			if !c.secondConnectionWanted(snapshot, flowGeneration(flow)) {
+			if !c.secondConnectionWanted(snapshot, func() *controlQUICGeneration { return flowGeneration(flow) }) {
 				continue
 			}
 			// Do not consume the decision interval while the flow is still NEW

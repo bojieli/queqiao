@@ -130,7 +130,7 @@ func TestSingleTopologyIsolatesOnlyForAnExplicitFanOut(t *testing.T) {
 			client.quicPoolActive.Store(c.shared)
 			generation := &controlQUICGeneration{}
 			generation.flows.Store(c.shared)
-			if got := client.secondConnectionWanted(c.snapshot, generation); got != c.want {
+			if got := client.secondConnectionWanted(c.snapshot, func() *controlQUICGeneration { return generation }); got != c.want {
 				t.Fatalf("secondConnectionWanted = %v, want %v", got, c.want)
 			}
 			if got := client.maxBulkConns(); got != c.budget {
@@ -904,17 +904,17 @@ func TestFanOutJudgesSharingPerGeneration(t *testing.T) {
 	if n := client.quicPoolActive.Load(); n != 2 {
 		t.Fatalf("pooled flows across generations = %d, want 2 (the count the old trigger read)", n)
 	}
-	if client.secondConnectionWanted(bulk, replacement) {
+	if client.secondConnectionWanted(bulk, func() *controlQUICGeneration { return replacement }) {
 		t.Fatal("a bulk flow alone on the replacement fans out because a flow drains on the old generation")
 	}
 	_, again := pooled(3)
 	if again != replacement {
 		t.Fatal("the second flow landed on another generation")
 	}
-	if !client.secondConnectionWanted(bulk, replacement) {
+	if !client.secondConnectionWanted(bulk, func() *controlQUICGeneration { return replacement }) {
 		t.Fatal("a bulk flow sharing the replacement does not fan out")
 	}
-	if client.secondConnectionWanted(bulk, nil) {
+	if client.secondConnectionWanted(bulk, func() *controlQUICGeneration { return nil }) {
 		t.Fatal("a flow on no pooled generation fans out")
 	}
 }

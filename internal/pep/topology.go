@@ -62,14 +62,18 @@ func (c *Client) fanOutConnections() int {
 // connection budget (maxBulkConns). An automatic trigger belongs here, as a
 // further condition on a measured ceiling.
 //
-// Sharing is judged on the flow's own generation (generation, nil when the
-// flow is not on a pooled stream): after a handover a flow still draining on
+// Sharing is judged on the flow's own generation (generation reports it, nil
+// when the flow is not on a pooled stream; it is consulted only when a
+// fan-out is configured): after a handover a flow still draining on
 // the old generation does not share the replacement with a lone bulk flow,
 // and moving that flow would spend a handshake and the fan-out slot for
 // nothing. Isolation keeps today's client-wide count.
-func (c *Client) secondConnectionWanted(snapshot flowSnapshot, generation *controlQUICGeneration) bool {
+func (c *Client) secondConnectionWanted(snapshot flowSnapshot, generation func() *controlQUICGeneration) bool {
 	if c.singleTopology() {
-		if c.fanOutConnections() == 0 || generation == nil || generation.flows.Load() <= 1 {
+		if c.fanOutConnections() == 0 {
+			return false
+		}
+		if g := generation(); g == nil || g.flows.Load() <= 1 {
 			return false
 		}
 	} else if c.quicPoolActive.Load() <= 1 {
