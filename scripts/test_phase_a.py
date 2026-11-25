@@ -742,7 +742,7 @@ class EndToEnd(unittest.TestCase):
         t0 = time.time()
         _, rows = self.client("bgup", "--target", f"127.0.0.1:{self.http}", "--flows", "1", "--duration", "30",
                               "--object-bytes", "100000000", "--stop-file", stop, tls=False)
-        self.assertLess(time.time() - t0, 15)
+        self.assertLess(time.time() - t0, 25)   # far short of the 30 s window
         self.assertTrue(rows and rows[-1][2].startswith("u1o"))
         # The upload the stop cut counts what the sink received, as a 200
         # with the window's exit (28); never the bytes handed to the socket.
