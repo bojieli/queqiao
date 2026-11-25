@@ -262,6 +262,18 @@ func (c *socksPacketConn) SetWriteDeadline(t time.Time) error {
 	return c.association.local.SetWriteDeadline(t)
 }
 
+// judgeComparisons reports whether a workload test should apply its bounds
+// against legacy: not under the race detector, which slows the endpoints
+// several-fold and unequally. Hard assertions apply either way.
+func judgeComparisons(t *testing.T) bool {
+	t.Helper()
+	if workloadRaceEnabled {
+		t.Log("race detector on: comparative bounds are reported, not judged")
+		return false
+	}
+	return true
+}
+
 // durationQuantile is the nearest-rank q-quantile of samples; zero when there
 // are none.
 func durationQuantile(samples []time.Duration, q float64) time.Duration {

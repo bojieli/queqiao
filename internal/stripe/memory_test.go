@@ -520,16 +520,17 @@ func waitProducerOnBound(t *testing.T, s *Scheduler) {
 	waitUntil(t, "the producer to wait on the bound", func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.tune.waiting
+		return s.tune.waiting && s.readyBytes > 0
 	})
 }
 
 // gatedSource reads like infiniteSource while open, and blocks like an
 // application with nothing to write while closed.
 type gatedSource struct {
-	mu   sync.Mutex
-	cond sync.Cond
-	shut bool
+	mu      sync.Mutex
+	cond    sync.Cond
+	shut    bool
+	blocked int // reads waiting at the gate
 }
 
 func newGatedSource() *gatedSource {
@@ -542,9 +543,17 @@ func (g *gatedSource) Read(p []byte) (int, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for g.shut {
+		g.blocked++
 		g.cond.Wait()
+		g.blocked--
 	}
 	return len(p), nil
+}
+
+func (g *gatedSource) waiting() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.blocked > 0
 }
 
 func (g *gatedSource) set(open bool) {
@@ -588,6 +597,9 @@ func TestRetentionBoundIsKeptAcrossAnApplicationPause(t *testing.T) {
 	src.set(false)
 	waitUntil(t, "the flow to hold nothing while it waits on the application", func() bool {
 		lane.completeAll(s)
+		if !src.waiting() {
+			return false
+		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		return !s.tune.reading.IsZero() && s.uniqueBytes == 0 && s.readyBytes == 0 && len(s.live) == 0

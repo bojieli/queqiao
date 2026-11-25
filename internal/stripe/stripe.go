@@ -541,6 +541,7 @@ func (s *Scheduler) produce() {
 			// bytes arrived to fill the chunk, which is latency invented by
 			// the scheduler.
 			n, err = s.src.Read(buf)
+			s.sourceReturned()
 			drained = n < len(buf)
 		} else {
 			var ok bool
@@ -617,6 +618,7 @@ func (s *Scheduler) waitForRoom() (int, bool) {
 // the scheduler closed while it waited for memory.
 func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, drained, ok bool, err error) {
 	n, err = s.src.Read(staging)
+	s.sourceReturned()
 	if n <= 0 {
 		return nil, 0, 0, false, true, err
 	}
@@ -677,10 +679,6 @@ func (s *Scheduler) publish(buf []byte, n, reserved int, drained bool, err error
 		s.cfg.Memory.Release(reserved)
 		return false
 	}
-	// Close the rounds that ended during the read with the state they had:
-	// an application-idle flow was idle in them.
-	s.autotuneLocked(s.cfg.Now())
-	s.tune.reading = time.Time{}
 	if n > 0 {
 		chunk := &Chunk{Offset: s.nextOffset, Data: buf[:n], reservation: reserved}
 		if s.cfg.Sparse != nil && drained && n <= s.cfg.SparseBytes && s.sendQueueEmptyLocked() {
@@ -835,14 +833,28 @@ func (s *Scheduler) autotuneLocked(now time.Time) {
 	}
 }
 
+// sourceReturned ends an application-idle stretch when the source read
+// returns, before the producer waits for memory: a flow waiting on the
+// shared budget is not waiting on its application. The rounds that ended
+// during the read are closed with the state they had, in which it was.
+func (s *Scheduler) sourceReturned() {
+	if s.cfg.Autotune == nil {
+		return
+	}
+	s.mu.Lock()
+	s.autotuneLocked(s.cfg.Now())
+	s.tune.reading = time.Time{}
+	s.mu.Unlock()
+}
+
 // applicationIdleLocked reports whether the round that started at start has
 // been application-idle throughout: the producer was already waiting on the
-// application when it began, with nothing read and waiting and nothing in
+// application before it began, with nothing read and waiting and nothing in
 // flight, and no coverage arrived in it. None of that can change until the
 // application writes, which closes the elapsed rounds before it counts.
 func (s *Scheduler) applicationIdleLocked(start time.Time) bool {
 	t := &s.tune
-	return !t.reading.IsZero() && !start.Before(t.reading) &&
+	return !t.reading.IsZero() && t.reading.Before(start) &&
 		t.roundMaxU == 0 && s.uniqueBytes == 0 && s.readyBytes == 0 &&
 		!t.waiting && !t.blocked && !t.covered
 }

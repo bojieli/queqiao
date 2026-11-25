@@ -156,6 +156,9 @@ func TestSegmentFetchOnAnEmulatedPath(t *testing.T) {
 		t.Logf("%s: segment times %v; p10 throughput %.2f Mbit/s; rebuffer %.2f %%",
 			arm.name, rounded, floatQuantile(o.throughput, 0.10)*8/1e6, 100*o.rebuffer)
 	}
+	if !judgeComparisons(t) {
+		return
+	}
 	legacy, flip := outcomes[0], outcomes[1]
 	if got, floor := floatQuantile(flip.throughput, 0.10), 0.90*floatQuantile(legacy.throughput, 0.10); got < floor {
 		t.Errorf("p10 segment throughput %.2f Mbit/s under the flip bundle, below 0.90 × legacy's (%.2f)",

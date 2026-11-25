@@ -68,9 +68,12 @@ type oneShotResult struct {
 // allowance of one query, stated in the failure.
 //
 // The path is a long-haul shape at a modest size: 120 ms round trip, 10 %
-// random loss each way, a policed 20 Mbit/s. Queries are spaced 100 ms
-// rather than the model's 1 s, which changes nothing a query sees: each is
-// on its own and none waits for another. -short halves the queries.
+// random loss each way, a policed 20 Mbit/s. Queries run one at a time, the
+// next starting when the last is answered or reaches the 1 s retry: fresh
+// and reused associations share the tunnel's coded symbol stream, so a later
+// query in flight could reveal a lost tail that the tunnel must repair on its
+// own. That is the model's 1 s spacing without its idle remainder. -short
+// halves the queries.
 func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 	requireStableImpairmentClock(t)
 	queries := 60
@@ -82,7 +85,7 @@ func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 		RateBytesPerSec: 20e6 / 8, PolicerRefillPeriod: 8 * time.Millisecond,
 	}
 	const retry = time.Second
-	const wait = 3 * time.Second
+	const wait = retry
 
 	over := map[string][2]int{}
 	for _, arm := range workloadArms() {
@@ -146,11 +149,8 @@ func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 			}
 
 			results := make([]oneShotResult, queries)
-			var wg sync.WaitGroup
 			for i := range queries {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				func() {
 					id := uint32(100 + i)
 					fresh := i%2 == 0
 					r := oneShotResult{fresh: fresh}
@@ -184,9 +184,7 @@ func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 					}
 					results[i] = r
 				}()
-				time.Sleep(100 * time.Millisecond)
 			}
-			wg.Wait()
 
 			var counts [2]int
 			var answered [2][]time.Duration
@@ -210,6 +208,9 @@ func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 			over[arm.name] = counts
 		})
 	}
+	if !judgeComparisons(t) {
+		return
+	}
 	legacy, flip := over[legacyArm.name], over[flipArm.name]
 	for kind, name := range []string{"reused", "fresh"} {
 		if limit := oneShotLimit(legacy[kind], queries/2); flip[kind] > limit {
@@ -221,7 +222,7 @@ func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 }
 
 // oneShotLimit is W11's bound as a count: legacy's count plus 0.5 pp of the
-// queries, rounded up, plus one query of small-sample allowance.
+// queries in whole queries, plus one query of small-sample allowance.
 func oneShotLimit(legacy, queries int) int {
-	return legacy + (queries*5+999)/1000 + 1
+	return legacy + queries*5/1000 + 1
 }

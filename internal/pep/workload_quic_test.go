@@ -116,6 +116,8 @@ func dialInnerQUIC(ctx context.Context, t *testing.T, rig *workloadRig, server *
 		_ = association.Close()
 		return nil, err
 	}
+	// The transport does not close a PacketConn it was handed.
+	t.Cleanup(func() { _ = association.Close() })
 	transport := &quic.Transport{Conn: &socksPacketConn{association: association, remote: remote, buf: make([]byte, 64*1024)}}
 	t.Cleanup(func() { _ = transport.Close() })
 	return transport.Dial(ctx, remote, tlsConfig, &quic.Config{MaxIdleTimeout: time.Minute, HandshakeIdleTimeout: 20 * time.Second})
@@ -177,6 +179,9 @@ type w8Outcome struct {
 	wirePerUseful float64 // emulated-path bytes, both directions, per downloaded byte
 	queueing      time.Duration
 	pages         []time.Duration
+	// The same two measures over the page phase.
+	pageLoss          float64
+	pageWirePerUseful float64
 }
 
 // W8. Tunnelled QUIC (docs/WORKLOAD-MODEL.md): a QUIC application inside the
@@ -190,8 +195,9 @@ type w8Outcome struct {
 // (a) A download on one stream, 20 MB or 30 s, whichever is first; (b) W3
 // pages, each one's objects as concurrent streams on the same connection.
 // Bounds (model W8): download goodput ≥ 0.90 × legacy; inner loss rate ≤
-// legacy + 1 pp; wire bytes per useful byte ≤ legacy × 1.15. Page load time
-// and the inner smoothed RTT above its minimum are reported.
+// legacy + 1 pp; wire bytes per useful byte ≤ legacy × 1.15; the loss and
+// overhead bounds hold over the page phase too. Page load time and the inner
+// smoothed RTT above its minimum are reported.
 //
 // Two paths, both 120 ms round trip at 20 Mbit/s behind a drop-tail queue.
 // On the clean one the inner flow fills the bottleneck through the tunnel;
@@ -273,8 +279,14 @@ func runTunnelledQUIC(t *testing.T, path pathsim.Config, size, pages int) []w8Ou
 			st := conn.ConnectionStats()
 			o.queueing = st.SmoothedRTT - st.MinRTT
 
+			pageSentBefore, pageWireBefore := servers[i].stats(), rigs[i].wireBytes()
+			pageBytes := 0
 			for p := range pages {
 				document, objects := pageObjects(int64(p))
+				pageBytes += document
+				for _, size := range objects {
+					pageBytes += size
+				}
 				start := time.Now()
 				if err := innerGet(ctx, conn, document); err != nil {
 					errs <- fmt.Errorf("%s: page %d document: %w", arm.name, p, err)
@@ -299,6 +311,13 @@ func runTunnelledQUIC(t *testing.T, path pathsim.Config, size, pages int) []w8Ou
 				}
 				o.pages = append(o.pages, time.Since(start))
 			}
+			if pages > 0 {
+				pageSentAfter, pageWireAfter := servers[i].stats(), rigs[i].wireBytes()
+				if sent := pageSentAfter.PacketsSent - pageSentBefore.PacketsSent; sent > 0 {
+					o.pageLoss = float64(pageSentAfter.PacketsLost-pageSentBefore.PacketsLost) / float64(sent)
+				}
+				o.pageWirePerUseful = float64(pageWireAfter-pageWireBefore) / float64(pageBytes)
+			}
 		}()
 	}
 	wg.Wait()
@@ -308,9 +327,10 @@ func runTunnelledQUIC(t *testing.T, path pathsim.Config, size, pages int) []w8Ou
 	}
 	for i, arm := range arms {
 		o := outcomes[i]
-		t.Logf("%s: goodput %.2f Mbit/s, inner loss %.2f %%, wire bytes per useful byte %.3f, inner queueing %v, page load p50 %v",
+		t.Logf("%s: download goodput %.2f Mbit/s, inner loss %.2f %%, wire bytes per useful byte %.3f, inner queueing %v; "+
+			"pages: load p50 %v, inner loss %.2f %%, wire bytes per useful byte %.3f",
 			arm.name, o.goodput*8/1e6, 100*o.innerLoss, o.wirePerUseful, o.queueing.Round(time.Millisecond),
-			durationQuantile(o.pages, 0.5).Round(time.Millisecond))
+			durationQuantile(o.pages, 0.5).Round(time.Millisecond), 100*o.pageLoss, o.pageWirePerUseful)
 	}
 	return outcomes
 }
@@ -318,6 +338,9 @@ func runTunnelledQUIC(t *testing.T, path pathsim.Config, size, pages int) []w8Ou
 // checkTunnelledQUIC applies W8's bounds to the flip arm against legacy.
 func checkTunnelledQUIC(t *testing.T, outcomes []w8Outcome) {
 	t.Helper()
+	if !judgeComparisons(t) {
+		return
+	}
 	legacy, flip := outcomes[0], outcomes[1]
 	if flip.goodput < 0.90*legacy.goodput {
 		t.Errorf("tunnelled QUIC goodput %.2f Mbit/s under the flip bundle, below 0.90 × legacy's %.2f",
@@ -330,5 +353,15 @@ func checkTunnelledQUIC(t *testing.T, outcomes []w8Outcome) {
 	if flip.wirePerUseful > 1.15*legacy.wirePerUseful {
 		t.Errorf("%.3f wire bytes per useful byte under the flip bundle against %.3f under legacy; the bound is legacy × 1.15",
 			flip.wirePerUseful, legacy.wirePerUseful)
+	}
+	// The page phase, whose concurrent streams the download does not
+	// exercise, is held to the same loss and overhead bounds.
+	if flip.pageLoss > legacy.pageLoss+0.01 {
+		t.Errorf("pages: the inner connection lost %.2f %% of its packets under the flip bundle against %.2f %% under legacy; the bound is legacy + 1 pp",
+			100*flip.pageLoss, 100*legacy.pageLoss)
+	}
+	if flip.pageWirePerUseful > 1.15*legacy.pageWirePerUseful {
+		t.Errorf("pages: %.3f wire bytes per useful byte under the flip bundle against %.3f under legacy; the bound is legacy × 1.15",
+			flip.pageWirePerUseful, legacy.pageWirePerUseful)
 	}
 }

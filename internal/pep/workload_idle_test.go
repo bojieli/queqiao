@@ -284,16 +284,36 @@ func TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock(t *testing.T) {
 					crossed = true
 					checkIdleEnds(t, cells, idleTimeout, time.Now(), tick+propagation)
 				}
+				if !crossed && now+time.Minute >= idleTimeout {
+					// The last minute before the timeout: every flow is
+					// still open, including those about to end at it.
+					for _, cell := range cells {
+						if cell.woken {
+							continue
+						}
+						for name, side := range map[string]*idleSide{"client": cell.client, "destination": cell.far} {
+							if end, ok := side.end(); ok {
+								t.Errorf("%v: the %s application saw the flow end (%v) before the flow idle timeout", cell, name, end.err)
+							}
+						}
+					}
+				}
 				var wg sync.WaitGroup
 				for _, cell := range cells {
 					if cell.woken || !cell.survives(idleTimeout) {
 						continue
 					}
+					waking := now == cell.target
+					if waking {
+						// Decided here, not in the worker, so the loop
+						// below reads it without a race.
+						cell.woken = true
+					}
 					wg.Add(1)
 					go func() {
 						defer wg.Done()
 						switch {
-						case now == cell.target:
+						case waking:
 							runIdleWake(cell, propagation)
 						case cell.heartbeat > 0 && now%cell.heartbeat == 0:
 							if _, err := cell.client.conn.Write(idleMessage(idlePing)); err != nil {
@@ -305,7 +325,7 @@ func TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock(t *testing.T) {
 				}
 				// The destination answers what reaches it.
 				for _, cell := range cells {
-					if cell.woken || !cell.survives(idleTimeout) || now == cell.target {
+					if cell.woken || !cell.survives(idleTimeout) {
 						continue
 					}
 					if cell.heartbeat > 0 && now%cell.heartbeat == 0 {
@@ -360,30 +380,31 @@ func countTrue(m map[string]bool) int {
 // arrived within the bound. The destination's half is driven here too, so
 // a send is acknowledged as it would be by a real server.
 func runIdleWake(cell *idleCell, within time.Duration) {
-	cell.woken = true
 	start := time.Now()
+	deadline := start.Add(within)
+	write := func(side *idleSide, tag byte) bool {
+		_ = side.conn.SetWriteDeadline(deadline)
+		_, err := side.conn.Write(idleMessage(tag))
+		_ = side.conn.SetWriteDeadline(time.Time{})
+		return err == nil
+	}
+	expect := func(side *idleSide, tag byte) bool {
+		return side.expect(tag, time.Until(deadline)) == nil
+	}
 	if cell.push {
-		if _, err := cell.far.conn.Write(idleMessage(idlePush)); err != nil {
-			return
-		}
-		if cell.client.expect(idlePush, within) != nil {
+		if !write(cell.far, idlePush) || !expect(cell.client, idlePush) {
 			return
 		}
 	} else {
-		if _, err := cell.client.conn.Write(idleMessage(idleSend)); err != nil {
-			return
-		}
-		if cell.far.expect(idleSend, within) != nil {
-			return
-		}
-		if _, err := cell.far.conn.Write(idleMessage(idleSendAck)); err != nil {
-			return
-		}
-		if cell.client.expect(idleSendAck, within) != nil {
+		if !write(cell.client, idleSend) || !expect(cell.far, idleSend) ||
+			!write(cell.far, idleSendAck) || !expect(cell.client, idleSendAck) {
 			return
 		}
 	}
 	cell.wake = time.Since(start)
+	if cell.wake > within {
+		return
+	}
 	cell.delivered = true
 	// The application closes its side; the other must see it.
 	_ = cell.client.conn.Close()
