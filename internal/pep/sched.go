@@ -101,11 +101,10 @@ type controlBoost struct {
 }
 
 // announce registers a control frame's place ahead of later DATA writers.
+// It allocates nothing: the channel a DATA writer waits on is made only when
+// one has to wait.
 func (b *controlBoost) announce() {
 	b.mu.Lock()
-	if b.pending == 0 {
-		b.clear = make(chan struct{})
-	}
 	b.pending++
 	b.mu.Unlock()
 }
@@ -114,8 +113,9 @@ func (b *controlBoost) announce() {
 func (b *controlBoost) settle() {
 	b.mu.Lock()
 	b.pending--
-	if b.pending == 0 {
+	if b.pending == 0 && b.clear != nil {
 		close(b.clear)
+		b.clear = nil
 	}
 	b.mu.Unlock()
 }
@@ -126,6 +126,9 @@ func (b *controlBoost) yield(ctx context.Context) error {
 	if b.pending == 0 {
 		b.mu.Unlock()
 		return nil
+	}
+	if b.clear == nil {
+		b.clear = make(chan struct{})
 	}
 	clear := b.clear
 	b.mu.Unlock()
