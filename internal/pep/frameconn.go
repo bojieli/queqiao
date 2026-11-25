@@ -43,6 +43,9 @@ type frameConn struct {
 	wire byte
 
 	writeMu contextMutex
+	// boost counts control frames waiting for writeMu and boosts the
+	// stream while there are any (sched=class; see controlBoost).
+	boost controlBoost
 	// writeBuf is reused under writeMu so that every frame reaches the
 	// transport as one write without allocating per frame.
 	writeBuf []byte
@@ -360,9 +363,11 @@ func (c *frameConn) Write(f protocol.Frame) error {
 		}
 		return nil
 	}
-	c.writeMu.Lock()
+	boosted, _ := c.lockWrite(context.Background(), f)
 	defer c.writeMu.Unlock()
-	return c.writeLocked(f)
+	err := c.writeLocked(f)
+	c.endBoost(boosted)
+	return err
 }
 
 // writeCoded hands a bulk frame to the coded substrate, falling back to the
@@ -403,7 +408,12 @@ func (c *frameConn) writeLocked(f protocol.Frame) error {
 	if cap(buf) <= writeBufferRetain {
 		c.writeBuf = buf
 	}
-	if err := writeFull(c.control, buf); err != nil {
+	if cw, ok := c.control.(classWriter); ok {
+		err = writeFullClass(cw, buf, frameSendClass(f))
+	} else {
+		err = writeFull(c.control, buf)
+	}
+	if err != nil {
 		return err
 	}
 	c.countData(f, false)
@@ -460,10 +470,12 @@ func (c *frameConn) needsOpenSafetyCopy(f protocol.Frame) bool {
 func (c *frameConn) writeControlContext(ctx context.Context, f protocol.Frame) error {
 	ctx, cancel := context.WithTimeout(ctx, frameWriteTimeout)
 	defer cancel()
-	if err := c.writeMu.LockContext(ctx); err != nil {
+	boosted, err := c.lockWrite(ctx, f)
+	if err != nil {
 		return err
 	}
 	defer c.writeMu.Unlock()
+	defer c.endBoost(boosted)
 	if err := ctx.Err(); err != nil {
 		return err
 	}

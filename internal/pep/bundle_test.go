@@ -70,6 +70,55 @@ func TestBundleValidatorRejectsUnsupportedCombinations(t *testing.T) {
 	}
 }
 
+// sched=class is the stage-2 bundle: it requires cc-api=v2, and the default
+// is legacy.
+func TestSchedValidatorRequiresCCAPIV2(t *testing.T) {
+	for _, c := range []struct {
+		sched SchedMode
+		api   CCAPIVersion
+		want  string
+	}{
+		{"", CCAPIV1, ""},
+		{"", CCAPIV2, ""},
+		{SchedLegacy, CCAPIV1, ""},
+		{SchedLegacy, CCAPIV2, ""},
+		{SchedClass, CCAPIV2, ""},
+		{SchedClass, CCAPIV1, "requires cc-api=v2"},
+		{SchedClass, "", "requires cc-api=v2"},
+		{"fifo", CCAPIV2, "unsupported sched"},
+	} {
+		sched := c.sched
+		err := validateSched(&sched, c.api)
+		if c.want == "" {
+			if err != nil {
+				t.Errorf("sched %q with cc-api %q rejected: %v", c.sched, c.api, err)
+			}
+			if c.sched == "" && sched != SchedLegacy {
+				t.Errorf("the default sched is %q, want %q", sched, SchedLegacy)
+			}
+		} else if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("sched %q with cc-api %q: got %v, want an error containing %q", c.sched, c.api, err, c.want)
+		}
+		if exported := ValidateSched(c.sched, c.api); (exported == nil) != (c.want == "") {
+			t.Errorf("ValidateSched(%q, %q) = %v, disagrees with the constructors", c.sched, c.api, exported)
+		}
+	}
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, ClassifierLegacy); got != "cc-api=v2,sched=class" {
+		t.Errorf("bundle %q", got)
+	}
+	if got := Bundle(CCAPIV2, MemoryOwned, CodedRetrySticky, GatewayAdmissionOwned, SchedClass, ClassifierLegacy); got != "cc-api=v2,sched=class,coded-retry=sticky,mem=owned,gateway-admission=owned" {
+		t.Errorf("bundle %q", got)
+	}
+	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedLegacy, ClassifierLegacy); got != "legacy" {
+		t.Errorf("bundle %q, want legacy", got)
+	}
+	// The stage 6/7 campaigns run sched=class with the phased classifier in
+	// both arms; the two switches compose.
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, ClassifierPhased); got != "cc-api=v2,sched=class,classifier=phased" {
+		t.Errorf("sched=class with classifier=phased = %q", got)
+	}
+}
+
 func TestClientAndServerRejectAnUnsupportedBundle(t *testing.T) {
 	certificate, credentials := testCertificate(t)
 	if _, err := NewClient(ClientConfig{
@@ -88,6 +137,21 @@ func TestClientAndServerRejectAnUnsupportedBundle(t *testing.T) {
 		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, CCAPI: CCAPIV2,
 	}); err != nil {
 		t.Fatalf("server rejected cc-api=v2 with the default controller: %v", err)
+	}
+	if _, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials, Sched: SchedClass,
+	}); err == nil {
+		t.Fatal("client accepted sched=class without cc-api=v2")
+	}
+	if _, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, Sched: SchedClass,
+	}); err == nil {
+		t.Fatal("server accepted sched=class without cc-api=v2")
+	}
+	if _, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, CCAPI: CCAPIV2, Sched: SchedClass,
+	}); err != nil {
+		t.Fatalf("server rejected sched=class with cc-api=v2: %v", err)
 	}
 }
 

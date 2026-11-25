@@ -233,6 +233,7 @@ func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtim
 		WaitForOpenAcknowledgement: opts.waitForOpenAck, UDPOnStream: opts.udpOnStream, WireVersions: mustWireVersions(opts.wireVersions),
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
 		CCAPI:               pep.CCAPIVersion(opts.ccAPI),
+		Sched:               pep.SchedMode(opts.sched),
 		CodedRetry:          pep.CodedRetryMode(opts.codedRetry),
 		CarrierShadow:       opts.carrierShadowConfig(),
 		Memory:              pep.MemoryMode(opts.memory),

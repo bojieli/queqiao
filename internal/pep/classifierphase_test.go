@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	quiccongestion "github.com/apernet/quic-go/congestion"
+
 	"github.com/bojieli/queqiao/internal/classifier"
 	"github.com/bojieli/queqiao/internal/coded"
 	"github.com/bojieli/queqiao/internal/pathmodel"
@@ -399,7 +401,7 @@ func TestClassifierModeValidation(t *testing.T) {
 	if err := ValidateClassifier(ClassifierPhased, profile.Default()); err != nil {
 		t.Fatal(err)
 	}
-	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, ClassifierPhased); got != "classifier=phased" {
+	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedLegacy, ClassifierPhased); got != "classifier=phased" {
 		t.Fatalf("bundle %q", got)
 	}
 }
@@ -487,6 +489,9 @@ func TestASparseWriteOfABulkFlowIsSentInteractiveAndCoded(t *testing.T) {
 	if key.forceReliable || !fc.bulkFrame(key.frame) {
 		t.Fatal("the keystroke would not be coded")
 	}
+	if frameSendClass(key.frame) != quiccongestion.ClassInteractive {
+		t.Fatal("sched=class would charge the keystroke to a class other than INTERACTIVE")
+	}
 
 	data, dataOnBulkQueue := send(16 << 10)
 	if !dataOnBulkQueue || data.frame.Header.Class != protocol.ClassBulk {
@@ -494,6 +499,9 @@ func TestASparseWriteOfABulkFlowIsSentInteractiveAndCoded(t *testing.T) {
 	}
 	if !data.forceReliable || fc.bulkFrame(data.frame) {
 		t.Fatal("a 16 KiB chunk of a BULK flow would be coded")
+	}
+	if frameSendClass(data.frame) != quiccongestion.ClassBulk {
+		t.Fatal("sched=class would not charge a BULK chunk to BULK")
 	}
 }
 

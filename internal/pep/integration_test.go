@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apernet/quic-go"
+
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/protocol"
@@ -409,21 +411,27 @@ func portBelowTheDynamicRange(t *testing.T) int {
 }
 
 func TestQUICOneLaneSOCKSEndToEnd(t *testing.T) {
-	testQUICOneLaneSOCKSEndToEnd(t, "")
+	testQUICOneLaneSOCKSEndToEnd(t, "", "")
 }
 
 // The cc-api=v2 bundle starts, both ends, and carries the same flows.
 func TestQUICOneLaneSOCKSEndToEndUnderCCAPIV2(t *testing.T) {
-	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2)
+	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, "")
+}
+
+// The sched=class bundle (cc-api=v2 with the class scheduler) starts, both
+// ends, and carries the same flows.
+func TestQUICOneLaneSOCKSEndToEndUnderSchedClass(t *testing.T) {
+	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, SchedClass)
 }
 
 // The coded-retry bundle starts, both ends, on top of cc-api=v2, and carries
 // the same flows.
 func TestQUICOneLaneSOCKSEndToEndUnderCodedRetry(t *testing.T) {
-	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, CodedRetrySticky)
+	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, "", CodedRetrySticky)
 }
 
-func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, codedRetry ...CodedRetryMode) {
+func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedMode, codedRetry ...CodedRetryMode) {
 	var retry CodedRetryMode
 	if len(codedRetry) > 0 {
 		retry = codedRetry[0]
@@ -444,7 +452,7 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, codedRetry .
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
-		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond, CCAPI: ccAPI, CodedRetry: retry,
+		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond, CCAPI: ccAPI, Sched: sched, CodedRetry: retry,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -455,7 +463,7 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, codedRetry .
 	}
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true, Logger: logger,
-		Metrics: metrics.New(), CCAPI: ccAPI, CodedRetry: retry,
+		Metrics: metrics.New(), CCAPI: ccAPI, Sched: sched, CodedRetry: retry,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -561,6 +569,25 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, codedRetry .
 	}
 	if got := client.Metrics().Snapshot(); got.ActiveFlows != 0 || got.FlowsCompleted != 2 {
 		t.Fatalf("client flow lifecycle leaked: active=%d started=%d completed=%d failed=%d", got.ActiveFlows, got.FlowsStarted, got.FlowsCompleted, got.FlowsFailed)
+	}
+	if sched == SchedClass {
+		// Both ends of this test's live connection schedule classes: the
+		// client's dials the gateway's address, the gateway's is bound to
+		// it.
+		gateway := packetConn.LocalAddr().String()
+		var clientSide, gatewaySide bool
+		classScheduledConns.Range(func(k, _ any) bool {
+			conn := k.(*quic.Conn)
+			if conn.Context().Err() != nil {
+				return true
+			}
+			clientSide = clientSide || conn.RemoteAddr().String() == gateway
+			gatewaySide = gatewaySide || conn.LocalAddr().String() == gateway
+			return true
+		})
+		if !clientSide || !gatewaySide {
+			t.Fatalf("sched=class installed on the client: %v, on the gateway: %v", clientSide, gatewaySide)
+		}
 	}
 	cancel()
 	for range 2 {

@@ -25,5 +25,17 @@ func (m *contextMutex) LockContext(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
-func (m *contextMutex) Lock()   { _ = m.LockContext(context.Background()) }
+func (m *contextMutex) Lock() { _ = m.LockContext(context.Background()) }
+
+// TryLock acquires the mutex if it is free, without waiting.
+func (m *contextMutex) TryLock() bool {
+	m.once.Do(func() { m.token = make(chan struct{}, 1) })
+	select {
+	case m.token <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *contextMutex) Unlock() { <-m.token }
