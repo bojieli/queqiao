@@ -66,3 +66,34 @@ func TestAWriteReportsTheSubstrateItActuallyUsed(t *testing.T) {
 		t.Fatal("a coded frame with a stream safety copy was reported unreliable")
 	}
 }
+
+// The class telemetry counts a frame at every substrate that took it: a coded
+// frame with an open safety copy went both ways.
+func TestClassTelemetryCountsBothCopiesOfAnOpenSafetyFrame(t *testing.T) {
+	model := pathmodel.NewPathModel()
+	model.Report(1, pathmodel.Observation{
+		Erasure: 0.14, BurstFactor: 1, ObservedSamples: 5000,
+		Delivered: 1 << 20, RoundTrip: 200 * time.Millisecond,
+	})
+	path := coded.New(newPipeCarrier(), coded.Config{Path: model})
+	defer path.Close()
+	fc := &frameConn{control: &bufferConn{}, bulk: path, wantsCoding: func() bool { return true }}
+	var codedBytes, streamBytes int
+	fc.setDataObserver(func(f protocol.Frame, coded bool) {
+		n := len(f.Payload)
+		if coded {
+			codedBytes += n
+		} else {
+			streamBytes += n
+		}
+	})
+	fc.openUnconfirmed = func() bool { return true }
+	fc.openSafetyCopy.Store(true)
+	frame := protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeData, FlowID: 1, Class: protocol.ClassInteractive}, Payload: []byte("payload")}
+	if _, err := fc.writeContextVia(context.Background(), frame); err != nil {
+		t.Fatal(err)
+	}
+	if codedBytes != 7 || streamBytes != 7 {
+		t.Fatalf("counted coded %d and stream %d bytes, want 7 and 7", codedBytes, streamBytes)
+	}
+}

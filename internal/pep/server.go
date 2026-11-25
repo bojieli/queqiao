@@ -69,7 +69,11 @@ type ServerConfig struct {
 	CongestionScope CongestionScope
 	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
 	// is legacy.
-	CodedRetry                    CodedRetryMode
+	CodedRetry CodedRetryMode
+	// Classifier selects the flow-classifier bundle; see ClassifierMode.
+	// Empty is legacy. The gateway classifies the direction it sends, so
+	// downstream DATA follows this setting, not the client's.
+	Classifier                    ClassifierMode
 	BrutalBytesPerSec             uint64
 	AdaptiveMinBytesSec           uint64
 	AdaptiveMaxBytesSec           uint64
@@ -479,6 +483,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, err
 	}
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
+		return nil, err
+	}
+	if err := resolveClassifier(&cfg.Classifier, cfg.Profile); err != nil {
 		return nil, err
 	}
 	if err := cfg.CarrierShadow.resolve(); err != nil {
@@ -1227,7 +1234,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	s.cfg.Logger.Debug("remote flow opened", "transport", transportKindForConn(conn), "wire", fc.wire, "account", principal.AccountID, "device", principal.DeviceID, "open_duration", destinationDialStarted.Sub(sessionStarted), "destination_dial_duration", time.Since(destinationDialStarted), "total_duration", time.Since(sessionStarted))
 	defer destinationConn.Close()
 	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
-	flow.classifier = classifier.New(s.classifierConfig())
+	flow.classifier = classifier.New(classifierBacklogFor(s.classifierConfig(), flow.memoryLimits))
 	flow.memOwned = s.cfg.Memory == MemoryOwned
 	flow.codedRetrySticky = s.cfg.CodedRetry == CodedRetrySticky
 	flow.carrierShadow = s.carrierShadow
@@ -1321,6 +1328,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		"data_coded", codedFrames, "data_stream", streamFrames,
 		"coded_substrate", codedSubstrateFields(substrate, hasCoded),
 		"class", classifier.Class(flow.class.Load())}
+	logFields = append(logFields, flow.classLogFields()...)
 	logFields = append(logFields, codedSubstrateLogFields(substrate, hasCoded)...)
 	logFields = append(logFields, flow.replacementLogFields()...)
 	if !flowComplete && err != nil && !errors.Is(err, context.Canceled) {
@@ -2055,8 +2063,9 @@ func transportKindForConn(conn streamConn) TransportKind {
 // setting it on only one of them would leave the other demoting flows the first
 // had decided to protect.
 func (s *Server) classifierConfig() classifier.Config {
-	if s.cfg.Profile.Classifier.BulkBytes == 0 {
-		return profile.Default().Classifier
+	cfg := s.cfg.Profile.Classifier
+	if cfg.BulkBytes == 0 {
+		cfg = profile.Default().Classifier
 	}
-	return s.cfg.Profile.Classifier
+	return phasedClassifierConfig(cfg, s.cfg.Classifier)
 }

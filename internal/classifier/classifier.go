@@ -77,6 +77,50 @@ type Config struct {
 	// to reach this profile's byte floor, and it produces an episode on the
 	// second one.
 	BulkIdleGapVetoEpisodes int
+
+	// Phased splits the class into two (the classifier=phased bundle).
+	//
+	// Class keeps today's meaning: a sticky fact about the flow, "this flow
+	// has been a bulk transfer". Lane choice, bulk isolation and pre-warm read
+	// it, because re-isolating a flow back and forth costs a lane each way.
+	//
+	// Current is what the flow is doing now. It leaves BULK once the flow has
+	// carried payload with no bulk evidence for BulkExitWindows windows, and re-enters it once the
+	// sender has held a large backlog for BulkReenterBacklog (or four smoothed
+	// round trips, whichever is longer). The frame's class byte, the lane
+	// queue, the aggregate budget's interactive flag and the coding choice
+	// read it.
+	//
+	// Without Phased, Current is Class, which is the legacy bundle.
+	Phased bool
+	// BulkExitWindow and BulkExitWindows set how a flow that is currently
+	// BULK leaves it: after BulkExitWindows distinct windows of BulkExitWindow
+	// in which it carried payload and showed no bulk evidence. Evidence is a
+	// send backlog over BulkBacklogBytes, or a recent window over the
+	// small-exchange rate in either direction, and it restarts the count.
+	//
+	// A window with no payload neither counts nor resets: an idle gap is not
+	// evidence about what the flow is, so a transfer whose source stalls is
+	// still BULK when it resumes (TestBulkClassDoesNotFlap). Two one-second
+	// windows match the exchange window the evidence itself is measured
+	// over: slow to leave, so a transfer's short stall does not flap it, and
+	// quick enough that a session is INTERACTIVE again two to four seconds
+	// after its burst ends. Small writes do not wait for it: the sparse-write
+	// rule sends them INTERACTIVE at once.
+	BulkExitWindow  time.Duration
+	BulkExitWindows int
+	// BulkReenterBacklog is how long a flow that has left BULK must hold a
+	// send backlog over BulkBacklogBytes, without a break, before it is BULK
+	// again. It is the same second a new flow is given before the bulk test
+	// can fire (BulkMinimumAge): a prompt or a page that drains inside it is
+	// carried as an exchange, and a transfer that does not is a transfer.
+	BulkReenterBacklog time.Duration
+	// BulkBacklogBytes is the send backlog -- bytes read from the application
+	// and not yet acknowledged by the peer -- above which a flow is
+	// transferring rather than conversing. It is the small-exchange budget of
+	// one window: a conversation is never that far ahead of its peer, and a
+	// backlogged transfer holds at least its read-ahead bound, which is larger.
+	BulkBacklogBytes uint64
 }
 
 func DefaultConfig() Config {
@@ -96,6 +140,10 @@ func DefaultConfig() Config {
 		BulkMinimumAge:      1 * time.Second,
 		InteractiveMaxRate:  1 * 1024 * 1024,
 		InteractiveIdleGap:  250 * time.Millisecond,
+		BulkExitWindow:      1 * time.Second,
+		BulkExitWindows:     2,
+		BulkReenterBacklog:  1 * time.Second,
+		BulkBacklogBytes:    64 * 1024,
 	}
 }
 
@@ -108,6 +156,19 @@ type Observation struct {
 	SinceLastPayload         time.Duration
 	Bidirectional            bool
 	SmallBidirectionalBursts bool
+	// SendBacklog is what this endpoint has read from its application and
+	// the peer has not yet acknowledged. Only the phased classifier reads it.
+	SendBacklog uint64
+	// SmoothedRTT is the flow's current round-trip estimate, zero before one
+	// exists. Only the phased classifier reads it.
+	SmoothedRTT time.Duration
+	// CarriedPayload says this observation is of bytes just carried rather
+	// than a re-examination. Only the phased classifier reads it.
+	CarriedPayload bool
+	// BacklogDrained says the send backlog fell to BulkBacklogBytes or below
+	// at some point since the previous observation, even if it is above it
+	// again now. Only the phased classifier reads it.
+	BacklogDrained bool
 }
 
 // Classifier is stateful. Once a flow becomes bulk it remains bulk until it
@@ -133,6 +194,21 @@ type Classifier struct {
 	cfg          Config
 	mu           sync.Mutex
 	class        Class
+
+	// current is the phased classifier's present-tense class; without Phased
+	// it is always class. quietWindows counts the distinct exit windows that
+	// carried payload since bulk evidence was last seen, firstQuietAge is the
+	// age of the first of them, and lastQuietWindow the index of the latest. backlogSince
+	// is the age at which the present unbroken send backlog began, and
+	// inBacklog says whether there is one.
+	current         Class
+	quietWindows    int
+	firstQuietAge   time.Duration
+	lastQuietWindow int64
+	backlogSince    time.Duration
+	inBacklog       bool
+	// exits and reentries count the phased transitions, for telemetry.
+	exits, reentries uint64
 }
 
 // Declare sets the class a flow starts in, from something known before it
@@ -156,30 +232,162 @@ func (c *Classifier) Declare(class Class) {
 	switch class {
 	case ClassInteractive, ClassBulk:
 		c.class = class
+		c.current = class
 	}
 }
 
 func New(cfg Config) *Classifier {
 	if cfg.NewBytes == 0 || cfg.NewAge <= 0 || cfg.BulkBytes == 0 ||
 		cfg.BulkRateBytesPerSec <= 0 || cfg.BulkMinimumAge <= 0 {
+		phased := cfg.Phased
 		cfg = DefaultConfig()
+		cfg.Phased = phased
 	}
-	return &Classifier{cfg: cfg, class: ClassNew}
+	defaults := DefaultConfig()
+	if cfg.BulkExitWindow <= 0 {
+		cfg.BulkExitWindow = defaults.BulkExitWindow
+	}
+	if cfg.BulkExitWindows <= 0 {
+		cfg.BulkExitWindows = defaults.BulkExitWindows
+	}
+	if cfg.BulkReenterBacklog <= 0 {
+		cfg.BulkReenterBacklog = defaults.BulkReenterBacklog
+	}
+	if cfg.BulkBacklogBytes == 0 {
+		cfg.BulkBacklogBytes = defaults.BulkBacklogBytes
+	}
+	return &Classifier{cfg: cfg, class: ClassNew, current: ClassNew}
 }
 
+// Class is the sticky class: once BULK, BULK for the life of the flow. Lane
+// choice and bulk isolation read it.
 func (c *Classifier) Class() Class {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.class
 }
 
+// Current is what the flow is doing now. Under the legacy bundle it is Class.
+func (c *Classifier) Current() Class {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.current
+}
+
+// BacklogBytes is the send backlog above which the phased classifier counts a
+// flow as transferring.
+func (c *Classifier) BacklogBytes() uint64 { return c.cfg.BulkBacklogBytes }
+
+// Phased reports whether this classifier keeps a current class apart from the
+// sticky one.
+func (c *Classifier) Phased() bool { return c.cfg.Phased }
+
+// PhaseTransitions reports how many times the current class left BULK and
+// re-entered it after the flow first became BULK.
+func (c *Classifier) PhaseTransitions() (exits, reentries uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.exits, c.reentries
+}
+
 // Observe advances the flow class. The caller should call this at a bounded
 // cadence (for example, once per scheduler tick), not once per packet.
+//
+// It returns the current class: under the legacy bundle that is the sticky
+// class, under the phased bundle what the flow is doing now.
 func (c *Classifier) Observe(o Observation) Class {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	before := c.class
+	c.observeSticky(o)
+	if !c.cfg.Phased {
+		c.current = c.class
+		return c.current
+	}
+	c.observeCurrent(o, before)
+	return c.current
+}
+
+// observeCurrent advances the phased classifier's present-tense class. The
+// sticky class has already been advanced from the same observation; before is
+// what it was until then.
+//
+// A flow that has never been BULK is whatever the sticky class says, so the
+// first second of every flow and the first entry into BULK are exactly the
+// legacy bundle's: a download is BULK at the same instant it is today. Only a
+// flow that has been BULK can be anything else.
+func (c *Classifier) observeCurrent(o Observation, before Class) {
+	backlogged := o.SendBacklog > c.cfg.BulkBacklogBytes
+	if o.BacklogDrained {
+		// The backlog dipped since the last look: whatever is queued now
+		// started after that, so it is a new stretch.
+		c.inBacklog = false
+	}
+	if backlogged {
+		if !c.inBacklog {
+			c.inBacklog = true
+			c.backlogSince = o.Age
+		}
+	} else {
+		c.inBacklog = false
+	}
+	evidence := backlogged || !o.SmallBidirectionalBursts
+	switch {
+	case c.class != ClassBulk:
+		c.current = c.class
+	case before != ClassBulk:
+		// Entered BULK on this observation, by the legacy test.
+		c.current = ClassBulk
+		c.quietWindows = 0
+	case c.current == ClassBulk:
+		// Leaving needs payload-carrying windows with neither a backlog nor a
+		// recent window over the small-exchange rate. A transfer that is
+		// backlogged never has one, however slowly its path drains it.
+		switch {
+		case evidence:
+			c.quietWindows = 0
+		case o.CarriedPayload:
+			window := int64(o.Age / c.cfg.BulkExitWindow)
+			if c.quietWindows == 0 {
+				c.firstQuietAge = o.Age
+			}
+			if c.quietWindows == 0 || window != c.lastQuietWindow {
+				c.quietWindows++
+				c.lastQuietWindow = window
+			}
+			// Distinct windows alone could be two writes a millisecond apart
+			// on either side of a boundary; the stretch must also last as
+			// long as the windows it counts, wherever the burst ended
+			// relative to a window boundary.
+			if c.quietWindows >= c.cfg.BulkExitWindows &&
+				o.Age-c.firstQuietAge >= time.Duration(c.cfg.BulkExitWindows)*c.cfg.BulkExitWindow {
+				c.current = ClassInteractive
+				c.quietWindows = 0
+				c.exits++
+			}
+		}
+	default:
+		// Re-entering needs the sender to have been behind for a sustained
+		// stretch: a prompt or a page that drains within it stays an
+		// exchange. Four round trips is the floor on a long path, where a
+		// one-second backlog is only a few flights.
+		hold := c.cfg.BulkReenterBacklog
+		if rtts := 4 * o.SmoothedRTT; rtts > hold {
+			hold = rtts
+		}
+		if c.inBacklog && o.Age-c.backlogSince >= hold {
+			c.current = ClassBulk
+			c.quietWindows = 0
+			c.reentries++
+		}
+	}
+}
+
+// observeSticky advances the sticky class, which is the whole of the legacy
+// classifier.
+func (c *Classifier) observeSticky(o Observation) {
 	if c.class == ClassBulk {
-		return c.class
+		return
 	}
 	if c.cfg.BulkIdleGapVeto > 0 {
 		if o.SinceLastPayload >= c.cfg.BulkIdleGapVeto {
@@ -193,14 +401,13 @@ func (c *Classifier) Observe(o Observation) Class {
 	}
 	if c.isBulk(o) {
 		c.class = ClassBulk
-		return c.class
+		return
 	}
 	if c.class == ClassNew && o.Age >= c.cfg.NewAge {
 		if c.isInteractive(o) || o.BytesUp+o.BytesDown >= c.cfg.NewBytes {
 			c.class = ClassInteractive
 		}
 	}
-	return c.class
 }
 
 func (c *Classifier) isBulk(o Observation) bool {

@@ -155,6 +155,18 @@ type Config struct {
 	// single coded lane accumulates one admission charge per erasure and
 	// eventually cannot retry the bytes which are missing.
 	Reliable func(laneID uint64) bool
+	// SparseBytes and Sparse mark sparse writes: a read of at most
+	// SparseBytes that found no READY bytes ahead of it -- the flow's send
+	// queue was empty -- is offered to Sparse, under the scheduler's lock, and
+	// the chunk is marked Sparse if it answers true. Sparse may refuse, to
+	// bound how much of a flow can be sent this way; it must not call back
+	// into the scheduler. Zero SparseBytes or a nil Sparse marks nothing.
+	SparseBytes int
+	Sparse      func(n int) bool
+	// ReliableSparse is Reliable for a chunk marked Sparse. A flow that is
+	// sending bulk may still code a sparse write, so the lane's answer for it
+	// can differ. Nil uses Reliable.
+	ReliableSparse func(laneID uint64) bool
 	// ForceReliable pins selected byte ranges to a reliable carrier even when
 	// the lane normally uses datagrams. The decision is snapshotted at dispatch
 	// just like Reliable, so an in-flight recovery cannot change substrates
@@ -295,6 +307,9 @@ type Chunk struct {
 	// other, so the end of the stream is ordered with respect to the data
 	// rather than being a separate event that can overtake it.
 	Final bool
+	// Sparse marks a small write that found the flow's send queue empty (see
+	// Config.Sparse). Every attempt of the chunk keeps it.
+	Sparse bool
 
 	// urgent marks a chunk that came back from a lane which stalled or died.
 	// Such a chunk is admitted to a lane even when that lane is at its window,
@@ -321,7 +336,7 @@ func (c *Chunk) End() uint64 { return c.Offset + uint64(len(c.Data)) }
 // Ref is this dispatch's identity without its bytes, for a callback that may
 // outlive the chunk's memory reservation.
 func (c *Chunk) Ref() *Chunk {
-	return &Chunk{Reliable: c.Reliable, Offset: c.Offset, Final: c.Final, attempt: c.attempt}
+	return &Chunk{Reliable: c.Reliable, Offset: c.Offset, Final: c.Final, Sparse: c.Sparse, attempt: c.attempt}
 }
 
 type attempt struct {
@@ -370,6 +385,10 @@ const gapHistory = 16
 type outstanding struct {
 	chunk    *Chunk
 	attempts []attempt
+	// coded records that an attempt of this chunk was written unreliably
+	// (on a coded path). It outlives the attempt: a retry waiting for
+	// dispatch after its coded attempt expired is still coded loss.
+	coded bool
 }
 
 // Stats reports what the scheduler did, for tests and metrics.
@@ -492,7 +511,12 @@ func (s *Scheduler) produce() {
 			buf      []byte
 			n        int
 			reserved int
-			err      error
+			// drained says the read returned less than it had room for,
+			// which is the evidence that the source had nothing more: a
+			// read that filled its buffer was limited by the scheduler, not
+			// by the application.
+			drained bool
+			err     error
 		)
 		if staging == nil {
 			buf = make([]byte, allowance)
@@ -502,14 +526,15 @@ func (s *Scheduler) produce() {
 			// bytes arrived to fill the chunk, which is latency invented by
 			// the scheduler.
 			n, err = s.src.Read(buf)
+			drained = n < len(buf)
 		} else {
 			var ok bool
-			buf, n, reserved, ok, err = s.readStaged(staging[:min(len(staging), allowance)], allowance)
+			buf, n, reserved, drained, ok, err = s.readStaged(staging[:min(len(staging), allowance)], allowance)
 			if !ok {
 				return
 			}
 		}
-		if !s.publish(buf, n, reserved, err) {
+		if !s.publish(buf, n, reserved, drained, err) {
 			return
 		}
 	}
@@ -572,11 +597,12 @@ func (s *Scheduler) waitForRoom() (int, bool) {
 // readStaged blocks on the application holding no shared memory, then
 // reserves exactly the allocation the bytes in hand need. ok is false when
 // the scheduler closed while it waited for memory.
-func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, ok bool, err error) {
+func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, drained, ok bool, err error) {
 	n, err = s.src.Read(staging)
 	if n <= 0 {
-		return nil, 0, 0, true, err
+		return nil, 0, 0, false, true, err
 	}
+	drained = n < len(staging)
 	size := n
 	filler, canFill := s.src.(AvailableReader)
 	// A read that filled the staging buffer suggests more is waiting; one
@@ -596,7 +622,7 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 			s.ready.Broadcast()
 		}
 		s.mu.Unlock()
-		return nil, 0, 0, false, nil
+		return nil, 0, 0, false, false, nil
 	}
 	buf = make([]byte, size)
 	copy(buf, staging[:n])
@@ -606,6 +632,7 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 		if m > 0 {
 			n += m
 		}
+		drained = n < size
 		if fillErr != nil && !errors.Is(fillErr, ErrUnsupported) {
 			err = fillErr
 		}
@@ -620,12 +647,12 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 			buf, reserved = short, n
 		}
 	}
-	return buf, n, reserved, true, err
+	return buf, n, reserved, drained, true, err
 }
 
 // publish files what one read produced. It reports false when the producer
 // must stop: the scheduler closed, or the source ended.
-func (s *Scheduler) publish(buf []byte, n, reserved int, err error) bool {
+func (s *Scheduler) publish(buf []byte, n, reserved int, drained bool, err error) bool {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -634,6 +661,9 @@ func (s *Scheduler) publish(buf []byte, n, reserved int, err error) bool {
 	}
 	if n > 0 {
 		chunk := &Chunk{Offset: s.nextOffset, Data: buf[:n], reservation: reserved}
+		if s.cfg.Sparse != nil && drained && n <= s.cfg.SparseBytes && s.sendQueueEmptyLocked() {
+			chunk.Sparse = s.cfg.Sparse(n)
+		}
 		s.nextOffset += uint64(n)
 		s.stats.SourceBytes += uint64(n)
 		s.pending = append(s.pending, chunk)
@@ -961,7 +991,7 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 			s.nextAttempt++
 		}
 		id := s.nextAttempt
-		reliable := s.laneRetransmits(laneID)
+		reliable := s.laneRetransmitsChunk(laneID, chunk)
 		if s.cfg.ForceReliable != nil && s.cfg.ForceReliable(chunk.Offset) {
 			reliable = true
 		}
@@ -996,6 +1026,49 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		return &issued
 	}
 	return nil
+}
+
+// UnreliableOutstanding reports whether any chunk not yet acknowledged has an
+// attempt that went out unreliably -- on a coded path -- as recorded at
+// dispatch or corrected by WroteAs.
+func (s *Scheduler) UnreliableOutstanding() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, out := range s.live {
+		if out.coded {
+			return true
+		}
+		for _, a := range out.attempts {
+			if !a.reliable {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sendQueueEmptyLocked reports whether nothing waits for dispatch: no bytes
+// never sent, and no retry requeued for another attempt, which readyBytes does
+// not count.
+func (s *Scheduler) sendQueueEmptyLocked() bool {
+	if s.readyBytes != 0 {
+		return false
+	}
+	for _, chunk := range s.pending {
+		if len(chunk.Data) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// laneRetransmitsChunk is laneRetransmits for one chunk, which a sparse
+// write may answer differently.
+func (s *Scheduler) laneRetransmitsChunk(laneID uint64, chunk *Chunk) bool {
+	if chunk.Sparse && s.cfg.ReliableSparse != nil {
+		return s.cfg.ReliableSparse(laneID)
+	}
+	return s.laneRetransmits(laneID)
 }
 
 // laneRetransmits reports whether a lane recovers its own losses.
@@ -1556,6 +1629,9 @@ func (s *Scheduler) wrote(laneID uint64, chunk *Chunk, reliable *bool) {
 				s.substrateChangedLocked(a, *reliable)
 			}
 			a.reliable = *reliable
+		}
+		if !a.reliable {
+			out.coded = true
 		}
 		s.releaseQueuedLocked(laneID, uint64(len(out.chunk.Data)))
 		if s.cfg.CodedRetry && a.abandoned && !a.reliable {
