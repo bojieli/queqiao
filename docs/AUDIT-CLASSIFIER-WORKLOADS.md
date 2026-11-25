@@ -22,6 +22,8 @@ Status: **read-only audit**, for `DESIGN-PATH-AUTHORITY.md` §15.3 and stage 2. 
 | `ssh` | NEW, then INTERACTIVE at 3 s. Stays INTERACTIVE while both directions stay under 64 KiB per window. One output burst over that, once the session has 128 KiB total, makes it BULK for life. |
 | `video-call` (UDP) | PACKET frames on the datagram substrate (`internal/pep/udp.go:562-565`): INTERACTIVE always. There is no classifier. |
 | `upload` | BULK after 1 s and 128 KiB, decided by the client, which is the sender. The gateway reaches the same class from the delivered bytes and uses it only for its CONTROL frames. |
+| LLM streaming | A 100 KB prompt is uploaded, then a long, low-rate stream of deltas arrives on the same connection. On a fresh connection the prompt alone does not reach 128 KiB, and the deltas keep both directions small, so the flow stays NEW and then INTERACTIVE. A second prompt on the reused connection, or a prompt over 128 KiB still uploading at 1 s on a slow uplink, makes it BULK for life. |
+| long-idle messaging | NEW, then INTERACTIVE at 3 s, and INTERACTIVE indefinitely while the traffic is small messages, because the window is recent rather than lifetime. Idle time does not change the class. One media send over 64 KiB per window makes it BULK for life. |
 | bulk download | INTERACTIVE for the first second, then BULK. On a path where the flow's rate is under about 64 KiB/s per window it never becomes BULK. |
 
 ## Risks
@@ -61,6 +63,22 @@ Status: **read-only audit**, for `DESIGN-PATH-AUTHORITY.md` §15.3 and stage 2. 
 - **Under `sched=class`.** Upstream scheduling is correct. Downstream ignores a declared class: an `ssh` hint protects keystrokes but not echoes, and a declared bulk backup is INTERACTIVE downstream for its first second.
 - **Fix.** Carry a declared class to the gateway in OPEN, with a flag that distinguishes a declaration from the default class byte (PROTOCOL.md §7), and `Declare` it there. Fixing R1 matters more than this, because a hint is only a starting point.
 - **Blocks.** Nothing.
+
+### R5. LLM streaming: a reused connection latches BULK on its second prompt
+
+- **Current behaviour.** The 64 KiB window and the 128 KiB total separate a single request from a transfer, but not a multi-turn session. Agent loops resend a growing context on one kept-alive HTTP/2 connection to the same API host. The first turn usually stays below 128 KiB, or finishes inside its first second. The second turn's upload exceeds 64 KiB in a window when the flow is older than 1 s and has more than 128 KiB total, so the flow becomes BULK for life (`classifier.go:206-213`, `181-183`). It also happens on the first turn when the prompt is over 128 KiB and the uplink is slow enough that the upload is still running at 1 s. Both ends latch. The gateway, which sends the deltas, sees the same upload as delivered bytes.
+- **Under `sched=class`.** The deltas that follow are BULK DATA from the gateway: small messages at weight 1 of 7 behind any download. They are also sent uncoded (`mpflow.go:1281-1285`), so a lost delta costs a retransmission round trip and is seen as a stall. Time to first token and the inter-delta gap p99 under bulk degrade from the second turn on, which is the common case for agents.
+- **Fix.** The R1 token bucket is the right shape: the prompt's excess over `B_I` is BULK and the deltas are INTERACTIVE. That makes prompt upload under bulk upload slower, and time to first token includes the upload. So `B_I` should cover a typical prompt, or the excess should go to INTERACTIVE while the flow has no backlog history. Demotion with hysteresis also returns the deltas to INTERACTIVE, `k` windows after the prompt.
+- **Blocks.** As R1: stage 7 and stage 10. The model's LLM entry needs a multi-turn scenario on one connection, measuring time to first token and inter-delta gap p50/p99, or the gate will not see this.
+
+### R6. Long-idle messaging connections
+
+- **Current behaviour.** Push channels, chat sockets and WebSockets stay INTERACTIVE for hours of small messages; this is the case the recent-window rule was written for (`mpflow.go:3392-3411`). Two problems remain:
+  - A photo or file sent on the same connection makes it BULK for life, as R1. Every later push and message then waits behind bulk until the connection is replaced, which can be hours.
+  - Every client flow, idle or not, has its own 250 ms monitor ticker (`internal/pep/client.go:2801`, `2959-2973`), which also drives `refreshClass`. Hundreds of idle connections on mobile cost four wakeups per second each. This is CPU and battery, not radio, and it is not a classification error.
+- **Under `sched=class`.** An idle flow has no demand, so it costs the arbiter nothing. The harm is only the latched case: a message's delivery latency under bulk becomes bulk queueing delay.
+- **Fix.** As R1, for the latch. For the wakeups, an idle flow should stop its ticker and re-arm it on the next payload or lane event. That is outside the class scheduler, and belongs with stage 8's carrier work, which owns liveness for idle flows.
+- **Blocks.** The latch, as R1. The wakeups block no gate. They should be a pre-registered bound on client CPU (already a §15.4 secondary) in a many-idle-connections scenario.
 
 ### Also seen
 
