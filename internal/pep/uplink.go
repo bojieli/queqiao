@@ -219,6 +219,9 @@ func (c *Client) watchUplink(ctx context.Context, known string) {
 // onUplinkChanged abandons what belonged to the old path and measures the new
 // one before anything needs it.
 func (c *Client) onUplinkChanged(ctx context.Context) {
+	// Connections dialled from now on belong to a new path controller,
+	// whatever the new uplink's address (congestion=path).
+	c.uplinkGeneration.Add(1)
 	// Reachability evidence belongs to the old uplink just as completely as
 	// its congestion and erasure measurements do. Carrying a UDP cooldown onto
 	// the new interface would suppress the very probe that can measure it.

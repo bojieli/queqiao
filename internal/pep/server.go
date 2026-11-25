@@ -973,11 +973,14 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 		// to this remote host (§4.1). Every connection of one device -- an
 		// old client's isolated and rescue lanes too -- attaches to the same
 		// one.
-		if _, err := s.cfg.Credentials.Store.Authorize(principal, time.Now()); err == nil {
-			controller = attachPathController(conn, congestionConfig{
-				kind: s.cfg.Congestion, ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched, scope: s.cfg.CongestionScope,
-			}, gatewayPathPrincipal(principal))
+		if err := authorizePathPrincipal(s.cfg.Credentials.Store, principal, time.Now()); err != nil {
+			// Not authorised now: the connection carries no data, rather
+			// than carrying it later outside the device's path budget.
+			return
 		}
+		controller = attachPathController(conn, congestionConfig{
+			kind: s.cfg.Congestion, ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched, scope: s.cfg.CongestionScope,
+		}, gatewayPathPrincipal(principal))
 	}
 	s.metrics.DataConnectionAccepted(wire)
 	auth := &quicAuthState{principal: principal}

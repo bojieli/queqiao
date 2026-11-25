@@ -261,6 +261,10 @@ type Client struct {
 	// windowCredit is the receive-window credit topology=single grants its
 	// preferred connections, bounded over every live one (topology.go).
 	windowCredit windowCredit
+	// uplinkGeneration counts uplink changes (watchUplink). It is part of
+	// the client's path keys: two networks can hand out the same private
+	// address, so the source address alone does not tell their paths apart.
+	uplinkGeneration atomic.Uint64
 	// observedRTT caches the most recent lane's measured round trip (nanoseconds) so
 	// the adaptive fallback grace can scale with the path. Updated on every
 	// authenticated lane; zero until the first dial.
@@ -1759,7 +1763,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 			discoverGrouping: c.cfg.Profile.DiscoverGrouping,
 			kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 			adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-			ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipal,
+			ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipalNow(),
 		}
 		if pooled {
 			outer, err = c.dialPooledQUICLane(ctx, ccfg)
@@ -2390,7 +2394,7 @@ func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
 		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipal,
+		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipalNow(),
 	})
 	c.cfg.Logger.Debug("bulk QUIC pool authenticated", "duration", time.Since(started))
 	return entry, nil

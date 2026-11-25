@@ -1475,7 +1475,15 @@ func (m *sourceMeter) roll(now time.Time) {
 		return
 	}
 	if elapsed := now.Sub(m.start); elapsed >= rtt && elapsed > 0 {
-		m.last, m.measured = float64(m.bytes)/elapsed.Seconds(), true
+		if elapsed >= 2*rtt {
+			// The window holding the bytes ended a round trip or more
+			// ago and the windows since were empty: the latest complete
+			// round trip carried nothing, whenever rate was polled.
+			m.last = 0
+		} else {
+			m.last = float64(m.bytes) / elapsed.Seconds()
+		}
+		m.measured = true
 		m.start, m.bytes = now, 0
 	}
 }

@@ -2,6 +2,7 @@ package pep
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -490,5 +491,83 @@ func TestCodedReadersFollowThePathController(t *testing.T) {
 	plain := bed.clientTLS()
 	if isPathScoped(plain) {
 		t.Fatal("a connection with no path controller is marked path-scoped")
+	}
+}
+
+// An uplink change starts a new path controller even when the new network
+// hands out the same source address as the old one: the client's path key
+// carries its uplink generation. A connection dialled before the change
+// keeps its controller.
+func TestAnUplinkChangeWithTheSameAddressStartsANewController(t *testing.T) {
+	pathAuthorities.forget()
+	_, credentials := testCertificate(t)
+	client, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
+		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bed := newPathBed(t, pathsim.Config{OneWayDelay: time.Millisecond, Seed: 17})
+	dial := func() *wancongestion.PathAttachment {
+		cfg := pathScopeConfig
+		cfg.principal = client.pathPrincipalNow()
+		att, ok := configureQUICController(bed.clientTLS(), cfg).(*wancongestion.PathAttachment)
+		if !ok {
+			t.Fatal("no path attachment")
+		}
+		return att
+	}
+	before, again := dial(), dial()
+	if before.Controller() != again.Controller() {
+		t.Fatal("two connections on one uplink got different controllers")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client.onUplinkChanged(ctx)
+	after := dial()
+	if after.Controller() == before.Controller() {
+		t.Fatal("after an uplink change with the same source address the new connection reuses the old network's controller")
+	}
+}
+
+// A data connection whose principal is no longer authorised when the
+// gateway would attach it to its path controller is closed, rather than left
+// to carry data later outside the device's path budget.
+func TestAGatewayClosesADataConnectionItCannotAttach(t *testing.T) {
+	pathAuthorities.forget()
+	saved := authorizePathPrincipal
+	authorizePathPrincipal = func(*identity.Store, identity.Principal, time.Time) error { return errors.New("account disabled") }
+	t.Cleanup(func() { authorizePathPrincipal = saved })
+	certificate, roots := testCertificate(t)
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true,
+		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.ServePacketConn(ctx, packetConn) }()
+	clientTLS, err := tlsClientConfig(roots, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialCtx, done := context.WithTimeout(ctx, 10*time.Second)
+	defer done()
+	conn, err := quic.DialAddr(dialCtx, packetConn.LocalAddr().String(), clientTLS, quicConfig(flowWindows{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseWithError(0, "")
+	select {
+	case <-conn.Context().Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gateway kept a data connection it could not attach to its path controller")
 	}
 }

@@ -148,6 +148,19 @@ func (p *pacer) settle(now monotime.Time) {
 	p.lastSentTime = now
 }
 
+// budgetReachedAt is when the balance reaches need at the current rate,
+// without the pacing timer's floor: zero if it already has.
+func (p *pacer) budgetReachedAt(need quiccongestion.ByteCount) monotime.Time {
+	if p.budgetAtLastSent >= need {
+		return 0
+	}
+	bps := p.getBandwidth()
+	if bps <= 0 {
+		return p.lastSentTime.Add(time.Second)
+	}
+	return p.lastSentTime.Add(time.Duration(float64(need-p.budgetAtLastSent) / float64(bps) * float64(time.Second)))
+}
+
 // timeUntilBudget is when the balance will reach need: one datagram for
 // timeUntilSend, or a caller's own packet size.
 func (p *pacer) timeUntilBudget(need quiccongestion.ByteCount) monotime.Time {

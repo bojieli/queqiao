@@ -57,6 +57,13 @@ type PathController struct {
 	rtt pathRTT
 
 	atts map[*PathAttachment]struct{}
+	// byClass holds, per class, the attachments with demand in it: the only
+	// ones that can hold a claim on that class's turn, so admission visits
+	// them and never the idle ones. windowWaiters, pacingWaiters and
+	// deferredWaiters are the attachments refused for the window, the
+	// balance and a claim, to wake when that may have cleared.
+	byClass                                       [quiccongestion.NumSendClasses]map[*PathAttachment]struct{}
+	windowWaiters, pacingWaiters, deferredWaiters map[*PathAttachment]struct{}
 	// flight is the sum of the COUNTED attachments' gauges.
 	flight quiccongestion.ByteCount
 	// now is the latest event time; event times are clamped to it so the
@@ -101,8 +108,6 @@ type PathController struct {
 	// datagramBurst publishes its burst factor (math.Float64bits), zero
 	// until datagramsSeen is enough to say.
 	datagrams     *lossmodel.Estimator
-	datagramPairs uint64
-	datagramPrev  bool
 	datagramBurst atomic.Uint64
 
 	// Scratch for the law's batches.
@@ -201,16 +206,22 @@ const (
 func NewPathController(initialPacketSize quiccongestion.ByteCount, path pathmodel.Model, weights ClassWeights) *PathController {
 	law := newPathLaw(initialPacketSize, path)
 	c := &PathController{
-		law:       law,
-		arb:       NewClassArbiter(weights, law.inner.maxDatagramSize),
-		atts:      make(map[*PathAttachment]struct{}),
-		nextPseq:  1,
-		ringBase:  1,
-		maxPacket: law.inner.maxDatagramSize,
-		created:   time.Now(),
-		id:        pathControllerIDs.Add(1),
-		clock:     monotime.Now,
-		datagrams: lossmodel.New(lossmodel.Config{}),
+		law:             law,
+		arb:             NewClassArbiter(weights, law.inner.maxDatagramSize),
+		atts:            make(map[*PathAttachment]struct{}),
+		windowWaiters:   make(map[*PathAttachment]struct{}),
+		pacingWaiters:   make(map[*PathAttachment]struct{}),
+		deferredWaiters: make(map[*PathAttachment]struct{}),
+		nextPseq:        1,
+		ringBase:        1,
+		maxPacket:       law.inner.maxDatagramSize,
+		created:         time.Now(),
+		id:              pathControllerIDs.Add(1),
+		clock:           monotime.Now,
+		datagrams:       lossmodel.New(lossmodel.Config{}),
+	}
+	for cl := range c.byClass {
+		c.byClass[cl] = make(map[*PathAttachment]struct{})
 	}
 	law.SetRTTStatsProvider(&c.rtt)
 	law.inner.appLimitedBy = c.appLimited
@@ -221,7 +232,7 @@ func NewPathController(initialPacketSize quiccongestion.ByteCount, path pathmode
 // an admission opportunity of at least one packet time by now: the window
 // open for a packet, and the balance accrued over that time.
 func (c *PathController) unused() bool {
-	return !c.noDemandSince.IsZero() && c.unusedTime >= c.packetTime(c.maxPacket)
+	return !c.noDemandSince.IsZero() && c.unusedTime >= c.serialTime(c.maxPacket)
 }
 
 // accrue adds to unusedTime the part of [accruedAt, now] in which, with no
@@ -240,7 +251,7 @@ func (c *PathController) accrue(now monotime.Time) {
 	}
 	if now.After(from) && c.flight+c.maxPacket <= c.law.GetCongestionWindow() {
 		start := from
-		if fit := c.law.pacer.timeUntilBudget(c.maxPacket); !fit.IsZero() && fit.After(start) {
+		if fit := c.law.pacer.budgetReachedAt(c.maxPacket); !fit.IsZero() && fit.After(start) {
 			start = fit
 		}
 		if now.After(start) {
@@ -475,26 +486,24 @@ func (c *PathController) advance(now monotime.Time) {
 		switch {
 		case !r.datagram || (r.fate != fateDelivered && r.fate != fateLost):
 			c.datagrams.Break()
-			c.datagramPrev = false
 		default:
 			c.datagrams.ObserveOutcome(r.fate == fateDelivered)
-			if c.datagramPrev {
-				// A transition between two adjacent datagram-bearing
-				// samples: the evidence the statistic is made of.
-				c.datagramPairs++
-			}
-			c.datagramPrev = true
 		}
 		c.ring[0] = fateRecord{}
 		c.ring = c.ring[1:]
 		c.ringBase++
 	}
-	if c.datagramPairs >= pathDatagramEvidence {
+	// The evidence decays with the statistic: transitions the estimator
+	// still weighs, not every pair ever seen. Below the threshold the
+	// override is withdrawn and the path-wide figure stands.
+	if c.datagrams.Transitions() >= pathDatagramEvidence {
 		b := c.datagrams.Snapshot().BurstFactor
 		if b < 1 {
 			b = 1
 		}
 		c.datagramBurst.Store(math.Float64bits(b))
+	} else {
+		c.datagramBurst.Store(0)
 	}
 	for len(c.lostHeld) > 0 {
 		h := c.lostHeld[0]
@@ -561,13 +570,34 @@ func (c *PathController) noteDemand(union quiccongestion.Demand, now monotime.Ti
 	}
 }
 
+func markIn(set map[*PathAttachment]struct{}, a *PathAttachment, on bool) {
+	if on {
+		set[a] = struct{}{}
+	} else {
+		delete(set, a)
+	}
+}
+
+func (c *PathController) markWindow(a *PathAttachment, on bool) {
+	a.windowBlocked = on
+	markIn(c.windowWaiters, a, on)
+}
+
+func (c *PathController) markPacing(a *PathAttachment, on bool) {
+	a.pacingBlocked = on
+	markIn(c.pacingWaiters, a, on)
+}
+
+func (c *PathController) markDeferred(a *PathAttachment, on bool) {
+	a.deferred = on
+	markIn(c.deferredWaiters, a, on)
+}
+
 // demand is the union of the attachments' demand.
 func (c *PathController) demand() quiccongestion.Demand {
 	var d quiccongestion.Demand
-	for a := range c.atts {
-		for i, e := range a.demand.Eligible {
-			d.Eligible[i] = d.Eligible[i] || e
-		}
+	for cl := range c.byClass {
+		d.Eligible[cl] = len(c.byClass[cl]) > 0
 	}
 	return d
 }
@@ -575,9 +605,9 @@ func (c *PathController) demand() quiccongestion.Demand {
 // collectBlocked returns the wakers of attachments refused for the window,
 // except a, and clears their flag: flight fell or the window grew.
 func (c *PathController) collectBlocked(a *PathAttachment, wakes []func()) []func() {
-	for o := range c.atts {
-		if o != a && o.windowBlocked && o.wake != nil {
-			o.windowBlocked = false
+	for o := range c.windowWaiters {
+		if o != a && o.wake != nil {
+			c.markWindow(o, false)
 			wakes = append(wakes, o.wake)
 		}
 	}
@@ -587,8 +617,8 @@ func (c *PathController) collectBlocked(a *PathAttachment, wakes []func()) []fun
 // collectWaiting returns the wakers of attachments refused for precedence,
 // except a: the claim they waited on may have cleared.
 func (c *PathController) collectWaiting(a *PathAttachment, wakes []func()) []func() {
-	for o := range c.atts {
-		if o != a && o.deferred && o.wake != nil {
+	for o := range c.deferredWaiters {
+		if o != a && o.wake != nil {
 			wakes = append(wakes, o.wake)
 		}
 	}
@@ -602,8 +632,15 @@ func runWakes(wakes []func()) {
 }
 
 func (c *PathController) attach(a *PathAttachment, now monotime.Time, inFlight, maxPacket quiccongestion.ByteCount) {
-	c.clamp(now)
+	// Time so far is judged against the flight before this attachment
+	// joins it.
+	c.accrue(c.clamp(now))
 	c.atts[a] = struct{}{}
+	for cl, e := range a.demand.Eligible {
+		if e {
+			c.byClass[cl][a] = struct{}{}
+		}
+	}
 	c.attached.Store(int64(len(c.atts)))
 	a.probing = false
 	a.gauge = 0
@@ -622,6 +659,9 @@ func (c *PathController) detach(a *PathAttachment, now monotime.Time) []func() {
 		return nil
 	}
 	now = c.clamp(now)
+	// Time so far is judged against the flight before this attachment
+	// leaves it.
+	c.accrue(now)
 	for key := range a.pkts {
 		c.discard(a, key)
 	}
@@ -644,9 +684,14 @@ func (c *PathController) detach(a *PathAttachment, now monotime.Time) []func() {
 	}
 	a.gauge = 0
 	a.gaugeView.Store(0)
-	a.windowBlocked = false
+	c.markWindow(a, false)
+	c.markPacing(a, false)
+	c.markDeferred(a, false)
+	for cl := range c.byClass {
+		delete(c.byClass[cl], a)
+	}
 	a.claimDeadline = 0
-	a.waiting, a.deferred, a.unable = false, false, false
+	a.waiting, a.unable = false, false
 	delete(c.atts, a)
 	if len(c.atts) == 0 {
 		// Published before the count, so a sweep that sees no attachment
@@ -675,12 +720,21 @@ func (c *PathController) notePacketSize(size quiccongestion.ByteCount) {
 }
 
 // packetTime is how long the path's rate takes to send n bytes.
+// packetTime is how long the path's rate takes to send n bytes, floored at
+// the pacing timer's granularity: it times a wake-up (a claim's deadline).
 func (c *PathController) packetTime(n quiccongestion.ByteCount) time.Duration {
+	return max(c.serialTime(n), quiccongestion.MinPacingDelay)
+}
+
+// serialTime is how long the path's rate takes to send n bytes, unfloored:
+// what an unused send opportunity is measured in. At 100 Mbit/s a full
+// packet takes about 96 µs, a tenth of the timer's floor.
+func (c *PathController) serialTime(n quiccongestion.ByteCount) time.Duration {
 	rate := c.law.bandwidth()
 	if rate <= 0 {
 		return time.Millisecond
 	}
-	return max(time.Duration(float64(n)/float64(rate)*float64(time.Second)), quiccongestion.MinPacingDelay)
+	return time.Duration(float64(n) / float64(rate) * float64(time.Second))
 }
 
 func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes quiccongestion.ByteCount) (quiccongestion.Permit, []func()) {
@@ -723,7 +777,7 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	}
 	turn := c.arb.Select()
 	if turn != quiccongestion.ClassExempt && !own[turn] && !c.claimed(a, turn, now) {
-		for o := range c.atts {
+		for o := range c.byClass[turn] {
 			if o != a && o.usable(now)[turn] {
 				// Another attachment has demand in the turn but no live
 				// claim: its claim lapsed.
@@ -732,6 +786,15 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 			}
 		}
 		turn = c.arb.SelectAmong(own)
+	} else if turn != quiccongestion.ClassExempt && !own[turn] && !c.fits(now, turn, maxBytes) {
+		// The claimants of the path's turn could not send it now either
+		// (its class has no room in the window or the balance), so their
+		// claim gives them nothing this attachment would take. If its own
+		// work fits -- CONTROL on the control debt, above all -- it is
+		// served now rather than waiting for the flight to drain.
+		if mine := c.arb.SelectAmong(own); mine != quiccongestion.ClassExempt && c.fits(now, mine, maxBytes) {
+			turn = mine
+		}
 	}
 	// The window and the balance, for the turn the path would serve now.
 	borrowed, refusal := c.admissible(a, now, turn, maxBytes)
@@ -747,7 +810,7 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	}
 	if c.claimed(a, turn, now) {
 		var retry monotime.Time
-		for o := range c.atts {
+		for o := range c.byClass[turn] {
 			if !c.claims(o, a, turn, now) {
 				continue
 			}
@@ -762,7 +825,8 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 			}
 		}
 		c.stats.refusedTurn.Add(1)
-		a.waiting, a.deferred = true, true
+		a.waiting = true
+		c.markDeferred(a, true)
 		a.claimDeadline = 0
 		return quiccongestion.Permit{RetryAt: retry}, wakes
 	}
@@ -778,8 +842,10 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	if borrowed {
 		c.stats.debtPermits.Add(1)
 	}
-	a.windowBlocked, a.pacingBlocked = false, false
-	a.waiting, a.deferred = false, false
+	c.markWindow(a, false)
+	c.markPacing(a, false)
+	a.waiting = false
+	c.markDeferred(a, false)
 	c.permitSeq++
 	a.lastPermit = c.permitSeq
 	p := c.arb.PermitTurn(turn, maxBytes, !borrowed)
@@ -847,7 +913,7 @@ func (c *PathController) claimed(a *PathAttachment, turn quiccongestion.SendClas
 	if turn == quiccongestion.ClassExempt {
 		return false
 	}
-	for o := range c.atts {
+	for o := range c.byClass[turn] {
 		if c.claims(o, a, turn, now) {
 			return true
 		}
@@ -858,6 +924,20 @@ func (c *PathController) claimed(a *PathAttachment, turn quiccongestion.SendClas
 // admissible checks the window, against the path's flight or a PROBING
 // attachment's own, and the balance, for a packet of the given turn. A
 // CONTROL turn may borrow the control debt; borrowed says it did.
+// fits says whether an ordinary packet of the given turn would pass the
+// path's window and balance now, as admissible decides for a COUNTED
+// attachment, without recording anything.
+func (c *PathController) fits(now monotime.Time, turn quiccongestion.SendClass, maxBytes quiccongestion.ByteCount) bool {
+	debt := quiccongestion.ByteCount(0)
+	if turn == quiccongestion.ClassControl {
+		debt = pathControlDebtPackets * c.maxPacket
+	}
+	if c.flight+maxBytes > c.law.GetCongestionWindow()+debt {
+		return false
+	}
+	return c.law.pacer.budget(now) >= maxBytes-debt
+}
+
 func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn quiccongestion.SendClass, maxBytes quiccongestion.ByteCount) (bool, *quiccongestion.Permit) {
 	debt := quiccongestion.ByteCount(0)
 	if turn == quiccongestion.ClassControl {
@@ -870,14 +950,14 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 	// window (§4.3), or, on a CONTROL turn, the window plus the debt.
 	if a.probing {
 		if a.gauge+maxBytes > pathProbeWindowPackets*c.maxPacket {
-			a.windowBlocked = true
+			c.markWindow(a, true)
 			a.unable = true
 			c.stats.refusedWindow.Add(1)
 			return false, &quiccongestion.Permit{}
 		}
 	} else if c.flight+maxBytes > window {
 		if c.flight+maxBytes > window+debt {
-			a.windowBlocked = true
+			c.markWindow(a, true)
 			c.stats.refusedWindow.Add(1)
 			return false, &quiccongestion.Permit{}
 		}
@@ -888,7 +968,7 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 	if budget := c.law.pacer.budget(now); budget < maxBytes {
 		if budget < maxBytes-debt {
 			c.stats.refusedPacing.Add(1)
-			a.pacingBlocked = true
+			c.markPacing(a, true)
 			retry := c.law.pacer.timeUntilBudget(maxBytes - debt)
 			if retry.IsZero() || retry.Before(now) {
 				retry = now
@@ -958,6 +1038,7 @@ func (c *PathController) demote(a *PathAttachment) {
 	if a.probing {
 		return
 	}
+	c.accrue(c.now)
 	c.flight -= a.gauge
 	c.flightGauge.Store(int64(c.flight))
 	a.probing = true
@@ -976,6 +1057,7 @@ func (c *PathController) promote(a *PathAttachment) {
 	if !a.probing {
 		return
 	}
+	c.accrue(c.now)
 	a.probing = false
 	c.flight += a.gauge
 	c.flightGauge.Store(int64(c.flight))
@@ -1101,9 +1183,9 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 	}
 	if c.law.bandwidth() > rateBefore {
 		// A higher rate moves every pacing refusal's retry earlier.
-		for o := range c.atts {
-			if o != a && o.pacingBlocked && o.wake != nil {
-				o.pacingBlocked = false
+		for o := range c.pacingWaiters {
+			if o != a && o.wake != nil {
+				c.markPacing(o, false)
 				wakes = append(wakes, o.wake)
 			}
 		}
@@ -1129,6 +1211,15 @@ func (c *PathController) discarded(a *PathAttachment, now monotime.Time, inFligh
 
 func (c *PathController) setDemand(a *PathAttachment, d quiccongestion.Demand) []func() {
 	a.demand = d
+	if _, attached := c.atts[a]; attached {
+		for cl, e := range d.Eligible {
+			if e {
+				c.byClass[cl][a] = struct{}{}
+			} else {
+				delete(c.byClass[cl], a)
+			}
+		}
+	}
 	union := c.demand()
 	// Demand carries no time: it is read from the clock, without moving
 	// the event clock.
