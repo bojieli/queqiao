@@ -719,6 +719,7 @@ func (o *carrierShadow) noteLaneFailure(f *multipathFlow, lane *mpLane, err erro
 	o.metrics.CarrierShadowLaneFailure(remedy)
 	o.logger.Info("carrier shadow lane failed", append(o.flowFields(f),
 		"lane_id", lane.id, "carrier_id", obs.id, "carrier_state", carrierStateLabel(obs),
+		"observed_unix_ms", observedMillis(obs),
 		"pto_since_progress", obs.progress.PTOExpiries, "since_transport_progress", obs.since,
 		"design_remedy", remedy.String(), "healthy_lanes", len(f.healthyLanes()), "error", fmt.Sprint(err))...)
 }
@@ -732,15 +733,15 @@ func (o *carrierShadow) noteOutage(f *multipathFlow, now time.Time, grace time.D
 		return
 	}
 	o.logger.Info("carrier shadow outage", append(o.flowFields(f),
-		"grace", grace, "deadline_unix_ms", now.Add(grace).UnixMilli())...)
+		"observed_unix_ms", now.UnixMilli(), "grace", grace, "deadline_unix_ms", now.Add(grace).UnixMilli())...)
 }
 
-func (o *carrierShadow) noteOutageEnd(f *multipathFlow, deadline time.Time) {
+func (o *carrierShadow) noteOutageEnd(f *multipathFlow, ended, deadline time.Time) {
 	if o == nil {
 		return
 	}
 	o.logger.Info("carrier shadow outage ended", append(o.flowFields(f),
-		"deadline_remaining", time.Until(deadline))...)
+		"observed_unix_ms", ended.UnixMilli(), "deadline_remaining", deadline.Sub(ended))...)
 }
 
 // noteRescue records the client starting a rescue round: the start of the

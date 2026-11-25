@@ -228,6 +228,10 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
     transitions: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     for record in endpoint.of(STATE):
         transitions[carrier_key(record)].append(record)
+    # Hooks and the sampler can log out of order; walk by observation time
+    # (stable, so file order breaks ties).
+    for values in transitions.values():
+        values.sort(key=lambda r: r["_t"])
     by_kind: Counter = Counter()
     later_failure_delay: list[float] = []
     outcomes: Counter = Counter()
@@ -289,7 +293,7 @@ def failure_observations(endpoint: Endpoint) -> dict[tuple, list[tuple[float, st
     return out
 
 
-def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> dict[str, Any]:
+def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offset_s: float = 0.0) -> dict[str, Any]:
     """Pair each gateway outage with the client's observation of the same
     failure and with the JOIN that ended it.
 
@@ -336,6 +340,12 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
             grace = seconds(outage.get("grace")) or grace_s
             graces.append(grace)
             deadline = start + grace
+            recorded = outage.get("deadline_unix_ms")
+            if isinstance(recorded, (int, float)) and not isinstance(recorded, bool):
+                # The gateway's own deadline, on the same clock and offset as
+                # every other gateway timestamp.
+                deadline = recorded / 1000.0 - offset_s
+                start = deadline - grace
             next_start = records[index + 1]["_t"] if index + 1 < len(records) else math.inf
             end = next((t for t in sorted(ended.get(key, [])) if start <= t < next_start), None)
             # Without an end record the window runs past the deadline, so a
@@ -375,8 +385,10 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
                 row["expired_without_join"] = True
             # Every JOIN of this outage that matches an attempt is a transit
             # sample, not only the first: J budgets for the slow handoffs.
+            # A slower sibling of the winning JOIN can arrive after the
+            # outage ended; it still measures J, up to the next outage.
             for j in joins.get(key, []):
-                if not start <= j["_t"] <= window_end:
+                if not start <= j["_t"] < min(next_start, capture_end + 1):
                     continue
                 attempt = attempts.get((*key, j.get("lane_id")))
                 if attempt is not None and attempt[0] <= j["_t"]:
@@ -480,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
             report["calibration"][endpoint.name] = calibration(endpoint)
             report["stalls"][endpoint.name] = stall_comparison(endpoint)
     if args.client and args.gateway:
-        report["recovery_deadline"] = recovery_deadline(client, gateway, args.grace_s)
+        report["recovery_deadline"] = recovery_deadline(client, gateway, args.grace_s, args.clock_offset_ms / 1000.0)
     report["skipped"] = {"client": dict(client.skipped), "gateway": dict(gateway.skipped)}
     if args.json:
         json.dump(report, sys.stdout, indent=2, sort_keys=True)

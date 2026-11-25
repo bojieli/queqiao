@@ -1370,6 +1370,9 @@ func (f *multipathFlow) failLane(lane *mpLane, err error) {
 	var shadow carrierObservation
 	if f.carrierShadow != nil && lane != nil && !lane.closed.Load() {
 		shadow = f.carrierShadow.observeLane(lane)
+		if shadow.at.IsZero() {
+			shadow.at = time.Now() // a TCP lane has no carrier, only a failure time
+		}
 	}
 	if lane != nil && lane.fc != nil && !lane.closed.Load() {
 		if observer, ok := lane.fc.transport().(interface{ transportFailed(error) }); ok {
@@ -2666,7 +2669,9 @@ func (f *multipathFlow) replacementBudget(now time.Time, grace time.Duration) ti
 // starts from a full grace.
 func (f *multipathFlow) endReplacementOutage() {
 	if deadline := f.replacementDeadline.Swap(0); deadline != 0 && f.carrierShadow != nil {
-		f.carrierShadow.noteOutageEnd(f, time.Unix(0, deadline))
+		// The caller may hold the lane admission lock: log off it.
+		ended := time.Now()
+		go f.carrierShadow.noteOutageEnd(f, ended, time.Unix(0, deadline))
 	}
 }
 
