@@ -2506,6 +2506,20 @@ func (f *multipathFlow) replacementLogFields() []any {
 // `lane_replacement_attempts` on its completion record.
 func (f *multipathFlow) noteReplacementAttempt() uint64 { return f.replacementAttempts.Add(1) }
 
+// beginReplacementAttempt is noteReplacementAttempt for a manager that has not
+// yet checked whether the flow has ended, and reports whether the attempt may
+// start. A flow that has ended starts none. The completion record is written
+// only after done closes, so checking again after counting means every attempt
+// that does start is in that record; one counted in the instant done closes
+// is refused rather than left to dial uncounted.
+func (f *multipathFlow) beginReplacementAttempt() (uint64, bool) {
+	if f.doneChanClosed() {
+		return 0, false
+	}
+	attempt := f.noteReplacementAttempt()
+	return attempt, !f.doneChanClosed()
+}
+
 // noteReplacementFailure records that one such attempt did not produce a lane.
 // A non-failed attempt may have succeeded or may still be in flight when
 // the flow record is emitted. The peer's refusal is also a returned error.

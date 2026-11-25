@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -623,5 +624,51 @@ func TestTCPReplacementFailureLogNamesFlowAndAttempt(t *testing.T) {
 	// stopped may have been counted without returning.
 	if uint64(len(got)) > attempts || attempts > uint64(len(got))+1 {
 		t.Fatalf("logged %d failed attempts against lane_replacement_attempts %d", len(got), attempts)
+	}
+}
+
+// Issue #187. The TCP lane manager could take a tick that arrived with the
+// flow's end and dial one more replacement after the completion record was
+// written, so a gateway saw a dial the record never counted. An attempt that
+// starts is counted before the flow's end can be observed, and a flow that
+// has ended starts none.
+func TestAReplacementThatStartsIsInTheCompletionRecord(t *testing.T) {
+	flow := newGraceTestFlow(t)
+	if attempt, ok := flow.beginReplacementAttempt(); !ok || attempt != 1 {
+		t.Fatalf("a live flow's first replacement = %d, %v; want 1, true", attempt, ok)
+	}
+	flow.signalDone()
+	if attempt, ok := flow.beginReplacementAttempt(); ok {
+		t.Fatalf("an ended flow started replacement %d", attempt)
+	}
+	if got := replacementFields(flow)["lane_replacement_attempts"]; got != uint64(1) {
+		t.Fatalf("an ended flow counted %v attempts, want the 1 it started", got)
+	}
+
+	// The race itself: the record is read once done has closed, as the
+	// client writes it, while a manager keeps starting attempts.
+	for range 200 {
+		flow := newGraceTestFlow(t)
+		started := make(chan uint64, 1024)
+		go func() {
+			defer close(started)
+			for {
+				attempt, ok := flow.beginReplacementAttempt()
+				if !ok {
+					return
+				}
+				started <- attempt
+			}
+		}()
+		for len(started) == 0 {
+			runtime.Gosched()
+		}
+		flow.signalDone()
+		recorded := replacementFields(flow)["lane_replacement_attempts"].(uint64)
+		for attempt := range started {
+			if attempt > recorded {
+				t.Fatalf("replacement %d started after a completion record that counts %d", attempt, recorded)
+			}
+		}
 	}
 }

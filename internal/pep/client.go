@@ -2849,7 +2849,13 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 		}
 		var attempt uint64
 		if replacement {
-			attempt = flow.noteReplacementAttempt()
+			// The manager's select can take a tick that arrived with the
+			// flow's end, and a replacement dialled then reached the gateway
+			// after the completion record had been written without it.
+			var ok bool
+			if attempt, ok = flow.beginReplacementAttempt(); !ok {
+				return false
+			}
 		}
 		pending++
 		go func() {
