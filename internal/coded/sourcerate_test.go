@@ -84,3 +84,20 @@ func TestAnEmptyWindowIsASparseMeasurementNotAColdMeter(t *testing.T) {
 		t.Fatal("an empty window read as no measurement: the lane would size like a cold burst")
 	}
 }
+
+// A burst followed by a pause of a few round trips -- short of the idle
+// reset -- measures the empty round trip before the next symbol, not the
+// burst spread over the pause, whether or not anything polled meanwhile.
+func TestThePauseAfterABurstIsMeasuredAsEmpty(t *testing.T) {
+	var m sourceMeter
+	rtt := 20 * time.Millisecond
+	t0 := time.Now()
+	_, _ = m.rate(t0, rtt)
+	for i := range 10 {
+		m.add(10_000, t0.Add(time.Duration(i)*time.Millisecond))
+	}
+	m.add(100, t0.Add(55*time.Millisecond)) // after a pause of over two round trips
+	if r, ok := m.rate(t0.Add(56*time.Millisecond), rtt); !ok || r != 0 {
+		t.Fatalf("after a pause the rate is %.0f B/s (%v); want the empty round trip's", r, ok)
+	}
+}

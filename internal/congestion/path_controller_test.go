@@ -1180,3 +1180,59 @@ func TestTheFirstPacketAfterAnUnusedOpportunityIsApplicationLimited(t *testing.T
 		t.Fatalf("the first packet after an unused opportunity was registered as a path measurement (state %v)", ok)
 	}
 }
+
+// The datagram burst override rests on transition evidence that decays with
+// the statistic: once datagram-bearing samples stop sitting next to each
+// other for long enough, it is withdrawn and the path-wide figure stands.
+func TestTheDatagramOverrideIsWithdrawnWhenItsEvidenceDecays(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	send := func(datagram bool) quiccongestion.PacketNumber {
+		n := a.next
+		a.next++
+		a.inFlight += 1200
+		a.sizes[n] = 1200
+		a.a.OnSent(quiccongestion.SentPacket{Space: quiccongestion.SpaceApplication, Number: n, Bytes: 1200,
+			AckEliciting: true, InFlightCounted: true, HasDatagram: datagram, InFlight: a.inFlight, Time: now})
+		return n
+	}
+	var batch []quiccongestion.PacketNumber
+	for range 400 {
+		batch = append(batch, send(true))
+	}
+	a.event(now, batch, nil)
+	if _, ok := c.DatagramBurstFactor(); !ok {
+		t.Fatal("no override after 400 adjacent datagram samples")
+	}
+	for range 10 {
+		batch = batch[:0]
+		for range 1000 {
+			batch = append(batch, send(true), send(false))
+		}
+		a.event(now, batch, nil)
+	}
+	if b, ok := c.DatagramBurstFactor(); ok {
+		t.Fatalf("the override %.2f stands on evidence that has decayed away", b)
+	}
+}
+
+// Time is judged against the flight before an attachment leaves: a full
+// window that a detach opens was not an unused opportunity before it.
+func TestADetachDoesNotMakeThePastLookUnused(t *testing.T) {
+	c := newPCController()
+	now := base()
+	full, other := attachPC(t, c, now), attachPC(t, c, now)
+	window := c.law.GetCongestionWindow()
+	for full.inFlight+1200 <= window {
+		full.send(now, 1200)
+	}
+	other.send(now, 1200)
+	other.a.OnDemand(quiccongestion.Demand{})
+	now = now.Add(300 * time.Millisecond)
+	full.a.OnDetach(now)
+	other.event(now, numbers(0, 1), nil)
+	if c.law.inner.estimator.appLimited {
+		t.Fatal("the time before the detach was counted as an unused opportunity")
+	}
+}

@@ -101,8 +101,6 @@ type PathController struct {
 	// datagramBurst publishes its burst factor (math.Float64bits), zero
 	// until datagramsSeen is enough to say.
 	datagrams     *lossmodel.Estimator
-	datagramPairs uint64
-	datagramPrev  bool
 	datagramBurst atomic.Uint64
 
 	// Scratch for the law's batches.
@@ -475,26 +473,24 @@ func (c *PathController) advance(now monotime.Time) {
 		switch {
 		case !r.datagram || (r.fate != fateDelivered && r.fate != fateLost):
 			c.datagrams.Break()
-			c.datagramPrev = false
 		default:
 			c.datagrams.ObserveOutcome(r.fate == fateDelivered)
-			if c.datagramPrev {
-				// A transition between two adjacent datagram-bearing
-				// samples: the evidence the statistic is made of.
-				c.datagramPairs++
-			}
-			c.datagramPrev = true
 		}
 		c.ring[0] = fateRecord{}
 		c.ring = c.ring[1:]
 		c.ringBase++
 	}
-	if c.datagramPairs >= pathDatagramEvidence {
+	// The evidence decays with the statistic: transitions the estimator
+	// still weighs, not every pair ever seen. Below the threshold the
+	// override is withdrawn and the path-wide figure stands.
+	if c.datagrams.Transitions() >= pathDatagramEvidence {
 		b := c.datagrams.Snapshot().BurstFactor
 		if b < 1 {
 			b = 1
 		}
 		c.datagramBurst.Store(math.Float64bits(b))
+	} else {
+		c.datagramBurst.Store(0)
 	}
 	for len(c.lostHeld) > 0 {
 		h := c.lostHeld[0]
@@ -602,7 +598,9 @@ func runWakes(wakes []func()) {
 }
 
 func (c *PathController) attach(a *PathAttachment, now monotime.Time, inFlight, maxPacket quiccongestion.ByteCount) {
-	c.clamp(now)
+	// Time so far is judged against the flight before this attachment
+	// joins it.
+	c.accrue(c.clamp(now))
 	c.atts[a] = struct{}{}
 	c.attached.Store(int64(len(c.atts)))
 	a.probing = false
@@ -622,6 +620,9 @@ func (c *PathController) detach(a *PathAttachment, now monotime.Time) []func() {
 		return nil
 	}
 	now = c.clamp(now)
+	// Time so far is judged against the flight before this attachment
+	// leaves it.
+	c.accrue(now)
 	for key := range a.pkts {
 		c.discard(a, key)
 	}
@@ -958,6 +959,7 @@ func (c *PathController) demote(a *PathAttachment) {
 	if a.probing {
 		return
 	}
+	c.accrue(c.now)
 	c.flight -= a.gauge
 	c.flightGauge.Store(int64(c.flight))
 	a.probing = true
@@ -976,6 +978,7 @@ func (c *PathController) promote(a *PathAttachment) {
 	if !a.probing {
 		return
 	}
+	c.accrue(c.now)
 	a.probing = false
 	c.flight += a.gauge
 	c.flightGauge.Store(int64(c.flight))

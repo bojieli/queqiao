@@ -190,6 +190,11 @@ func (e *Estimator) ObserveOutcome(arrived bool) {
 	e.record(arrived)
 }
 
+// Transitions is the weight of the neighbour transitions the run statistics
+// currently rest on: pairs of adjacent outcomes, decayed as the counters
+// are. Outcomes separated by Break contribute none.
+func (e *Estimator) Transitions() float64 { return e.fromArrival + e.fromLoss }
+
 // Break records that the fate of the next packet in sequence is unknown --
 // it was discarded or expired without an outcome -- so the run statistics are
 // not chained across it: the packets on either side are not neighbours. It
