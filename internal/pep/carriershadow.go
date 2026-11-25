@@ -392,6 +392,9 @@ type carrierObservation struct {
 	progress carrierProgress
 	since    time.Duration
 	epoch    uint64
+	// at is when the carrier was read; records carry it so a reader can
+	// order them by observation rather than by when they were logged.
+	at time.Time
 }
 
 // live reports whether the observation is of a carrier that has not ended.
@@ -469,7 +472,7 @@ func (o *carrierShadow) sample(c *shadowCarrier) carrierObservation {
 	now := time.Now()
 	progress, ended := c.src.carrierProgress()
 	events := c.m.observe(carrierSample{At: now, Progress: progress, Ended: ended}, buf[:0])
-	obs := carrierObservation{tracked: true, id: c.id, state: c.m.state, progress: progress, since: c.m.sinceProgress(now), epoch: c.m.epoch}
+	obs := carrierObservation{tracked: true, id: c.id, state: c.m.state, progress: progress, since: c.m.sinceProgress(now), epoch: c.m.epoch, at: now}
 	var summary *carrierMachine
 	if len(events) > 0 && c.m.terminal() {
 		copied := c.m
@@ -493,7 +496,7 @@ func (o *carrierShadow) emit(c *shadowCarrier, event carrierEvent, srtt time.Dur
 	switch event.Kind {
 	case carrierTransition:
 		o.metrics.CarrierShadowTransition(event.To, event.FalseReplacement)
-		o.logger.Info("carrier shadow state", "endpoint", o.role, "carrier_id", c.id,
+		o.logger.Info("carrier shadow state", "endpoint", o.role, "carrier_id", c.id, "observed_unix_ms", event.At.UnixMilli(),
 			"from", event.From.String(), "to", event.To.String(), "reason", event.Reason,
 			"pto_since_progress", event.PTOs, "since_transport_progress", event.SinceProgress,
 			"false_replacement", event.FalseReplacement, "transport_epoch", event.Epoch, "srtt", srtt,
@@ -680,6 +683,7 @@ func (o *carrierShadow) noteStall(f *multipathFlow, lane *mpLane, pendingSince t
 	o.metrics.CarrierShadowStall(remedy, acked)
 	fields := append(o.flowFields(f),
 		"carrier_id", obs.id, "carrier_state", carrierStateLabel(obs), "transport_acked", acked,
+		"observed_unix_ms", observedMillis(obs),
 		"pto_since_progress", obs.progress.PTOExpiries, "since_transport_progress", obs.since,
 		"eliciting_outstanding", obs.progress.ElicitingOutstanding, "srtt", obs.progress.SmoothedRTT,
 		"transport_epoch", obs.epoch, "design_remedy", remedy.String(), "legacy_remedy", o.legacyStallRemedy(),
@@ -689,6 +693,13 @@ func (o *carrierShadow) noteStall(f *multipathFlow, lane *mpLane, pendingSince t
 		fields = append(fields, "lane_id", lane.id)
 	}
 	o.logger.Info("carrier shadow stall", fields...)
+}
+
+func observedMillis(obs carrierObservation) int64 {
+	if obs.at.IsZero() {
+		return time.Now().UnixMilli()
+	}
+	return obs.at.UnixMilli()
 }
 
 func carrierStateLabel(obs carrierObservation) string {
@@ -744,13 +755,13 @@ func (o *carrierShadow) noteRescue(f *multipathFlow) {
 
 // noteJoinArrival records a JOIN reaching the gateway's admission, with
 // whether it arrived inside an outage and how much of the grace was left.
-func (o *carrierShadow) noteJoinArrival(f *multipathFlow, laneID uint64, deadline time.Time) {
+func (o *carrierShadow) noteJoinArrival(f *multipathFlow, laneID uint64, arrived, deadline time.Time) {
 	if o == nil {
 		return
 	}
-	fields := append(o.flowFields(f), "lane_id", laneID, "in_outage", !deadline.IsZero())
+	fields := append(o.flowFields(f), "lane_id", laneID, "in_outage", !deadline.IsZero(), "observed_unix_ms", arrived.UnixMilli())
 	if !deadline.IsZero() {
-		fields = append(fields, "deadline_remaining", time.Until(deadline))
+		fields = append(fields, "deadline_remaining", deadline.Sub(arrived))
 	}
 	o.logger.Info("carrier shadow join arrived", fields...)
 }

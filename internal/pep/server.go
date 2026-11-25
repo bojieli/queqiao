@@ -1538,14 +1538,18 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 	// here rather than expiring underneath the handshake it was waiting for.
 	// The grace is per outage, so a rescue that dials several JOINs in
 	// parallel extends it once per arriving JOIN, each one fresh evidence.
+	// The shadow record needs the deadline in force when the JOIN arrived;
+	// it is written after the extension so logging cannot delay it.
+	var shadowDeadline time.Time
 	if s.carrierShadow != nil {
-		// The deadline in force when the JOIN arrived, before it extends it.
-		s.carrierShadow.noteJoinArrival(serverSession.flow, laneID, serverSession.flow.replacementDeadlineTime())
+		shadowDeadline = serverSession.flow.replacementDeadlineTime()
 	}
-	if !serverSession.completed.Load() && serverSession.flow.extendReplacementOutage(time.Now(), laneReplacementWait) {
+	shadowArrival := time.Now()
+	if !serverSession.completed.Load() && serverSession.flow.extendReplacementOutage(shadowArrival, laneReplacementWait) {
 		s.metrics.LaneGraceExtended()
 		s.cfg.Logger.Debug("lane replacement grace extended by rescue join", "lane", laneID, "flow_id", open.Header.FlowID)
 	}
+	s.carrierShadow.noteJoinArrival(serverSession.flow, laneID, shadowArrival, shadowDeadline)
 	kind := transportKindForConn(conn)
 	controlReplacement := open.Header.Flags&protocol.FlagReserveControl != 0
 	if controlReplacement && (!serverSession.flow.reserveControlLane || kind != TransportQUIC) {

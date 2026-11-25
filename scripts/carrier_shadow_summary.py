@@ -151,6 +151,11 @@ class Endpoint:
                     if at is None:
                         self.skipped["no time"] += 1
                         continue
+                    # Prefer the time the observation was made over the
+                    # time it was logged: a hook can log after the sampler.
+                    observed = record.get("observed_unix_ms")
+                    if isinstance(observed, (int, float)) and not isinstance(observed, bool):
+                        at = observed / 1000.0
                     record["_t"] = at - offset_s
                     record["_process"] = record.get("pid", path)
                     self.records.append(record)
@@ -335,11 +340,15 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
             end = next((t for t in sorted(ended.get(key, [])) if start <= t < next_start), None)
             # Without an end record the window runs past the deadline, so a
             # JOIN that arrived late is found and counted late.
-            window_end = end if end is not None else min(next_start, deadline + grace)
+            window_end = end if end is not None else min(next_start, capture_end)
             window_start = max(previous_end if previous_end is not None else -math.inf, start - grace)
             previous_end = end if end is not None else min(next_start, deadline)
             row: dict[str, Any] = {"session_id": key[0], "flow_id": key[1], "gateway_outage_start": start, "gateway_deadline": deadline}
-            observed = next(((t, kind) for t, kind in client_obs.get(key, []) if window_start <= t <= window_end), None)
+            # The client observation nearest the gateway's grace start is the
+            # most plausible view of the same failure; an earlier, resolved
+            # stall in the window is not.
+            candidates = [(t, kind) for t, kind in client_obs.get(key, []) if window_start <= t <= window_end]
+            observed = min(candidates, key=lambda c: abs(c[0] - start)) if candidates else None
             if observed is not None:
                 # Positive: the gateway started its grace after the client
                 # first saw the failure.
@@ -357,12 +366,6 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
                 arrival_margin.append(row["join_arrival_margin_s"])
                 if arrival > deadline:
                     late += 1
-                attempt = attempts.get((*key, join.get("lane_id")))
-                if attempt is not None and attempt[0] <= arrival:
-                    row["join_transit_s"] = arrival - attempt[0]
-                    row["join_transport"] = attempt[1]
-                    transit.append(row["join_transit_s"])
-                    transit_by[attempt[1]].append(row["join_transit_s"])
             elif end is None and next_start == math.inf and capture_end < deadline:
                 # The log stops inside the grace: right-censored, not failed.
                 unfinished += 1
@@ -370,6 +373,18 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
             elif end is None:
                 expired += 1
                 row["expired_without_join"] = True
+            # Every JOIN of this outage that matches an attempt is a transit
+            # sample, not only the first: J budgets for the slow handoffs.
+            for j in joins.get(key, []):
+                if not start <= j["_t"] <= window_end:
+                    continue
+                attempt = attempts.get((*key, j.get("lane_id")))
+                if attempt is not None and attempt[0] <= j["_t"]:
+                    transit.append(j["_t"] - attempt[0])
+                    transit_by[attempt[1]].append(j["_t"] - attempt[0])
+                    if join is not None and j is join:
+                        row["join_transit_s"] = j["_t"] - attempt[0]
+                        row["join_transport"] = attempt[1]
             flows.append(row)
 
     result: dict[str, Any] = {

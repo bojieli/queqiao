@@ -2057,6 +2057,7 @@ func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID
 // controller, while this pool is the multiplexed control failure domain being
 // rebuilt.
 func (c *Client) openControlPoolJoinLane(ctx context.Context, sessionID [16]byte, flowID, laneID uint64) (*mpLane, error) {
+	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, TransportQUIC)
 	lane, err := c.dialLaneMode(ctx, TransportQUIC, sessionID, laneID, true)
 	if err != nil {
 		return nil, err
@@ -3309,6 +3310,7 @@ func (c *Client) openSprayedQUICRescueJoin(ctx context.Context, flow *multipathF
 	if err != nil {
 		return nil, err
 	}
+	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, TransportQUIC)
 	lane, err := c.dialJoinLane(ctx, TransportQUIC, sessionID, laneID)
 	if err != nil {
 		return nil, err

@@ -324,4 +324,23 @@ func TestCarrierShadowLabelsAStalledFlowOnAHealthyCarrierLive(t *testing.T) {
 	if waitForRecord(t, e.clientLogs, "carrier shadow rescue started", 5*time.Second, func(map[string]any) bool { return true }) == nil {
 		t.Fatalf("today's client did not start its stall rescue:\n%s", e.clientLogs.String())
 	}
+	// The rescue's JOIN attempts pair with the gateway's arrivals by lane:
+	// the per-attempt transit the recovery-deadline report uses for J.
+	paired := false
+	deadline := time.Now().Add(10 * time.Second)
+	for !paired && time.Now().Before(deadline) {
+		attempts := map[float64]bool{}
+		for _, r := range logRecords(t, e.clientLogs.String(), "carrier shadow join attempt") {
+			attempts[r["lane_id"].(float64)] = r["flow_id"] == stall["flow_id"]
+		}
+		for _, r := range logRecords(t, e.gatewayLogs.String(), "carrier shadow join arrived") {
+			if attempts[r["lane_id"].(float64)] && r["flow_id"] == stall["flow_id"] {
+				paired = true
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !paired {
+		t.Fatalf("no JOIN attempt paired with a gateway arrival:\nclient:\n%s\ngateway:\n%s", e.clientLogs.String(), e.gatewayLogs.String())
+	}
 }
