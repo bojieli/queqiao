@@ -749,6 +749,14 @@ def report(campaign: str, gates: dict, interim: bool = False,
             ts_ = [t for t in trials.values() if t.path == path and t.block == block and t.arm == arm]
             block_cache[k] = wl.block_extract(ts_, plan) if ts_ else {}
         return block_cache[k]
+    def ran(path: str, block: int, arm: str, key: str) -> bool:
+        """Did the arm run the phase of measure `key` in this block?"""
+        ph = key.split(".", 1)[0] if "." in key else None
+        for t in trials.values():
+            if t.path == path and t.block == block and t.arm == arm:
+                if ph is None or t.trial == ph or any(r["phase"] == ph for r in t.rows):
+                    return True
+        return False
     tail_cache: Dict[Tuple[str, int, str], Dict[str, Tuple[float, List[float]]]] = {}
 
     def block_tails(path: str, block: int, arm: str) -> Dict[str, Tuple[float, List[float]]]:
@@ -918,11 +926,11 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     "|---|---|---|---:|---:|---:|---:|---|"]
             for key, (kind, values) in judged_rules.items():
                 for cand in arms[1:]:
-                    # The blocks in which this measure's trial type ran in
-                    # both arms (a type stopped early has fewer blocks).
-                    common = [b for b in blocks_here if key in block_measures(path, b, cand)
-                              and key in block_measures(path, b, main)] or \
-                             [b for b in blocks_here if block_measures(path, b, cand) and block_measures(path, b, main)]
+                    # Every block in which this measure's trial type (its phase)
+                    # ran in both arms -- a type stopped early has fewer -- the
+                    # measure present or not: a block missing it in either arm
+                    # is unmeasured, not left out of the coverage count.
+                    common = [b for b in blocks_here if ran(path, b, cand, key) and ran(path, b, main, key)]
                     c = [block_measures(path, b, cand).get(key, float("nan")) for b in common]
                     m = [block_measures(path, b, main).get(key, float("nan")) for b in common]
                     # Coverage against the blocks this measure's type ran (its
@@ -1384,18 +1392,33 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
     # newest earlier one if it may carry forward.
     chosen: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
     stale: List[str] = []
+    final_rows: List[tuple] = []
     for key in sorted({r[:4] for r in rows}):
         rs = sorted((r for r in rows if r[:4] == key), key=lambda r: r[6])
         fin = final.get(key[2])
         on_final = [r for r in rs if fin and same(r[5], fin[0]) and r[5][3] == final_sw.get((key[2], key[1]))]
         if on_final:
             chosen[key] = (on_final[-1][4], "")
+            final_rows.append(on_final[-1])
         elif key[3].lower() in carry:
             chosen[key] = (rs[-1][4], f"carried forward from {rs[-1][7]}")
         else:
             stale.append(f"{key[0]} {key[3]} on {key[1]} for {key[2]} ran on an earlier build or other flags "
                          f"({rs[-1][7]}; the final bundle is {fin[2] if fin else '?'}): rerun it on the final bundle, "
                          f"or carry it forward with --carry {key[3]} if no later stage changed what it exercises")
+    # One SHA-256 per (role, platform) of each candidate's prebuilt binaries
+    # across every campaign counted on the final bundle: two campaigns that
+    # each match the newest one on a shared digest may still disagree on a
+    # platform the newest did not use.
+    accepted: Dict[Tuple[str, Tuple[str, str]], Tuple[str, str]] = {}
+    for r in sorted(final_rows, key=lambda r: r[6]):
+        if r[5] and r[5][0] == "binaries":
+            for rp, digest in r[5][1]:
+                got = accepted.setdefault((r[2], rp), (digest, r[7]))
+                if got[0] != digest:
+                    problems.append(f"arm `{r[2]}` ran {rp[0]} {rp[1]} binary {got[0][:12]} in {got[1]} but "
+                                    f"{digest[:12]} in {r[7]}")
+    problems[:] = list(dict.fromkeys(problems))
     # Coverage before verdicts: a combination with no row is missing, not
     # passed by the rows that happen to exist.
     cells_of: Dict[str, set] = collections.defaultdict(set)

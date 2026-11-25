@@ -600,7 +600,9 @@ it beside A and B as well (the `classifier=v2` gate). It is written as a
 campaign of its own in `<campaign>/idle-wake`, judged by `ab_analyze.py`
 like any other. On a small client host D's two idle client instances need
 `idle_wake_on_small = true`. A campaign of D alone is refused: its arms
-would run one after the other.
+would run one after the other. A campaign with D has one path: blocks load
+one path at a time, so on a second path D's wakes would fall while that path
+is idle. Run one campaign per path.
 
 **Sequential stopping** (design section 15.4; `sequential = true`). Each
 trial type starts with 6 blocks per path. After block 6 and after each

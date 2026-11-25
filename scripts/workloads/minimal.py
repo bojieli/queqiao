@@ -402,6 +402,12 @@ class Minimal(pa._Scenario):
             raise ab.ConfigError("[workload:minimal] idle_wake: auto, true or false")
         # D runs beside C at stage 10 (and beside A and B for classifier=v2).
         cfg.minimal_wake = iw == "true" or (iw == "auto" and "mixed-all" in cfg.minimal_trials)
+        if cfg.minimal_wake and len(cfg.clients) > 1:
+            # Blocks load one path at a time, so on a second path D's wakes
+            # could fall while that path is idle: run D per path.
+            raise ab.ConfigError("[workload:minimal] D (idle_wake) needs one path per campaign: blocks load one path "
+                                 "at a time, so another path's wakes would not be under load. Run one campaign per "
+                                 "path, or set idle_wake = false")
         if cfg.minimal_wake:
             # D adds an idle client instance per arm on each path's client
             # host, beside the blocks' one: a small host must allow it.

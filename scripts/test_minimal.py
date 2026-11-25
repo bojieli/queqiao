@@ -1273,6 +1273,67 @@ class RoundFourFixes(unittest.TestCase):
         self.assertGreater(time.monotonic() - c0, 0.35)
 
 
+class RoundFiveFixes(unittest.TestCase):
+    def test_a_block_missing_a_gated_measure_is_unmeasured(self):
+        # Seven bulk blocks; in block 7 the candidate's goodput measure is
+        # absent (as when an extractor withholds a measure): six measured of
+        # seven run is INCOMPLETE under full coverage, not a pass on six.
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            unit_campaign(root, [(b, "a", "bulk") for b in range(1, 8)])
+            g = an.load_gates()
+            g["resamples"] = 500
+            m = wl.WORKLOADS["minimal"]
+            real = m.block_extract
+
+            def drop(self_, trials, plan):
+                out = real(self_, trials, plan)
+                if trials and trials[0].block == 7 and trials[0].arm == "cand":
+                    out.pop("bulk.goodput_bps", None)
+                return out
+            with mock.patch.object(m, "block_extract", drop):
+                _, v = an.report(root, g)
+        self.assertEqual(v[("a", "cand", "rule:bulk.goodput_bps")], "n/a")
+
+    def test_conflicting_prebuilt_binaries_are_not_one_release(self):
+        # Newest campaign: linux client only. Two earlier ones share its
+        # gateway digest but ran different darwin clients.
+        pa_tests = importlib.import_module("test_phase_a")
+        g = an.load_gates()
+        g["resamples"] = 500
+        g["workloads"]["llm"] = {k: v for k, v in g["workloads"]["llm"].items() if k != "*.class_interactive"}
+        llm = wl.WORKLOADS["llm"]
+        gw = {"gateway": {"platform": "linux/amd64", "sha256": "1" * 64}}
+
+        def camp(root, extra, path):
+            OneFinalBuild().one_path(root, path, "x")
+            plan = json.loads(pathlib.Path(root, "plan.json").read_text())
+            cand = plan["arms"]["cand"]
+            cand.pop("commit", None)
+            cand["binaries"] = dict(gw, **extra)
+            pathlib.Path(root, "plan.json").write_text(json.dumps(plan))
+        with tempfile.TemporaryDirectory() as d:
+            e1, e2, new = os.path.join(d, "mac-1"), os.path.join(d, "mac-2"), os.path.join(d, "linux")
+            camp(e1, {"client:a": {"platform": "darwin/arm64", "sha256": "2" * 64}}, "a")
+            camp(e2, {"client:b": {"platform": "darwin/arm64", "sha256": "3" * 64}}, "b")
+            camp(new, {"client:c": {"platform": "linux/amd64", "sha256": "4" * 64}}, "c")
+            with mock.patch.object(an, "FLIP_WORKLOADS", ("llm",)), \
+                    mock.patch.object(llm, "report_only", llm.report_only + ("class_interactive",)):
+                text, ok = an.flip_report([e1, e2, new], g)
+                self.assertFalse(ok)
+                self.assertIn("ran client darwin/arm64 binary 222222222222 in mac-1 but 333333333333 in mac-2", text)
+                camp(os.path.join(d, "mac-2b"), {"client:b": {"platform": "darwin/arm64", "sha256": "2" * 64}}, "b")
+                text, ok = an.flip_report([e1, os.path.join(d, "mac-2b"), new], g)
+                self.assertTrue(ok, text)
+
+    def test_d_runs_on_one_path_per_campaign(self):
+        two = BASE.replace("[arm:main]", "[client:b]\nhost = c2\n[production:c2]\nhost = c2\n[arm:main]")
+        with self.assertRaises(ab.ConfigError) as cm:
+            parse(two)
+        self.assertIn("one path per campaign", str(cm.exception))
+        parse(two.replace("tls = false", "tls = false\nidle_wake = false"))
+
+
 class ShortAnswers(unittest.TestCase):
     def test_a_short_rpc_answer_is_not_a_completed_request(self):
         # A server that answers every request with 200 and 10 bytes.
