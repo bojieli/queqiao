@@ -68,7 +68,7 @@ func (r *Registry) CreditDelay(d time.Duration) {
 		i++
 	}
 	r.creditDelay.buckets[i].Add(1)
-	r.creditDelay.sumNS.Add(uint64(d))
+	r.creditDelay.sumNS.Add(uint64(d.Nanoseconds())) // #nosec G115 -- d is clamped to >= 0 above
 }
 
 func (r *Registry) creditDelaySnapshot() CreditDelaySnapshot {

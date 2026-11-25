@@ -138,8 +138,8 @@ type Registry struct {
 	carrierShadow carrierShadowCounters
 	// creditDelay is the sender-side credit delay histogram (creditdelay.go).
 	creditDelay creditDelayHistogram
-	telemetryMu   sync.Mutex
-	quicFlows     map[uint64]quicObservation
+	telemetryMu sync.Mutex
+	quicFlows   map[uint64]quicObservation
 	// clock is the time source for observation freshness. Tests replace it;
 	// production leaves it nil and reads the wall clock.
 	clock func() time.Time
