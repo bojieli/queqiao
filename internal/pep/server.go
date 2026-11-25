@@ -59,7 +59,10 @@ type ServerConfig struct {
 	Congestion CongestionControlKind
 	// CCAPI selects how QUIC congestion controllers are driven; see
 	// CCAPIVersion. Empty is v1.
-	CCAPI                         CCAPIVersion
+	CCAPI CCAPIVersion
+	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
+	// is legacy.
+	CodedRetry                    CodedRetryMode
 	BrutalBytesPerSec             uint64
 	AdaptiveMinBytesSec           uint64
 	AdaptiveMaxBytesSec           uint64
@@ -452,6 +455,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, errors.New("brutal congestion requires a positive per-lane byte rate")
 	}
 	if err := validateBundle(&cfg.CCAPI, cfg.Congestion, cfg.Profile); err != nil {
+		return nil, err
+	}
+	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
 		return nil, err
 	}
 	if cfg.AdaptiveMinBytesSec == 0 {
@@ -1123,13 +1129,15 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		// Owned admission: the session limit counts logical flows, charged
 		// here at OPEN. The refusal is FLOW_LIMIT, a code every wire version
 		// knows and the answer a peer already gets for an account's limit.
-		if !tryAcquire(s.semaphore) {
+		acquired := tryAcquire(s.semaphore)
+		if !acquired {
 			// A parked relay's slots are due back at its expiry, which the
 			// sweeper may not have reached yet; take them back before
 			// refusing anyone.
 			s.udpRelays.expire()
+			acquired = tryAcquire(s.semaphore)
 		}
-		if !tryAcquire(s.semaphore) {
+		if !acquired {
 			s.cfg.Logger.Warn("remote session limit reached")
 			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetFlowLimit, "remote session limit reached")})
 			return
@@ -1187,6 +1195,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
 	flow.classifier = classifier.New(s.classifierConfig())
 	flow.memOwned = s.cfg.Memory == MemoryOwned
+	flow.codedRetrySticky = s.cfg.CodedRetry == CodedRetrySticky
 	// Wire version 1 requires range acknowledgements on both endpoints.
 	flow.ackRanges.Store(true)
 	flow.idleTimeout = s.cfg.FlowIdleTimeout

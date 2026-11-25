@@ -73,7 +73,10 @@ func NewQUICCarrier(conn *quic.Conn) (*QUICCarrier, error) {
 func (c *QUICCarrier) MaxDatagramBytes() int { return int(c.limit.Load()) }
 
 func (c *QUICCarrier) Send(d []byte) error {
-	err := c.conn.SendDatagram(d)
+	return c.sent(c.conn.SendDatagram(d), len(d))
+}
+
+func (c *QUICCarrier) sent(err error, size int) error {
 	if err == nil {
 		return nil
 	}
@@ -86,7 +89,7 @@ func (c *QUICCarrier) Send(d []byte) error {
 	if errors.As(err, &tooLarge) {
 		c.limit.Store(tooLarge.MaxDatagramPayloadSize)
 		return fmt.Errorf("%w: %d bytes offered, %d accepted",
-			ErrDatagramTooLarge, len(d), tooLarge.MaxDatagramPayloadSize)
+			ErrDatagramTooLarge, size, tooLarge.MaxDatagramPayloadSize)
 	}
 	return err
 }
@@ -98,4 +101,18 @@ func (c *QUICCarrier) Receive() ([]byte, error) {
 func (c *QUICCarrier) Close() error {
 	c.stop()
 	return nil
+}
+
+// SendTagged is Send for a datagram whose registration in a packet, or
+// discard, is reported to the function given to ObserveTags.
+func (c *QUICCarrier) SendTagged(d []byte, tag uint64) error {
+	return c.sent(c.conn.SendDatagramTagged(d, tag), len(d))
+}
+
+// ObserveTags installs the connection's datagram observer. A connection has
+// one, and it has one coded path, so this carrier is the only one to set it.
+func (c *QUICCarrier) ObserveTags(f func(tag uint64, registered bool)) {
+	c.conn.SetDatagramObserver(func(tag uint64, outcome quic.DatagramOutcome) {
+		f(tag, outcome == quic.DatagramRegistered)
+	})
 }

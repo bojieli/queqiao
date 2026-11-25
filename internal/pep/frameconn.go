@@ -324,7 +324,7 @@ func (c *frameConn) countData(f protocol.Frame, coded bool) {
 
 func (c *frameConn) Write(f protocol.Frame) error {
 	if c.bulkFrame(f) {
-		reliable, err := c.writeCoded(context.Background(), f)
+		reliable, err := c.writeCoded(context.Background(), f, nil)
 		if err != nil || reliable {
 			return err
 		}
@@ -343,13 +343,16 @@ func (c *frameConn) Write(f protocol.Frame) error {
 // writeCoded hands a bulk frame to the coded substrate, falling back to the
 // control stream if it will not take it: correctness is not worth trading for
 // the coding.
-func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame) (reliable bool, err error) {
+//
+// onCoded, when set, is told what became of a frame the coded path took; it
+// is never called for one it did not.
+func (c *frameConn) writeCoded(ctx context.Context, f protocol.Frame, onCoded func(coded.Outcome, time.Time)) (reliable bool, err error) {
 	f.Header.Version = c.wireVersion()
 	buf, err := protocol.AppendFrame(nil, f)
 	if err != nil {
 		return false, err
 	}
-	if err := c.bulk.SendContext(ctx, buf); err != nil {
+	if err := c.bulk.SendObserved(ctx, buf, onCoded); err != nil {
 		return true, c.writeControlContext(ctx, f)
 	}
 	c.countData(f, true)
@@ -404,13 +407,19 @@ func (c *frameConn) writeContextVia(ctx context.Context, f protocol.Frame) (bool
 // Report the substrate that actually accepted the frame, including reliable
 // fallback and the stream safety copy sent before OPEN confirmation.
 func (c *frameConn) writeContextViaMode(ctx context.Context, f protocol.Frame, forceReliable bool) (bool, error) {
+	return c.writeContextObserved(ctx, f, forceReliable, nil)
+}
+
+// writeContextObserved is writeContextViaMode with an observer for a frame
+// that goes to the coded path (see writeCoded).
+func (c *frameConn) writeContextObserved(ctx context.Context, f protocol.Frame, forceReliable bool, onCoded func(coded.Outcome, time.Time)) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, frameWriteTimeout)
 	defer cancel()
 	if !forceReliable && c.bulkFrame(f) {
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		reliable, err := c.writeCoded(ctx, f)
+		reliable, err := c.writeCoded(ctx, f, onCoded)
 		if err != nil || reliable || !c.needsOpenSafetyCopy(f) {
 			return reliable, err
 		}

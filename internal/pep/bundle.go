@@ -64,10 +64,13 @@ func ValidateBundle(ccAPI CCAPIVersion, congestion CongestionControlKind, p prof
 // Bundle names the switches in effect, for publishing an endpoint's effective
 // configuration: "legacy" when every switch is off. admission is a gateway's
 // (stage 5, independent of the others); a client passes the empty value.
-func Bundle(ccAPI CCAPIVersion, memory MemoryMode, admission GatewayAdmission) string {
+func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, admission GatewayAdmission) string {
 	var on []string
 	if ccAPI == CCAPIV2 {
 		on = append(on, "cc-api=v2")
+	}
+	if codedRetry == CodedRetrySticky {
+		on = append(on, "coded-retry=sticky")
 	}
 	if memory == MemoryOwned {
 		on = append(on, "mem=owned")
