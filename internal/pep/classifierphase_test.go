@@ -693,18 +693,19 @@ func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
 		refill          bool
 	}{
 		{"default", base, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 64 << 10, false},
-		{"48 KiB send bound, legacy", base, small, defaultChunkSize, defaultChunkSize, false, 8 << 10, false},
-		{"48 KiB send bound, mem=owned", base, small, defaultChunkSize, defaultChunkSize, true, 8 << 10, false},
-		{"two 16 KiB chunks", base, twoChunks, 16 << 10, 16 << 10, false, 8 << 10, false},
+		{"default, mem=owned at the autotune floor", base, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, true, 16 << 10, false},
 		{"ios, legacy memory", base, ios, iosChunkSize, iosChunkSize, false, 64 << 10, false},
-		{"ios, mem=owned at the autotune floor", base, ios, iosChunkSize, iosChunkSize, true, 24 << 10, false},
-		{"ios, mem=owned, staged reads that may be extended", base, ios, iosChunkSize, stagingBytes, true, 24 << 10, false},
-		{"48 KiB send bound, mem=owned, staged reads that may be extended", base, small, defaultChunkSize, stagingBytes, true, 8 << 10, false},
 		{"a profile's lower threshold is kept", 16 << 10, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 16 << 10, false},
-		// Too small to tell a transfer from a conversation by bytes: refill
-		// evidence.
-		{"eight slots of 1 KiB staged reads", base, eightSlots, 32 << 10, stagingBytes, false, 3584, true},
-		{"33 KiB legacy bound: a 32 KiB read and a 1 KiB staged read", base, mixed, 32 << 10, stagingBytes, false, 512, true},
+		// One coalesced acknowledgement (64 KiB plus a chunk) can empty these,
+		// so bytes outstanding cannot separate a transfer from a
+		// conversation: refill evidence.
+		{"48 KiB send bound, legacy", base, small, defaultChunkSize, defaultChunkSize, false, 1, true},
+		{"48 KiB send bound, mem=owned", base, small, defaultChunkSize, defaultChunkSize, true, 1, true},
+		{"two 16 KiB chunks", base, twoChunks, 16 << 10, 16 << 10, false, 1, true},
+		{"ios, mem=owned at the autotune floor", base, ios, iosChunkSize, iosChunkSize, true, 1, true},
+		{"ios, mem=owned, staged reads", base, ios, iosChunkSize, stagingBytes, true, 1, true},
+		{"eight slots of 1 KiB staged reads", base, eightSlots, 32 << 10, stagingBytes, false, 1, true},
+		{"33 KiB legacy bound: a 32 KiB read and a 1 KiB staged read", base, mixed, 32 << 10, stagingBytes, false, 1, true},
 		{"32 KiB + 1 send bound, legacy", base, flowMemoryLimits{maxSendBytes: 32<<10 + 1, maxOutstanding: 16384}, 32 << 10, 32 << 10, false, 1, true},
 		{"one slot", base, oneSlot, 32 << 10, 32 << 10, false, 1, true},
 	} {
@@ -737,8 +738,8 @@ func TestFitBacklogThresholdUsesTheProfileAndTheReadPath(t *testing.T) {
 		protocol.FlagAckDown, protocol.FlagAckUp, nil, nil, nil, limits, memlimit.New(1<<20), nil,
 		phasedClassifierConfig(profile.Default().Classifier, ClassifierPhased))
 	staged.fitBacklogThreshold()
-	if got := staged.classifier.BacklogBytes(); got != 3584 {
-		t.Fatalf("eight staged 1 KiB reads: threshold %d, want 3584", got)
+	if got := staged.classifier.BacklogBytes(); got != 1 || !staged.refillMode || staged.fullReadBytes != stagingBytes {
+		t.Fatalf("eight staged 1 KiB reads: threshold %d refill %v full read %d, want 1, refill evidence, and the staging size", got, staged.refillMode, staged.fullReadBytes)
 	}
 }
 
@@ -885,6 +886,74 @@ func TestASingleSlotFlowUsesRefillEvidence(t *testing.T) {
 	cycle(late, 32<<10, 50*time.Millisecond, 10*time.Millisecond, 400)
 	if late.current() == classifier.ClassBulk {
 		t.Fatal("full reads arriving 50 ms after the slot opened were taken for a continuous backlog")
+	}
+}
+
+// The peer coalesces acknowledgements, so one can release both slots of a
+// two-chunk flow at once. A producer that refills both at once is still a
+// continuously backlogged transfer.
+func TestCoalescedAcksOfAWholeFlightAreNotDrains(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	f.chunkSize = 16 << 10
+	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 2
+	f.fitBacklogThreshold()
+	h.leaveBulk()
+	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
+		h.write(16<<10, false)
+		h.write(16<<10, false)
+		h.advance(10 * time.Millisecond)
+		h.ackTo(f.bytesUp.Load()) // both chunks in one acknowledgement
+		h.advance(time.Millisecond)
+	}
+	if h.current() != classifier.ClassBulk {
+		t.Fatal("a two-slot transfer whose whole flight is acknowledged at once never re-entered BULK")
+	}
+}
+
+// Receive-side bytes observed between an acknowledgement and the prompt
+// refill do not end the backlog stretch while the refill is still due.
+func TestAReceiveBetweenAckAndRefillKeepsTheStretch(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	f.chunkSize = 32 << 10
+	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 1
+	f.fitBacklogThreshold()
+	h.leaveBulk()
+	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
+		h.write(32<<10, false)
+		h.advance(10 * time.Millisecond)
+		h.ackTo(f.bytesUp.Load())
+		h.advance(time.Millisecond)
+		h.recv(100) // the peer's own small message
+		h.advance(time.Millisecond)
+	}
+	if h.current() != classifier.ClassBulk {
+		t.Fatal("receive-side bytes between each acknowledgement and its refill kept a single-slot transfer INTERACTIVE")
+	}
+}
+
+// A read is full when it fills its buffer, whatever its size: a staged fill
+// reads the rest of the chunk into a smaller remaining slice.
+func TestAReadThatFillsItsBufferIsFull(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	f.chunkSize = 1500
+	f.sendMemory = memlimit.New(1 << 20)
+	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 1
+	f.fitBacklogThreshold()
+	h.leaveBulk()
+	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
+		// The staging read fills 1024 bytes, then the fill reads the 476
+		// left in the chunk: both filled what they were offered.
+		f.observeCarriedRead(1024, true, 1024)
+		f.observeCarriedRead(476, true, 476)
+		h.advance(10 * time.Millisecond)
+		h.ackTo(f.bytesUp.Load())
+		h.advance(time.Millisecond)
+	}
+	if h.current() != classifier.ClassBulk {
+		t.Fatal("a staged transfer whose fill reads filled their buffers never re-entered BULK")
 	}
 }
 

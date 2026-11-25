@@ -156,20 +156,25 @@ const minBacklogThresholdBytes = 8 << 10
 const refillWindow = 20 * time.Millisecond
 
 // leastResidual is the least a continuously backlogged flow can hold,
-// unacknowledged, just after the peer acknowledges its oldest read and
-// before the producer refills: the worst case is a queue whose oldest read
-// is a whole chunk and whose other reads are as small as the read path
-// allows. Each scheduler bound limits that remainder:
+// unacknowledged, just after one acknowledgement and before the producer
+// refills. One acknowledgement can release up to maxAckRelease: the peer
+// coalesces until ackBytesThreshold is pending, and the chunk that crosses
+// it can add one more. The worst case is a queue whose oldest read is a
+// whole chunk and whose others are as small as the read path allows, with
+// as much of it as possible released at once. Each scheduler bound limits
+// what is left:
 //
-//   - the send bytes: the bytes the limit has room for beyond one chunk;
-//   - the chunk count: maxOutstanding-1 minimum-size reads;
-//   - under mem=owned, the autotune floor beyond one chunk.
+//   - the send bytes: the limit less one release;
+//   - the chunk count: one whole chunk and maxOutstanding-1 minimum-size
+//     reads, less one release;
+//   - under mem=owned, the autotune floor less one release.
 //
 // It reports false when no bound applies.
 func leastResidual(limits flowMemoryLimits, chunkSize, readSize int, memOwned bool) (int, bool) {
 	if chunkSize <= 0 {
 		return 0, false
 	}
+	release := maxAckRelease(chunkSize)
 	residual, bounded := 0, false
 	take := func(r int) {
 		r = max(r, 0)
@@ -178,16 +183,19 @@ func leastResidual(limits flowMemoryLimits, chunkSize, readSize int, memOwned bo
 		}
 	}
 	if limits.maxSendBytes > 0 {
-		take(limits.maxSendBytes - chunkSize)
+		take(limits.maxSendBytes - release)
 	}
 	if limits.maxOutstanding > 0 {
-		take((limits.maxOutstanding - 1) * readSize)
+		take(chunkSize + (limits.maxOutstanding-1)*readSize - release)
 	}
 	if memOwned {
-		take(stripe.DefaultAutotuneStartupChunks*chunkSize - chunkSize)
+		take(stripe.DefaultAutotuneStartupChunks*chunkSize - release)
 	}
 	return residual, bounded
 }
+
+// maxAckRelease is the most one acknowledgement can cover.
+func maxAckRelease(chunkSize int) int { return ackBytesThreshold + chunkSize }
 
 func minPositive(a, b int) int {
 	if a <= 0 {
@@ -215,7 +223,7 @@ func (f *multipathFlow) fitBacklogThreshold() {
 	threshold, refill := backlogThresholdFor(f.classifier.BacklogBytes(), f.memoryLimits, f.chunkSize, readSize, f.memOwned)
 	f.classifier.SetBacklogBytes(threshold)
 	f.ackMu.Lock()
-	f.refillMode, f.fullReadBytes = refill, readSize
+	f.refillMode, f.fullReadBytes, f.refillThreshold = refill, readSize, threshold
 	f.ackMu.Unlock()
 }
 
@@ -337,7 +345,11 @@ func (f *multipathFlow) noteAckedCoverage() {
 // conversation by bytes outstanding) the backlog counts only while the
 // latest read filled its buffer, and room an acknowledgement opened is a
 // drain unless a full read takes it within refillWindow.
-func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool) (upBytes, downBytes, backlog uint64, drained bool) {
+//
+// bufLen is the buffer the read had room for, so a read that filled it is a
+// full read whatever its size; zero means unknown, and fullReadBytes stands
+// in for it.
+func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool, bufLen int) (upBytes, downBytes, backlog uint64, drained bool) {
 	f.ackMu.Lock()
 	defer f.ackMu.Unlock()
 	if publish && n > 0 {
@@ -359,6 +371,9 @@ func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool) (
 	if f.refillMode {
 		if up && n > 0 {
 			full := n >= f.fullReadBytes
+			if bufLen > 0 {
+				full = n >= bufLen
+			}
 			if f.drainPending && !(full && now.Sub(f.drainPendingAt) <= refillWindow) {
 				f.ackDrained = true
 			}
@@ -367,8 +382,15 @@ func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool) (
 		} else if f.drainPending && now.Sub(f.drainPendingAt) > refillWindow {
 			f.ackDrained, f.drainPending = true, false
 		}
-		if !f.lastReadFull {
+		switch {
+		case !f.lastReadFull:
 			backlog = 0
+		case f.drainPending || backlog > f.refillThreshold:
+			// Still behind, or a refill is due within the window: an
+			// observation of something else -- receive-side bytes, a
+			// re-examination -- does not end the stretch before the
+			// refill has had its chance.
+			backlog = max(backlog, f.refillThreshold+1)
 		}
 	}
 	drained = f.ackDrained
@@ -378,7 +400,7 @@ func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool) (
 
 // ackSample is countAndSample for no new bytes.
 func (f *multipathFlow) ackSample() (backlog uint64, drained bool) {
-	_, _, backlog, drained = f.countAndSample(f.clockNow(), 0, true, false)
+	_, _, backlog, drained = f.countAndSample(f.clockNow(), 0, true, false, 0)
 	return backlog, drained
 }
 

@@ -452,11 +452,14 @@ type multipathFlow struct {
 	// pending since drainPendingAt becomes a drain unless a read of at least
 	// fullReadBytes follows within refillWindow, and lastReadFull says whether
 	// the latest read filled its buffer. All under ackMu.
-	refillMode     bool
-	fullReadBytes  int
-	drainPending   bool
-	drainPendingAt time.Time
-	lastReadFull   bool
+	refillMode    bool
+	fullReadBytes int
+	// refillThreshold is the classifier's threshold in refill mode, the
+	// backlog reported while a full-read stretch is unbroken.
+	refillThreshold uint64
+	drainPending    bool
+	drainPendingAt  time.Time
+	lastReadFull    bool
 	// ackSampleHook and afterAckSampleHook, when set by a test, run just
 	// before and just after an observation samples the acknowledgement state.
 	ackSampleHook, afterAckSampleHook func()
@@ -3498,9 +3501,15 @@ func (f *multipathFlow) clockNow() time.Time {
 // byte totals in the same step, so no other observation can see the one
 // without the other.
 func (f *multipathFlow) observeCarried(n int, up bool) bool {
+	return f.observeCarriedRead(n, up, 0)
+}
+
+// observeCarriedRead is observeCarried for a read into a buffer of bufLen
+// bytes, which says whether the read filled it.
+func (f *multipathFlow) observeCarriedRead(n int, up bool, bufLen int) bool {
 	f.classifyMu.Lock()
 	defer f.classifyMu.Unlock()
-	return f.observeLocked(n, up, true)
+	return f.observeLocked(n, up, true, bufLen)
 }
 
 // observe classifies the flow with n more bytes than its totals hold.
@@ -3513,7 +3522,7 @@ func (f *multipathFlow) observeCarried(n int, up bool) bool {
 func (f *multipathFlow) observe(n int, up bool) bool {
 	f.classifyMu.Lock()
 	defer f.classifyMu.Unlock()
-	return f.observeLocked(n, up, false)
+	return f.observeLocked(n, up, false, 0)
 }
 
 // observeLocked observes n bytes carried in direction up. With publish, it
@@ -3521,7 +3530,7 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 // acknowledgement state, so an acknowledgement is always judged against a
 // byte count that either includes this read or does not, never one the
 // observation has counted and the ACK path has not.
-func (f *multipathFlow) observeLocked(n int, up, publish bool) bool {
+func (f *multipathFlow) observeLocked(n int, up, publish bool, bufLen int) bool {
 	now := f.clockNow()
 	previousPayload := f.lastPayload.Load()
 	if n > 0 {
@@ -3535,7 +3544,7 @@ func (f *multipathFlow) observeLocked(n int, up, publish bool) bool {
 	if f.ackSampleHook != nil {
 		f.ackSampleHook()
 	}
-	upBytes, downBytes, sendBacklog, backlogDrained := f.countAndSample(now, n, up, publish)
+	upBytes, downBytes, sendBacklog, backlogDrained := f.countAndSample(now, n, up, publish, bufLen)
 	if f.afterAckSampleHook != nil {
 		f.afterAckSampleHook()
 	}
