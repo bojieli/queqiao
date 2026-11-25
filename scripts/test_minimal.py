@@ -1411,6 +1411,82 @@ class RoundSixFixes(unittest.TestCase):
             self.assertEqual(set(srv.SINK), {"live"})          # in progress: kept
 
 
+class MeasuredProgress(unittest.TestCase):
+    def test_window_bytes_are_sample_differences_never_interpolated(self):
+        # A transfer stalled from 5 s to 95 s and then delivered 1 MB at
+        # 95.1 s: sampled every 250 ms, the line is flat through the window,
+        # and the late megabyte is not spread back into it.
+        pa = sys.modules["ab_workload_phase_a"]
+        samples = [[k * 0.25, 9_000_000 if k * 0.25 >= 5 else 0] for k in range(0, 381)] + [[95.25, 10_000_000]]
+        self.assertEqual(pa.progress_in_window([samples], (5.0, 95.0)), (0.0, 90.0))
+        # Even with no sample inside the stall, nothing is spread backwards.
+        sparse = [[0.0, 0], [5.0, 9_000_000], [96.0, 10_000_000]]
+        self.assertEqual(pa.progress_in_window([sparse], (5.0, 95.0)), (0.0, 90.0))
+        self.assertFalse(pa.progress_covered((5.0, 95.0), [samples], 1))
+        # No qualifying bytes at all fails coverage.
+        flat = [[k * 0.25, 0] for k in range(0, 401)]
+        self.assertFalse(pa.progress_covered((5.0, 95.0), [flat], 1))
+
+    def test_the_sampler_records_a_stalled_transfer_as_a_flat_line(self):
+        cl = load_script(CLIENT, "wlclient_progress")
+        p = cl.Progress("down", 1)
+        s = cl.Sampler([p], every=0.05)
+        s.start()
+        p.add(1000)
+        time.sleep(0.4)                  # a blocked recv: no I/O, yet samples keep coming
+        p.add(500)
+        time.sleep(0.12)
+        s.done.set()
+        s.join()
+        stalled = [c for t, c in p.samples if c == 1000]
+        self.assertGreaterEqual(len(stalled), 5)
+        self.assertEqual(p.samples[-1][1], 1500)
+
+    def test_an_uploads_timeline_ends_at_the_transfer_not_the_receipt(self):
+        cl = load_script(CLIENT, "wlclient_progress2")
+        p = cl.Progress("up", 1)
+        p.add(10)
+        p.close(100.0)
+        p.sample(130.0)                  # the receipt fetch comes later: no new sample
+        self.assertEqual(p.samples[-1], [100.0, 10])
+
+    def test_error_responses_are_not_credited(self):
+        # A download whose origin answers 404 with a body: no qualifying bytes.
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                with c:
+                    try:
+                        c.recv(4096)
+                        c.sendall(b"HTTP/1.0 404 Not Found\r\nContent-Length: 100000\r\n\r\n" + b"x" * 100000)
+                    except OSError:
+                        pass
+        threading.Thread(target=serve, daemon=True).start()
+        socks = Socks5UDP()
+        socks.start()
+        try:
+            p = subprocess.run([sys.executable, str(CLIENT), "bgdown", "--socks", f"127.0.0.1:{socks.port}",
+                                "--target", f"127.0.0.1:{port}", "--path", "/x", "--flows", "1", "--duration", "2",
+                                "--no-tls"], capture_output=True, text=True, timeout=60)
+        finally:
+            srv.close()
+            socks.srv.close()
+        prog = [json.loads(l[2:]) for l in p.stdout.splitlines() if l.startswith("J\t")]
+        self.assertEqual(len(prog), 1)
+        self.assertEqual(prog[0]["samples"][-1][1], 0)
+        pa = sys.modules["ab_workload_phase_a"]
+        self.assertFalse(pa.progress_covered((prog[0]["samples"][0][0], prog[0]["samples"][-1][0]),
+                                             [prog[0]["samples"]], 1))
+
+
 class ShortAnswers(unittest.TestCase):
     def test_a_short_rpc_answer_is_not_a_completed_request(self):
         # A server that answers every request with 200 and 10 bytes.

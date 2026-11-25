@@ -390,36 +390,69 @@ def cmd_term(args) -> None:
 
 # --- backgrounds ----------------------------------------------------------------------
 
+CHUNK = 1 << 16        # background I/O granularity: the counter moves at least this often
+
+
 class Progress:
-    """A background flow's bytes over time: (wall-clock s, cumulative bytes)
-    every PROGRESS_EVERY s and at each object's end, so the bytes inside any
-    window are read off the flow's own timeline instead of spread evenly
-    over an object's interval. Recorded as a J record of kind "bgprog"."""
-    EVERY = 0.25
+    """A background flow's qualifying bytes over time. The flow adds to one
+    cumulative counter after every chunk (at most 64 KiB) of a successful
+    transfer; a Sampler records (wall-clock s, cumulative) every 250 ms
+    whatever the I/O is doing, so a stalled transfer shows as a flat line and
+    no byte is ever placed earlier than it moved. close(t) freezes the
+    timeline at the transfer's end. Recorded as a J record "bgprog"."""
 
     def __init__(self, direction: str, flow: int):
         self.dir, self.flow, self.total = direction, flow, 0
+        self.lock = threading.Lock()
+        self.closed = False
         self.samples = [[round(time.time(), 3), 0]]
 
-    def add(self, n: int, force: bool = False) -> None:
-        self.total += n
-        now = time.time()
-        if force or now - self.samples[-1][0] >= self.EVERY:
-            self.samples.append([round(now, 3), self.total])
+    def add(self, n: int) -> None:
+        with self.lock:
+            self.total += n
+
+    def sample(self, now: float) -> None:
+        with self.lock:
+            if not self.closed:
+                self.samples.append([round(now, 3), self.total])
+
+    def close(self, t: float) -> None:
+        """The transfer ended at t: the last sample, and no more."""
+        with self.lock:
+            if not self.closed:
+                self.closed = True
+                self.samples.append([round(t, 3), self.total])
 
     def emit(self) -> None:
-        self.add(0, force=True)
         record({"kind": "bgprog", "dir": self.dir, "flow": self.flow, "samples": self.samples})
+
+
+class Sampler(threading.Thread):
+    """Samples every flow's counter every `every` seconds until stopped."""
+
+    def __init__(self, flows, every: float = 0.25):
+        super().__init__(daemon=True)
+        self.flows, self.every, self.done = flows, every, threading.Event()
+
+    def run(self) -> None:
+        nxt = time.time()
+        while not self.done.is_set():
+            nxt += self.every
+            self.done.wait(max(0.0, nxt - time.time()))
+            now = time.time()
+            for p in self.flows:
+                p.sample(now)
 
 
 def cmd_bgdown(args) -> None:
     """`flows` downloads, each fetching object after object (plain HTTP from
-    the origin) until the window closes or the stop file appears; each
-    flow's received bytes over time are recorded (Progress)."""
+    the origin) until the window closes or the stop file appears. Only a
+    200 response's body counts toward its progress (Progress, Sampler)."""
     end = time.time() + args.duration
+    progs = [Progress("down", i) for i in range(1, args.flows + 1)]
 
     def flow(i):
-        prog = Progress("down", i)
+        prog = progs[i - 1]
         k = 0
         while time.time() < end and not stopped(args):
             k += 1
@@ -430,40 +463,46 @@ def cmd_bgdown(args) -> None:
                 s.sendall(f"GET {args.path} HTTP/1.0\r\nHost: origin\r\n\r\n".encode())
                 head = b""
                 while b"\r\n\r\n" not in head:
-                    b = s.recv(65536)
+                    b = s.recv(CHUNK)
                     if not b:
                         raise EOFError
                     head += b
                 code = int(head.split(b" ", 2)[1])
+                ok = code == 200
                 got = len(head.split(b"\r\n\r\n", 1)[1])
-                prog.add(got)
+                if ok:
+                    prog.add(got)
                 while time.time() < end and not stopped(args):
                     try:
-                        b = s.recv(1 << 16)
+                        b = s.recv(CHUNK)
                     except socket.timeout:
-                        prog.add(0)
                         continue
                     if not b:
                         break
                     got += len(b)
-                    prog.add(len(b))
+                    if ok:
+                        prog.add(len(b))
                 else:
                     err = 28
                 s.close()
             except (OSError, EOFError, ValueError):
                 err = 7
             t1 = time.time()
-            prog.add(0, force=True)
             row(t0, t1, f"b{i}o{k}", code, got, t1 - t0, err)
-            if err not in (0,):
+            if err not in (0,) or code != 200:
                 break
-        prog.emit()
+        prog.close(time.time())
 
+    sampler = Sampler(progs)
+    sampler.start()
     ts = [threading.Thread(target=flow, args=(i,)) for i in range(1, args.flows + 1)]
     for t in ts:
         t.start()
     for t in ts:
         t.join()
+    sampler.done.set()
+    for p in progs:
+        p.emit()
 
 
 SINK_UNKNOWN = 99   # a cut upload whose received bytes could not be learned
@@ -503,13 +542,14 @@ def cmd_bgup(args) -> None:
     """`flows` uploads to the far side's sink, each posting object after
     object until the window closes or the stop file appears."""
     end = time.time() + args.duration
-    block = os.urandom(1 << 16)
+    block = os.urandom(CHUNK)
     run = os.urandom(6).hex()
+    # Bytes handed to the tunnel's client over time, a chunk at a time: they
+    # reach the far side within the client's bounded send window.
+    progs = [Progress("up", i) for i in range(1, args.flows + 1)]
 
     def flow(i):
-        # Bytes handed to the tunnel's client over time: they reach the far
-        # side within the client's bounded send window.
-        prog = Progress("up", i)
+        prog = progs[i - 1]
         k = 0
         while time.time() < end and not stopped(args):
             k += 1
@@ -535,6 +575,10 @@ def cmd_bgup(args) -> None:
             except (OSError, EOFError, ValueError, ssl.SSLError):
                 err = 7
             t1 = time.time()
+            if err:
+                # The flow's transfer ends here: freeze its timeline before
+                # any receipt is fetched.
+                prog.close(t1)
             if err == 28:
                 # Cut by the window: count what the sink received, not what
                 # this side handed to its socket. Unknown is recorded as such.
@@ -545,16 +589,20 @@ def cmd_bgup(args) -> None:
                     row(t0, t1, f"u{i}o{k}", 200, got, t1 - t0, 28)
             else:
                 row(t0, t1, f"u{i}o{k}", code, sent, t1 - t0, err)
-            prog.add(0, force=True)
             if err:
                 break
-        prog.emit()
+        prog.close(time.time())
 
+    sampler = Sampler(progs)
+    sampler.start()
     ts = [threading.Thread(target=flow, args=(i,)) for i in range(1, args.flows + 1)]
     for t in ts:
         t.start()
     for t in ts:
         t.join()
+    sampler.done.set()
+    for p in progs:
+        p.emit()
 
 
 # --- W7 call: UDP through SOCKS5 UDP ASSOCIATE ---------------------------------------

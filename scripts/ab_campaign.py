@@ -840,21 +840,27 @@ def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[T
     return [got[f] for f in order]
 
 
-# The pids of a job's processes, never by command line: members TOKEN PGID
-# START. On Linux, every process whose environment holds QQ_AB_JOB=TOKEN
-# (inherited by everything the job started, whatever its process group or
-# its leader's fate). Where the environment cannot be read (macOS), the
-# processes of the job's process group that started no earlier than the job.
-JOB_MEMBERS_SH = r'''members() {
-  if [ -d /proc/self ]; then
-    grep -l -z -x -F -- "QQ_AB_JOB=$1" /proc/[0-9]*/environ 2>/dev/null | sed 's#^/proc/##; s#/environ$##' | grep -v -x -F "$$"
-  else
-    ps -ax -o pid=,pgid=,etime= 2>/dev/null | awk -v g="$2" -v t0="$3" -v now="$(date +%s)" -v me="$$" '
-      $2 == g && $1 != me { n = split($3, a, /[-:]/); s = 0; m = 1
-        for (i = n; i >= 1; i--) { s += a[i] * m; m = (i == n || i == n - 1) ? m * 60 : (i == n - 2 ? m * 24 : m) }
-        if (now - s >= t0 - 2) print $1 }'
-  fi
-}'''
+# Ownership of a job's processes, by token only. Every job runs as
+# `env QQ_AB_TOKEN=<token> bash <job file>`, so the job shell and every
+# process it starts carry the token from exec on. own_mode says how this host
+# can read it: "proc" (Linux, /proc/<pid>/environ), "ps" (ps -E shows the
+# environment), or "none" -- then nothing is signalled and the job is
+# reported for manual cleanup. members TOKEN MODE lists the owners' pids.
+JOB_OWN_SH = r'''own_mode() {
+  if [ -r /proc/self/environ ]; then echo proc; return; fi
+  env QQ_AB_PROBE=yes sleep 5 & q=$!
+  if ps -E -ww -o command= -p "$q" 2>/dev/null | grep -q -F 'QQ_AB_PROBE=yes'; then echo ps; else echo none; fi
+  kill "$q" 2>/dev/null; wait "$q" 2>/dev/null
+}
+members() {
+  case "$2" in
+    proc) grep -l -z -x -F -- "QQ_AB_TOKEN=$1" /proc/[0-9]*/environ 2>/dev/null \
+            | sed 's#^/proc/##; s#/environ$##' | grep -v -x -F -- "$$" ;;
+    ps) ps -E -ww -ax -o pid=,command= 2>/dev/null \
+            | awk -v a="QQ_AB_" -v b="TOKEN=$1" 'index($0, a b) {print $1}' | grep -v -x -F -- "$$" ;;
+  esac
+}
+tok_ok() { case "$1" in ""|*[!0-9a-f-]*) return 1;; *-*) return 0;; *) return 1;; esac; }'''
 
 
 def wait_owned_script(pid_file: str, port: int) -> str:
@@ -923,6 +929,7 @@ class Campaign:
         self.job_seq = 0
         self.blocks_run = 0
         self.units_run: List[List[Any]] = []
+        self.teardown_notes: List[str] = []
         self.stopped = ""
         self.stopped_types: Dict[str, str] = {}
         self.beside_threads: List[threading.Thread] = []
@@ -1357,19 +1364,26 @@ rm -f "$f"''', what=f"stop {tag}")
         return f"{self.w(client.host)}/run/stop-probe-{client.name}-{arm.name}"
 
     def as_job(self, host: str, script: str) -> str:
-        """Run a job in its own process group, recorded under run/, so that
-        teardown can stop it and everything it started (curl, python) even
-        when the runner was interrupted while the job's ssh was in flight.
-        Every process of the job inherits QQ_AB_JOB=<token>; the descriptor
-        holds the group and that token, and stays while any such process
-        survives the job's own end."""
+        """Run a job so that teardown can stop it and everything it started,
+        even when the runner was interrupted while the job's ssh was in
+        flight: the job is a file run as `env QQ_AB_TOKEN=<token> bash
+        <file>`, so its shell and every descendant carry the token from exec
+        on (JOB_OWN_SH). The descriptor run/job-N.pgid holds "<pid> <token>";
+        it is removed when the job ends with none of its processes left, and
+        kept (for teardown, or manual cleanup) otherwise."""
         W = self.w(host)
         self.job_seq += 1
         f = f"{W}/run/job-{self.job_seq}.pgid"
+        body = f"{W}/run/job-{self.job_seq}.sh"
         tok = f"{self.token}-{self.job_seq}"
-        return (f"set -m\n{JOB_MEMBERS_SH}\nt0=$(date +%s)\n(\nexport QQ_AB_JOB={tok}\n{script}\n) &\nj=$!\n"
-                f"echo \"$j {tok} $t0\" > {f}\n"
-                f"wait $j\nrc=$?\n[ -n \"$(members {tok} $j $t0)\" ] || rm -f {f}\nexit $rc")
+        return (f"{JOB_OWN_SH}\n"
+                f"cat > {body} <<'QQ_AB_JOB_EOF'\n{script}\nQQ_AB_JOB_EOF\n"
+                f"env QQ_AB_TOKEN={tok} bash {body} &\nj=$!\n"
+                f"echo \"$j {tok}\" > {f}\n"
+                f"wait $j\nrc=$?\n"
+                f"m=$(own_mode)\n"
+                f"if [ \"$m\" != none ] && [ -z \"$(members {tok} $m)\" ]; then rm -f {f} {body}; fi\n"
+                f"exit $rc")
 
     def interim(self, path: str, trial: str = "") -> Tuple[bool, str]:
         """(stop?, summary) for one path x trial type's sequential gate on
@@ -1673,26 +1687,30 @@ rm -f "$f"''', what=f"stop {tag}")
             h = self.hosts[host]
             W = self.w(host)
             try:
-                h.run(self.owned(host) + f'''[ -d {W}/run ] || exit 0
-# Jobs first. A descriptor is "pgid token": every process the job started
-# carries QQ_AB_JOB=<token> in its environment (as_job), whatever its process
-# group, its leader's fate or its command line. Only those are signalled, and
-# a descriptor goes only once none of its processes is left.
-''' + JOB_MEMBERS_SH + f'''
-desc() {{ read -r g t s < "$1"; case "$g$s" in *[!0-9]*|"") return 1;; esac
-  case "$t" in *[!0-9a-f-]*|"") return 1;; esac; echo "$t $g $s"; }}
+                rc_, text_ = h.run(self.owned(host) + f'''[ -d {W}/run ] || exit 0
+# Jobs first, by token only (JOB_OWN_SH): a descriptor is "<pid> <token>",
+# each field checked on its own. Where ownership cannot be established
+# nothing is signalled and the descriptor stays, reported as unverified.
+''' + JOB_OWN_SH + f'''
+m=$(own_mode)
+if [ -e {W}/run ] && ! ls -A {W}/run >/dev/null 2>&1; then echo "UNVERIFIED: cannot list {W}/run"; fi
 for f in {W}/run/job-*.pgid; do
   [ -f "$f" ] || continue
-  d=$(desc "$f") || {{ echo "stale job descriptor $f left alone"; continue; }}
-  ps_=$(members $d); [ -n "$ps_" ] && kill -TERM $ps_ 2>/dev/null
+  read -r p t x < "$f" 2>/dev/null || {{ echo "UNVERIFIED: cannot read $f"; continue; }}
+  case "$p" in ""|*[!0-9]*) echo "stale job descriptor $f left alone"; continue;; esac
+  tok_ok "$t" && [ -z "$x" ] || {{ echo "stale job descriptor $f left alone"; continue; }}
+  [ "$m" = none ] && {{ echo "UNVERIFIED: $f: job ownership cannot be established on this host"; continue; }}
+  ps_=$(members "$t" "$m"); [ -n "$ps_" ] && kill -TERM $ps_ 2>/dev/null
 done
 sleep 1
 for f in {W}/run/job-*.pgid; do
   [ -f "$f" ] || continue
-  d=$(desc "$f") || continue
-  ps_=$(members $d); [ -n "$ps_" ] && kill -KILL $ps_ 2>/dev/null
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(members $d)" ] && break; sleep 0.2; done
-  if [ -z "$(members $d)" ]; then rm -f "$f"; else echo "job processes survive: $f: $(members $d | tr '\n' ' ')"; fi
+  read -r p t x < "$f" 2>/dev/null || continue
+  case "$p" in ""|*[!0-9]*) continue;; esac
+  tok_ok "$t" && [ -z "$x" ] && [ "$m" != none ] || continue
+  ps_=$(members "$t" "$m"); [ -n "$ps_" ] && kill -KILL $ps_ 2>/dev/null
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(members "$t" "$m")" ] && break; sleep 0.2; done
+  if [ -z "$(members "$t" "$m")" ]; then rm -f "$f" "${{f%.pgid}}.sh"; else echo "job processes survive: $f"; fi
 done
 # Only the processes this campaign spawned (its pid files), each checked to
 # be running from the work directory; anything else that mentions the
@@ -1708,6 +1726,8 @@ for f in {W}/run/*.pid; do
   p=$(cat "$f"); mine "$p" && kill -9 "$p" 2>/dev/null
 done
 rm -f {W}/run/*.pid''', what="stop every process this campaign started")
+                self.teardown_notes += [f"{host}: {x.strip()}" for x in text_.splitlines()
+                                        if x.startswith(("UNVERIFIED", "job processes survive"))]
             except Exception as e:  # keep tearing down the other hosts
                 self.log(f"teardown on {host} failed: {e}")
         for host, ports in self.cfg.planned_ports().items():
@@ -1927,9 +1947,17 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         for host in self.reserved:
             # Teardown removes a job's descriptor only once none of its
             # processes is left: one still there names survivors.
-            rc, text = self.hosts[host].run(f"ls {self.w(host)}/run/job-*.pgid 2>/dev/null; true",
-                                            what="verify no job process survived")
-            out += [f"{host}: a job's processes survived teardown ({x.strip()})" for x in text.splitlines() if x.strip()]
+            # An unreadable directory or a failed check is unverified, not clean.
+            W = self.w(host)
+            rc, text = self.hosts[host].run(
+                f"[ -e {W}/run ] || exit 0\nls -A {W}/run >/dev/null || exit 3\n"
+                f"for f in {W}/run/job-*.pgid; do [ -e \"$f\" ] && echo \"$f\"; done; exit 0",
+                what="verify no job process survived")
+            if rc != 0 and not self.dry:
+                out.append(f"{host}: could not check for surviving job processes (exit {rc})")
+            out += [f"{host}: a job's processes were not verified gone ({x.strip()})" for x in text.splitlines()
+                    if x.strip().endswith(".pgid")]
+        out += self.teardown_notes
         return out
 
     def block_seconds(self, path: str, trial: str = "") -> float:

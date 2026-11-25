@@ -764,53 +764,100 @@ class LocalProcesses(unittest.TestCase):
         self.camp._fetch_glob(self.host, str(e), "server-b001-a", os.path.join(self.home, "fetched"))
         self.assertEqual(len(self.camp.fetch_failures), 1)
 
-    def test_an_interrupted_job_is_stopped_with_everything_it_started(self):
-        # A job (here: a shell that started a child) whose ssh is still in
-        # flight when the runner is interrupted: teardown stops its group.
-        script = self.camp.as_job("local", f"{sys.executable} -c 'import time; time.sleep(60)' & wait")
-        done = threading.Event()
-        threading.Thread(target=lambda: (self.host.run(script, timeout=90), done.set()), daemon=True).start()
-        for _ in range(100):
-            files = list(pathlib.Path(self.W, "run").glob("job-*.pgid"))
-            if files:
-                break
-            time.sleep(0.05)
-        self.assertTrue(files)
-        pgid = int(files[0].read_text().split()[0])
-        self.camp.teardown()
-        self.assertTrue(done.wait(10), "the job's shell did not end")
-        out = subprocess.run(["ps", "-o", "pid=", "-g", str(pgid)], capture_output=True, text=True).stdout.strip()
-        self.assertEqual(out, "")
-        self.assertEqual(list(pathlib.Path(self.W, "run").glob("job-*.pgid")), [])
+    CHILD = ("import signal, sys, os, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+             "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)")
 
-    def test_a_job_child_that_ignores_term_is_still_killed(self):
-        # The job's shell exits on TERM; its child ignores TERM and has no
-        # work-directory path in its command line. Teardown must still find
-        # it (by the job's own identity, not its leader or its arguments),
-        # KILL it, and leave no descriptor behind.
-        child = ("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                 "open(__import__('sys').argv[1], 'w').write(str(__import__('os').getpid())); time.sleep(60)")
-        pidfile = os.path.join(self.home, "child.pid")
-        script = self.camp.as_job("local", f"{sys.executable} -c \"{child}\" {pidfile} & wait")
+    def start_job(self, child_ignores_term=True):
+        """A job whose shell loops (a forked shell, as the request and probe
+        generators are) and whose child ignores TERM and has no work-directory
+        path in its command line. Returns (job shell pid, child pid, done)."""
+        pidfile = os.path.join(self.home, f"child-{time.monotonic_ns()}.pid")
+        prog = self.CHILD if child_ignores_term else "import sys, os, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)"
+        script = self.camp.as_job("local", f"{sys.executable} -c \"{prog}\" {pidfile} &\n"
+                                           f"while :; do sleep 0.2; done")
         done = threading.Event()
-        threading.Thread(target=lambda: (self.host.run(script, timeout=90), done.set()), daemon=True).start()
+        threading.Thread(target=lambda: (self.host.run(script, timeout=120), done.set()), daemon=True).start()
         for _ in range(200):
             if os.path.exists(pidfile) and pathlib.Path(pidfile).read_text():
                 break
             time.sleep(0.05)
-        pid = int(pathlib.Path(pidfile).read_text())
-        self.assertNotIn(self.W, subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
+        files = list(pathlib.Path(self.W, "run").glob("job-*.pgid"))
+        self.assertEqual(len(files), 1)
+        shell = int(files[0].read_text().split()[0])
+        child = int(pathlib.Path(pidfile).read_text())
+        self.assertNotIn(self.W, subprocess.run(["ps", "-o", "args=", "-p", str(child)], capture_output=True,
                                                 text=True).stdout)
+        return shell, child, done, files[0]
+
+    def own_mode(self):
+        return subprocess.run(["bash", "-s"], input=ab.JOB_OWN_SH + "\nown_mode", capture_output=True,
+                              text=True).stdout.strip()
+
+    @unittest.skipUnless(os.path.exists("/proc/self/environ"), "needs /proc/<pid>/environ (Linux)")
+    def test_an_interrupted_job_is_stopped_with_everything_it_started(self):
+        # The job's shell (a loop that would start more traffic) and its
+        # TERM-ignoring child both carry the token from exec on: teardown
+        # KILLs both, verifies none is left, and removes the descriptor.
+        self.assertEqual(self.own_mode(), "proc")
+        shell, child, done, desc = self.start_job()
         self.camp.teardown()
-        self.assertFalse(self.alive(pid))
-        self.assertTrue(done.wait(10))
-        self.assertEqual(list(pathlib.Path(self.W, "run").glob("job-*.pgid")), [])
+        self.assertFalse(self.alive(shell))
+        self.assertFalse(self.alive(child))
+        self.assertTrue(done.wait(10), "the job's ssh did not end")
+        self.assertFalse(desc.exists())
         ok = {"local": ab.parse_snapshot("listen-ok\nps-ok")}
         with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok):
-            self.assertEqual([x for x in self.camp.verify_teardown() if "job" in x], [])
-            # A descriptor teardown could not clear names survivors.
-            pathlib.Path(self.W, "run", "job-77.pgid").write_text("1 ab-1 0\n")
-            self.assertTrue([x for x in self.camp.verify_teardown() if "job's processes survived" in x])
+            self.assertEqual(self.camp.verify_teardown(), [])
+
+    def test_without_a_way_to_establish_ownership_nothing_is_signalled(self):
+        # As on a macOS host whose ps does not show environments: the job's
+        # processes are left alone, the descriptor stays, and teardown is
+        # reported as unverified for manual cleanup.
+        no_owner = ab.JOB_OWN_SH.replace("own_mode() {", "own_mode() { echo none; return\n", 1)
+        with mock.patch.object(ab, "JOB_OWN_SH", no_owner):
+            shell, child, done, desc = self.start_job()
+            try:
+                self.camp.teardown()
+                time.sleep(0.3)
+                self.assertTrue(self.alive(shell))
+                self.assertTrue(self.alive(child))
+                self.assertTrue(desc.exists())
+                ok = {"local": ab.parse_snapshot("listen-ok\nps-ok")}
+                with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok):
+                    notes = self.camp.verify_teardown()
+                self.assertTrue(any("ownership cannot be established" in x for x in notes), notes)
+                self.assertTrue(any("not verified gone" in x for x in notes), notes)
+            finally:
+                for p in (child, shell):
+                    try:
+                        os.kill(p, 9)
+                    except OSError:
+                        pass
+            self.assertTrue(done.wait(10))
+
+    def test_descriptor_fields_are_each_validated(self):
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.procs.append(other)
+        run = pathlib.Path(self.W, "run")
+        for n, text in enumerate((f"{other.pid}\n", f"x abc-1\n", f"{other.pid} abc-1 extra\n",
+                                  f"{other.pid} Thu-Jan\n", f"{other.pid} abc\n"), start=20):
+            (run / f"job-{n}.pgid").write_text(text)
+        self.camp.teardown()
+        time.sleep(0.3)
+        self.assertTrue(self.alive(other.pid))
+        self.assertEqual(len(list(run.glob("job-*.pgid"))), 5)        # left for a human
+
+    def test_an_unreadable_run_directory_is_not_a_clean_teardown(self):
+        run = pathlib.Path(self.W, "run")
+        os.chmod(run, 0)
+        try:
+            ok = {"local": ab.parse_snapshot("listen-ok\nps-ok")}
+            with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok):
+                notes = self.camp.verify_teardown()
+        finally:
+            os.chmod(run, 0o755)
+        if os.geteuid() != 0:
+            self.assertTrue(any("could not check for surviving job processes" in x for x in notes), notes)
 
     def test_a_stale_job_descriptor_is_not_signalled(self):
         # The pid in a left-over descriptor now belongs to another process

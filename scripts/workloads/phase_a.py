@@ -177,15 +177,15 @@ def useful_bg(rows: Sequence[dict]) -> float:
 
 
 def _cum_at(samples: Sequence[Sequence[float]], t: float) -> float:
-    """A flow's cumulative bytes at wall-clock t from its progress samples:
-    between two samples (at most a quarter second apart) linear; before the
-    first, none; after the last, all."""
-    if not samples or t <= samples[0][0]:
-        return 0.0
-    for (a, x), (b, y) in zip(samples, samples[1:]):
-        if t <= b:
-            return x + (y - x) * ((t - a) / (b - a) if b > a else 1.0)
-    return float(samples[-1][1])
+    """A flow's cumulative qualifying bytes at wall-clock t: the last sample
+    at or before t (wlclient samples every 250 ms, whatever the I/O is doing).
+    Never interpolated, so no byte is placed earlier than it was counted."""
+    got = 0.0
+    for when, cum in samples:
+        if when > t:
+            break
+        got = float(cum)
+    return got
 
 
 def progress_flows(records: Sequence[dict], direction: str) -> List[List[Sequence[float]]]:
@@ -195,9 +195,9 @@ def progress_flows(records: Sequence[dict], direction: str) -> List[List[Sequenc
 
 
 def progress_in_window(flows: Sequence[Sequence[Sequence[float]]], window: Tuple[float, float]) -> Tuple[float, float]:
-    """(bytes, seconds) the background moved inside `window`: each flow's
-    bytes read off its own timeline at the window's two ends, so bytes
-    moved before or after the foreground are never credited to it."""
+    """(bytes, seconds) the background moved inside `window`: the difference
+    of each flow's samples at the window's two edges, so bytes moved before
+    or after the foreground are never credited to it."""
     a, b = window
     got = sum(_cum_at(s, b) - _cum_at(s, a) for s in flows)
     return got, max(0.0, b - a)
@@ -210,6 +210,8 @@ def progress_covered(fg: Tuple[float, float], flows: Sequence[Sequence[Sequence[
     if len(flows) < n or fg[1] <= fg[0]:
         return False
     for s in flows:
+        if not s or float(s[-1][1]) <= 0:
+            return False                 # no qualifying (200) bytes at all
         inside = max(0.0, min(s[-1][0], fg[1]) - max(s[0][0], fg[0]))
         if inside < COVERAGE * (fg[1] - fg[0]) or _cum_at(s, fg[1]) - _cum_at(s, fg[0]) <= 0:
             return False
