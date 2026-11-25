@@ -305,6 +305,19 @@ for _name, _fn in (("wl-call", call_script), ("wl-browse", browse_script), ("wl-
 # The trial table of the model's Minimal live plan (DESIGN-PATH-AUTHORITY.md
 # section 15.3): every setting is fixed there, so none is configurable here.
 TRIAL_TYPES = ("bulk", "mixed-67", "mixed-all")
+# Generic secondaries of section 15.4 that gate stage 10 and are reported,
+# not gated, at stages 6 and 7.
+STAGE10_GENERIC = ("credit_delay_p95_s", "false_promotion_rate")
+
+
+def campaign_stage(plan: dict) -> int:
+    """The stage a minimal campaign gates (`[workload:minimal] stage`). A
+    plan from before the setting has its default: 10 with trial type C,
+    else 7."""
+    c = plan.get("config") or {}
+    if c.get("minimal_stage"):
+        return int(c["minimal_stage"])
+    return 10 if "mixed-all" in (c.get("minimal_trials") or ()) else 7
 TRIAL_SECONDS = {"bulk": 60, "mixed-67": 90, "mixed-all": 120}
 LEAD = 5              # backgrounds start this long before the foreground (model 3.0)
 UPLOAD = 100_000      # U, the LLM prompt
@@ -333,22 +346,42 @@ class Minimal(pa._Scenario):
     name = "minimal"
     report_only = (pa.LLM_REPORT_ONLY + pa.TERM_REPORT_ONLY +
                    ("html_first_byte_p50_s", "sessions_failed", "call_sessions_failed", "call_late_loss_up",
-                    "call_late_loss_down", "call_audio_gaps_per_min_up", "call_audio_gaps_per_min_down"))
+                    "call_late_loss_down", "call_audio_gaps_per_min_up", "call_audio_gaps_per_min_down") +
+                   STAGE10_GENERIC)
 
     # The primaries: only bulk flows' bytes (section 15.3).
     primaries = ("bulk.goodput_bps", "mixed-67.bg_down_rate_bps", "mixed-all.bg_down_rate_bps",
                  "mixed-all.bg_up_rate_bps")
     # Generic secondaries where defined (section 15.4): flow completion and
     # wire bytes per useful byte need A's bulk flows; the others apply to
-    # every trial. Credit delay and false promotion have no measurement yet.
+    # every trial. Credit delay and the shadow false-promotion rate gate
+    # every trial type of a stage-10 campaign and are reported, not gated,
+    # at stages 6 and 7 (see `generics`).
     generic = {"bulk": ("completion", "stalls_per_trial", "reissued_per_source", "wire_per_useful", "queue_p90_ms",
                         "cpu_p90"),
                "mixed-67": ("stalls_per_trial", "reissued_per_source", "queue_p90_ms", "cpu_p90"),
                "mixed-all": ("stalls_per_trial", "reissued_per_source", "queue_p90_ms", "cpu_p90")}
 
+    def generics(self, plan) -> Dict[str, Tuple[str, ...]]:
+        """The generic secondaries each trial type is judged on in this
+        campaign: at stage 10, `generic` plus STAGE10_GENERIC."""
+        if campaign_stage(plan) < 10:
+            return dict(self.generic)
+        return {ph: ks + STAGE10_GENERIC for ph, ks in self.generic.items()}
+
+    def reported(self, plan) -> Dict[str, Tuple[str, ...]]:
+        """The generic secondaries each trial type reports without gating."""
+        if campaign_stage(plan) < 10:
+            return {ph: STAGE10_GENERIC for ph in self.generic}
+        return {}
+
     def block_extract(self, trials, plan):
         out = super().block_extract(trials, plan)
-        for ph, ks in self.generic.items():
+        measured: Dict[str, Tuple[str, ...]] = {}
+        for src in (self.generics(plan), self.reported(plan)):
+            for ph, ks in src.items():
+                measured[ph] = measured.get(ph, ()) + ks
+        for ph, ks in measured.items():
             pt = [t for t in trials if getattr(t, "trial", "") == ph]
             if not pt:
                 continue
@@ -370,6 +403,16 @@ class Minimal(pa._Scenario):
         if bad or not trials or len(set(trials)) != len(trials):
             raise ab.ConfigError(f"[workload:minimal] trials: want some of {', '.join(TRIAL_TYPES)}, each once")
         cfg.minimal_trials = [t for t in TRIAL_TYPES if t in trials]
+        # The stage this campaign gates. Stage 10 gates credit delay and the
+        # shadow false-promotion rate (the latter needs --carrier-shadow on
+        # every endpoint of both arms); stages 6 and 7 report them.
+        stage = p.get("stage", "auto").strip().lower()
+        if stage == "auto":
+            cfg.minimal_stage = 10 if "mixed-all" in cfg.minimal_trials else 7
+        elif stage in ("6", "7", "10"):
+            cfg.minimal_stage = int(stage)
+        else:
+            raise ab.ConfigError("[workload:minimal] stage: auto, 6, 7 or 10")
         iw = p.get("idle_wake", "auto").strip().lower()
         if iw not in ("auto", "true", "false"):
             raise ab.ConfigError("[workload:minimal] idle_wake: auto, true or false")

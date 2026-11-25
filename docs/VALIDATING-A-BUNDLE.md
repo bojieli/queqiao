@@ -338,10 +338,21 @@ is where fallback is counted. A client whose runtime configuration says
 gateway flow record shows a TCP carrier, or a TCP lane that carried bytes:
 an AUTO rescue can hand a flow to TCP without counting a client fallback.
 Without those records, QUIC-only cannot be shown, and wire cost is
-unmeasured. Sender-side credit delay p95 and the
-shadow false-promotion rate need the stage 0 instrumentation. They are listed
-as required and reported as not measured, so until that instrumentation
-lands, no campaign reaches an overall PASS.
+unmeasured.
+
+Sender-side credit delay p95 comes from every endpoint's
+`queqiao_credit_delay_seconds` histogram, scraped before and after each
+trial. Each endpoint times what it sends: from a chunk's last byte being
+taken by the carrier to the flow acknowledgement that covers it, minus the
+path's minimum round trip, one chunk per flow at a time. The trial's p95
+pools the gateway's and the client's movement. A build without the
+histogram leaves it unmeasured. The shadow false-promotion rate is the
+carrier-shadow observer's promotions (entries into REPLACE) that were
+acknowledged again afterwards, over all its promotions, from the same
+scrapes; a trial with no promotion has a rate of 0. It needs
+`--carrier-shadow` on every endpoint of both arms, as each endpoint's runtime
+configuration record shows; otherwise it is unmeasured.
+`carrier_shadow_summary.py` reports the same rate from the logs.
 
 The last line per candidate is the overall verdict:
 
@@ -387,7 +398,10 @@ and each client host is one leaf under a shared ancestor. The DC campaign
     measurement.
 - **A shared start:** a phase's jobs start on a barrier, five seconds ahead
   on the hosts' clocks. Request wave *w* starts at the barrier plus
-  (*w* − 1) × `request_timeout` on every leaf. The analysis requires every
+  (*w* − 1) × `request_timeout` on every leaf. A W4 client (`wlclient rpc`)
+  is given the barrier's absolute time, starts at once and waits for the
+  barrier after initialising, so the leaf hosts' interpreter start-up times
+  do not shift their waves. The analysis requires every
   loaded leaf to have been in each wave together for at least 0.1 s, on
   millisecond times; otherwise latency and spread are unmeasured. This also
   relies on NTP-synchronised clocks.
@@ -582,9 +596,13 @@ from the model):
 - **Generic secondaries** (`[secondary]`), as rules of each trial type
   where defined: stalls, reissued bytes, queue p90 and client CPU in every
   type; flow completion and wire bytes per useful byte in A, whose bulk
-  flows define them. Credit delay and the shadow false-promotion rate have
-  no measurement in any build yet; the report lists them and does not gate
-  them.
+  flows define them. Credit delay p95 and the shadow false-promotion rate
+  are rules of every trial type in a stage-10 campaign, and are reported
+  without being gated at stages 6 and 7. `[workload:minimal] stage` sets the
+  stage: `auto`, the default, is 10 when the campaign runs C and 7
+  otherwise. Run every endpoint of both arms with `--carrier-shadow` at
+  stage 10, or the false-promotion rate is unmeasured and the cell is
+  INCOMPLETE. D is judged on its own rules only (design section 15.4).
 - **B:** the LLM's TTFT p50 and p95, delta lateness p99, stalls and
   freezes per streamed minute, call failures, and class correctness (at
   least 99 % of the response's DATA bytes sent INTERACTIVE, from the
@@ -598,7 +616,10 @@ from the model):
   direction is its own open-loop stream on its own clock: the far side
   starts its downlink when the call's first packet names the call and its
   return address, and uplink arrivals never pace it; its report gives the
-  uplink's arrivals and the downlink's sends; the page load time p50 and p95 (from the first CONNECT)
+  uplink's arrivals and the downlink's sends. The call ends, for C's
+  background window, with its media (the uplink's last send or the
+  downlink's last arrival), not with the report's fetches, which cross the
+  same SOCKS path afterwards; the page load time p50 and p95 (from the first CONNECT)
   and failed objects.
 - **D** (`gates.ini [workload:idle-wake]`). The idle interval starts when
   the client has the whole 200 KB sync and acknowledges it, for pushes and

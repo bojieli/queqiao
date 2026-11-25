@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
 import ab_workloads  # noqa: E402
+import carrier_shadow_summary as shadow  # noqa: E402
 
 GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "gates.ini")
 CLK_TCK = 100  # ticks per second in the runner's CPU samples
@@ -343,9 +344,68 @@ def fetch_failed(campaign: str) -> List[str]:
         return []
 
 
-# Section 15.4 secondaries with no measurement in any build yet.
-NOT_YET_MEASURED = ("credit_delay_p95_s", "false_promotion_rate")
-LOG_MEASURES = ("queue_p90_ms", "reissued_per_source", "transit_p50_s", "transit_p90_s", "cpu_p90")
+LOG_MEASURES = ("queue_p90_ms", "reissued_per_source", "transit_p50_s", "transit_p90_s", "cpu_p90",
+                "false_promotion_rate")
+
+CREDIT_BUCKET = re.compile(r'^queqiao_credit_delay_seconds_bucket\{le="([^"]+)"\}$')
+
+
+def histogram_deltas(pre: Dict[str, float], post: Dict[str, float]) -> List[Tuple[float, float]]:
+    """The credit delay histogram's movement between two scrapes, as
+    (upper bound s, cumulative count) pairs in bound order; empty when the
+    build does not export it (in either scrape)."""
+    out = []
+    for k, v in post.items():
+        m = CREDIT_BUCKET.match(k)
+        if m and k in pre:
+            le = float("inf") if m.group(1) == "+Inf" else float(m.group(1))
+            out.append((le, v - pre[k]))
+    return sorted(out)
+
+
+def histogram_quantile(q: float, cumulative: Sequence[Tuple[float, float]]) -> float:
+    """The q-quantile of a cumulative histogram, interpolated linearly inside
+    its bucket (as Prometheus does); a quantile in the +Inf bucket is the last
+    finite bound. NaN with no samples."""
+    if not cumulative or cumulative[-1][1] <= 0:
+        return float("nan")
+    rank = q * cumulative[-1][1]
+    lo_bound, lo_count = 0.0, 0.0
+    for le, c in cumulative:
+        if c >= rank:
+            if le == float("inf"):
+                return lo_bound
+            if c == lo_count:
+                return le
+            return lo_bound + (le - lo_bound) * (rank - lo_count) / (c - lo_count)
+        lo_bound, lo_count = le, c
+    return lo_bound
+
+
+def credit_delay_p95(pairs: Sequence[Tuple[Dict[str, float], Dict[str, float]]]) -> float:
+    """Sender-side credit delay p95 (section 15.3) over a trial, pooled over
+    its endpoints (each times the direction it sends), from each endpoint's
+    histogram scraped before and after it. NaN when any endpoint lacks the
+    histogram: a pool of some endpoints is not the trial's."""
+    pooled: Dict[float, float] = {}
+    for pre, post in pairs:
+        d = histogram_deltas(pre, post)
+        if not d:
+            return float("nan")
+        for le, c in d:
+            pooled[le] = pooled.get(le, 0.0) + c
+    return histogram_quantile(0.95, sorted(pooled.items()))
+
+
+def false_promotions(pairs: Sequence[Tuple[Dict[str, float], Dict[str, float]]], observed: bool) -> float:
+    """The shadow false-promotion rate over a trial (section 15.4; the
+    carrier-shadow summary's definition), from the observer's counters at
+    every endpoint scraped before and after it. Needs the observer
+    (--carrier-shadow) on at every endpoint: otherwise NaN, not zero."""
+    d = lambda pre, post, k: post.get(k, float("nan")) - pre.get(k, float("nan"))
+    false_ = sum(d(a, b, "queqiao_carrier_shadow_false_replacements_total") for a, b in pairs)
+    promoted = sum(d(a, b, 'queqiao_carrier_shadow_transitions_total{to="replace"}') for a, b in pairs)
+    return shadow.false_promotion_rate(false_, promoted, observed and bool(pairs))
 
 
 def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial],
@@ -532,6 +592,9 @@ def cpu_p90(files: List[str], t: Trial) -> float:
 # "runtime configuration" record (design section 14: every test arm publishes
 # its effective configuration per endpoint).
 EFFECTIVE: Dict[Tuple[str, str], set] = {}
+# Whether each endpoint of an (arm, block tag) ran the carrier-shadow
+# observer, from its runtime configuration record(s).
+SHADOW: Dict[Tuple[str, str, str], set] = {}
 
 
 def effective(r: dict) -> str:
@@ -589,6 +652,7 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
             for r in recs:
                 if r.get("msg") == "runtime configuration":
                     EFFECTIVE.setdefault((t.arm, "gateway"), set()).add(effective(r))
+                    SHADOW.setdefault((t.arm, t.tag, "gateway"), set()).add(r.get("carrier_shadow") is True)
             for r in recs:
                 try:
                     r["_t"] = ts(r["time"])
@@ -609,6 +673,7 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
                 if r.get("msg") == "runtime configuration":
                     EFFECTIVE.setdefault((t.arm, "client"), set()).add(effective(r))
                     t.m["client_transport"] = r.get("transport", "")
+                    SHADOW.setdefault((t.arm, t.tag, f"client-{c}"), set()).add(r.get("carrier_shadow") is True)
             for r in crecs:
                 try:
                     r["_t"] = ts(r["time"])
@@ -641,6 +706,16 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         t.m["transit_p50_s"] = st.quantile(ex, 0.5)
         t.m["transit_p90_s"] = st.quantile(ex, 0.9)
         t.m["cpu_p90"] = cpu_p90(cpus, t)
+        # The generic secondaries from every endpoint's /metrics around the
+        # trial: the gateway (the download's sender) and the path's client
+        # (the upload's), each timing what it sends.
+        ends = [(pre, post)] + list(zip(cpre, cpost)) if clients else [(pre, post)]
+        t.m["credit_delay_p95_s"] = credit_delay_p95(ends)
+        # The observer must have been on at every endpoint the trial used,
+        # as each one's runtime configuration record says.
+        names = ["gateway"] + [f"client-{c}" for c in clients]
+        on = all(SHADOW.get((t.arm, t.tag, n)) == {True} for n in names)
+        t.m["false_promotion_rate"] = false_promotions(ends, on)
         # A trial whose logs were not all fetched has partial telemetry: a
         # finite number from a subset is not a measurement of the trial.
         if any(f"-{t.tag}" in x and (f"/gw-{t.arm}/" in x or f"-{t.arm}/" in x) for x in failed):
@@ -715,6 +790,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
     if plan.get("workload") == "dc":
         raise SystemExit("this is a DC gate campaign: evaluate it with scripts/dc_gate.py")
     EFFECTIVE.clear()
+    SHADOW.clear()
     sq = sequential_of(plan)
     problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run, failures=failures)
     frozen = plan.get("gates_sha256")
@@ -739,7 +815,8 @@ def report(campaign: str, gates: dict, interim: bool = False,
     rules = dict(gates.get("workloads", {}).get(wl.name, {}))
     # The generic secondaries that apply to a rule-judged workload's phases,
     # as rules of those phases with their [secondary] bounds.
-    for ph, ks in getattr(wl, "generic", {}).items():
+    generics = wl.generics(plan) if hasattr(wl, "generics") else getattr(wl, "generic", {})
+    for ph, ks in generics.items():
         for k in ks:
             if k in gates["secondary"]:
                 better, margin = gates["secondary"][k]
@@ -1013,11 +1090,10 @@ def report(campaign: str, gates: dict, interim: bool = False,
         for k in unruled:
             for cand in arms[1:]:
                 verdicts[(path, cand, f"rule:{k}")] = "n/a"
-        unmeasurable = [k for k in gates["secondary"] if getattr(wl, "generic", None)
-                        and k not in {x for ks in wl.generic.values() for x in ks} and k in NOT_YET_MEASURED]
-        if unmeasurable:
-            out += ["", "Generic secondaries the design requires but no build measures yet (stage 0 "
-                    "instrumentation), listed and not gated: " + ", ".join(f"`{k}`" for k in unmeasurable) + "."]
+        reported = sorted({k for ks in (wl.reported(plan).values() if hasattr(wl, "reported") else ()) for k in ks})
+        if reported:
+            out += ["", "Generic secondaries the design gates at stage 10, reported and not gated at this "
+                    "campaign's stage: " + ", ".join(f"`{k}`" for k in reported) + "."]
         if unruled:
             out += ["", f"Measures without a rule in gates.ini [workload:{wl.name}] (the verdict stays INCOMPLETE): "
                     + ", ".join(f"`{k}`" for k in unruled)]

@@ -1061,6 +1061,21 @@ class RoundThreeFixes(unittest.TestCase):
         self.assertGreaterEqual(req.duration, cfg.dc.rpc_requests * cfg.dc.request_timeout)
         self.assertLess(req.expected, 30)              # the estimate stays the usual time
 
+    def test_the_rpc_job_waits_for_the_barrier_itself(self):
+        # The shell must not hold the interpreter back until the barrier:
+        # the client gets the barrier's absolute time and waits after
+        # initialising, so every leaf's waves start from the same instant.
+        cfg = ab.load_config(str(HERE / "validation" / "dc-minimal.example.ini"))
+        req = cfg.wl.phases(cfg, "dc")[0]
+        job = next(j for j in req.jobs if j.kind == "dc-rpc")
+        camp = mock.Mock(cfg=cfg)
+        camp.w.return_value = "/w"
+        arm = mock.Mock(index=0)
+        script = wl.rpc_script(camp, job, arm, req.duration, start_at=1_700_000_000)
+        self.assertTrue(script.startswith("python3 /w/wlclient.py rpc --start-at 1700000000 "), script)
+        self.assertNotIn("date +%s", script)
+        self.assertNotIn("--start-at", wl.rpc_script(camp, job, arm, req.duration))
+
     def test_wake_instances_cannot_collide_with_an_arm(self):
         text = BASE.replace("[arm:cand]", "[arm:main-wake]")
         cfg = parse(text)
@@ -1626,11 +1641,12 @@ class BesideSession(unittest.TestCase):
 class Socks5UDP(threading.Thread):
     """SOCKS5 relay for the tests: CONNECT and UDP ASSOCIATE, on loopback.
     With drop_every n it drops every n-th uplink datagram; with burst s it
-    holds the uplink and releases it in bursts every s seconds."""
+    holds the uplink and releases it in bursts every s seconds; with
+    connect_delay s every CONNECT takes s seconds to open (a slow path)."""
 
-    def __init__(self, drop_every=0, burst=0.0):
+    def __init__(self, drop_every=0, burst=0.0, connect_delay=0.0):
         super().__init__(daemon=True)
-        self.drop_every, self.burst = drop_every, burst
+        self.drop_every, self.burst, self.connect_delay = drop_every, burst, connect_delay
         self.srv = socket.socket()
         self.srv.bind(("127.0.0.1", 0))
         self.srv.listen(64)
@@ -1657,6 +1673,7 @@ class Socks5UDP(threading.Thread):
             if head[1] == 3:
                 self.associate(c)
                 return
+            time.sleep(self.connect_delay)
             u = socket.create_connection((host, port))
             c.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
         except OSError:
@@ -1782,6 +1799,26 @@ class EndToEnd(unittest.TestCase):
                            "--report-target", f"127.0.0.1:{free_port()}")
         self.assertIn("no reflector report", recs[0]["fail"])
 
+    def test_the_calls_window_ends_with_its_media_not_its_report(self):
+        # The report is fetched over the same SOCKS path, here a slow one
+        # (each CONNECT takes 1.5 s, and there are at least two fetches):
+        # the call's end, which C's background window is built from, is
+        # the media's, not the report's.
+        slow = Socks5UDP(connect_delay=1.5)
+        slow.start()
+        try:
+            p = subprocess.run([sys.executable, str(CLIENT), "call", "--socks", f"127.0.0.1:{slow.port}", "--no-tls",
+                                "--target", f"127.0.0.1:{self.udp}", "--duration", "2",
+                                "--report-target", f"127.0.0.1:{self.http}"], capture_output=True, text=True, timeout=60)
+        finally:
+            slow.srv.close()
+        c = [json.loads(l[2:]) for l in p.stdout.splitlines() if l.startswith("J\t")][0]
+        self.assertEqual(c["fail"], "")
+        lo, hi = mn.pa.fg_span([c])
+        self.assertGreaterEqual(hi - lo, 1.9)                       # the media is all inside
+        self.assertLess(hi - lo, 2 + 0.8)                           # and nothing of the report
+        self.assertGreaterEqual(c["reported"] - c["t0"], 2 + 3.0)   # though the fetches did take their time
+
     def test_the_downlink_keeps_its_own_clock_under_a_lossy_bursty_uplink(self):
         # The uplink loses every other packet and arrives in 300 ms bursts;
         # the downlink must still be the full open-loop stream, on time.
@@ -1824,6 +1861,22 @@ class EndToEnd(unittest.TestCase):
         # ASR and TTS alternate: 200 bytes back, then 300 KB.
         self.assertEqual([r[4] for r in rows], ["200", "300000", "200", "300000"])
         self.assertEqual({r[6] for r in rows}, {"0"})
+
+    def test_request_waves_start_at_the_shared_barrier(self):
+        # The barrier is 3 s ahead: the client starts now, initialises, and
+        # waits for it; each wave is due at barrier + i x spacing on the
+        # shared clock, not at its interpreter's start plus that.
+        at = time.time() + 3.0
+        p = subprocess.run([sys.executable, str(CLIENT), "rpc", "--socks", f"127.0.0.1:{self.socks.port}", "--no-tls",
+                            "--target", f"127.0.0.1:{self.http}", "--count", "3", "--spacing", "0.5",
+                            "--start-at", f"{at:.3f}"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = [l.split("\t") for l in p.stdout.splitlines()]
+        self.assertEqual([r[2] for r in rows], ["w1r1", "w2r1", "w3r1"])
+        starts = [float(r[0]) for r in rows]
+        for i, t in enumerate(starts):
+            self.assertGreaterEqual(t, at + 0.5 * i - 0.01)
+            self.assertLess(t, at + 0.5 * i + 0.25)
 
     def test_idle_connections_wake(self):
         ready = os.path.join(self.tmp.name, "ready")
