@@ -8,7 +8,6 @@ import (
 
 	"github.com/bojieli/queqiao/internal/coded"
 	"github.com/bojieli/queqiao/internal/fec"
-	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
@@ -297,7 +296,7 @@ func newCodedPath(conn *quic.Conn, roundTrip time.Duration, queueFrames int) *co
 		RoundTrip: roundTrip,
 		// What the endpoint pair has already been measured to do, so the first
 		// symbol is coded for the path rather than for a clean one.
-		Path: pathmodel.Shared(peerKey(conn)),
+		Path: pathModelOf(conn),
 		// This bounds both the sender and receiver channel in coded.Path.
 		// Zero deliberately preserves the throughput-oriented desktop default.
 		Pending: queueFrames,

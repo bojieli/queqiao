@@ -162,8 +162,11 @@ type ClientConfig struct {
 	// gateway of either generation; a single version pins every connection to
 	// it. Whatever a flow's first lane negotiates, every lane that later joins
 	// the flow speaks too.
-	WireVersions                  []byte
-	Congestion                    CongestionControlKind
+	WireVersions []byte
+	Congestion   CongestionControlKind
+	// CCAPI selects how QUIC congestion controllers are driven; see
+	// CCAPIVersion. Empty is v1.
+	CCAPI                         CCAPIVersion
 	BrutalBytesPerSec             uint64
 	AdaptiveMinBytesSec           uint64
 	AdaptiveMaxBytesSec           uint64
@@ -435,7 +438,7 @@ type controlQUICGeneration struct {
 	verified     time.Time
 	proofEpoch   uint64
 	probe        *controlPathProbe
-	lossPath     *pathmodel.PathModel
+	lossPath     pathmodel.Model
 	prefixBudget prefixRepairBudget
 	pendingOpens map[*controlPoolStreamConn]pendingOpen
 	id           uint64
@@ -638,6 +641,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	if cfg.Congestion == CongestionBrutal && cfg.BrutalBytesPerSec == 0 {
 		return nil, errors.New("brutal congestion requires a positive per-lane byte rate")
+	}
+	if err := validateBundle(&cfg.CCAPI, cfg.Congestion, cfg.Profile); err != nil {
+		return nil, err
 	}
 	if cfg.AdaptiveMinBytesSec == 0 {
 		cfg.AdaptiveMinBytesSec = defaultAdaptiveMinBytesPerSec
@@ -1681,6 +1687,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 			discoverGrouping: c.cfg.Profile.DiscoverGrouping,
 			kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 			adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
+			ccAPI: c.cfg.CCAPI,
 		}
 		if pooled {
 			outer, err = c.dialPooledQUICLane(ctx, ccfg)
@@ -1874,7 +1881,7 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 		generation = &controlQUICGeneration{borrowing: borrowing, stopBorrowing: stopBorrowing,
 			id: attempt.epoch, conn: conn, packet: packet, verified: time.Now(),
 			controller: configureQUICController(conn, ccfg),
-			lossPath:   pathmodel.Shared(peerKey(conn)),
+			lossPath:   pathModelOf(conn),
 		}
 		go generation.watchLiveness(func(g *controlQUICGeneration) { c.supersedeSilentGeneration(g, &ccfg) })
 	}
@@ -2291,6 +2298,7 @@ func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
 		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
+		ccAPI: c.cfg.CCAPI,
 	})
 	c.cfg.Logger.Debug("bulk QUIC pool authenticated", "duration", time.Since(started))
 	return entry, nil

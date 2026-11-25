@@ -566,6 +566,7 @@ type runtimeOptions struct {
 	// silently replaced by the default.
 	resolvedProfile profile.Profile
 	congestion      string
+	ccAPI           string
 	// memory is the memory-ownership bundle (design §14 stage 3).
 	memory                                                      string
 	brutalBytesPerSec, adaptiveMinBytesSec, adaptiveMaxBytesSec uint64
@@ -614,6 +615,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.BoolVar(&opts.udpOnStream, "udp-on-stream", false, "carry UDP packets on streams instead of QUIC datagrams")
 	fs.IntVar(&opts.hopPortCount, "hop-port-count", 0, "number of UDP ports to listen on for port hopping (0/1 = disabled)")
 	fs.StringVar(&opts.congestion, "congestion", string(pep.CongestionErasure), "QUIC congestion controller")
+	fs.StringVar(&opts.ccAPI, "cc-api", string(pep.CCAPIV1), "how QUIC congestion controllers are driven: v1 (per-packet callbacks) or v2 (the path-authority controller API; requires --congestion=erasure)")
 	fs.StringVar(&opts.memory, "mem", string(pep.MemoryLegacy), "memory-ownership bundle: legacy, or owned (fair shared send-memory grants and the credit-driven retention bound)")
 	fs.Uint64Var(&opts.brutalBytesPerSec, "brutal-bytes-per-sec", 0, "Brutal fixed byte rate")
 	fs.Uint64Var(&opts.adaptiveMinBytesSec, "adaptive-min-bytes-per-sec", 64*1024, "Adaptive minimum byte rate")
@@ -720,6 +722,18 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	}
 	if opts.congestion == string(pep.CongestionBrutal) && opts.brutalBytesPerSec == 0 {
 		return errors.New("--brutal-bytes-per-sec is required with brutal congestion")
+	}
+	// The bundle is checked before anything is logged or renewed; the
+	// constructors check it again for direct callers.
+	if opts.ccAPI == "" {
+		return errors.New("--cc-api must be v1 or v2")
+	}
+	bundleProfile := opts.resolvedProfile
+	if p, err := profile.ByName(opts.pathProfile); err == nil {
+		bundleProfile = p
+	}
+	if err := pep.ValidateBundle(pep.CCAPIVersion(opts.ccAPI), pep.CongestionControlKind(opts.congestion), bundleProfile); err != nil {
+		return err
 	}
 	if opts.logFormat != "json" && opts.logFormat != "text" {
 		return errors.New("--log-format must be json or text")
@@ -893,6 +907,7 @@ func runServer(args []string) (returnErr error) {
 		EnableQUIC:        opts.transport == string(pep.TransportQUIC) || opts.transport == string(pep.TransportAuto),
 		TCPFallbackLanes:  opts.tcpFallbackLanes, TCPCongestion: opts.tcpCongestion,
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
+		CCAPI:               pep.CCAPIVersion(opts.ccAPI),
 		Memory:              pep.MemoryMode(opts.memory),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
@@ -1009,6 +1024,8 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("listen", opts.listen),
 		slog.String("transport", opts.transport),
 		slog.String("congestion", opts.congestion),
+		slog.String("cc_api", opts.ccAPI),
+		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory))),
 		slog.String("mem", opts.memory),
 		slog.Int("max_sessions", opts.maxSessions),
 		slog.Uint64("max_payload_bytes", uint64(protocol.MaxPayload)),

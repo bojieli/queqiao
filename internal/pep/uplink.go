@@ -420,11 +420,13 @@ func (c *Client) rejectProbePeer(lane *authenticatedLane, err error) {
 // ignorance it was opened to remove, and the first flow would still be the one
 // discovering the path.
 func (c *Client) awaitMeasurement(lane *authenticatedLane, deadline time.Time) {
-	keyed, ok := lane.outer.(interface{ pathIdentity() string })
+	keyed, ok := lane.outer.(interface{ pathModel() pathmodel.Model })
 	if !ok {
 		return
 	}
-	model := pathmodel.Shared(keyed.pathIdentity())
+	// The connection's own reference, so a cc-api v2 rekey moves the poll to
+	// the new path with the controller.
+	model := keyed.pathModel()
 	for time.Now().Before(deadline) {
 		if model.Current().ObservedSamples >= pathProbePackets {
 			return

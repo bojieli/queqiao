@@ -55,8 +55,11 @@ type ServerConfig struct {
 	// Memory selects the memory-ownership bundle; empty is legacy. A gateway
 	// has no shared send budget, so only the retention autotune and the
 	// no-progress accounting of READY bytes apply to it.
-	Memory                        MemoryMode
-	Congestion                    CongestionControlKind
+	Memory     MemoryMode
+	Congestion CongestionControlKind
+	// CCAPI selects how QUIC congestion controllers are driven; see
+	// CCAPIVersion. Empty is v1.
+	CCAPI                         CCAPIVersion
 	BrutalBytesPerSec             uint64
 	AdaptiveMinBytesSec           uint64
 	AdaptiveMaxBytesSec           uint64
@@ -349,6 +352,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	if cfg.Congestion == CongestionBrutal && cfg.BrutalBytesPerSec == 0 {
 		return nil, errors.New("brutal congestion requires a positive per-lane byte rate")
+	}
+	if err := validateBundle(&cfg.CCAPI, cfg.Congestion, cfg.Profile); err != nil {
+		return nil, err
 	}
 	if cfg.AdaptiveMinBytesSec == 0 {
 		cfg.AdaptiveMinBytesSec = defaultAdaptiveMinBytesPerSec
@@ -712,6 +718,7 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	controller := configureQUICController(conn, congestionConfig{
 		kind: s.cfg.Congestion, brutalBytesPerSecond: s.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: s.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: s.cfg.AdaptiveMaxBytesSec,
+		ccAPI: s.cfg.CCAPI,
 	})
 	state := conn.ConnectionState().TLS
 	if state.NegotiatedProtocol == identity.EnrollmentALPN {

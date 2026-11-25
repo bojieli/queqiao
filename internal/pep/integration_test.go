@@ -409,6 +409,15 @@ func portBelowTheDynamicRange(t *testing.T) int {
 }
 
 func TestQUICOneLaneSOCKSEndToEnd(t *testing.T) {
+	testQUICOneLaneSOCKSEndToEnd(t, "")
+}
+
+// The cc-api=v2 bundle starts, both ends, and carries the same flows.
+func TestQUICOneLaneSOCKSEndToEndUnderCCAPIV2(t *testing.T) {
+	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2)
+}
+
+func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion) {
 	destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -425,7 +434,7 @@ func TestQUICOneLaneSOCKSEndToEnd(t *testing.T) {
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
-		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond,
+		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond, CCAPI: ccAPI,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -436,7 +445,7 @@ func TestQUICOneLaneSOCKSEndToEnd(t *testing.T) {
 	}
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true, Logger: logger,
-		Metrics: metrics.New(),
+		Metrics: metrics.New(), CCAPI: ccAPI,
 	})
 	if err != nil {
 		t.Fatal(err)
