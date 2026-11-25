@@ -549,7 +549,30 @@ func (o *carrierShadow) trackLive(src carrierProgressSource) (*shadowCarrier, ca
 }
 
 func (o *carrierShadow) flowFields(f *multipathFlow) []any {
-	return []any{"endpoint", o.role, "session_id", fmt.Sprintf("%x", f.sessionID), "flow_id", f.flowID}
+	return o.idFields(f.sessionID, f.flowID)
+}
+
+func (o *carrierShadow) idFields(sessionID [16]byte, flowID uint64) []any {
+	return []any{"endpoint", o.role, "session_id", fmt.Sprintf("%x", sessionID), "flow_id", flowID}
+}
+
+// noteJoinAttempt records the client starting one JOIN, with the lane ID the
+// gateway will log when it arrives: the pair is the handoff transit J of
+// §10.3 step 4, per attempt and per transport.
+func (o *carrierShadow) noteJoinAttempt(sessionID [16]byte, flowID, laneID uint64, kind TransportKind) {
+	if o == nil {
+		return
+	}
+	o.logger.Info("carrier shadow join attempt", append(o.idFields(sessionID, flowID), "lane_id", laneID, "transport", string(kind))...)
+}
+
+// noteJoinAfterEnd records a JOIN that reached the gateway after the flow's
+// session had ended, which is refused.
+func (o *carrierShadow) noteJoinAfterEnd(sessionID [16]byte, flowID, laneID uint64) {
+	if o == nil {
+		return
+	}
+	o.logger.Info("carrier shadow join arrived", append(o.idFields(sessionID, flowID), "lane_id", laneID, "in_outage", false, "session_ended", true)...)
 }
 
 // bindLane records which carrier a flow's lane rides, so a measurement can

@@ -633,7 +633,11 @@ func (f *multipathFlow) addLaneLocked(lane *mpLane) {
 	}
 	lane.admitted = time.Now()
 	f.lanes[lane.id] = lane
-	f.carrierShadow.bindLane(f, lane)
+	if f.carrierShadow != nil {
+		// Off the admission lock: the observer reads transport stats and
+		// writes a log line.
+		go f.carrierShadow.bindLane(f, lane)
+	}
 	f.lanesJoined.Add(1)
 	if lane.id >= f.nextJoinID {
 		f.nextJoinID = lane.id + 1

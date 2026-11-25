@@ -2034,6 +2034,7 @@ func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID
 	if kind != TransportQUIC && kind != TransportTCP {
 		return nil, fmt.Errorf("unsupported join transport %q", kind)
 	}
+	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, kind)
 	if kind == TransportQUIC && c.cfg.EnableQUICPool {
 		if lane, poolErr := c.openPooledJoinLane(ctx, sessionID, flowID, laneID); poolErr == nil {
 			return lane, nil

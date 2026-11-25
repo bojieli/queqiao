@@ -321,7 +321,7 @@ func TestCarrierShadowLabelsAStalledFlowOnAHealthyCarrierLive(t *testing.T) {
 	if e.clientMetrics.Snapshot().FlowStallsDetected == 0 {
 		t.Fatal("today's watchdog did not count the stall")
 	}
-	if len(logRecords(t, e.clientLogs.String(), "carrier shadow rescue started")) == 0 {
+	if waitForRecord(t, e.clientLogs, "carrier shadow rescue started", 5*time.Second, func(map[string]any) bool { return true }) == nil {
 		t.Fatalf("today's client did not start its stall rescue:\n%s", e.clientLogs.String())
 	}
 }

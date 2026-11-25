@@ -90,7 +90,7 @@ func (r CarrierShadowRemedy) String() string {
 // CarrierShadowPTOBuckets bounds the probe-timeout histogram. Bucket n-1
 // counts episodes that reached n expiries; the last bucket also holds every
 // episode that went further.
-const CarrierShadowPTOBuckets = 8
+const CarrierShadowPTOBuckets = 16
 
 type carrierShadowCounters struct {
 	transitions [CarrierShadowStates]atomic.Uint64

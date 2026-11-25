@@ -44,7 +44,7 @@ import sys
 from collections import Counter, defaultdict
 from typing import Any, Iterable, Iterator
 
-BUCKETS = 8
+BUCKETS = 16
 DEFAULT_GRACE_S = 45.0
 
 STATE = "carrier shadow state"
@@ -57,6 +57,7 @@ OUTAGE = "carrier shadow outage"
 OUTAGE_ENDED = "carrier shadow outage ended"
 RESCUE = "carrier shadow rescue started"
 JOIN = "carrier shadow join arrived"
+ATTEMPT = "carrier shadow join attempt"
 
 RFC3339 = re.compile(
     r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})\Z", re.IGNORECASE
@@ -190,7 +191,9 @@ def calibration(endpoint: Endpoint) -> dict[str, Any]:
         if not isinstance(top, int) or top < 1:
             continue
         open_episodes += 1
-        for i in range(min(top, BUCKETS)):
+        # Episode lines exist only for two or more expiries, so they say
+        # nothing about n = 1: that bucket comes from complete summaries.
+        for i in range(1, min(top, BUCKETS)):
             reached[i] += 1
             if record.get("outcome") == "recovered":
                 recovered[i] += 1
@@ -252,9 +255,8 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
             later_failure_delay.append(failure["_t"] - stall["_t"])
         elif stall.get("carrier_state") == "closed" or any(t.get("to") == "closed" for t in same):
             outcomes["carrier closed by an endpoint (censored)"] += 1
-        elif newer or stall.get("transport_acked") is True:
-            # Progress in a newer epoch, or QUIC acknowledging at the stall
-            # itself: the carrier was live.
+        elif newer:
+            # Progress in a newer epoch: the carrier was live.
             outcomes["carrier stayed live: design would not rescue"] += 1
         else:
             outcomes["unresolved: no later evidence about the carrier"] += 1
@@ -295,12 +297,16 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
     """
     client_obs = failure_observations(client)
     gateway_obs = failure_observations(gateway)
-    rescues: dict[tuple, list[float]] = defaultdict(list)
-    for record in client.of(RESCUE):
-        rescues[flow_key(record)].append(record["_t"])
-    joins: dict[tuple, list[float]] = defaultdict(list)
+    # A JOIN's transit runs from the client starting that attempt to the
+    # gateway parsing it, matched by lane ID; the transport is kept, since a
+    # TCP handoff and a QUIC JOIN have different budgets.
+    attempts: dict[tuple, tuple[float, str]] = {}
+    for record in client.of(ATTEMPT):
+        key = (*flow_key(record), record.get("lane_id"))
+        attempts.setdefault(key, (record["_t"], str(record.get("transport"))))
+    joins: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     for record in gateway.of(JOIN):
-        joins[flow_key(record)].append(record["_t"])
+        joins[flow_key(record)].append(record)
     ended: dict[tuple, list[float]] = defaultdict(list)
     for record in gateway.of(OUTAGE_ENDED):
         ended[flow_key(record)].append(record["_t"])
@@ -313,6 +319,7 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
     skew: list[float] = []
     observation_skew: list[float] = []
     transit: list[float] = []
+    transit_by: dict[str, list[float]] = defaultdict(list)
     arrival_margin: list[float] = []
     flows = []
     late = expired = unfinished = 0
@@ -326,7 +333,9 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
             deadline = start + grace
             next_start = records[index + 1]["_t"] if index + 1 < len(records) else math.inf
             end = next((t for t in sorted(ended.get(key, [])) if start <= t < next_start), None)
-            window_end = end if end is not None else min(next_start, deadline)
+            # Without an end record the window runs past the deadline, so a
+            # JOIN that arrived late is found and counted late.
+            window_end = end if end is not None else min(next_start, deadline + grace)
             window_start = max(previous_end if previous_end is not None else -math.inf, start - grace)
             previous_end = end if end is not None else min(next_start, deadline)
             row: dict[str, Any] = {"session_id": key[0], "flow_id": key[1], "gateway_outage_start": start, "gateway_deadline": deadline}
@@ -340,17 +349,20 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
                 first_gateway = next((t for t, _ in gateway_obs.get(key, []) if window_start <= t <= window_end), None)
                 if first_gateway is not None:
                     observation_skew.append(first_gateway - observed[0])
-            arrival = next((t for t in sorted(joins.get(key, [])) if start <= t <= window_end), None)
-            if arrival is not None:
+            join = next((j for j in sorted(joins.get(key, []), key=lambda j: j["_t"]) if start <= j["_t"] <= window_end), None)
+            if join is not None:
+                arrival = join["_t"]
                 row["join_arrival_margin_s"] = deadline - arrival
+                row["join_refused_session_ended"] = join.get("session_ended") is True
                 arrival_margin.append(row["join_arrival_margin_s"])
                 if arrival > deadline:
                     late += 1
-                floor = observed[0] if observed is not None else window_start
-                started = [t for t in rescues.get(key, []) if floor <= t <= arrival]
-                if started:
-                    row["join_transit_s"] = arrival - max(started)
+                attempt = attempts.get((*key, join.get("lane_id")))
+                if attempt is not None and attempt[0] <= arrival:
+                    row["join_transit_s"] = arrival - attempt[0]
+                    row["join_transport"] = attempt[1]
                     transit.append(row["join_transit_s"])
+                    transit_by[attempt[1]].append(row["join_transit_s"])
             elif end is None and next_start == math.inf and capture_end < deadline:
                 # The log stops inside the grace: right-censored, not failed.
                 unfinished += 1
@@ -365,6 +377,7 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float) -> di
         "outages_without_join": expired, "outages_unfinished_at_capture_end": unfinished,
         "skew_s": quantiles(skew), "first_observation_skew_s": quantiles(observation_skew),
         "join_transit_s": quantiles(transit), "join_arrival_margin_s": quantiles(arrival_margin),
+        "join_transit_by_transport_s": {k: quantiles(v) for k, v in sorted(transit_by.items())},
         "flows": flows,
     }
     # §10.3 step 4: the JOIN must reach the gateway by t_c + G - S, where S
@@ -422,7 +435,9 @@ def render(report: dict[str, Any], out) -> None:
         print(f"   gateway outages {deadline['gateway_outages']}, JOINs after the deadline {deadline['joins_after_deadline']}, outages with no JOIN {deadline['outages_without_join']}, unfinished at capture end {deadline['outages_unfinished_at_capture_end']}", file=out)
         print(f"   skew (gateway grace start - client first observation): {format_q(deadline['skew_s'])}", file=out)
         print(f"   first-observation skew (gateway - client): {format_q(deadline['first_observation_skew_s'])}", file=out)
-        print(f"   JOIN transit (client rescue start -> gateway arrival): {format_q(deadline['join_transit_s'])}", file=out)
+        print(f"   JOIN transit (client attempt start -> gateway arrival, same lane): {format_q(deadline['join_transit_s'])}", file=out)
+        for transport, q in deadline["join_transit_by_transport_s"].items():
+            print(f"   JOIN transit over {transport}: {format_q(q)}", file=out)
         print(f"   JOIN arrival margin before the gateway deadline: {format_q(deadline['join_arrival_margin_s'])}", file=out)
         if "latest_handoff_start_s" in deadline:
             print(f"   measured S (client observes later than the gateway) {deadline['S_s']:.3f}s, J (handoff start to JOIN parsed) {deadline['J_s']:.3f}s", file=out)

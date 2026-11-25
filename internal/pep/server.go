@@ -1509,6 +1509,9 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinOpenFailed, session.ResetDestination, "pending open failed")
 			return
 		} else if held {
+			// A rescue that reached the gateway after the session's grace
+			// ended it: the late tail of the recovery deadline.
+			s.carrierShadow.noteJoinAfterEnd(sessionID, open.Header.FlowID, laneID)
 			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinSessionEnded, session.ResetProtocol, "unknown session: "+sessionEndedAnswer)
 			return
 		}
