@@ -82,8 +82,9 @@ func (c *Client) secondConnectionWanted(snapshot flowSnapshot) bool {
 // bound before the streams' windows do: on Android's 1 MiB streams and 4 MiB
 // connection, eight bulk flows reach 4 MiB in flight on one connection
 // against 6 MiB across the pooled connection and the two isolated ones. So
-// the connection ceiling grows by one stream window for every isolated
-// connection single topology does not open, which restores the receive
+// the connection ceiling grows by one stream window (at most half a
+// connection window) for every isolated connection single topology does not
+// open, which restores the receive
 // capacity isolation had without exceeding the receive commitment it made
 // (each of those connections could hold a whole connection window). It never
 // grows past the desktop ceiling. A fixed window (initial equal to maximum)
@@ -93,7 +94,15 @@ func singleConnectionWindows(w flowWindows, notOpened int) flowWindows {
 		return w
 	}
 	_, connection, streamMax, connectionMax, _ := w.resolved()
-	perFlow := min(streamMax, connectionMax)
+	// Each unopened connection is credited one stream window, but never
+	// more than half a connection window: a handover keeps the draining
+	// generation beside its replacement, and two grown windows,
+	// 2·(connection + k·perFlow), must still fit inside what isolation
+	// could hold across the same two generations and its k bulk
+	// connections, 2·connection + k·connection. The mobile profiles' streams
+	// are well under half their connection windows, so this binds only on
+	// configurations where a stream may fill most of a connection.
+	perFlow := min(streamMax, connectionMax/2)
 	grown := connectionMax + uint64(notOpened)*perFlow
 	if grown > maxConnectionReceiveWindow {
 		grown = maxConnectionReceiveWindow

@@ -158,6 +158,9 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 		// mobile/core/resources.go.
 		{"ios", flowWindows{stream: 64 * kib, maxStream: 64 * kib, connection: 2 * mib, maxConnection: 2 * mib, maxStreams: 32}, 1},
 		{"android", flowWindows{stream: mib, maxStream: mib, connection: 4 * mib, maxConnection: 4 * mib, maxStreams: 64}, 2},
+		// A stream allowed the whole connection window: growth is capped
+		// at half a connection per unopened connection.
+		{"stream equals connection", flowWindows{stream: mib, maxStream: mib, connection: mib, maxConnection: mib, maxStreams: 64}, 1},
 	} {
 		t.Run(p.name, func(t *testing.T) {
 			single := singleConnectionWindows(p.windows, p.maxBulk)
@@ -179,12 +182,19 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 				pooled := flows - own
 				isolated := min(uint64(pooled)*streamMax, connMax) + uint64(own)*min(streamMax, connMax)
 				one := min(uint64(flows)*streamMax, sConnMax)
-				if one < isolated && one < maxConnectionReceiveWindow {
+				if one < isolated && one < maxConnectionReceiveWindow && streamMax*2 <= connMax {
 					t.Errorf("%d bulk flows: one connection can hold %d bytes in flight, isolated %d", flows, one, isolated)
 				}
 			}
 			if commitment := connMax * uint64(1+p.maxBulk); sConnMax > commitment {
 				t.Errorf("one connection's window %d exceeds the isolated topology's commitment %d", sConnMax, commitment)
+			}
+			// During a handover the draining generation and its
+			// replacement both carry the grown window; isolation's
+			// worst case is the same two generations plus its bulk
+			// connections.
+			if overlap, isolated := 2*sConnMax, connMax*uint64(2+p.maxBulk); overlap > isolated {
+				t.Errorf("two overlapping generations hold %d, isolation %d", overlap, isolated)
 			}
 			t.Logf("connection window %d..%d -> %d..%d", conn, connMax, sConn, sConnMax)
 		})
@@ -498,17 +508,18 @@ func TestSingleTopologyRescuesAFlowThatLosesItsLane(t *testing.T) {
 // gateway bundle. Its flows isolate and complete, and the gateway attaches
 // every data connection of that device -- pooled and isolated -- to one
 // path controller. And the reverse: a topology=single client against a
-// legacy gateway, which sees one connection.
+// legacy gateway, which sees one connection. The old peer in each arm speaks
+// only wire 1.
 func TestTopologyAcrossOldAndNewPeers(t *testing.T) {
 	if testing.Short() {
 		t.Skip("multi-second end-to-end transfer")
 	}
-	t.Run("isolating old client, new gateway", func(t *testing.T) {
+	t.Run("isolating wire-1 old client, new gateway", func(t *testing.T) {
 		pathAuthorities.forget()
 		clientMetrics := metrics.New()
 		rig := newTopologyRig(t, ServerConfig{
 			CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath, Classifier: ClassifierPhased,
-		}, ClientConfig{Transport: TransportQUIC, EnableQUICPool: true, Metrics: clientMetrics})
+		}, ClientConfig{Transport: TransportQUIC, EnableQUICPool: true, Metrics: clientMetrics, WireVersions: []byte{1}})
 		maxGateway := 0
 		if err := rig.download(4, func() {
 			deadline := time.Now().Add(2500 * time.Millisecond)
@@ -530,12 +541,12 @@ func TestTopologyAcrossOldAndNewPeers(t *testing.T) {
 			t.Fatalf("old client isolated %d flows; gateway saw at most %d attachments", isolations, maxGateway)
 		}
 	})
-	t.Run("single client, legacy gateway", func(t *testing.T) {
+	t.Run("single client, legacy wire-1 gateway", func(t *testing.T) {
 		pathAuthorities.forget()
 		clientMetrics := metrics.New()
 		cfg := newBundleClientConfig(TopologySingle)
 		cfg.Metrics = clientMetrics
-		rig := newTopologyRig(t, ServerConfig{}, cfg)
+		rig := newTopologyRig(t, ServerConfig{AcceptWire: []byte{1}}, cfg)
 		if err := rig.download(4, nil); err != nil {
 			t.Fatal(err)
 		}
