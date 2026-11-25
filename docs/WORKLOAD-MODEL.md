@@ -7,7 +7,7 @@ What this is based on, and what it is not:
 - Read: README, `docs/DESIGN-PATH-AUTHORITY.md` v6, `docs/BENCHMARKING.md`, `internal/classifier`, and the classifier's call sites in `internal/pep` and `internal/profile`.
 - The classifier traces in §5 are from reading the code. Nothing was executed; each finding names the unit test that would confirm it.
 - The stage-2 (`sched=class`) and stage-6 branches are not on `origin/main` and were not read. The weights 4:2:1 are taken from the brief; the design doc still lists weights as open question Q1.
-- No 900 s constant exists on `origin/main`. The production 900 s idle EOF is therefore not explained by a default, and workload W9 is designed to localise it.
+- No 900 s default exists on `origin/main` (a 15-minute relay idle timeout appears only in a test fixture, `cmd/queqiaod/relay_test.go:70`). The production 900 s idle EOF is therefore not explained by a default, and workload W9 is designed to localise it.
 - All numeric regression bounds are provisional. They become pre-registered only after the pilot of design §15.4.
 - The findings of §5 are merged with the stage-2 classifier audit in `docs/AUDIT-CLASSIFIER-WORKLOADS.md`, which keeps the F and R numbers used here and extends them. That audit read the stage-2 branch and confirms the 4:2:1 weights (`internal/congestion/classarb.go:20` on PR #181).
 
@@ -344,7 +344,7 @@ Default profile (`wan-shared-bottleneck`, `internal/profile/profile.go:151`) use
 | Observations happen when bytes are read from the local application, when bytes are delivered to it, and at most every 250 ms when the sender asks whether to code | `internal/pep/stripedsend.go:290-295`; `mpflow.go:3180`; `mpflow.go:1276-1341` |
 | Each endpoint classifies on its own; the gateway's label governs the response direction | `internal/pep/server.go:1190`, `2000-2010` |
 | The class decides the frame's class byte, the lane queue, the aggregate budget's interactive flag, whether to code, and lane isolation | `stripedsend.go:612-615`; `mpflow.go:2290-2320`; `mpflow.go:1281-1298`; `internal/pep/client.go:2737`, `3022`; `stripedsend.go:584-586` |
-| UDP PACKET frames are INTERACTIVE by constant; no classifier runs | `internal/pep/udp.go:363`, `464`, `564`, `933`, `967` |
+| UDP PACKET frames are INTERACTIVE by constant; no classifier runs | `internal/pep/udp.go:562-565`, `965-968` (PACKET); `363`, `464`, `933` set the same constant on CLOSE, OPEN and ACK |
 | Flow activity for the idle timeout is payload only; default 30 min | `mpflow.go:3366-3367`, `95`, `1834-1880`; `cmd/queqiaod/main.go:616` |
 
 ### 5.2 Label over each workload's lifetime
@@ -392,13 +392,13 @@ Default profile (`wan-shared-bottleneck`, `internal/profile/profile.go:151`) use
 
 - Only payload refreshes a flow's activity (`mpflow.go:3366-3367`). Kernel TCP keepalives on the two outer legs (30 s: `client.go:833`, `internal/pep/destination.go:67`) keep those sockets alive but do not count.
 - The default `FlowIdleTimeout` is 30 min. FCM's Wi-Fi heartbeat is 28 min; IMAP IDLE re-arms at 29 min. The margin is two minutes and one minute.
-- The production 900 s EOF has no matching constant on `origin/main`. Candidates: an operator-set `--flow-idle-timeout`, a middlebox or `relay` hop (the relay's own default is 2 min, `cmd/queqiaod/relay.go:103`), or the destination. W9b's 14/16-minute cells and the idle-EOF-time and death-mode metrics identify which side closes first.
+- The production 900 s EOF has no matching default on `origin/main`. Candidates: an operator-set `--flow-idle-timeout`, a middlebox or `relay` hop (the relay's own default is 2 min, `cmd/queqiaod/relay.go:103`), or the destination. W9b's 14/16-minute cells and the idle-EOF-time and death-mode metrics identify which side closes first.
 
 ### 5.4 Recommended changes
 
 | ID | Change | Detail | Blocks |
 | --- | --- | --- | --- |
-| R1 | **Split the class into a sticky fact and a current state** | `everBulk` (sticky, as today) keeps driving isolation, pre-warm and lane choice (`client.go:2737`, `3022`; `stripedsend.go:584`). `nowBulk` drives the frame's class byte, the lane queue, the budget flag and the coding choice (`stripedsend.go:614`; `mpflow.go:2291`, `2312`, `1281`). Lane machinery does not flap; scheduling follows behaviour. | **stage 6/7 campaigns** |
+| R1 | **Split the class into a sticky fact and a current state** | `everBulk` (sticky, as today) keeps driving isolation, pre-warm and lane choice (`client.go:2737`, `3022`; `stripedsend.go:584`). `nowBulk` drives the frame's class byte, the lane queue, the budget flag and the coding choice (`stripedsend.go:614`, and the `carriesBulk` sample passed down at `456`, `473`, `637`; `mpflow.go:2291`, `2311-2319`, `1281`). Lane machinery does not flap; scheduling follows behaviour. | **stage 6/7 campaigns** |
 | R1a | Sparse-write rule (demotion on cadence) | A write that finds the flow's send queue empty and is ≤ 2 packets is sent INTERACTIVE and coded, whatever `nowBulk` says. This is the sparse-flow rule of fq_codel applied per flow. It covers LLM deltas, keystrokes after `cat` and pushes after sync immediately, with no timer. A transferring flow almost never has an empty queue, so it cannot use this to jump the class. | with R1 |
 | R1b | Windowed exit from BULK (hysteresis) | `nowBulk` clears after 2 consecutive full windows (2 s) with ≤ 64 KiB in each direction and an empty send backlog. It sets again when the flow has had a continuous backlog for `max(1 s, 4 × SRTT)`; the cumulative byte test is already met. Asymmetric on purpose: slow to leave, slower to bounce. | with R1 |
 | R2 | Fix the stale window | In `recentBytes`, when `now − recentStart ≥ 2 × exchangeWindow`, zero `prior` as well. One line plus the test in F3. | **stage 6/7 campaigns** |
