@@ -439,6 +439,10 @@ type multipathFlow struct {
 	// ackedCum mirrors acked for the classifier, which must not take
 	// replayMu: it is reached from the scheduler's dispatch.
 	ackedCum atomic.Uint64
+	// backlogDrained records that an acknowledgement took the send backlog
+	// to the classifier's threshold or below since the last observation, so
+	// a backlog that dipped between reads is not taken for a continuous one.
+	backlogDrained atomic.Bool
 	// classBytes counts DATA payload this endpoint sent, by class byte (new,
 	// interactive, bulk) and substrate (stream, coded).
 	classBytes [3][2]atomic.Uint64
@@ -688,6 +692,7 @@ func (f *multipathFlow) startLane(lane *mpLane) {
 	// reader, as the first version did, meant the writer could already be
 	// asking for it.
 	lane.fc.setCodingPolicy(f.prefersCodingOverRetransmission)
+	lane.fc.setDataObserver(f.noteDataBytes)
 	if f.phased() {
 		lane.fc.setFrameCodingPolicy(f.frameCoding)
 	}
@@ -744,7 +749,6 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 		}
 		if frame.Header.Type == protocol.TypeData {
 			lane.sent.Add(uint64(len(frame.Payload)))
-			f.noteDataBytes(frame.Header.Class, !reliable, len(frame.Payload))
 		}
 		// The transport has taken these bytes, which is what frees the lane to
 		// accept more. A QUIC stream write returns only once the packer has
@@ -2164,7 +2168,11 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			// loss of feedback alone is not evidence against future coded DATA.
 			// Only those byte offsets escape; later exchanges remain coded.
 			for _, lane := range f.healthyLanes() {
-				if lane.fc.codesData() {
+				// Under the phased classifier a BULK flow still codes its
+				// sparse writes, so the question is whether the lane's coded
+				// path could have taken any of the pending DATA, not what the
+				// flow prefers now.
+				if lane.fc.codesData() || f.phased() && lane.fc.codingBulk() {
 					f.escapePendingCoding()
 					break
 				}
@@ -2701,11 +2709,13 @@ func (f *multipathFlow) acknowledgeCoverage(sequence uint64, final bool, ranges 
 	advanced := sequence > f.acked
 	if advanced {
 		f.acked = sequence
-		f.ackedCum.Store(sequence)
 	}
 	if f.ackTrack != nil {
 		f.ackTrack.Advance(sequence)
 		advanced = f.ackTrack.Add(ranges) || advanced
+	}
+	if advanced {
+		f.noteAckedCoverage()
 	}
 	if end := f.codingRecoveryEnd.Load(); end != 0 &&
 		(f.acked >= end || f.ackTrack != nil && f.ackTrack.Covered(0, end)) {
@@ -3468,6 +3478,7 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 		// What this endpoint has read from its application and the peer has
 		// not acknowledged. Only the phased classifier reads it.
 		SendBacklog:    saturatingSub(upBytes, f.ackedCum.Load()),
+		BacklogDrained: f.backlogDrained.Swap(false),
 		SmoothedRTT:    time.Duration(f.currentRTTNS.Load()),
 		CarriedPayload: n > 0,
 	}

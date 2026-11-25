@@ -649,7 +649,7 @@ func (s *Scheduler) publish(buf []byte, n, reserved int, err error) bool {
 	}
 	if n > 0 {
 		chunk := &Chunk{Offset: s.nextOffset, Data: buf[:n], reservation: reserved}
-		if s.cfg.Sparse != nil && n <= s.cfg.SparseBytes && s.readyBytes == 0 {
+		if s.cfg.Sparse != nil && n <= s.cfg.SparseBytes && s.sendQueueEmptyLocked() {
 			chunk.Sparse = s.cfg.Sparse(n)
 		}
 		s.nextOffset += uint64(n)
@@ -1014,6 +1014,21 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		return &issued
 	}
 	return nil
+}
+
+// sendQueueEmptyLocked reports whether nothing waits for dispatch: no bytes
+// never sent, and no retry requeued for another attempt, which readyBytes does
+// not count.
+func (s *Scheduler) sendQueueEmptyLocked() bool {
+	if s.readyBytes != 0 {
+		return false
+	}
+	for _, chunk := range s.pending {
+		if len(chunk.Data) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // laneRetransmitsChunk is laneRetransmits for one chunk, which a sparse

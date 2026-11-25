@@ -158,3 +158,22 @@ func TestPhasedReentersBulkOnlyOnASustainedBacklog(t *testing.T) {
 		t.Fatalf("re-entered after %v on a 600 ms path, want at least four round trips", held)
 	}
 }
+
+// A backlog that dipped below the threshold between two observations is two
+// stretches, not one.
+func TestPhasedBacklogThatDippedIsNotContinuous(t *testing.T) {
+	c := New(phasedConfig())
+	c.Observe(bulkObservation(2 * time.Second))
+	age := 2 * time.Second
+	for ; c.Current() == ClassBulk; age += 100 * time.Millisecond {
+		c.Observe(quietObservation(age))
+	}
+	for end := age + 3*time.Second; age < end; age += 100 * time.Millisecond {
+		o := quietObservation(age)
+		o.SendBacklog = 80 << 10
+		o.BacklogDrained = true
+		if got := c.Observe(o); got != ClassInteractive {
+			t.Fatalf("a backlog that drained between every observation re-entered BULK at %v", age)
+		}
+	}
+}

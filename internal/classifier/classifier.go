@@ -165,6 +165,10 @@ type Observation struct {
 	// CarriedPayload says this observation is of bytes just carried rather
 	// than a re-examination. Only the phased classifier reads it.
 	CarriedPayload bool
+	// BacklogDrained says the send backlog fell to BulkBacklogBytes or below
+	// at some point since the previous observation, even if it is above it
+	// again now. Only the phased classifier reads it.
+	BacklogDrained bool
 }
 
 // Classifier is stateful. Once a flow becomes bulk it remains bulk until it
@@ -270,6 +274,10 @@ func (c *Classifier) Current() Class {
 	return c.current
 }
 
+// BacklogBytes is the send backlog above which the phased classifier counts a
+// flow as transferring.
+func (c *Classifier) BacklogBytes() uint64 { return c.cfg.BulkBacklogBytes }
+
 // Phased reports whether this classifier keeps a current class apart from the
 // sticky one.
 func (c *Classifier) Phased() bool { return c.cfg.Phased }
@@ -310,6 +318,11 @@ func (c *Classifier) Observe(o Observation) Class {
 // flow that has been BULK can be anything else.
 func (c *Classifier) observeCurrent(o Observation, before Class) {
 	backlogged := o.SendBacklog > c.cfg.BulkBacklogBytes
+	if o.BacklogDrained {
+		// The backlog dipped since the last look: whatever is queued now
+		// started after that, so it is a new stretch.
+		c.inBacklog = false
+	}
 	if backlogged {
 		if !c.inBacklog {
 			c.inBacklog = true

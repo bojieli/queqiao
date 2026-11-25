@@ -76,3 +76,35 @@ func TestSparseWritesAreMarkedOnlyOntoAnEmptyQueue(t *testing.T) {
 	}
 	close(src.writes)
 }
+
+// A retry waiting in the ready set is a non-empty send queue, although
+// readyBytes counts only bytes never sent.
+func TestASmallWriteBehindAQueuedRetryIsNotSparse(t *testing.T) {
+	src := &writesReader{writes: make(chan []byte, 8)}
+	s := New(src, Config{
+		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
+		SparseBytes: 2800, Sparse: func(int) bool { return true },
+	})
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	src.writes <- make([]byte, 16<<10)
+	for s.ReadyBytes() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	c, err := s.Next(ctx, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Fail(1, c) // requeued for another attempt
+	src.writes <- make([]byte, 36)
+	for s.ReadyBytes() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	retry, _ := s.Next(ctx, 2, 0)
+	small, _ := s.Next(ctx, 2, 0)
+	if retry.Offset != 0 || small.Sparse {
+		t.Fatalf("retry offset %d, small write sparse=%v; want the retry first and the write not sparse", retry.Offset, small.Sparse)
+	}
+	close(src.writes)
+}

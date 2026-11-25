@@ -175,6 +175,34 @@ func (f *multipathFlow) laneRetransmitsSparse(laneID uint64) bool {
 	return !lane.fc.codingBulk()
 }
 
+// noteAckedCoverage publishes what the peer holds of this endpoint's stream,
+// cumulative point and selective ranges together, so the classifier's send
+// backlog does not count bytes acknowledged beyond a gap. Called under
+// replayMu after an acknowledgement advanced.
+func (f *multipathFlow) noteAckedCoverage() {
+	covered := f.acked
+	if f.ackTrack != nil {
+		snapshot := f.ackTrack.Snapshot()
+		covered = max(covered, snapshot.cumulative)
+		for _, r := range snapshot.ranges {
+			if r[1] > r[0] && r[0] >= snapshot.cumulative {
+				covered += r[1] - r[0]
+			}
+		}
+	}
+	f.ackedCum.Store(covered)
+	if saturatingSub(f.bytesUp.Load(), covered) <= f.classifierBacklogBytes() {
+		f.backlogDrained.Store(true)
+	}
+}
+
+func (f *multipathFlow) classifierBacklogBytes() uint64 {
+	if f.classifier == nil {
+		return classifier.DefaultConfig().BulkBacklogBytes
+	}
+	return f.classifier.BacklogBytes()
+}
+
 // publishClass stores what the classifier now says: the current class in
 // f.class, and whether the flow has ever been BULK in f.everBulk.
 func (f *multipathFlow) publishClass(current classifier.Class) {

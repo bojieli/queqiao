@@ -507,3 +507,98 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 	}
 	return copy(p, w), nil
 }
+
+// A sparse write of a BULK flow is coded; if its datagrams stop getting
+// through, the stall watchdog must still send its retry to the stream. It used
+// to ask only whether the flow preferred coding, which a BULK flow does not.
+func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	h.advance(2 * time.Second)
+	h.burst()
+	f := h.f
+	if h.current() != classifier.ClassBulk {
+		t.Fatalf("setup: flow is %v, want bulk", h.current())
+	}
+	f.stallGrace = 10 * time.Millisecond
+	f.stallScan = time.Millisecond
+	model := pathmodel.NewPathModel()
+	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000, Delivered: 2e6})
+	path := coded.New(newPipeCarrier(), coded.Config{Path: model})
+	defer path.Close()
+	capture := newAckCaptureConn(0, nil)
+	defer capture.Close()
+	fc := newSplitFrameConn(capture, path)
+	fc.setCodingPolicy(f.prefersCodingOverRetransmission)
+	fc.setFrameCodingPolicy(f.frameCoding)
+	lane := &mpLane{id: 0, kind: TransportQUIC, fc: fc, writeQ: make(chan laneFrame, 2),
+		writeInteractiveQ: make(chan laneFrame, 2), writeDone: make(chan struct{})}
+	lane.ready.Store(true)
+	f.lanes[0] = lane
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	now := time.Now()
+	src := &chunkReader{writes: make(chan []byte, 1)}
+	sched := stripe.New(src, stripe.Config{
+		Reliable: f.laneRetransmits, ReliableSparse: f.laneRetransmitsSparse,
+		SparseBytes: f.sparseBytes(), Sparse: f.admitSparse,
+		ForceReliable:   f.recoverChunkReliably,
+		RetransmitAfter: func() time.Duration { return time.Millisecond }, Now: func() time.Time { return now },
+	})
+	defer sched.Close()
+	f.scheduler.Store(sched)
+	src.writes <- []byte("echo")
+	first, err := sched.Next(ctx, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Sparse || first.Reliable {
+		t.Fatalf("fixture: the echo is sparse=%v reliable=%v, want a coded sparse write", first.Sparse, first.Reliable)
+	}
+	if err = f.sendChunk(ctx, lane, first, true); err != nil {
+		t.Fatal(err)
+	}
+	sent := <-lane.writeInteractiveQ
+	sent.onWritten(false)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { f.stallWatchdog(stop); close(done) }()
+	defer func() { close(stop); <-done }()
+	select {
+	case <-f.stallSignals():
+	case <-ctx.Done():
+		t.Fatal("no stall detected")
+	}
+	now = now.Add(time.Second)
+	if sched.ReissueExpired() != 1 {
+		t.Fatal("the lost echo was not reissued")
+	}
+	retry, err := sched.Next(ctx, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retry.Reliable {
+		t.Fatal("the stalled sparse write keeps retrying on datagrams; no stream escape")
+	}
+}
+
+// The send backlog counts what the peer does not hold, including bytes it
+// acknowledged selectively beyond a gap, and an acknowledgement that drains it
+// below the threshold is reported to the next observation.
+func TestSendBacklogCountsSelectiveCoverageAndDips(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	f.bytesUp.Store(400 << 10)
+	f.replayMu.Lock()
+	f.highestSent = 400 << 10
+	f.replayMu.Unlock()
+	// The first 16 KiB is missing; everything above it arrived.
+	if _, err := f.acknowledgeCoverage(0, false, [][2]uint64{{16 << 10, 400 << 10}}); err != nil {
+		t.Fatal(err)
+	}
+	if backlog := saturatingSub(f.bytesUp.Load(), f.ackedCum.Load()); backlog != 16<<10 {
+		t.Fatalf("backlog %d with one 16 KiB gap, want %d", backlog, 16<<10)
+	}
+	if !f.backlogDrained.Load() {
+		t.Fatal("an acknowledgement that left 16 KiB outstanding was not recorded as a drain")
+	}
+}

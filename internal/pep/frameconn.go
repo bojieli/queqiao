@@ -63,6 +63,10 @@ type frameConn struct {
 	// the write codes what the dispatch planned to code. Nil keeps the
 	// flow-level answer.
 	frameCoding func(protocol.Class) bool
+	// dataObserver, when set, is told of every DATA payload a substrate took,
+	// by class byte. A frame sent coded and also as a stream safety copy is
+	// reported once for each.
+	dataObserver func(class protocol.Class, coded bool, n int)
 	// openUnconfirmed is installed only on an optimistic client lane. The first
 	// coded DATA frame sent before OPEN_OK is also written once behind OPEN on
 	// the reliable stream. The coded copy keeps short-flow latency; the bounded
@@ -97,6 +101,12 @@ func (c *frameConn) setCodingPolicy(wants func() bool) { c.wantsCoding = wants }
 // setFrameCodingPolicy installs the per-frame policy of the phased classifier.
 // Same ordering rule as setCodingPolicy.
 func (c *frameConn) setFrameCodingPolicy(wants func(protocol.Class) bool) { c.frameCoding = wants }
+
+// setDataObserver installs the class telemetry. Same ordering rule as
+// setCodingPolicy.
+func (c *frameConn) setDataObserver(observe func(protocol.Class, bool, int)) {
+	c.dataObserver = observe
+}
 
 func (c *frameConn) setOpenSafetyPolicy(unconfirmed func() bool) {
 	c.openUnconfirmed = unconfirmed
@@ -324,6 +334,9 @@ func (c *frameConn) countData(f protocol.Frame, coded bool) {
 			c.codedData.Add(1)
 		} else {
 			c.streamData.Add(1)
+		}
+		if c.dataObserver != nil {
+			c.dataObserver(f.Header.Class, coded, len(f.Payload))
 		}
 	case protocol.TypePacket:
 		if coded {
