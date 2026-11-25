@@ -508,7 +508,7 @@ class Runner(unittest.TestCase):
             self.assertIn(cell, text)
         self.assertIn("23487 (wlserver call reflector)", text)
         self.assertIn("23488 (wlserver wake)", text)
-        self.assertIn("gateway main-wake", text)
+        self.assertIn("gateway main.wake", text)
         # D starts before the first block, on its own instances, and the
         # blocks wait for its syncs (the ready marker).
         d_start = text.index("idle-wake: starting its sessions beside the blocks")
@@ -748,21 +748,45 @@ class ClassCorrectness(unittest.TestCase):
                 "data_bytes_new_coded": 0, "data_bytes_new_stream": 0, "data_bytes_interactive_coded": inter,
                 "data_bytes_interactive_stream": 0, "data_bytes_bulk_coded": 0, "data_bytes_bulk_stream": bulk}
 
+    def flow_at(self, when, up, inter, bulk):
+        return dict(self.flow(up, inter, bulk), _t=when)
+
+    def trial(self, flows, phase="ph", t0=100.0, t1=110.0):
+        T = collections.namedtuple("T", "flow_records records")
+        return T(flows, [{"kind": "llm", "_phase": phase, "t0": t0, "t1": t1}])
+
     def test_the_llm_flow_is_the_one_that_carried_the_prompt(self):
-        T = collections.namedtuple("T", "flow_records")
-        bg = self.flow(500, 0, 50_000_000)                   # a download: not the LLM's
-        t1 = T([bg, self.flow(600_000, 99_500, 500)])
-        t2 = T([bg, self.flow(100_500, 100_000, 0)])
         pa = sys.modules["ab_workload_phase_a"]
-        self.assertAlmostEqual(pa.class_interactive([t1, t2], 100_000), 199_500 / 200_000)
+        bg = self.flow_at(105, 500, 0, 50_000_000)          # a download: not the LLM's
+        t1 = self.trial([bg, self.flow_at(109, 600_000, 99_500, 500)])
+        t2 = self.trial([bg, self.flow_at(109, 100_500, 100_000, 0)])
+        self.assertAlmostEqual(pa.class_interactive([t1, t2], 100_000, "ph"), 199_500 / 200_000)
         # A background upload cut mid-object carried a prompt-sized upload
         # but no streamed response: not the LLM's flow.
-        cut = self.flow(2_000_000, 0, 60)
-        self.assertAlmostEqual(pa.class_interactive([T([cut] + t1.flow_records)], 100_000), 99_500 / 100_000)
+        cut = self.flow_at(108, 2_000_000, 0, 60)
+        self.assertAlmostEqual(pa.class_interactive([self.trial([cut] + t1.flow_records)], 100_000, "ph"),
+                               99_500 / 100_000)
         # A trial without the LLM's record, or without class telemetry, is unmeasured.
-        self.assertNotEqual(pa.class_interactive([t1, T([bg])], 100_000), pa.class_interactive([t1, T([bg])], 100_000))
-        bare = {k: v for k, v in self.flow(100_500, 50_000, 0).items() if not k.startswith("data_bytes")}
-        x = pa.class_interactive([T([bare])], 100_000)
+        x = pa.class_interactive([t1, self.trial([bg])], 100_000, "ph")
+        self.assertNotEqual(x, x)
+        bare = {k: v for k, v in self.flow_at(109, 100_500, 50_000, 0).items() if not k.startswith("data_bytes")}
+        x = pa.class_interactive([self.trial([bare])], 100_000, "ph")
+        self.assertNotEqual(x, x)
+
+    def test_only_the_measured_phases_flows_count(self):
+        # One trial, two phases with the same prompt size: phase "none" (calls
+        # 100-110 s) was classified right, phase "down4" (200-210 s) wrong.
+        pa = sys.modules["ab_workload_phase_a"]
+        T = collections.namedtuple("T", "flow_records records")
+        t = T([self.flow_at(109, 100_500, 100_000, 0), self.flow_at(209, 100_500, 0, 100_000)],
+              [{"kind": "llm", "_phase": "none", "t0": 100.0, "t1": 110.0},
+               {"kind": "llm", "_phase": "down4", "t0": 200.0, "t1": 210.0},
+               {"kind": "llm", "_phase": "up1", "t0": 300.0, "t1": 310.0}])
+        self.assertEqual(pa.class_interactive([t], 100_000, "none"), 1.0)
+        self.assertEqual(pa.class_interactive([t], 100_000, "down4"), 0.0)
+        # A phase with no completion record of its own is unmeasured, not
+        # passed on another phase's evidence.
+        x = pa.class_interactive([t], 100_000, "up1")
         self.assertNotEqual(x, x)
 
     def test_the_full_profile_reads_the_telemetry_too(self):
@@ -773,7 +797,7 @@ class ClassCorrectness(unittest.TestCase):
         with mock.patch.object(pa, "class_interactive", return_value=0.995) as ci:
             m = llm.phase_measures("single-100k-none", recs, [], [])
         self.assertEqual(m["class_interactive"], 0.995)
-        self.assertEqual(ci.call_args[0][1], 100_000)
+        self.assertEqual(ci.call_args[0][1:], (100_000, "single-100k-none"))
 
 
 class RoundTwoFixes(unittest.TestCase):
@@ -888,6 +912,161 @@ class RoundTwoFixes(unittest.TestCase):
                 text, ok = an.flip_report([a_, b_], g)
         self.assertFalse(ok)
         self.assertIn("single-100k-down4 on a for cand ran on an earlier build or other flags", text)
+
+
+def two_path_llm_campaign(root, flags_a=(), flags_b=(), drop_phase=None):
+    """An llm campaign on paths a and b (each a copy of the one-path
+    campaign), with per-path client flags; optionally without one phase."""
+    pa_tests = importlib.import_module("test_phase_a")
+    tmp = root + "-src"
+    pa_tests.write_llm_campaign(tmp)
+    os.makedirs(root)
+    plan = json.loads(pathlib.Path(tmp, "plan.json").read_text())
+    plan["paths"] = ["a", "b"]
+    plan["schedule"] = plan["schedule"] + [dict(sl, path="b") for sl in plan["schedule"]]
+    plan["clients"] = {"a": {"small": True, "flags": list(flags_a)}, "b": {"small": True, "flags": list(flags_b)}}
+    pathlib.Path(root, "plan.json").write_text(json.dumps(plan))
+    pathlib.Path(root, "status.json").write_text(pathlib.Path(tmp, "status.json").read_text())
+    tsv = pathlib.Path(tmp, "trials.tsv").read_text().splitlines()
+    rows = [l for l in tsv[1:] if drop_phase is None or l.split("\t")[7] != drop_phase]
+    rows_b = ["\t".join(f[:1] + ["b"] + f[2:]) for f in (l.split("\t") for l in rows)]
+    pathlib.Path(root, "trials.tsv").write_text("\n".join([tsv[0]] + rows + rows_b) + "\n")
+    recs = [json.loads(l) for l in pathlib.Path(tmp, "measures.jsonl").read_text().splitlines()]
+    recs = [r for r in recs if drop_phase is None or r["_phase"] != drop_phase]
+    pathlib.Path(root, "measures.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs)
+                                                    + "".join(json.dumps(dict(r, _path="b")) + "\n" for r in recs))
+
+
+class RoundThreeFixes(unittest.TestCase):
+    def test_a_paths_final_bundle_has_that_paths_client_switches(self):
+        # The final campaign swapped the client switches between paths a and
+        # b and reran only one cell: the other cell on each path ran under
+        # the other path's switches, so it is not on the final bundle.
+        g = an.load_gates()
+        g["resamples"] = 500
+        g["workloads"]["llm"] = {k: v for k, v in g["workloads"]["llm"].items() if k != "*.class_interactive"}
+        llm = wl.WORKLOADS["llm"]
+        with tempfile.TemporaryDirectory() as d:
+            early, final = os.path.join(d, "early"), os.path.join(d, "final")
+            two_path_llm_campaign(early, ["--sched=class"], ["--sched=rr"])
+            two_path_llm_campaign(final, ["--sched=rr"], ["--sched=class"], drop_phase="single-100k-down4")
+            with mock.patch.object(an, "FLIP_WORKLOADS", ("llm",)), \
+                    mock.patch.object(llm, "report_only", llm.report_only + ("class_interactive",)):
+                text, ok = an.flip_report([early, final], g)
+        self.assertFalse(ok)
+        for p in ("a", "b"):
+            self.assertIn(f"llm single-100k-down4 on {p} for cand ran on an earlier build or other flags", text)
+
+    def test_the_dc_bounds_are_frozen_in_the_plan(self):
+        dc_tests = importlib.import_module("test_dc_gate")
+        dc = importlib.import_module("dc_gate")
+        bounds = dc.load_bounds()
+        bounds["resamples"] = 1000
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "dc")
+            dc_tests.write_dc(root)
+            plan = json.loads(pathlib.Path(root, "plan.json").read_text())
+            plan["dc_bounds_sha256"] = bounds["sha256"]
+            pathlib.Path(root, "plan.json").write_text(json.dumps(plan))
+            _, v = dc.evaluate(root, bounds)
+            self.assertEqual(v["cand"], "PASS")
+            plan["dc_bounds_sha256"] = "0" * 64              # judged under other bounds
+            pathlib.Path(root, "plan.json").write_text(json.dumps(plan))
+            text, v = dc.evaluate(root, bounds)
+            self.assertEqual(v["cand"], "INCOMPLETE")
+            self.assertIn("differ from the ones frozen", text)
+        # The runner freezes it for a DC campaign.
+        cfg = ab.load_config(str(HERE / "validation" / "dc-minimal.example.ini"))
+        with tempfile.TemporaryDirectory() as tmp:
+            camp = ab.Campaign(cfg, os.path.join(tmp, "out"), ".", dry=False, stream=io.StringIO())
+            with mock.patch.object(ab.Campaign, "preflight"), mock.patch.object(ab.Campaign, "build", return_value={}), \
+                    mock.patch.object(ab.Campaign, "setup", side_effect=RuntimeError("stop here")), \
+                    mock.patch.object(ab.Campaign, "teardown"), mock.patch.object(ab.Campaign, "verify_teardown", return_value=[]), \
+                    mock.patch.object(ab.Campaign, "check_production"), mock.patch.object(ab.Campaign, "release"):
+                camp.run()
+            plan = json.loads(pathlib.Path(tmp, "out", "plan.json").read_text())
+        self.assertEqual(plan["dc_bounds_sha256"], dc.load_bounds()["sha256"])
+
+    def test_dc_percentiles_are_over_the_blocks_pooled_requests(self):
+        # Two trials of one arm in a block: one fast, one with a single slow
+        # request. The block's p99 is that of the 144 requests pooled, not
+        # the mean of the two trials' p99s.
+        dc = importlib.import_module("dc_gate")
+        T = collections.namedtuple("T", "m")
+        fast = T({"latency_p99": 0.3, "_lat": [0.3] * 72})
+        slow = T({"latency_p99": 0.5, "_lat": [0.3] * 71 + [1.0]})
+        self.assertAlmostEqual(dc.pooled_block_stat([fast, slow], "latency_p99"),
+                               st.quantile([0.3] * 143 + [1.0], 0.99))
+        self.assertNotAlmostEqual(dc.pooled_block_stat([fast, slow], "latency_p99"), (0.3 + 0.5) / 2)
+        unmeasured = T({"latency_p99": float("nan"), "_lat": []})
+        x = dc.pooled_block_stat([fast, unmeasured], "latency_p99")
+        self.assertNotEqual(x, x)
+
+    def test_a_failing_rpc_job_has_room_for_every_timeout(self):
+        cfg = ab.load_config(str(HERE / "validation" / "dc-minimal.example.ini"))
+        req = cfg.wl.phases(cfg, "dc")[0]
+        self.assertGreaterEqual(req.duration, cfg.dc.rpc_requests * cfg.dc.request_timeout)
+        self.assertLess(req.expected, 30)              # the estimate stays the usual time
+
+    def test_wake_instances_cannot_collide_with_an_arm(self):
+        text = BASE.replace("[arm:cand]", "[arm:main-wake]")
+        cfg = parse(text)
+        names = [a.name for a in cfg.arms] + [a.name for a in cfg.beside_arms()]
+        self.assertEqual(len(names), len(set(names)), names)
+
+    def test_relative_path_flags_are_refused(self):
+        for flag in ("--flow-metadata-socket ../../var/run/agent.sock", "--cert=./certs/x.pem", "--key ~/k.pem"):
+            with self.assertRaises(ab.ConfigError, msg=flag):
+                parse(BASE.replace("[client:a]\nhost = c1", f"[client:a]\nhost = c1\nflags = {flag}"))
+        # A bare name stays in the endpoint's own directory; a URL is not a path.
+        parse(BASE.replace("[client:a]\nhost = c1", "[client:a]\nhost = c1\nflags = --log-tag agent.sock --peer https://x/y"))
+
+
+class ShortAnswers(unittest.TestCase):
+    def test_a_short_rpc_answer_is_not_a_completed_request(self):
+        # A server that answers every request with 200 and 10 bytes.
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        port = srv.getsockname()[1]
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                with c:
+                    buf = b""
+                    try:
+                        while True:
+                            while b"\r\n\r\n" not in buf:
+                                x = c.recv(65536)
+                                if not x:
+                                    raise EOFError
+                                buf += x
+                            head, buf = buf.split(b"\r\n\r\n", 1)
+                            n = int(next((l.split(b":")[1] for l in head.split(b"\r\n")
+                                          if l.lower().startswith(b"content-length")), b"0"))
+                            while len(buf) < n:
+                                buf += c.recv(65536)
+                            buf = buf[n:]
+                            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789")
+                    except (EOFError, OSError):
+                        pass
+        threading.Thread(target=serve, daemon=True).start()
+        socks = Socks5UDP()
+        socks.start()
+        try:
+            p = subprocess.run([sys.executable, str(CLIENT), "rpc", "--socks", f"127.0.0.1:{socks.port}", "--no-tls",
+                                "--target", f"127.0.0.1:{port}", "--count", "2", "--spacing", "0.1"],
+                               capture_output=True, text=True, timeout=60)
+        finally:
+            srv.close()
+            socks.srv.close()
+        rows = [l.split("\t") for l in p.stdout.splitlines()]
+        self.assertEqual([r[3] for r in rows], ["200", "200"])
+        self.assertEqual([r[6] for r in rows], ["22", "22"])      # not 0: the answer was short
 
 
 class DCAtMinimalSize(unittest.TestCase):

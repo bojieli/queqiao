@@ -204,20 +204,31 @@ def prompt_bytes(recs: Sequence[dict]) -> int:
     return min(us) if us else 1 << 62
 
 
-def class_interactive(trials: Sequence[Any], upload: int) -> float:
-    """Class correctness of the LLM's response (W5): the fraction of DATA
-    payload the gateway sent on the LLM's flows with the INTERACTIVE class
-    byte, from its flow completion records (per-flow class telemetry). The
-    LLM's flows are the ones that carried a prompt upward (at least U bytes
-    from the client, less than 4 MB, which no background flow does). NaN when
-    a trial has no such record or no class telemetry."""
+def class_interactive(trials: Sequence[Any], upload: int, phase: str) -> float:
+    """Class correctness of the LLM's response (W5) in one phase: the
+    fraction of DATA payload the gateway sent on the LLM's flows with the
+    INTERACTIVE class byte, from its flow completion records (per-flow class
+    telemetry). Only records that completed within the phase's LLM calls
+    (from their first start to 5 s after their last end, on the trial's
+    wall clock) count, so another phase of the same trial cannot supply or
+    mask them. Within that window the LLM's flows are the ones that carried
+    a prompt upward (at least U bytes from the client, less than 4 MB) and a
+    streamed response down. NaN when a trial has no such record or no class
+    telemetry."""
     inter = total = 0
     for t in trials:
+        calls = [r for r in getattr(t, "records", []) or [] if r.get("_phase") == phase and r.get("kind") == "llm"
+                 and r.get("t0") is not None]
+        if not calls:
+            return float("nan")
+        lo = min(float(r["t0"]) for r in calls) - 1.0
+        hi = max(float(r.get("t1") or r["t0"]) for r in calls) + 5.0
         # The prompt up (at least U, under 4 MB) and the streamed response
         # down (at least 40 KB: 400 deltas of about 180 B): a cut background
         # upload carries the first but gets only a short reply.
         recs = [r for r in getattr(t, "flow_records", []) or []
-                if upload <= int(r.get("bytes_from_client") or 0) < 4_000_000
+                if lo <= float(r.get("_t", float("nan"))) <= hi
+                and upload <= int(r.get("bytes_from_client") or 0) < 4_000_000
                 and 40_000 <= int(r.get("bytes_to_client") or 0) < 4_000_000]
         if not recs:
             return float("nan")
@@ -435,7 +446,7 @@ class LLM(_Scenario):
         if not self.under_background(ph, recs, rows, trials):
             return {k: float("nan") for k in m}
         # From the gateway's per-flow class telemetry (the model's R3).
-        m["class_interactive"] = class_interactive(trials, prompt_bytes(recs))
+        m["class_interactive"] = class_interactive(trials, prompt_bytes(recs), ph)
         return m
 
 
@@ -522,5 +533,5 @@ class Mixed(_Scenario):
         m["bg_rate_bps"] = got / secs if secs > 0 and not unknown else float("nan")
         if not self.under_background(ph, recs, rows, trials):
             return {k: float("nan") for k in m}
-        m["class_interactive"] = class_interactive(trials, prompt_bytes(recs))
+        m["class_interactive"] = class_interactive(trials, prompt_bytes(recs), ph)
         return m

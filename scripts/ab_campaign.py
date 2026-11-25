@@ -281,7 +281,9 @@ class Config:
         if not (self.wl and self.wl.beside(self)):
             return []
         n = len(self.arms)
-        return [dataclasses.replace(a, name=f"{a.name}-wake", index=n + a.index) for a in self.arms]
+        # "." is not allowed in arm names (ARM_RE), so these never collide
+        # with an arm's directories, pid tags or log names.
+        return [dataclasses.replace(a, name=f"{a.name}.wake", index=n + a.index) for a in self.arms]
 
     def planned_ports(self) -> Dict[str, List[Tuple[int, str]]]:
         out: Dict[str, List[Tuple[int, str]]] = {}
@@ -444,6 +446,10 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
             [(f"[arm:{a.name}]", a.flags + a.gateway_flags + a.client_flags) for a in arms]:
         for f in fl:
             for tok in [f] + ([f.split("=", 1)[1]] if "=" in f else []):
+                if relative_path(tok):
+                    # Relative to an endpoint's working directory a path can
+                    # still climb into production, unseen by the checks below.
+                    raise ConfigError(f"{where}: {f!r} is a relative path; path-valued flags must be absolute")
                 if not tok.startswith("/"):
                     continue
                 tok = os.path.normpath(tok)       # "//x/../y" is "/y"
@@ -730,6 +736,16 @@ def cfg_work_in(text: str, work: str) -> bool:
 
 
 # --- the campaign ------------------------------------------------------------
+
+def relative_path(tok: str) -> bool:
+    """A flag token that names a path, but not from the root: it has a
+    directory part ("a/b", "../x", "./s") or starts with "~". A bare name
+    resolves inside the endpoint's own directory under the work directory,
+    and a URL is not a path."""
+    if tok.startswith("-") or "://" in tok or tok.startswith("/"):
+        return False
+    return tok.startswith("~") or "/" in tok
+
 
 def flag_value(flags: Sequence[str], name: str) -> Optional[str]:
     """The value Go's flag package would take for -name/--name from these
@@ -1723,7 +1739,11 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                     "gateway_flags": cfg.gateway.flags,
                     # The gates in force, frozen before the first block: the
                     # analyzer refuses a verdict under other ones.
-                    "gates_sha256": gates_digest()}
+                    "gates_sha256": gates_digest(),
+                    # The DC gate's frozen bounds likewise (dc_gate.py).
+                    "dc_bounds_sha256": gates_digest(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                  "validation", "dc_gate.ini"))
+                    if cfg.wl.analyzer == "dc_gate" else None}
             if not self.dry:
                 with open(os.path.join(self.out, "plan.json"), "w") as f:
                     json.dump(plan, f, indent=2, default=str)

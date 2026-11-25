@@ -532,7 +532,7 @@ class Minimal(pa._Scenario):
             return {"goodput_bps": got / secs if secs else nan}
         m: Dict[str, float] = {}
         m.update(pa.llm_metrics([r for r in recs if r.get("kind") == "llm"]))
-        m["class_interactive"] = pa.class_interactive(trials, UPLOAD)
+        m["class_interactive"] = pa.class_interactive(trials, UPLOAD, ph)
         term = pa.term_metrics([r for r in recs if r.get("kind") == "term"])
         if ph == "mixed-67":
             m.update({k: v for k, v in term.items() if k in ("echo_p99_a_s", "echo_p99_c_s", "latch_ratio", "over1s_a",

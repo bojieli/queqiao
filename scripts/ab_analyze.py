@@ -1236,10 +1236,11 @@ def arm_config(e: dict) -> Tuple[Tuple[str, ...], ...]:
     return tuple(tuple(e.get(k) or ()) for k in ("flags", "gateway_flags", "client_flags"))
 
 
-def endpoint_switches(plan: dict) -> Tuple[Tuple[str, ...], ...]:
-    """The [gateway] and [client:...] flags every arm's endpoints ran with,
+def endpoint_switches(plan: dict, path: str) -> Tuple[Tuple[str, ...], ...]:
+    """The [gateway] flags and the flags of the path's own client (every
+    leaf's, by name, for the DC gate) that the arm's endpoints ran with,
     without the per-run address ones: two campaigns on the same commits but
-    other behaviour switches are not the same bundle."""
+    other behaviour switches on that path are not the same bundle."""
     def keep(flags):
         out, skip = [], False
         for f in flags or ():
@@ -1251,8 +1252,12 @@ def endpoint_switches(plan: dict) -> Tuple[Tuple[str, ...], ...]:
                 continue
             out.append(f)
         return tuple(out)
-    clients = tuple(sorted({keep(c.get("flags")) for c in (plan.get("clients") or {}).values()}))
-    return (keep(plan.get("gateway_flags")),) + tuple(clients)
+    clients = plan.get("clients") or {}
+    if path in clients:
+        mine: Tuple[Tuple[str, ...], ...] = (keep(clients[path].get("flags")),)
+    else:
+        mine = tuple((name,) + keep(c.get("flags")) for name, c in sorted(clients.items()))
+    return (keep(plan.get("gateway_flags")),) + mine
 
 
 def same_build(a: Tuple[str, object], b: Tuple[str, object]) -> bool:
@@ -1307,7 +1312,9 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
     roles: Dict[str, str] = {}
     paths_all: set = set()
     candidates: set = set()
-    final: Dict[str, Tuple[tuple, tuple, str]] = {}      # arm -> (identity, order, campaign)
+    # (arm, path) -> (identity, order, campaign): a path's final bundle
+    # includes the client switches that path ran with.
+    final: Dict[Tuple[str, str], Tuple[tuple, tuple, str]] = {}
     for n_, campaign in enumerate(campaigns):
         base = os.path.basename(os.path.normpath(campaign))
         with open(os.path.join(campaign, "plan.json")) as f:
@@ -1319,31 +1326,32 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
             continue
         seen.add(name)
         order = (finished_at(campaign), n_)
-        ident: Dict[str, tuple] = {}
-        switches = endpoint_switches(plan)
+        ident: Dict[Tuple[str, str], tuple] = {}
+        plan_paths = ["dc"] if name == "dc" else list(plan["paths"])
         for arm, e in plan["arms"].items():
             role = "main" if arm == plan["main"] else "candidate"
             if roles.setdefault(arm, role) != role:
                 problems.append(f"arm `{arm}` is {role} in {base} but {roles[arm]} elsewhere")
             b = build_identity(e)
-            ident[arm] = (b[0], tuple(sorted(b[1].items())) if isinstance(b[1], dict) else b[1],
-                          arm_config(e) + switches)
+            for p_ in plan_paths:
+                ident[(arm, p_)] = (b[0], tuple(sorted(b[1].items())) if isinstance(b[1], dict) else b[1],
+                                    arm_config(e) + endpoint_switches(plan, p_))
+                if role == "candidate" and ((arm, p_) not in final or order > final[(arm, p_)][1]):
+                    final[(arm, p_)] = (ident[(arm, p_)], order, base)
             if role == "candidate":
                 candidates.add(arm)
-                if arm not in final or order > final[arm][1]:
-                    final[arm] = (ident[arm], order, base)
         if name == "dc":
             import dc_gate
             _, v = dc_gate.evaluate(campaign, dc_gate.load_bounds())
             for cand, verdict in v.items():
-                rows.append((name, "dc", cand, "dc-gate", verdict, ident.get(cand, ()), order, base))
+                rows.append((name, "dc", cand, "dc-gate", verdict, ident.get((cand, "dc"), ()), order, base))
             continue
         paths_all |= set(plan["paths"])
         _, v = report(campaign, gates)
         for path in plan["paths"]:
             for cand in [a for a in plan["arms"] if a != plan["main"]]:
                 for cell, verdict in sorted(cell_verdicts(v, path, cand).items()):
-                    rows.append((name, path, cand, cell, verdict, ident[cand], order, base))
+                    rows.append((name, path, cand, cell, verdict, ident[(cand, path)], order, base))
 
     def same(a: tuple, b: tuple) -> bool:
         """Same build (binaries: every role and platform both used) and flags."""
@@ -1359,7 +1367,7 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
     stale: List[str] = []
     for key in sorted({r[:4] for r in rows}):
         rs = sorted((r for r in rows if r[:4] == key), key=lambda r: r[6])
-        fin = final.get(key[2])
+        fin = final.get((key[2], key[1]))
         on_final = [r for r in rs if fin and same(r[5], fin[0])]
         if on_final:
             chosen[key] = (on_final[-1][4], "")
@@ -1389,7 +1397,8 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
     out += [f"| {w_} | {p_} | {c_} | {cell} | {v_ if v_ == 'PASS' else '**' + v_ + '**'} | {note} |"
             for (w_, p_, c_, cell), (v_, note) in sorted(chosen.items())]
     if final:
-        out += ["", "Final bundle: " + "; ".join(f"`{a}` as run in {fin[2]}" for a, fin in sorted(final.items())) + "."]
+        out += ["", "Final bundle: " + "; ".join(f"`{a_}` on {p_} as run in {fin[2]}"
+                                                 for (a_, p_), fin in sorted(final.items())) + "."]
     if missing:
         out += ["", "Missing: " + ", ".join(f"`{m}`" for m in missing) + "."]
     if stale:

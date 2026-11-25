@@ -559,7 +559,11 @@ class DC(Workload):
             # W4 first (one request at a time, all loaded leaves together),
             # then the sustained phase.
             rpc_window = dc.rpc_requests * dc.rpc_spacing
-            return [Phase("requests", rpc_window + dc.request_timeout,
+            # The job's cap is the serial worst case (every request taking its
+            # whole timeout), so a candidate that fails them all is measured,
+            # not cut off as a harness failure; `expected` is the usual time.
+            worst = dc.rpc_requests * (dc.request_timeout + dc.rpc_spacing) + 10
+            return [Phase("requests", worst,
                           [Job(c, "dc-rpc", 1) for c in loaded] + [Job(control, "probe", 1, load=False, params=probe)],
                           barrier=True, expected=rpc_window + 2),
                     Phase("sustained", cfg.duration,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import glob
+import hashlib
 import os
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -40,6 +41,8 @@ def load_bounds(path: str = BOUNDS) -> dict:
     out.update(alpha=s.getfloat("alpha"), resamples=s.getint("bootstrap_resamples"), seed=s.getint("bootstrap_seed"),
                max_zero_main_fraction=s.getfloat("max_zero_main_fraction"), binding_max=v.getfloat("binding_max"),
                min_legacy_completion=v.getfloat("min_legacy_completion"))
+    with open(path, "rb") as f:
+        out["sha256"] = hashlib.sha256(f.read()).hexdigest()
     return out
 
 
@@ -146,6 +149,7 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     # The requests themselves, for a p99 pooled over blocks when a block has
     # fewer than 100 per arm (design section 15.4).
     m["_lat"] = lat if overlap else []
+    m["_ctl"] = ctl_samples = []
     m["latency_p50"] = st.quantile(lat, 0.5)
     m["latency_p99"] = st.quantile(lat, 0.99)
     if not overlap:
@@ -160,6 +164,8 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     # probe job that produced nothing leaves the trial unmeasured.
     phases = {r["phase"] for r in probes}
     m["control_p50"] = st.quantile(ctl, 0.5) if {"sustained", "requests"} <= phases else float("nan")
+    if m["control_p50"] == m["control_p50"]:
+        ctl_samples.extend(ctl)
     m["requests_ok"] = sum(1 for r in req if r["complete"] == "1")
     m["requests"] = len(req)
     # Completion: loaded leaves' requests and the control leaf's, together.
@@ -168,6 +174,20 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     m["completion"] = ((m["requests_ok"] + sum(1 for r in probes if r["complete"] == "1")) / (len(req) + len(probes))
                        if req or probes else float("nan"))
     return m
+
+
+# Percentile measures computed over an arm's pooled samples in a block:
+# measure -> (sample list in Trial.m, quantile).
+POOLED = {"latency_p50": ("_lat", 0.5), "latency_p99": ("_lat", 0.99), "control_p50": ("_ctl", 0.5)}
+
+
+def pooled_block_stat(trials: List[Trial], key: str) -> float:
+    """The arm's block value of a percentile measure: the quantile of its
+    trials' samples pooled, NaN unless every trial measured it."""
+    src, q = POOLED[key]
+    if not trials or any(t.m.get(key) != t.m.get(key) for t in trials):
+        return float("nan")
+    return st.quantile([x for t in trials for x in t.m.get(src, [])], q)
 
 
 def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Trial], loaded: List[str],
@@ -286,6 +306,12 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     if plan.get("workload") != "dc" or not plan.get("dc"):
         raise SystemExit(f"{campaign} is not a dc campaign")
     problems, trials = completeness(campaign, plan, trials)
+    frozen = plan.get("dc_bounds_sha256")
+    if frozen and bounds.get("sha256") != frozen:
+        # The bounds were frozen before the first block; another file (or a
+        # changed one) does not judge this campaign.
+        problems = problems + [f"the DC bounds differ from the ones frozen in the campaign's plan (sha256 {frozen[:12]}); "
+                               "judge it with that dc_gate.ini"]
     dc = plan["dc"]
     loaded, control = dc["loaded"], dc["control"]
     main = plan["main"]
@@ -299,9 +325,15 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
 
     def per_block(arm: str, key: str, agg) -> Dict[int, float]:
         out: Dict[int, List[float]] = {}
+        trials_of: Dict[int, List[Trial]] = {}
         for t in ab:
             if t.arm == arm:
                 out.setdefault(t.block, []).append(t.m[key])
+                trials_of.setdefault(t.block, []).append(t)
+        if key in POOLED:
+            # A percentile of the arm's block is taken over the block's pooled
+            # samples (design section 15.4), not averaged over its trials.
+            return {b: pooled_block_stat(ts_, key) for b, ts_ in trials_of.items()}
         return {b: agg(v) for b, v in out.items()}
 
     # Strict: a block with an unmeasured trial is unmeasured, not averaged

@@ -65,8 +65,11 @@ built to refuse rather than to trust:
   config and logs), and a process pattern. No configured flag may name a
   production path, and no work directory may be inside one. Before anything
   is copied, the preflight resolves those paths, the work directory and
-  every path a flag names on the host itself (symlinks, `..`, `//`). So a
-  path that reaches production through a symlink is refused too. The section must
+  every path a flag names on the host itself (symlinks, `..`, `//`, and a
+  symlink as the last component). So a path that reaches production through
+  a symlink is refused too. A path-valued flag must be absolute: a relative
+  one (`a/b`, `../x`, `~/x`) is refused, since from the endpoint's working
+  directory it could climb into production unchecked. The section must
   exist even when it lists nothing, so no host is touched without being looked
   at first.
 - **Preflight is read-only, and it refuses.** Before anything is copied or
@@ -581,7 +584,7 @@ at the stopping look, and tested with a bootstrap that resamples blocks.
 
 **D beside the blocks.** D barely contends after its sync, so its arms run
 at once as paired sessions, each on its own gateway and client instances
-(`<arm>-wake`, on the ports after the arms'), which the blocks' restarts do
+(`<arm>.wake`, a name no arm can take, on the ports after the arms'), which the blocks' restarts do
 not touch. The campaign starts D first and waits until every connection has
 synced (if they have not within two minutes, the campaign aborts before any
 block), then runs C's first two blocks back to back to cover D's
@@ -613,8 +616,10 @@ a look a trial type:
 Each trial type stops on its own; the others continue. Coverage is counted
 against the blocks a type ran, and a cell passes only when every one of its
 rules passed: undecided or unmeasured leaves it INCOMPLETE. `plan.json`
-freezes the SHA-256 of `gates.ini`; the analyzer gives no verdict under
-another gates file. `status.json`
+freezes the SHA-256 of `gates.ini` (and, for a DC campaign, of
+`dc_gate.ini`); the analyzers, and the flip, give no verdict under another
+file. The flip compares each path's results with that path's own final
+client switches. `status.json`
 records the units run (block, path, type), why each type stopped, and the
 wall time. The analyzer judges each type at its last look, and its tables
 show the bounds at that look's level. Sequential mode is only for workloads
@@ -632,6 +637,11 @@ only (`calibrate = first`), and that block's solo rates stand for every
 block's ancestor-binding check and leaf identities; every block's carrier
 and leaf evidence is still checked. With 30 requests per arm in a trial,
 DC's request p99 is pooled over blocks and tested by resampling blocks.
+Every request and control percentile of an arm's block is taken over the
+block's pooled samples. Each DC request has at most `request_timeout`
+seconds and counts as completed only with the full ASR or TTS answer; the
+job's cap allows every request its timeout, so a candidate that fails them
+all is measured, not cut off.
 
 **Optional workloads.** The rest of the workload model is available but is
 not a gate:

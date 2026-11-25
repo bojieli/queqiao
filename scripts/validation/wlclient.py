@@ -109,8 +109,14 @@ class Reader:
     def __init__(self, sock):
         self.s = sock
         self.buf = b""
+        self.deadline = None     # monotonic; a read past it times out
 
     def fill(self) -> None:
+        if self.deadline is not None:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("request deadline")
+            self.s.settimeout(left)
         b = self.s.recv(65536)
         if not b:
             raise EOFError("connection closed")
@@ -975,17 +981,28 @@ def cmd_wake(args) -> None:
 
 # --- W4: transactional requests (the DC gate at minimal size) -------------------------
 
-def http_exchange(sock, reader: "Reader", method: str, path: str, up: int, pad_to: int) -> tuple:
+def http_exchange(sock, reader: "Reader", method: str, path: str, up: int, pad_to: int,
+                  deadline: float = None) -> tuple:
     """One request on an open keep-alive connection: `up` body bytes, the
-    head padded to `pad_to`. Returns (status, body bytes read)."""
+    head padded to `pad_to`, all of it by `deadline` (monotonic) if given.
+    Returns (status, body bytes read)."""
+    def budget():
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("request deadline")
+            sock.settimeout(left)
     head = f"{method} {path} HTTP/1.1\r\nHost: wlserver\r\nContent-Length: {up}\r\nX-Pad: "
     head += "p" * max(0, pad_to - up - len(head) - 4) + "\r\n\r\n"
+    budget()
     sock.sendall(head.encode())
     left = up
     while left > 0:
         k = min(left, 65536)
+        budget()
         sock.sendall(BODY[:k])
         left -= k
+    reader.deadline = deadline
     status = reader.line()
     length = 0
     while True:
@@ -995,6 +1012,7 @@ def http_exchange(sock, reader: "Reader", method: str, path: str, up: int, pad_t
         if h.lower().startswith(b"content-length:"):
             length = int(h.split(b":", 1)[1])
     reader.exact(length)
+    reader.deadline = None
     return (200 if b" 200 " in status + b" " else 0), length
 
 
@@ -1005,8 +1023,11 @@ def cmd_rpc(args) -> None:
     """W4 at minimal size: --count requests one at a time, --spacing s apart
     (from each start), ASR (--asr-up up, --asr-down back) and TTS (--tts-up
     request, --tts-down back) alternating, on one keep-alive connection, the
-    first one cold; a failed request's connection is replaced. Row per
-    request: flow w<i>r1 (request i of every leaf is wave i), the bytes
+    first one cold; a failed request's connection is replaced. Each request,
+    connection set-up included, gets at most --timeout seconds of wall time,
+    so the whole job ends within count x timeout plus the spacing. A request
+    succeeds only with HTTP 200 and exactly the expected answer size. Row
+    per request: flow w<i>r1 (request i of every leaf is wave i), the bytes
     back, its seconds."""
     sock = reader = None
     c0 = time.monotonic()
@@ -1017,16 +1038,19 @@ def cmd_rpc(args) -> None:
         asr = i % 2 == 0
         t0 = time.time()
         code, got, ex = 0, 0, 0
+        deadline = time.monotonic() + args.timeout
         try:
             if sock is None:
-                sock = open_conn(args, args.timeout)
-                sock.settimeout(args.timeout)
+                sock = open_conn(args, max(0.1, deadline - time.monotonic()))
                 reader = Reader(sock)
             if asr:
-                code, got = http_exchange(sock, reader, "POST", f"/sink?reply={args.asr_down}", args.asr_up, args.asr_up + 300)
+                code, got = http_exchange(sock, reader, "POST", f"/sink?reply={args.asr_down}", args.asr_up,
+                                          args.asr_up + 300, deadline)
             else:
-                code, got = http_exchange(sock, reader, "GET", f"/bytes/{args.tts_down}", 0, args.tts_up)
-            ex = 0 if code == 200 else 22
+                code, got = http_exchange(sock, reader, "GET", f"/bytes/{args.tts_down}", 0, args.tts_up, deadline)
+            want = args.asr_down if asr else args.tts_down
+            # A short answer is not a completed request, whatever its status.
+            ex = 0 if code == 200 and got == want else 22
         except (OSError, EOFError, ValueError, ssl.SSLError):
             ex = 28
             try:
