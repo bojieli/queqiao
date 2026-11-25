@@ -276,7 +276,22 @@ func (c *Classifier) Current() Class {
 
 // BacklogBytes is the send backlog above which the phased classifier counts a
 // flow as transferring.
-func (c *Classifier) BacklogBytes() uint64 { return c.cfg.BulkBacklogBytes }
+func (c *Classifier) BacklogBytes() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cfg.BulkBacklogBytes
+}
+
+// SetBacklogBytes replaces BulkBacklogBytes, for a flow whose send path can
+// hold less than the configured threshold. Zero is ignored.
+func (c *Classifier) SetBacklogBytes(n uint64) {
+	if n == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cfg.BulkBacklogBytes = n
+}
 
 // Phased reports whether this classifier keeps a current class apart from the
 // sticky one.

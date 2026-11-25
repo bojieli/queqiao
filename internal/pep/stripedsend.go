@@ -314,7 +314,7 @@ func (s *flowSource) ReadAvailable(p []byte) (int, error) {
 func (s *flowSource) Read(p []byte) (int, error) {
 	n, err := s.flow.inner.Read(p)
 	if n > 0 {
-		s.flow.observeCarried(n, true)
+		s.flow.observeCarriedRead(n, true, len(p))
 	}
 	if err != nil {
 		// HTTP clients often close a fully-consumed SOCKS socket without a TCP
@@ -344,6 +344,7 @@ func (s *flowSource) Read(p []byte) (int, error) {
 // policy.
 func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 	defer close(f.sendDone)
+	f.fitBacklogThreshold()
 
 	retention := f.retentionBytes
 	var autotune *stripe.Autotune

@@ -2,10 +2,12 @@ package pep
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/bojieli/queqiao/internal/classifier"
 	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
+	"github.com/bojieli/queqiao/internal/stripe"
 )
 
 // ClassifierMode selects the flow-classifier bundle.
@@ -101,24 +103,128 @@ const sparseWriteBytes = 2 * 1400
 // its class like any other flow past this point.
 const sparseAllowanceBytes = smallExchangeBytes
 
-// classifierBacklogFor fits the phased classifier's backlog threshold to the
-// flow's send-memory bound. The backlog cannot exceed what the flow may
-// retain, so on a memory profile whose per-flow send limit is at or under
-// the default threshold, a sustained transfer could never show the evidence
-// that keeps or puts it in BULK. Half the bound is still far above any
-// conversation's backlog and is reached by any producer blocked for room.
-func classifierBacklogFor(cfg classifier.Config, limits flowMemoryLimits) classifier.Config {
-	if !cfg.Phased || limits.maxSendBytes <= 0 {
-		return cfg
+// backlogThresholdFor fits the phased classifier's backlog threshold to what
+// the flow's scheduler can actually hold. The backlog -- bytes read from the
+// application and not acknowledged -- cannot exceed the read-ahead the
+// scheduler allows, and the scheduler stops reading at whichever of its
+// bounds binds first:
+//
+//   - the per-flow send bytes (maxSendBytes);
+//   - the chunk count (maxOutstanding). A backlogged source fills each read,
+//     so this holds maxOutstanding x readSize bytes, where readSize is a
+//     whole chunk, or only the staging buffer when the scheduler stages
+//     reads: a staged read is extended only if the connection takes a read
+//     deadline and the shared send memory has a whole chunk free, and under
+//     contention neither is promised;
+//   - under mem=owned, the autotuned retention bound, which can sit at its
+//     startup floor of stripe.DefaultAutotuneStartupChunks chunks.
+//
+// A continuously backlogged flow dips below that capacity each time the peer
+// acknowledges a read before the producer refills its slot, and a dip to the
+// threshold or under it is recorded as a drain that ends the backlog
+// stretch. The threshold is therefore half of what remains after one read is
+// acknowledged: a blocked transfer stays above it between refills, and it is
+// still far above any conversation's backlog. It only ever lowers base.
+func backlogThresholdFor(base uint64, limits flowMemoryLimits, chunkSize, readSize int, memOwned bool) (threshold uint64, refill bool) {
+	if base == 0 {
+		base = classifier.DefaultConfig().BulkBacklogBytes
 	}
-	threshold := cfg.BulkBacklogBytes
-	if threshold == 0 {
-		threshold = classifier.DefaultConfig().BulkBacklogBytes
+	if readSize <= 0 || readSize > chunkSize {
+		readSize = chunkSize
 	}
-	if half := countBytes(limits.maxSendBytes / 2); half < threshold {
-		cfg.BulkBacklogBytes = max(half, 1)
+	residual, ok := leastResidual(limits, chunkSize, readSize, memOwned)
+	if !ok {
+		return base, false
 	}
-	return cfg
+	threshold = min(base, max(countBytes(residual/2), 1))
+	return threshold, threshold < minBacklogThresholdBytes
+}
+
+// minBacklogThresholdBytes is the lowest backlog threshold that still sits
+// above a conversation's unacknowledged bytes: an LLM stream of 40 deltas a
+// second of about 200 bytes holds 8 KB in flight on a one-second path. Below
+// it, bytes outstanding are not evidence of a transfer, and the flow uses
+// refill evidence instead (see refillWindow).
+const minBacklogThresholdBytes = 8 << 10
+
+// refillWindow is how soon after an acknowledgement opens room a full read
+// must follow for the flow to count as never having drained. A producer
+// blocked for room is woken by the acknowledgement and reads at once from a
+// socket that already holds the bytes, which takes well under a millisecond;
+// twenty allows for a loaded scheduler. A conversation's next write comes at
+// its own cadence and is not full.
+const refillWindow = 20 * time.Millisecond
+
+// leastResidual is the least a continuously backlogged flow can hold,
+// unacknowledged, just after one acknowledgement and before the producer
+// refills. One acknowledgement can release up to maxAckRelease: the peer
+// coalesces until ackBytesThreshold is pending, and the chunk that crosses
+// it can add one more. The worst case is a queue whose oldest read is a
+// whole chunk and whose others are as small as the read path allows, with
+// as much of it as possible released at once. Each scheduler bound limits
+// what is left:
+//
+//   - the send bytes: the limit less one release;
+//   - the chunk count: one whole chunk and maxOutstanding-1 minimum-size
+//     reads, less one release;
+//   - under mem=owned, the autotune floor less one release.
+//
+// It reports false when no bound applies.
+func leastResidual(limits flowMemoryLimits, chunkSize, readSize int, memOwned bool) (int, bool) {
+	if chunkSize <= 0 {
+		return 0, false
+	}
+	release := maxAckRelease(chunkSize)
+	residual, bounded := 0, false
+	take := func(r int) {
+		r = max(r, 0)
+		if !bounded || r < residual {
+			residual, bounded = r, true
+		}
+	}
+	if limits.maxSendBytes > 0 {
+		take(limits.maxSendBytes - release)
+	}
+	if limits.maxOutstanding > 0 {
+		take(chunkSize + (limits.maxOutstanding-1)*readSize - release)
+	}
+	if memOwned {
+		take(stripe.DefaultAutotuneStartupChunks*chunkSize - release)
+	}
+	return residual, bounded
+}
+
+// maxAckRelease is the most one acknowledgement can cover.
+func maxAckRelease(chunkSize int) int { return ackBytesThreshold + chunkSize }
+
+func minPositive(a, b int) int {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 || a < b {
+		return a
+	}
+	return b
+}
+
+// fitBacklogThreshold applies backlogThresholdFor once the flow's chunk size,
+// memory limits and memory bundle are all settled, which is when its send
+// loop starts. It starts from the threshold the profile configured.
+func (f *multipathFlow) fitBacklogThreshold() {
+	if !f.phased() {
+		return
+	}
+	readSize := f.chunkSize
+	if f.sendMemory != nil {
+		// The scheduler stages each read in stagingBytes and extends it only
+		// when it can; size for the reads a contended flow is left with.
+		readSize = min(readSize, stagingBytes)
+	}
+	threshold, refill := backlogThresholdFor(f.classifier.BacklogBytes(), f.memoryLimits, f.chunkSize, readSize, f.memOwned)
+	f.classifier.SetBacklogBytes(threshold)
+	f.ackMu.Lock()
+	f.refillMode, f.fullReadBytes, f.refillThreshold = refill, readSize, threshold
+	f.ackMu.Unlock()
 }
 
 // phased reports whether this flow runs the phased classifier.
@@ -210,10 +316,100 @@ func (f *multipathFlow) noteAckedCoverage() {
 			}
 		}
 	}
-	f.ackedCum.Store(covered)
-	if saturatingSub(f.bytesUp.Load(), covered) <= f.classifierBacklogBytes() {
-		f.backlogDrained.Store(true)
+	threshold := f.classifierBacklogBytes()
+	now := f.clockNow()
+	f.ackMu.Lock()
+	defer f.ackMu.Unlock()
+	f.ackCovered = covered
+	if saturatingSub(f.bytesUp.Load(), covered) > threshold {
+		return
 	}
+	if !f.refillMode {
+		f.ackDrained = true
+		return
+	}
+	// The room this opened is a drain only if no full read takes it at
+	// once; countAndSample decides.
+	if !f.drainPending {
+		f.drainPending, f.drainPendingAt = true, now
+	}
+}
+
+// countAndSample is the classifier's view of one observation, at now, of n
+// bytes in direction up: the flow's byte totals including them (added to the
+// totals when publish is set), the send backlog against those totals, and
+// whether a drain was published since the last sample, all under ackMu,
+// which the acknowledgement path also holds when it records a drain.
+//
+// In refill mode (a threshold too small to separate a transfer from a
+// conversation by bytes outstanding) the backlog counts only while the
+// latest read filled its buffer, and room an acknowledgement opened is a
+// drain unless a full read takes it within refillWindow.
+//
+// bufLen is the buffer the read had room for, so a read that filled it is a
+// full read whatever its size; zero means unknown, and fullReadBytes stands
+// in for it.
+func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool, bufLen int) (upBytes, downBytes, backlog uint64, drained bool) {
+	f.ackMu.Lock()
+	defer f.ackMu.Unlock()
+	if publish && n > 0 {
+		if up {
+			f.bytesUp.Add(countBytes(n))
+		} else {
+			f.bytesDown.Add(countBytes(n))
+		}
+	}
+	upBytes, downBytes = f.bytesUp.Load(), f.bytesDown.Load()
+	if !publish {
+		if up {
+			upBytes += countBytes(n)
+		} else {
+			downBytes += countBytes(n)
+		}
+	}
+	backlog = saturatingSub(upBytes, f.ackCovered)
+	if f.refillMode {
+		if up && n > 0 {
+			full := n >= f.fullReadBytes
+			if bufLen > 0 {
+				full = n >= bufLen
+			}
+			if f.drainPending && !(full && now.Sub(f.drainPendingAt) <= refillWindow) {
+				f.ackDrained = true
+			}
+			f.drainPending = false
+			f.lastReadFull = full
+		} else if f.drainPending && now.Sub(f.drainPendingAt) > refillWindow {
+			f.ackDrained, f.drainPending = true, false
+		}
+		switch {
+		case !f.lastReadFull:
+			backlog = 0
+		case f.drainPending || backlog > f.refillThreshold:
+			// Still behind, or a refill is due within the window: an
+			// observation of something else -- receive-side bytes, a
+			// re-examination -- does not end the stretch before the
+			// refill has had its chance.
+			backlog = max(backlog, f.refillThreshold+1)
+		}
+	}
+	drained = f.ackDrained
+	f.ackDrained = false
+	return upBytes, downBytes, backlog, drained
+}
+
+// ackSample is countAndSample for no new bytes.
+func (f *multipathFlow) ackSample() (backlog uint64, drained bool) {
+	_, _, backlog, drained = f.countAndSample(f.clockNow(), 0, true, false, 0)
+	return backlog, drained
+}
+
+// setAckCoverage publishes acknowledged coverage without a drain, for tests
+// that model the peer.
+func (f *multipathFlow) setAckCoverage(covered uint64) {
+	f.ackMu.Lock()
+	f.ackCovered = covered
+	f.ackMu.Unlock()
 }
 
 func (f *multipathFlow) classifierBacklogBytes() uint64 {
