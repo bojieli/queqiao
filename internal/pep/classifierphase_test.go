@@ -560,9 +560,6 @@ func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	sent := <-lane.writeInteractiveQ
-	if f.codedDataOutstanding() {
-		t.Fatal("coded DATA counted as outstanding before any was written")
-	}
 	reliable, err := fc.writeContextObserved(ctx, sent.frame, sent.forceReliable, nil)
 	if err != nil || reliable {
 		t.Fatalf("the echo was not written coded: reliable=%v err=%v", reliable, err)
@@ -612,5 +609,48 @@ func TestSendBacklogCountsSelectiveCoverageAndDips(t *testing.T) {
 	}
 	if !f.backlogDrained.Load() {
 		t.Fatal("an acknowledgement that left 16 KiB outstanding was not recorded as a drain")
+	}
+}
+
+// A stall on a BULK flow whose outstanding data all went on the stream is not
+// a coded stall, though the lane could code; and a coded chunk the peer has
+// acknowledged, selectively or not, is no longer outstanding.
+func TestCodedDataOutstandingFollowsTheAttempts(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	src := &chunkReader{writes: make(chan []byte, 2)}
+	defer close(src.writes)
+	coding := false
+	sched := stripe.New(src, stripe.Config{
+		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
+		Reliable: func(uint64) bool { return !coding },
+	})
+	defer sched.Close()
+	f.scheduler.Store(sched)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	next := func(n int) *stripe.Chunk {
+		t.Helper()
+		src.writes <- make([]byte, n)
+		c, err := sched.Next(ctx, 0, 0)
+		if err != nil || c == nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	stream := next(16 << 10)
+	sched.WroteAs(0, stream, true)
+	if f.codedDataOutstanding() {
+		t.Fatal("a stream-only chunk counted as outstanding coded DATA")
+	}
+	coding = true
+	coded := next(36)
+	sched.WroteAs(0, coded, false)
+	if !f.codedDataOutstanding() {
+		t.Fatal("an unacknowledged coded chunk was not outstanding")
+	}
+	sched.Complete(0, coded) // acknowledged above the stream chunk's gap
+	if f.codedDataOutstanding() {
+		t.Fatal("a coded chunk acknowledged selectively still counted as outstanding")
 	}
 }

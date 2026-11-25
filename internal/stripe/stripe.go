@@ -507,7 +507,12 @@ func (s *Scheduler) produce() {
 			buf      []byte
 			n        int
 			reserved int
-			err      error
+			// drained says the read returned less than it had room for,
+			// which is the evidence that the source had nothing more: a
+			// read that filled its buffer was limited by the scheduler, not
+			// by the application.
+			drained bool
+			err     error
 		)
 		if staging == nil {
 			buf = make([]byte, allowance)
@@ -517,14 +522,15 @@ func (s *Scheduler) produce() {
 			// bytes arrived to fill the chunk, which is latency invented by
 			// the scheduler.
 			n, err = s.src.Read(buf)
+			drained = n < len(buf)
 		} else {
 			var ok bool
-			buf, n, reserved, ok, err = s.readStaged(staging[:min(len(staging), allowance)], allowance)
+			buf, n, reserved, drained, ok, err = s.readStaged(staging[:min(len(staging), allowance)], allowance)
 			if !ok {
 				return
 			}
 		}
-		if !s.publish(buf, n, reserved, err) {
+		if !s.publish(buf, n, reserved, drained, err) {
 			return
 		}
 	}
@@ -587,11 +593,12 @@ func (s *Scheduler) waitForRoom() (int, bool) {
 // readStaged blocks on the application holding no shared memory, then
 // reserves exactly the allocation the bytes in hand need. ok is false when
 // the scheduler closed while it waited for memory.
-func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, ok bool, err error) {
+func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, drained, ok bool, err error) {
 	n, err = s.src.Read(staging)
 	if n <= 0 {
-		return nil, 0, 0, true, err
+		return nil, 0, 0, false, true, err
 	}
+	drained = n < len(staging)
 	size := n
 	filler, canFill := s.src.(AvailableReader)
 	// A read that filled the staging buffer suggests more is waiting; one
@@ -611,7 +618,7 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 			s.ready.Broadcast()
 		}
 		s.mu.Unlock()
-		return nil, 0, 0, false, nil
+		return nil, 0, 0, false, false, nil
 	}
 	buf = make([]byte, size)
 	copy(buf, staging[:n])
@@ -621,6 +628,7 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 		if m > 0 {
 			n += m
 		}
+		drained = n < size
 		if fillErr != nil && !errors.Is(fillErr, ErrUnsupported) {
 			err = fillErr
 		}
@@ -635,12 +643,12 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 			buf, reserved = short, n
 		}
 	}
-	return buf, n, reserved, true, err
+	return buf, n, reserved, drained, true, err
 }
 
 // publish files what one read produced. It reports false when the producer
 // must stop: the scheduler closed, or the source ended.
-func (s *Scheduler) publish(buf []byte, n, reserved int, err error) bool {
+func (s *Scheduler) publish(buf []byte, n, reserved int, drained bool, err error) bool {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -649,7 +657,7 @@ func (s *Scheduler) publish(buf []byte, n, reserved int, err error) bool {
 	}
 	if n > 0 {
 		chunk := &Chunk{Offset: s.nextOffset, Data: buf[:n], reservation: reserved}
-		if s.cfg.Sparse != nil && n <= s.cfg.SparseBytes && s.sendQueueEmptyLocked() {
+		if s.cfg.Sparse != nil && drained && n <= s.cfg.SparseBytes && s.sendQueueEmptyLocked() {
 			chunk.Sparse = s.cfg.Sparse(n)
 		}
 		s.nextOffset += uint64(n)
@@ -1014,6 +1022,22 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		return &issued
 	}
 	return nil
+}
+
+// UnreliableOutstanding reports whether any chunk not yet acknowledged has an
+// attempt that went out unreliably -- on a coded path -- as recorded at
+// dispatch or corrected by WroteAs.
+func (s *Scheduler) UnreliableOutstanding() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, out := range s.live {
+		for _, a := range out.attempts {
+			if !a.reliable {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // sendQueueEmptyLocked reports whether nothing waits for dispatch: no bytes

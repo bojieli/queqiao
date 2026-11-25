@@ -119,3 +119,31 @@ func TestASmallWriteBehindAQueuedRetryIsNotSparse(t *testing.T) {
 		t.Fatalf("retry offset %d, small write sparse=%v; want the retry first and the write not sparse", retry.Offset, small.Sparse)
 	}
 }
+
+// A read that filled what the scheduler offered was limited by the scheduler,
+// not by the application, however small: a tiny chunk size is not a stream of
+// sparse writes.
+func TestAFullReadIsNotSparse(t *testing.T) {
+	src := &writesReader{writes: make(chan []byte, 8)}
+	defer close(src.writes)
+	s := New(src, Config{
+		ChunkSize: 1024, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
+		SparseBytes: 2800, Sparse: func(int) bool { return true },
+	})
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	src.writes <- make([]byte, 1024)
+	full, err := s.Next(ctx, 1, 0)
+	if err != nil || full == nil {
+		t.Fatal(err)
+	}
+	src.writes <- make([]byte, 36)
+	short, err := s.Next(ctx, 1, 0)
+	if err != nil || short == nil {
+		t.Fatal(err)
+	}
+	if full.Sparse || !short.Sparse {
+		t.Fatalf("full 1 KiB read sparse=%v, short read sparse=%v; want false and true", full.Sparse, short.Sparse)
+	}
+}

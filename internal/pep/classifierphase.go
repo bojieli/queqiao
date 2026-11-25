@@ -223,28 +223,21 @@ func classByteIndex(class protocol.Class) int {
 	return 0
 }
 
-// noteDataFrame is the frame connection's DATA observer: the class telemetry,
-// and the high-water mark of coded DATA for the stall watchdog.
+// noteDataFrame is the frame connection's DATA observer, for the class
+// telemetry.
 func (f *multipathFlow) noteDataFrame(frame protocol.Frame, coded bool) {
 	f.noteDataBytes(frame.Header.Class, coded, len(frame.Payload))
-	if !coded {
-		return
-	}
-	end := frame.Header.Sequence + uint64(len(frame.Payload))
-	for {
-		high := f.codedHigh.Load()
-		if end <= high || f.codedHigh.CompareAndSwap(high, end) {
-			return
-		}
-	}
 }
 
-// codedDataOutstanding reports whether DATA this endpoint sent on the coded
-// substrate may still be unacknowledged. Under the phased classifier a BULK
+// codedDataOutstanding reports whether a chunk this endpoint sent on the
+// coded substrate is still unacknowledged. Under the phased classifier a BULK
 // flow codes only its sparse writes, so whether the lane could code says
-// nothing about whether a stalled flow has coded work pending.
+// nothing about whether a stalled flow has coded work pending. The scheduler
+// is the authority: a chunk acknowledged selectively has left it, and each
+// attempt records the substrate its write actually used.
 func (f *multipathFlow) codedDataOutstanding() bool {
-	return f.codedHigh.Load() > f.ackedPoint.Load()
+	sched := f.scheduler.Load()
+	return sched != nil && sched.UnreliableOutstanding()
 }
 
 // noteDataBytes records one DATA frame's payload by its class byte and the

@@ -446,11 +446,6 @@ type multipathFlow struct {
 	// to the classifier's threshold or below since the last observation, so
 	// a backlog that dipped between reads is not taken for a continuous one.
 	backlogDrained atomic.Bool
-	// codedHigh is one past the highest DATA byte this endpoint sent on the
-	// coded substrate, and ackedPoint mirrors acked, so the stall watchdog
-	// can tell whether any coded DATA is still unacknowledged.
-	codedHigh  atomic.Uint64
-	ackedPoint atomic.Uint64
 	// classBytes counts DATA payload this endpoint sent, by class byte (new,
 	// interactive, bulk) and substrate (stream, coded).
 	classBytes [3][2]atomic.Uint64
@@ -2764,7 +2759,6 @@ func (f *multipathFlow) acknowledgeCoverage(sequence uint64, final bool, ranges 
 	advanced := sequence > f.acked
 	if advanced {
 		f.acked = sequence
-		f.ackedPoint.Store(sequence)
 	}
 	if f.ackTrack != nil {
 		f.ackTrack.Advance(sequence)
