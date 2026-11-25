@@ -1,6 +1,7 @@
 package congestion
 
 import (
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -9,6 +10,7 @@ import (
 	quiccongestion "github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/monotime"
 
+	"github.com/bojieli/queqiao/internal/lossmodel"
 	"github.com/bojieli/queqiao/internal/pathmodel"
 )
 
@@ -83,11 +85,24 @@ type PathController struct {
 	// event that marks the sampler.
 	noDemandSince monotime.Time
 	opportunity   bool
+	// unusedTime is how much of the time since noDemandSince the path could
+	// have admitted a packet -- window open and balance covering one --
+	// accrued up to accruedAt. Time window-blocked or repaying debt is not
+	// unused.
+	unusedTime time.Duration
+	accruedAt  monotime.Time
 	// clock reads the time of a demand change, which carries none. It is
 	// monotime.Now; a simulation substitutes its own.
 	clock func() monotime.Time
 	// flightGauge mirrors flight for telemetry readers.
 	flightGauge atomic.Int64
+	// datagrams is the loss estimator over datagram-bearing samples only,
+	// for the coded path's parity (§9); the law's is path-wide.
+	// datagramBurst publishes its burst factor (math.Float64bits), zero
+	// until datagramsSeen is enough to say.
+	datagrams     *lossmodel.Estimator
+	datagramsSeen uint64
+	datagramBurst atomic.Uint64
 
 	// Scratch for the law's batches.
 	acked []quiccongestion.AckedPacketInfo
@@ -121,6 +136,8 @@ type fateRecord struct {
 	key  packetKey
 	sent monotime.Time
 	fate fate
+	// datagram says the packet carried a DATAGRAM frame.
+	datagram bool
 }
 
 type heldLoss struct {
@@ -189,6 +206,7 @@ func NewPathController(initialPacketSize quiccongestion.ByteCount, path pathmode
 		maxPacket: law.inner.maxDatagramSize,
 		created:   time.Now(),
 		clock:     monotime.Now,
+		datagrams: lossmodel.New(lossmodel.Config{}),
 	}
 	law.SetRTTStatsProvider(&c.rtt)
 	law.inner.appLimitedBy = c.appLimited
@@ -198,13 +216,36 @@ func NewPathController(initialPacketSize quiccongestion.ByteCount, path pathmode
 // unused says whether the path, without demand since noDemandSince, has had
 // an admission opportunity of at least one packet time by now: the window
 // open for a packet, and the balance accrued over that time.
-func (c *PathController) unused(now monotime.Time) bool {
+func (c *PathController) unused() bool {
+	return !c.noDemandSince.IsZero() && c.unusedTime >= c.packetTime(c.maxPacket)
+}
+
+// accrue adds to unusedTime the part of [accruedAt, now] in which, with no
+// demand, an ordinary admission would have succeeded. The window and flight
+// change only at events, so they are as they were at accruedAt; the balance
+// refills continuously and covers a packet from a computable time. It is
+// called at every event before the event changes anything.
+func (c *PathController) accrue(now monotime.Time) {
 	if c.noDemandSince.IsZero() {
-		return false
+		c.accruedAt = now
+		return
 	}
-	return now.Sub(c.noDemandSince) >= c.packetTime(c.maxPacket) &&
-		c.flight+c.maxPacket <= c.law.GetCongestionWindow() &&
-		c.law.pacer.budget(now) >= c.maxPacket
+	from := c.accruedAt
+	if from.Before(c.noDemandSince) {
+		from = c.noDemandSince
+	}
+	if now.After(from) && c.flight+c.maxPacket <= c.law.GetCongestionWindow() {
+		start := from
+		if fit := c.law.pacer.timeUntilBudget(c.maxPacket); !fit.IsZero() && fit.After(start) {
+			start = fit
+		}
+		if now.After(start) {
+			c.unusedTime += now.Sub(start)
+		}
+	}
+	if now.After(c.accruedAt) {
+		c.accruedAt = now
+	}
 }
 
 // appLimited is the law's application-limited marker under a path
@@ -215,9 +256,26 @@ func (c *PathController) unused(now monotime.Time) bool {
 // not either. A sender blocked on peer flow control or a full send queue
 // has no eligible demand, and is.
 func (c *PathController) appLimited() bool {
-	o := c.opportunity || c.unused(c.now)
+	o := c.opportunity || c.unused()
 	c.opportunity = false
 	return o
+}
+
+// pathDatagramEvidence is how many datagram-bearing samples must have
+// resolved before their own burst statistic replaces the path-wide one.
+const pathDatagramEvidence = 200
+
+// DatagramBurstFactor is the burst factor of the loss of datagram-bearing
+// packets, measured over adjacent datagram-bearing samples, and false until
+// enough of them have resolved. The coded path sizes its parity from it: on
+// a path shared with stream traffic, the path-wide statistic is dominated by
+// packets whose loss pattern is not the datagrams'.
+func (c *PathController) DatagramBurstFactor() (float64, bool) {
+	bits := c.datagramBurst.Load()
+	if bits == 0 {
+		return 0, false
+	}
+	return math.Float64frombits(bits), true
 }
 
 // Attach returns a new attachment of this controller, to be installed on one
@@ -402,9 +460,26 @@ func (c *PathController) advance(now monotime.Time) {
 		default:
 			c.law.estimator.Break()
 		}
+		// The datagram statistic (§4.2) counts a transition only between
+		// adjacent records that both carried a datagram: anything else
+		// between them breaks the run.
+		switch {
+		case !r.datagram || (r.fate != fateDelivered && r.fate != fateLost):
+			c.datagrams.Break()
+		default:
+			c.datagrams.ObserveOutcome(r.fate == fateDelivered)
+			c.datagramsSeen++
+		}
 		c.ring[0] = fateRecord{}
 		c.ring = c.ring[1:]
 		c.ringBase++
+	}
+	if c.datagramsSeen >= pathDatagramEvidence {
+		b := c.datagrams.Snapshot().BurstFactor
+		if b < 1 {
+			b = 1
+		}
+		c.datagramBurst.Store(math.Float64bits(b))
 	}
 	for len(c.lostHeld) > 0 {
 		h := c.lostHeld[0]
@@ -448,19 +523,22 @@ func (c *PathController) setGauge(a *PathAttachment, inFlight quiccongestion.Byt
 }
 
 // noteDemand tracks intervals in which the path has no eligible demand.
+// Only ordinary work counts: EXEMPT obligations (a due ACK, a path probe)
+// are not demand for a permit, and must not interrupt an idle interval.
 func (c *PathController) noteDemand(union quiccongestion.Demand, now monotime.Time) {
 	any := false
-	for _, e := range union.Eligible {
-		any = any || e
+	for _, cl := range scheduledClasses {
+		any = any || union.Eligible[cl]
 	}
+	c.accrue(now)
 	switch {
 	case any && !c.noDemandSince.IsZero():
-		if c.unused(now) {
+		if c.unused() {
 			c.opportunity = true
 		}
-		c.noDemandSince = 0
+		c.noDemandSince, c.unusedTime = 0, 0
 	case !any && c.noDemandSince.IsZero():
-		c.noDemandSince = now
+		c.noDemandSince, c.accruedAt, c.unusedTime = now, now, 0
 	}
 }
 
@@ -588,6 +666,7 @@ func (c *PathController) packetTime(n quiccongestion.ByteCount) time.Duration {
 
 func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes quiccongestion.ByteCount) (quiccongestion.Permit, []func()) {
 	now = c.clamp(now)
+	c.accrue(now)
 	c.advance(now)
 	var wakes []func()
 
@@ -741,6 +820,7 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 
 func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []func() {
 	now := c.clamp(s.Time)
+	c.accrue(now)
 	var wakes []func()
 	before := c.flight
 	c.setGauge(a, s.InFlight)
@@ -752,7 +832,9 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 	if s.Exempt {
 		c.stats.exemptBytes.Add(byteTotal(s.Bytes))
 	}
-	if s.Kind == quiccongestion.KindPTOProbe {
+	if s.Kind == quiccongestion.KindPTOProbe && a.progress == nil {
+		// Without the transport's own progress export, PTO probes sent
+		// since the last acknowledgement stand in for its expiry count.
 		a.ptoSinceProgress++
 		if !a.probing && a.ptoSinceProgress >= pathProbingPTOProbes {
 			c.demote(a)
@@ -769,7 +851,7 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 		pseq := c.nextPseq
 		c.nextPseq++
 		key := packetKey{space: s.Space, number: s.Number}
-		c.ring = append(c.ring, fateRecord{att: a, key: key, sent: now})
+		c.ring = append(c.ring, fateRecord{att: a, key: key, sent: now, datagram: s.HasDatagram})
 		a.pkts[key] = sampleRef{pseq: pseq, bytes: s.Bytes}
 		c.stats.samples.Add(1)
 		// The sampler's pre-send flight is the path's before this packet.
@@ -818,6 +900,9 @@ func (c *PathController) promote(a *PathAttachment) {
 
 func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent) []func() {
 	now := c.clamp(ev.Time)
+	// What the path could have sent until now is judged on the state before
+	// this event changes it.
+	c.accrue(now)
 	// Deadlines are enforced before outcomes are accepted, so an
 	// acknowledgement past the horizon is not credited merely because no
 	// other callback came first.
@@ -905,7 +990,7 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		c.lost = append(c.lost, quiccongestion.LostPacketInfo{PacketNumber: ref.pseq, BytesLost: ref.bytes})
 		resolved += ref.bytes
 	}
-	if progress {
+	if progress && a.progress == nil {
 		a.ptoSinceProgress = 0
 		c.promote(a)
 	}
@@ -940,6 +1025,7 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 
 func (c *PathController) discarded(a *PathAttachment, now monotime.Time, inFlight quiccongestion.ByteCount, refs []quiccongestion.PacketRef) []func() {
 	now = c.clamp(now)
+	c.accrue(now)
 	before := c.flight
 	c.setGauge(a, inFlight)
 	for _, r := range refs {
@@ -988,6 +1074,10 @@ type PathAttachment struct {
 	// it sends first; zero while nobody has deferred to it since it last
 	// sent.
 	claimDeadline monotime.Time
+	// progress reads the connection's transport progress; progressEpoch is
+	// the epoch last seen.
+	progress      func() TransportProgress
+	progressEpoch uint64
 	// pacingBlocked says its last refusal was for the balance.
 	pacingBlocked bool
 	// unable says it asked and could not use the path's opportunity for a
@@ -1121,42 +1211,57 @@ func (a *PathAttachment) OnAttach(now monotime.Time, inFlight, maxPacket quiccon
 }
 
 func (a *PathAttachment) OnDemand(d quiccongestion.Demand) {
+	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
+	early := c.applyProgress(a, tp)
 	wakes := c.setDemand(a, d)
+	wakes = append(wakes, early...)
 	c.mu.Unlock()
 	runWakes(wakes)
 }
 
 func (a *PathAttachment) Admit(now monotime.Time, maxBytes quiccongestion.ByteCount) quiccongestion.Permit {
+	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
+	early := c.applyProgress(a, tp)
 	p, wakes := c.admit(a, now, maxBytes)
+	wakes = append(wakes, early...)
 	c.mu.Unlock()
 	runWakes(wakes)
 	return p
 }
 
 func (a *PathAttachment) OnSent(s quiccongestion.SentPacket) {
+	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
+	early := c.applyProgress(a, tp)
 	wakes := c.sent(a, s)
+	wakes = append(wakes, early...)
 	c.mu.Unlock()
 	runWakes(wakes)
 }
 
 func (a *PathAttachment) OnAckEvent(ev quiccongestion.AckEvent) {
+	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
+	early := c.applyProgress(a, tp)
 	wakes := c.ackEvent(a, ev)
+	wakes = append(wakes, early...)
 	c.mu.Unlock()
 	runWakes(wakes)
 }
 
 func (a *PathAttachment) OnDiscarded(now monotime.Time, inFlight quiccongestion.ByteCount, refs []quiccongestion.PacketRef, _ bool, _ quiccongestion.DiscardReason) {
+	tp := a.readProgress()
 	c := a.ctl.Load()
 	c.mu.Lock()
+	early := c.applyProgress(a, tp)
 	wakes := c.discarded(a, now, inFlight, refs)
+	wakes = append(wakes, early...)
 	c.mu.Unlock()
 	runWakes(wakes)
 }
@@ -1190,6 +1295,54 @@ func (a *PathAttachment) OnDetach(now monotime.Time) {
 	wakes := c.detach(a, now)
 	c.mu.Unlock()
 	runWakes(wakes)
+}
+
+// TransportProgress is a connection's published transport progress: an
+// epoch that moves whenever an ack-eliciting application packet is newly
+// acknowledged, and the probe timeouts that expired since it last moved.
+type TransportProgress struct {
+	Epoch       uint64
+	PTOExpiries uint32
+}
+
+// pathProbingPTOExpiries is k_s (§10.2): the probe timeouts without transport
+// progress after which an attachment is PROBING.
+const pathProbingPTOExpiries = 2
+
+// SetTransportProgress gives the attachment its connection's progress
+// export. With it, PROBING follows the transport's own evidence -- which
+// also sees a late acknowledgement of a packet retired for a PTO probe,
+// although no packet event reports one -- rather than being inferred from
+// packet callbacks. It must be called before installation.
+func (a *PathAttachment) SetTransportProgress(read func() TransportProgress) { a.progress = read }
+
+func (a *PathAttachment) readProgress() (tp TransportProgress) {
+	if a.progress != nil {
+		tp = a.progress()
+	}
+	return tp
+}
+
+// applyProgress moves the attachment between COUNTED and PROBING on its
+// transport's progress. It is called, with a fresh reading, at every
+// callback of the connection's run loop.
+func (c *PathController) applyProgress(a *PathAttachment, tp TransportProgress) []func() {
+	if a.progress == nil {
+		return nil
+	}
+	if tp.Epoch != a.progressEpoch {
+		a.progressEpoch = tp.Epoch
+		c.promote(a)
+		return nil
+	}
+	if !a.probing && tp.PTOExpiries >= pathProbingPTOExpiries {
+		before := c.flight
+		c.demote(a)
+		if c.flight < before {
+			return c.collectBlocked(a, nil)
+		}
+	}
+	return nil
 }
 
 // SetProbing sets the attachment's state from its endpoint's own evidence of

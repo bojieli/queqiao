@@ -136,6 +136,14 @@ type Config struct {
 	Path pathmodel.Model
 	// Pending bounds the frames queued for sending before Send blocks.
 	Pending int
+	// SourceRate sizes the window from this path's own registered source
+	// bytes per round trip, repairs excluded, instead of from Path's Share
+	// (design §9). Under congestion=path there is no share: the model's
+	// figure describes a hypothetical joining member, and a sparse coded
+	// lane beside a busy bulk connection would size its window from
+	// throughput it cannot use. Until a round trip of sending has been
+	// measured the cold-start prior stands.
+	SourceRate bool
 	// tailDefer replaces the deferral Path.tailDefer derives from the round
 	// trip. It is unexported because only tests need it: telling a drain from
 	// a pause by wall clock needs a deferral that a loaded runner's timer
@@ -223,6 +231,10 @@ type Path struct {
 	// would have this path answer a non-conforming sender by buying more
 	// parity for a channel that is not erasing anything.
 	malformed atomic.Uint64
+
+	// source measures the source bytes this path has had accepted per
+	// round trip, for SourceRate.
+	source sourceMeter
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -799,7 +811,10 @@ func (p *Path) sendSource(esi uint32, vector []byte, tracks []*frameTrack) error
 	binary.BigEndian.PutUint32(d[5:], esi)
 	copy(d[sourceHeader:], vector)
 	if len(tracks) == 0 {
-		_, err := p.put(d)
+		sent, err := p.put(d)
+		if sent {
+			p.source.add(len(d), time.Now(), p.roundTrip())
+		}
 		return err
 	}
 	tagged, ok := p.carrier.(TaggedCarrier)
@@ -811,6 +826,7 @@ func (p *Path) sendSource(esi uint32, vector []byte, tracks []*frameTrack) error
 			p.abandon(tracks...)
 			return err
 		}
+		p.source.add(len(d), time.Now(), p.roundTrip())
 		p.registerUntagged(tracks)
 		return nil
 	}
@@ -823,6 +839,8 @@ func (p *Path) sendSource(esi uint32, vector []byte, tracks []*frameTrack) error
 	if !sent {
 		// Refused, so the carrier will never report on it.
 		p.onTag(tag, false)
+	} else {
+		p.source.add(len(d), time.Now(), p.roundTrip())
 	}
 	return err
 }
@@ -1228,6 +1246,12 @@ func (p *Path) params() fec.Params {
 
 // rate is the sending rate the window is sized against.
 func (p *Path) rate() float64 {
+	if p.cfg.SourceRate {
+		if r := p.source.rate(time.Now(), p.roundTrip()); r > 0 {
+			return r
+		}
+		return float64(p.symbolBytes()) * 64 / p.roundTrip().Seconds()
+	}
 	if p.cfg.Path != nil {
 		if share := p.cfg.Path.Current().Share; share > 0 {
 			return share
@@ -1393,4 +1417,43 @@ func (p *Path) Close() error {
 	err := p.carrier.Close()
 	p.wg.Wait()
 	return err
+}
+
+// sourceMeter is a path's source bytes per second, measured over windows of
+// one round trip: the rate of the last full window, or, once the current
+// window has run a round trip, of that one. Idle time counts, so a sparse
+// lane measures a sparse rate.
+type sourceMeter struct {
+	mu    sync.Mutex
+	start time.Time
+	bytes int
+	last  float64
+}
+
+func (m *sourceMeter) roll(now time.Time, rtt time.Duration) {
+	if m.start.IsZero() {
+		m.start = now
+		return
+	}
+	if elapsed := now.Sub(m.start); elapsed >= rtt && elapsed > 0 {
+		m.last = float64(m.bytes) / elapsed.Seconds()
+		m.start, m.bytes = now, 0
+	}
+}
+
+func (m *sourceMeter) add(n int, now time.Time, rtt time.Duration) {
+	m.mu.Lock()
+	m.roll(now, rtt)
+	m.bytes += n
+	m.mu.Unlock()
+}
+
+func (m *sourceMeter) rate(now time.Time, rtt time.Duration) float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.start.IsZero() {
+		return 0
+	}
+	m.roll(now, rtt)
+	return m.last
 }

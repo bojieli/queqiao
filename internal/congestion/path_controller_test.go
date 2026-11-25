@@ -895,3 +895,151 @@ func TestPathRTTIgnoresThePeersAckDelay(t *testing.T) {
 		t.Fatalf("the path's smoothed RTT is %v after a 300 ms raw sample whose corrected value is 100 ms", srtt)
 	}
 }
+
+// sendClass registers one ordinary packet carrying bytes of class.
+func (p *pcConn) sendClass(now monotime.Time, bytes quiccongestion.ByteCount, class quiccongestion.SendClass) {
+	n := p.next
+	p.next++
+	p.inFlight += bytes
+	p.sizes[n] = bytes
+	var cb [quiccongestion.NumSendClasses]quiccongestion.ByteCount
+	cb[class] = bytes
+	p.a.OnSent(quiccongestion.SentPacket{
+		Space: quiccongestion.SpaceApplication, Number: n, Bytes: bytes,
+		AckEliciting: true, InFlightCounted: true, Kind: quiccongestion.KindOrdinary,
+		ClassBytes: cb, InFlight: p.inFlight, Time: now,
+	})
+}
+
+// A stalled claimant -- PROBING, its probe window full, holding CONTROL
+// demand and credit -- beside a healthy sibling with two backlogged classes:
+// the sibling's classes are replenished between themselves, so neither
+// starves while the claimant stays stalled.
+func TestALapsedClaimStarvesNoClassOfTheSibling(t *testing.T) {
+	c := newPCController()
+	now := base()
+	stuck, healthy := attachPC(t, c, now), attachPC(t, c, now)
+	for range pathProbingPTOProbes {
+		stuck.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
+	}
+	stuck.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	healthy.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassInteractive: true, quiccongestion.ClassBulk: true}})
+	stuck.a.Admit(now, 1200) // refused for its own probe window
+	for step := 1; step <= 2000; step++ {
+		now = now.Add(time.Millisecond)
+		if step%100 == 0 {
+			var acked []quiccongestion.PacketNumber
+			for n := range healthy.sizes {
+				acked = append(acked, n)
+			}
+			healthy.event(now, acked, nil)
+			clear(healthy.sizes)
+		}
+		if p := healthy.a.Admit(now, 1200); p.OK {
+			healthy.sendClass(now, 1200, p.Turn)
+		}
+	}
+	served := c.Stats().Classes.Served
+	t.Logf("served: interactive %d, bulk %d", served[quiccongestion.ClassInteractive], served[quiccongestion.ClassBulk])
+	if served[quiccongestion.ClassBulk] == 0 || 4*served[quiccongestion.ClassBulk] < served[quiccongestion.ClassInteractive] {
+		t.Fatalf("BULK starved beside a stalled claimant: interactive %d, bulk %d", served[quiccongestion.ClassInteractive], served[quiccongestion.ClassBulk])
+	}
+}
+
+// Unused admission time is time in which a packet could have been sent. A
+// sender whose queue empties on a full window, and whose next ACK opens it,
+// had no opportunity in between and is not application-limited; nor does a
+// due ACK -- an EXEMPT obligation -- count as demand that hides one.
+func TestUnusedTimeCountsOnlyWhileAPacketCouldBeSent(t *testing.T) {
+	t.Run("window-blocked", func(t *testing.T) {
+		c := newPCController()
+		now := base()
+		a := attachPC(t, c, now)
+		window := c.law.GetCongestionWindow()
+		for a.inFlight+1200 <= window {
+			a.send(now, 1200)
+		}
+		a.a.OnDemand(quiccongestion.Demand{})
+		now = now.Add(300 * time.Millisecond) // within the fate horizon
+		a.event(now, numbers(0, 3), nil)
+		if c.law.inner.estimator.appLimited {
+			t.Fatal("a window-blocked interval was read as an unused opportunity")
+		}
+	})
+	t.Run("exempt only", func(t *testing.T) {
+		c := newPCController()
+		now := base()
+		a := attachPC(t, c, now)
+		a.send(now, 1200)
+		a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassExempt: true}})
+		now = now.Add(300 * time.Millisecond) // within the fate horizon
+		a.event(now, numbers(0, 1), nil)
+		if !c.law.inner.estimator.appLimited {
+			t.Fatal("EXEMPT obligations hid an interval with nothing to send")
+		}
+	})
+}
+
+// PROBING follows the transport's published progress: a late ACK of a
+// packet retired for a PTO probe produces no packet event, but moves the
+// progress epoch, and the attachment is COUNTED again at its next callback.
+func TestProbingFollowsTransportProgress(t *testing.T) {
+	c := newPCController()
+	now := base()
+	var tp TransportProgress
+	a := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+	a.a = c.Attach(nil, nil)
+	a.a.SetTransportProgress(func() TransportProgress { return tp })
+	a.a.OnAttach(now, 0, 1200, func() {})
+	a.send(now, 1200)
+	tp.PTOExpiries = pathProbingPTOExpiries
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	if c.Stats().Counted[a.a.epoch] {
+		t.Fatal("not PROBING after its transport reported probe timeouts without progress")
+	}
+	tp = TransportProgress{Epoch: 1}
+	a.a.Admit(now, 1200)
+	if !c.Stats().Counted[a.a.epoch] {
+		t.Fatal("still PROBING after its transport made progress")
+	}
+}
+
+// The coded reader's burst statistic is the datagrams' own: here the
+// datagram-bearing packets lose independently while another attachment's
+// stream packets lose in long runs, and only the path-wide figure shows it.
+func TestTheDatagramBurstStatisticIsTheDatagramsOwn(t *testing.T) {
+	c := newPCController()
+	now := base()
+	dg, bulk := attachPC(t, c, now), attachPC(t, c, now)
+	var dgAcked, dgLost, bulkAcked, bulkLost []quiccongestion.PacketNumber
+	for i := range 600 {
+		n := dg.next
+		dg.next++
+		dg.inFlight += 1200
+		dg.sizes[n] = 1200
+		dg.a.OnSent(quiccongestion.SentPacket{Space: quiccongestion.SpaceApplication, Number: n, Bytes: 1200,
+			AckEliciting: true, InFlightCounted: true, HasDatagram: true, InFlight: dg.inFlight, Time: now})
+		if i%5 == 4 {
+			dgLost = append(dgLost, n)
+		} else {
+			dgAcked = append(dgAcked, n)
+		}
+	}
+	for i := range 600 {
+		n := bulk.send(now, 1200)
+		if i%40 < 10 {
+			bulkLost = append(bulkLost, n)
+		} else {
+			bulkAcked = append(bulkAcked, n)
+		}
+	}
+	now = now.Add(100 * time.Millisecond)
+	dg.event(now, dgAcked, dgLost)
+	bulk.event(now, bulkAcked, bulkLost)
+	b, ok := c.DatagramBurstFactor()
+	path := c.law.estimator.Snapshot().BurstFactor
+	t.Logf("datagram burst %.2f (%v), path-wide %.2f", b, ok, path)
+	if !ok || b > 1.1 || path < 1.4 {
+		t.Fatalf("datagram burst %.2f (%v) against path-wide %.2f", b, ok, path)
+	}
+}

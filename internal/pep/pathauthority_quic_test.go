@@ -464,3 +464,31 @@ func TestTwoClientsInOneProcessHaveTheirOwnControllers(t *testing.T) {
 		t.Fatal("two clients' connections share one controller")
 	}
 }
+
+// Under congestion=path a connection's coded readers are wired to the
+// path controller: its window sizes from its own source rate, and its burst
+// statistic is the controller's datagram one once that has evidence (until
+// then, the model's).
+func TestCodedReadersFollowThePathController(t *testing.T) {
+	pathAuthorities.forget()
+	bed := newPathBed(t, pathsim.Config{OneWayDelay: time.Millisecond, Seed: 16})
+	conn, att := bed.dial()
+	waitAttached(t, att.Controller(), 1)
+	if !isPathScoped(conn) {
+		t.Fatal("a path-scoped connection is not marked for source-rate sizing")
+	}
+	m := pathModelOf(conn)
+	if m.datagramBurst.Load() == nil {
+		t.Fatal("the connection's model has no datagram burst source")
+	}
+	if _, ok := att.Controller().DatagramBurstFactor(); ok {
+		t.Fatal("a fresh controller claims datagram burst evidence")
+	}
+	if got, want := m.Current().BurstFactor, m.model.Load().Current().BurstFactor; got != want {
+		t.Fatalf("without datagram evidence the reader sees burst %.2f, want the model's %.2f", got, want)
+	}
+	plain := bed.clientTLS()
+	if isPathScoped(plain) {
+		t.Fatal("a connection with no path controller is marked path-scoped")
+	}
+}

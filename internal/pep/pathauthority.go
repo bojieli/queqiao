@@ -1,6 +1,7 @@
 package pep
 
 import (
+	"context"
 	"net"
 	"strconv"
 	"sync"
@@ -136,6 +137,16 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal strin
 		return c
 	}
 	attachment := controller.Attach(rekey, func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
+	// PROBING follows the transport's own progress export (§4.4, §10.2).
+	attachment.SetTransportProgress(func() wancongestion.TransportProgress {
+		st := conn.ConnectionStats()
+		return wancongestion.TransportProgress{Epoch: st.ProgressEpoch, PTOExpiries: st.PTOExpiriesSinceProgress}
+	})
+	// The coded path reads the datagrams' own burst statistic, from
+	// whichever controller the connection is attached to now, and sizes its
+	// window from its own source rate.
+	pathModelOf(conn).setDatagramBurst(func() (float64, bool) { return attachment.Controller().DatagramBurstFactor() })
+	markPathScoped(conn)
 	markClassScheduled(conn)
 	conn.SetCongestionControl(attachment)
 	return attachment
@@ -151,4 +162,19 @@ func provisionalPathController(conn *quic.Conn) wancongestion.TelemetryProvider 
 	markClassScheduled(conn)
 	conn.SetCongestionControl(sender)
 	return sender
+}
+
+// pathScopedConns holds the connections attached to a path controller. A
+// coded path on one sizes its window from its own source rate (§9).
+var pathScopedConns sync.Map // *quic.Conn -> struct{}
+
+func markPathScoped(conn *quic.Conn) {
+	if _, loaded := pathScopedConns.LoadOrStore(conn, struct{}{}); !loaded {
+		context.AfterFunc(conn.Context(), func() { pathScopedConns.Delete(conn) })
+	}
+}
+
+func isPathScoped(conn *quic.Conn) bool {
+	_, ok := pathScopedConns.Load(conn)
+	return ok
 }
