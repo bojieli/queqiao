@@ -139,6 +139,14 @@ func TestSparseStreamWritesAmidReverseAcksArriveOnTime(t *testing.T) {
 	for i := 0; i < downloads; i++ {
 		cfg.Seed = int64(5 + i)
 		client, server := reverseAckPair(t, cfg, upstream, downstream)
+		// Stream reads and writes do not watch ctx. Closing the connections
+		// when it expires turns a transfer that stopped making progress --
+		// the regression this test is for -- into a bounded failure.
+		stop := context.AfterFunc(ctx, func() {
+			_ = client.CloseWithError(0, "test deadline")
+			_ = server.CloseWithError(0, "test deadline")
+		})
+		defer stop()
 		bulk, err := server.OpenStreamSync(ctx)
 		if err != nil {
 			t.Fatal(err)

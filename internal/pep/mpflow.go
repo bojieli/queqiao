@@ -2874,6 +2874,7 @@ func (f *multipathFlow) reportGap() {
 		return
 	}
 	f.gapPending.Store(true)
+	f.markACKPending()
 	select {
 	case f.ackWake <- struct{}{}:
 	default:
@@ -2890,9 +2891,18 @@ func (f *multipathFlow) repeatACK(lane *mpLane) {
 		f.ackReplayLane.Store(lane)
 	}
 	f.ackRepeatPending.Store(true)
+	f.markACKPending()
 	select {
 	case f.ackWake <- struct{}{}:
 	default:
+	}
+}
+
+// markACKPending stamps when the oldest acknowledgement not yet written was
+// asked for, whichever way it was asked, for the lane trace.
+func (f *multipathFlow) markACKPending() {
+	if laneTrace.Load() {
+		f.ackPendingSinceNS.CompareAndSwap(0, time.Now().UnixNano())
 	}
 }
 
@@ -2901,9 +2911,7 @@ func (f *multipathFlow) scheduleACK(sequence uint64) {
 		return
 	}
 	f.acksSched.Add(1)
-	if laneTrace.Load() {
-		f.ackPendingSinceNS.CompareAndSwap(0, time.Now().UnixNano())
-	}
+	f.markACKPending()
 	for {
 		old := f.ackSequence.Load()
 		if sequence <= old || f.ackSequence.CompareAndSwap(old, sequence) {

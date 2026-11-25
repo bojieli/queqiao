@@ -1101,6 +1101,11 @@ func (s *Scheduler) wrote(laneID uint64, chunk *Chunk, reliable *bool) {
 		out.attempts[i].written = true
 		if reliable != nil {
 			out.attempts[i].reliable = *reliable
+			// The substrate the bytes actually went over, for Stats.Reissue,
+			// when this is the latest dispatch.
+			if i == len(out.attempts)-1 {
+				out.lastReliable = *reliable
+			}
 		}
 		s.releaseQueuedLocked(laneID, uint64(len(out.chunk.Data)))
 		s.ready.Broadcast()

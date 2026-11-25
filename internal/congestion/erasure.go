@@ -949,7 +949,11 @@ func (e *ErasureSender) maybeRearm() {
 	// Pending only while the lane stays uncapped: a sibling that starts
 	// again before the backoff ends takes the room back.
 	if share := e.share.Load(); share == 0 {
-		e.departed = e.departed || e.lastShare > 0
+		// A share the pool withheld because this lane is application-limited
+		// says nothing about its siblings, so it is not a departure.
+		if !e.appLimited {
+			e.departed = e.departed || e.lastShare > 0
+		}
 	} else {
 		e.departed, e.lastShare = false, share
 	}
