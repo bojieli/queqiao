@@ -146,14 +146,16 @@ func (l *flowLease) detach() *flowLease {
 	return moved
 }
 
-// principalConnections counts one principal's admitted data connections, and
-// whether one of them is the standby admitted past a full connection bound.
+// principalConnections counts one principal's admitted data connections that
+// hold a slot of the general bound, and names the standby admitted past it.
 type principalConnections struct {
-	connections int
-	standby     bool
+	general int
+	standby *connectionTicket
 }
 
 // connectionTicket is what an admitted QUIC connection gives back on close.
+// standby is read and changed only under the server's connMu: a standby
+// whose principal's last general connection closes inherits that slot.
 type connectionTicket struct {
 	principal string
 	standby   bool
@@ -182,14 +184,17 @@ func (s *Server) dataPrincipal(state tls.ConnectionState) (identity.Principal, b
 // data connection may have one more: that is the standby its client dials to
 // verify a path and move its flows, and refusing it is refusing the recovery
 // of connections this gateway already carries. The overflow is at most one
-// per principal holding a connection, so it is bounded by the general bound.
-func (s *Server) admitQUICConnection(state tls.ConnectionState) (connectionTicket, bool) {
+// per principal holding a general slot, so it is bounded by the general
+// bound, and a standby whose principal's last general connection closes
+// takes that slot over rather than letting it go.
+func (s *Server) admitQUICConnection(state tls.ConnectionState) (*connectionTicket, bool) {
 	principal, data := s.dataPrincipal(state)
 	key := ""
 	if data {
 		key = principalKey(principal)
 	}
 	if s.admitConnection() {
+		ticket := &connectionTicket{principal: key}
 		if key != "" {
 			s.connMu.Lock()
 			if s.principalConns == nil {
@@ -200,43 +205,66 @@ func (s *Server) admitQUICConnection(state tls.ConnectionState) (connectionTicke
 				p = &principalConnections{}
 				s.principalConns[key] = p
 			}
-			p.connections++
+			p.general++
 			s.connMu.Unlock()
 		}
-		return connectionTicket{principal: key}, true
+		return ticket, true
 	}
 	if key == "" || s.cfg.testReleasedAdmission {
-		return connectionTicket{}, false
+		return nil, false
 	}
 	if _, err := s.cfg.Credentials.Store.Authorize(principal, time.Now()); err != nil {
-		return connectionTicket{}, false
+		return nil, false
 	}
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 	p := s.principalConns[key]
-	if p == nil || p.connections == 0 || p.standby {
-		return connectionTicket{}, false
+	if p == nil || p.general == 0 || p.standby != nil {
+		return nil, false
 	}
-	p.connections++
-	p.standby = true
-	return connectionTicket{principal: key, standby: true}, true
+	ticket := &connectionTicket{principal: key, standby: true}
+	p.standby = ticket
+	return ticket, true
 }
 
-func (s *Server) releaseQUICConnection(ticket connectionTicket) {
+// isStandby reports whether a ticket is, at this moment, the overflow
+// standby rather than a holder of a general slot.
+func (s *Server) isStandby(ticket *connectionTicket) bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return ticket.standby
+}
+
+func (s *Server) releaseQUICConnection(ticket *connectionTicket) {
+	if ticket == nil {
+		return
+	}
+	releaseGeneral := true
 	if ticket.principal != "" {
 		s.connMu.Lock()
 		if p := s.principalConns[ticket.principal]; p != nil {
-			p.connections--
-			if ticket.standby {
-				p.standby = false
+			switch {
+			case ticket.standby:
+				p.standby = nil
+				releaseGeneral = false
+			default:
+				p.general--
+				if p.general == 0 && p.standby != nil {
+					// The standby outlives the connections it stood by:
+					// it now holds the general slot this one gives back.
+					p.standby.standby = false
+					p.standby = nil
+					p.general = 1
+					releaseGeneral = false
+				}
 			}
-			if p.connections <= 0 {
+			if p.general <= 0 && p.standby == nil {
 				delete(s.principalConns, ticket.principal)
 			}
 		}
 		s.connMu.Unlock()
 	}
-	if !ticket.standby {
+	if releaseGeneral {
 		s.releaseConnection()
 	}
 }

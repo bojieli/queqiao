@@ -768,9 +768,18 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	// place of either; this runs after the workers below have been joined.
 	retain := false
 	defer func() {
-		if live != nil && s.udpRelays.endLive(grant, live, udpConn, lease) {
-			s.cfg.Logger.Debug("UDP association relay handed to its replacement",
-				"relay", udpConn.LocalAddr().String())
+		if live != nil {
+			switch s.udpRelays.endLive(grant, live, udpConn, lease, resumable && retain) {
+			case liveHanded:
+				s.cfg.Logger.Debug("UDP association relay handed to its replacement",
+					"relay", udpConn.LocalAddr().String())
+				return
+			case liveParked:
+				s.cfg.Logger.Debug("UDP association relay retained for a replacement",
+					"relay", udpConn.LocalAddr().String(), "resumed", resumed)
+				return
+			}
+			_ = udpConn.Close()
 			return
 		}
 		if resumable && retain {

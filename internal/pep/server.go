@@ -738,7 +738,7 @@ func (s *Server) ServePacketConn(ctx context.Context, packetConn net.PacketConn)
 			s.cfg.Logger.Warn("remote QUIC connection limit reached")
 			continue
 		}
-		if ticket.standby {
+		if s.isStandby(ticket) {
 			s.cfg.Logger.Debug("remote QUIC standby connection admitted past the connection limit")
 		}
 		// Session admission is performed per QUIC stream in handleQUIC. Holding
@@ -749,7 +749,16 @@ func (s *Server) ServePacketConn(ctx context.Context, packetConn net.PacketConn)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer s.releaseQUICConnection(ticket)
+			// The ticket follows the connection, not the flows it carried:
+			// handleQUIC waits for every stream handler, and the handler of
+			// an OPEN runs for its flow's life, which continues on another
+			// connection once this one dies.
+			release := sync.OnceFunc(func() { s.releaseQUICConnection(ticket) })
+			defer release()
+			go func() {
+				<-conn.Context().Done()
+				release()
+			}()
 			s.handleQUIC(ctx, conn)
 		}()
 	}

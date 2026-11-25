@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -544,9 +545,77 @@ func TestAStandbyConnectionIsAdmittedBesideAPrincipalsConnections(t *testing.T) 
 	server.connMu.Lock()
 	defer server.connMu.Unlock()
 	for _, p := range server.principalConns {
-		if p.connections != 2 || !p.standby {
-			t.Fatalf("principal holds %d connections, standby %v; want 2 and true", p.connections, p.standby)
+		if p.general != 1 || p.standby == nil {
+			t.Fatalf("principal holds %d general connections, standby %v; want 1 and one", p.general, p.standby != nil)
 		}
+	}
+}
+
+// After a promotion the client's flows live on the standby and the old
+// connection is gone. The connection slot follows the connection, not the
+// flows it once carried, and the standby inherits the general slot, so the
+// next recovery can have a standby of its own: at MaxSessions=1 a flow can be
+// moved twice.
+func TestAFlowCanMoveToAStandbyTwiceAtTheConnectionLimit(t *testing.T) {
+	serverCredentials, clientCredentials := testCertificate(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	destination := admissionDestination(t, idleFlows)
+	server, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{Credentials: serverCredentials, MaxSessions: 1})
+	current, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := [16]byte{0x62}
+	if response, _, _, err := exchange(ctx, current, openFrame(t, sessionID, 5, destination)); err != nil || response.Header.Type != protocol.TypeOpenOK {
+		t.Fatalf("open answered %+v, %v", response.Header, err)
+	}
+	for move := uint64(1); move <= 2; move++ {
+		standby, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
+		if err != nil {
+			t.Fatalf("move %d: standby dial: %v", move, err)
+		}
+		if echo, err := probe(ctx, standby); err != nil || echo.Header.Type != protocol.TypeProbe {
+			t.Fatalf("move %d: standby probe answered %+v, %v", move, echo.Header, err)
+		}
+		// The old connection dies, and the flow rejoins on the standby. The
+		// JOIN is retried while the gateway has yet to see the old lane end.
+		_ = current.conn.CloseWithError(0, "promoted")
+		var fc *frameConn
+		var outer streamConn
+		for attempt := 0; ; attempt++ {
+			var joined protocol.Frame
+			joined, fc, outer, err = exchange(ctx, standby, joinFrame(sessionID, 5, move))
+			if err == nil && joined.Header.Type == protocol.TypeOpenOK {
+				break
+			}
+			if attempt == 20 || err != nil || resetCode(joined.Payload) != session.ResetFlowLimit {
+				t.Fatalf("move %d: JOIN answered %+v %q, %v", move, joined.Header, joined.Payload, err)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err := fc.Write(protocol.Frame{Header: protocol.Header{
+			Version: protocol.Version, Type: protocol.TypeData, SessionID: sessionID, FlowID: 5,
+			Sequence: (move - 1) * 4, Class: protocol.ClassInteractive,
+		}, Payload: []byte("move")}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readUntilData(fc, outer, 5*time.Second); err != nil {
+			t.Fatalf("move %d: flow carried nothing on its new connection: %v", move, err)
+		}
+		for deadline := time.Now().Add(5 * time.Second); ; {
+			server.connMu.Lock()
+			held := len(server.connections)
+			server.connMu.Unlock()
+			if held == 1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("move %d: %d general connection slots held with one connection alive", move, held)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		current = standby
 	}
 }
 
@@ -666,11 +735,13 @@ func TestALiveUDPRelayIsHandedToItsReplacement(t *testing.T) {
 	}
 }
 
-// The handoff itself, against the store's race: an association that ends at
-// the same moment its replacement claims it either hands the relay over or
-// parks it, never both and never neither.
-func TestALiveRelayIsEitherHandedOverOrParked(t *testing.T) {
-	for i := range 200 {
+// The handoff itself, against the store's race (§11.2). An association that
+// ends while its replacement claims it, whether it ends because it was
+// claimed or on its own, either hands the relay over or parks it with its
+// lease; the token stays claimable throughout, so the replacement gets the
+// relay and the slots in every interleaving, and the lease is released once.
+func TestALiveRelayIsAlwaysTakenOverWhateverTheInterleaving(t *testing.T) {
+	for i := range 400 {
 		store := newUDPRelayStore()
 		token, err := newUDPResumeToken()
 		if err != nil {
@@ -681,43 +752,76 @@ func TestALiveRelayIsEitherHandedOverOrParked(t *testing.T) {
 			t.Fatal(err)
 		}
 		lease := &flowLease{}
-		released := 0
-		lease.add(func() { released++ })
+		var released atomic.Int32
+		lease.add(func() { released.Add(1) })
 		stopped := make(chan struct{})
-		entry := store.publishLive(token, udpTestPrincipal, func() { close(stopped) })
+		var stopOnce sync.Once
+		entry := store.publishLive(token, udpTestPrincipal, func() { stopOnce.Do(func() { close(stopped) }) })
 		var wg sync.WaitGroup
-		var handed bool
+		var end liveEnd
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			// Even rounds: the owner ends because it was claimed. Odd
-			// rounds: it ends on its own, racing the claim.
+			// rounds: its lane failed and it ends on its own, racing the
+			// claim.
 			if i%2 == 0 {
 				<-stopped
 			}
-			handed = store.endLive(token, entry, relay, lease)
-			if !handed {
-				store.retain(token, udpTestPrincipal, relay)
-				lease.release()
-			}
+			end = store.endLive(token, entry, relay, lease, true)
+			lease.release()
 		}()
+		if i%4 == 1 {
+			wg.Wait()
+		}
 		got, moved := store.transfer(context.Background(), token[:], udpTestPrincipal, time.Second)
 		wg.Wait()
-		switch {
-		case got != nil && handed:
-			moved.release()
-		case got == nil && !handed:
-			if store.claim(token[:], udpTestPrincipal) == nil {
-				t.Fatal("relay neither handed over nor parked")
-			}
-		default:
-			t.Fatalf("handed=%v but transfer returned %v", handed, got != nil)
+		if got == nil {
+			t.Fatalf("round %d: the replacement got no relay (owner %v)", i, end)
 		}
-		if released != 1 {
-			t.Fatalf("lease released %d times, want 1", released)
+		if end == liveClosed {
+			t.Fatalf("round %d: the owner closed a relay its replacement holds", i)
+		}
+		if released.Load() != 0 {
+			t.Fatalf("round %d: the lease was released before the replacement ended", i)
+		}
+		moved.release()
+		if released.Load() != 1 {
+			t.Fatalf("round %d: lease released %d times, want 1", i, released.Load())
 		}
 		_ = relay.Close()
 		store.closeAll()
+	}
+}
+
+// A relay parked with a lease that nobody takes over releases the lease when
+// it expires.
+func TestAnUnclaimedParkedRelayReleasesItsLease(t *testing.T) {
+	store := newUDPRelayStoreWith(time.Millisecond, udpRelaysRetained)
+	token, err := newUDPResumeToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := &flowLease{}
+	var released atomic.Int32
+	lease.add(func() { released.Add(1) })
+	entry := store.publishLive(token, udpTestPrincipal, func() {})
+	if end := store.endLive(token, entry, relay, lease, true); end != liveParked {
+		t.Fatalf("owner end = %v, want parked", end)
+	}
+	lease.release()
+	for deadline := time.Now().Add(2 * time.Second); released.Load() == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("an expired parked relay kept its lease")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if released.Load() != 1 {
+		t.Fatalf("lease released %d times, want 1", released.Load())
 	}
 }
 
