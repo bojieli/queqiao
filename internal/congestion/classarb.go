@@ -88,8 +88,8 @@ func (a *ClassArbiter) OnDemand(d quiccongestion.Demand) {
 		if d.Eligible[c] && !a.demand[c] && a.held[c] > 0 && a.heldRound[c] == a.round {
 			// Back within the round it went idle in: it keeps what it had
 			// not spent of this round's allocation, and nothing more.
-			// Anything charged to it while idle (a PTO probe's
-			// retransmission) is taken off what it held.
+			// What was charged to it while idle (a PTO probe's
+			// retransmission) has already been taken off what it held.
 			a.deficit[c] += a.held[c]
 			a.held[c] = 0
 		} else if d.Eligible[c] && !a.demand[c] && a.deficit[c] >= 0 && a.credited[c] != a.round+1 {
@@ -142,8 +142,16 @@ func (a *ClassArbiter) OnSent(classBytes [quiccongestion.NumSendClasses]quiccong
 	a.mu.Lock()
 	for _, c := range scheduledClasses {
 		if b := int64(classBytes[c]); b > 0 {
-			a.deficit[c] -= b
 			a.served[c] += uint64(b)
+			if !a.demand[c] && a.heldRound[c] == a.round && a.held[c] > 0 {
+				// Charged while idle (a PTO probe's retransmission): the
+				// credit it held for this round pays first, so only an
+				// excess becomes debt that outlives the round.
+				use := min(a.held[c], b)
+				a.held[c] -= use
+				b -= use
+			}
+			a.deficit[c] -= b
 		}
 	}
 	a.normalize()

@@ -308,3 +308,29 @@ func TestClassArbiterIdleDebitComesOffHeldCredit(t *testing.T) {
 		t.Fatalf("CONTROL deficit %d after a 1000-byte idle charge against 500 held, want -500 or less", got)
 	}
 }
+
+// An idle class's retransmission is paid from the credit it held for the
+// round, so when the round ends before it returns, it comes back without a
+// debt it never ran up.
+func TestClassArbiterIdleChargeWithinHeldCreditLeavesNoDebtAcrossRounds(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	cb := demandOf(quiccongestion.ClassControl, quiccongestion.ClassBulk)
+	bulk := demandOf(quiccongestion.ClassBulk)
+	a.OnDemand(cb)
+	a.Permit(arbPacket)
+	spend := quiccongestion.ByteCount(a.Stats().Deficit[quiccongestion.ClassControl] - 500)
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassControl: spend})
+	a.OnDemand(bulk) // 500 held
+	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassControl: 300})
+	// BULK runs the round out and replenishment starts another.
+	for range 20 {
+		a.OnSent(simBuilder(a.Permit(arbPacket), bulk, 0))
+	}
+	a.OnDemand(cb)
+	if got := a.Stats().Deficit[quiccongestion.ClassControl]; got < 0 {
+		t.Fatalf("CONTROL returned with a %d-byte debt it never ran up", -got)
+	}
+	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassControl {
+		t.Fatalf("turn %v: the returning ACK waits behind BULK", p.Turn)
+	}
+}
