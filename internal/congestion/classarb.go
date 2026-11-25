@@ -167,12 +167,15 @@ func (a *ClassArbiter) normalize() {
 			rounds = need
 		}
 	}
+	a.round++
 	for _, c := range scheduledClasses {
 		if a.demand[c] {
 			a.deficit[c] += rounds * a.weights[c] * a.quantum
+			// This round's quantum is given: a demand toggle within the
+			// round earns no second one.
+			a.credited[c] = a.round + 1
 		}
 	}
-	a.round++
 }
 
 // ClassArbiterStats is what an arbiter has done.

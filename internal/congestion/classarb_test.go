@@ -242,3 +242,27 @@ func TestClassArbiterNewlyEligibleControlJoinsTheRound(t *testing.T) {
 		t.Fatalf("toggling demand raised CONTROL's credit from %d to %d", before, after)
 	}
 }
+
+// A demand toggle after a replenishment earns no second allocation in the
+// same round: bursty CONTROL against backlogged BULK still gets 4:1.
+func TestClassArbiterTogglesAfterReplenishmentKeepTheWeights(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	both := demandOf(quiccongestion.ClassControl, quiccongestion.ClassBulk)
+	bulk := demandOf(quiccongestion.ClassBulk)
+	a.OnDemand(both)
+	for range 5000 {
+		p := a.Permit(arbPacket)
+		a.OnSent(simBuilder(p, both, 0))
+		if a.Stats().Deficit[quiccongestion.ClassControl] <= 0 {
+			// CONTROL has spent its allocation; its queue empties and
+			// refills before BULK's turn.
+			a.OnDemand(bulk)
+			a.OnDemand(both)
+		}
+	}
+	s := a.Stats().Served
+	share := float64(s[quiccongestion.ClassBulk]) / float64(s[quiccongestion.ClassBulk]+s[quiccongestion.ClassControl])
+	if share < 0.19 {
+		t.Fatalf("BULK share %.3f under toggling CONTROL, want its weight 0.2", share)
+	}
+}
