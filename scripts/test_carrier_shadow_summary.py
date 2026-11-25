@@ -352,5 +352,41 @@ class CalibrationFollowUpTest(unittest.TestCase):
         ]
         self.assertAlmostEqual(summarize(client, gateway)["recovery_deadline"]["skew_s"]["max"], 10.0, places=3)
 
+    def test_a_resolved_incident_does_not_match_a_later_outage(self):
+        client = [
+            stall(9.0, 1, 1, 5),
+            rec(9.5, "carrier shadow state", endpoint="client", carrier_id=1, to="active", transport_epoch=6, **{"from": "suspect"}),
+            stall(12.0, 1, 1, 6),
+        ]
+        gateway = [rec(10.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=1, grace=45_000_000_000),
+                   rec(13.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=1)]
+        self.assertAlmostEqual(summarize(client, gateway)["recovery_deadline"]["skew_s"]["max"], -2.0, places=3)
+
+    def test_a_recovered_episode_line_is_progress_after_a_stall(self):
+        client = [
+            stall(10.0, 7, 4, 1, pto_since_progress=1),
+            rec(10.4, "carrier shadow episode", endpoint="client", carrier_id=4, max_pto=3, outcome="recovered", transport_epoch=2),
+        ]
+        report = summarize(client, [rec(30.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
+        self.assertEqual(report["stalls"]["client"]["outcomes"], {"carrier stayed live: design would not rescue": 1})
+        self.assertEqual(report["calibration"]["client"]["open_episodes_censored"], 0)
+
+    def test_a_lane_failure_is_evidence_of_an_open_episode(self):
+        client = [rec(3.0, "carrier shadow lane failed", endpoint="client", session_id=SESSION, flow_id=5, carrier_id=8,
+                      carrier_state="active", pto_since_progress=1, transport_epoch=4)]
+        report = summarize(client, [rec(9.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
+        self.assertEqual(report["calibration"]["client"]["open_episodes_censored"], 1)
+
+    def test_records_of_one_sample_keep_their_order(self):
+        # One sample ends an episode and finds a new one SUSPECT: same time,
+        # emitted in that order.
+        client = [
+            rec(5.0, "carrier shadow episode", endpoint="client", carrier_id=8, max_pto=2, outcome="recovered", transport_epoch=4, observed_unix_ms=5000),
+            rec(5.0, "carrier shadow state", endpoint="client", carrier_id=8, to="suspect", transport_epoch=4, pto_since_progress=2,
+                observed_unix_ms=5000, **{"from": "active"}),
+        ]
+        report = summarize(client, [rec(9.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
+        self.assertEqual(report["calibration"]["client"]["open_episodes_censored"], 1)
+
 if __name__ == "__main__":
     unittest.main()

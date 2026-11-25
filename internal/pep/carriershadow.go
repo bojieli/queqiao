@@ -636,7 +636,8 @@ func (o *carrierShadow) emit(c *shadowCarrier, event carrierEvent, srtt time.Dur
 		// One-expiry episodes are routine tail probes; they are counted in
 		// the metrics and in the carrier's closing summary, not logged.
 		if event.PTOs >= 2 {
-			fields := []any{"endpoint", o.role, "carrier_id", c.id, "max_pto", event.PTOs, "outcome", event.Outcome, "transport_epoch", event.Epoch}
+			fields := []any{"endpoint", o.role, "carrier_id", c.id, "observed_unix_ms", event.At.UnixMilli(),
+				"max_pto", event.PTOs, "outcome", event.Outcome, "transport_epoch", event.Epoch}
 			if event.PeakLowerBound {
 				fields = append(fields, "max_pto_lower_bound", true)
 			}
@@ -874,7 +875,7 @@ func (o *carrierShadow) noteLaneFailure(f *multipathFlow, lane *mpLane, err erro
 	o.logger.Info("carrier shadow lane failed", append(o.flowFields(f),
 		"lane_id", lane.id, "carrier_id", obs.id, "carrier_state", carrierStateLabel(obs),
 		"observed_unix_ms", observedMillis(obs),
-		"pto_since_progress", obs.progress.PTOExpiries, "since_transport_progress", obs.since,
+		"pto_since_progress", obs.progress.PTOExpiries, "since_transport_progress", obs.since, "transport_epoch", obs.epoch,
 		"design_remedy", remedy.String(), "healthy_lanes", len(f.healthyLanes()), "error", fmt.Sprint(err))...)
 }
 
@@ -913,12 +914,14 @@ func (o *carrierShadow) noteRescue(ctx context.Context, f *multipathFlow) contex
 
 // noteRescueRequest records the client's watchdog handing a rescue request
 // to the lane manager: one per request actually queued, which a stall
-// episode may make several of, or none while a round is in flight.
-func (o *carrierShadow) noteRescueRequest(f *multipathFlow) {
+// episode may make several of, or none while a round is in flight. at is
+// taken before the request was queued, so it orders before any round that
+// answers it.
+func (o *carrierShadow) noteRescueRequest(f *multipathFlow, at time.Time) {
 	if o == nil || o.role != carrierShadowClient {
 		return
 	}
-	o.logger.Info("carrier shadow rescue requested", o.flowFields(f)...)
+	o.logger.Info("carrier shadow rescue requested", append(o.flowFields(f), "observed_unix_ms", at.UnixMilli())...)
 }
 
 // noteJoinArrival records a JOIN reaching the gateway's admission, with

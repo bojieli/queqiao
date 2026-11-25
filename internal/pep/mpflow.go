@@ -2201,10 +2201,11 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 				// in this episode so the peer can replace the current lane.
 				f.suspectDataLanes()
 			}
+			requested := time.Now() // before the manager can answer it
 			select {
 			case f.stallSignal <- struct{}{}:
 				lastSignal = now
-				f.carrierShadow.noteRescueRequest(f)
+				f.carrierShadow.noteRescueRequest(f, requested)
 			default:
 			}
 		}
