@@ -248,9 +248,6 @@ type attempt struct {
 type outstanding struct {
 	chunk    *Chunk
 	attempts []attempt
-	// lastReliable is the substrate of the most recent dispatch, for
-	// Stats.Reissue.
-	lastReliable bool
 }
 
 // ReissueCause is why a chunk was offered again.
@@ -547,7 +544,6 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		out.attempts = append(out.attempts, attempt{
 			id: id, lane: laneID, deadline: deadline, reliable: reliable,
 		})
-		out.lastReliable = reliable
 		chunk.urgent = false
 		s.laneLoad[laneID]++
 		s.laneBytes[laneID] += uint64(len(chunk.Data))
@@ -660,6 +656,12 @@ func (s *Scheduler) Fail(laneID uint64, chunk *Chunk) {
 	if !ok {
 		return
 	}
+	failedReliable := false
+	for _, a := range out.attempts {
+		if a.id == chunk.attempt && a.lane == laneID {
+			failedReliable = a.reliable
+		}
+	}
 	if !s.dropAttemptLocked(out, laneID, chunk.attempt) {
 		// This callback belongs to an unreliable attempt already retired by
 		// timeout or receiver evidence. It must not fail its replacement merely
@@ -672,7 +674,7 @@ func (s *Scheduler) Fail(laneID uint64, chunk *Chunk) {
 		// attempt ended. Keeping that distinction makes a replacement a retry,
 		// preserves late logical completion, and avoids briefly treating the
 		// same retained bytes as new source work.
-		s.requeueLocked(out, ReissueLane)
+		s.requeueLocked(out, ReissueLane, failedReliable)
 	}
 	s.ready.Broadcast()
 }
@@ -691,9 +693,10 @@ func (s *Scheduler) RetireLaneFor(laneID uint64, cause ReissueCause) {
 			continue
 		}
 		s.stats.LaneFailures++
+		retiredReliable := laneHasReliableAttempt(out, laneID)
 		s.dropLaneAttemptsLocked(out, laneID)
 		if len(out.attempts) == 0 {
-			s.requeueLocked(out, cause)
+			s.requeueLocked(out, cause, retiredReliable)
 		}
 	}
 	delete(s.laneLoad, laneID)
@@ -808,12 +811,14 @@ func (s *Scheduler) retransmitAfter() time.Duration {
 
 // requeueLocked returns a chunk to the ready set in offset order, so the
 // receiver's contiguous point is always what the next free lane works on.
-func (s *Scheduler) requeueLocked(out *outstanding, cause ReissueCause) {
+// It records why, and whether the attempt being replaced went over a reliable
+// substrate (Stats.Reissue).
+func (s *Scheduler) requeueLocked(out *outstanding, cause ReissueCause, fromReliable bool) {
 	chunk := out.chunk
 	if s.pendingHas(chunk.Offset) {
 		return
 	}
-	chunk.requeuedFor, chunk.requeuedFromReliable = cause, out.lastReliable
+	chunk.requeuedFor, chunk.requeuedFromReliable = cause, fromReliable
 	// A chunk only returns to the ready set because a lane stalled or failed,
 	// which makes it the work most likely to be blocking delivery.
 	chunk.urgent = true
@@ -876,7 +881,9 @@ func (s *Scheduler) ReissueUnacknowledgedBelow(offset uint64) int {
 			// callback will make it eligible for the normal timed retry.
 			continue
 		}
-		s.requeueLocked(out, ReissueGap)
+		// Only chunks with no reliable attempt are re-offered here: what
+		// was lost went over a coded substrate.
+		s.requeueLocked(out, ReissueGap, false)
 		reissued++
 	}
 	if reissued > 0 {
@@ -959,7 +966,7 @@ func (s *Scheduler) ReissueExpired() int {
 		if len(out.attempts) > 0 {
 			out.attempts[0].deadline = now.Add(after)
 		}
-		s.requeueLocked(out, ReissueTimer)
+		s.requeueLocked(out, ReissueTimer, reliable)
 		reissued++
 	}
 	if reissued > 0 {
@@ -1101,11 +1108,6 @@ func (s *Scheduler) wrote(laneID uint64, chunk *Chunk, reliable *bool) {
 		out.attempts[i].written = true
 		if reliable != nil {
 			out.attempts[i].reliable = *reliable
-			// The substrate the bytes actually went over, for Stats.Reissue,
-			// when this is the latest dispatch.
-			if i == len(out.attempts)-1 {
-				out.lastReliable = *reliable
-			}
 		}
 		s.releaseQueuedLocked(laneID, uint64(len(out.chunk.Data)))
 		s.ready.Broadcast()

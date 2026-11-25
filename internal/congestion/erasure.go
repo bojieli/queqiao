@@ -167,6 +167,13 @@ type ErasureSender struct {
 	heldSends                    atomic.Uint64
 	uncappedPacing               atomic.Uint64
 	denied                       bool
+	// releaseAt is when the pacer would next have allowed a datagram, as of
+	// its last refusal, and windowDenied and lastAckAt the same evidence for
+	// the window: a refusal counts against the send that follows it only if
+	// that send is the one it held back (see heldBack).
+	releaseAt    monotime.Time
+	windowDenied bool
+	lastAckAt    monotime.Time
 	rampFloor                    float64
 	rampFloorN                   float64
 	rampRound                    uint64
@@ -1389,8 +1396,28 @@ func (e *ErasureSender) HasPacingBudget(now monotime.Time) bool {
 	if !ok {
 		e.pacingDenials.Add(1)
 		e.denied = true
+		e.releaseAt = e.pacer.timeUntilSend()
 	}
 	return ok
+}
+
+// heldSlack is how late after the moment a refusal held it to, a send still
+// counts as the one held: quic-go sends at its pacing deadline, or right
+// after the acknowledgement that opened the window, give or take a timer's
+// resolution.
+const heldSlack = 5 * time.Millisecond
+
+// heldBack reports whether an ack-eliciting send at sentTime is one a refused
+// poll held back: the first send after a pacing refusal, at the pacer's
+// release, or the first after a window refusal, right after the
+// acknowledgement that opened it. A send that comes later had the budget
+// waiting for it; the refusal was after the last packet of something, and
+// the application had nothing more until now.
+func (e *ErasureSender) heldBack(sentTime monotime.Time) bool {
+	paced := e.denied && e.releaseAt != 0 && !sentTime.After(e.releaseAt.Add(heldSlack))
+	windowed := e.windowDenied && e.lastAckAt != 0 && !sentTime.After(e.lastAckAt.Add(heldSlack))
+	e.denied, e.windowDenied, e.releaseAt = false, false, 0
+	return paced || windowed
 }
 
 func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
@@ -1405,9 +1432,8 @@ func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 	// acknowledgements -- stream data, which must wait for a full datagram's
 	// budget -- spent seconds behind them.
 	if retransmittable {
-		if e.denied {
+		if e.heldBack(sentTime) {
 			e.heldSends.Add(1)
-			e.denied = false
 			e.limitHeld = true
 		}
 		if bytesInFlight > e.limitPeak {
@@ -1431,7 +1457,7 @@ func (e *ErasureSender) CanSend(bytesInFlight quiccongestion.ByteCount) bool {
 	ok := bytesInFlight < e.GetCongestionWindow()
 	if !ok {
 		e.windowDenials.Add(1)
-		e.denied = true
+		e.windowDenied = true
 	}
 	return ok
 }
@@ -1480,6 +1506,7 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	// fictitious gap. Retaining the scratch slice avoids allocating on every
 	// acknowledgement.
 	e.outcomes = e.outcomes[:0]
+	e.lastAckAt = eventTime
 	var ackedBytes uint64
 	for _, packet := range acked {
 		ackedBytes += uint64(packet.BytesAcked)

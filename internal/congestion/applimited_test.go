@@ -13,10 +13,12 @@ import (
 // closeLimitRound plays one round of sends at inFlight, with or without a
 // refused poll ahead of them, and closes it.
 func closeLimitRound(e *ErasureSender, inFlight quiccongestion.ByteCount, held bool) {
+	now := monotime.Now()
 	if held {
-		e.denied = true
+		// Refused, and released now: the send below is the one it held.
+		e.denied, e.releaseAt = true, now
 	}
-	e.OnPacketSent(monotime.Now(), inFlight, quiccongestion.PacketNumber(e.inner.round+1), 1200, true)
+	e.OnPacketSent(now, inFlight, quiccongestion.PacketNumber(e.inner.round+1), 1200, true)
 	e.inner.round++
 	e.judgeAppLimited()
 }
@@ -71,4 +73,38 @@ func (e *ErasureSender) allowanceForTest() float64 {
 		allowed = rate
 	}
 	return allowed
+}
+
+// A refusal after the last packet of a request is not evidence against the
+// next request, which finds the budget waiting for it.
+func TestARefusalBeforeAnIdleGapHoldsNothingBack(t *testing.T) {
+	e := NewErasureSender(1200)
+	e.SetRTTStatsProvider(&fixedRTT{min: 200 * time.Millisecond, smoothed: 200 * time.Millisecond})
+	now := base()
+	var number quiccongestion.PacketNumber
+	for e.HasPacingBudget(now) {
+		number++
+		e.OnPacketSent(now, 1200, number, 1200, true)
+	}
+	// Refused; the application then has nothing to send for a second.
+	if e.HasPacingBudget(now) {
+		t.Fatal("setup: the budget should be spent")
+	}
+	number++
+	e.OnPacketSent(now.Add(time.Second), 1200, number, 1200, true)
+	if got := e.Telemetry().HeldSends; got != 0 {
+		t.Fatalf("a send a second after the refusal counted as held (%d)", got)
+	}
+	// Refused again, and this time the send waits for the pacer's release.
+	later := now.Add(time.Second)
+	for e.HasPacingBudget(later) {
+		number++
+		e.OnPacketSent(later, 1200, number, 1200, true)
+	}
+	release := e.pacer.timeUntilSend()
+	number++
+	e.OnPacketSent(release, 1200, number, 1200, true)
+	if got := e.Telemetry().HeldSends; got != 1 {
+		t.Fatalf("the send at the pacer's release counted %d held, want 1", got)
+	}
 }
