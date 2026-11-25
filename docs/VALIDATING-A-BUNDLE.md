@@ -13,6 +13,21 @@ forward only after it passes a live gate, and there are three kinds of gate:
 All three run on real paths. The correctness gates of section 15.1 are
 ordinary Go tests and are not covered here.
 
+**Live time is kept small.** The default is the minimal profile: four trial
+types and the DC gate, with sequential stopping. It comes to about 2.5–3
+hours per path, and `--dry-run` prints the estimate before anything runs.
+The full matrix of workloads remains available as an opt-in. See "The
+minimal profile" below.
+
+**Where campaigns run.** Temporary gateways run on the two shared proxy
+hosts (ssh aliases `proxy-a` and `proxy-b` in the examples), on their own
+ports, beside each host's production `queqiaod.service`. The runner never
+stops, restarts or reconfigures that service. Declare its unit, ports
+(including the whole hop-port range) and paths in the host's
+`[production:...]` section. The runner then refuses to start on any of
+them, refuses any flag that names one of those paths, and checks the unit
+is untouched before, during and after the campaign.
+
 The harness replaces the per-campaign shell scripts that earlier A/B runs
 used. It keeps their trial shape: concurrent `curl` downloads through a
 temporary SOCKS5 client, the completion rule (curl exit 0, HTTP 200, exact
@@ -46,7 +61,9 @@ built to refuse rather than to trust:
   documentation addresses appear in the committed examples.
 - **Every host needs a `[production:...]` section.** The section lists the
   host's systemd units, launchd labels, declared ports (include a production
-  gateway's whole hop-port range), and a process pattern. The section must
+  gateway's whole hop-port range), production paths (its binary, state,
+  config and logs), and a process pattern. No configured flag may name a
+  production path, and no work directory may be inside one. The section must
   exist even when it lists nothing, so no host is touched without being looked
   at first.
 - **Preflight is read-only, and it refuses.** Before anything is copied or
@@ -453,9 +470,11 @@ one release. Its gate is Gate 1 run on the release candidate:
   before the flip, with no flags: the legacy bundle. The candidate is the
   release-candidate build with no flags, so its new defaults are what is
   measured.
-- **Paths and workloads.** Every path in the field campaign. Run every
-  workload in `FLIP_WORKLOADS`: `bulk`, `single`, `interactive`, `llm`,
-  `term` and `mixed` for now; Phase B of the workload model adds the rest.
+- **Paths and workloads.** Every path in the field campaign, with the
+  minimal profile: `minimal` (trial types A, B and C) and `idle-wake` (D)
+  on every path, and the DC gate. `--profile full` instead requires the
+  full matrix (`bulk`, `single`, `interactive`, `llm`, `term`, `mixed` and
+  `dc`).
 - **Gateways first.** Add a crossover arm (`gateway_ref = <candidate>`,
   `client_ref = <previous release>`). It shows that an upgraded gateway does
   no harm to clients that have not upgraded yet, which is the order the
@@ -480,9 +499,91 @@ the same commits; for prebuilt binaries, the same SHA-256 for each role and
 platform.
 
 ```sh
-./scripts/ab_analyze.py --flip ~/campaigns/rc-bulk ~/campaigns/rc-single ~/campaigns/rc-interactive \
-    ~/campaigns/rc-llm ~/campaigns/rc-term ~/campaigns/rc-mixed
+./scripts/ab_analyze.py --flip ~/campaigns/rc-minimal-a ~/campaigns/rc-minimal-b \
+    ~/campaigns/rc-wake-a ~/campaigns/rc-wake-b ~/campaigns/rc-dc
 ```
+
+## The minimal profile
+
+Four trial types, each running several workloads in one trial so that they
+share blocks. The cells are judged separately, so a bulk gain cannot hide a
+regression in call jitter or page time.
+
+| Trial type | Cell | What runs | Gates |
+|---|---|---|---|
+| A | `minimal` / `bulk` | four downloads, 60 s, judged as a rate (0.90 of main) | stages 6 and 7 |
+| B | `minimal` / `mixed-67` | a 5-turn LLM loop (100 KB prompt) and a terminal session with one 300 KB burst, under two downloads, about 90 s | stages 6 and 7 |
+| C | `minimal` / `mixed-all` | a video call (audio and about 3 Mbit/s of video each way, open loop, through UDP ASSOCIATE), one browsing burst (30 KB of HTML and 40 objects), one LLM call, keystrokes, one download and one upload, at once, 120 s | stage 10 |
+| D | `idle-wake` / `wake` | 50 idle connections after a 200 KB sync. The far side wakes each at 1, 5 and 16 minutes, followed by warm pushes; the client wakes it at 3 and 10 minutes. One session per arm | stage 10 |
+| DC | `dc` | the stage 9 gate at its minimal size, 6 blocks | stage 9 |
+
+What each cell measures:
+
+- **A:** goodput as a rate.
+- **B:** the `llm` and `term` measures, and the background's rate.
+- **C:** for each traffic class on its own:
+  - the call, per direction: lateness p99 (clock-free, from the reflector's
+    stamps), late loss (lost, or more than 150 ms late), audio late loss and
+    gaps, frame loss and freezes;
+  - the page load time and its failed objects;
+  - the LLM's TTFT, lateness, stalls and freezes;
+  - keystroke echo p99;
+  - the download's and the upload's rates.
+- **D:**
+  - wakes delivered within 5 s, which must be all of them;
+  - silent deaths (a wake lost with no EOF or error seen locally), which
+    must be none;
+  - the wake penalty: the push's delay over the best of its own warm
+    follow-ups, and a client send's round trip over its warm sends, at p50
+    and p99.
+
+  D runs once per arm, so it is judged over its pooled wakes by an unpaired
+  bootstrap, not over blocks.
+
+The bounds are in `gates.ini` (`[workload:minimal]`, `[workload:idle-wake]`)
+and are provisional. Example configs: `minimal-campaign.example.ini` and
+`idle-wake.example.ini`.
+
+**Sequential stopping** (A, B and C; `sequential = true`). The campaign
+runs 6 blocks, then recomputes every gate after each further block, up to
+a cap of 12. It stops as soon as the verdict is determined: every
+contrast's one-sided lower bound clears its margin, or any contrast's upper
+bound falls below it.
+
+The correction for repeated looks is a Haybittle–Peto boundary:
+
+- at each interim look (after blocks 6 to 11), a contrast is decided only
+  at one-sided α = 0.001;
+- at the cap, it is decided at α = 0.05 − 6 × 0.001 = 0.044.
+
+By the union bound, the chance of a wrong pass over all seven looks is at
+most 0.05, whatever the correlation between looks. The final look keeps
+almost all of a fixed 12-block test's power, which a Bonferroni split
+(0.05 / 7 at every look) would not. A pass needs the t and the bootstrap
+bound to agree, while either one can show an early failure. `status.json`
+records the blocks used, why the campaign stopped, and its wall time. The
+analyzer judges a stopped campaign at its last look. The DC gate keeps a
+fixed number of blocks.
+
+**Cost.** `--dry-run` prints the estimated wall time per path. For the
+example configs:
+
+| Campaign | Estimated wall time |
+|---|---|
+| A, B and C | about 2¼ hours if it stops at block 6, about 4½ hours at the cap of 12 |
+| D | about 40 minutes |
+| DC, on its own path | about 1¾ hours at 6 blocks |
+
+**Optional workloads.** The rest of the workload model is available but is
+not a gate:
+
+- `llm`, `term` and `mixed` with every variant;
+- the swarm (M3) and the soak (M7);
+- the long-tail workloads, which are not built yet: long-idle survival
+  (W9b), HTTP/3 (W8), segment fetch (W10) and one-shot datagrams (W11).
+
+`ab_analyze.py --flip --profile full` judges the full matrix instead of
+the minimal one.
 
 ## Scenario workloads
 

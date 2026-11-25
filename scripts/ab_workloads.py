@@ -55,6 +55,9 @@ class Phase:
     # Start every job on a shared remote clock (BARRIER_LEAD seconds ahead),
     # for phases whose jobs on different hosts must load the path together.
     barrier: bool = False
+    # How long the phase normally takes, for wall-time estimates; `duration`
+    # is the cap its jobs' timeouts derive from. 0: the same as duration.
+    expected: float = 0.0
 
 
 @dataclass
@@ -153,6 +156,11 @@ class Workload:
     # True: the section 15.4 primary gate on useful bytes (and the
     # [secondary] bounds) applies; False: only the [workload:<name>] rules.
     primary = True
+    # Trials per arm per block: 2 (ABBA, section 15.3), or 1 for a workload
+    # too long to repeat (one session per arm, arms in random order).
+    trials_per_arm = 2
+    # True: judged over its pooled samples (samples()), not per block.
+    sample_based = False
 
     def configure(self, cfg: Any, cp: configparser.ConfigParser) -> None:
         """Read and validate this workload's own config section."""
@@ -199,6 +207,19 @@ class Workload:
 
     def after_block(self, campaign: Any, block: int, path: str, tagp: str, writer: Any) -> None:
         """Extra trials at the end of each block (the DC calibration)."""
+
+    def estimate_seconds(self, cfg: Any, path: str) -> float:
+        """Seconds of workload in one trial on this path (its phases' windows;
+        the runner adds its own per-trial and per-block overheads)."""
+        return float(sum(ph.expected or ph.duration for ph in self.phases(cfg, path)))
+
+    def extra_block_seconds(self, cfg: Any, path: str) -> float:
+        """Seconds of extra trials per block (the DC calibration)."""
+        return 0.0
+
+    def samples(self, trials: Sequence[Any]) -> Dict[str, List[float]]:
+        """For a sample_based workload: pooled samples by name."""
+        return {}
 
     def extract(self, trial: Any, plan: dict) -> Dict[str, float]:
         """Per-trial measures, "<phase>.<metric>", for the rules in gates.ini."""
@@ -419,6 +440,9 @@ class DC(Workload):
                 Phase("requests", dc.waves * dc.request_timeout,
                       [Job(c, "requests", dc.requests_per_leaf, params=req) for c in loaded]
                       + [Job(control, "probe", 1, load=False, params=probe)], barrier=True)]
+
+    def extra_block_seconds(self, cfg: Any, path: str) -> float:
+        return float(len(cfg.dc.loaded) * (cfg.duration + 15)) if cfg.dc.calibrate else 0.0
 
     def after_block(self, campaign: Any, block: int, path: str, tagp: str, writer: Any) -> None:
         """Each loaded leaf alone on the main arm: the common ancestor binds

@@ -68,6 +68,12 @@ PROBE_TIMEOUT = 10
 # Exit status of the ownership guard: the work directory is not this
 # invocation's, so nothing was done to it.
 NOT_OWNER = 9
+# Wall-time estimates: seconds the runner adds per trial (client start and
+# stop, scrapes), per block (gateway restarts, log collection) and once
+# (builds, copies, enrollment). Measured on earlier campaigns; rough.
+TRIAL_OVERHEAD = 25
+BLOCK_OVERHEAD = 45
+SETUP_SECONDS = 240
 # Seconds between dispatching a DC phase's jobs and their shared start.
 BARRIER_LEAD = 5
 # Millisecond wall-clock time on a campaign host. Whole seconds (the last
@@ -189,6 +195,10 @@ class Production:
     launchd: List[str]
     ports: List[int]
     process_pattern: str
+    # The production service's own files and directories (state, config,
+    # binary, logs): no flag may name them and no work directory may be
+    # inside them.
+    paths: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -214,6 +224,9 @@ class Config:
     production: List[Production]
     wl: Any = None                  # the ab_workloads.Workload
     dc: Any = None                  # the dc workload's parameters
+    # Sequential stopping (ab_stats.Sequential): looks after `first_blocks`
+    # ... `blocks`; None for a fixed number of blocks.
+    sequential: Any = None
 
     @property
     def work_dir(self) -> str:
@@ -264,6 +277,19 @@ def load_config(path: str) -> Config:
     if not cp.read(path):
         raise ConfigError(f"cannot read {path}")
     return parse_config(cp)
+
+
+def _sequential(c) -> Any:
+    """[campaign] sequential = true: Haybittle-Peto stopping from
+    first_blocks (default 6) to blocks (the cap, default 12)."""
+    if not _bool(c.get("sequential", "false")):
+        return None
+    import ab_stats
+    try:
+        return ab_stats.Sequential(first=c.getint("first_blocks", 6), cap=c.getint("blocks", 12),
+                                   alpha=c.getfloat("alpha", 0.05), interim_alpha=c.getfloat("interim_alpha", 0.001))
+    except ValueError as e:
+        raise ConfigError(f"sequential: {e}")
 
 
 def parse_config(cp: configparser.ConfigParser) -> Config:
@@ -331,7 +357,11 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                 raise ConfigError(f"[{sec}] host is required")
             prod.append(Production(name=sec.split(":", 1)[1], host=s["host"], units=_words(s.get("units", "")),
                                    launchd=_words(s.get("launchd", "")), ports=_ports(s.get("ports", "")),
-                                   process_pattern=s.get("process_pattern", "queqiao")))
+                                   process_pattern=s.get("process_pattern", "queqiao"),
+                                   paths=_words(s.get("paths", ""))))
+            for path_ in prod[-1].paths:
+                if not path_.startswith("/") or path_.rstrip("/") == "":
+                    raise ConfigError(f"[{sec}] paths must be absolute directories or files, not {path_!r}")
     if len(arms) < 2:
         raise ConfigError("at least two [arm:...] sections are required")
     if sum(1 for a in arms if a.role == "main") != 1:
@@ -344,9 +374,14 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  duration=c.getint("duration", 90), gap=c.getfloat("gap", 5.0), block_gap=c.getfloat("block_gap", 10.0),
                  probe_bytes=c.getint("probe_bytes", 1024), probe_interval=c.getfloat("probe_interval", 0.5),
                  snapshot_every=c.getint("snapshot_every", 4), lane_trace=_bool(c.get("lane_trace", "true")),
+                 sequential=_sequential(c),
                  log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=15")),
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
+    if cfg.sequential and wl.analyzer != "ab_analyze":
+        # The stopping looks run ab_analyze; dc_gate judges its campaign at a
+        # fixed size.
+        raise ConfigError(f"sequential stopping is not supported for workload {workload}; set a fixed blocks")
     owned = wl.owned_flags()
     for where, fl in [("[gateway] flags", gw.flags)] + [(f"[client:{c.name}] flags", c.flags) for c in clients.values()] + \
             [(f"[arm:{a.name}]", a.flags + a.gateway_flags + a.client_flags) for a in arms]:
@@ -367,6 +402,16 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
             if p in seen:
                 raise ConfigError(f"port {p} on {host} planned twice: {seen[p]} and {what}")
             seen[p] = what
+    # No configured flag may reach a production path, in any spelling
+    # (--state=/x, --state /x, or a path inside it).
+    prod_paths = [p_.rstrip("/") for pr in prod for p_ in pr.paths]
+    for where, fl in [("[gateway] flags", gw.flags)] + [(f"[client:{c.name}] flags", c.flags) for c in clients.values()] + \
+            [(f"[arm:{a.name}]", a.flags + a.gateway_flags + a.client_flags) for a in arms]:
+        for f in fl:
+            for tok in [f] + ([f.split("=", 1)[1]] if "=" in f else []):
+                for p_ in prod_paths:
+                    if tok == p_ or tok.startswith(p_ + "/"):
+                        raise ConfigError(f"{where}: {f!r} names production path {p_}")
     covered = {p.host for p in prod}
     missing = [h for h in cfg.hosts() if h not in covered]
     if missing:
@@ -391,7 +436,7 @@ class Slot:
     cold: bool
 
 
-def block_order(n_arms: int, block: int, rng: random.Random) -> List[int]:
+def block_order(n_arms: int, block: int, rng: random.Random, trials_per_arm: int = 2) -> List[int]:
     """Arm indices for one block; every arm appears exactly twice.
 
     Two arms: ABBA or BAAB, chosen at random (section 15.3). More arms: a
@@ -399,6 +444,10 @@ def block_order(n_arms: int, block: int, rng: random.Random) -> List[int]:
     each block and the direction reversing every n blocks, so over n * 2
     blocks every arm takes every position equally often.
     """
+    if trials_per_arm == 1:
+        order = list(range(n_arms))
+        rng.shuffle(order)
+        return order
     if n_arms == 2:
         return [0, 1, 1, 0] if rng.random() < 0.5 else [1, 0, 0, 1]
     k = (block - 1) % n_arms
@@ -416,7 +465,7 @@ def schedule(cfg: Config) -> List[Slot]:
         k = (b - 1) % len(paths)
         for path in paths[k:] + paths[:k]:
             seen: Dict[int, int] = {}
-            for i, ai in enumerate(block_order(len(cfg.arms), b, rng), start=1):
+            for i, ai in enumerate(block_order(len(cfg.arms), b, rng, cfg.wl.trials_per_arm), start=1):
                 seen[ai] = seen.get(ai, 0) + 1
                 out.append(Slot(b, path, i, cfg.arms[ai].name, seen[ai], seen[ai] == 1))
     return out
@@ -590,6 +639,12 @@ def refusal_reasons(cfg: Config, snaps: Dict[str, dict]) -> List[str]:
             reasons.append(f"{host}: a process from an earlier campaign is running: {left}")
     for p in cfg.production:
         snap = snaps.get(p.host, {})
+        home = snap.get("home")
+        if home:
+            W = f"{home}/{cfg.work_dir}"
+            for p_ in p.paths:
+                if W == p_.rstrip("/") or W.startswith(p_.rstrip("/") + "/"):
+                    reasons.append(f"{p.host}: the work directory {W} is inside production path {p_}")
         for u in snap.get("unit_errors", []):
             if u in p.units or u in p.launchd:
                 reasons.append(f"{p.host}: declared production unit {u} cannot be observed (not found, or no access)")
@@ -758,6 +813,9 @@ class Campaign:
         self.production_changed = False
         self.measures_path = None if dry else os.path.join(self.out, "measures.jsonl")
         self.job_seq = 0
+        self.blocks_run = 0
+        self.stopped = ""
+        self.t_start = time.time()
         self.job_failures: List[dict] = []
         self.token = "dry-run-token" if dry else os.urandom(16).hex()
         self.started = False
@@ -823,6 +881,8 @@ class Campaign:
                     raise Refused(f"{host.dest}: $HOME must be an absolute path of [A-Za-z0-9._/-] ({home.strip()[:200]!r})")
                 host.home = home.strip()
         self.before = self.snapshot_all("before")
+        for host, snap in self.before.items():
+            snap["home"] = self.hosts[host].home if self.hosts[host].home != "~" else ""
         if self.dry:
             print("[preflight] would refuse if any of these is listening, declared production, or if "
                   f"a process under ~/{self.cfg.work_dir}/ is already running:", file=self.stream)
@@ -1152,6 +1212,17 @@ rm -f "$f"''', what=f"stop {tag}")
                 f"echo \"$j $(ps -o lstart= -p $j | tr -s ' ' | sed 's/^ //;s/ $//')\" > {f}\n"
                 f"wait $j\nrc=$?\nrm -f {f}\nexit $rc")
 
+    def interim(self, block: int) -> Tuple[bool, str]:
+        """(stop?, summary) for the sequential gate after `block` blocks."""
+        import ab_analyze
+        try:
+            decisions = ab_analyze.interim_decisions(self.out, ab_analyze.load_gates())
+        except Exception as e:  # an analysis error must not end the campaign
+            return False, f"interim analysis failed ({type(e).__name__}: {e}); continuing"
+        import ab_stats
+        counts = {d: decisions.count(d) for d in sorted(set(decisions))}
+        return ab_stats.overall_stop(decisions), ", ".join(f"{v} {k}" for k, v in counts.items()) or "nothing to judge"
+
     def pause(self, seconds: float) -> None:
         if not self.dry:
             time.sleep(seconds)
@@ -1416,6 +1487,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             plan = {"config": {k: v for k, v in cfg.__dict__.items() if k not in ("gateway", "clients", "arms", "production", "dc", "wl")},
                     "workload": cfg.workload, "analyzer": cfg.wl.analyzer, "paths": cfg.paths(),
                     "dc": cfg.dc.__dict__ if cfg.dc else None,
+                    "sequential": cfg.sequential.__dict__ if cfg.sequential else None,
                     "arms": manifest, "schedule": [s.__dict__ for s in slots], "main": cfg.main.name,
                     "clients": {c.name: {"small": c.small, "platform": c.platform} for c in cfg.clients.values()}}
             if not self.dry:
@@ -1450,6 +1522,17 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                     self.run_block(block, path, [s for s in slots if s.block == block and s.path == path], writer)
                     if not self.dry:
                         time.sleep(cfg.block_gap)
+                self.blocks_run = block
+                if cfg.sequential and not self.dry and block >= cfg.sequential.first and block < cfg.blocks:
+                    # Recompute the gate on the blocks so far; stop once its
+                    # verdict is determined (ab_stats.Sequential).
+                    if tsv:
+                        tsv.flush()
+                    stop, why = self.interim(block)
+                    self.log(f"look after block {block}: {why}")
+                    if stop:
+                        self.stopped = f"after block {block}: {why}"
+                        break
                 if cfg.snapshot_every and block % cfg.snapshot_every == 0 and block < cfg.blocks:
                     self.check_production(f"mid-b{block:03d}")
             if not self.dry:
@@ -1506,6 +1589,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
                            "production": production, "teardown_leftovers": leftovers, "cleanup_failures": clean_failures,
                            "fetch_failures": self.fetch_failures, "job_failures": self.job_failures,
+                           "blocks_run": self.blocks_run, "stopped": self.stopped,
+                           "wall_seconds": round(time.time() - self.t_start, 1),
                            "finished_utc": utc(time.time())}, f, indent=2)
         return status
 
@@ -1529,10 +1614,30 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             out += [f"{host}: still running: {x}" for x in snap.get("leftover", [])]
         return out
 
+    def estimate(self) -> Dict[str, Tuple[float, float]]:
+        """Estimated wall seconds per path: (if stopped at the first look,
+        at the cap), the workload's phases plus the runner's overheads."""
+        cfg = self.cfg
+        out = {}
+        trials = len(cfg.arms) * cfg.wl.trials_per_arm
+        first = cfg.sequential.first if cfg.sequential else cfg.blocks
+        for path in cfg.paths():
+            trial = cfg.wl.estimate_seconds(cfg, path) + TRIAL_OVERHEAD + cfg.gap
+            block = trials * trial + cfg.wl.extra_block_seconds(cfg, path) + BLOCK_OVERHEAD + cfg.block_gap
+            out[path] = (SETUP_SECONDS + first * block, SETUP_SECONDS + cfg.blocks * block)
+        return out
+
     def print_plan(self, slots: List[Slot]) -> None:
         cfg = self.cfg
         p = lambda *a: print(*a, file=self.stream)
         p(f"# campaign {cfg.name}: workload {cfg.workload}, {cfg.blocks} block(s), seed {cfg.seed}")
+        if cfg.sequential:
+            sq = cfg.sequential
+            p(f"# sequential: looks after blocks {sq.first}..{sq.cap}, interim alpha {sq.interim_alpha:g}, "
+              f"final alpha {sq.final_alpha:g} (Haybittle-Peto)")
+        for path, (lo, hi) in self.estimate().items():
+            span = f"{lo / 60:.0f} min" if lo == hi else f"{lo / 60:.0f} min (stopping at the first look) to {hi / 60:.0f} min (cap)"
+            p(f"# estimated wall time on {path}: {span}")
         p(f"# work directory on every host: ~/{cfg.work_dir}")
         p(f"# gateway host {cfg.gateway.host} ({cfg.gateway.platform}), clients dial {cfg.gateway.address}")
         for a in cfg.arms:

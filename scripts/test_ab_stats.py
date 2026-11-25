@@ -168,5 +168,52 @@ class Misc(unittest.TestCase):
         self.assertGreaterEqual(ub, m)
 
 
+
+class SequentialStopping(unittest.TestCase):
+    def test_alpha_is_spent_within_the_total(self):
+        sq = st.Sequential(first=6, cap=12, alpha=0.05, interim_alpha=0.001)
+        self.assertEqual(sq.interim_looks, 6)
+        self.assertAlmostEqual(sq.final_alpha, 0.044)
+        self.assertEqual(sq.alpha_at(6), 0.001)
+        self.assertEqual(sq.alpha_at(12), sq.final_alpha)
+        with self.assertRaises(ValueError):
+            st.Sequential(first=2, cap=60, interim_alpha=0.001)   # 58 interim looks spend more than 0.05
+
+    def test_upper_bound_known_answer(self):
+        self.assertAlmostEqual(st.t_upper_bound([1, 2, 3, 4, 5]), 3 + 2.131847 * math.sqrt(0.5), places=5)
+
+    def test_clear_effects_stop_early_and_ambiguous_ones_run_to_the_cap(self):
+        sq = st.Sequential()
+        rng = random.Random(4)
+        clear = [10 + rng.gauss(0, 1) for _ in range(6)]
+        self.assertEqual(sq.decide(clear, resamples=2000), "pass")
+        self.assertEqual(sq.decide([-x for x in clear], resamples=2000), "fail")
+        murky = [rng.gauss(0.2, 1) for _ in range(6)]
+        self.assertEqual(sq.decide(murky, resamples=2000), "continue")
+        self.assertEqual(sq.decide(murky[:5], resamples=2000), "continue")   # before the first look
+        self.assertIn(sq.decide([rng.gauss(0.2, 1) for _ in range(12)], resamples=2000), ("pass", "fail"))
+
+    def test_the_whole_procedure_keeps_its_error_rate(self):
+        # True mean contrast exactly zero (the margin): how often does the
+        # procedure, looking after every block from 6 to 12, wrongly pass?
+        sq = st.Sequential()
+        rng = random.Random(21)
+        reps, passes = 400, 0
+        for r in range(reps):
+            d = [rng.gauss(0, 1) for _ in range(12)]
+            for n in range(sq.first, sq.cap + 1):
+                v = sq.decide(d[:n], resamples=300, seed=r)
+                if v != "continue":
+                    passes += v == "pass"
+                    break
+        self.assertLessEqual(passes / reps, 0.07, passes)   # nominal 0.05, with Monte Carlo slack
+
+    def test_overall_stop(self):
+        self.assertTrue(st.overall_stop(["pass", "fail", "continue"]))
+        self.assertTrue(st.overall_stop(["pass", "pass"]))
+        self.assertFalse(st.overall_stop(["pass", "continue"]))
+        self.assertFalse(st.overall_stop([]))
+
+
 if __name__ == "__main__":
     unittest.main()

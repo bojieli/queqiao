@@ -324,3 +324,83 @@ def paired_secondary(candidate: Sequence[float], main: Sequence[float], alpha: f
     diffs = [float(c) - float(m) for c, m in zip(candidate, main)
              if c is not None and m is not None and c == c and m == m]
     return mean(diffs), bootstrap_bound(diffs, alpha=alpha, resamples=resamples, seed=seed, upper=upper), len(diffs)
+
+
+# --- sequential stopping ---------------------------------------------------------
+
+def t_upper_bound(xs: Sequence[float], alpha: float = 0.05) -> float:
+    """Upper bound of the one-sided (1 - alpha) t-interval of the mean."""
+    xs = _finite(xs)
+    n = len(xs)
+    if n < 2:
+        return float("nan")
+    return mean(xs) + t_quantile(1.0 - alpha, n - 1) * stdev(xs) / math.sqrt(n)
+
+
+def bounds(d: Sequence[float], alpha: float, resamples: int = 20000, seed: int = 1):
+    """(t lower, t upper, bootstrap lower, bootstrap upper) one-sided bounds
+    of the mean of d, each at level alpha."""
+    return (t_lower_bound(d, alpha), t_upper_bound(d, alpha),
+            bootstrap_bound(d, alpha=alpha, resamples=resamples, seed=seed),
+            bootstrap_bound(d, alpha=alpha, resamples=resamples, seed=seed, upper=True))
+
+
+@dataclass
+class Sequential:
+    """A Haybittle-Peto group-sequential design over blocks.
+
+    Looks happen after `first`, first + 1, ..., `cap` blocks. At every
+    interim look a contrast is decided only if it is overwhelming: its
+    one-sided lower bound at `interim_alpha` is above zero (pass) or its
+    upper bound at the same level is below zero (fail). At the cap it is
+    decided at `final_alpha` = alpha - (number of interim looks) x
+    interim_alpha, as an ordinary one-sided test. By the union bound the
+    chance of a wrong pass over all looks is at most alpha, whatever the
+    correlation between looks; the final look keeps almost all of the
+    fixed-sample test's power, which a Bonferroni split over every look
+    would not.
+    """
+    first: int = 6
+    cap: int = 12
+    alpha: float = 0.05
+    interim_alpha: float = 0.001
+
+    def __post_init__(self):
+        if not 2 <= self.first <= self.cap:
+            raise ValueError("need 2 <= first <= cap")
+        if self.final_alpha <= 0:
+            raise ValueError("interim looks spend all of alpha")
+
+    @property
+    def interim_looks(self) -> int:
+        return self.cap - self.first
+
+    @property
+    def final_alpha(self) -> float:
+        return self.alpha - self.interim_looks * self.interim_alpha
+
+    def alpha_at(self, blocks: int) -> float:
+        return self.final_alpha if blocks >= self.cap else self.interim_alpha
+
+    def decide(self, d: Sequence[float], resamples: int = 20000, seed: int = 1) -> str:
+        """'pass', 'fail' or 'continue' for one contrast after len(d) blocks.
+        At the cap it is pass or fail. Both the t and the bootstrap bound
+        must agree for a pass, and either one suffices for an early fail."""
+        n = len(_finite(d))
+        if n < self.first:
+            return "continue"
+        a = self.alpha_at(n)
+        tl, tu, bl, bu = bounds(d, a, resamples, seed)
+        if tl > 0 and bl > 0:
+            return "pass"
+        if n >= self.cap:
+            return "fail"
+        if tu < 0 or bu < 0:
+            return "fail"
+        return "continue"
+
+
+def overall_stop(decisions: Sequence[str]) -> bool:
+    """A gate of several contrasts stops once its verdict is determined:
+    any contrast decided fail, or every contrast decided pass."""
+    return any(x == "fail" for x in decisions) or (bool(decisions) and all(x == "pass" for x in decisions))

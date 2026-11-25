@@ -464,9 +464,341 @@ def cmd_bgup(args) -> None:
         t.join()
 
 
+# --- W7 call: UDP through SOCKS5 UDP ASSOCIATE ---------------------------------------
+
+def socks_udp(socks: str, timeout: float):
+    """(control TCP socket, UDP socket, relay address) for a SOCKS5 UDP
+    ASSOCIATE. The control connection must stay open for the association."""
+    sh, sp = socks.rsplit(":", 1)
+    c = socket.create_connection((sh, int(sp)), timeout=timeout)
+    c.sendall(b"\x05\x01\x00")
+    if _exact(c, 2) != b"\x05\x00":
+        raise OSError("socks: no acceptable auth method")
+    c.sendall(b"\x05\x03\x00\x01" + b"\x00" * 6)
+    head = _exact(c, 4)
+    if head[1] != 0:
+        raise OSError(f"socks: udp associate failed ({head[1]})")
+    if head[3] == 1:
+        addr = socket.inet_ntoa(_exact(c, 4))
+    elif head[3] == 4:
+        addr = socket.inet_ntop(socket.AF_INET6, _exact(c, 16))
+    else:
+        addr = _exact(c, _exact(c, 1)[0]).decode()
+    port = struct.unpack(">H", _exact(c, 2))[0]
+    if addr in ("0.0.0.0", "::"):
+        addr = sh
+    u = socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET, socket.SOCK_DGRAM)
+    u.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+    u.bind(("", 0))
+    return c, u, (addr, port)
+
+
+# Packet layout (both directions): magic "QC", stream (a|v), 0, seq u32,
+# frame u32, index u16, count u16, client send time (double, monotonic ms)
+# at 16; the reflector writes its receive time (double) and its running
+# count (u32) at 24..35; padding follows.
+CALL_HEAD = struct.Struct(">2sccIIHHd")
+
+
+def cmd_call(args) -> None:
+    """Open loop, both directions at once (the far side reflects): audio of
+    160 B every 20 ms; video at 30 frames/s of 10 KB in 1,100 B packets,
+    with a 40 KB key frame every 2 s. Records, per packet sent, its stream,
+    frame, send time and -- when it came back -- its up and down transit
+    deltas on the two unsynchronised clocks (milliseconds)."""
+    time.sleep(args.delay)
+    th, tp = args.target.rsplit(":", 1)
+    dest = socket.inet_aton(th) + struct.pack(">H", int(tp))
+    t0 = time.time()
+    rec = {"kind": "call", "t0": round(t0, 3), "fail": "", "audio": [], "video": [], "count": 0,
+           "seconds": args.duration}
+    try:
+        ctl, u, relay = socks_udp(args.socks, 10)
+    except (OSError, EOFError, ValueError) as e:
+        rec["fail"] = f"{type(e).__name__}: {e}"[:200]
+        rec["t1"] = round(time.time(), 3)
+        record(rec)
+        row(t0, time.time(), "v0", 0, 0, 0.0, 1)
+        return
+    u.settimeout(0.2)
+    c0 = time.monotonic()
+    sent = {}          # (stream, seq) -> [frame, send ms]
+    back = {}          # (stream, seq) -> (server ms, client receive ms)
+    done = threading.Event()
+    maxcount = [0]
+
+    def receiver():
+        while not done.is_set():
+            try:
+                data, _ = u.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            now = (time.monotonic() - c0) * 1000.0
+            payload = data[10:]   # RSV(2) FRAG(1) ATYP(1)=1 ADDR(4) PORT(2)
+            if len(payload) < 36 or payload[:2] != b"QC":
+                continue
+            _, stream, _, seq, frame, _, _, _ = CALL_HEAD.unpack_from(payload)
+            srv, cnt = struct.unpack_from(">dI", payload, 24)
+            maxcount[0] = max(maxcount[0], cnt)
+            back[(stream, seq)] = (srv, now)
+
+    th_ = threading.Thread(target=receiver, daemon=True)
+    th_.start()
+    seq = {b"a": 0, b"v": 0}
+    nxt_audio = 0.0
+    nxt_video = 0.0
+    frame_no = 0
+    header = b"\x00\x00\x00\x01" + dest
+
+    def send(stream: bytes, frame: int, idx: int, count: int, size: int):
+        seq[stream] += 1
+        t = (time.monotonic() - c0) * 1000.0
+        body = CALL_HEAD.pack(b"QC", stream, b"\x00", seq[stream], frame, idx, count, t) + b"\x00" * 12
+        body += b"p" * max(0, size - len(body))
+        sent[(stream, seq[stream])] = [frame, t]
+        u.sendto(header + body, relay)
+
+    try:
+        while not stopped(args):
+            now = time.monotonic() - c0
+            if now >= args.duration:
+                break
+            if now >= nxt_audio:
+                send(b"a", int(nxt_audio / 0.02), 0, 1, 160)
+                nxt_audio += 0.020
+            if now >= nxt_video:
+                frame_no += 1
+                size = 40_000 if frame_no % 60 == 1 else 10_000
+                parts = (size + 1099) // 1100
+                for i in range(parts):
+                    send(b"v", frame_no, i, parts, min(1100, size - i * 1100))
+                nxt_video += 1.0 / 30
+            time.sleep(max(0.0, min(nxt_audio, nxt_video) - (time.monotonic() - c0)))
+    except OSError as e:
+        rec["fail"] = f"{type(e).__name__}: {e}"[:200]
+    time.sleep(1.0)                     # the last echoes
+    done.set()
+    for (stream, sq), (frame, t) in sorted(sent.items()):
+        b = back.get((stream, sq))
+        entry = [frame, round(t, 1)] + ([round(b[0] - t, 1), round(b[1] - b[0], 1)] if b else [])
+        rec["audio" if stream == b"a" else "video"].append(entry)
+    rec["count"] = maxcount[0]
+    rec["t1"] = round(time.time(), 3)
+    for s_ in (u, ctl):
+        try:
+            s_.close()
+        except OSError:
+            pass
+    record(rec)
+    row(t0, time.time(), "v0", 0 if rec["fail"] else 200, len(sent), time.time() - t0, 1 if rec["fail"] else 0)
+
+
+# --- W3 browsing burst -----------------------------------------------------------------
+
+def page_objects(seed: int, n: int = 40) -> list:
+    """The page's object sizes: log-normal, median 15 KB, p95 300 KB (sigma
+    from the ratio), capped at 2 MB; fixed by the seed."""
+    import math as _m
+    rng = random.Random(seed)
+    sigma = _m.log(300_000 / 15_000) / 1.6449
+    return [min(2_000_000, int(15_000 * _m.exp(rng.gauss(0, sigma)))) for _ in range(n)]
+
+
+def http_get(sock, reader: "Reader", n: int) -> float:
+    """GET /bytes/n on an open connection; returns the first-byte time
+    (monotonic) and leaves the body read."""
+    sock.sendall(f"GET /bytes/{n} HTTP/1.1\r\nHost: wlserver\r\n\r\n".encode())
+    if not reader.buf:
+        reader.fill()
+    first = time.monotonic()
+    status = reader.line()
+    if b" 200 " not in status + b" ":
+        raise OSError(f"http status {status[:40]!r}")
+    length = 0
+    while True:
+        h = reader.line()
+        if not h:
+            break
+        if h.lower().startswith(b"content-length:"):
+            length = int(h.split(b":", 1)[1])
+    left = length
+    while left > 0:
+        if not reader.buf:
+            reader.fill()
+        k = min(left, len(reader.buf))
+        reader.buf = reader.buf[k:]
+        left -= k
+    return first
+
+
+def cmd_browse(args) -> None:
+    """One page: the HTML (30 KB), then its 40 objects queued on up to 6
+    new connections (HTTP/1.1, as a browser opens per origin). Records every
+    object's start, first byte and end (client monotonic, from the page start)."""
+    time.sleep(args.delay)
+    t0 = time.time()
+    sizes = page_objects(args.seed)
+    rec = {"kind": "browse", "t0": round(t0, 3), "fail": "", "objects": []}
+    c0 = time.monotonic()
+    queue = list(enumerate(sizes, start=1))
+    lock = threading.Lock()
+
+    def fetch_on(conn_reader, idx, n):
+        sock, reader = conn_reader
+        a = time.monotonic()
+        try:
+            fb = http_get(sock, reader, n)
+            rec["objects"].append([idx, n, round(a - c0, 4), round(fb - c0, 4), round(time.monotonic() - c0, 4), ""])
+            return True
+        except (OSError, EOFError, ValueError, ssl.SSLError) as e:
+            rec["objects"].append([idx, n, round(a - c0, 4), None, round(time.monotonic() - c0, 4),
+                                   f"{type(e).__name__}"])
+            return False
+
+    try:
+        s = open_conn(args, args.timeout)
+        s.settimeout(args.timeout)
+        conn = (s, Reader(s))
+        fetch_on(conn, 0, 30_000)       # the HTML
+    except (OSError, EOFError, ssl.SSLError) as e:
+        rec["fail"] = f"{type(e).__name__}: {e}"[:200]
+        conn = None
+
+    def worker(first_conn):
+        c = first_conn
+        while True:
+            with lock:
+                if not queue:
+                    break
+                idx, n = queue.pop(0)
+            if c is None:
+                try:
+                    so = open_conn(args, args.timeout)
+                    so.settimeout(args.timeout)
+                    c = (so, Reader(so))
+                except (OSError, EOFError, ssl.SSLError) as e:
+                    rec["objects"].append([idx, n, round(time.monotonic() - c0, 4), None,
+                                           round(time.monotonic() - c0, 4), type(e).__name__])
+                    continue
+            if not fetch_on(c, idx, n):
+                c = None
+        if c:
+            try:
+                c[0].close()
+            except OSError:
+                pass
+
+    if conn is not None:
+        ws = [threading.Thread(target=worker, args=(conn if i == 0 else None,)) for i in range(6)]
+        for w_ in ws:
+            w_.start()
+        for w_ in ws:
+            w_.join()
+    rec["t1"] = round(time.time(), 3)
+    record(rec)
+    bad = sum(1 for o in rec["objects"] if o[5])
+    row(t0, time.time(), "g0", 0 if rec["fail"] else 200, len(rec["objects"]), time.time() - t0,
+        1 if rec["fail"] or bad else 0)
+
+
+# --- idle wake ----------------------------------------------------------------------
+
+def cmd_wake(args) -> None:
+    """`conns` connections, each: a sync burst, then silence; the far side
+    pushes at each of --wakes (seconds after the connection's request) and
+    --follow more at 1 s spacing; the client sends one message at each of
+    --sends, then two warm ones 1 s apart. Records every push's server time
+    and client receive time, every send's round trip, and how the
+    connection ended."""
+    wakes = args.wakes
+    sends = [float(x) for x in args.sends.split(",") if x]
+    t0 = time.time()
+
+    def one(i):
+        rec = {"kind": "wake", "conn": i, "t0": round(time.time(), 3), "fail": "", "pushes": [], "sends": [],
+               "wakes": [float(x) for x in wakes.split(",") if x], "follow": args.follow, "end": ""}
+        try:
+            s = open_conn(args, 30)
+            s.settimeout(None)
+            c0 = time.monotonic()
+            s.sendall(f"W {args.sync} {wakes} {args.follow}\n".encode())
+        except (OSError, EOFError, ssl.SSLError) as e:
+            rec["fail"] = f"{type(e).__name__}: {e}"[:200]
+            rec["t1"] = round(time.time(), 3)
+            record(rec)
+            return
+        pending = {}
+        lock = threading.Lock()
+        stop = threading.Event()
+
+        def reader():
+            r = Reader(s)
+            try:
+                while not stop.is_set():
+                    t = r.exact(1)
+                    if t in (b"Y",):
+                        n = struct.unpack(">H", r.exact(2))[0]
+                        r.exact(n)
+                    elif t == b"P":
+                        idx, srv = struct.unpack(">Id", r.exact(12))
+                        rec["pushes"].append([idx, round(srv, 3), round(time.monotonic() - c0, 4)])
+                    elif t == b"A":
+                        n = struct.unpack(">I", r.exact(4))[0]
+                        with lock:
+                            sent_at = pending.pop(n, None)
+                        if sent_at is not None:
+                            rec["sends"].append([n, round(sent_at, 4), round(time.monotonic() - c0 - sent_at, 4)])
+            except EOFError:
+                if not stop.is_set():
+                    rec["end"] = f"EOF at {time.monotonic() - c0:.1f}s"
+            except (OSError, ssl.SSLError) as e:
+                if not stop.is_set():
+                    rec["end"] = f"{type(e).__name__} at {time.monotonic() - c0:.1f}s"
+
+        th_ = threading.Thread(target=reader, daemon=True)
+        th_.start()
+        n = 0
+        try:
+            for at in sends:
+                for k in range(3):        # the wake, then two warm sends
+                    due = at + k
+                    delay = due - (time.monotonic() - c0)
+                    if delay > 0:
+                        if stopped(args) or (time.monotonic() - c0) > args.duration:
+                            break
+                        time.sleep(delay)
+                    n += 1
+                    with lock:
+                        pending[n] = time.monotonic() - c0
+                    s.sendall(b"S" + struct.pack(">I", n))
+            last = max(rec["wakes"] + sends + [0]) + args.follow + 6
+            while time.monotonic() - c0 < last and not stopped(args):
+                time.sleep(0.5)
+        except (OSError, ssl.SSLError) as e:
+            rec["end"] = rec["end"] or f"{type(e).__name__} at {time.monotonic() - c0:.1f}s"
+        stop.set()
+        rec["unanswered_sends"] = len(pending)
+        try:
+            s.close()
+        except OSError:
+            pass
+        rec["t1"] = round(time.time(), 3)
+        record(rec)
+
+    ts = [threading.Thread(target=one, args=(i,)) for i in range(args.conns)]
+    for t in ts:
+        t.start()
+        time.sleep(0.02)
+    for t in ts:
+        t.join()
+    row(t0, time.time(), "w0", 200, args.conns, time.time() - t0, 0)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("cmd", choices=("llm", "term", "bgdown", "bgup"))
+    ap.add_argument("cmd", choices=("llm", "term", "bgdown", "bgup", "call", "browse", "wake"))
     ap.add_argument("--socks", required=True)
     ap.add_argument("--target", required=True)
     ap.add_argument("--no-tls", action="store_true")
@@ -494,13 +826,20 @@ def main(argv=None) -> int:
     ap.add_argument("--burst-bytes", type=int, default=300_000)
     ap.add_argument("--mean-gap", type=float, default=0.150)
     ap.add_argument("--floor", type=float, default=0.030)
+    # wake
+    ap.add_argument("--conns", type=int, default=50)
+    ap.add_argument("--sync", type=int, default=200_000)
+    ap.add_argument("--wakes", default="60,300,960", help="server push times, seconds after connecting")
+    ap.add_argument("--sends", default="180,600", help="client send times, seconds after connecting")
+    ap.add_argument("--follow", type=int, default=5)
     # backgrounds
     ap.add_argument("--flows", type=int, default=4)
     ap.add_argument("--path", default="/")
     ap.add_argument("--object-bytes", type=int, default=8 << 20)
     args = ap.parse_args(argv)
     args.deadline = time.time() + args.delay + args.duration
-    {"llm": cmd_llm, "term": cmd_term, "bgdown": cmd_bgdown, "bgup": cmd_bgup}[args.cmd](args)
+    {"llm": cmd_llm, "term": cmd_term, "bgdown": cmd_bgdown, "bgup": cmd_bgup, "call": cmd_call,
+     "browse": cmd_browse, "wake": cmd_wake}[args.cmd](args)
     return 0
 
 

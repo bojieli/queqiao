@@ -499,7 +499,7 @@ class Flip(unittest.TestCase):
         with mock.patch.object(dc, "evaluate", return_value=("", {"cand": "PASS"})):
             text, ok = an.flip_report([root], self.gates)
         self.assertFalse(ok)
-        self.assertIn("llm (no campaign)", text)
+        self.assertIn("minimal (no campaign)", text)
 
     def test_every_cell_must_be_covered_on_every_path(self):
         # Path a ran both cells; path b ran only one of them.

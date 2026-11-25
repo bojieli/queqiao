@@ -47,6 +47,7 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 PAD = "x" * 400
+BLOCK = os.urandom(1 << 16)
 # Bytes received per tagged upload, and whether its request has ended.
 SINK: dict = {}
 SINK_LOCK = threading.Lock()
@@ -148,6 +149,24 @@ class HTTP(socketserver.StreamRequestHandler):
                 R = (last - first) if first is not None else 0.0
                 self.llm(R, float(q.get("think_ms", 500)), int(q.get("n", 400)), float(q.get("cadence_ms", 25)),
                          int(q.get("seed", 1)))
+            elif method == "GET" and url.path.startswith("/bytes/"):
+                # Browsing objects: N bytes, keep-alive.
+                try:
+                    n = int(url.path[len("/bytes/"):])
+                except ValueError:
+                    n = -1
+                if not 0 <= n <= 1 << 30:
+                    self.wfile.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                    self.wfile.flush()
+                    continue
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                                 b"Content-Length: %d\r\n\r\n" % n)
+                left = n
+                while left > 0:
+                    k = min(left, len(BLOCK))
+                    self.wfile.write(BLOCK[:k])
+                    left -= k
+                self.wfile.flush()
             elif method == "POST" and url.path == "/sink":
                 self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok\n")
                 self.wfile.flush()
@@ -243,17 +262,106 @@ def tls_context(directory: str) -> ssl.SSLContext:
     return ctx
 
 
+def reflect(sock: socket.socket) -> None:
+    """The call's far side: every datagram straight back to its sender, with
+    the reflector's receive time (server monotonic ms, 8 bytes) and its
+    running count of datagrams from that sender (4 bytes) written at bytes
+    24..35 -- the layout wlclient's call generator reserves for them."""
+    counts: dict = {}
+    while True:
+        try:
+            data, peer = sock.recvfrom(65535)
+        except OSError:
+            continue
+        now = mono_ms()
+        counts[peer] = counts.get(peer, 0) + 1
+        if len(data) >= 36:
+            data = data[:24] + struct.pack(">dI", now, counts[peer]) + data[36:]
+        try:
+            sock.sendto(data, peer)
+        except OSError:
+            pass
+
+
+class Wake(socketserver.BaseRequestHandler):
+    """Idle-wake connections. The client opens one with a line
+    `W <sync bytes> <wake seconds,...> <followups>`; the server sends the
+    sync burst at once (login history), then stays silent until each wake
+    time (seconds after the request, on its own clock), when it pushes one
+    message and `followups` more at 1 s spacing. A push is the record
+    `P<4-byte index><8-byte server monotonic ms>`. The client may also send
+    `S<4-byte n>` at any time, answered at once by `A<4-byte n>` (the
+    client-send wake)."""
+
+    def setup(self):
+        handshake(self)
+
+    def handle(self):
+        s = self.request
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        lock = threading.Lock()
+        try:
+            line = b""
+            while not line.endswith(b"\n"):
+                b = s.recv(1)
+                if not b:
+                    return
+                line += b
+            _, sync, wakes, follow = line.decode().split()
+            t0 = time.monotonic()
+            left = int(sync)
+            with lock:
+                while left > 0:
+                    k = min(left, 16384)
+                    s.sendall(b"Y" + struct.pack(">H", k) + b"y" * k)
+                    left -= k
+
+            def pushes():
+                i = 0
+                try:
+                    for w in [float(x) for x in wakes.split(",") if x]:
+                        for j in range(int(follow) + 1):
+                            due = t0 + w + j
+                            delay = due - time.monotonic()
+                            if delay > 0:
+                                time.sleep(delay)
+                            with lock:
+                                s.sendall(b"P" + struct.pack(">Id", i, mono_ms()))
+                            i += 1
+                except (OSError, ssl.SSLError):
+                    return
+
+            threading.Thread(target=pushes, daemon=True).start()
+            while True:
+                head = read_exact(s, 5)
+                if head[:1] == b"S":
+                    with lock:
+                        s.sendall(b"A" + head[1:5])
+        except (EOFError, OSError, ssl.SSLError, ValueError):
+            return
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--http", type=int, required=True)
     ap.add_argument("--term", type=int, required=True)
+    ap.add_argument("--udp", type=int, default=0, help="UDP reflector port for the call (0: none)")
+    ap.add_argument("--wake", type=int, default=0, help="idle-wake port (0: none)")
     ap.add_argument("--dir", default=".")
     ap.add_argument("--no-tls", action="store_true")
     args = ap.parse_args(argv)
     ctx = None if args.no_tls else tls_context(args.dir)
     term = Server((args.bind, args.term), Term, ctx)
     threading.Thread(target=term.serve_forever, daemon=True).start()
+    if args.wake:
+        wake = Server((args.bind, args.wake), Wake, ctx)
+        threading.Thread(target=wake.serve_forever, daemon=True).start()
+    if args.udp:
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        u.bind((args.bind, args.udp))
+        threading.Thread(target=reflect, args=(u,), daemon=True).start()
     Server((args.bind, args.http), HTTP, ctx).serve_forever()
     return 0
 
