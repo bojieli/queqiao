@@ -197,16 +197,16 @@ type Classifier struct {
 
 	// current is the phased classifier's present-tense class; without Phased
 	// it is always class. quietWindows counts the distinct exit windows that
-	// carried payload since bulk evidence was last seen, and lastQuietWindow
-	// is the latest of them (by index from the flow's start). backlogSince
+	// carried payload since bulk evidence was last seen, firstQuietAge is the
+	// age of the first of them, and lastQuietWindow the index of the latest. backlogSince
 	// is the age at which the present unbroken send backlog began, and
 	// inBacklog says whether there is one.
-	current          Class
-	quietWindows     int
-	firstQuietWindow int64
-	lastQuietWindow  int64
-	backlogSince     time.Duration
-	inBacklog        bool
+	current         Class
+	quietWindows    int
+	firstQuietAge   time.Duration
+	lastQuietWindow int64
+	backlogSince    time.Duration
+	inBacklog       bool
 	// exits and reentries count the phased transitions, for telemetry.
 	exits, reentries uint64
 }
@@ -349,17 +349,18 @@ func (c *Classifier) observeCurrent(o Observation, before Class) {
 		case o.CarriedPayload:
 			window := int64(o.Age / c.cfg.BulkExitWindow)
 			if c.quietWindows == 0 {
-				c.firstQuietWindow = window
+				c.firstQuietAge = o.Age
 			}
 			if c.quietWindows == 0 || window != c.lastQuietWindow {
 				c.quietWindows++
 				c.lastQuietWindow = window
 			}
 			// Distinct windows alone could be two writes a millisecond apart
-			// on either side of a boundary; the stretch must also span the
-			// windows it counts.
+			// on either side of a boundary; the stretch must also last as
+			// long as the windows it counts, wherever the burst ended
+			// relative to a window boundary.
 			if c.quietWindows >= c.cfg.BulkExitWindows &&
-				window-c.firstQuietWindow >= int64(c.cfg.BulkExitWindows) {
+				o.Age-c.firstQuietAge >= time.Duration(c.cfg.BulkExitWindows)*c.cfg.BulkExitWindow {
 				c.current = ClassInteractive
 				c.quietWindows = 0
 				c.exits++

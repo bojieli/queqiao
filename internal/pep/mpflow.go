@@ -544,6 +544,8 @@ type multipathFlow struct {
 	sparseCurrent, sparsePrior uint64
 	// clock, when set by a test, replaces time.Now for classification.
 	clock func() time.Time
+	// classifyMu orders observe-and-publish.
+	classifyMu sync.Mutex
 
 	replayMu sync.Mutex
 	// closeFrame is this flow's half-close, retained until the peer
@@ -2762,7 +2764,7 @@ func (f *multipathFlow) acknowledgeCoverage(sequence uint64, final bool, ranges 
 		f.ackTrack.Advance(sequence)
 		advanced = f.ackTrack.Add(ranges) || advanced
 	}
-	if advanced {
+	if advanced && f.phased() {
 		f.noteAckedCoverage()
 	}
 	if end := f.codingRecoveryEnd.Load(); end != 0 &&
@@ -3530,6 +3532,11 @@ func (f *multipathFlow) observe(n int, up bool) bool {
 		SmoothedRTT:    time.Duration(f.currentRTTNS.Load()),
 		CarriedPayload: n > 0,
 	}
+	// Observing and publishing are one step: two goroutines observe (the
+	// application reader and the receive loop), and a result published out
+	// of order would leave dispatch on a class the classifier has left.
+	f.classifyMu.Lock()
+	defer f.classifyMu.Unlock()
 	oldClass := classifier.Class(f.class.Load())
 	newClass := f.classifier.Observe(obs)
 	f.publishClass(newClass)

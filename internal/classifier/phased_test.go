@@ -177,3 +177,18 @@ func TestPhasedBacklogThatDippedIsNotContinuous(t *testing.T) {
 		}
 	}
 }
+
+// Two quiet writes either side of a window boundary are two windows but not
+// two windows' worth of quiet.
+func TestPhasedExitNeedsTheWholeQuietStretch(t *testing.T) {
+	c := New(phasedConfig())
+	c.Observe(bulkObservation(2 * time.Second))
+	c.Observe(quietObservation(2999 * time.Millisecond))
+	c.Observe(quietObservation(3001 * time.Millisecond))
+	if got := c.Observe(quietObservation(4001 * time.Millisecond)); got != ClassBulk {
+		t.Fatalf("left BULK after %v of quiet", 4001*time.Millisecond-2999*time.Millisecond)
+	}
+	if got := c.Observe(quietObservation(5 * time.Second)); got != ClassInteractive {
+		t.Fatalf("still %v after two seconds of quiet payload windows", got)
+	}
+}

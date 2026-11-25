@@ -436,6 +436,7 @@ func TestASparseWriteOfABulkFlowIsSentInteractiveAndCoded(t *testing.T) {
 	f.lanes[0] = lane
 
 	src := &chunkReader{writes: make(chan []byte, 4)}
+	defer close(src.writes)
 	sched := stripe.New(src, stripe.Config{
 		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
 		Reliable: f.laneRetransmits, ReliableSparse: f.laneRetransmitsSparse,
@@ -494,7 +495,6 @@ func TestASparseWriteOfABulkFlowIsSentInteractiveAndCoded(t *testing.T) {
 	if !data.forceReliable || fc.bulkFrame(data.frame) {
 		t.Fatal("a 16 KiB chunk of a BULK flow would be coded")
 	}
-	close(src.writes)
 }
 
 // chunkReader hands the scheduler one write per Read.
@@ -538,6 +538,7 @@ func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
 	defer cancel()
 	now := time.Now()
 	src := &chunkReader{writes: make(chan []byte, 1)}
+	defer close(src.writes)
 	sched := stripe.New(src, stripe.Config{
 		Reliable: f.laneRetransmits, ReliableSparse: f.laneRetransmitsSparse,
 		SparseBytes: f.sparseBytes(), Sparse: f.admitSparse,

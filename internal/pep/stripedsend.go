@@ -617,6 +617,12 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 		// stream is what ends it.
 		return nil
 	}
+	if f.phased() {
+		// The phased class moves with the backlog, which acknowledgements
+		// change without any application read; re-examine before stamping,
+		// whether or not this lane asked a coding question at dispatch.
+		f.refreshClass()
+	}
 	frame := protocol.Frame{Header: protocol.Header{
 		Version: protocol.Version, Type: protocol.TypeData, SessionID: f.sessionID, FlowID: f.flowID,
 		Sequence: chunk.Offset, Class: f.sendClass(chunk.Sparse),

@@ -24,6 +24,7 @@ func (r *writesReader) Read(p []byte) (int, error) {
 // behind READY bytes, is not.
 func TestSparseWritesAreMarkedOnlyOntoAnEmptyQueue(t *testing.T) {
 	src := &writesReader{writes: make(chan []byte, 8)}
+	defer close(src.writes)
 	admitted := 0
 	s := New(src, Config{
 		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
@@ -74,13 +75,13 @@ func TestSparseWritesAreMarkedOnlyOntoAnEmptyQueue(t *testing.T) {
 	if ref := c.Ref(); !ref.Sparse {
 		t.Fatal("a chunk's reference lost its sparse mark")
 	}
-	close(src.writes)
 }
 
 // A retry waiting in the ready set is a non-empty send queue, although
 // readyBytes counts only bytes never sent.
 func TestASmallWriteBehindAQueuedRetryIsNotSparse(t *testing.T) {
 	src := &writesReader{writes: make(chan []byte, 8)}
+	defer close(src.writes)
 	s := New(src, Config{
 		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
 		SparseBytes: 2800, Sparse: func(int) bool { return true },
@@ -106,5 +107,4 @@ func TestASmallWriteBehindAQueuedRetryIsNotSparse(t *testing.T) {
 	if retry.Offset != 0 || small.Sparse {
 		t.Fatalf("retry offset %d, small write sparse=%v; want the retry first and the write not sparse", retry.Offset, small.Sparse)
 	}
-	close(src.writes)
 }
