@@ -177,9 +177,22 @@ def pooled_promotions(counts: Sequence[Optional[Tuple[float, float]]]) -> Option
     return sum(c[0] for c in counts), sum(c[1] for c in counts)
 
 
-def outcomes(counts: Optional[Tuple[float, float]]) -> Optional[List[float]]:
-    """The promotions as 0/1 samples (1: in vain), whose mean is the rate."""
-    if counts is None:
-        return None
-    false_, resolved = int(round(counts[0])), int(round(counts[1]))
-    return [1.0] * false_ + [0.0] * (resolved - false_)
+class Events:
+    """A block's (false, resolved) promotions standing for its events in a
+    pooled proportion: its length is its number of events, and blocks are
+    combined by summing their counts, never by expanding them."""
+
+    def __init__(self, counts: Tuple[float, float]) -> None:
+        self.false, self.resolved = counts
+
+    def __len__(self) -> int:
+        return int(round(self.resolved))
+
+    @staticmethod
+    def rate(blocks: Sequence["Events"], q=None) -> float:
+        return rate((sum(b.false for b in blocks), sum(b.resolved for b in blocks)))
+
+
+def outcomes(counts: Optional[Tuple[float, float]]) -> Optional[Events]:
+    """A block's promotions as Events; None when unmeasured."""
+    return None if counts is None else Events(counts)

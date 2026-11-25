@@ -257,17 +257,18 @@ def promotion_rate(endpoint: Endpoint, rows: list[dict[str, Any]], thresholds: C
     k_p is not known, or when no promotion was resolved (a zero
     denominator)."""
     configs = list(endpoint.configs.values())
-    if configs:
-        # Every process must have run the observer, at one k_p: the rows
-        # pool every process's episodes, so they are read at one threshold.
-        observed = all(c.get("carrier_shadow") is True for c in configs)
-        kps = set()
-        for c in configs:
-            ks = int(c.get("carrier_shadow_ks") or 0) or 2
-            kps.add(int(c.get("carrier_shadow_kp") or 0) or max(4, ks))
-    else:
-        observed = bool(endpoint.records)
-        kps = {k[1] for k in thresholds if isinstance(k[1], int)}
+    # Every process must have run the observer, at one k_p: the rows pool
+    # every process's episodes, so they are read at one threshold. A
+    # process's k_p is its configuration's, and any k_p its own shadow
+    # records logged counts too, so a process without a configuration
+    # record cannot hide a different threshold.
+    observed = all(c.get("carrier_shadow") is True for c in configs) if configs else bool(endpoint.records)
+    kps = set()
+    for c in configs:
+        ks = int(c.get("carrier_shadow_ks") or 0) or 2
+        kps.add(int(c.get("carrier_shadow_kp") or 0) or max(4, ks))
+    kps |= {r.get("k_p") for r in endpoint.records
+            if isinstance(r.get("k_p"), int) and not isinstance(r.get("k_p"), bool) and r.get("k_p") > 0}
     kp = next(iter(kps)) if len(kps) == 1 else None
     row = rows[min(kp, BUCKETS) - 1] if observed and kp else None
     return {"observer": observed, "k_p": kp,

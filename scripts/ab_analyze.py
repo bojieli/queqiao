@@ -949,6 +949,25 @@ def report(campaign: str, gates: dict, interim: bool = False,
                                    f"{n_m} events) | {fmt(d_, '.4g')} (with margin) | lower {fmt(bound, '.4g')} | "
                                    f"{'+' if better == 'lower' else '-'}{margin:g} | {verdict} |")
                         continue
+                    if key == "credit_delay_p95_s":
+                        # Block histograms, pooled over blocks when a block is
+                        # sparse (section 15.4), as in a rule.
+                        hb = lambda ts_: gm.pool([t.m.get("_credit_hist") for t in ts_])
+                        hc, hm, common = paired(trials, path, main, cand, hb)
+                        have = [(gm.Tail(x), gm.Tail(y)) for x, y in zip(hc, hm) if x is not None and y is not None]
+                        if have and min(min(len(x), len(y)) for x, y in have) < tail_min(0.95):
+                            a_ = gates["alpha"]
+                            d_, lo_, _ = st.pooled_quantile_bounds(
+                                [x for x, _ in have], [y for _, y in have], 0.95,
+                                lambda c__, m__: RULES[better](c__, m__, (margin,)), a_, gates["resamples"],
+                                gates["seed"], combine=gm.Tail.quantile)
+                            verdict = "n/a" if len(have) < max(need, 2) or lo_ != lo_ else (
+                                "pass" if lo_ > 0 else "**FAIL**")
+                            verdicts[(path, cand, key)] = verdict
+                            out.append(f"| {SECONDARY_LABELS.get(key, key)} | {cand} | {len(have)} (pooled) | "
+                                       f"{fmt(d_, '.4g')} (with margin) | lower {fmt(lo_, '.4g')} | "
+                                       f"{'+' if better == 'lower' else '-'}{margin:g} | {verdict} |")
+                            continue
                     c, m, common = paired(trials, path, main, cand, lambda ts_, k=key: block_metric(ts_, k))
                     upper = better == "lower"
                     mdiff, bound, n = st.paired_secondary(c, m, alpha=gates["alpha"], resamples=gates["resamples"],
@@ -1030,7 +1049,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
                                    f"{fmt(mean_d, '.4g')} | n/a | {fmt(bl, '.4g')} | {verdict} |")
                         continue
                     events = [(block_tails(path, b, cand).get(key), block_tails(path, b, main).get(key)) for b in common]
-                    if any(e is not None and e[0] is None for pair in events for e in pair):
+                    if kind in RULES and any(e is not None and e[0] is None for pair in events for e in pair):
                         # A proportion over events (the false-promotion rate).
                         have = [(c_[1], m_[1]) for c_, m_ in events if c_ is not None and m_ is not None]
                         verdict, mean_d, lo_, n_c, n_m = proportion_verdict(
@@ -1138,7 +1157,7 @@ def proportion_verdict(have: Sequence[Tuple[List[float], List[float]]], need: in
         return "reported", float("nan"), float("nan"), n_c, n_m
     a_ = sq.alpha_at(len(have)) if sq else gates["alpha"]
     mean_d, lo_, hi_ = st.pooled_quantile_bounds([x for x, _ in have], [y for _, y in have], None, contrast, a_,
-                                                 gates["resamples"], gates["seed"])
+                                                 gates["resamples"], gates["seed"], combine=gm.Events.rate)
     dec = "pass" if lo_ > 0 else "fail" if hi_ < 0 or (sq and len(have) >= sq.cap) or not sq else "continue"
     return decision_verdict(dec, undecided_ok), mean_d, lo_, n_c, n_m
 

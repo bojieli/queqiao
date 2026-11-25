@@ -127,7 +127,7 @@ class Extraction(unittest.TestCase):
         self.assertIsNone(gm.promotions([(pre, post)], [5]))
         # No promotion resolved: a zero denominator, not a zero rate.
         self.assertTrue(math.isnan(gm.rate(gm.promotions([(pre, pre)], [4]))))
-        self.assertEqual(gm.outcomes(gm.promotions([(pre, pre)], [4])), [])
+        self.assertEqual(len(gm.outcomes(gm.promotions([(pre, pre)], [4]))), 0)
         # Without the observer at an endpoint it is not measured, never zero.
         self.assertIsNone(gm.promotions([(pre, post), (pre, post)], [4, None]))
         self.assertEqual(gm.effective_kp({"carrier_shadow_ks": 0, "carrier_shadow_kp": 0}), 4)
@@ -338,6 +338,49 @@ class RoundTwo(unittest.TestCase):
             cal = shadow.calibration(ep)
         self.assertIsNone(cal["k_p"])
         self.assertIsNone(cal["false_promotion_rate"])
+
+
+class RoundThree(unittest.TestCase):
+    def test_a_hard_override_of_the_rate_is_a_hard_assertion(self):
+        g = gates()
+        g["workloads"]["minimal"] = dict(g["workloads"]["minimal"], **{"bulk.false_promotion_rate": ("ceiling", (0.5,))})
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            campaign(root, stage=10, cand_false=(3, 4), main_false=(0, 2))
+            text, v = an.report(root, g)
+        self.assertEqual(v[("a", "cand", "rule:bulk.false_promotion_rate")], "**FAIL**", text)
+
+    def test_the_full_profiles_sparse_credit_delay_is_pooled(self):
+        # One slow sample per block: pooled over blocks, its p95 is the pooled
+        # histogram's, and it fails against a fast main.
+        def trials(cand, main):
+            out = {}
+            for b in range(1, 7):
+                for slot, (arm, xs) in enumerate((("main", main), ("cand", cand)), start=1):
+                    t = an.Trial(b, "a", slot, arm, "x", 1, False)
+                    t.m["_credit_hist"] = gm.credit_histogram([(histogram([]), histogram(xs))])
+                    out[(b, "a", slot)] = t
+            return out
+        tr = trials([1.2], [0.01])
+        hb = lambda ts_: gm.pool([t.m.get("_credit_hist") for t in ts_])
+        hc, hm, _ = an.paired(tr, "a", "main", "cand", hb)
+        d_, lo, _ = st.pooled_quantile_bounds([gm.Tail(x) for x in hc], [gm.Tail(y) for y in hm], 0.95,
+                                              lambda c, m: an.RULES["lower"](c, m, (0.05,)), 0.05, 200, 1,
+                                              combine=gm.Tail.quantile)
+        self.assertLess(lo, 0)
+
+    def test_the_summary_reads_thresholds_from_shadow_records_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b = os.path.join(d, "a.jsonl"), os.path.join(d, "b.jsonl")
+            with open(a, "w") as f:
+                f.write(json.dumps({"time": "2026-06-01T00:00:00Z", "msg": "runtime configuration", "pid": 1,
+                                    "carrier_shadow": True, "carrier_shadow_kp": 4}) + "\n")
+            with open(b, "w") as f:      # another process, no configuration record, k_p = 2
+                f.write(json.dumps({"time": "2026-06-01T00:00:01Z", "msg": shadow.STATE, "pid": 2, "carrier_id": 1,
+                                    "from": "suspect", "to": "replace", "k_s": 2, "k_p": 2}) + "\n")
+            ep = shadow.Endpoint("client")
+            ep.load([a, b])
+            self.assertIsNone(shadow.calibration(ep)["false_promotion_rate"])
 
 
 if __name__ == "__main__":

@@ -362,7 +362,9 @@ the rate is pooled over every block's promotions and tested by resampling
 blocks; an arm with no promotion at all has a zero denominator, and the rate
 is reported, not gated (design section 15.4). It needs `--carrier-shadow` on
 every endpoint of both arms, as each endpoint's runtime configuration
-record shows; otherwise it is unmeasured.
+record shows; otherwise it is unmeasured. Both read the existing
+`[secondary]` bounds in `gates.ini`, which is unchanged, so campaigns that
+froze it keep their verdicts.
 
 The last line per candidate is the overall verdict:
 
