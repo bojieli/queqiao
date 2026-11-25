@@ -136,6 +136,14 @@ type Config struct {
 	Path pathmodel.Model
 	// Pending bounds the frames queued for sending before Send blocks.
 	Pending int
+	// SourceRate sizes the window from this path's own registered source
+	// bytes per round trip, repairs excluded, instead of from Path's Share
+	// (design §9). Under congestion=path there is no share: the model's
+	// figure describes a hypothetical joining member, and a sparse coded
+	// lane beside a busy bulk connection would size its window from
+	// throughput it cannot use. Until a round trip of sending has been
+	// measured the cold-start prior stands.
+	SourceRate bool
 	// tailDefer replaces the deferral Path.tailDefer derives from the round
 	// trip. It is unexported because only tests need it: telling a drain from
 	// a pause by wall clock needs a deferral that a loaded runner's timer
@@ -188,8 +196,10 @@ type Path struct {
 	// adds to it, and the carrier's observer, which settles it, so it has its
 	// own lock; nothing is called while that lock is held except appending
 	// to outcomes.
-	tagMu      sync.Mutex
-	tags       map[uint64][]*frameTrack
+	tagMu sync.Mutex
+	tags  map[uint64][]*frameTrack
+	// tagBytes is each outstanding tag's datagram size, for SourceRate.
+	tagBytes   map[uint64]int
 	tagsClosed bool
 	outcomes   []settled
 	outcomeC   chan struct{}
@@ -223,6 +233,10 @@ type Path struct {
 	// would have this path answer a non-conforming sender by buying more
 	// parity for a channel that is not erasing anything.
 	malformed atomic.Uint64
+
+	// source measures the source bytes this path has had accepted per
+	// round trip, for SourceRate.
+	source sourceMeter
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -415,7 +429,7 @@ func (p *Path) isSettled(track *frameTrack) bool {
 // and records it before the datagram is offered, because the carrier can
 // register it before Send returns. ok is false when the path has closed, in
 // which case tracks have been abandoned.
-func (p *Path) tagFor(tracks []*frameTrack) (tag uint64, ok bool) {
+func (p *Path) tagFor(tracks []*frameTrack, bytes int) (tag uint64, ok bool) {
 	p.tagMu.Lock()
 	if p.tagsClosed {
 		p.tagMu.Unlock()
@@ -425,6 +439,12 @@ func (p *Path) tagFor(tracks []*frameTrack) (tag uint64, ok bool) {
 	p.nextTag++
 	tag = p.nextTag
 	p.tags[tag] = append([]*frameTrack(nil), tracks...)
+	if p.cfg.SourceRate {
+		if p.tagBytes == nil {
+			p.tagBytes = make(map[uint64]int)
+		}
+		p.tagBytes[tag] = bytes
+	}
 	p.tagMu.Unlock()
 	return tag, true
 }
@@ -439,8 +459,16 @@ func (p *Path) onTag(tag uint64, registered bool) {
 		return
 	}
 	delete(p.tags, tag)
-	queued := false
 	now := time.Now()
+	if bytes, ok := p.tagBytes[tag]; ok {
+		delete(p.tagBytes, tag)
+		if registered {
+			// A source symbol counts when a packet carrying it is
+			// registered, not when it entered the send queue.
+			p.source.add(bytes, now)
+		}
+	}
+	queued := false
 	for _, track := range tracks {
 		if track.settled {
 			continue
@@ -798,11 +826,16 @@ func (p *Path) sendSource(esi uint32, vector []byte, tracks []*frameTrack) error
 	d[4] = kindSource
 	binary.BigEndian.PutUint32(d[5:], esi)
 	copy(d[sourceHeader:], vector)
-	if len(tracks) == 0 {
-		_, err := p.put(d)
+	tagged, ok := p.carrier.(TaggedCarrier)
+	if len(tracks) == 0 && !(ok && p.cfg.SourceRate) {
+		sent, err := p.put(d)
+		if sent && p.cfg.SourceRate {
+			// The carrier cannot report registration: acceptance is the
+			// nearest event.
+			p.source.add(len(d), time.Now())
+		}
 		return err
 	}
-	tagged, ok := p.carrier.(TaggedCarrier)
 	if !ok {
 		// Nothing below can say when a packet was built, so acceptance is
 		// the nearest event there is.
@@ -811,11 +844,14 @@ func (p *Path) sendSource(esi uint32, vector []byte, tracks []*frameTrack) error
 			p.abandon(tracks...)
 			return err
 		}
+		if p.cfg.SourceRate {
+			p.source.add(len(d), time.Now())
+		}
 		p.registerUntagged(tracks)
 		return nil
 	}
 	p.observe.Do(func() { tagged.ObserveTags(p.onTag) })
-	tag, ok := p.tagFor(tracks)
+	tag, ok := p.tagFor(tracks, len(d))
 	if !ok {
 		return p.failure()
 	}
@@ -1228,6 +1264,15 @@ func (p *Path) params() fec.Params {
 
 // rate is the sending rate the window is sized against.
 func (p *Path) rate() float64 {
+	if p.cfg.SourceRate {
+		rtt := p.roundTrip()
+		if r, ok := p.source.rate(time.Now(), rtt); ok {
+			// A measured sparse lane keeps a sparse window; at least one
+			// symbol a round trip.
+			return max(r, float64(p.symbolBytes())/rtt.Seconds())
+		}
+		return float64(p.symbolBytes()) * 64 / p.roundTrip().Seconds()
+	}
 	if p.cfg.Path != nil {
 		if share := p.cfg.Path.Current().Share; share > 0 {
 			return share
@@ -1393,4 +1438,71 @@ func (p *Path) Close() error {
 	err := p.carrier.Close()
 	p.wg.Wait()
 	return err
+}
+
+// sourceMeter is a path's source bytes per second, measured over windows of
+// one round trip: the rate of the last full window, or, once the current
+// window has run a round trip, of that one. Idle time within a window counts,
+// so a sparse lane measures a sparse rate; an idle gap of several round
+// trips ends the measurement, so a burst after a pause restarts from the
+// prior rather than from stale traffic. add may run on the carrier's
+// goroutine, so it uses the round trip rate last saw.
+type sourceMeter struct {
+	mu      sync.Mutex
+	start   time.Time
+	lastAdd time.Time
+	bytes   int
+	last    float64
+	// measured says last is a measurement, which may be zero: a window
+	// without a source symbol is a sparse lane, not a cold one.
+	measured bool
+	rtt      time.Duration
+}
+
+// sourceIdleRTTs is how many round trips without a source symbol end a
+// measurement.
+const sourceIdleRTTs = 4
+
+func (m *sourceMeter) roll(now time.Time) {
+	rtt := m.rtt
+	if rtt <= 0 {
+		rtt = 300 * time.Millisecond
+	}
+	if !m.lastAdd.IsZero() && now.Sub(m.lastAdd) > sourceIdleRTTs*rtt {
+		m.start, m.lastAdd, m.bytes, m.last, m.measured = time.Time{}, time.Time{}, 0, 0, false
+	}
+	if m.start.IsZero() {
+		return
+	}
+	if elapsed := now.Sub(m.start); elapsed >= rtt && elapsed > 0 {
+		if elapsed >= 2*rtt {
+			// The window holding the bytes ended a round trip or more
+			// ago and the windows since were empty: the latest complete
+			// round trip carried nothing, whenever rate was polled.
+			m.last = 0
+		} else {
+			m.last = float64(m.bytes) / elapsed.Seconds()
+		}
+		m.measured = true
+		m.start, m.bytes = now, 0
+	}
+}
+
+func (m *sourceMeter) add(n int, now time.Time) {
+	m.mu.Lock()
+	m.roll(now)
+	if m.start.IsZero() {
+		m.start = now
+	}
+	m.bytes += n
+	m.lastAdd = now
+	m.mu.Unlock()
+}
+
+func (m *sourceMeter) rate(now time.Time, rtt time.Duration) (float64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rtt = rtt
+	m.roll(now)
+	return m.last, m.measured
 }

@@ -76,6 +76,65 @@ func ValidateSched(sched SchedMode, ccAPI CCAPIVersion) error {
 	return validateSched(&sched, ccAPI)
 }
 
+// CongestionScope selects what one congestion controller governs. It is the
+// switch of the sixth migration bundle (§14 stage 6, congestion=path), which
+// requires the first two.
+type CongestionScope string
+
+const (
+	// CongestionScopeConnection gives every QUIC connection its own
+	// controller, coordinated through the shared path model's shares and
+	// seeds. Today's behaviour.
+	CongestionScopeConnection CongestionScope = "connection"
+	// CongestionScopePath gives each path and sending direction one
+	// controller, a PathController (§4), which every connection on the path
+	// attaches to and asks to admit each packet. It owns the rate, the
+	// window, the erasure estimate, the minimum round trip and class
+	// arbitration; nothing is divided, so there are no shares, seeds or
+	// ramps. It works with isolation on: a flow's isolated or pooled
+	// connections, and an old client's, are attachments to the same
+	// controller. It requires cc-api=v2 and sched=class.
+	CongestionScopePath CongestionScope = "path"
+)
+
+// validateCongestionScope rejects a scope the migration does not support
+// with the given controller API and scheduler. The empty scope is the
+// default, connection.
+func validateCongestionScope(scope *CongestionScope, ccAPI CCAPIVersion, sched SchedMode) error {
+	if *scope == "" {
+		*scope = CongestionScopeConnection
+	}
+	switch *scope {
+	case CongestionScopeConnection:
+		return nil
+	case CongestionScopePath:
+	default:
+		return fmt.Errorf("unsupported congestion scope %q (want %s or %s)", *scope, CongestionScopeConnection, CongestionScopePath)
+	}
+	if ccAPI != CCAPIV2 {
+		return fmt.Errorf("congestion=%s requires cc-api=%s", CongestionScopePath, CCAPIV2)
+	}
+	if sched != SchedClass {
+		// The path controller owns class arbitration (§4.3); there is no
+		// path controller that leaves packet filling to round robin.
+		return fmt.Errorf("congestion=%s requires sched=%s", CongestionScopePath, SchedClass)
+	}
+	return nil
+}
+
+// ValidateCongestionScope reports whether a congestion scope is supported
+// with a controller API and scheduler. Check those with ValidateBundle and
+// ValidateSched first.
+func ValidateCongestionScope(scope CongestionScope, ccAPI CCAPIVersion, sched SchedMode) error {
+	if ccAPI == "" {
+		ccAPI = CCAPIV1
+	}
+	if sched == "" {
+		sched = SchedLegacy
+	}
+	return validateCongestionScope(&scope, ccAPI, sched)
+}
+
 // dcLongHaulProfile is the profile that stays on today's code throughout the
 // migration (§0 decision 9).
 const dcLongHaulProfile = "dc-long-haul"
@@ -114,14 +173,17 @@ func ValidateBundle(ccAPI CCAPIVersion, congestion CongestionControlKind, p prof
 // configuration: "legacy" when every switch is off. admission is a gateway's
 // (stage 5, independent of the others); a client passes the empty value.
 // sched is the class scheduler (stage 2); classifierMode is the
-// flow-classifier bundle.
-func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, admission GatewayAdmission, sched SchedMode, classifierMode ClassifierMode) string {
+// flow-classifier bundle; scope is the path controller switch (stage 6).
+func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, admission GatewayAdmission, sched SchedMode, classifierMode ClassifierMode, scope CongestionScope) string {
 	var on []string
 	if ccAPI == CCAPIV2 {
 		on = append(on, "cc-api=v2")
 	}
 	if sched == SchedClass {
 		on = append(on, "sched=class")
+	}
+	if scope == CongestionScopePath {
+		on = append(on, "congestion=path")
 	}
 	if codedRetry == CodedRetrySticky {
 		on = append(on, "coded-retry=sticky")

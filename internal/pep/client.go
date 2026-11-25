@@ -170,6 +170,10 @@ type ClientConfig struct {
 	// Sched selects how a QUIC connection orders the classes of work it
 	// sends; see SchedMode. Empty is legacy. Class requires CCAPI v2.
 	Sched SchedMode
+	// CongestionScope selects what one congestion controller governs; see
+	// CongestionScope. Empty is connection. Path requires CCAPI v2 and
+	// Sched class.
+	CongestionScope CongestionScope
 	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
 	// is legacy.
 	CodedRetry                    CodedRetryMode
@@ -240,6 +244,14 @@ type Client struct {
 	// agent is configured, which is the default.
 	flowMeta *flowmeta.Lookup
 	cfg      ClientConfig
+	// pathPrincipal names this client's identity in path keys under
+	// congestion=path; empty in a client built without NewClient, which
+	// then shares the process-wide client label.
+	pathPrincipal string
+	// uplinkGeneration counts uplink changes (watchUplink). It is part of
+	// the client's path keys: two networks can hand out the same private
+	// address, so the source address alone does not tell their paths apart.
+	uplinkGeneration atomic.Uint64
 	// observedRTT caches the most recent lane's measured round trip (nanoseconds) so
 	// the adaptive fallback grace can scale with the path. Updated on every
 	// authenticated lane; zero until the first dial.
@@ -665,6 +677,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := validateSched(&cfg.Sched, cfg.CCAPI); err != nil {
 		return nil, err
 	}
+	if err := validateCongestionScope(&cfg.CongestionScope, cfg.CCAPI, cfg.Sched); err != nil {
+		return nil, err
+	}
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
 		return nil, err
 	}
@@ -735,8 +750,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("client profile: %w", err)
 	}
 	client := &Client{
-		flowMeta: flowmeta.New(cfg.FlowMetadataSocket, cfg.FlowMetadataTimeout),
-		cfg:      cfg, udpHealth: newUDPHealth(cfg.UDPFailureThreshold, cfg.UDPCooldown),
+		pathPrincipal: newClientPathPrincipal(),
+		flowMeta:      flowmeta.New(cfg.FlowMetadataSocket, cfg.FlowMetadataTimeout),
+		cfg:           cfg, udpHealth: newUDPHealth(cfg.UDPFailureThreshold, cfg.UDPCooldown),
 		credentials: cfg.Credentials, budget: budget,
 		metrics: cfg.Metrics, sessionLimit: cfg.SessionLimit, pendingOpens: make(chan struct{}, cfg.MaxPendingOpens),
 		sendMemory: sendMemory, receiveMemory: receiveMemory, memoryLimits: memoryLimits,
@@ -1720,7 +1736,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 			discoverGrouping: c.cfg.Profile.DiscoverGrouping,
 			kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 			adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-			ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched,
+			ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipalNow, generation: c.uplinkGeneration.Load,
 		}
 		if pooled {
 			outer, err = c.dialPooledQUICLane(ctx, ccfg)
@@ -2333,7 +2349,7 @@ func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
 		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched,
+		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipalNow, generation: c.uplinkGeneration.Load,
 	})
 	c.cfg.Logger.Debug("bulk QUIC pool authenticated", "duration", time.Since(started))
 	return entry, nil

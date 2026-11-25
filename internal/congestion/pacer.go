@@ -43,6 +43,13 @@ type pacer struct {
 	// time, and that 67ms was the whole of this transport's deficit against a
 	// tuned TCP client on the same path.
 	burstFloor func() quiccongestion.ByteCount
+	// keepDebt makes the bucket a signed balance: a packet larger than the
+	// budget leaves the bucket in debt, and the debt is repaid by refill
+	// before anything else may be sent. The default forgives it, which a
+	// controller one connection owns can afford; a path controller cannot,
+	// because exempt packets are debited whether or not there was budget for
+	// them, and forgiving their debt would let them add to the path's rate.
+	keepDebt bool
 }
 
 func newPacer(getBandwidth func() quiccongestion.ByteCount) *pacer {
@@ -67,6 +74,11 @@ func newPacerWithBurstDelay(getBandwidth func() quiccongestion.ByteCount, burstP
 
 func (p *pacer) sentPacket(sendTime monotime.Time, size quiccongestion.ByteCount) {
 	budget := p.budget(sendTime)
+	if p.keepDebt {
+		p.budgetAtLastSent = budget - size
+		p.lastSentTime = sendTime
+		return
+	}
 	if size > budget {
 		p.budgetAtLastSent = 0
 	} else {
@@ -82,6 +94,20 @@ func (p *pacer) budget(now monotime.Time) quiccongestion.ByteCount {
 	}
 	if p.lastSentTime.IsZero() {
 		return p.maxBurstSize()
+	}
+	if p.keepDebt {
+		// The balance may be negative, so overflow is detected on the
+		// refill rather than on the sum. Event times are clamped
+		// non-decreasing by the caller.
+		refill := (bps * quiccongestion.ByteCount(max(now.Sub(p.lastSentTime), 0).Nanoseconds())) / 1e9
+		if refill < 0 {
+			refill = quiccongestion.ByteCount(1<<62 - 1)
+		}
+		budget := p.budgetAtLastSent + refill
+		if budget < p.budgetAtLastSent {
+			budget = quiccongestion.ByteCount(1<<62 - 1)
+		}
+		return minByteCount(p.maxBurstSize(), budget)
 	}
 	budget := p.budgetAtLastSent + (bps*quiccongestion.ByteCount(now.Sub(p.lastSentTime).Nanoseconds()))/1e9
 	if budget < 0 { // protect against integer overflow
@@ -108,14 +134,44 @@ func (p *pacer) maxBurstSize() quiccongestion.ByteCount {
 func (p *pacer) setBurstFloor(f func() quiccongestion.ByteCount) { p.burstFloor = f }
 
 func (p *pacer) timeUntilSend() monotime.Time {
-	if p.budgetAtLastSent >= p.maxDatagramSize {
+	return p.timeUntilBudget(p.maxDatagramSize)
+}
+
+// settle carries a debt-keeping balance forward to now at the current rate,
+// so a later change of rate applies only from now: refill earned at the old
+// rate is neither withdrawn by a decrease nor multiplied by an increase.
+func (p *pacer) settle(now monotime.Time) {
+	if !p.keepDebt || p.lastSentTime.IsZero() || !now.After(p.lastSentTime) {
+		return
+	}
+	p.budgetAtLastSent = p.budget(now)
+	p.lastSentTime = now
+}
+
+// budgetReachedAt is when the balance reaches need at the current rate,
+// without the pacing timer's floor: zero if it already has.
+func (p *pacer) budgetReachedAt(need quiccongestion.ByteCount) monotime.Time {
+	if p.budgetAtLastSent >= need {
+		return 0
+	}
+	bps := p.getBandwidth()
+	if bps <= 0 {
+		return p.lastSentTime.Add(time.Second)
+	}
+	return p.lastSentTime.Add(time.Duration(float64(need-p.budgetAtLastSent) / float64(bps) * float64(time.Second)))
+}
+
+// timeUntilBudget is when the balance will reach need: one datagram for
+// timeUntilSend, or a caller's own packet size.
+func (p *pacer) timeUntilBudget(need quiccongestion.ByteCount) monotime.Time {
+	if p.budgetAtLastSent >= need {
 		return 0
 	}
 	bps := uint64(p.getBandwidth())
 	if bps == 0 {
 		return p.lastSentTime.Add(time.Second)
 	}
-	diff := 1e9 * uint64(p.maxDatagramSize-p.budgetAtLastSent)
+	diff := 1e9 * uint64(need-p.budgetAtLastSent)
 	d := diff / bps
 	if diff%bps != 0 {
 		d++

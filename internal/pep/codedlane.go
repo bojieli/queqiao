@@ -300,5 +300,8 @@ func newCodedPath(conn *quic.Conn, roundTrip time.Duration, queueFrames int) *co
 		// This bounds both the sender and receiver channel in coded.Path.
 		// Zero deliberately preserves the throughput-oriented desktop default.
 		Pending: queueFrames,
+		// Under congestion=path the model has no share for this encoder:
+		// its window is sized from its own source rate.
+		SourceRate: isPathScoped(conn),
 	})
 }

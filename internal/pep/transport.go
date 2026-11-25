@@ -173,6 +173,22 @@ type congestionConfig struct {
 	// sched selects the class scheduler; see SchedMode. It applies only
 	// with ccAPI v2.
 	sched SchedMode
+	// scope selects what one controller governs; see CongestionScope. It
+	// applies only with ccAPI v2 and the erasure law.
+	scope CongestionScope
+	// provisional says the connection's peer is not yet known to be an
+	// authorised data connection (a gateway installs a controller before it
+	// knows the ALPN or the principal). Under congestion=path such a
+	// connection gets a standalone controller and attaches to its path's
+	// controller only once it is known; see attachPathController.
+	provisional bool
+	// principal names the sending endpoint's identity in its path key under
+	// congestion=path, read at installation and at each migration; see
+	// Client.pathPrincipalNow.
+	principal func() string
+	// generation, if set, reads the endpoint's uplink generation, which
+	// principal includes; see PathAttachment.SetGeneration.
+	generation func() uint64
 }
 
 type udpHealth struct {
@@ -1160,6 +1176,16 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 		// bottleneck from only its own delivered rate, so the aggregate
 		// overshot by however many lanes there were. Live, four lanes
 		// delivered about 8 Mbit/s where one delivered 11.
+		if cfg.ccAPI == CCAPIV2 && cfg.scope == CongestionScopePath {
+			if cfg.provisional {
+				return provisionalPathController(conn)
+			}
+			principal := cfg.principal
+			if principal == nil {
+				principal = func() string { return clientPathPrincipal }
+			}
+			return attachPathController(conn, cfg, principal)
+		}
 		if cfg.ccAPI == CCAPIV2 {
 			// One resolution of the path names both the model and the key a
 			// migration is compared against.

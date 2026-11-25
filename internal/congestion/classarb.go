@@ -216,6 +216,95 @@ func (a *ClassArbiter) PermitAt(now monotime.Time, maxBytes quiccongestion.ByteC
 	return p
 }
 
+// Select normalises the deficits and returns the turn the path's demand
+// gives: the highest-priority class with eligible demand and a positive
+// deficit, or ClassExempt when no class has demand. It issues nothing.
+func (a *ClassArbiter) Select() quiccongestion.SendClass {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.normalize()
+	for _, c := range scheduledClasses {
+		if a.demand[c] && a.deficit[c] > 0 {
+			return c
+		}
+	}
+	return quiccongestion.ClassExempt
+}
+
+// SelectAmong returns the highest-priority class in mask that has demand and
+// a positive deficit; ClassExempt when no class in mask has demand. A path
+// controller uses it when another attachment's claim on the path's turn has
+// lapsed, to serve the asking attachment from its own demand.
+//
+// If no class in mask has credit, the classes in mask with demand are
+// replenished -- whole rounds of their quanta, until one is positive -- as
+// normalize does for the path. normalize itself cannot: the class holding
+// the lapsed claim still has demand and credit, so no round ends while it
+// is stalled, and without this the asking attachment would fall back to its
+// highest-priority class every time and starve the others it has.
+func (a *ClassArbiter) SelectAmong(mask [quiccongestion.NumSendClasses]bool) quiccongestion.SendClass {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.normalize()
+	if c, ok := a.positiveAmong(mask); ok {
+		return c
+	}
+	rounds := int64(-1)
+	for _, c := range scheduledClasses {
+		if !mask[c] || !a.demand[c] {
+			continue
+		}
+		step := a.weights[c] * a.quantum
+		need := (1 - a.deficit[c] + step - 1) / step
+		if rounds < 0 || need < rounds {
+			rounds = need
+		}
+	}
+	if rounds < 0 {
+		return quiccongestion.ClassExempt
+	}
+	for _, c := range scheduledClasses {
+		if mask[c] && a.demand[c] {
+			a.deficit[c] += rounds * a.weights[c] * a.quantum
+		}
+	}
+	c, _ := a.positiveAmong(mask)
+	return c
+}
+
+func (a *ClassArbiter) positiveAmong(mask [quiccongestion.NumSendClasses]bool) (quiccongestion.SendClass, bool) {
+	for _, c := range scheduledClasses {
+		if mask[c] && a.demand[c] && a.deficit[c] > 0 {
+			return c, true
+		}
+	}
+	return quiccongestion.ClassExempt, false
+}
+
+// PermitTurn issues a permit for a turn already chosen. With fill, the other
+// classes with demand and a positive deficit may fill the rest of the packet
+// up to their deficit; without it the packet carries the turn's class only,
+// which is what a permit that relies on borrowed budget must do.
+func (a *ClassArbiter) PermitTurn(turn quiccongestion.SendClass, maxBytes quiccongestion.ByteCount, fill bool) quiccongestion.Permit {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	p := quiccongestion.Permit{OK: true, MaxBytes: maxBytes, Turn: turn}
+	if turn == quiccongestion.ClassExempt {
+		p.Turn = quiccongestion.ClassControl
+		return p
+	}
+	a.turns[turn]++
+	if !fill {
+		return p
+	}
+	for _, c := range scheduledClasses {
+		if c != turn && a.demand[c] && a.deficit[c] > 0 {
+			p.Fill[c] = quiccongestion.ByteCount(a.deficit[c])
+		}
+	}
+	return p
+}
+
 // OnSent charges each class for the bytes a packet carried of it.
 func (a *ClassArbiter) OnSent(classBytes [quiccongestion.NumSendClasses]quiccongestion.ByteCount) {
 	a.mu.Lock()

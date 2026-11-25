@@ -68,8 +68,18 @@ type tuicBandwidthEstimator struct {
 	// packetStates. Packet numbers only increase, so it turns removeObsolete
 	// from a scan of everything in flight into a walk of what is actually
 	// being dropped. See there for what that cost.
-	lowestState        quiccongestion.PacketNumber
-	lowestKnown        bool
+	lowestState quiccongestion.PacketNumber
+	lowestKnown bool
+	// retireByFate turns the watermark off: states leave the table only when
+	// the owner of the numbering says their packet's fate is final (retire),
+	// when they are acknowledged, or through the memory guard. A path
+	// controller numbers the packets of several connections in one send
+	// order, and their acknowledgements arrive in no order relative to each
+	// other: a watermark derived from one connection's largest acknowledgement
+	// would delete the states of the others' packets still in flight, whose
+	// acknowledgements would then be state misses and their bytes never
+	// counted as delivered.
+	retireByFate       bool
 	legacyPrevAcked    uint64
 	legacyPrevAckTime  monotime.Time
 	legacyPrevSent     uint64
@@ -145,7 +155,10 @@ func (e *tuicBandwidthEstimator) onSentPacket(now monotime.Time, number quiccong
 		e.lastAckedSentTime = now
 		e.totalSentAtAck = e.totalSent
 	}
-	if len(e.packetStates) >= tuicMaxSendStates {
+	// A retireByFate table is bounded by its owner, which retires a state
+	// whenever it gives up on the packet's fate; pruning here would delete
+	// states whose fates the owner still accepts.
+	if !e.retireByFate && len(e.packetStates) >= tuicMaxSendStates {
 		e.pruneStates()
 	}
 	if !e.lowestKnown {
@@ -199,6 +212,9 @@ func (e *tuicBandwidthEstimator) onLost(number quiccongestion.PacketNumber) tuic
 // only taken while the range is no longer than the map; past that the scan is
 // the cheaper of the two and is bounded by tuicMaxSendStates.
 func (e *tuicBandwidthEstimator) removeObsolete(leastUnacked quiccongestion.PacketNumber) {
+	if e.retireByFate {
+		return
+	}
 	if len(e.packetStates) == 0 {
 		e.lowestState, e.lowestKnown = leastUnacked, true
 		return
@@ -216,6 +232,13 @@ func (e *tuicBandwidthEstimator) removeObsolete(leastUnacked quiccongestion.Pack
 		}
 	}
 	e.lowestState, e.lowestKnown = leastUnacked, true
+}
+
+// retire drops the state of a packet whose fate is final without an
+// acknowledgement: lost beyond correction, discarded, or expired. It is how a
+// retireByFate estimator's table shrinks.
+func (e *tuicBandwidthEstimator) retire(number quiccongestion.PacketNumber) {
+	delete(e.packetStates, number)
 }
 
 // bandwidthSampleTrace is one delivery-rate sample with the two quantities it

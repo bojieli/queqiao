@@ -19,6 +19,10 @@ import (
 // and so the model.
 type connPathModel struct {
 	model atomic.Pointer[pathmodel.PathModel]
+	// datagramBurst, if set, supplies the burst factor of the datagram
+	// substrate's own loss (congestion=path; design §4.2, §9), which the
+	// coded path sizes parity from in place of the path-wide figure.
+	datagramBurst atomic.Pointer[func() (float64, bool)]
 }
 
 var _ pathmodel.Model = (*connPathModel)(nil)
@@ -27,7 +31,18 @@ func (m *connPathModel) Report(member pathmodel.Member, o pathmodel.Observation)
 	return m.model.Load().Report(member, o)
 }
 
-func (m *connPathModel) Current() pathmodel.State { return m.model.Load().Current() }
+func (m *connPathModel) Current() pathmodel.State {
+	st := m.model.Load().Current()
+	if f := m.datagramBurst.Load(); f != nil {
+		if b, ok := (*f)(); ok {
+			st.BurstFactor = b
+		}
+	}
+	return st
+}
+
+// setDatagramBurst installs the datagram burst factor's source.
+func (m *connPathModel) setDatagramBurst(f func() (float64, bool)) { m.datagramBurst.Store(&f) }
 
 var connPathModels sync.Map // *quic.Conn -> *connPathModel
 
@@ -42,6 +57,27 @@ func pathModelOf(conn *quic.Conn) *connPathModel {
 	actual, loaded := connPathModels.LoadOrStore(conn, created)
 	if !loaded {
 		context.AfterFunc(conn.Context(), func() { connPathModels.Delete(conn) })
+	}
+	return actual.(*connPathModel)
+}
+
+// pathModelOfKey returns the connection's path model reference, creating
+// it on first use with the model for key rather than the peer's, so a
+// connection whose readers belong to another key (congestion=path's
+// principal-scoped model) never creates the peer-keyed one.
+func pathModelOfKey(conn *quic.Conn, key string) *connPathModel {
+	if m, ok := connPathModels.Load(conn); ok {
+		cm := m.(*connPathModel)
+		cm.model.Store(pathmodel.Shared(key))
+		return cm
+	}
+	created := &connPathModel{}
+	created.model.Store(pathmodel.Shared(key))
+	actual, loaded := connPathModels.LoadOrStore(conn, created)
+	if !loaded {
+		context.AfterFunc(conn.Context(), func() { connPathModels.Delete(conn) })
+	} else {
+		actual.(*connPathModel).model.Store(pathmodel.Shared(key))
 	}
 	return actual.(*connPathModel)
 }
