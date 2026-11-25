@@ -25,6 +25,11 @@ type fakeClassStream struct {
 
 	hold    chan struct{} // non-nil: a non-CONTROL write waits on it
 	holding chan struct{} // signalled when a write starts waiting
+
+	// pause, if set, holds setBoost(true) until it is closed; boosting is
+	// signalled when it starts waiting.
+	pause    chan struct{}
+	boosting chan struct{}
 }
 
 type fakeWrite struct {
@@ -53,6 +58,13 @@ func (s *fakeClassStream) writeClass(p []byte, class quiccongestion.SendClass) (
 
 func (s *fakeClassStream) setBoost(on bool) bool {
 	s.mu.Lock()
+	pause := s.pause
+	s.mu.Unlock()
+	if on && pause != nil {
+		s.boosting <- struct{}{}
+		<-pause
+	}
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.boost == on {
 		panic("a boost transition repeated: transitions are not serialised")
@@ -61,6 +73,8 @@ func (s *fakeClassStream) setBoost(on bool) bool {
 	s.boostLog = append(s.boostLog, on)
 	return true
 }
+
+func (s *fakeClassStream) classed() bool { return true }
 
 func (s *fakeClassStream) boosted() bool {
 	s.mu.Lock()
@@ -252,5 +266,76 @@ func TestBoostTransitionsAreSerialised(t *testing.T) {
 	}
 	if s.boosted() || b.count() != 0 {
 		t.Fatal("the boost did not end with the last waiter")
+	}
+}
+
+// A control frame that has announced it is waiting keeps its place: while
+// its boost call is still in progress the DATA write ahead of it finishes,
+// and a later DATA write must not take writeMu before the control frame.
+func TestAnnouncedControlFrameKeepsItsPlaceAheadOfLaterData(t *testing.T) {
+	s := newFakeClassStream()
+	fc := newFrameConn(s)
+	s.hold = make(chan struct{})
+	s.pause = make(chan struct{})
+	s.boosting = make(chan struct{}, 1)
+
+	first := make(chan error, 1)
+	go func() { first <- fc.WriteContext(context.Background(), dataFrame(protocol.ClassBulk, 1000)) }()
+	<-s.holding // the first DATA write holds writeMu
+
+	ack := make(chan error, 1)
+	go func() { ack <- fc.WriteContext(context.Background(), ackFrame()) }()
+	<-s.boosting // the ACK has announced itself and is inside setBoost
+
+	// The first DATA write finishes while the boost call is paused.
+	s.mu.Lock()
+	hold := s.hold
+	s.hold = nil
+	s.mu.Unlock()
+	close(hold)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	second := make(chan error, 1)
+	go func() { second <- fc.WriteContext(context.Background(), dataFrame(protocol.ClassBulk, 2000)) }()
+	time.Sleep(50 * time.Millisecond)
+	if _, writes := s.log(); len(writes) != 1 {
+		t.Fatalf("a later DATA write went ahead of the waiting ACK: %+v", writes)
+	}
+	close(s.pause)
+	if err := <-ack; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	_, writes := s.log()
+	if len(writes) != 3 || writes[1].class != quiccongestion.ClassControl || writes[2].n <= writes[0].n {
+		t.Fatalf("writes %+v, want first DATA, the ACK, then the later DATA", writes)
+	}
+}
+
+// A control write whose context is already cancelled does not boost the
+// stream while another write holds writeMu: it could never proceed, and a
+// boost would promote the buffered DATA ahead of it for nothing.
+func TestCancelledControlWriteDoesNotBoost(t *testing.T) {
+	s := newFakeClassStream()
+	fc := newFrameConn(s)
+	s.hold = make(chan struct{})
+	data := make(chan error, 1)
+	go func() { data <- fc.WriteContext(context.Background(), dataFrame(protocol.ClassBulk, 1000)) }()
+	<-s.holding
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := fc.WriteContext(ctx, ackFrame()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled control write returned %v", err)
+	}
+	if boostLog, _ := s.log(); len(boostLog) != 0 {
+		t.Fatalf("a cancelled control write toggled the boost: %v", boostLog)
+	}
+	close(s.hold)
+	if err := <-data; err != nil {
+		t.Fatal(err)
 	}
 }
