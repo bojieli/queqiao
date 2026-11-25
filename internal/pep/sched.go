@@ -173,9 +173,9 @@ func (b *controlBoost) count() int {
 // the lane's stream while it waits; boosted says so, and the caller leaves
 // once the frame has been written. A cancelled wait leaves at once.
 //
-// A control frame that has to wait first announces itself, then boosts, then
-// waits: a DATA writer that arrives after the announcement waits for it, so
-// it cannot take writeMu between the boost and the control frame. A control
+// A control frame first announces itself, then tries writeMu, and if it is
+// held boosts and waits: a DATA writer that arrives after the announcement
+// waits for it, so it cannot take writeMu ahead of the control frame. A control
 // write whose context is already done never boosts, since boosting would
 // promote buffered DATA that a write which cannot proceed has no claim on.
 func (c *frameConn) lockWrite(ctx context.Context, f protocol.Frame) (boosted bool, err error) {
@@ -193,10 +193,15 @@ func (c *frameConn) lockWrite(ctx context.Context, f protocol.Frame) (boosted bo
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	// Announce before looking at writeMu: a DATA writer checks for
+	// announced control frames before it locks, so once this frame finds
+	// writeMu held, no DATA writer that arrives after it -- including the
+	// holder's next chunk -- can take writeMu first.
+	c.boost.announce()
 	if c.writeMu.TryLock() {
+		c.boost.settle()
 		return false, nil
 	}
-	c.boost.announce()
 	boosted = c.boost.enter(cw)
 	err = lock()
 	c.boost.settle()

@@ -339,3 +339,46 @@ func TestCancelledControlWriteDoesNotBoost(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The holder's next chunk cannot pass a control frame that found writeMu
+// held, even when it arrives between the control frame's failed attempt and
+// its boost: the announcement comes first.
+func TestHoldersNextChunkWaitsForTheAnnouncedControlFrame(t *testing.T) {
+	s := newFakeClassStream()
+	fc := newFrameConn(s)
+	s.hold = make(chan struct{})
+	s.pause = make(chan struct{})
+	s.boosting = make(chan struct{}, 1)
+	release := make(chan struct{})
+	chunks := make(chan error, 2)
+	go func() {
+		// One DATA writer, two chunks back to back.
+		chunks <- fc.WriteContext(context.Background(), dataFrame(protocol.ClassBulk, 1000))
+		<-release
+		chunks <- fc.WriteContext(context.Background(), dataFrame(protocol.ClassBulk, 2000))
+	}()
+	<-s.holding
+	ack := make(chan error, 1)
+	go func() { ack <- fc.WriteContext(context.Background(), ackFrame()) }()
+	<-s.boosting
+	s.mu.Lock()
+	hold := s.hold
+	s.hold = nil
+	s.mu.Unlock()
+	close(hold)
+	if err := <-chunks; err != nil {
+		t.Fatal(err)
+	}
+	close(release) // the next chunk arrives while the boost call is paused
+	time.Sleep(50 * time.Millisecond)
+	close(s.pause)
+	if err := <-ack; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-chunks; err != nil {
+		t.Fatal(err)
+	}
+	if _, writes := s.log(); len(writes) != 3 || writes[1].class != quiccongestion.ClassControl {
+		t.Fatalf("writes %+v, want the ACK before the holder's next chunk", writes)
+	}
+}
