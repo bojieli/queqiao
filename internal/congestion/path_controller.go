@@ -1201,8 +1201,12 @@ func (c *PathController) demote(a *PathAttachment) []func() {
 			c.discard(a, key)
 		}
 	}
-	c.advance(c.now)
-	return c.publishObserved(a, c.now, nil)
+	// Demotion can be found from transport progress before the callback's
+	// own time is clamped in: read the clock, so a publication settles the
+	// balance at the demotion's time, not the previous event's.
+	now := c.clamp(c.clock())
+	c.advance(now)
+	return c.publishObserved(a, now, nil)
 }
 
 // promote makes a COUNTED again with its current gauge.

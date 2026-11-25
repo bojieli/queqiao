@@ -1842,3 +1842,33 @@ func TestReleasingNoOutcomePublishesNothing(t *testing.T) {
 		t.Fatalf("a discard that released no outcome published %d measurements", s.Publications)
 	}
 }
+
+// A demotion found from transport progress, before the callback's own time
+// is taken in, publishes with the balance settled at the demotion's time.
+func TestADemotionFromProgressSettlesAtItsOwnTime(t *testing.T) {
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	now := base()
+	clock := now
+	c.clock = func() monotime.Time { return clock }
+	var tp TransportProgress
+	a := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+	a.a = c.Attach(nil, nil)
+	a.a.SetTransportProgress(func() TransportProgress { return tp })
+	a.a.OnAttach(now, 0, 1200, func() {})
+	a.a.SetRTTStatsProvider(&fixedRTT{min: 100 * time.Millisecond, smoothed: 100 * time.Millisecond})
+	b := attachPC(t, c, now)
+	a.send(now, 1200) // holds the head of the send order
+	for range 40 {
+		b.send(now, 1200)
+	}
+	b.event(now.Add(50*time.Millisecond), numbers(0, 40), numbers(40, 40))
+	clock = now.Add(80 * time.Millisecond)
+	tp.PTOExpiries = pathProbingPTOExpiries
+	a.a.OnDemand(quiccongestion.Demand{}) // a callback without a time
+	c.mu.Lock()
+	settled := c.law.pacer.lastSentTime
+	c.mu.Unlock()
+	if settled != clock {
+		t.Fatalf("the demotion's publication settled the balance at %v, not at the demotion (%v)", settled, clock)
+	}
+}
