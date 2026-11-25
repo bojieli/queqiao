@@ -34,7 +34,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
 import ab_workloads  # noqa: E402
-import carrier_shadow_summary as shadow  # noqa: E402
+import generic_metrics as gm  # noqa: E402
 
 GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "gates.ini")
 CLK_TCK = 100  # ticks per second in the runner's CPU samples
@@ -347,65 +347,17 @@ def fetch_failed(campaign: str) -> List[str]:
 LOG_MEASURES = ("queue_p90_ms", "reissued_per_source", "transit_p50_s", "transit_p90_s", "cpu_p90",
                 "false_promotion_rate")
 
-CREDIT_BUCKET = re.compile(r'^queqiao_credit_delay_seconds_bucket\{le="([^"]+)"\}$')
 
 
-def histogram_deltas(pre: Dict[str, float], post: Dict[str, float]) -> List[Tuple[float, float]]:
-    """The credit delay histogram's movement between two scrapes, as
-    (upper bound s, cumulative count) pairs in bound order; empty when the
-    build does not export it (in either scrape)."""
-    out = []
-    for k, v in post.items():
-        m = CREDIT_BUCKET.match(k)
-        if m and k in pre:
-            le = float("inf") if m.group(1) == "+Inf" else float(m.group(1))
-            out.append((le, v - pre[k]))
-    return sorted(out)
-
-
-def histogram_quantile(q: float, cumulative: Sequence[Tuple[float, float]]) -> float:
-    """The q-quantile of a cumulative histogram, interpolated linearly inside
-    its bucket (as Prometheus does); a quantile in the +Inf bucket is the last
-    finite bound. NaN with no samples."""
-    if not cumulative or cumulative[-1][1] <= 0:
-        return float("nan")
-    rank = q * cumulative[-1][1]
-    lo_bound, lo_count = 0.0, 0.0
-    for le, c in cumulative:
-        if c >= rank:
-            if le == float("inf"):
-                return lo_bound
-            if c == lo_count:
-                return le
-            return lo_bound + (le - lo_bound) * (rank - lo_count) / (c - lo_count)
-        lo_bound, lo_count = le, c
-    return lo_bound
-
-
-def credit_delay_p95(pairs: Sequence[Tuple[Dict[str, float], Dict[str, float]]]) -> float:
-    """Sender-side credit delay p95 (section 15.3) over a trial, pooled over
-    its endpoints (each times the direction it sends), from each endpoint's
-    histogram scraped before and after it. NaN when any endpoint lacks the
-    histogram: a pool of some endpoints is not the trial's."""
-    pooled: Dict[float, float] = {}
-    for pre, post in pairs:
-        d = histogram_deltas(pre, post)
-        if not d:
-            return float("nan")
-        for le, c in d:
-            pooled[le] = pooled.get(le, 0.0) + c
-    return histogram_quantile(0.95, sorted(pooled.items()))
-
-
-def false_promotions(pairs: Sequence[Tuple[Dict[str, float], Dict[str, float]]], observed: bool) -> float:
-    """The shadow false-promotion rate over a trial (section 15.4; the
-    carrier-shadow summary's definition), from the observer's counters at
-    every endpoint scraped before and after it. Needs the observer
-    (--carrier-shadow) on at every endpoint: otherwise NaN, not zero."""
-    d = lambda pre, post, k: post.get(k, float("nan")) - pre.get(k, float("nan"))
-    false_ = sum(d(a, b, "queqiao_carrier_shadow_false_replacements_total") for a, b in pairs)
-    promoted = sum(d(a, b, 'queqiao_carrier_shadow_transitions_total{to="replace"}') for a, b in pairs)
-    return shadow.false_promotion_rate(false_, promoted, observed and bool(pairs))
+def pooled_generic(trials: Sequence["Trial"], key: str) -> Optional[float]:
+    """Credit delay p95 and the false-promotion rate of a set of trials (an
+    arm's block), from their pooled histograms and promotion counts rather
+    than an average of per-trial figures; None for any other measure."""
+    if key == "credit_delay_p95_s":
+        return gm.quantile(0.95, gm.pool([t.m.get("_credit_hist") for t in trials]))
+    if key == "false_promotion_rate":
+        return gm.rate(gm.pooled_promotions([t.m.get("_promotions") for t in trials]))
+    return None
 
 
 def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial],
@@ -593,7 +545,7 @@ def cpu_p90(files: List[str], t: Trial) -> float:
 # its effective configuration per endpoint).
 EFFECTIVE: Dict[Tuple[str, str], set] = {}
 # Whether each endpoint of an (arm, block tag) ran the carrier-shadow
-# observer, from its runtime configuration record(s).
+# observer, and its k_p, from its runtime configuration record(s).
 SHADOW: Dict[Tuple[str, str, str], set] = {}
 
 
@@ -652,7 +604,8 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
             for r in recs:
                 if r.get("msg") == "runtime configuration":
                     EFFECTIVE.setdefault((t.arm, "gateway"), set()).add(effective(r))
-                    SHADOW.setdefault((t.arm, t.tag, "gateway"), set()).add(r.get("carrier_shadow") is True)
+                    SHADOW.setdefault((t.arm, t.tag, "gateway"), set()).add(
+                        (r.get("carrier_shadow") is True, gm.effective_kp(r)))
             for r in recs:
                 try:
                     r["_t"] = ts(r["time"])
@@ -673,7 +626,8 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
                 if r.get("msg") == "runtime configuration":
                     EFFECTIVE.setdefault((t.arm, "client"), set()).add(effective(r))
                     t.m["client_transport"] = r.get("transport", "")
-                    SHADOW.setdefault((t.arm, t.tag, f"client-{c}"), set()).add(r.get("carrier_shadow") is True)
+                    SHADOW.setdefault((t.arm, t.tag, f"client-{c}"), set()).add(
+                        (r.get("carrier_shadow") is True, gm.effective_kp(r)))
             for r in crecs:
                 try:
                     r["_t"] = ts(r["time"])
@@ -709,18 +663,23 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         # The generic secondaries from every endpoint's /metrics around the
         # trial: the gateway (the download's sender) and the path's client
         # (the upload's), each timing what it sends.
-        ends = [(pre, post)] + list(zip(cpre, cpost)) if clients else [(pre, post)]
-        t.m["credit_delay_p95_s"] = credit_delay_p95(ends)
+        ends = [(pre, post)] + [(a, b) for a, b in zip(cpre, cpost)][:len(clients)]
+        t.m["_credit_hist"] = gm.credit_histogram(ends)
+        t.m["credit_delay_p95_s"] = gm.quantile(0.95, t.m["_credit_hist"])
         # The observer must have been on at every endpoint the trial used,
-        # as each one's runtime configuration record says.
-        names = ["gateway"] + [f"client-{c}" for c in clients]
-        on = all(SHADOW.get((t.arm, t.tag, n)) == {True} for n in names)
-        t.m["false_promotion_rate"] = false_promotions(ends, on)
+        # as each one's runtime configuration record says, with one k_p.
+        kps = []
+        for n in ["gateway"] + [f"client-{c}" for c in clients]:
+            seen = SHADOW.get((t.arm, t.tag, n)) or set()
+            kps.append(next(iter(seen))[1] if len(seen) == 1 and next(iter(seen))[0] else None)
+        t.m["_promotions"] = gm.promotions(ends, kps)
+        t.m["false_promotion_rate"] = gm.rate(t.m["_promotions"])
         # A trial whose logs were not all fetched has partial telemetry: a
         # finite number from a subset is not a measurement of the trial.
         if any(f"-{t.tag}" in x and (f"/gw-{t.arm}/" in x or f"-{t.arm}/" in x) for x in failed):
             for k in LOG_MEASURES:
                 t.m[k] = float("nan")
+            t.m["_promotions"] = None      # whether the observer ran is in the logs
             t.m["_transit"] = []
     return "/".join(sorted(method)) or "none"
 
@@ -744,6 +703,9 @@ def block_outcome(ts_: List[Trial]) -> float:
 def block_metric(ts_: List[Trial], key: str) -> float:
     """The arm's mean over its trials in the block; NaN unless every trial
     has the measure, so a block cannot be judged on half its evidence."""
+    pooled = pooled_generic(ts_, key)
+    if pooled is not None:
+        return pooled
     vals = [t.m.get(key, float("nan")) for t in ts_]
     if not vals or any(v is None or v != v for v in vals):
         return float("nan")
@@ -1040,6 +1002,33 @@ def report(campaign: str, gates: dict, interim: bool = False,
                         out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {n_} samples | "
                                    f"{fmt(mean_d, '.4g')} | n/a | {fmt(bl, '.4g')} | {verdict} |")
                         continue
+                    events = [(block_tails(path, b, cand).get(key), block_tails(path, b, main).get(key)) for b in common]
+                    if any(e is not None and e[0] is None for pair in events for e in pair):
+                        # A proportion over events (the false-promotion rate):
+                        # pooled over every block's events and tested by
+                        # resampling blocks. A block without the evidence in
+                        # either arm is unmeasured; an arm with no event at all
+                        # has a zero denominator: reported, not gated.
+                        have = [(c_[1], m_[1]) for c_, m_ in events if c_ is not None and m_ is not None]
+                        n_c, n_m = sum(len(x) for x, _ in have), sum(len(y) for _, y in have)
+                        mean_d = lo_ = float("nan")
+                        if len(have) < max(need, 2):
+                            verdict = "n/a"
+                        elif not n_c or not n_m:
+                            verdict = "reported"
+                        else:
+                            a_ = sq.alpha_at(len(have)) if sq else gates["alpha"]
+                            mean_d, lo_, hi_ = st.pooled_quantile_bounds(
+                                [x for x, _ in have], [y for _, y in have], None,
+                                lambda c__, m__: RULES[kind](c__, m__, values), a_, gates["resamples"], gates["seed"])
+                            dec = ("pass" if lo_ > 0 else
+                                   "fail" if hi_ < 0 or (sq and len(have) >= sq.cap) or not sq else "continue")
+                            verdict = decision_verdict(dec, undecided_ok)
+                        verdicts[(path, cand, f"rule:{key}")] = verdict
+                        out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {len(have)} "
+                                   f"(pooled, {n_c} and {n_m} events) | {fmt(mean_d, '.4g')} | n/a | {fmt(lo_, '.4g')} | "
+                                   f"{verdict + (' (no promotion in an arm: zero denominator)' if verdict == 'reported' else '')} |")
+                        continue
                     dec = None
                     # Only blocks whose measure is valid in both arms and that
                     # have samples on both sides go into a pooled tail.
@@ -1314,7 +1303,7 @@ def cell_verdicts(verdicts: dict, path: str, cand: str) -> Dict[str, str]:
                      "VOID" if "VOID" in vs else
                      "INCOMPLETE" if "n/a" in vs else
                      "FAIL" if "**FAIL**" in vs else
-                     "PASS" if all(v in ("pass", "**PASS**") for v in vs) else "INCOMPLETE")
+                     "PASS" if all(v in ("pass", "**PASS**", "reported") for v in vs) else "INCOMPLETE")
     return out
 
 

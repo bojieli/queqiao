@@ -342,17 +342,27 @@ unmeasured.
 
 Sender-side credit delay p95 comes from every endpoint's
 `queqiao_credit_delay_seconds` histogram, scraped before and after each
-trial. Each endpoint times what it sends: from a chunk's last byte being
-taken by the carrier to the flow acknowledgement that covers it, minus the
-path's minimum round trip, one chunk per flow at a time. The trial's p95
-pools the gateway's and the client's movement. A build without the
-histogram leaves it unmeasured. The shadow false-promotion rate is the
-carrier-shadow observer's promotions (entries into REPLACE) that were
-acknowledged again afterwards, over all its promotions, from the same
-scrapes; a trial with no promotion has a rate of 0. It needs
-`--carrier-shadow` on every endpoint of both arms, as each endpoint's runtime
-configuration record shows; otherwise it is unmeasured.
-`carrier_shadow_summary.py` reports the same rate from the logs.
+trial. Each endpoint times what it sends over a QUIC stream: from a chunk's
+last byte being taken by the carrier to the flow acknowledgement that covers
+it, minus the path's minimum round trip, one chunk per flow at a time. An
+arm's block p95 is taken over the histograms of its trials, gateway and
+client, pooled, never as a mean of per-trial percentiles; a block with fewer
+than 20 samples per arm is pooled over blocks like any sparse tail. A build
+without the histogram, or a scrape that is truncated or went back (a
+restart), leaves it unmeasured.
+
+The shadow false-promotion rate is, from the same scrapes, the
+carrier-shadow observer's resolved no-progress episodes that reached its
+`k_p` (the promotions the design would have made) and the share of them
+that then progressed again, so that the promotion would have been in vain.
+Each episode is counted once, when it is resolved, in the numerator and the
+denominator together. It is the calibration rate at `n = k_p` that
+`carrier_shadow_summary.py` prints from the logs. Promotions are rare, so
+the rate is pooled over every block's promotions and tested by resampling
+blocks; an arm with no promotion at all has a zero denominator, and the rate
+is reported, not gated (design section 15.4). It needs `--carrier-shadow` on
+every endpoint of both arms, as each endpoint's runtime configuration
+record shows; otherwise it is unmeasured.
 
 The last line per candidate is the overall verdict:
 

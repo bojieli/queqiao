@@ -17,6 +17,11 @@ import (
 // segment per round trip: the next chunk the carrier takes after a sample
 // completes starts the next one. A chunk the flow later re-issues keeps its
 // first take time, so a repair's cost is part of the delay it caused.
+//
+// Only a QUIC stream write is timed. Its return is the moment the carrier
+// took the bytes; a coded write returns when the frame is queued for the
+// code, before its symbols are registered or even sent, and a TCP lane has
+// no path minimum round trip to subtract.
 type creditSampler struct {
 	pending atomic.Bool
 	mu      sync.Mutex
@@ -28,9 +33,10 @@ type creditSampler struct {
 
 // noteCarrierTook is called when a lane's carrier has taken a DATA frame.
 func (f *multipathFlow) noteCarrierTook(lane *mpLane, sequence uint64, n int) {
-	if f.metrics == nil || n <= 0 || f.credit.pending.Load() {
+	if f.metrics == nil || n <= 0 || lane.kind != TransportQUIC || f.credit.pending.Load() {
 		return
 	}
+	taken := time.Now()
 	minRTT := time.Duration(f.minRTTNS.Load())
 	if minRTT <= 0 {
 		// The flow has not refreshed its telemetry yet: ask this lane.
@@ -39,14 +45,23 @@ func (f *multipathFlow) noteCarrierTook(lane *mpLane, sequence uint64, n int) {
 		}
 	}
 	if minRTT <= 0 {
-		// No path minimum to subtract (a TCP lane, or no round trip yet):
-		// a sample would not mean the same thing, so none is taken.
+		// No round trip measured yet: nothing to subtract, so no sample.
+		return
+	}
+	end := sequence + uint64(n)
+	// Armed under replayMu, the lock acknowledgements are applied under,
+	// so an acknowledgement is either already reflected here or will find
+	// the sample armed. A chunk already covered (a re-issue of acknowledged
+	// bytes) has no covering acknowledgement still to come.
+	f.replayMu.Lock()
+	defer f.replayMu.Unlock()
+	if f.acked >= end || f.ackTrack != nil && f.ackTrack.Covered(sequence, end) {
 		return
 	}
 	c := &f.credit
 	c.mu.Lock()
 	if !c.pending.Load() {
-		c.start, c.end, c.taken, c.minRTT = sequence, sequence+uint64(n), time.Now(), minRTT
+		c.start, c.end, c.taken, c.minRTT = sequence, end, taken, minRTT
 		c.pending.Store(true)
 	}
 	c.mu.Unlock()

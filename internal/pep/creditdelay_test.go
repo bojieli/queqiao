@@ -17,8 +17,8 @@ import (
 // One sample: from the carrier taking a chunk to the acknowledgement that
 // covers it, minus the path's minimum round trip. An acknowledgement that
 // does not cover the chunk leaves the sample open, a second take while it is
-// open does not restart it, and a lane with no minimum round trip (TCP, or
-// none measured yet) takes no sample at all.
+// open does not restart it, and neither a TCP lane nor a chunk that is
+// already acknowledged starts one.
 func TestCreditDelayIsTimedFromTheCarriersTakeToTheCoveringACK(t *testing.T) {
 	registry := metrics.New()
 	local, remote := net.Pipe()
@@ -30,7 +30,7 @@ func TestCreditDelayIsTimedFromTheCarriersTakeToTheCoveringACK(t *testing.T) {
 	})}
 	tcp := &mpLane{id: 1, kind: TransportTCP, fc: newFrameConn(&statsConn{})}
 
-	flow.noteSent(0, 3000)
+	flow.noteSent(0, 5000)
 	flow.noteCarrierTook(tcp, 0, 1000)
 	if flow.credit.pending.Load() {
 		t.Fatal("a lane without a minimum round trip started a sample")
@@ -60,8 +60,20 @@ func TestCreditDelayIsTimedFromTheCarriersTakeToTheCoveringACK(t *testing.T) {
 	if flow.credit.pending.Load() {
 		t.Fatal("the completed sample is still pending")
 	}
+	// A re-issue of bytes already acknowledged has no covering
+	// acknowledgement still to come: it arms nothing.
+	flow.noteCarrierTook(quic, 1000, 1000)
+	if flow.credit.pending.Load() {
+		t.Fatal("a chunk already covered armed a sample")
+	}
+	// A TCP lane is not timed even once the flow has a QUIC minimum cached.
+	flow.minRTTNS.Store(int64(minRTT))
+	flow.noteCarrierTook(tcp, 4000, 1000)
+	if flow.credit.pending.Load() {
+		t.Fatal("a TCP lane armed a sample with the QUIC minimum")
+	}
+	flow.minRTTNS.Store(0)
 	// Selective coverage completes a sample too.
-	flow.noteSent(3000, 1000)
 	flow.noteCarrierTook(quic, 3000, 1000)
 	if _, err := flow.acknowledgeCoverage(2000, false, [][2]uint64{{3000, 4000}}); err != nil {
 		t.Fatal(err)

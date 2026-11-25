@@ -129,19 +129,6 @@ def wilson_upper(successes: int, total: int, z: float = 1.96) -> float | None:
     return min(1.0, (centre + spread) / (1 + z * z / total))
 
 
-def false_promotion_rate(false_replacements: float, promotions: float, observed: bool = True) -> float:
-    """The shadow false-promotion rate (design section 15.4): of the carriers
-    the observer would have promoted a standby for (entries into REPLACE),
-    the share that were acknowledged again afterwards, so that the promotion
-    would have been made in vain. With no promotion at all no promotion was
-    false, which is 0, not missing; without the observer it is NaN."""
-    if not observed or promotions != promotions or false_replacements != false_replacements:
-        return float("nan")
-    if promotions <= 0:
-        return 0.0
-    return min(1.0, max(0.0, false_replacements / promotions))
-
-
 class Endpoint:
     """Every carrier-shadow record one endpoint wrote, in file order."""
 
@@ -152,6 +139,9 @@ class Endpoint:
         # The latest timestamp of any record, shadow or not: where the
         # capture really ends, for deciding what is censored.
         self.capture_end = 0.0
+        # The endpoint's runtime configuration record (the last one read):
+        # whether the observer ran, and its thresholds.
+        self.config: dict[str, Any] | None = None
 
     def load(self, paths: list[str], offset_s: float = 0.0) -> None:
         for path in paths:
@@ -161,6 +151,9 @@ class Endpoint:
                     if stamp is not None:
                         self.capture_end = max(self.capture_end, stamp - offset_s)
                     msg = record.get("msg")
+                    if msg == "runtime configuration":
+                        self.config = record
+                        continue
                     if not isinstance(msg, str) or not msg.startswith("carrier shadow"):
                         continue
                     at = parse_instant(record.get("time"))
@@ -251,9 +244,30 @@ def calibration(endpoint: Endpoint) -> dict[str, Any]:
         "carriers_ended": len(summarized), "open_carrier_episodes": open_episodes,
         "open_episodes_censored": open_censored, "rows": rows,
         "transitions": dict(transitions), "false_replacements": false_replacements,
-        "false_promotion_rate": false_promotion_rate(false_replacements, transitions.get("replace", 0)),
+        **promotion_rate(endpoint, rows, thresholds),
         "thresholds": [{"k_s": k[0], "k_p": k[1], "records": n} for k, n in thresholds.items()],
     }
+
+
+def promotion_rate(endpoint: Endpoint, rows: list[dict[str, Any]], thresholds: Counter) -> dict[str, Any]:
+    """The shadow false-promotion rate (design section 15.4): the calibration
+    row at the endpoint's own k_p, so a promotion is an episode that reached
+    k_p and was resolved, and a false one is such an episode that then
+    progressed. None when the observer cannot be shown to have run, when
+    k_p is not known, or when no promotion was resolved (a zero
+    denominator)."""
+    config = endpoint.config
+    observed = config.get("carrier_shadow") is True if config is not None else bool(endpoint.records)
+    if config is not None:
+        ks = int(config.get("carrier_shadow_ks") or 0) or 2
+        kp = int(config.get("carrier_shadow_kp") or 0) or max(4, ks)
+    else:
+        kps = {k[1] for k in thresholds if isinstance(k[1], int)}
+        kp = kps.pop() if len(kps) == 1 else None
+    row = rows[min(kp, BUCKETS) - 1] if observed and kp else None
+    return {"observer": observed, "k_p": kp,
+            "promotions_resolved": None if row is None else row["recovered"] + row["dead"],
+            "false_promotion_rate": None if row is None else row["false_rate"]}
 
 
 def open_carrier_records(endpoint: Endpoint, summarized: set) -> dict[tuple, list[dict[str, Any]]]:
@@ -771,8 +785,14 @@ def render(report: dict[str, Any], out) -> None:
         cal = report["calibration"][name]
         print(f"== {name}: probe-timeout episodes (k_s/k_p calibration)", file=out)
         print(f"   carriers ended {cal['carriers_ended']}, episodes from still-open carriers {cal['open_carrier_episodes']}, open at capture end (censored) {cal['open_episodes_censored']}", file=out)
-        print(f"   transitions {cal['transitions']}, false replacements {cal['false_replacements']} "
-              f"(false-promotion rate {cal['false_promotion_rate']:.3f})", file=out)
+        print(f"   transitions {cal['transitions']}, false replacements {cal['false_replacements']}", file=out)
+        if not cal["observer"]:
+            rate = "not measured: the observer did not run"
+        elif cal["false_promotion_rate"] is None:
+            rate = f"none resolved at k_p={cal['k_p']} (zero denominator)" if cal["k_p"] else "k_p unknown"
+        else:
+            rate = f"{cal['false_promotion_rate']:.3f} of {cal['promotions_resolved']} at k_p={cal['k_p']}"
+        print(f"   false-promotion rate: {rate}", file=out)
         print("   n   reached  recovered  dead  censored  P(recover|n)  upper95", file=out)
         for row in cal["rows"]:
             rate = "-" if row["false_rate"] is None else f"{row['false_rate']:.3f}"

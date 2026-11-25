@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import ab_campaign as ab
 import ab_stats as st
 import ab_workloads as w
+import generic_metrics as gm
 
 pa = __import__("sys").modules.get("ab_workload_phase_a")
 if pa is None:                                   # loaded alone (tests): import its sibling
@@ -310,6 +311,14 @@ TRIAL_TYPES = ("bulk", "mixed-67", "mixed-all")
 STAGE10_GENERIC = ("credit_delay_p95_s", "false_promotion_rate")
 
 
+def pooled_generic(ms: Sequence[dict], key: str) -> float:
+    """Credit delay p95 or the false-promotion rate over several trials'
+    measures, from their pooled histograms and promotion counts."""
+    if key == "credit_delay_p95_s":
+        return gm.quantile(0.95, gm.pool([m.get("_credit_hist") for m in ms]))
+    return gm.rate(gm.pooled_promotions([m.get("_promotions") for m in ms]))
+
+
 def campaign_stage(plan: dict) -> int:
     """The stage a minimal campaign gates (`[workload:minimal] stage`). A
     plan from before the setting has its default: 10 with trial type C,
@@ -386,6 +395,11 @@ class Minimal(pa._Scenario):
             if not pt:
                 continue
             for k in ks:
+                if k in STAGE10_GENERIC:
+                    # Pooled over the block's trials, never an average of
+                    # per-trial percentiles or rates.
+                    out[f"{ph}.{k}"] = pooled_generic([getattr(t, "m", {}) for t in pt], k)
+                    continue
                 vals = [getattr(t, "m", {}).get(k, float("nan")) for t in pt]
                 out[f"{ph}.{k}"] = (sum(vals) / len(vals) if all(v is not None and v == v for v in vals)
                                     else float("nan"))
@@ -537,7 +551,20 @@ class Minimal(pa._Scenario):
         return True
 
     def block_tails(self, trials, plan):
-        out: Dict[str, Tuple[float, List[float]]] = {}
+        out: Dict[str, Tuple[Optional[float], List[float]]] = {}
+        # The generic secondaries' raw evidence, for pooling over blocks:
+        # credit delay as samples (a p95), the promotions as 0/1 events (a
+        # proportion, q None). Absent when any of the type's trials lacks it.
+        for ph in self.generic:
+            ms = [getattr(t, "m", {}) for t in trials if getattr(t, "trial", "") == ph]
+            if not ms:
+                continue
+            h = gm.pool([m.get("_credit_hist") for m in ms])
+            if h is not None:
+                out[f"{ph}.credit_delay_p95_s"] = (0.95, gm.samples(h))
+            ev = gm.outcomes(gm.pooled_promotions([m.get("_promotions") for m in ms]))
+            if ev is not None:
+                out[f"{ph}.false_promotion_rate"] = (None, ev)
         for ph in ("mixed-67", "mixed-all"):
             pt = [t for t in trials if getattr(t, "trial", "") == ph]
             if not pt:

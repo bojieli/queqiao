@@ -352,7 +352,8 @@ def pooled_quantile_bounds(cand_blocks: Sequence[Sequence[float]], main_blocks: 
     arms' pooled q-quantiles, and its one-sided (lower, upper) bounds at
     level alpha from a bootstrap that resamples blocks (both arms' samples
     of a block together), so the blocks stay the unit of analysis. Returns
-    (observed, lower, upper)."""
+    (observed, lower, upper). With q None the statistic is the pooled mean
+    (a proportion over events given as 0/1 samples)."""
     n = len(cand_blocks)
     if n == 0 or n != len(main_blocks):
         return float("nan"), float("nan"), float("nan")
@@ -362,7 +363,7 @@ def pooled_quantile_bounds(cand_blocks: Sequence[Sequence[float]], main_blocks: 
         m = [x for i in idx for x in main_blocks[i]]
         if not c or not m:
             return float("nan")
-        return contrast(quantile(c, q), quantile(m, q))
+        return contrast(quantile(c, q) if q is not None else mean(c), quantile(m, q) if q is not None else mean(m))
     observed = stat(range(n))
     rng = random.Random(seed)
     reps = resamples
