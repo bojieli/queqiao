@@ -192,8 +192,11 @@ type ClientConfig struct {
 	// the throughput-oriented defaults used by servers and desktop clients.
 	MemoryLimits *MemoryLimits
 	// Memory selects the memory-ownership bundle; empty is legacy.
-	Memory  MemoryMode
-	Metrics *metrics.Registry
+	Memory MemoryMode
+	// Classifier selects the flow-classifier bundle; see ClassifierMode.
+	// Empty is legacy.
+	Classifier ClassifierMode
+	Metrics    *metrics.Registry
 	// FallbackDelay is when AUTO starts connecting its warm-standby TCP
 	// candidate. It is not a deadline for QUIC and not a transport-selection
 	// race.
@@ -665,6 +668,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
 		return nil, err
 	}
+	if err := resolveClassifier(&cfg.Classifier, cfg.Profile); err != nil {
+		return nil, err
+	}
 	if err := cfg.CarrierShadow.resolve(); err != nil {
 		return nil, err
 	}
@@ -1110,6 +1116,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 		"data_coded", codedFrames, "data_stream", streamFrames,
 		"coded_substrate", codedSubstrateFields(substrate, hasCoded),
 		"class", classifier.Class(flowSession.class.Load())}
+	logFields = append(logFields, flowSession.classLogFields()...)
 	logFields = append(logFields, codedSubstrateLogFields(substrate, hasCoded)...)
 	logFields = append(logFields, flowSession.replacementLogFields()...)
 	if !flowComplete && err != nil && !errors.Is(err, context.Canceled) {
@@ -2040,7 +2047,7 @@ func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID
 	if kind != TransportQUIC && kind != TransportTCP {
 		return nil, fmt.Errorf("unsupported join transport %q", kind)
 	}
-	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, kind)
+	c.carrierShadow.noteJoinAttempt(ctx, sessionID, flowID, laneID, kind)
 	if kind == TransportQUIC && c.cfg.EnableQUICPool {
 		if lane, poolErr := c.openPooledJoinLane(ctx, sessionID, flowID, laneID); poolErr == nil {
 			return lane, nil
@@ -2063,7 +2070,7 @@ func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID
 // controller, while this pool is the multiplexed control failure domain being
 // rebuilt.
 func (c *Client) openControlPoolJoinLane(ctx context.Context, sessionID [16]byte, flowID, laneID uint64) (*mpLane, error) {
-	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, TransportQUIC)
+	c.carrierShadow.noteJoinAttempt(ctx, sessionID, flowID, laneID, TransportQUIC)
 	lane, err := c.dialLaneMode(ctx, TransportQUIC, sessionID, laneID, true)
 	if err != nil {
 		return nil, err
@@ -2562,7 +2569,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 			if now.Before(nextStallRescue) {
 				continue
 			}
-			if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
+			if err := c.runRescueRound(withShadowRescueTrigger(manageCtx, shadowRescueStall), flow, sessionID, flowID); err != nil {
 				if manageCtx.Err() != nil || flow.doneChanClosed() {
 					return
 				}
@@ -2673,7 +2680,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				recoveryAttempts++
 				lastRecoveryAttempt = now
 				attempt := flow.noteReplacementAttempt()
-				if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
+				if err := c.runRescueRound(withShadowRescueTrigger(manageCtx, shadowRescueOutage), flow, sessionID, flowID); err != nil {
 					err = classifyUnconfirmedRefusal(flow, err)
 					flow.noteReplacementFailure(err)
 					// The flow this belongs to is the whole point of the
@@ -2862,6 +2869,8 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 			joinCtx := manageCtx
 			if stall != nil {
 				joinCtx = context.WithValue(joinCtx, laneReplacementContextKey{}, *stall)
+				// A stall-driven bundle join is this manager's rescue round.
+				joinCtx = flow.carrierShadow.noteRescue(withShadowRescueTrigger(joinCtx, shadowRescueStall), flow)
 			}
 			lane, joinErr := c.openJoinLane(joinCtx, TransportTCP, sessionID, flowID, laneID)
 			select {
@@ -3119,7 +3128,7 @@ func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessio
 		ctx = context.WithValue(ctx, laneReplacementContextKey{}, *hint)
 	}
 	flow.rescueInFlight.Store(true)
-	flow.carrierShadow.noteRescue(flow)
+	ctx = flow.carrierShadow.noteRescue(ctx, flow)
 	err := c.openParallelRescue(ctx, flow, sessionID, flowID)
 	flow.rescueInFlight.Store(false)
 	// The capacity streak is kept per round rather than per attempt: a round
@@ -3322,7 +3331,7 @@ func (c *Client) openSprayedQUICRescueJoin(ctx context.Context, flow *multipathF
 	if err != nil {
 		return nil, err
 	}
-	c.carrierShadow.noteJoinAttempt(sessionID, flowID, laneID, TransportQUIC)
+	c.carrierShadow.noteJoinAttempt(ctx, sessionID, flowID, laneID, TransportQUIC)
 	lane, err := c.dialJoinLane(ctx, TransportQUIC, sessionID, laneID)
 	if err != nil {
 		return nil, err
@@ -3631,10 +3640,11 @@ func closeAuthenticatedLane(lane *authenticatedLane) {
 // startup is visible in every flow the process creates, including ones opened
 // long afterwards.
 func (c *Client) classifierConfig() classifier.Config {
-	if c.cfg.Profile.Classifier.BulkBytes == 0 {
-		return profile.Default().Classifier
+	cfg := c.cfg.Profile.Classifier
+	if cfg.BulkBytes == 0 {
+		cfg = profile.Default().Classifier
 	}
-	return c.cfg.Profile.Classifier
+	return phasedClassifierConfig(cfg, c.cfg.Classifier)
 }
 
 // declareClass asks the local capture agent what opened this connection, and
@@ -3671,7 +3681,7 @@ func (c *Client) declareClass(ctx context.Context, inner net.Conn, flow *multipa
 		return
 	}
 	flow.classifier.Declare(class)
-	flow.class.Store(uint32(protocol.Class(class)))
+	flow.publishClass(class)
 	// Counted like any other transition. A declared class never passes through
 	// Observe, so without this the whole mechanism is invisible in telemetry:
 	// an operator reading class_transitions would see zero and conclude the

@@ -210,7 +210,7 @@ func TestCarrierShadowLabelsABlackholedConnectionDead(t *testing.T) {
 	if stall == nil {
 		t.Fatalf("no client stall was recorded on the blackholed carrier:\n%s", e.clientLogs.String())
 	}
-	if stall["legacy_remedy"] != "demote_and_rescue_dial" {
+	if stall["legacy_remedy"] != "demote_and_request_rescue" {
 		t.Fatalf("stall record = %v", stall)
 	}
 	t.Logf("stall on the blackholed carrier: state %v, design remedy %v, %v PTOs", stall["carrier_state"], stall["design_remedy"], stall["pto_since_progress"])
@@ -307,7 +307,7 @@ func TestCarrierShadowLabelsAStalledFlowOnAHealthyCarrierLive(t *testing.T) {
 	if remedy := stall["design_remedy"]; remedy != "wait" && remedy != "wait_move_coded" {
 		t.Fatalf("design remedy on a live carrier = %v", remedy)
 	}
-	if stall["legacy_remedy"] != "demote_and_rescue_dial" {
+	if stall["legacy_remedy"] != "demote_and_request_rescue" {
 		t.Fatalf("legacy remedy = %v", stall["legacy_remedy"])
 	}
 	got := e.clientMetrics.Snapshot().CarrierShadow
