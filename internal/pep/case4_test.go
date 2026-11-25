@@ -99,9 +99,13 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 		} else {
 			pendingQueueSamples++
 		}
-		samples++
-		if s.QUICDelayBrake > 0 {
-			brakedSamples++
+		// Only a poll with controller telemetry says anything about the
+		// brake: without it the zero is a default, not a reading.
+		if s.QUICControllerSamples > 0 {
+			samples++
+			if s.QUICDelayBrake > 0 {
+				brakedSamples++
+			}
 		}
 		if s.QUICDelayBrake > maxBrake {
 			maxBrake = s.QUICDelayBrake
