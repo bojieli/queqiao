@@ -202,6 +202,9 @@ type laneFrame struct {
 	// recovers its own losses; see frameConn.writeContextVia.
 	onWritten     func(reliable bool)
 	forceReliable bool
+	// onCoded, when set, is told what became of the frame if it went to the
+	// coded path; see coded.Path.SendObserved.
+	onCoded func(coded.Outcome)
 }
 
 type inboundEvent struct {
@@ -241,6 +244,8 @@ type multipathFlow struct {
 	receiveMemory *memlimit.Budget
 	// memOwned selects the owned-memory bundle (MemoryOwned).
 	memOwned bool
+	// codedRetrySticky selects the coded-retry bundle (CodedRetrySticky).
+	codedRetrySticky bool
 
 	sendAckFlag uint16
 	recvAckFlag uint16
@@ -707,7 +712,7 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 				return
 			}
 		}
-		reliable, err := lane.fc.writeContextViaMode(f.ctx, frame, queued.forceReliable)
+		reliable, err := lane.fc.writeContextObserved(f.ctx, frame, queued.forceReliable, queued.onCoded)
 		if err != nil {
 			f.failLane(lane, fmt.Errorf("lane %d write: %w", lane.id, err))
 			return
@@ -2287,6 +2292,13 @@ func (f *multipathFlow) enqueueFrameClass(ctx context.Context, lane *mpLane, fra
 // enqueueFrameWritten is enqueueFrameClass with a callback invoked once the
 // lane's transport has taken the frame's bytes.
 func (f *multipathFlow) enqueueFrameWritten(ctx context.Context, lane *mpLane, frame protocol.Frame, bulk bool, onWritten func(reliable bool), forceReliable ...bool) error {
+	return f.enqueueLaneFrame(ctx, lane, laneFrame{frame: frame, onWritten: onWritten, forceReliable: len(forceReliable) > 0 && forceReliable[0]}, bulk)
+}
+
+// enqueueLaneFrame queues a frame, with its notifications, for a lane's
+// writer.
+func (f *multipathFlow) enqueueLaneFrame(ctx context.Context, lane *mpLane, queued laneFrame, bulk bool) error {
+	frame := queued.frame
 	if lane == nil || lane.closed.Load() {
 		return errors.New("lane is closed")
 	}
@@ -2318,7 +2330,7 @@ func (f *multipathFlow) enqueueFrameWritten(ctx context.Context, lane *mpLane, f
 		}
 	}
 	select {
-	case queue <- laneFrame{frame: frame, onWritten: onWritten, forceReliable: len(forceReliable) > 0 && forceReliable[0]}:
+	case queue <- queued:
 		return nil
 	case <-lane.writeDone:
 		if acquired {

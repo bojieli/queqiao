@@ -160,6 +160,20 @@ type Config struct {
 	// just like Reliable, so an in-flight recovery cannot change substrates
 	// when the policy later clears. Nil leaves the lane's decision unchanged.
 	ForceReliable func(offset uint64) bool
+	// CodedRetry selects the coded-retry bundle (design §8.1, §14 stage 4):
+	//
+	//   - an attempt the lane carries unreliably has no recovery deadline
+	//     until its transport reports, through Registered, that the bytes
+	//     actually left in a packet; a frame waiting in a queue below this
+	//     scheduler has not started to be lost. Abandoned retires it at once;
+	//   - every attempt after a chunk's first is reliable: once the code has
+	//     had its one chance at a chunk, the chunk is sticky to the stream;
+	//   - receiver gap evidence retires only an unreliable attempt that has
+	//     been registered, so an attempt still queued below is never copied.
+	//
+	// Together these give each chunk one repair owner at a time: the code
+	// until its deadline, then the stream. ForceReliable still applies.
+	CodedRetry bool
 	// Windows supplies admission limits. When nil, only LaneWindow and
 	// MaxOutstanding apply, which is the behaviour of a flow with no
 	// congestion coupling.
@@ -324,6 +338,12 @@ type attempt struct {
 	// afterwards they are the transport's problem, and the scheduler retains
 	// them only so they can be re-issued if the lane dies.
 	written bool
+	// registered records, under CodedRetry, that an unreliable attempt's
+	// bytes were registered in a packet; its deadline counts from then.
+	// abandoned records that the coded path gave the attempt up before its
+	// transport reported the write, which settles it when that report comes.
+	registered bool
+	abandoned  bool
 }
 
 type outstanding struct {
@@ -333,14 +353,17 @@ type outstanding struct {
 
 // Stats reports what the scheduler did, for tests and metrics.
 type Stats struct {
-	ChunksIssued      uint64
-	ChunksRetransmit  uint64
-	ChunksCompleted   uint64
-	BytesIssued       uint64
-	BytesRetransmit   uint64
-	LaneFailures      uint64
-	SourceBytes       uint64
-	PeakOutstanding   int
+	ChunksIssued     uint64
+	ChunksRetransmit uint64
+	ChunksCompleted  uint64
+	BytesIssued      uint64
+	BytesRetransmit  uint64
+	LaneFailures     uint64
+	SourceBytes      uint64
+	PeakOutstanding  int
+	// CodedAbandoned counts unreliable attempts the coded path abandoned,
+	// under CodedRetry.
+	CodedAbandoned    uint64
 	CompletedByLaneID map[uint64]uint64
 }
 
@@ -913,6 +936,18 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		if s.cfg.ForceReliable != nil && s.cfg.ForceReliable(chunk.Offset) {
 			reliable = true
 		}
+		if s.cfg.CodedRetry {
+			if exists {
+				// The sticky reliable bit: a chunk dispatched before had its
+				// one coded attempt, and every later one is on the stream.
+				reliable = true
+			}
+			if !reliable {
+				// The deadline starts at registration, not here: from now
+				// until then the bytes wait in queues they cannot be lost in.
+				deadline = time.Time{}
+			}
+		}
 		out.attempts = append(out.attempts, attempt{
 			id: id, lane: laneID, deadline: deadline, reliable: reliable,
 		})
@@ -1350,6 +1385,10 @@ func (s *Scheduler) retireUnreliableAttemptsLocked(out *outstanding, deadline ti
 		retire := !a.reliable && a.written
 		if retire && !deadline.IsZero() {
 			retire = !a.deadline.IsZero() && !deadline.Before(a.deadline)
+		} else if retire && s.cfg.CodedRetry {
+			// Coverage beyond an attempt still waiting to leave says nothing
+			// about it; copying it now would give its bytes a second owner.
+			retire = a.registered
 		}
 		if !retire {
 			kept = append(kept, a)
@@ -1470,13 +1509,122 @@ func (s *Scheduler) wrote(laneID uint64, chunk *Chunk, reliable *bool) {
 		if out.attempts[i].id != chunk.attempt || out.attempts[i].lane != laneID || out.attempts[i].written {
 			continue
 		}
-		out.attempts[i].written = true
+		a := &out.attempts[i]
+		a.written = true
 		if reliable != nil {
-			out.attempts[i].reliable = *reliable
+			if s.cfg.CodedRetry && a.reliable != *reliable {
+				s.substrateChangedLocked(a, *reliable)
+			}
+			a.reliable = *reliable
 		}
 		s.releaseQueuedLocked(laneID, uint64(len(out.chunk.Data)))
+		if s.cfg.CodedRetry && a.abandoned && !a.reliable {
+			// The coded path gave these bytes up before the write was
+			// reported, and they went nowhere else.
+			s.retireAttemptLocked(out, a.id)
+		}
 		s.ready.Broadcast()
 		return
+	}
+}
+
+// substrateChangedLocked keeps a CodedRetry attempt's deadline right when its
+// write used a different substrate than its dispatch expected. Bytes that went
+// to the stream after all are the stream's, on the deadline any reliable
+// attempt has; bytes that went to the code wait for their registration,
+// unless it has already been reported.
+func (s *Scheduler) substrateChangedLocked(a *attempt, reliable bool) {
+	switch {
+	case reliable:
+		if a.deadline.IsZero() {
+			if after := s.retransmitAfter(); after > 0 {
+				a.deadline = s.cfg.Now().Add(after)
+			}
+		}
+	case !a.registered:
+		a.deadline = time.Time{}
+	}
+}
+
+// Registered reports, under CodedRetry, that every packet carrying an
+// unreliable attempt's bytes has been registered for sending. The attempt's
+// recovery deadline starts now. A report for an attempt that has been retired
+// is ignored: the attempt identity is not reused.
+func (s *Scheduler) Registered(laneID uint64, chunk *Chunk) {
+	if chunk == nil || !s.cfg.CodedRetry {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, a := s.attemptLocked(laneID, chunk)
+	if a == nil || a.registered {
+		return
+	}
+	a.registered = true
+	if a.reliable {
+		// A stream copy (the pre-OPEN_OK safety copy) owns these bytes.
+		return
+	}
+	a.deadline = time.Time{}
+	if after := s.retransmitAfter(); after > 0 {
+		a.deadline = s.cfg.Now().Add(after)
+	}
+}
+
+// Abandoned reports, under CodedRetry, that the coded path gave up an
+// unreliable attempt before all of its bytes were registered: they will
+// never be sent. The attempt is retired and the chunk returns to the ready
+// set, where the sticky bit puts it on the stream. A write the transport has
+// not reported yet is settled when it is, because it may have gone to the
+// stream as well. A report for a retired attempt is ignored.
+func (s *Scheduler) Abandoned(laneID uint64, chunk *Chunk) {
+	if chunk == nil || !s.cfg.CodedRetry {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out, a := s.attemptLocked(laneID, chunk)
+	if a == nil {
+		return
+	}
+	if !a.written {
+		a.abandoned = true
+		return
+	}
+	if a.reliable {
+		return
+	}
+	s.retireAttemptLocked(out, a.id)
+	s.ready.Broadcast()
+}
+
+func (s *Scheduler) attemptLocked(laneID uint64, chunk *Chunk) (*outstanding, *attempt) {
+	out, ok := s.live[chunk.Offset]
+	if !ok {
+		return nil, nil
+	}
+	for i := range out.attempts {
+		if out.attempts[i].id == chunk.attempt && out.attempts[i].lane == laneID {
+			return out, &out.attempts[i]
+		}
+	}
+	return nil, nil
+}
+
+// retireAttemptLocked ends one unreliable attempt and, if it was the chunk's
+// last, returns the chunk to the ready set.
+func (s *Scheduler) retireAttemptLocked(out *outstanding, id uint64) {
+	for i, a := range out.attempts {
+		if a.id != id {
+			continue
+		}
+		out.attempts = append(out.attempts[:i], out.attempts[i+1:]...)
+		s.releaseLaneLocked(a.lane, uint64(len(out.chunk.Data)), !a.written)
+		s.stats.CodedAbandoned++
+		break
+	}
+	if len(out.attempts) == 0 {
+		s.requeueLocked(out.chunk)
 	}
 }
 

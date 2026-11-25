@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/bojieli/queqiao/internal/coded"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/stripe"
 )
@@ -350,7 +351,11 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		// cannot repair has no other way back on a single-lane flow.
 		Reliable:      f.laneRetransmits,
 		ForceReliable: f.recoverChunkReliably,
-		Windows:       &laneAdmission{flow: f},
+		// The coded-retry bundle (design §8.1): a coded attempt's deadline
+		// starts when its datagrams are registered, and its retry, like every
+		// later attempt of the chunk, is on the stream.
+		CodedRetry: f.codedRetrySticky,
+		Windows:    &laneAdmission{flow: f},
 	})
 	defer sched.Close()
 
@@ -612,11 +617,20 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 	// it is acknowledged, and is the thing that will re-issue it if this lane
 	// stops. Recording it again would put the same bytes under two limits.
 	f.noteSent(chunk.Offset, len(chunk.Data))
-	var written func(reliable bool)
+	queued := laneFrame{frame: frame, forceReliable: chunk.Reliable}
 	if sched := f.scheduler.Load(); sched != nil {
-		written = func(reliable bool) { sched.WroteAs(lane.id, chunk, reliable) }
+		queued.onWritten = func(reliable bool) { sched.WroteAs(lane.id, chunk, reliable) }
+		if f.codedRetrySticky && !chunk.Reliable {
+			queued.onCoded = func(outcome coded.Outcome) {
+				if outcome == coded.Registered {
+					sched.Registered(lane.id, chunk)
+					return
+				}
+				sched.Abandoned(lane.id, chunk)
+			}
+		}
 	}
-	return f.enqueueFrameWritten(ctx, lane, frame, bulk, written, chunk.Reliable)
+	return f.enqueueLaneFrame(ctx, lane, queued, bulk)
 }
 
 // sendFinal closes the outbound direction once every byte has been

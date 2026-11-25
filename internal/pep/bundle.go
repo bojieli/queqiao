@@ -63,10 +63,13 @@ func ValidateBundle(ccAPI CCAPIVersion, congestion CongestionControlKind, p prof
 
 // Bundle names the switches in effect, for publishing an endpoint's effective
 // configuration: "legacy" when every switch is off.
-func Bundle(ccAPI CCAPIVersion, memory MemoryMode) string {
+func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry ...CodedRetryMode) string {
 	var on []string
 	if ccAPI == CCAPIV2 {
 		on = append(on, "cc-api=v2")
+	}
+	if len(codedRetry) > 0 && codedRetry[0] == CodedRetrySticky {
+		on = append(on, "coded-retry=sticky")
 	}
 	if memory == MemoryOwned {
 		on = append(on, "mem=owned")
