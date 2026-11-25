@@ -111,6 +111,28 @@ def useful(row: dict) -> int:
     return int(row["bytes"] or 0) if row.get("http") == "200" else 0
 
 
+def under_load(probes: List[dict], load: List[dict], slack: float = 1.0) -> List[dict]:
+    """Probes whose request overlapped the load, by each row's remote
+    completion time (`epoch`, whole seconds) minus its duration. The hosts'
+    clocks are assumed NTP-synchronised; `slack` absorbs the rounding. Rows
+    from a runner that did not record epochs are kept as they are."""
+    def span(r):
+        e = r.get("epoch") or ""
+        if not e.isdigit():
+            return None
+        return float(e) - float(r["seconds"] or 0), float(e)
+    spans = [span(r) for r in load]
+    if not load or any(x is None for x in spans):
+        return probes
+    lo, hi = min(a for a, _ in spans), max(b for _, b in spans)
+    out = []
+    for r in probes:
+        sp = span(r)
+        if sp is None or (sp[1] >= lo - slack and sp[0] <= hi + slack):
+            out.append(r)
+    return out
+
+
 class Trial:
     def __init__(self, block: int, path: str, slot: int, arm: str, role: str, arm_trial: int, cold: bool):
         self.block, self.path, self.slot, self.arm, self.role = block, path, slot, arm, role
@@ -335,7 +357,8 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         t.m["wire_per_useful"] = (wire / useful if useful and t.m["tcp_fallbacks"] == 0 else float("nan"))
         # A probe that did not finish counts at its timeout: dropping it
         # would let an arm improve its p99 by failing its slowest requests.
-        probes = [float(r["seconds"]) if r["complete"] == "1" else PROBE_TIMEOUT for r in t.rows if r["kind"] == "probe"]
+        probes = [float(r["seconds"]) if r["complete"] == "1" else PROBE_TIMEOUT
+                  for r in under_load([r for r in t.rows if r["kind"] == "probe"], bulk)]
         t.m["interactive_p99_s"] = st.quantile(probes, 0.99) if probes else float("nan")
 
         key = (t.arm, t.tag)
@@ -364,6 +387,7 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
             for r in crecs:
                 if r.get("msg") == "runtime configuration":
                     EFFECTIVE.setdefault((t.arm, "client"), set()).add(effective(r))
+                    t.m["client_transport"] = r.get("transport", "")
             for r in crecs:
                 try:
                     r["_t"] = ts(r["time"])
@@ -382,6 +406,10 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
                 method.add("count-matched")
             base = os.path.join(campaign, "logs", f"cl-{c}-{t.arm}")
             cpus += glob.glob(os.path.join(base, f"client-{t.tag}-s{t.slot}.cpu" if small else f"client-{t.tag}.cpu"))
+        # Gateway QUIC bytes say nothing about a client that dialled TCP
+        # directly (--transport tcp increments no fallback counter).
+        if t.m.get("client_transport") not in ("quic", "auto"):
+            t.m["wire_per_useful"] = float("nan")
         t.m["_transit"] = ex
         t.m["transit_p50_s"] = st.quantile(ex, 0.5)
         t.m["transit_p90_s"] = st.quantile(ex, 0.9)

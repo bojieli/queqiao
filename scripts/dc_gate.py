@@ -24,7 +24,8 @@ from typing import Dict, List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
-from ab_analyze import PROBE_TIMEOUT, Trial, completeness, fmt, read_campaign, useful  # noqa: E402
+from ab_analyze import (PROBE_TIMEOUT, Trial, completeness, fmt, iter_json, read_campaign,  # noqa: E402
+                        under_load, useful)
 
 BOUNDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "dc_gate.ini")
 
@@ -36,7 +37,8 @@ def load_bounds(path: str = BOUNDS) -> dict:
     s, v, g = cp["statistics"], cp["validity"], cp["gate"]
     out = {k: g.getfloat(k) for k in g}
     out.update(alpha=s.getfloat("alpha"), resamples=s.getint("bootstrap_resamples"), seed=s.getint("bootstrap_seed"),
-               max_zero_main_fraction=s.getfloat("max_zero_main_fraction"), binding_max=v.getfloat("binding_max"))
+               max_zero_main_fraction=s.getfloat("max_zero_main_fraction"), binding_max=v.getfloat("binding_max"),
+               min_legacy_completion=v.getfloat("min_legacy_completion"))
     return out
 
 
@@ -68,7 +70,11 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     lat = [done(r) for r in req]
     m["latency_p50"] = st.quantile(lat, 0.5)
     m["latency_p99"] = st.quantile(lat, 0.99)
-    probes = [r for r in t.rows if r["client"] == control and r["kind"] == "probe"]
+    # Only control requests that overlapped the loaded leaves' phase count.
+    probes = []
+    for ph in ("sustained", "requests"):
+        load = [r for r in t.rows if r["phase"] == ph and r["client"] in loaded and r["kind"] != "probe"]
+        probes += under_load([r for r in t.rows if r["client"] == control and r["kind"] == "probe" and r["phase"] == ph], load)
     ctl = [float(r["seconds"]) if r["complete"] == "1" else PROBE_TIMEOUT for r in probes]
     # The control leaf must have been observed under both phases' load; a
     # probe job that produced nothing leaves the trial unmeasured.
@@ -76,6 +82,11 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     m["control_p50"] = st.quantile(ctl, 0.5) if {"sustained", "requests"} <= phases else float("nan")
     m["requests_ok"] = sum(1 for r in req if r["complete"] == "1")
     m["requests"] = len(req)
+    # Completion: loaded leaves' requests and the control leaf's, together.
+    # Latency substitutes a timeout for a failure, so it cannot show an arm
+    # that fails everything; completion does.
+    m["completion"] = ((m["requests_ok"] + sum(1 for r in probes if r["complete"] == "1")) / (len(req) + len(probes))
+                       if req or probes else float("nan"))
     return m
 
 
@@ -136,13 +147,28 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     finished = sum(t.m["sus_finished"] for t in ab) / flows if flows else float("nan")
     backlogged = finished == finished and finished <= 0.10
 
+    # Every endpoint of every arm must actually have run dc-long-haul.
+    import glob
+    profiles: Dict[str, set] = {}
+    for arm in plan["arms"]:
+        files = glob.glob(os.path.join(campaign, "logs", f"gw-{arm}", "*.jsonl*")) + \
+            [f for leaf in loaded + [control] for f in glob.glob(os.path.join(campaign, "logs", f"cl-{leaf}-{arm}", "*.jsonl*"))]
+        profiles[arm] = {rec.get("path_profile", "") for rec in iter_json(files, ('"runtime configuration"',))
+                         if rec.get("msg") == "runtime configuration"}
+        if profiles[arm] != {"dc-long-haul"}:
+            problems = problems + [f"arm {arm}: endpoints ran path profile(s) {sorted(profiles[arm]) or 'unrecorded'}, "
+                                   "not only dc-long-haul"]
     a, r, s = bounds["alpha"], bounds["resamples"], bounds["seed"]
     # Section 15.4's void rule, on the sustained outcome: a campaign in which
     # too many legacy blocks delivered nothing is rerun, not judged.
     legacy_sus = per_block(main, "aggregate_bytes", total)
     zero_frac = (sum(1 for v in legacy_sus.values() if v == 0) / len(legacy_sus)) if legacy_sus else float("nan")
     zero_void = not (zero_frac <= bounds["max_zero_main_fraction"])
+    legacy_completion = st.mean([t.m["completion"] for t in ab if t.arm == main])
+    workload_broken = not (legacy_completion >= bounds["min_legacy_completion"])
     void_reason = ("more than the pre-registered fraction of legacy blocks delivered nothing" if zero_void else
+                   f"the legacy arm completed only {legacy_completion:.0%} of requests; the workload does not work"
+                   if workload_broken else
                    "the shared ancestor did not bind; add load" if not bound_ok else
                    f"{finished:.0%} of sustained flows finished their object inside the window; raise object_bytes"
                    if not backlogged else "")
@@ -150,6 +176,8 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
         # name, key, per-block aggregation, contrast builder (cand, legacy) -> d
         ("sustained goodput (aggregate bytes)", "aggregate_bytes", total,
          lambda c, l: c - bounds["goodput_ratio"] * l, f"cand - {bounds['goodput_ratio']:g} x legacy"),
+        ("request completion", "completion", avg,
+         lambda c, l: c - (l - bounds["completion_margin"]), f"cand - (legacy - {bounds['completion_margin']:g})"),
         ("request latency p50", "latency_p50", avg,
          lambda c, l: bounds["latency_max_ratio"] * l - c, f"{bounds['latency_max_ratio']:g} x legacy - cand"),
         ("request latency p99", "latency_p99", avg,

@@ -60,15 +60,21 @@ built to refuse rather than to trust:
   - a planned temporary port is declared or already listening;
   - a host's listening ports could not be read (it needs `ss` on Linux and
     `lsof` elsewhere; an empty list is never trusted);
+  - a declared unit or launchd job cannot be observed;
+  - a home directory contains anything but `[A-Za-z0-9._/-]`;
   - a process from an earlier campaign with the same name is still running.
 - **One directory per host, reserved.** Everything temporary lives under
   `~/qq-ab-<name>`. After the read-only preflight, the runner claims that
   directory on every host with an atomic `mkdir` and an owner token. A second
   invocation with the same name is refused, and teardown and cleanup act only
-  on directories whose token is their own. Every process is started from there with a pid file. A
-  process is signalled only after its command line has been checked to
-  contain that directory, so a stale pid file can never reach a production
-  process. Nothing uses `pkill`.
+  on directories whose token is their own. Every process is started from there with a pid file. Teardown signals only
+  those pid-file processes, each after checking that its command line contains
+  the directory, so a stale pid file can never reach a production process.
+  Any other process that mentions the directory, such as an operator's
+  `tail -f`, is reported as a leftover, never killed. Nothing uses `pkill`.
+  A process counts as ready only when the spawned process itself owns the
+  listening port, so a child that failed to bind is never mistaken for
+  another campaign's listener on the same port.
 - **Production is watched during the run.** The runner re-snapshots every
   `snapshot_every` blocks and once more at the end. Any change to a
   production unit, launchd job or matching process aborts the campaign, tears
@@ -143,7 +149,10 @@ followed by its mirror, and every arm is compared with the reference.
 - `interactive`: the bulk load plus a small-object probe every
   `probe_interval` seconds. It measures interactive p99 under bulk. The probe
   stops as soon as the bulk flows finish, so every sample is taken under
-  load. A probe that does not finish counts at its 10-second timeout.
+  load. A probe that does not finish counts at its 10-second timeout. Each row
+  carries its remote completion time (`epoch`). Only probes whose request
+  overlapped the load's interval are used. The hosts' clocks are assumed to
+  be NTP-synchronised, with one second of slack.
 
 A stage's gate needs all three. Run them as three campaigns with different
 names.
@@ -253,7 +262,8 @@ measured only if every trial in it has the measure. A trial in which any flow
 fell back to TCP has no QUIC-only wire count, so it leaves wire cost
 unmeasured rather than flattering it. Fallback is read from the client's own
 `/metrics`, which the runner scrapes around every trial, because the client
-is where fallback is counted. Sender-side credit delay p95 and the
+is where fallback is counted. A client whose runtime configuration says
+`transport=tcp` also has no QUIC wire cost. Sender-side credit delay p95 and the
 shadow false-promotion rate need the stage 0 instrumentation. They are listed
 as required and reported as not measured, so until that instrumentation
 lands, no campaign reaches an overall PASS.
@@ -315,6 +325,7 @@ the t and the bootstrap one-sided lower bounds must be above zero.
 | Criterion | Contrast |
 |---|---|
 | sustained goodput (aggregate of loaded leaves) | `cand − 0.90 × legacy` |
+| request completion (loaded and control requests) | `cand − (legacy − 0.02)` |
 | request latency p50 and p99 | `1.10 × legacy − cand` |
 | worst leaf's service | `cand − 0.90 × legacy` |
 | completion spread (slowest leaf's median over fastest leaf's) | `1.25 × legacy − cand`, and `3.5 − cand` |
@@ -339,10 +350,16 @@ The campaign is **VOID** in three cases:
   window. Both arms were then capped at the object size, so raise
   `object_bytes`.
 - More than 10% of the legacy arm's blocks delivered nothing. Rerun.
+- The legacy arm completed fewer than 90% of its requests, so the workload
+  does not work at all. Latency would otherwise compare two sets of
+  substituted timeouts.
 
 An unfinished campaign is INCOMPLETE, as in Gate 1. So is one in which any
 criterion lacks evidence in some judged block, for example a control probe
-that produced nothing.
+that produced nothing or did not overlap the load. So is one in which any
+endpoint's runtime configuration record does not show `path_profile`
+`dc-long-haul`. The runner adds that flag to both ends and rejects configs
+that set it.
 
 ```sh
 ./scripts/ab_campaign.py --config scripts/validation/dc.local.ini --dry-run

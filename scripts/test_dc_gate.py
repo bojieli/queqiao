@@ -26,7 +26,8 @@ def iso(t):
 
 
 def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blocks=12, seed=3,
-             cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False, no_solo=()):
+             cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False, no_solo=(),
+             profile="dc-long-haul", fail_requests=()):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -60,10 +61,12 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
                     rows.append([b, "dc", slot] + base + ["sustained", j, leaf, "bulk", f"b{i}", iso(t), iso(t + 60),
                                                           200, size, 60, 0 if finished else 28, int(finished), 60])
                 rt = 0.30 * (1.0 if arm == "legacy" else cand_request / max(share, 1e-3)) * noise
+                failed = arm in fail_requests
                 for w in (1, 2, 3):
                     for r in range(1, 9):
                         rows.append([b, "dc", slot] + base + ["requests", j, leaf, "requests", f"w{w}r{r}", iso(t + 60),
-                                                              iso(t + 70), 200, 307200, f"{rt:.4f}", 0, 1, 10])
+                                                              iso(t + 70), "000" if failed else 200, 0 if failed else 307200,
+                                                              30 if failed else f"{rt:.4f}", 28 if failed else 0, 0 if failed else 1, 10])
             ctl = 0.20 * (1.0 if arm == "legacy" else cand_control) * noise
             for phase in ("sustained", "requests"):
                 if (b, slot, phase) in drop_control:
@@ -79,6 +82,12 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
                 rows.append([b, "dc", 100 + j, "legacy", "main", 0, 0, "solo", 0, leaf, "bulk", f"b{i}", iso(t),
                              iso(t + 60), 200, int(level / binding / 2), 60, 28, 0, 60])
             t += 65
+    for arm in ("legacy", "cand"):
+        for d in [f"gw-{arm}"] + [f"cl-{c}-{arm}" for c in LOADED + ["ctl"]]:
+            os.makedirs(os.path.join(root, "logs", d), exist_ok=True)
+            with open(os.path.join(root, "logs", d, "x-b001-dc.jsonl"), "w") as f:
+                f.write(json.dumps({"time": iso(t), "msg": "runtime configuration",
+                                    "path_profile": profile if arm == "cand" else "dc-long-haul"}) + "\n")
     with open(os.path.join(root, "plan.json"), "w") as f:
         json.dump(plan, f)
     with open(os.path.join(root, "status.json"), "w") as f:
@@ -182,6 +191,21 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("uncal", no_solo=((7, "lb"),))
         self.assertEqual(v["cand"], "INCOMPLETE")
         self.assertIn("lack a usable solo calibration of every loaded leaf (first: block 7)", text)
+
+    def test_the_wrong_profile_gets_no_verdict(self):
+        text, v = self.run_gate("profile", profile="wan-shared-bottleneck")
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("not only dc-long-haul", text)
+
+    def test_failing_every_request_fails_rather_than_hiding_in_timeouts(self):
+        text, v = self.run_gate("cfail", fail_requests=("cand",))
+        self.assertEqual(v["cand"], "FAIL")
+        self.assertIn("**FAIL**", self.criterion(text, "request completion"))
+
+    def test_a_workload_that_fails_for_both_arms_is_void(self):
+        text, v = self.run_gate("bothfail", fail_requests=("cand", "legacy"))
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("the workload does not work", text)
 
     def test_unfinished_campaign_gets_no_verdict(self):
         root = os.path.join(self.tmp.name, "unfinished")

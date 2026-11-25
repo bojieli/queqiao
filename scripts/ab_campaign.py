@@ -71,7 +71,7 @@ CURL_ENV = ("env -u NO_PROXY -u no_proxy -u ALL_PROXY -u all_proxy -u HTTP_PROXY
             "-u HTTPS_PROXY -u http_proxy -u https_proxy curl --noproxy ''")
 TRIAL_COLUMNS = ("block", "path", "slot", "arm", "role", "arm_trial", "cold", "phase", "job",
                  "client", "kind", "flow", "start_utc", "end_utc", "http", "bytes", "seconds",
-                 "curl_exit", "complete", "wall")
+                 "curl_exit", "complete", "wall", "epoch")
 
 
 class ConfigError(Exception):
@@ -342,6 +342,10 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
         for leaf in dc.loaded + [dc.control]:
             if leaf not in clients:
                 raise ConfigError(f"[dc] leaf {leaf!r} is not a [client:...] section")
+        for where, fl in [("[gateway] flags", gw.flags)] + [(f"[client:{c.name}] flags", c.flags) for c in clients.values()] + \
+                [(f"[arm:{a.name}]", a.flags + a.gateway_flags + a.client_flags) for a in arms]:
+            if any(f.lstrip("-").split("=", 1)[0] == "path-profile" for f in fl if f.startswith("-")):
+                raise ConfigError(f"{where}: the DC gate runs --path-profile dc-long-haul on both ends; do not set it")
         if dc.control in dc.loaded:
             raise ConfigError("[dc] control must not be one of the loaded leaves")
         leaves = dc.loaded + [dc.control]
@@ -477,14 +481,20 @@ W={work}
 os=$(uname -s)
 echo "os $os"
 for u in {units}; do
-  v=$(systemctl show "$u" -p ActiveState -p MainPID -p NRestarts -p ExecMainStartTimestampMonotonic --value 2>/dev/null | tr '\n' ' ')
+  # unit-error when the unit cannot be observed: the preflight refuses then,
+  # rather than comparing two empty observations as "unchanged".
+  if ! v=$(systemctl show "$u" -p LoadState -p ActiveState -p MainPID -p NRestarts -p ExecMainStartTimestampMonotonic 2>/dev/null | sort | tr '\n' ' ') \
+     || [ -z "$v" ] || echo "$v" | grep -q 'LoadState=not-found'; then
+    echo "unit-error $u"; continue
+  fi
   pid=$(systemctl show "$u" -p MainPID --value 2>/dev/null)
   exe=""; sha=""
   if [ -n "$pid" ] && [ "$pid" != 0 ]; then exe=$(readlink -f /proc/$pid/exe 2>/dev/null); sha=$( (sha256sum "/proc/$pid/exe" 2>/dev/null || true) | cut -c1-64); fi
   echo "unit $u $v exe=$exe sha=$sha"
 done
 for l in {launchd}; do
-  echo "launchd $l $(launchctl list 2>/dev/null | awk -v l="$l" '$3==l{{print $1, $2}}')"
+  v=$(launchctl list 2>/dev/null | awk -v l="$l" '$3==l{{print $1, $2}}')
+  if [ -n "$v" ]; then echo "launchd $l $v"; else echo "unit-error $l"; fi
 done
 ps -eo pid=,lstart=,args= 2>/dev/null | grep -i -E -- {pattern} | grep -v -F -- "$W/" | grep -v -E 'grep|ps -eo' | sed 's/^ */proc /'
 # "listen-ok" only when the listener table was actually read; without it the
@@ -507,7 +517,7 @@ exit 0
 
 
 def parse_snapshot(text: str) -> dict:
-    snap = {"units": {}, "launchd": {}, "procs": [], "listen": set(), "leftover": []}
+    snap = {"units": {}, "launchd": {}, "procs": [], "listen": set(), "leftover": [], "unit_errors": []}
     for line in text.splitlines():
         parts = line.split(" ", 1)
         if len(parts) < 2:
@@ -527,6 +537,8 @@ def parse_snapshot(text: str) -> dict:
                 snap["listen"].add(int(toks[1]))
         elif kind == "leftover":
             snap["leftover"].append(rest.strip())
+        elif kind == "unit-error":
+            snap["unit_errors"].append(rest.strip())
         elif kind == "os":
             snap["os"] = rest.strip()
     snap["listen_ok"] = any(line.strip() == "listen-ok" for line in text.splitlines())
@@ -541,6 +553,8 @@ def snapshot_diff(before: dict, after: dict) -> List[str]:
             w = after.get(kind, {}).get(name)
             if w != v:
                 out.append(f"{kind[:-1] if kind == 'units' else kind} {name}: {v!r} -> {w!r}")
+    for u in sorted(set(after.get("unit_errors", [])) - set(before.get("unit_errors", []))):
+        out.append(f"production unit {u} can no longer be observed")
     gone = sorted(set(before.get("procs", [])) - set(after.get("procs", [])))
     new = sorted(set(after.get("procs", [])) - set(before.get("procs", [])))
     out += [f"process ended or restarted: {p}" for p in gone]
@@ -569,6 +583,9 @@ def refusal_reasons(cfg: Config, snaps: Dict[str, dict]) -> List[str]:
             reasons.append(f"{host}: a process from an earlier campaign is running: {left}")
     for p in cfg.production:
         snap = snaps.get(p.host, {})
+        for u in snap.get("unit_errors", []):
+            if u in p.units or u in p.launchd:
+                reasons.append(f"{p.host}: declared production unit {u} cannot be observed (not found, or no access)")
         for u in p.units:
             v = snap.get("units", {}).get(u, "")
             if cfg_work_in(v, cfg.work_dir):
@@ -598,14 +615,15 @@ def _q(s: str) -> str:
     return shlex.quote(s)
 
 
-def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[Tuple[str, str, str, str, str]]:
-    """Parse a job's output into (flow, http, bytes, seconds, curl_exit).
+def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[Tuple[str, str, str, str, str, str]]:
+    """Parse a job's output into (flow, http, bytes, seconds, curl_exit, epoch),
+    epoch being the remote host's clock when the request ended ("" if unknown).
 
     A flow that printed nothing usable (curl killed, ssh dropped) is still a
     row: 0 bytes, HTTP 000, exit -1, so it counts against completion instead
     of disappearing from the denominator. A probe has no fixed count.
     """
-    got: Dict[str, Tuple[str, str, str, str, str]] = {}
+    got: Dict[str, Tuple[str, str, str, str, str, str]] = {}
     order: List[str] = []
     for line in out.splitlines():
         parts = line.rstrip("\n").split("\t")
@@ -617,9 +635,10 @@ def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[T
         size = f[1] if f[1].isdigit() else "0"
         secs = f[2] or f"{duration:.3f}"
         ex = f[3] if re.match(r"^-?[0-9]+$", f[3] or "") else "-1"
+        epoch = parts[0] if parts[0].isdigit() else ""
         if flow not in got:
             order.append(flow)
-        got[flow] = (flow, code, size, secs, ex)
+        got[flow] = (flow, code, size, secs, ex, epoch)
     if kind == "bulk":
         want = [f"b{i}" for i in range(1, n + 1)]
     elif kind == "requests":
@@ -629,8 +648,25 @@ def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[T
     for flow in want:
         if flow not in got:
             order.append(flow)
-            got[flow] = (flow, "000", "0", f"{duration:.3f}", "-1")
+            got[flow] = (flow, "000", "0", f"{duration:.3f}", "-1", "")
     return [got[f] for f in order]
+
+
+def wait_owned_script(pid_file: str, port: int) -> str:
+    """Exit 0 once the pid in pid_file is alive and owns a TCP listener on
+    port (ss -p on Linux, lsof elsewhere); 1 if it dies or never does."""
+    return f'''p=$(cat {pid_file} 2>/dev/null)
+[ -n "$p" ] || {{ echo "no pid file"; exit 1; }}
+for i in $(seq 1 80); do
+  kill -0 "$p" 2>/dev/null || {{ echo "process $p exited"; exit 1; }}
+  if command -v ss >/dev/null 2>&1; then
+    ss -Hltnp "sport = :{port}" 2>/dev/null | grep -q "pid=$p," && exit 0
+  else
+    lsof -nP -a -p "$p" -iTCP:{port} -sTCP:LISTEN >/dev/null 2>&1 && exit 0
+  fi
+  sleep 0.25
+done
+echo "process $p does not own port {port}"; exit 1'''
 
 
 def origin_script(W: str, objects: Sequence[Tuple[str, int]]) -> str:
@@ -732,8 +768,10 @@ class Campaign:
         if not self.dry:
             for host in self.hosts.values():
                 rc, home = host.run('printf %s "$HOME"', what="home directory")
-                if rc != 0 or not home.strip().startswith("/"):
-                    raise Refused(f"{host.dest}: cannot resolve $HOME ({home.strip()[:200]})")
+                if rc != 0 or not re.match(r"^/[A-Za-z0-9._/-]+$", home.strip()):
+                    # Paths are interpolated into shell unquoted; refuse
+                    # anything that could split or expand.
+                    raise Refused(f"{host.dest}: $HOME must be an absolute path of [A-Za-z0-9._/-] ({home.strip()[:200]!r})")
                 host.home = home.strip()
         self.before = self.snapshot_all("before")
         if self.dry:
@@ -861,7 +899,7 @@ class Campaign:
         # what stop() and teardown() check before signalling anything.
         self.spawn(gh, "origin", f"{W}/origin",
                    f"python3 -m http.server {g.origin_port} --bind 127.0.0.1 --directory {W}/origin")
-        self.wait_port(gh, g.origin_port, "origin")
+        self.wait_port(gh, g.origin_port, "origin", "origin")
         for arm in cfg.arms:
             d = self.gw_dir(arm)
             self.must(gh, f"mkdir -p {d}/logs", f"gateway directory for {arm.name}")
@@ -920,11 +958,14 @@ if ps -o args= -p "$p" 2>/dev/null | grep -q -F -- "{W}/"; then
 fi
 rm -f "$f"''', what=f"stop {tag}")
 
-    def wait_port(self, host: Host, port: int, what: str) -> None:
-        rc, _ = host.run(f"for i in $(seq 1 80); do (exec 3<>/dev/tcp/127.0.0.1/{port}) 2>/dev/null && exit 0; sleep 0.25; done; exit 1",
-                         what=f"wait for {what} on {port}")
-        if rc != 0:
-            raise RuntimeError(f"{host.dest}: {what} did not listen on {port}")
+    def wait_port(self, host: Host, port: int, what: str, tag: str) -> None:
+        """Wait until the process this campaign spawned as `tag` is alive and
+        is the one listening on `port`. A connection alone is not enough: a
+        child that failed to bind would otherwise be mistaken for another
+        campaign's listener on the same port, and its trials measured there."""
+        rc, out = host.run(wait_owned_script(f"{self.w(host.dest)}/run/{tag}.pid", port), what=f"wait for {what} on {port}")
+        if rc != 0 and not self.dry:
+            raise RuntimeError(f"{host.dest}: {what} is not listening on {port} from its own process ({out.strip()[:200]})")
 
     def gw_cmd(self, arm: Arm, logname: str) -> str:
         g, cfg = self.cfg.gateway, self.cfg
@@ -933,14 +974,14 @@ rm -f "$f"''', what=f"stop {tag}")
                 "--metrics-listen", f"127.0.0.1:{g.metrics_port_base + arm.index}", "--log-file", f"{d}/logs/{logname}.jsonl",
                 "--log-max-size-mib", str(cfg.log_max_mib), "--log-stderr=false", *g.flags, *arm.flags, *arm.gateway_flags]
         if cfg.dc:
-            args += ["--path-profile", "dc-long-haul"] if not any(a.startswith("--path-profile") for a in args) else []
+            args += ["--path-profile", "dc-long-haul"]
         return " ".join(_q(a) for a in args)
 
     def start_gateway(self, arm: Arm, logname: str) -> None:
         gh = self.hosts[self.cfg.gateway.host]
         env = "QUEQIAO_LANE_TRACE=1" if self.cfg.lane_trace else ""
         self.spawn(gh, f"gw-{arm.name}", self.gw_dir(arm), self.gw_cmd(arm, logname), env)
-        self.wait_port(gh, self.cfg.gateway.metrics_port_base + arm.index, f"gateway {arm.name} metrics")
+        self.wait_port(gh, self.cfg.gateway.metrics_port_base + arm.index, f"gateway {arm.name} metrics", f"gw-{arm.name}")
 
     def cl_cmd(self, client: Client, arm: Arm, logname: str) -> str:
         d = self.cl_dir(client, arm)
@@ -950,7 +991,7 @@ rm -f "$f"''', what=f"stop {tag}")
                 "--log-file", f"{d}/logs/{logname}.jsonl", "--log-max-size-mib", str(min(self.cfg.log_max_mib, 256)),
                 "--log-stderr=false", *client.flags, *arm.flags, *arm.client_flags]
         if self.cfg.dc:
-            args += ["--path-profile", "dc-long-haul"] if not any(a.startswith("--path-profile") for a in args) else []
+            args += ["--path-profile", "dc-long-haul"]
         return " ".join(_q(a) for a in args)
 
     def start_client(self, client: Client, arm: Arm, logname: str) -> None:
@@ -963,7 +1004,7 @@ rm -f "$f"''', what=f"stop {tag}")
             self.active_small[client.host] = tag
         env = "QUEQIAO_LANE_TRACE=1" if self.cfg.lane_trace else ""
         self.spawn(ch, tag, self.cl_dir(client, arm), self.cl_cmd(client, arm, logname), env)
-        self.wait_port(ch, client.socks_port_base + arm.index, f"client {tag}")
+        self.wait_port(ch, client.socks_port_base + arm.index, f"client {tag}", tag)
         if client.cpu_sample:
             W = self.w(client.host)
             ch.run(cpu_sampler(f"{W}/run/{tag}.pid", f"{self.cl_dir(client, arm)}/logs/{logname}.cpu"),
@@ -1079,10 +1120,10 @@ rm -f "$f"''', what=f"stop {tag}")
             return
         for i, (client, kind, n) in enumerate(jobs):
             t0, t1, rc, out = results[i]
-            for flow, code, size, secs, ex in job_rows(out, kind, n, self.cfg.dc.waves if self.cfg.dc else 1, duration):
+            for flow, code, size, secs, ex, epoch in job_rows(out, kind, n, self.cfg.dc.waves if self.cfg.dc else 1, duration):
                 complete = int(ex == "0" and code == "200" and size == str(self.expected(kind)))
                 writer([slot.block, slot.path, slot.slot, arm.name, arm.role, slot.arm_trial, int(slot.cold), phase, i,
-                        client.name, kind, flow, utc(t0), utc(t1), code, size, secs, ex, complete, f"{t1 - t0:.3f}"])
+                        client.name, kind, flow, utc(t0), utc(t1), code, size, secs, ex, complete, f"{t1 - t0:.3f}", epoch])
 
     def clients_for(self, path: str) -> List[Client]:
         if self.cfg.workload == "dc":
@@ -1213,15 +1254,20 @@ rm -f "$f"''', what=f"stop {tag}")
             W = self.w(host)
             try:
                 h.run(self.owned(host) + f'''[ -d {W}/run ] || exit 0
+# Only the processes this campaign spawned (its pid files), each checked to
+# be running from the work directory; anything else that mentions the
+# directory is reported as a leftover by the verification, never killed.
+mine() {{ ps -o args= -p "$1" 2>/dev/null | grep -q -F -- "{W}/"; }}
 for f in {W}/run/*.pid; do
   [ -f "$f" ] || continue
-  p=$(cat "$f")
-  if ps -o args= -p "$p" 2>/dev/null | grep -q -F -- "{W}/"; then kill "$p" 2>/dev/null; fi
+  p=$(cat "$f"); mine "$p" && kill "$p" 2>/dev/null
 done
 sleep 2
-ps -eo pid=,args= | grep -F -- "{W}/" | grep -v -F grep | while read -r p rest; do kill -9 "$p" 2>/dev/null; done
-rm -f {W}/run/*.pid
-ps -eo pid=,args= | grep -F -- "{W}/" | grep -v -F grep || true''', what="stop every temporary process under the work directory")
+for f in {W}/run/*.pid; do
+  [ -f "$f" ] || continue
+  p=$(cat "$f"); mine "$p" && kill -9 "$p" 2>/dev/null
+done
+rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             except Exception as e:  # keep tearing down the other hosts
                 self.log(f"teardown on {host} failed: {e}")
         for host, ports in self.cfg.planned_ports().items():
@@ -1250,7 +1296,13 @@ ps -eo pid=,args= | grep -F -- "{W}/" | grep -v -F grep || true''', what="stop e
             os.makedirs(self.out, exist_ok=False)
         self.print_plan(slots)
         self.preflight()
-        manifest = self.build()
+        try:
+            manifest = self.build()
+        except BaseException:
+            # Nothing was started; give the reservations back so a corrected
+            # rerun is not refused.
+            self.release()
+            raise
         plan = {"config": {k: v for k, v in cfg.__dict__.items() if k not in ("gateway", "clients", "arms", "production", "dc")},
                 "workload": cfg.workload, "paths": cfg.paths(), "dc": cfg.dc.__dict__ if cfg.dc else None,
                 "arms": manifest, "schedule": [s.__dict__ for s in slots], "main": cfg.main.name,

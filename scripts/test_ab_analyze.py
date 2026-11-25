@@ -27,7 +27,8 @@ def iso(t):
 
 
 def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, late_every=5, zero_main=(), cand_stalls=3,
-                   status="complete", drop_slot=None, workload="bulk", cand_probe=None, cand_fallbacks=0, missing_queue=()):
+                   status="complete", drop_slot=None, workload="bulk", cand_probe=None, cand_fallbacks=0, missing_queue=(),
+                   cand_transport="auto"):
     """A two-arm campaign on one path with known outcomes.
 
     Main delivers ~40 MB per trial (four 10 MB flows) with 20% block-to-block
@@ -96,7 +97,8 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
                 bundle = "legacy" if arm == "main" else "cc-api=v2"
                 for fh in (sf, cf):
                     fh.write(json.dumps({"time": iso(start), "msg": "runtime configuration", "bundle": bundle,
-                                         "congestion": "erasure"}) + "\n")
+                                         "congestion": "erasure",
+                                         "transport": "auto" if arm == "main" else cand_transport}) + "\n")
                 for k in range(40):
                     tc = start + 1 + k * 0.4
                     ts_ = tc + 0.2 + (0.3 if k % late_every == late_every - 1 else 0.0)
@@ -194,8 +196,8 @@ class Analyzer(unittest.TestCase):
         root = self.campaign("files", cand_ratio=1.0)
         text, _ = an.report(root, self.gates)
         self.assertTrue(os.path.exists(os.path.join(root, "per_trial.tsv")))
-        self.assertIn("- `main` gateway: `bundle=legacy congestion=erasure`", text)
-        self.assertIn("- `cand` client: `bundle=cc-api=v2 congestion=erasure`", text)
+        self.assertIn("- `main` gateway: `bundle=legacy congestion=erasure transport=auto`", text)
+        self.assertIn("- `cand` client: `bundle=cc-api=v2 congestion=erasure transport=auto`", text)
         for want in ("### p: 12 blocks", "| metric | main | cand |", "flow-ACK transit p50 / p90",
                      "queue p90", "**Primary gate (section 15.4), p**", "stalls / trial", "wire bytes / useful byte", "TCP fallbacks"):
             self.assertIn(want, text)
@@ -226,6 +228,18 @@ class Analyzer(unittest.TestCase):
         self.assertTrue(all(t.m["wire_per_useful"] != t.m["wire_per_useful"] for t in cand))
         _, v = an.report(root, self.measurable)
         self.assertEqual(v[("p", "cand", "wire_per_useful")], "n/a")
+
+    def test_a_tcp_transport_client_has_no_quic_wire_cost(self):
+        _, v = an.report(self.campaign("tcp", cand_ratio=1.0, cand_transport="tcp"), self.measurable)
+        self.assertEqual(v[("p", "cand", "wire_per_useful")], "n/a")
+
+    def test_probes_outside_the_load_are_dropped(self):
+        load = [{"epoch": "1010", "seconds": "10"}, {"epoch": "1012", "seconds": "11"}]
+        probes = [{"epoch": "1005", "seconds": "0.1"}, {"epoch": "1020", "seconds": "0.1"},
+                  {"epoch": "995", "seconds": "0.1"}, {"epoch": "", "seconds": "0.1"}]
+        kept = an.under_load(probes, load)
+        self.assertEqual([p["epoch"] for p in kept], ["1005", ""])
+        self.assertEqual(an.under_load(probes, [{"epoch": "", "seconds": "1"}]), probes)
 
     def test_http_error_bodies_are_not_useful_bytes(self):
         t = an.Trial(1, "p", 1, "main", "main", 1, True)

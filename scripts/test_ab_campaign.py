@@ -71,7 +71,7 @@ class DryRun(unittest.TestCase):
         self.assertIn("read-only production snapshot (before)", text)
         self.assertIn("[preflight] would refuse", text)
         self.assertIn("main: bulk x4 via path-a/cand", text)
-        self.assertIn("stop every temporary process under the work directory", text)
+        self.assertIn("stop every process this campaign started", text)
         self.assertIn("blocks 2-12 repeat", text)
         # The runner owns these; the arm's bundle is appended after them.
         self.assertIn("--cc-api=v2 --sched=class --congestion=path", text)
@@ -225,6 +225,10 @@ class Config(unittest.TestCase):
         self.assertEqual(camp.binary(cand, "linux/amd64", "client"), camp.binary(main, "linux/amd64", "gateway"))
         self.assertNotEqual(camp.binary(cand, "linux/amd64", "gateway"), camp.binary(main, "linux/amd64", "gateway"))
 
+    def test_dc_profile_cannot_be_overridden(self):
+        text = DC_EXAMPLE.read_text().replace("flags = --cc-api=v2 --sched=class", "flags = --path-profile=wan-shared-bottleneck --cc-api=v2 --sched=class")
+        self.assertRejected(text, "dc-long-haul on both ends")
+
     def test_prebuilt_binaries_must_cover_every_platform(self):
         text = BASE + "[client:mac]\nhost = gw\nplatform = darwin/arm64\nsocks_port_base = 24581\nmetrics_port_base = 24591\n"
         self.assertRejected(text, "binary_darwin_arm64")
@@ -285,6 +289,19 @@ class Safety(unittest.TestCase):
         self.assertTrue(any("declared production port" in x for x in r), r)
         self.assertTrue(any("origin port 23480" in x for x in r), r)
 
+    def test_unobservable_production_unit_is_refused(self):
+        cfg = parse(BASE)
+        snaps = {"gw": ab.parse_snapshot("listen-ok\nunit-error queqiaod\n"), "c1": ab.parse_snapshot("listen-ok")}
+        self.assertTrue(any("cannot be observed" in x for x in ab.refusal_reasons(cfg, snaps)))
+        d = ab.snapshot_diff(ab.parse_snapshot(SNAP), ab.parse_snapshot(SNAP + "unit-error other\n"))
+        self.assertTrue(any("can no longer be observed" in x for x in d))
+
+    def test_unsafe_home_is_refused(self):
+        camp = ab.Campaign(parse(BASE), "/x", ".", dry=False, stream=io.StringIO())
+        with mock.patch.object(ab.Host, "run", return_value=(0, "/home/a b")):
+            with self.assertRaises(ab.Refused):
+                camp.preflight()
+
     def test_leftover_campaign_process_is_refused(self):
         cfg = parse(BASE)
         snaps = {"gw": ab.parse_snapshot(""),
@@ -313,8 +330,9 @@ class Parsing(unittest.TestCase):
         out = "1700000000\tb1\t200\t100\t1.5\t0\ngarbage\n1700000001\tb3\n"
         rows = ab.job_rows(out, "bulk", 3, 1, 90)
         self.assertEqual([r[0] for r in rows], ["b1", "b3", "b2"])
-        self.assertEqual(rows[1], ("b3", "000", "0", "90.000", "-1"))
-        self.assertEqual(rows[2], ("b2", "000", "0", "90.000", "-1"))
+        self.assertEqual(rows[0], ("b1", "200", "100", "1.5", "0", "1700000000"))
+        self.assertEqual(rows[1], ("b3", "000", "0", "90.000", "-1", "1700000001"))
+        self.assertEqual(rows[2], ("b2", "000", "0", "90.000", "-1", ""))
 
     def test_request_waves_are_expected(self):
         rows = ab.job_rows("", "requests", 2, 2, 30)
@@ -419,6 +437,56 @@ class LocalProcesses(unittest.TestCase):
         time.sleep(0.3)
         self.assertTrue(self.alive(victim.pid))
         self.assertTrue(os.path.isdir(self.W))
+
+    def test_readiness_requires_the_spawned_process_to_own_the_port(self):
+        import socket
+        listener = subprocess.Popen([sys.executable, "-c",
+                                     "import socket,sys,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen();"
+                                     "print(s.getsockname()[1], flush=True); time.sleep(30)", f"{self.W}/marker"],
+                                    stdout=subprocess.PIPE, text=True)
+        self.procs.append(listener)
+        port = int(listener.stdout.readline())
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.procs.append(other)
+        own = pathlib.Path(self.W, "run", "own.pid")
+        own.write_text(str(listener.pid))
+        rc, out = self.host.run(ab.wait_owned_script(str(own), port))
+        self.assertEqual(rc, 0, out)
+        # Someone else's listener on the port is not readiness of ours.
+        own.write_text(str(other.pid))
+        rc, out = self.host.run(ab.wait_owned_script(str(own), port).replace("seq 1 80", "seq 1 2"))
+        self.assertEqual(rc, 1, out)
+        # A dead child is reported at once.
+        other.kill()
+        other.wait()
+        rc, out = self.host.run(ab.wait_owned_script(str(own), port))
+        self.assertEqual(rc, 1)
+        self.assertIn("exited", out)
+
+    def test_teardown_kills_only_what_it_started(self):
+        # An operator's process that merely mentions the work directory (a
+        # `tail -f` on a log) survives teardown, and verification reports it.
+        tail = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", f"{self.W}/run/x.out"])
+        self.procs.append(tail)
+        self.camp.teardown()
+        time.sleep(0.3)
+        self.assertTrue(self.alive(tail.pid))
+        os.makedirs(self.camp.out)
+        left = self.camp.verify_teardown()
+        self.assertTrue(any(str(tail.pid) in x for x in left), left)
+
+    def test_build_failure_releases_the_reservations(self):
+        cfg = self.cfg
+        camp = ab.Campaign(cfg, os.path.join(self.home, "out3"), ".", dry=False, stream=io.StringIO())
+        camp.hosts["local"].home = self.home
+        camp.cfg = cfg
+        cfg.name = "t2"
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\n")}), \
+                mock.patch.object(ab.Campaign, "build", side_effect=subprocess.CalledProcessError(1, "go")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                camp.run()
+        self.assertFalse(os.path.exists(os.path.join(self.home, "qq-ab-t2")))
+        cfg.name = "t1"
 
     def test_teardown_leftovers_are_reported(self):
         snap = {"local": ab.parse_snapshot("listen-ok\nlisten udp 23471\nleftover 99 " + self.W + "/gw-main/queqiaod server\n")}
