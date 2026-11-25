@@ -63,6 +63,9 @@ you choose the next document based on what you want to do.
 - [Control redesign](CONTROL-REDESIGN.md) — proposed delay-bounded goodput
   objective, the two latched estimators it removes, what it does not solve, and
   the cases that would falsify it.
+- [Path-authority architecture](DESIGN-PATH-AUTHORITY.md) — proposed
+  replacement of per-lane shares with one congestion authority per path and
+  direction (design only, not implemented).
 
 ## Measure and qualify
 
