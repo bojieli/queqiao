@@ -454,6 +454,11 @@ rate each one actually sustains and keeps completion honest.
 Stop every temporary listener when the campaign ends. An earlier session left
 an authenticated listener bound to all interfaces for thirteen hours.
 
+The path-authority migration's gates are live A/B campaigns with a fixed
+block design and a pre-registered statistical test. They have their own
+runner, which also enforces the cleanup above. See
+[`VALIDATING-A-BUNDLE.md`](VALIDATING-A-BUNDLE.md).
+
 ## What the rig cannot tell you
 
 It models one bottleneck queue per direction plus an optional per-source

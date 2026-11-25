@@ -1,0 +1,358 @@
+# Validating a bundle
+
+The path-authority migration ([`DESIGN-PATH-AUTHORITY.md`](DESIGN-PATH-AUTHORITY.md),
+section 14) adds its behaviour as bundles behind switches. A switch moves
+forward only after it passes a live gate, and there are three kinds of gate:
+
+| Gate | Design | What it decides | Tools |
+|---|---|---|---|
+| A stage's live A/B | 15.3, 15.4 | whether a stage's bundle is at least 0.90 of the reference on every path | `ab_campaign.py`, `ab_analyze.py` |
+| The DC gate (stage 9) | 11.3 | whether `dc-long-haul` moves to the new architecture or keeps the legacy bundle | `ab_campaign.py` with `workload = dc`, `dc_gate.py` |
+| The default flip (stage 10) | 14 | whether new defaults ship | the first gate, run on the default build |
+
+All three run on real paths. The correctness gates of section 15.1 are
+ordinary Go tests and are not covered here.
+
+The harness replaces the per-campaign shell scripts that earlier A/B runs
+used. It keeps their trial shape: concurrent `curl` downloads through a
+temporary SOCKS5 client, the completion rule (curl exit 0, HTTP 200, exact
+byte count), gateway `/metrics` scraped before and after every trial, and the
+lane trace on both ends. On top of that it adds the block design and the
+statistics of section 15.4, refuses to start next to production, and tears
+everything down.
+
+## The pieces
+
+- `scripts/ab_campaign.py` runs a campaign. Each arm is a build plus a flag
+  bundle. The build is a git ref, built locally for every platform the
+  campaign needs, or prebuilt binaries. A crossover arm builds its gateway and
+  its client from different refs (`gateway_ref`, `client_ref`).
+- `scripts/ab_analyze.py` evaluates a campaign against section 15.4 and prints
+  a markdown table for a pull-request comment. `--pilot` sizes the campaign.
+- `scripts/dc_gate.py` evaluates a DC gate campaign against the frozen bounds.
+- `scripts/ab_stats.py` holds the statistics. It uses the standard library
+  only, and its tests pin every function to a known answer.
+- `scripts/validation/` holds the example campaigns, `gates.ini` (the section
+  15.4 constants and the secondary bounds), and `dc_gate.ini` (the stage 9
+  bounds, frozen).
+
+## Safety
+
+The campaign runs next to production gateways and relays, so the runner is
+built to refuse rather than to trust:
+
+- **No host is named in the repository.** Hosts and addresses live in a config
+  file matching `*.local.ini`, which git ignores. Use ssh aliases. Only
+  documentation addresses appear in the committed examples.
+- **Every host needs a `[production:...]` section.** The section lists the
+  host's systemd units, launchd labels, declared ports (include a production
+  gateway's whole hop-port range), and a process pattern. The section must
+  exist even when it lists nothing, so no host is touched without being looked
+  at first.
+- **Preflight is read-only, and it refuses.** Before anything is copied or
+  started, the runner snapshots each host:
+  - each unit's state, MainPID, NRestarts, start time and executable SHA-256;
+  - each launchd job;
+  - every process that matches the pattern;
+  - every listening port.
+
+  It then refuses to start if any planned temporary port is declared or
+  already listening, or if a process from an earlier campaign with the same
+  name is still running.
+- **One directory per host.** Everything temporary lives under
+  `~/qq-ab-<name>`. Every process is started from there with a pid file. A
+  process is signalled only after its command line has been checked to
+  contain that directory, so a stale pid file can never reach a production
+  process. Nothing uses `pkill`.
+- **Production is watched during the run.** The runner re-snapshots every
+  `snapshot_every` blocks and once more at the end. Any change to a
+  production unit, launchd job or matching process aborts the campaign, tears
+  it down, writes `prod-diff-*.txt`, and exits with status 3.
+- **Small hosts.** A host marked `small = true` never runs more than one
+  temporary client at a time: each trial starts its arm's client and stops it
+  afterwards. Earlier campaigns had resident clients OOM-killed on a 769 MB
+  relay host. The runner also checks this at run time.
+- **Teardown always runs**, on success, on error, and on SIGINT or SIGTERM.
+  It stops every temporary process, checks that no planned port is still
+  listening, and removes the work directory (pass `--keep-remote` to keep it).
+
+`--dry-run` prints the whole plan:
+
+- arms, hosts, planned ports and the full schedule;
+- every command of the first block, and of setup and teardown.
+
+It contacts no host and builds nothing. Run it first, every time.
+
+## Configure once
+
+```sh
+cp scripts/validation/campaign.example.ini scripts/validation/stage6.local.ini
+$EDITOR scripts/validation/stage6.local.ini
+./scripts/ab_campaign.py --config scripts/validation/stage6.local.ini --dry-run
+```
+
+The config has five kinds of section:
+
+- `[campaign]`: blocks, seed, workload, and timing.
+- `[gateway]`: one host, and the literal address clients dial.
+- One `[client:<path>]` per measured path. On a laptop, set
+  `--local-address` so a TUN-mode proxy does not carry the test
+  ([`BENCHMARKING.md`](BENCHMARKING.md), "Live campaigns").
+- One `[arm:<name>]` per arm, exactly one of them `role = main`.
+- One `[production:<name>]` per host.
+
+The `main` arm is the reference the contrasts are taken against. It is
+usually today's `origin/main`, but not always: see stage 7 below.
+
+Flags that point a process at state, a listener, a log or a profile
+(`--state`, `--listen`, `--metrics-listen`, `--log-file`, `--profile`, and
+others) are set by the runner. A config that sets them is rejected.
+
+## Gate 1: a stage's live A/B
+
+### Choose the arms
+
+Arm flags are the section 14 switch names. Check `queqiaod client -h` on the
+candidate build.
+
+| Stage | Reference arm (`role = main`) | Candidate arm | Note |
+|---|---|---|---|
+| 0, 1 | `origin/main` | `--cc-api=v2` | baseline experiments only; the class scheduler is not available yet (round-5 review) |
+| 2 | today's controllers | {isolated, single connection} × {round-robin, `--sched=class`} | the product-configuration screen of 15.3: four arms. It chooses a configuration; it does not attribute a result to topology |
+| 6 | `origin/main` | `--cc-api=v2 --sched=class --congestion=path` | works with isolation on |
+| 7 | `--congestion=path` with isolation | `--congestion=path --topology=single` | the topology test of 15.3: the reference arm is *not* main |
+| 8 | stage 7's bundle | `... --recovery=carrier` | |
+
+More than two arms is fine. Each arm runs twice per block, in a rotated order
+followed by its mirror, and every arm is compared with the reference.
+
+### Workloads
+
+`workload` selects one of the section 15.3 workloads:
+
+- `bulk`: four concurrent downloads.
+- `single`: one flow.
+- `interactive`: the bulk load plus a small-object probe every
+  `probe_interval` seconds. It measures interactive p99 under bulk.
+
+A stage's gate needs all three. Run them as three campaigns with different
+names.
+
+### Unit and outcome
+
+One block is four trials on one path for two arms, in ABBA or BAAB order
+chosen at random from the seed. With N arms a block has 2N trials. Every
+gateway is restarted before every block, so no path knowledge
+(`knowledgeLifetime`) carries from one block to the next. An arm's first
+trial in a block starts cold. Its second starts warm, from that arm's own
+first trial. On a small host the client is restarted for every trial, but the
+gateway keeps its state, and the gateway is the sender for these downloads.
+
+The outcome per arm per block is the useful bytes delivered within `duration`
+seconds, summed over the arm's two trials and all their flows. A failed flow
+counts what it delivered. A flow that printed nothing counts as zero; it is
+not dropped.
+
+### Pilot, then freeze the block count
+
+Section 15.4 fixes the sample size in advance from a pilot. Run a 12-block
+campaign, then:
+
+```sh
+./scripts/ab_campaign.py --config scripts/validation/stage6.local.ini --output ~/campaigns/stage6-pilot
+./scripts/ab_analyze.py ~/campaigns/stage6-pilot --pilot
+```
+
+The pilot table gives, per path and candidate, the blocks needed for 80%
+power when the true ratio is 1, using the pilot's contrast variance and its
+mean main outcome. Freeze the largest number as `blocks`. Do not reuse the
+pilot's blocks, and change the campaign `name` so the new campaign gets its
+own directory.
+
+### Run, analyze, post
+
+```sh
+./scripts/ab_campaign.py --config scripts/validation/stage6.local.ini --output ~/campaigns/stage6
+./scripts/ab_analyze.py ~/campaigns/stage6 > comment.md
+gh pr comment <PR> --body-file comment.md
+```
+
+A campaign directory holds:
+
+- `plan.json`: arms, commits, binary SHA-256s and the schedule.
+- `effective-commands.json`.
+- `trials.tsv`: one row per flow.
+- `metrics/`: gateway scrapes before and after each trial.
+- `logs/`: gateway and client logs, gzipped, and client CPU samples.
+- `prod-*.txt`: the production snapshots.
+
+The analyzer adds `per_trial.tsv` and `summary.md`.
+
+### Reading the table
+
+For each path, the analyzer prints each arm's medians:
+
+- goodput;
+- completion;
+- server loss;
+- queue p90, from the gateway lane trace as `srtt - minRTT`, deduplicated
+  per connection;
+- stalls per trial;
+- wire bytes per useful byte;
+- reissued bytes per source byte;
+- flow-ACK transit p50 and p90;
+- client CPU p90;
+- for the interactive workload, interactive p99.
+
+Flow-ACK transit is matched by sequence number when the build logs per-ACK
+`flow ack sent` and `flow ack received` events, as the instrumented builds of
+the 2×2 run did. Otherwise it is count-matched from the lane trace's `acksout`
+and `acksin`, which assumes one ordered stream per flow. The header says which
+method was used.
+
+Then comes the primary gate, per candidate. For each block it takes
+`d = candidate − 0.90 × main` and reports:
+
+- the mean contrast;
+- the one-sided 95% t lower bound, which the design names as primary;
+- the bootstrap lower bound, which the design names as the check.
+
+The gate **passes only when both lower bounds are above zero**. A
+disagreement fails rather than being settled in the candidate's favour. The
+gate is **VOID** when more than 10% of main's blocks delivered nothing; the
+campaign is then rerun. "Point estimate ≥ 0.95 and the interval includes 1"
+is not a pass.
+
+Next come the secondary bounds from `gates.ini`. Each one is a per-block
+`candidate − main` difference with a one-sided bootstrap bound against a
+pre-registered margin. The design requires all of them but does not give
+their values. The margins in `gates.ini` are **provisional** and must be
+confirmed before the stage's campaign starts. Sender-side credit delay p95 and
+the shadow false-promotion rate need the stage 0 instrumentation and are not
+computed yet.
+
+The last line per candidate is the overall verdict:
+
+- **PASS**: the primary gate passes and so does every secondary.
+- **FAIL**: any of them fails.
+- **INCOMPLETE**: a required secondary could not be measured. That is not a
+  pass.
+
+## Gate 2: the DC gate (stage 9)
+
+Section 11.3 keeps `dc-long-haul` on the legacy bundle through the migration.
+It moves the profile only if the profile passes its own gate on the new
+architecture. The bounds are in `scripts/validation/dc_gate.ini`. They are
+**frozen**: section 11.3 and the round-5 review both require them to be fixed
+before the campaign runs. A change must land in its own commit before any
+stage 9 data exists.
+
+### The workload
+
+A leaf is an endpoint pair, and the gateway is the sender for downloads. So
+the gateway's tree runs from its egress to a group to each client address,
+and each client host is one leaf under a shared ancestor. The DC campaign
+(`scripts/validation/dc-campaign.example.ini`) has these parts:
+
+- One temporary gateway per arm, with `--path-profile dc-long-haul` on both
+  ends.
+- **Loaded leaves:** two or more client hosts, each its own leaf, that load
+  the shared ancestor at the same time.
+- **A control leaf:** the uncongested sibling. It fetches one request-sized
+  object every `control_interval` seconds and nothing else.
+- **Each trial, two phases, with every leaf at once:**
+  - *sustained*: `bulk_flows_per_leaf` downloads per loaded leaf, for
+    `duration` seconds;
+  - *requests*: `waves` waves of `requests_per_leaf` concurrent 300 KB
+    fetches per loaded leaf, the shape of the profile's own relay
+    measurement.
+- **Calibration:** at the end of every block, each loaded leaf runs alone on
+  the legacy arm.
+
+### The criteria
+
+Each criterion is a paired per-block contrast against the legacy arm. Both
+the t and the bootstrap one-sided lower bounds must be above zero.
+
+| Criterion | Contrast |
+|---|---|
+| sustained goodput (aggregate of loaded leaves) | `cand − 0.90 × legacy` |
+| request latency p50 and p99 | `1.10 × legacy − cand` |
+| worst leaf's service | `cand − 0.90 × legacy` |
+| completion spread (slowest leaf's median over fastest leaf's) | `1.25 × legacy − cand`, and `3.5 − cand` |
+| cross-leaf fairness (Jain's index) | `cand − (legacy − 0.05)` |
+| control leaf request p50 | `1.10 × legacy − cand` |
+
+The spread bound exists because of the regime the profile document reports
+(`DESIGN-DC-PROFILE.md`, "One relay per node isn't faster than several" and
+"Relay layout"). Independent relays moved about 2.5× the aggregate of one
+shared relay, but their groups spread out by 3.5×, while the shared relay
+finished every flow within 2 ms. A knowledge-only tree buys aggregate the same
+way, so a candidate that wins on goodput by starving a leaf fails here.
+
+The campaign is **VOID** unless the shared ancestor actually bound. The legacy
+arm's simultaneous aggregate must average at most 0.80 of the sum of the
+leaves' solo rates. A void campaign did not test the regime, so add load and
+rerun.
+
+```sh
+./scripts/ab_campaign.py --config scripts/validation/dc.local.ini --dry-run
+./scripts/ab_campaign.py --config scripts/validation/dc.local.ini --output ~/campaigns/dc-gate
+./scripts/dc_gate.py ~/campaigns/dc-gate > comment.md
+```
+
+Section 11.3 states what follows from each outcome:
+
+- **PASS:** the profile moves to the new architecture, and the legacy bundle
+  may be deleted at stage 11.
+- **FAIL:** the legacy bundle stays for this profile, nothing it needs is
+  deleted, and joint limiting waits for the tree-arbiter design (Q2).
+
+## Gate 3: the default flip (stage 10)
+
+Stage 10 flips every default in one release, gateways first, and soaks for
+one release. Its gate is Gate 1 run on the release candidate:
+
+- **Arms.** The reference arm is the previous release, or `origin/main`
+  before the flip, with no flags: the legacy bundle. The candidate is the
+  release-candidate build with no flags, so its new defaults are what is
+  measured.
+- **Paths and workloads.** Every path in the field campaign, with all three
+  workloads.
+- **Gateways first.** Add a crossover arm (`gateway_ref = <candidate>`,
+  `client_ref = <previous release>`). It shows that an upgraded gateway does
+  no harm to clients that have not upgraded yet, which is the order the
+  rollout takes.
+- **Legacy bundle.** The legacy bundle must still start and pass. Keep an arm
+  with every switch explicitly off on the candidate build, so the rollback
+  path is measured in the same campaign.
+- **DC profile.** Because of the gate's outcome, `dc-long-haul` either moved
+  at stage 9 or still runs the legacy bundle. Run its campaign again on the
+  candidate either way.
+
+The flip passes only if every path and workload is PASS. INCOMPLETE is not
+PASS.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s scripts -p 'test_*.py'
+```
+
+CI runs these tests. They cover:
+
+- **The statistics:** t quantiles against tables; the bootstrap against
+  closed-form two-point and constant cases and against the t-interval; a
+  false-pass rate under the null near 5%; the contrast, gate, void rule and
+  sample size against known answers.
+- **The analyzers:** synthetic campaigns whose transit, queue delay, loss and
+  CPU are known.
+- **The DC criteria:** a candidate that buys aggregate with unfairness fails,
+  and an ancestor that never binds voids the campaign.
+- **The runner:**
+  - dry runs contact nothing;
+  - the schedule's balance;
+  - config rejections;
+  - the refusal logic;
+  - snapshot, spawn, stop and teardown, run against processes the test itself
+    starts on the local machine.
