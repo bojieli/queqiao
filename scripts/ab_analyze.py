@@ -160,6 +160,19 @@ def useful(row: dict) -> int:
 OVERLAP_MIN = 0.1
 
 
+def tcp_evidence(rec: dict) -> bool:
+    """A gateway flow record (remote flow complete / ended with error) shows
+    TCP when its opening carrier was TCP or any lane that carried bytes was
+    (an AUTO rescue can hand a flow to TCP without a client fallback)."""
+    if rec.get("transport") != "quic":
+        return True
+    for lane in (rec.get("lane_bytes") or {}).values():
+        if isinstance(lane, dict) and lane.get("Kind") not in (None, "quic") and \
+                (lane.get("Sent", 0) or lane.get("Received", 0)):
+            return True
+    return False
+
+
 def span(r: dict) -> Optional[Tuple[float, float]]:
     """A row's (start, end) on its host's clock, in milliseconds as the runner
     records them; None when a row has no sub-second times, since whole
@@ -495,7 +508,8 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         key = (t.arm, t.tag)
         if key not in cache:
             recs = list(iter_json(server_logs(campaign, t.arm, t.tag),
-                                  ('"lane_metrics"', '"flow ack received"', '"runtime configuration"')))
+                                  ('"lane_metrics"', '"flow ack received"', '"runtime configuration"',
+                                   '"remote flow complete"', '"remote flow ended with error"')))
             for r in recs:
                 if r.get("msg") == "runtime configuration":
                     EFFECTIVE.setdefault((t.arm, "gateway"), set()).add(effective(r))
@@ -539,7 +553,12 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
             cpus += glob.glob(os.path.join(base, f"client-{t.tag}-s{t.slot}.cpu" if small else f"client-{t.tag}.cpu"))
         # Gateway QUIC bytes say nothing about a client that dialled TCP
         # directly (--transport tcp increments no fallback counter).
-        if t.m.get("client_transport") not in ("quic", "auto"):
+        # QUIC-only wire cost needs evidence that the trial was QUIC-only:
+        # the gateway's flow records, none showing a TCP carrier or lane.
+        flows_rec = [r for r in srecs if r.get("msg") in ("remote flow complete", "remote flow ended with error")
+                     and t.start - 1 <= r["_t"] <= t.end + 5]
+        t.m["tcp_flows"] = float(sum(1 for r in flows_rec if tcp_evidence(r)))
+        if t.m.get("client_transport") not in ("quic", "auto") or not flows_rec or t.m["tcp_flows"]:
             t.m["wire_per_useful"] = float("nan")
         t.m["_transit"] = ex
         t.m["transit_p50_s"] = st.quantile(ex, 0.5)
@@ -750,6 +769,15 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
                 judged_rules[k] = rule
             elif metric not in wl.report_only:
                 unruled.append(k)
+        # And every configured rule must find its measure: in each phase that
+        # ran on this path for a wildcard, by name otherwise. A measure the
+        # extractor never produced is unmeasured, not absent from the verdict.
+        phases_here = sorted({r["phase"] for t in trials.values() if t.path == path for r in t.rows})
+        for rk, rule in rules.items():
+            wanted = [f"{ph}.{rk[2:]}" for ph in phases_here] if rk.startswith("*.") else [rk]
+            for k in wanted:
+                if k not in judged_rules and (rk.startswith("*.") or k.split(".", 1)[0] in phases_here):
+                    judged_rules[k] = rule
         if keys:
             out += ["", f"**{wl.name} measures, per block (mean over blocks), {path}**", "",
                     "| measure | " + " | ".join(arms) + " |", "|---|" + "---:|" * len(arms)]

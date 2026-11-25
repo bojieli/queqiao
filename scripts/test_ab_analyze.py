@@ -27,7 +27,7 @@ def iso(t):
 
 def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, late_every=5, zero_main=(), cand_stalls=3,
                    status="complete", drop_slot=None, workload="bulk", cand_probe=None, cand_fallbacks=0, missing_queue=(),
-                   cand_transport="auto", cand_capped=False, fetch_failures=()):
+                   cand_transport="auto", cand_capped=False, fetch_failures=(), cand_tcp_lane=False):
     """A two-arm campaign on one path with known outcomes.
 
     Main delivers ~40 MB per trial (four 10 MB flows) with 20% block-to-block
@@ -99,6 +99,13 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
             os.makedirs(cli, exist_ok=True)
             with gzip.open(os.path.join(srv, f"server-{tag}.jsonl.gz"), "at") as sf, \
                     open(os.path.join(cli, f"client-{tag}-s{slot}.jsonl"), "w") as cf:
+                lanes = {"1": {"Kind": "quic", "Sent": useful, "Received": 100}}
+                if arm == "cand" and cand_tcp_lane:
+                    # An AUTO rescue moved part of the flow to TCP: no client
+                    # fallback is counted, but the lane shows it.
+                    lanes["2"] = {"Kind": "tcp", "Sent": 1000, "Received": 0}
+                sf.write(json.dumps({"time": iso(start + 10), "msg": "remote flow complete", "transport": "quic",
+                                     "lane_bytes": lanes}) + "\n")
                 bundle = "legacy" if arm == "main" else "cc-api=v2"
                 for fh in (sf, cf):
                     fh.write(json.dumps({"time": iso(start), "msg": "runtime configuration", "bundle": bundle,
@@ -225,6 +232,16 @@ class Analyzer(unittest.TestCase):
         _, v = an.report(self.campaign("partial", cand_ratio=1.0, missing_queue=((3, 2),)), self.measurable)
         self.assertEqual(v[("p", "cand", "queue_p90_ms")], "n/a")
         self.assertEqual(v[("p", "cand", "overall")], "INCOMPLETE")
+
+    def test_a_tcp_rescue_lane_has_no_quic_wire_cost(self):
+        root = self.campaign("tcplane", cand_ratio=1.0, cand_tcp_lane=True)
+        plan, trials = an.read_campaign(root)
+        an.measure(root, plan, trials)
+        cand = [t for t in trials.values() if t.arm == "cand"]
+        self.assertTrue(all(t.m["wire_per_useful"] != t.m["wire_per_useful"] for t in cand))
+        self.assertTrue(all(t.m["tcp_flows"] == 1 for t in cand))
+        self.assertTrue(an.tcp_evidence({"transport": "quic", "lane_bytes": {"2": {"Kind": "tcp", "Sent": 5}}}))
+        self.assertFalse(an.tcp_evidence({"transport": "quic", "lane_bytes": {"2": {"Kind": "tcp", "Sent": 0}}}))
 
     def test_tcp_fallback_trials_have_no_wire_cost(self):
         root = self.campaign("fallback", cand_ratio=1.0, cand_fallbacks=1)

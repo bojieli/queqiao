@@ -8,6 +8,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
@@ -200,6 +201,10 @@ class Config(unittest.TestCase):
                             "--state is set by the runner")
         self.assertRejected(BASE.replace("flags = --cc-api=v2", "gateway_flags = --listen :443"), "--listen")
 
+    def test_reversed_or_invalid_port_ranges_are_rejected(self):
+        self.assertRejected(BASE.replace("ports = 443 12540-12549", "ports = 12639-12540"), "low-high")
+        self.assertRejected(BASE.replace("ports = 443 12540-12549", "ports = 70000"), "out of range")
+
     def test_single_dash_spelling_is_also_owned(self):
         # Go's flag package treats -state and --state alike.
         self.assertRejected(BASE.replace("flags = --cc-api=v2", "flags = -state /var/lib/queqiao/provider"), "--state")
@@ -302,6 +307,21 @@ class Safety(unittest.TestCase):
         r = ab.refusal_reasons(cfg, snaps)
         self.assertEqual(len(r), 1)
         self.assertIn("c1: could not read the listening ports", r[0])
+
+    def test_a_process_table_that_becomes_unreadable_is_a_change(self):
+        d = ab.snapshot_diff(ab.parse_snapshot(SNAP), ab.parse_snapshot(SNAP.replace("ps-ok\n", "")))
+        self.assertTrue(any("process table can no longer be read" in x for x in d), d)
+
+    def test_clean_reports_a_directory_it_does_not_own(self):
+        camp = ab.Campaign(parse(BASE), "/o", ".", dry=False, stream=io.StringIO())
+        camp.reserved = ["gw"]
+        for h in camp.hosts.values():
+            h.home = "/home/u"
+        with mock.patch.object(ab.Host, "run", return_value=(ab.NOT_OWNER, "not owner of /home/u/qq-ab-t1")):
+            failed = camp.clean()
+        self.assertEqual(len(failed), 1)
+        self.assertIn("ownership could not be verified", failed[0])
+        self.assertEqual(camp.reserved, ["gw"])
 
     def test_unreadable_process_table_is_refused(self):
         cfg = parse(BASE)
@@ -709,6 +729,25 @@ class LocalProcesses(unittest.TestCase):
         self.camp._fetch_glob(self.host, str(e), "server-b001-a", os.path.join(self.home, "fetched"))
         self.assertEqual(len(self.camp.fetch_failures), 1)
 
+    def test_an_interrupted_job_is_stopped_with_everything_it_started(self):
+        # A job (here: a shell that started a child) whose ssh is still in
+        # flight when the runner is interrupted: teardown stops its group.
+        script = self.camp.as_job("local", f"{sys.executable} -c 'import time; time.sleep(60)' & wait")
+        done = threading.Event()
+        threading.Thread(target=lambda: (self.host.run(script, timeout=90), done.set()), daemon=True).start()
+        for _ in range(100):
+            files = list(pathlib.Path(self.W, "run").glob("job-*.pgid"))
+            if files:
+                break
+            time.sleep(0.05)
+        self.assertTrue(files)
+        pgid = int(files[0].read_text())
+        self.camp.teardown()
+        self.assertTrue(done.wait(10), "the job's shell did not end")
+        out = subprocess.run(["ps", "-o", "pid=", "-g", str(pgid)], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(out, "")
+        self.assertEqual(list(pathlib.Path(self.W, "run").glob("job-*.pgid")), [])
+
     def test_teardown_leftovers_are_reported(self):
         snap = {"local": ab.parse_snapshot("listen-ok\nps-ok\nlisten udp 23471\nleftover 99 " + self.W + "/gw-main/queqiaod server\n")}
         with mock.patch.object(ab.Campaign, "snapshot_all", return_value=snap):
@@ -717,6 +756,9 @@ class LocalProcesses(unittest.TestCase):
         self.assertTrue(any("still running: 99" in x for x in left), left)
         with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\nps-ok\n")}):
             self.assertEqual(self.camp.verify_teardown(), [])
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\n")}):
+            left = self.camp.verify_teardown()
+        self.assertTrue(any("process table" in x for x in left), left)
 
     def test_cpu_sampler_reads_a_busy_process(self):
         busy = subprocess.Popen([sys.executable, "-c", "while True: pass"])

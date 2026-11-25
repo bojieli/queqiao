@@ -182,6 +182,18 @@ class Plugins(unittest.TestCase):
         self.assertNotIn(("a", "cand", "rule:main.echo_p99_s"), v)
         self.assertEqual(v[("a", "cand", "overall")], "INCOMPLETE")   # nothing judged is not a pass
 
+    def test_a_rule_whose_measure_never_appeared_is_unmeasured(self):
+        # Two required measures; the extractor produced only one. The
+        # missing one must not drop out of the verdict.
+        root = os.path.join(self.tmp.name, "absent")
+        self.write_campaign(root, 1.0)
+        g = self.gates()
+        g["workloads"] = {"toy": {"*.echo_p99_s": ("atmost", (1.10,)), "*.completion": ("higher", (0.02,))}}
+        _, v = an.report(root, g)
+        self.assertEqual(v[("a", "cand", "rule:main.echo_p99_s")], "pass")
+        self.assertEqual(v[("a", "cand", "rule:main.completion")], "n/a")
+        self.assertEqual(v[("a", "cand", "overall")], "INCOMPLETE")
+
     def test_wildcard_and_hard_rules(self):
         root = os.path.join(self.tmp.name, "wild")
         self.write_campaign(root, 1.0)

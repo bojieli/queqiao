@@ -31,7 +31,7 @@ def ms(x):
 def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blocks=12, seed=3,
              cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False, no_solo=(),
              profile="dc-long-haul", fail_requests=(), stagger=(), gw_args=True, nat=False, tcp_leaf=None,
-             no_path_key=False, fallback_leaf=None):
+             no_path_key=False, fallback_leaf=None, tcp_lane_leaf=None, empty_egress=False):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -56,9 +56,13 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
             "ctl": "198.51.100.9"}
 
     def flow_record(arm, b, when, leaf):
-        rec = {"time": iso(when), "msg": "remote flow complete", "transport": "tcp" if leaf == tcp_leaf else "quic"}
+        rec = {"time": iso(when), "msg": "remote flow complete", "transport": "tcp" if leaf == tcp_leaf else "quic",
+               "lane_bytes": {"1": {"Kind": "quic", "Sent": 1000, "Received": 10}}}
+        if leaf == tcp_lane_leaf:
+            rec["lane_bytes"]["2"] = {"Kind": "tcp", "Sent": 500, "Received": 0}
         if not no_path_key:
-            rec.update(path_egress=egress, path_key=f"{egress}->{addr[leaf]}")
+            rec.update(path_egress="" if empty_egress else egress,
+                       path_key=f"{'' if empty_egress else egress}->{addr[leaf]}")
         srv.setdefault((arm, b), []).append(rec)
 
     def client_metrics(b, slot, arm, leaves):
@@ -278,6 +282,28 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("tcp", tcp_leaf="lb")
         self.assertEqual(v["cand"], "VOID")
         self.assertIn("not only QUIC", text)
+
+    def test_a_mid_flow_tcp_handoff_voids_the_campaign(self):
+        text, v = self.run_gate("tcplane", tcp_lane_leaf="lc")
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("ran over TCP", text)
+
+    def test_an_empty_egress_is_not_a_common_ancestor(self):
+        text, v = self.run_gate("noegress", empty_egress=True)
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("common ancestor is unknown", text)
+
+    def test_wave_overlap_uses_actual_intervals(self):
+        # lb has one early and one late request; la runs entirely between
+        # them: the envelopes overlap, the requests never did.
+        rows = [{"client": "la", "flow": "w1r1", "t_start": "10.000", "t_end": "10.400"},
+                {"client": "lb", "flow": "w1r1", "t_start": "9.000", "t_end": "9.300"},
+                {"client": "lb", "flow": "w1r2", "t_start": "11.000", "t_end": "11.300"}]
+        common = None
+        for leaf in ("la", "lb"):
+            iv = dc.merge([dc.span(r) for r in rows if r["client"] == leaf], 0.0)
+            common = iv if common is None else dc.intersect(common, iv)
+        self.assertEqual(common, [])
 
     def test_a_client_fallback_voids_the_campaign(self):
         text, v = self.run_gate("fallback", fallback_leaf="lc")

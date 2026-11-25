@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
 from ab_analyze import (OVERLAP_MIN, PROBE_TIMEOUT, Trial, capped_flows, completeness, flow_rows,  # noqa: E402
-                        fmt, iter_json, metrics, read_campaign, span, ts, under_load, useful)
+                        fmt, iter_json, metrics, read_campaign, span, tcp_evidence, ts, under_load, useful)
 
 BOUNDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "dc_gate.ini")
 
@@ -123,16 +123,18 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     waves = sorted({r["flow"].split("r", 1)[0] for r in req})
     overlap = bool(waves)
     for w in waves:
-        iv = []
+        # Demonstrable overlap, on millisecond times: the intersection across
+        # leaves of each leaf's actual request intervals (not its first-to-
+        # last envelope, which would fill an idle gap) lasts OVERLAP_MIN.
+        common = None
         for leaf in loaded:
             sp = [x for x in (span(r) for r in req if r["client"] == leaf and r["flow"].split("r", 1)[0] == w) if x]
             if not sp:
-                overlap = False
+                common = []
                 break
-            iv.append((min(a for a, _ in sp), max(b for _, b in sp)))
-        # Demonstrable overlap, on millisecond times: all leaves were in the
-        # wave together for at least OVERLAP_MIN.
-        if overlap and not min(b for _, b in iv) - max(a for a, _ in iv) >= OVERLAP_MIN - 1e-6:
+            iv = merge(sp, 0.0)
+            common = iv if common is None else intersect(common, iv)
+        if not common or sum(b - a for a, b in common) < OVERLAP_MIN - 1e-6:
             overlap = False
     m["waves_overlap"] = float(overlap)
     leaf_med = [st.median([done(r) for r in req if r["client"] == leaf]) for leaf in loaded]
@@ -208,8 +210,9 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
             return None
         # The carrier first: a TCP record is positive evidence against the
         # gate (and carries no leaf key by design).
-        if any(r.get("transport") != "quic" for r in rs):
-            wrong.append(f"{what}: flows ran over {sorted({str(r.get('transport')) for r in rs})}, not only QUIC")
+        if any(tcp_evidence(r) for r in rs):
+            wrong.append(f"{what}: some flows ran over TCP (an opening carrier or a lane that carried bytes), "
+                         "not only QUIC")
             return None
         if any("path_key" not in r for r in rs):
             missing.append(f"{what}: no gateway record of its carrier and leaf (needs QUEQIAO_LANE_TRACE=1 and a build "
@@ -222,6 +225,11 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
             elif fb > 0:
                 wrong.append(f"{what}: client {leaf} fell back to TCP")
         egress = {r.get("path_egress") for r in rs}
+        if not all(egress):
+            # resolvePath gives an empty egress when the route lookup failed:
+            # the common ancestor is then unknown, not verified.
+            missing.append(f"{what}: a flow record has no egress, so the common ancestor is unknown")
+            return None
         if len(egress) != 1:
             wrong.append(f"{what}: flows under {len(egress)} egresses, not one common ancestor")
         return {r["path_key"] for r in rs}

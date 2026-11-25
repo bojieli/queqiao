@@ -65,6 +65,9 @@ ARM_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 WORK_PREFIX = "qq-ab-"
 # curl --max-time of one probe request; an unfinished probe counts as this long.
 PROBE_TIMEOUT = 10
+# Exit status of the ownership guard: the work directory is not this
+# invocation's, so nothing was done to it.
+NOT_OWNER = 9
 # Seconds between dispatching a DC phase's jobs and their shared start.
 BARRIER_LEAD = 5
 # Millisecond wall-clock time on a campaign host. Whole seconds (the last
@@ -107,10 +110,17 @@ def _ports(v: str) -> List[int]:
     out: List[int] = []
     for tok in (v or "").replace(",", " ").split():
         if "-" in tok:
-            a, b = tok.split("-", 1)
-            out.extend(range(int(a), int(b) + 1))
+            a, b = (int(x) for x in tok.split("-", 1))
+            if not 1 <= a <= b <= 65535:
+                # A reversed or out-of-range declaration would silently
+                # protect nothing.
+                raise ConfigError(f"port range {tok!r} must be low-high within 1-65535")
+            out.extend(range(a, b + 1))
         else:
-            out.append(int(tok))
+            p = int(tok)
+            if not 1 <= p <= 65535:
+                raise ConfigError(f"port {tok!r} is out of range")
+            out.append(p)
     return out
 
 
@@ -545,6 +555,9 @@ def snapshot_diff(before: dict, after: dict) -> List[str]:
             w = after.get(kind, {}).get(name)
             if w != v:
                 out.append(f"{kind[:-1] if kind == 'units' else kind} {name}: {v!r} -> {w!r}")
+    for flag, what in (("ps_ok", "process table"), ("listen_ok", "listening ports")):
+        if before.get(flag) and not after.get(flag):
+            out.append(f"the {what} can no longer be read, so production cannot be verified")
     for u in sorted(set(after.get("unit_errors", [])) - set(before.get("unit_errors", []))):
         out.append(f"production unit {u} can no longer be observed")
     gone = sorted(set(before.get("procs", [])) - set(after.get("procs", [])))
@@ -743,6 +756,7 @@ class Campaign:
         self.fetch_failures: List[str] = []
         self.reserved: List[str] = []
         self.production_changed = False
+        self.job_seq = 0
         self.token = "dry-run-token" if dry else os.urandom(16).hex()
         self.started = False
 
@@ -844,14 +858,16 @@ class Campaign:
     def owned(self, host: str) -> str:
         """Shell guard: exit unless this invocation owns the work directory."""
         W = self.w(host)
-        return f'[ "$(cat {W}/.owner 2>/dev/null)" = "{self.token}" ] || {{ echo "not owner of {W}"; exit 0; }}\n'
+        return f'[ "$(cat {W}/.owner 2>/dev/null)" = "{self.token}" ] || {{ echo "not owner of {W}"; exit {NOT_OWNER}; }}\n'
 
     def release(self) -> None:
         for host in list(self.reserved):
             W = self.w(host)
             try:
-                self.hosts[host].run(self.owned(host) + f"rm -f {W}/.owner; rmdir {W}/run {W} 2>/dev/null; true",
-                                     what="release an unused reservation")
+                rc, _ = self.hosts[host].run(self.owned(host) + f"rm -f {W}/.owner; rmdir {W}/run {W} 2>/dev/null; true",
+                                             what="release an unused reservation")
+                if rc == NOT_OWNER and not self.dry:
+                    self.log(f"{host}: {W} is no longer this campaign's; left alone")
                 self.reserved.remove(host)
             except Exception as e:
                 self.log(f"{host}: could not release {W} ({e}); remove it by hand (owner token {self.token})")
@@ -1112,6 +1128,15 @@ rm -f "$f"''', what=f"stop {tag}")
     def stop_file(self, client: Client, arm: Arm) -> str:
         return f"{self.w(client.host)}/run/stop-probe-{client.name}-{arm.name}"
 
+    def as_job(self, host: str, script: str) -> str:
+        """Run a job in its own process group, recorded under run/, so that
+        teardown can stop it and everything it started (curl, python) even
+        when the runner was interrupted while the job's ssh was in flight."""
+        W = self.w(host)
+        self.job_seq += 1
+        f = f"{W}/run/job-{self.job_seq}.pgid"
+        return (f"set -m\n(\n{script}\n) &\nj=$!\necho $j > {f}\nwait $j\nrc=$?\nrm -f {f}\nexit $rc")
+
     def pause(self, seconds: float) -> None:
         if not self.dry:
             time.sleep(seconds)
@@ -1128,7 +1153,7 @@ rm -f "$f"''', what=f"stop {tag}")
         def go(i, job, gen):
             t0 = time.time()
             try:
-                rc, out = self.hosts[job.client.host].run(gen.script(self, job, arm, duration, start_at),
+                rc, out = self.hosts[job.client.host].run(self.as_job(job.client.host, gen.script(self, job, arm, duration, start_at)),
                                                           timeout=duration + 120 + BARRIER_LEAD,
                                                           what=f"{phase.name}: {job.kind} x{job.n} via {job.client.name}/{arm.name}")
             except Exception as e:  # a hung ssh is a failed job, not a dead campaign
@@ -1278,6 +1303,20 @@ rm -f "$f"''', what=f"stop {tag}")
             W = self.w(host)
             try:
                 h.run(self.owned(host) + f'''[ -d {W}/run ] || exit 0
+# Jobs first: each ran in its own process group (as_job), so the group takes
+# its curls and clients with it.
+for f in {W}/run/job-*.pgid; do
+  [ -f "$f" ] || continue
+  g=$(cat "$f")
+  [ "$(ps -o pgid= -p "$g" 2>/dev/null | tr -d ' ')" = "$g" ] && kill -TERM -- -"$g" 2>/dev/null
+done
+sleep 1
+for f in {W}/run/job-*.pgid; do
+  [ -f "$f" ] || continue
+  g=$(cat "$f")
+  [ "$(ps -o pgid= -p "$g" 2>/dev/null | tr -d ' ')" = "$g" ] && kill -KILL -- -"$g" 2>/dev/null
+  rm -f "$f"
+done
 # Only the processes this campaign spawned (its pid files), each checked to
 # be running from the work directory; anything else that mentions the
 # directory is reported as a leftover by the verification, never killed.
@@ -1317,7 +1356,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             except Exception as e:
                 rc, out = -1, f"{type(e).__name__}: {e}"
             if rc != 0 and not self.dry:
-                failed.append(f"{host}: {W} could not be removed ({out.strip()[:200]})")
+                why = "its ownership could not be verified, so it was left alone" if rc == NOT_OWNER else out.strip()[:200]
+                failed.append(f"{host}: {W} could not be removed ({why})")
                 continue
             self.reserved.remove(host)
         return failed
@@ -1445,6 +1485,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             snap = snaps.get(host, {})
             if not snap.get("listen_ok"):
                 out.append(f"{host}: could not read the listening ports")
+            if not snap.get("ps_ok"):
+                out.append(f"{host}: could not read the process table, so surviving processes cannot be ruled out")
             for port, what in ports:
                 if port in snap.get("listen", set()):
                     out.append(f"{host}: {what} port {port} is still listening")

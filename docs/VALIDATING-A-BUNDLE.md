@@ -84,6 +84,10 @@ built to refuse rather than to trust:
   temporary client at a time: each trial starts its arm's client and stops it
   afterwards. Earlier campaigns had resident clients OOM-killed on a 769 MB
   relay host. The runner also checks this at run time.
+- **Jobs run in their own process groups.** Each trial job (curl, a load
+  generator) runs in a process group recorded under `run/`, so teardown stops
+  the job and everything it started, even when the runner was interrupted
+  while the job's ssh session was still open.
 - **Teardown always runs**, on success, on error, and on SIGINT or SIGTERM.
   It stops every temporary process, checks that no planned port is still
   listening, and removes the work directory (pass `--keep-remote` to keep it).
@@ -287,7 +291,11 @@ fell back to TCP has no QUIC-only wire count, so it leaves wire cost
 unmeasured rather than flattering it. Fallback is read from the client's own
 `/metrics`, which the runner scrapes around every trial, because the client
 is where fallback is counted. A client whose runtime configuration says
-`transport=tcp` also has no QUIC wire cost. Sender-side credit delay p95 and the
+`transport=tcp` also has no QUIC wire cost. So does a trial in which a
+gateway flow record shows a TCP carrier, or a TCP lane that carried bytes:
+an AUTO rescue can hand a flow to TCP without counting a client fallback.
+Without those records, QUIC-only cannot be shown, and wire cost is
+unmeasured. Sender-side credit delay p95 and the
 shadow false-promotion rate need the stage 0 instrumentation. They are listed
 as required and reported as not measured, so until that instrumentation
 lands, no campaign reaches an overall PASS.
@@ -389,8 +397,10 @@ The campaign is **VOID** when the evidence contradicts the gate's premise:
   calibration trial must show exactly one leaf key. The loaded leaves' keys
   must be distinct: two hosts behind one address are one leaf. Each
   simultaneous trial must show exactly those keys plus one control key, all
-  under one egress. Every flow must be QUIC, and no client's fallback counter
-  may move. If the records or counters are missing, there is no verdict.
+  under one egress. Every flow must be QUIC: its opening carrier and every
+  lane that carried bytes. No client's fallback counter may move. If the
+  records or counters are missing, or a record has an empty egress (the
+  gateway's route lookup failed), there is no verdict.
 
 - The shared ancestor did not bind. The legacy arm's simultaneous rate must
   average at most 0.80 of the sum of the leaves' solo rates. Each rate is a
@@ -505,7 +515,8 @@ together, registered by name in `scripts/ab_workloads.py`. The built-ins are
 
   A key `*.metric` applies to that measure in every phase. Every measure the
   workload reports must have a rule, unless the workload lists it in
-  `report_only`, and every rule must have evidence in every judged block.
+  `report_only`. Every rule must find its measure in every phase that ran,
+  with evidence in every judged block.
   Otherwise the verdict is INCOMPLETE. `block_extract(trials, plan)` gives
   an arm's per-block measures. By default it is the mean of `extract` over
   the arm's trials; a workload may pool their raw samples instead.
