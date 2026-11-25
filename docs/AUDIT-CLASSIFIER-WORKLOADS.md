@@ -1,87 +1,82 @@
-# Classifier audit against the §15.3 workloads
+# Classifier audit against the workload model
 
-Status: **read-only audit**, for `DESIGN-PATH-AUTHORITY.md` §15.3 and stage 2. Line numbers refer to `feat/stage2-sched-class` at `d349fa0` (PR #181). Nothing here changes code.
+Status: **read-only audit.** It merges two independent readings: the stage-2 audit of `sched=class` (PR #181), and §5 of `docs/WORKLOAD-MODEL.md`. Findings keep the model's numbers F1–F8 and recommendations R1–R7. Findings only the stage-2 audit made are F9–F13 and R8–R9. The table at the end maps the first audit's own numbers to these.
 
-## What decides a frame's class under `sched=class`
+Line numbers refer to `origin/main` `0eb4f36`. `internal/pep/sched.go` and `internal/congestion/classarb.go` exist only on `feat/stage2-sched-class` `d349fa0`, and are marked "#181". The classifier, `mpflow.go`, `stripedsend.go`, `udp.go` and `profile.go` are identical on both. Nothing was executed; each finding names the test that would confirm it. Workload IDs (W1–W11, M1–M7) are the model's.
 
-- **Frame to class.** `frameSendClass` (`internal/pep/sched.go:33-48`): DATA whose header class is BULK is BULK; any other DATA is INTERACTIVE; PACKET is INTERACTIVE; everything else is CONTROL. DATA sent as coded datagrams is INTERACTIVE whatever its header says, because the datagram queue is (design §9).
-- **Header class.** Stamped from the flow's current class when the frame is built (`internal/pep/stripedsend.go:612-615`). Each endpoint stamps its own sending direction from its own classifier. The gateway creates one per flow (`internal/pep/server.go:1196`) and never reads the peer's class byte for DATA.
-- **Classifier inputs.** `multipathFlow.observe` (`internal/pep/mpflow.go:3363-3421`) runs on every local read (`stripedsend.go:291-294`, counted as up), every delivery to the application (`mpflow.go:3180`, down), and on a 250 ms refresh (`mpflow.go:1317`, `1329-1341`; driven by the client's flow monitor at `client.go:2973` and by the coding decision at `mpflow.go:1280`). `SmallBidirectionalBursts` means that each direction carried at most 64 KiB in the last 1–2 s (`mpflow.go:3320`, `3326`, `3412`).
-- **Transitions** (`internal/classifier/classifier.go:178-213`, defaults `82-100`).
-  - NEW → BULK at age ≥ 1 s and ≥ 128 KiB total, unless the flow is bidirectional with small recent bursts.
-  - NEW → INTERACTIVE at age ≥ 3 s.
-  - **BULK is never left** (`181-183`, pinned by `TestBulkClassDoesNotFlap`). The idle-gap veto that can keep a flow out of BULK is off in the default `wan-shared-bottleneck` profile (`internal/profile/profile.go:151`) and on only in `dc-long-haul` (`profile.go:185-194`).
-  - A process hint (`Declare`, `classifier.go:150-160`) is applied only on the client (`client.go:3650`). A declared INTERACTIVE is not sticky.
-- **Weights.** `DefaultClassWeights` are 4:2:1 (`internal/congestion/classarb.go:20`). With CONTROL idle, INTERACTIVE gets two thirds of a saturated path against BULK.
+## 1. What decides a frame's class
 
-## Workload traces
+- **Frame to class (#181).** `frameSendClass` (`internal/pep/sched.go:33-48`, #181):
+  - DATA whose header class is BULK is BULK, and any other DATA is INTERACTIVE.
+  - PACKET is INTERACTIVE.
+  - Every other frame is CONTROL.
+  - DATA sent as coded datagrams is INTERACTIVE whatever its header says, because the datagram queue is (design §9).
+  - The weights are 4:2:1 (`classarb.go:20`, #181). With CONTROL idle, INTERACTIVE gets two thirds of a saturated path against BULK.
+- **Header class.** It is stamped from the flow's current class when the frame is built (`internal/pep/stripedsend.go:612-615`). Each endpoint labels its own sending direction from its own classifier. The gateway creates that classifier (`internal/pep/server.go:1190`) and never adopts the peer's class byte.
+- **Rules.** Model §5.1 has the full table. In short:
+  - BULK requires age ≥ 1 s, 128 KiB total, and not "bidirectional with small recent bursts" (`internal/classifier/classifier.go:206-213`). "Small recent" means ≤ 64 KiB per direction in the current and previous 1 s windows (`mpflow.go:3320`, `3326`, `3412`).
+  - BULK is permanent (`classifier.go:181-183`).
+  - The idle veto is off on the default profile (`internal/profile/profile.go:151`, `185-194`).
+  - Hints (`Declare`) apply only on the client (`internal/pep/client.go:3644`).
+- **Observations.** One on each local read (`stripedsend.go:291-294`), one on each delivery (`mpflow.go:3180`), and a refresh every 250 ms at most (`mpflow.go:1317`, `1329-1341`). The refresh is driven by the client's per-flow monitor (`client.go:2795`, `2967`) and by the coding decision (`mpflow.go:1280`).
 
-| Workload | Lifetime class (each sending endpoint) |
-| --- | --- |
-| `browsing` | NEW, hence INTERACTIVE, for each connection's first second. A connection that moves more than 64 KiB in a window after 1 s and has 128 KiB total becomes BULK for life. |
-| `ssh` | NEW, then INTERACTIVE at 3 s. Stays INTERACTIVE while both directions stay under 64 KiB per window. One output burst over that, once the session has 128 KiB total, makes it BULK for life. |
-| `video-call` (UDP) | PACKET frames on the datagram substrate (`internal/pep/udp.go:562-565`): INTERACTIVE always. There is no classifier. |
-| `upload` | BULK after 1 s and 128 KiB, decided by the client, which is the sender. The gateway reaches the same class from the delivered bytes and uses it only for its CONTROL frames. |
-| LLM streaming | A 100 KB prompt is uploaded, then a long, low-rate stream of deltas arrives on the same connection. On a fresh connection the prompt alone does not reach 128 KiB, and the deltas keep both directions small, so the flow stays NEW and then INTERACTIVE. A second prompt on the reused connection, or a prompt over 128 KiB still uploading at 1 s on a slow uplink, makes it BULK for life. |
-| long-idle messaging | NEW, then INTERACTIVE at 3 s, and INTERACTIVE indefinitely while the traffic is small messages, because the window is recent rather than lifetime. Idle time does not change the class. One media send over 64 KiB per window makes it BULK for life. |
-| bulk download | INTERACTIVE for the first second, then BULK. On a path where the flow's rate is under about 64 KiB/s per window it never becomes BULK. |
+Model §5.2 traces every workload's label over its lifetime.
 
-## Risks
+## 2. Findings
 
-### R1. A burst latches an interactive session into BULK for life
+| ID | Finding | Workloads | Consequence under `sched=class` | Fix |
+| --- | --- | --- | --- | --- |
+| **F1** | An LLM call is BULK for its whole response: a request of 128 KiB or more, the second request on a reused connection, or several calls on one HTTP/2 connection. On a fresh connection, a 100 KB prompt is a knife-edge because of F3. | W5, M1–M3 | Deltas are BULK at weight 1 of 7 behind downloads, and uncoded (`mpflow.go:1281-1285`). Each lost delta costs a retransmission round trip and holds the deltas after it. TTFT and gap tail degrade from turn 2. | R1, R1a, R1b, R2 |
+| **F2** | The BULK latch is permanent, so every multi-phase connection is mislabelled after its first burst: SSH after `cat`, `scp` or a port forward in the same connection; HTTP/2 after a page; messaging after login sync or a media send; remote desktop. Both ends latch. | W3-h2, W6 phase C, W9 | Every later keystroke, request or push is BULK and uncoded. With `topology=single` the class is the only protection, so a session pays bulk queueing until it closes, which for messaging can be hours. Warm browsing under bulk can be slower than cold. The flow is also eligible for bulk isolation (`client.go:2737`). | R1, R1a, R1b |
+| **F3** | **The recent window goes stale across idle. This looks like a plain bug on main.** `recentBytes` rolls `current` into `prior` once, however long ago the window started (`mpflow.go:3345-3349`). The first observation after any idle period still sees the pre-idle burst as "recent". | W5, W9, W6 | It makes the gateway label a prompt of 128 KiB or more BULK on the first delta, and causes the 120–128 KiB knife-edge. It also contradicts the function's own contract: "what each direction has carried in the last exchangeWindow" (`mpflow.go:3328-3330`). | R2 |
+| **F4** | The idle veto does not help. It is off by default, needs two idle episodes, and is permanent in the other direction. | W5, W9 | — | none (R1 replaces it) |
+| **F5** | UDP has no classification. Every PACKET is INTERACTIVE at any rate (`sched.go:40-43`, #181; `udp.go:363`, `464`, `564`). The mobile packet stack forwards all device UDP (`mobile/core/packetstack.go:216-218`, `467`). | W8, M5 | Heavy UDP takes up to two thirds of the path from BULK. It also shares one ordered datagram FIFO with voice and with coded deltas and keystrokes, so their delay is set by the heavy flow (design Q5). Rate alone cannot separate it from a call; elasticity can. | R4, R5 |
+| **F6** | HTTP/2 hides streams. The classifier does not look inside TLS (`classifier.go:1-3`), and within one byte stream a small object waits behind a large one whatever the class. | W3-h2, W5-h2 | Only the wait after the large object has drained is the classifier's doing, and that is F2. | R1 (behaviour-following class) |
+| **F7** | Short flows are never BULK. A flow that ends before age 1 s is NEW throughout, so hundreds of sub-second objects are INTERACTIVE traffic. | W3, M3 | Nothing inside INTERACTIVE separates them from keystrokes. Acceptable now; measured by M3. | — |
+| **F8** | Idle handling shows up in the same workloads:<br>• only payload refreshes activity (`mpflow.go:3366-3367`);<br>• the default flow idle timeout is 30 min (`mpflow.go:95`; `cmd/queqiaod/main.go:616`), one or two minutes above FCM's and IMAP IDLE's own timers;<br>• the production 900 s EOF matches no constant on main. | W9, M6 | Not a scheduling issue. | R6 |
+| **F9** | Process hints are client-only and never reach the gateway (`client.go:3644`; `server.go:1190`). The rule itself is symmetric: an upload is BULK at the client exactly as a download is at the gateway. | W2, W6 | A hint can protect only upstream DATA. An `ssh` hint covers keystrokes but not echoes, and `Declare(INTERACTIVE)` cannot prevent F2 anyway (R7). | R8 (low priority) |
+| **F10** | Every client flow, idle or not, has its own 250 ms monitor ticker (`client.go:2795`, `2953-2967`). | W9, M6 | Not a classification error. Hundreds of idle connections on mobile cost four wakeups per second each, which is CPU and battery. | R9 |
+| **F11** | Every new bulk flow is INTERACTIVE for its first second (NEW until `BulkMinimumAge`). | W1, M4, M7 | About 12 MB per flow at 100 Mbit/s is served at INTERACTIVE weight, which delays a call or an echo at each bulk start. Backgrounds that start 5 s early hide it, so only the mixed runs see it. | R1b (backlog onset sets BULK) |
+| **F12** | Slow bulk never becomes BULK. A transfer that stays under about 64 KiB/s per window remains "small bidirectional bursts". | W1, W2 on a poor path | Several such transfers on a poor mobile path add up inside INTERACTIVE. | R1b (continuous backlog sets BULK whatever the rate) |
+| **F13** | A call relayed over TCP (TURN/TCP, or WebRTC behind a proxy that carries no UDP) runs at 2–4 Mbit/s and is BULK after 1 s. | W7 over TCP | Media at BULK weight. R1a does not rescue it: video frames exceed two packets. | measure first: a W7-over-TCP variant; hint or per-flow allowance if needed |
 
-- **Current behaviour.** `cat` of a large log, `scp` or port-forwarded traffic over the same SSH connection, or any burst over 64 KiB in a window once the session has 128 KiB total, sets BULK permanently (`classifier.go:181-183`, `206-213`). It happens at both ends, because both observe the burst. A client process hint cannot prevent it: `Declare(INTERACTIVE)` is not sticky, and the gateway never sees the hint.
-- **Under `sched=class`.** From then on every keystroke and echo is BULK DATA at weight 1 of 7 behind any other bulk flow. It also loses coding (`prefersCodingOverRetransmission`, `mpflow.go:1281-1285`) and is eligible for bulk-lane isolation (`client.go:2743`). Echo RTT under bulk becomes the bulk queueing delay until the session ends.
-- **Fix.**
-  - Classify DATA by backlog rather than by history, or give each flow an INTERACTIVE token bucket. A flow may send up to `R_I` bytes/s, with burst `B_I`, as INTERACTIVE; only the excess is BULK.
-  - With `R_I` = 64 KiB/s, which is `smallExchangeBytes`, a log dump's excess is BULK while it lasts and the next keystroke is INTERACTIVE again. It also replaces the first-second exemption below.
-  - The minimal alternative is demotion with hysteresis. BULK → INTERACTIVE after `k` consecutive windows (for example 3 s) in which the flow carried payload and both directions stayed under 64 KiB. This keeps `TestBulkClassDoesNotFlap` (an idle gap carries no payload) and does not flap within a transfer.
-- **Blocks.** Stage 7's gate and the stage-2 product screen. With `topology=single`, the class scheduler is the only protection a latched session has. It does not block stage 6: both arms use the same classifier and stage 6 keeps isolation. It must be fixed before stage 10, because the `ssh` "after a large output burst" scenario will fail.
+**Confirming tests** (model §5.3): F1 and F3 as stated there. F2: feed `observe` keystrokes, a 300 KB burst, then keystrokes, and assert the class after 3 s. F9: an end-to-end check that a declared flow's downstream DATA carries the declared class. F11: assert the class byte of DATA sent between 0 and 1 s of a bulk flow.
 
-### R2. A browser connection latches BULK after its first large object
+## 3. Recommendations
 
-- **Current behaviour.** HTTP/2, or a reused HTTP/1.1 connection, is one opaque TLS byte stream. The classifier does not decrypt (`classifier.go:1-3`), so it cannot see streams. The first object over 64 KiB in a window after age 1 s makes the connection BULK for life. Browsers keep these connections for minutes.
-- **Under `sched=class`.** Later page loads on the warm connection are BULK, so warm `browsing` under bulk can be *slower than cold*. Within one burst the byte order is TCP's, so a small object behind a large one waits for it whatever the class. The class adds the wait only after the large object has drained.
-- **Fix.** Per-stream classification is not available without MITM and is not proposed. The backlog or token-bucket rule of R1 fixes exactly the harmful part: once the large object drains, the next request goes out INTERACTIVE. Demotion with hysteresis also fixes it, but `k` windows later.
-- **Blocks.** Stage 7 and stage 10, as R1. The warm/cold split in §15.3 is what makes it visible.
+| ID | Change | Blocks |
+| --- | --- | --- |
+| **R1** | Split the class into a sticky fact and a current state. `everBulk` (sticky) keeps driving isolation, pre-warm and lane choice (`client.go:2737`, `3022`; `stripedsend.go:584`). `nowBulk` drives the class byte, the lane queue, the budget flag and coding (`stripedsend.go:614`; `mpflow.go:2291`, `2312`, `1281`). | stage 6/7 campaigns |
+| **R1a** | Sparse-write rule: a write that finds the flow's send queue empty and is at most 2 packets is sent INTERACTIVE and coded. This fixes F1 and F2 immediately, with no timer. | with R1 |
+| **R1b** | Windowed exit from BULK. `nowBulk` clears after 2 consecutive windows with ≤ 64 KiB each way and no backlog. It sets again after a continuous backlog of `max(1 s, 4 × SRTT)`. Continuous backlog should also be what sets BULK in the first place, which bounds F11 and closes F12. Keep `TestBulkClassDoesNotFlap`: an idle gap has no payload and no backlog, so it does not exit. | with R1 |
+| **R2** | Fix the stale window: when `now − recentStart ≥ 2 × exchangeWindow`, zero `prior` as well, and add the F3 test. It restores the function's stated contract rather than changing policy, so it qualifies under §14 as a present-bug fix that ships on by default. | stage 6/7 campaigns |
+| **R3** | Per-byte class telemetry: bytes per (flow, class, substrate) and class transitions with timestamps. Without it every finding above is invisible to a goodput gate. | stage 6/7 campaigns |
+| **R4** | Fair input to the coded path: deficit round robin across UDP associations and coded TCP chunks before frames enter ESI order, with the R1a sparse rule. No wire change and no symbol reordering. | stage 10 |
+| **R5** | Decide Q5 with data. Add a per-association rate and elasticity meter, then choose from W8 and M5 between charging heavy associations as BULK through a second datagram queue and coded stream (a fork change) or keeping them INTERACTIVE with R4. Until then, a per-association allowance of about 8 Mbit/s, with the excess policed at enqueue, is the stopgap. | stage 10 (decision) |
+| **R6** | Idle semantics: the tunnel must never be the shortest timer. Raise the default flow idle timeout to at least 2 h while both outer legs answer keepalives. A flow the tunnel ends must reach both applications as EOF or RST within 5 s. Localise the 900 s EOF with W9b first. | stage 8 and stage 10 |
+| **R7** | Do not use `ClassHints` for F1 or F2. `Declare(INTERACTIVE)` buys only the first second and cannot prevent or undo BULK (`classifier.go:138-160`). | — |
+| **R8** | Carry a declared class to the gateway in OPEN, with a flag that distinguishes a declaration from the default class byte (PROTOCOL.md §7), so a hint covers both directions. | nothing |
+| **R9** | Stop an idle flow's monitor ticker and re-arm it on the next payload or lane event. It belongs with stage 8, which owns idle liveness. Bound it through the existing client-CPU secondary in M6. | nothing |
 
-### R3. Heavy UDP occupies INTERACTIVE
+**Why R1–R3 block stage 6/7.** Stage 6 requires `sched=class`, and stage 7 removes isolation. A flow wrongly labelled BULK therefore loses more in the candidate arm, where it has the lowest weight on one shared connection, than in main, where it has its own lane and an interactive reserve. An A/B run with today's classifier would attribute the mislabel to the controller or the topology.
 
-- **Current behaviour.** Every PACKET is INTERACTIVE, at any rate (`sched.go:40-43`; design §9, Q5). The mobile packet stack forwards all device UDP (`mobile/core/packetstack.go:216-218`, `467`). QUIC/HTTP3 video and large UDP transfers therefore arrive as INTERACTIVE.
-- **Under `sched=class`.** A saturating UDP flow takes up to two thirds of the path from BULK, which is a fairness cost. Worse, the call shares one ordered datagram FIFO and symbol stream with it (design §9). The call's packets queue behind the heavy flow's: one-way delay and freezes are set by the heavy flow, not by bulk.
-- **Fix.** Give each association an INTERACTIVE rate allowance, for example 8 Mbit/s sustained over 2 s, enough for any call.
-  - Short term: police the excess at the association's enqueue, either deferred or dropped. QUIC above it adapts.
-  - Long term, which also resolves Q5: a second datagram queue and coded stream charged as BULK in the fork, with an association moved whole between them. Attribution is then per queue, never per symbol, so priority is not inverted inside an ordered stream.
-- **Blocks.** Not stage 6/7 on the core workloads: TCP bulk does not touch the datagram FIFO. It does block stage 10 through the `video-call` "under a saturating UDP flow" scenario. Q5 should be decided before that run.
+Land R1–R3 as their own switch (`classifier=v2`), gated on W1 (the 0.90 goodput gate, to show R1b costs bulk nothing), W5, W6 and W9a. Then run stages 6 and 7 with it on in both arms. R4–R6 concern behaviour that stages 6 and 7 leave unchanged from main, so they wait for the flip.
 
-### R4. Is upstream classified like downstream?
+This corrects the first stage-2 audit's statement that the latch does not block stage 6. That statement held only that both arms use the same classifier, and missed that the arms pay for a mislabel differently.
 
-- **Current behaviour.** The rule is symmetric. It uses the sum of both directions and a per-direction recent window, and the sender of each direction decides that direction's DATA class. An upload is BULK at the client after 1 s, as a download is at the gateway. There are three asymmetries:
-  - Process hints exist only at the client, so they affect only upstream DATA.
-  - The gateway re-examines a flow only on payload and coding decisions, while the client also has a 250 ms tick. This has no effect, because NEW and INTERACTIVE map to the same send class.
-  - Each end's classifier is fed by what it reads and what it delivers, so the receiver's view lags by the delivery delay.
-- **Under `sched=class`.** Upstream scheduling is correct. Downstream ignores a declared class: an `ssh` hint protects keystrokes but not echoes, and a declared bulk backup is INTERACTIVE downstream for its first second.
-- **Fix.** Carry a declared class to the gateway in OPEN, with a flag that distinguishes a declaration from the default class byte (PROTOCOL.md §7), and `Declare` it there. Fixing R1 matters more than this, because a hint is only a starting point.
-- **Blocks.** Nothing.
+## 4. Cross-reference
 
-### R5. LLM streaming: a reused connection latches BULK on its second prompt
-
-- **Current behaviour.** The 64 KiB window and the 128 KiB total separate a single request from a transfer, but not a multi-turn session. Agent loops resend a growing context on one kept-alive HTTP/2 connection to the same API host. The first turn usually stays below 128 KiB, or finishes inside its first second. The second turn's upload exceeds 64 KiB in a window when the flow is older than 1 s and has more than 128 KiB total, so the flow becomes BULK for life (`classifier.go:206-213`, `181-183`). It also happens on the first turn when the prompt is over 128 KiB and the uplink is slow enough that the upload is still running at 1 s. Both ends latch. The gateway, which sends the deltas, sees the same upload as delivered bytes.
-- **Under `sched=class`.** The deltas that follow are BULK DATA from the gateway: small messages at weight 1 of 7 behind any download. They are also sent uncoded (`mpflow.go:1281-1285`), so a lost delta costs a retransmission round trip and is seen as a stall. Time to first token and the inter-delta gap p99 under bulk degrade from the second turn on, which is the common case for agents.
-- **Fix.** The R1 token bucket is the right shape: the prompt's excess over `B_I` is BULK and the deltas are INTERACTIVE. That makes prompt upload under bulk upload slower, and time to first token includes the upload. So `B_I` should cover a typical prompt, or the excess should go to INTERACTIVE while the flow has no backlog history. Demotion with hysteresis also returns the deltas to INTERACTIVE, `k` windows after the prompt.
-- **Blocks.** As R1: stage 7 and stage 10. The model's LLM entry needs a multi-turn scenario on one connection, measuring time to first token and inter-delta gap p50/p99, or the gate will not see this.
-
-### R6. Long-idle messaging connections
-
-- **Current behaviour.** Push channels, chat sockets and WebSockets stay INTERACTIVE for hours of small messages; this is the case the recent-window rule was written for (`mpflow.go:3392-3411`). Two problems remain:
-  - A photo or file sent on the same connection makes it BULK for life, as R1. Every later push and message then waits behind bulk until the connection is replaced, which can be hours.
-  - Every client flow, idle or not, has its own 250 ms monitor ticker (`internal/pep/client.go:2801`, `2959-2973`), which also drives `refreshClass`. Hundreds of idle connections on mobile cost four wakeups per second each. This is CPU and battery, not radio, and it is not a classification error.
-- **Under `sched=class`.** An idle flow has no demand, so it costs the arbiter nothing. The harm is only the latched case: a message's delivery latency under bulk becomes bulk queueing delay.
-- **Fix.** As R1, for the latch. For the wakeups, an idle flow should stop its ticker and re-arm it on the next payload or lane event. That is outside the class scheduler, and belongs with stage 8's carrier work, which owns liveness for idle flows.
-- **Blocks.** The latch, as R1. The wakeups block no gate. They should be a pre-registered bound on client CPU (already a §15.4 secondary) in a many-idle-connections scenario.
-
-### Also seen
-
-- **Every new bulk flow is INTERACTIVE for its first second.** At 100 Mbit/s that is about 12 MB per flow at INTERACTIVE weight, which delays a call or an echo at every bulk start. Only `mixed` and `browsing` under bulk see it, because §15.3 starts bulk before measuring. The token bucket of R1 bounds it to `B_I`.
-- **Slow bulk never becomes BULK.** A transfer that stays under about 64 KiB/s per window stays INTERACTIVE. It is cheap at that rate, but several of them on a poor mobile path add up.
-- **A call over TCP becomes BULK.** A call relayed over TCP (TURN/TCP, or WebRTC behind a proxy that carries no UDP) runs at 2–4 Mbit/s and is BULK after one second. The token bucket would serve its first `R_I` as INTERACTIVE and the rest as BULK. This needs a per-flow allowance large enough for a call, or a hint. Worth one `video-call` scenario over TCP.
+| First stage-2 audit (PR #183, first revision) | Model §5 | Here |
+| --- | --- | --- |
+| R1 SSH or interactive flow bursts, then latches | F2 | F2 → R1, R1a, R1b |
+| R2 HTTP/2 connection latches after first large object | F2, F6 | F2, F6 → R1a, R1b |
+| R3 heavy UDP occupies INTERACTIVE | F5 | F5 → R4, R5 |
+| R4 upstream symmetry; hints client-only | — | F9 → R8 |
+| R5 LLM 100 KB prompt then deltas, latches on reuse | F1, F3 | F1, F3 → R1a, R2 |
+| R6 long-idle messaging: latch on media; per-flow ticker | F2, F8 | F2, F8, F10 → R1, R6, R9 |
+| "Also seen": first second INTERACTIVE | (F7, related) | F11 → R1b |
+| "Also seen": slow bulk never BULK | — | F12 → R1b |
+| "Also seen": call over TCP becomes BULK | — | F13 |
+| — | F4 idle veto | F4 |
+| — | F7 short flows | F7 |
+| — | R3 telemetry, R6 idle, R7 no hints | R3, R6, R7 |
