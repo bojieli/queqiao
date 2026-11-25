@@ -29,7 +29,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ================================================================================
-github.com/bojieli/quic-go@v0.61.1-0.20261125100122-9b565d3de352
+github.com/bojieli/quic-go@v0.61.1-0.20261125101006-50b847cee09c
 License: MIT
 Source: https://github.com/bojieli/quic-go
 --------------------------------------------------------------------------------

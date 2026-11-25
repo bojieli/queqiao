@@ -67,10 +67,10 @@ type erasurePathState struct {
 }
 
 var (
-	_ quiccongestion.PathSender     = (*ErasurePathSender)(nil)
+	_ quiccongestion.PathSender         = (*ErasurePathSender)(nil)
 	_ quiccongestion.ClassScheduler     = (*ErasurePathSender)(nil)
 	_ quiccongestion.EmptyBuildObserver = (*ErasurePathSender)(nil)
-	_ TelemetryProvider             = (*ErasurePathSender)(nil)
+	_ TelemetryProvider                 = (*ErasurePathSender)(nil)
 )
 
 // EnableClassScheduling makes the sender arbitrate between send classes with
@@ -84,11 +84,12 @@ func (p *ErasurePathSender) EnableClassScheduling(w ClassWeights) {
 
 // OnEmptyBuild is told that a packet admitted under a permit could not be
 // built although demand is unchanged: the turn's work does not fit. The
-// arbiter passes that class over until something changes, and the
-// connection is woken to try another decision. Once every class with
-// demand has been passed over the turn is EXEMPT, which does not wake.
-func (p *ErasurePathSender) OnEmptyBuild(_ monotime.Time, permit quiccongestion.Permit) {
-	if p.arb != nil && p.arb.OnEmptyBuild(permit.Turn) && p.wake != nil {
+// arbiter passes that class over for a few milliseconds or until something
+// changes, and the connection is woken to try another decision. Once every
+// class with demand is passed over, admission is refused until the earliest
+// mark expires, which is when the connection tries again.
+func (p *ErasurePathSender) OnEmptyBuild(now monotime.Time, permit quiccongestion.Permit) {
+	if p.arb != nil && p.arb.OnEmptyBuild(now, permit.Turn) && p.wake != nil {
 		p.wake()
 	}
 }
@@ -193,7 +194,7 @@ func (p *ErasurePathSender) Admit(now monotime.Time, maxBytes quiccongestion.Byt
 		return quiccongestion.Permit{RetryAt: retry}
 	}
 	if p.arb != nil {
-		return p.arb.Permit(maxBytes)
+		return p.arb.PermitAt(now, maxBytes)
 	}
 	return quiccongestion.Permit{OK: true, Turn: quiccongestion.ClassBulk, MaxBytes: maxBytes}
 }

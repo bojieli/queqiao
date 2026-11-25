@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	quiccongestion "github.com/apernet/quic-go/congestion"
+	"github.com/apernet/quic-go/monotime"
 )
 
 const (
@@ -359,31 +360,38 @@ func TestClassArbiterAckOnlyPacketsChargeNoClass(t *testing.T) {
 }
 
 // A turn that builds nothing because its work does not fit the permit is
-// passed over: the next permit goes to another class with demand, the one
-// after that is EXEMPT once every class has been passed over, and a sent
-// packet lets the stuck class back.
+// passed over: the next permit goes to another class with demand; once
+// every class with demand is passed over, admission is refused until the
+// earliest mark expires -- no spin, and no wait for an unrelated event --
+// after which the class gets its turn again; a sent packet clears the marks.
 func TestClassArbiterPassesOverAStuckTurn(t *testing.T) {
 	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	now := monotime.Now()
 	a.OnDemand(demandOf(quiccongestion.ClassInteractive, quiccongestion.ClassBulk))
-	p := a.Permit(arbPacket)
+	p := a.PermitAt(now, arbPacket)
 	if p.Turn != quiccongestion.ClassInteractive {
 		t.Fatalf("turn %v, want INTERACTIVE", p.Turn)
 	}
-	if !a.OnEmptyBuild(p.Turn) {
+	if !a.OnEmptyBuild(now, p.Turn) {
 		t.Fatal("a first empty build allows no other decision")
 	}
-	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassBulk || p.Fill[quiccongestion.ClassInteractive] != 0 {
+	if p := a.PermitAt(now, arbPacket); p.Turn != quiccongestion.ClassBulk || p.Fill[quiccongestion.ClassInteractive] != 0 {
 		t.Fatalf("permit %+v, want BULK with no INTERACTIVE fill", p)
 	}
-	a.OnEmptyBuild(quiccongestion.ClassBulk)
-	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassExempt {
-		t.Fatalf("turn %v with every class stuck, want EXEMPT", p.Turn)
+	a.OnEmptyBuild(now, quiccongestion.ClassBulk)
+	p = a.PermitAt(now, arbPacket)
+	if p.OK || p.RetryAt.IsZero() || !now.Before(p.RetryAt) {
+		t.Fatalf("permit %+v with every class passed over, want a refusal with a retry time", p)
 	}
-	if a.OnEmptyBuild(quiccongestion.ClassExempt) {
+	if a.OnEmptyBuild(now, quiccongestion.ClassExempt) {
 		t.Fatal("an EXEMPT empty build asks for another decision: the connection would spin")
 	}
+	if p := a.PermitAt(p.RetryAt, arbPacket); !p.OK || p.Turn != quiccongestion.ClassInteractive {
+		t.Fatalf("permit %+v at the retry time, want INTERACTIVE's turn back", p)
+	}
+	a.OnEmptyBuild(now, quiccongestion.ClassInteractive)
 	a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassExempt: 40})
-	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassInteractive {
+	if p := a.PermitAt(now, arbPacket); p.Turn != quiccongestion.ClassInteractive {
 		t.Fatalf("turn %v after a packet was sent, want INTERACTIVE back", p.Turn)
 	}
 }
