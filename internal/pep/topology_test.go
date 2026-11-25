@@ -739,7 +739,7 @@ func TestPreferredWindowCreditIsBoundedOverEveryLiveGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.closeQUICPool()
-	ccfg := congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2, sched: SchedClass, scope: CongestionScopePath, principal: client.pathPrincipalNow()}
+	ccfg := congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2, sched: SchedClass, scope: CongestionScopePath, principal: client.pathPrincipalNow}
 
 	const generations = 3
 	var live []*controlQUICGeneration

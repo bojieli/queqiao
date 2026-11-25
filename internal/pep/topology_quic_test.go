@@ -163,7 +163,7 @@ func (b *streamBed) bulkCounter(index uint32) *atomic.Int64 {
 func (b *streamBed) dial() (*quic.Conn, *wancongestion.PathController) {
 	conn := b.dialConn()
 	cfg := pathScopeConfig
-	cfg.principal = b.principal
+	cfg.principal = func() string { return b.principal }
 	att, ok := configureQUICController(conn, cfg).(*wancongestion.PathAttachment)
 	if !ok {
 		b.t.Fatal("congestion=path did not install a path attachment")
