@@ -35,7 +35,7 @@ const CreditDelayBuckets = len(CreditDelayBounds) + 1
 
 type creditDelayHistogram struct {
 	buckets [CreditDelayBuckets]atomic.Uint64
-	sumNS   atomic.Uint64
+	sumNS   atomic.Int64
 }
 
 // CreditDelaySnapshot is the histogram's part of a Snapshot. Buckets are not
@@ -68,7 +68,7 @@ func (r *Registry) CreditDelay(d time.Duration) {
 		i++
 	}
 	r.creditDelay.buckets[i].Add(1)
-	r.creditDelay.sumNS.Add(uint64(d.Nanoseconds())) // #nosec G115 -- d is clamped to >= 0 above
+	r.creditDelay.sumNS.Add(int64(d))
 }
 
 func (r *Registry) creditDelaySnapshot() CreditDelaySnapshot {
