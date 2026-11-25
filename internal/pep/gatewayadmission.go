@@ -185,8 +185,8 @@ func (s *Server) dataPrincipal(state tls.ConnectionState) (identity.Principal, b
 // verify a path and move its flows, and refusing it is refusing the recovery
 // of connections this gateway already carries. The overflow is at most one
 // per principal holding a general slot, so it is bounded by the general
-// bound, and a standby whose principal's last general connection closes
-// takes that slot over rather than letting it go.
+// bound, and a standby takes over the general slot of the first of its
+// principal's connections to close rather than letting it go.
 func (s *Server) admitQUICConnection(state tls.ConnectionState) (*connectionTicket, bool) {
 	principal, data := s.dataPrincipal(state)
 	key := ""
@@ -247,16 +247,16 @@ func (s *Server) releaseQUICConnection(ticket *connectionTicket) {
 			case ticket.standby:
 				p.standby = nil
 				releaseGeneral = false
+			case p.standby != nil:
+				// A connection the principal held closes while its standby
+				// lives: the standby is where its flows went, so it takes
+				// over the general slot this one gives back, and the
+				// principal can have a standby again for its next recovery.
+				p.standby.standby = false
+				p.standby = nil
+				releaseGeneral = false
 			default:
 				p.general--
-				if p.general == 0 && p.standby != nil {
-					// The standby outlives the connections it stood by:
-					// it now holds the general slot this one gives back.
-					p.standby.standby = false
-					p.standby = nil
-					p.general = 1
-					releaseGeneral = false
-				}
 			}
 			if p.general <= 0 && p.standby == nil {
 				delete(s.principalConns, ticket.principal)

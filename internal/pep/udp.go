@@ -778,6 +778,9 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 				s.cfg.Logger.Debug("UDP association relay retained for a replacement",
 					"relay", udpConn.LocalAddr().String(), "resumed", resumed)
 				return
+			case liveDropped:
+				s.cfg.Logger.Debug("UDP association relay not retained: the store is full")
+				return
 			}
 			_ = udpConn.Close()
 			return
