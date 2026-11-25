@@ -572,7 +572,7 @@ Configuration accepts exactly the bundles below and rejects any other combinatio
 | 7 | `topology=single` (6) | Client stops isolating. Per-flow rescue still dials; those connections are attachments. | per-flow | not started |
 | 8 | `recovery=carrier` (7, 4) | Carrier manager becomes the single owner of bindings and QUIC replacement; per-flow QUIC rescue dials and lane demotion are disabled by the same switch; the adaptive keepalive schedule is activated; binding deadlines with the skew rule of §10.3 step 4; §10.4. | carrier manager | not started |
 | 9 | DC gate | `dc-long-haul` on the new architecture (§11.3). | carrier manager | not started |
-| 10 | defaults | Flip defaults in one release, gateways first; soak one release. Requires the final bundle to pass §15.4 on every path × gated entry × scenario of §15.3 (`docs/WORKLOAD-MODEL.md`); one failing cell blocks the flip. | carrier manager | not started |
+| 10 | defaults | Flip defaults in one release, gateways first; soak one release. Requires the final bundle to pass trials A, B, C, D and the DC gate of §15.3 under §15.4 on every path, and the deterministic replacements of §15.3 in CI; one failure blocks the flip. | carrier manager | not started |
 | 11 | delete | Below. | — | not started |
 
 - **Fixes of present bugs ship on by default, small, beside their bundle.** Two stages found that main violates a bound it claims and fixed it in the default configuration with a minimal, local change: the producer's reservation before reading (#169, stage 3) and the full gateway that refuses its own recovery work (#170, stage 5). Everything that changes policy, rather than restoring a claimed bound, stays behind the switch.
@@ -637,41 +637,65 @@ New deterministic tests, on real fork send loops over an impaired in-process `Pa
 
 - **Unit.** One *block* is four trials on one path, in ABBA or BAAB order chosen at random, with both endpoints restarted before the block so no knowledge (`knowledgeLifetime`) carries between blocks, and with cold and warm starts balanced across arms. Blocks are the unit of analysis.
 - **Outcome per arm per block.** Useful bytes delivered within a fixed duration, summed over that arm's two trials and all their flows. A failed flow contributes what it delivered; a total outage contributes zero. A scenario with no bulk component has no primary outcome and is judged on its secondaries alone (§15.4).
-- **Workloads come from `docs/WORKLOAD-MODEL.md`**, which groups applications into clusters by network character (substrate, direction, burst size against IW and BDP, cadence, lifetime and idle, phase change within a connection) and gives one representative workload per cluster, plus mixed scenarios. Each entry there fixes its generator, backgrounds, metrics, which of them are gated and which only reported, provisional bounds and planned block count. The bounds are fixed after the pilot and before the gated campaign, and are then the pre-registered bounds of §15.4. The gate runs every entry on every path, and each scenario (background, cold or warm, variant) is its own cell, not pooled with another.
-- **Directions and pairing.** Backgrounds are the model's. Upload backgrounds appear wherever an entry's reverse direction carries its acknowledgements or its request, because the two directions differ in capacity and loss and are controlled independently. Entries whose flows do not contend (W9) run both arms concurrently as paired sessions instead of in ABBA order; the session is then the unit.
-- **Entries.**
+- **Minimal live plan (owner's decision).** Live runs total about 2.5–3 h per path across all gates. Four trial types and the DC gate are the gates; every other entry of `docs/WORKLOAD-MODEL.md` is covered inside them, by a deterministic or emulated test in CI, or by an optional run. The full workload matrix stays as an opt-in reference. Generators, metrics and provisional bounds are the model's.
 
-| ID | Workload | Gated before |
+| Trial | Gate | Content | Length |
+| --- | --- | --- | --- |
+| **A `bulk`** | stages 6/7 | 4 bulk downloads | 60 s |
+| **B `mixed-6/7`** | stages 6/7 | a 5-turn LLM loop (100 KB prompt) and terminal keystrokes with one 300 KB burst, under 2 bulk downloads | 90 s |
+| **DC** | stage 9 | the §11.3 gate at minimal size: 10 transactional requests (ASR and TTS alternating, the first cold), then the sustained-goodput and multi-leaf fairness workload | 60 s |
+| **C `mixed-all`** | stage 10 | concurrently: a video-call UDP stream, one browsing burst, one LLM call, terminal keystrokes, 1 bulk download and 1 bulk upload; metrics per class and per direction | 120 s |
+| **D `idle-wake`** | stage 10 | 50 idle connections after a 200 KB sync, each woken once at 1, 5 or 16 min (crossing the 15-minute boundary), push and send alternating; run once per path, beside C | about 17 min |
+
+- **One trial, every metric.** In B and C every workload's metrics come from the same trial as the bulk primary, so one block yields all of them.
+- **D** does not contend, so its arms run concurrently as paired sessions on their own client and gateway instances, which C's block restarts do not touch. It overlaps C's first blocks and adds no wall time.
+- **Directions.** Upload traffic appears wherever a workload's reverse direction carries its acknowledgements or its request (B's LLM requests, C's bulk upload), because the two directions differ in capacity and loss and are controlled independently.
+- **Coverage of the model's entries.**
+
+| ID | Workload | Covered by |
 | --- | --- | --- |
-| W1 | Bulk download: four flows (as ab6), one flow | stage 6/7 |
-| W2 | Bulk upload, desktop and iOS memory profile | stage 10 |
-| W3 | Browsing fan-out, HTTP/1.1 and HTTP/2, cold and warm | stage 10 |
-| W4 | Transactional burst (the DC gate, §11.3) | stage 9 |
-| W5 | LLM streaming call: single, loop, swarm | stage 6/7 (single, loop); stage 10 (swarm) |
-| W6 | Terminal keystrokes with output bursts | stage 6/7 |
-| W7 | Video call over UDP | stage 10 |
-| W8 | Tunnelled QUIC | stage 10 |
-| W9 | Idle wake: short-idle cycle (W9a), long-idle survival (W9b) | `classifier=v2` (W9a); stage 10 |
-| W10 | Segment fetch (ABR) | reported |
-| W11 | One-shot datagram | reported; gated for clients that capture all UDP |
-| M1, M2 | Mixed: LLM call against bulk download, and against bulk upload | stage 6/7 |
-| M3–M6 | Mixed: agent swarm, call + browsing + bulk, heavy and thin UDP together, idle wake under load | stage 10 |
-| M7 | Day-in-the-life soak | stage 10, on failures and memory only; no primary |
+| W1 | Bulk download | A (four flows); C (one flow). `speedtest` variant: optional |
+| W2 | Bulk upload | C (desktop profile). iOS memory profile: deterministic test 14 of §15.1 |
+| W3 | Browsing fan-out | C (one burst). The h1/h2 × cold/warm sweep: optional |
+| W4 | Transactional burst | DC |
+| W5 | LLM streaming call | B (loop; turn 1 opens a cold app connection); C (single call). Swarm: optional |
+| W6 | Terminal keystrokes with output bursts | B (before and after the burst, latch ratio); C |
+| W7 | Video call over UDP | C |
+| W8 | Tunnelled QUIC | deterministic test, emulated path |
+| W9a | Short-idle wake | D |
+| W9b | Long-idle survival (29/31/45/60 min) | deterministic test, injected clock |
+| W10 | Segment fetch | deterministic test, emulated path |
+| W11 | One-shot datagram | deterministic test, emulated path |
+| M1 | LLM call against bulk download | B |
+| M2 | LLM call against bulk upload | C |
+| M3 | Agent swarm | optional |
+| M4 | Call + browsing + bulk | C |
+| M5 | Heavy and thin UDP together | deterministic test, emulated path (with W8) |
+| M6 | Idle wake under load | D beside C |
+| M7 | Day-in-the-life soak | optional |
 
-- **Replaces the echo probe.** The interactive echo probe of earlier campaigns is W6 phase A under four downloads.
-- **Classifier first.** The workload model and `docs/AUDIT-CLASSIFIER-WORKLOADS.md` find that today's classifier mislabels W3-h2, W5, W6 and W9 (F1–F3). Its fixes R1–R3 land first and are on in both arms of the stage 6/7 campaigns, or those gates measure the label instead of the change. The switch that carries them is itself gated on W1, W5, W6 and W9a.
+- **Deterministic replacements** run in CI on `internal/pathsim`; the model's minimal live plan names them (still to be written). They gate stage 10 together with the live trials. Optional runs are reported, never gated.
+- **Replaces the echo probe.** The interactive echo probe of earlier campaigns is B's keystrokes before the burst, under bulk downloads.
+- **Classifier first.** The workload model and `docs/AUDIT-CLASSIFIER-WORKLOADS.md` find that today's classifier mislabels W3-h2, W5, W6 and W9 (F1–F3). Its fixes R1–R3 land first and are on in both arms of the stage 6/7 campaigns, or those gates measure the label instead of the change. The switch that carries them is itself gated on A, B and D.
 - **Product-configuration screen (after stage 2).** {isolated, single connection} × {round-robin, class scheduler} under today's controllers, plus one stream against several on one connection at a fixed connection window. This chooses a configuration; because isolation also changes the number of independent controllers, it does not attribute a result to topology.
 - **Topology under one authority (stage 7's gate).** `topology=single` against isolation with `congestion=path` in both arms. This is the comparison that tests §7. A result against the single connection reopens it.
 - **Credit delay** is measured on the sender's clock alone: time from a chunk's last byte being taken by the carrier to its covering ACK, minus the path's minimum RTT.
 
 ### 15.4 Statistical gate
 
-- **Primary test.** For each block `b`, the contrast `d_b = candidate_b − 0.90 × main_b` in delivered bytes. The gate passes on a path when the lower bound of the one-sided 95 % confidence interval of the mean contrast is above zero. The contrast is defined for zero outcomes in either arm and needs no ratio of a resampled denominator. A campaign in which more than a pre-registered fraction of main's blocks are zero is void and is rerun. "Point estimate ≥ 0.95 and the interval includes 1" is not accepted.
-- **Sample size, fixed in advance, from a pilot.** A 12-block pilot per path supplies the *variance* of the block contrasts and the mean of main's outcome. Power is computed for the alternative "true ratio 1", whose expected contrast is `0.10 × E[main]`, not for the pilot's observed contrast; the interval is a one-sided t-interval on the block contrasts (bootstrap as a check). The block count for 80 % power is frozen, and the pilot's data are not reused. For orientation only: ab6's Beijing interval for a different statistic (the geometric mean of paired ratios, 0.76 [0.58–0.97] over 12 rounds) corresponds to roughly a hundred blocks.
+- **Primary test.** For each block `b`, the contrast `d_b = candidate_b − 0.90 × main_b` in delivered bytes. The gate passes on a path when the lower bound of the one-sided confidence interval of the mean contrast, at the level of the current look (below; 95 % overall), is above zero. The contrast is defined for zero outcomes in either arm and needs no ratio of a resampled denominator. A campaign in which more than a pre-registered fraction of main's blocks are zero is void and is rerun. "Point estimate ≥ 0.95 and the interval includes 1" is not accepted.
+- **Sequential stopping.** Arms are interleaved in ABBA or BAAB blocks, and the trial types round-robin at block granularity so path drift hits all of them equally. Each trial type starts with 6 blocks per path. After block 6 and after each further block the one-sided tests are re-run, at a nominal level per look from an α-spending function (Lan–DeMets, Pocock type) over the 7 possible looks (6 to 12 blocks) with total one-sided α = 0.05, so the repeated looks do not inflate the false-pass rate; the levels are computed once and frozen before the first block, and Bonferroni (0.05/7 per look) is the conservative fallback. At a look the trial type
+  - **passes** when the lower bound of the primary contrast and of every secondary contrast is above zero and every hard assertion holds;
+  - **fails** when a hard assertion fails, or when the upper bound of the primary or of any secondary contrast is below zero;
+  - otherwise gets one more block. At the 12-block cap a trial type that has not passed fails.
+
+  Each trial type stops on its own; the others continue. The interval is a one-sided t-interval on the block contrasts (bootstrap as a check). No separate pilot is run: the model's provisional bounds (margins `m`, slacks `a`) are frozen before the first gated block, and changing one after any block has been seen voids the campaign.
 - **Initial state per arm.** Each arm runs as its own processes with its own path knowledge. An arm's first trial in a block starts cold (processes restarted) and its second starts from that arm's own first trial, in both ABBA and BAAB, so neither arm inherits the other's state by position.
 - **Secondary, all required, each with a pre-registered one-sided bound:** flow completion; stalls per trial; reissued bytes per source byte; wire bytes per useful byte against main's measured baseline by substrate and direction; sender-side credit delay p95; client CPU p90; shadow false-promotion rate.
-- **Workload secondaries.** Each metric the model gates for an entry (§15.3) is a required secondary; a metric it marks as reported is not per path × entry × scenario, with its own pre-registered one-sided bound against main in the same campaign. For a metric where smaller is better the contrast is `d_b = (m × main_b + a) − candidate_b`, with a multiplicative margin `m` and an absolute slack `a` fixed per metric after the pilot and before the gated campaign, so that a metric near zero on main is not failed by noise. Percentiles are computed over each arm's pooled samples in a block. A tail percentile is used only when a block holds enough samples for it. Hard assertions in the model (class correctness, delivery with heartbeat, no silent deaths) are pass/fail, not statistical. Survival counts are reported with exact binomial intervals.
-- **Pass.** A path × entry × scenario cell passes when its primary (where it has one), all its secondaries and its hard assertions pass. Stage 10 requires every gated cell (§14).
+- **Workload secondaries.** Each metric the model gates for a workload inside a trial (§15.3) is a required secondary of that trial, per path, with its own pre-registered one-sided bound against main in the same campaign; a metric the model marks as reported is not gated. For a metric where smaller is better the contrast is `d_b = (m × main_b + a) − candidate_b`, with a multiplicative margin `m` and an absolute slack `a` fixed per metric before the first gated block, so that a metric near zero on main is not failed by noise. Percentiles are computed over each arm's pooled samples in a block. A tail percentile is used only when a block holds enough samples for it. Hard assertions in the model (class correctness, delivery with heartbeat, no silent deaths) are pass/fail, not statistical. Survival counts are reported with exact binomial intervals.
+- **D (`idle-wake`)** is one paired session per path, not a block sequence. It passes when its hard assertions hold (every wake delivered within 5 s, including at 16 min; no silent deaths) and its wake-penalty p50 is within the model's W9a bound of main's from the same session; the p95 and max are reported.
+- **Pass.** A path × trial type passes under the rule above. Stage 10 requires A, B, C, D and DC on every path, and the deterministic replacements in CI (§14).
+- **Budget.** A block of A, B, C and DC together takes about 26 min with restarts, so 6–7 blocks is 2.5–3 h per path; the 12-block cap bounds the worst case at about 5 h.
 
 ## 16. Risks and open questions
 
@@ -689,7 +713,7 @@ New deterministic tests, on real fork send loops over an impaired in-process `Pa
 
 **Open questions.**
 
-- **Q1. Weights and allowances** (`w_C : w_I : w_B`, `D`, `V`, the probe window). Latency policy, set by tests 2 and 6 and workloads W5–W7 and M1–M5 (§15.3).
+- **Q1. Weights and allowances** (`w_C : w_I : w_B`, `D`, `V`, the probe window). Latency policy, set by tests 2 and 6, trials B and C, and the emulated W8 and M5 tests (§15.3).
 - **Q2. Joint limiting for the hierarchy** (§11.3), needed only if the DC gate fails.
 - **Q3. Fan-out trigger** (§7): which measurement identifies the single-connection ceiling.
 - **Q4. `k_s`, `k_p` and the keepalive floor** (§10.2), from shadow-mode data.

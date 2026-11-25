@@ -8,8 +8,34 @@ What this is based on, and what it is not:
 - The classifier traces in §5 are from reading the code. Nothing was executed; each finding names the unit test that would confirm it.
 - The stage-2 (`sched=class`) and stage-6 branches are not on `origin/main` and were not read. The weights 4:2:1 are taken from the brief; the design doc still lists weights as open question Q1.
 - No 900 s default exists on `origin/main` (a 15-minute relay idle timeout appears only in a test fixture, `cmd/queqiaod/relay_test.go:70`). The production 900 s idle EOF is therefore not explained by a default, and workload W9 is designed to localise it.
-- All numeric regression bounds are provisional. They become pre-registered only after the pilot of design §15.4.
+- All numeric regression bounds are provisional. They are frozen as the pre-registered bounds before the first gated block (design §15.4).
 - The findings of §5 are merged with the stage-2 classifier audit in `docs/AUDIT-CLASSIFIER-WORKLOADS.md`, which keeps the F and R numbers used here and extends them. That audit read the stage-2 branch and confirms the 4:2:1 weights (`internal/congestion/classarb.go:20` on PR #181).
+
+## Minimal live plan
+
+The owner approved a minimal, representative live evaluation: live runs total about 2.5–3 h per path across all gates, not tens of hours. The gates are four trial types plus the DC gate, run on both live paths (design §15.3); everything else in this document is covered inside them, by a deterministic or emulated test, or by an optional run. The full matrix of §3–§4 stays as an opt-in reference.
+
+| Trial | Gate | Content | Length |
+| --- | --- | --- | --- |
+| **A `bulk`** | stages 6/7 | W1, 4 downloads | 60 s |
+| **B `mixed-6/7`** | stages 6/7 | W5-loop (5 turns, `U` = 100 KB) and W6 with one 300 KB burst, under 2 bulk downloads | 90 s |
+| **DC** | stage 9 | W4 at minimal size (10 requests, the first cold), then design §11.3's sustained-goodput and fairness workload | 60 s |
+| **C `mixed-all`** | stage 10 | concurrently: W7 call, one W3 page, one W5 call, W6 keystrokes, 1 W1 download, 1 W2 upload; metrics per class and direction | 120 s |
+| **D `idle-wake`** | stage 10 | W9a at minimal size: 50 connections, 200 KB sync, each woken once at 1, 5 or 16 min; run once per path, both arms concurrently, beside C | about 17 min |
+
+In B and C every workload's metrics come from the same trial. Each workload keeps its metrics and provisional bounds from §3. Arms are interleaved in ABBA blocks: 6 blocks, then one block at a time with the one-sided test re-run and corrected for repeated looks, until decided or 12 blocks (design §15.4).
+
+**Moved out of the live gates.** These are deterministic or emulated tests in CI, on `internal/pathsim`, with the bounds of their sections measured against the legacy bundle on the same seeded path. None is written yet.
+
+| Entry | Test (to be written) | Replaces |
+| --- | --- | --- |
+| W9b | `TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock`: idle targets 5–60 min including 29/31/45/60 × heartbeat mode × wake direction; delivery, death mode, idle EOF time, EOF or RST within 5 s. Needs an injected clock in the flow idle timer, binding deadline and keepalive schedule | the overnight sessions |
+| W8 | `TestTunnelledQUICDownloadOnAnEmulatedPath`: download and page, goodput, inner loss, wire bytes per useful byte | live W8 |
+| M5 | `TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks`: W7 audio, W8 download and W6 together; audio late loss, keystroke p99, FIFO sojourn, PACKET drops | live M5 |
+| W10 | `TestSegmentFetchOnAnEmulatedPath`: p10 throughput and rebuffer ratio | live W10 |
+| W11 | `TestOneShotDatagramOnAnEmulatedPath`: response time and fraction over 1 s, fresh and reused associations | live W11 |
+
+**Optional manual runs**, reported and never gated: M3 swarm, M7 soak, and every variant not named above (W1 one-flow and `speedtest`, W2 iOS profile live, W3 h1/h2 × cold/warm sweep, W5 `U` sweep, h2, `reasoning`, W7 `game`). The iOS memory bound of W2 and M6 is held by design §15.1 test 14.
 
 ## 0. Decisions in one screen
 
@@ -18,7 +44,7 @@ What this is based on, and what it is not:
 3. **The classifier latches BULK permanently, and an LLM call with a request of 128 KiB or more is labelled BULK at both ends by the first response byte.** The response deltas then lose coding today, and lose priority under `sched=class`. The same latch hits SSH after a large output, a messaging connection after its login sync, and an HTTP/2 connection after a page load.
 4. **Three classifier changes must land before the stage 6/7 campaigns, in both arms**: a non-sticky scheduling class (sparse-write rule plus a windowed exit from BULK), the stale-window fix, and per-byte class telemetry. Otherwise the stage-7 gate measures the mislabel, not the topology.
 5. **UDP is always INTERACTIVE and shares one ordered symbol stream.** A tunnelled QUIC download therefore sits in the same FIFO as voice packets and coded LLM deltas. This is Q5 of the design. It does not block stages 6/7; it must be measured (W8, M5) and decided before the stage-10 flip.
-6. **Must-have before stage 10**: W1–W9, mixed M1–M6. Nice-to-have: W10, W11, the speedtest and game variants, real-application validation runs.
+6. **Must-have before stage 10**: trials A, B, C, D and DC live on every path, and the W8, W9b, W10, W11 and M5 tests in CI (Minimal live plan). Optional: M3, M7, the remaining variants, real-application validation runs.
 
 ## 1. Characteristic axes
 
@@ -130,11 +156,11 @@ What collapses and what does not:
 
 **Trial, block, gate.** As design §15.3–15.4: a block is four trials (ABBA or BAAB) on one path with endpoints restarted before the block. The block is the unit of analysis. For a metric where smaller is better, the per-block statistic is computed per arm by pooling that arm's two trials, and the secondary gate is the one-sided test on
 
-`d_b = (m × main_b + a) − candidate_b`, pass when the lower 95 % bound of mean `d_b` is above zero,
+`d_b = (m × main_b + a) − candidate_b`, pass when the lower bound of mean `d_b`, at the current look's level (design §15.4), is above zero,
 
 where `m` is the multiplicative margin and `a` the absolute slack given per metric below. For "larger is better" the contrast is `candidate_b − m × main_b` as in §15.4.
 
-**Blocks needed.** For a margin of 10 % and 80 % power the block count is `n ≈ (2.49 × CV / 0.10)²`, where `CV` is the standard deviation of the block contrast over main's mean. CV 0.2 gives 25 blocks, 0.3 gives 56, 0.5 gives 155. Each table below gives a planning number; the 12-block pilot replaces it.
+**Blocks needed** (opt-in full matrix only; the gates use the sequential rule of design §15.4). For a margin of 10 % and 80 % power the block count is `n ≈ (2.49 × CV / 0.10)²`, where `CV` is the standard deviation of the block contrast over main's mean. CV 0.2 gives 25 blocks, 0.3 gives 56, 0.5 gives 155. Each table below gives a planning number for that matrix.
 
 **Mandatory telemetry for every trial**, exported per endpoint: bytes sent per (flow, class, substrate ∈ {stream, coded}), class transitions with timestamps, coded-path FIFO sojourn p99, UDP PACKET frames dropped at overflow, reissued bytes, carrier generation changes, memory high-water mark, admission refusals by reason.
 
@@ -245,6 +271,8 @@ A real WebRTC pair (pion, GCC enabled) through the same association is a nice-to
 
 ### W8 Tunnelled QUIC (new, must-have)
 
+*Gate: deterministic test on an emulated path (Minimal live plan); the live form below is opt-in.*
+
 | | |
 | --- | --- |
 | Generator | `h3`: quic-go HTTP/3 client whose `PacketConn` is a SOCKS5 UDP ASSOCIATE; HTTP/3 server in `wlserver`, default CUBIC and default loss recovery. **(a) download**: one 20 MB GET, or 30 s, whichever is first. **(b) page**: W3's object list as 40 concurrent HTTP/3 streams on one connection, 8 pages. **(c) reference**: the same 20 MB object over TCP CONNECT in the same block. |
@@ -257,9 +285,9 @@ A real WebRTC pair (pion, GCC enabled) through the same association is a nice-to
 
 Two parts, because wake latency needs many samples and survival needs long waits.
 
-**W9a Short-idle wake cycle (statistics).** `stream`, 50 concurrent TLS connections. On connect each receives a 200 KB sync burst (login history), then goes silent. Each connection then repeats: idle `I` seconds, one **server push** of 300 B carrying `s`, client replies with a 60 B ack; then 5 follow-up pushes at 1 s spacing (the warm reference); idle `I` again; one **client send** of 300 B, far side acks 60 B. `I` drawn per cycle from {30 s, 60 s, 120 s, 300 s}. Trial 20 minutes. App-level ping variant: 40 B ping and pong every 60 s.
+**W9a Short-idle wake cycle (statistics).** *Gate: trial D, a one-session minimal form (Minimal live plan).* `stream`, 50 concurrent TLS connections. On connect each receives a 200 KB sync burst (login history), then goes silent. Each connection then repeats: idle `I` seconds, one **server push** of 300 B carrying `s`, client replies with a 60 B ack; then 5 follow-up pushes at 1 s spacing (the warm reference); idle `I` again; one **client send** of 300 B, far side acks 60 B. `I` drawn per cycle from {30 s, 60 s, 120 s, 300 s}. Trial 20 minutes. App-level ping variant: 40 B ping and pong every 60 s.
 
-**W9b Long-idle survival (counts).** 120 connections per arm, opened together, 200 KB sync, then silence. Idle targets {5, 14, 16, 29, 31, 45, 60 min} × 3 heartbeat modes {none, 60 s ping, 10 min ping} × 2 wake directions {server push, client send}, plus spares; one wake per connection, then 5 warm follow-ups. Session length 65 minutes. The 14/16 and 29/31 pairs bracket the observed 900 s EOF and the 30-minute `FlowIdleTimeout` default.
+**W9b Long-idle survival (counts).** *Gate: deterministic test with an injected clock (Minimal live plan); the live sessions below are opt-in.* 120 connections per arm, opened together, 200 KB sync, then silence. Idle targets {5, 14, 16, 29, 31, 45, 60 min} × 3 heartbeat modes {none, 60 s ping, 10 min ping} × 2 wake directions {server push, client send}, plus spares; one wake per connection, then 5 warm follow-ups. Session length 65 minutes. The 14/16 and 29/31 pairs bracket the observed 900 s EOF and the 30-minute `FlowIdleTimeout` default.
 
 Idle connections do not contend, so **both arms run concurrently** from the same host in W9a and W9b. This gives perfect pairing and halves wall time. One `BG-down4` variant of W9a checks wake under load (also M6).
 
@@ -291,11 +319,11 @@ Trials: in W9a one push-plus-send cycle takes about 265 s on average, so 50 conn
 
 ### W10 Segment fetch (nice-to-have)
 
-`rpc` on one warm connection: a 1.5 MB GET every 4 s for 60 s (15 segments), down. Variant `publish`: `stream` writing 4 Mbit/s upstream at constant rate for 60 s. Metrics: segment download time; **rebuffer ratio** = `Σ max(0, d_k − 4 s) / 60 s`; throughput as an ABR would see it (`size / d_k`, p10). Bound: p10 throughput ≥ 0.90 × main; rebuffer ratio ≤ main + 1 pp. Stresses restart after idle every 4 s and a classifier that flips with the duty cycle once it is no longer sticky. 20 blocks.
+*Gate: deterministic test on an emulated path (Minimal live plan).* `rpc` on one warm connection: a 1.5 MB GET every 4 s for 60 s (15 segments), down. Variant `publish`: `stream` writing 4 Mbit/s upstream at constant rate for 60 s. Metrics: segment download time; **rebuffer ratio** = `Σ max(0, d_k − 4 s) / 60 s`; throughput as an ABR would see it (`size / d_k`, p10). Bound: p10 throughput ≥ 0.90 × main; rebuffer ratio ≤ main + 1 pp. Stresses restart after idle every 4 s and a classifier that flips with the duty cycle once it is no longer sticky. 20 blocks.
 
 ### W11 One-shot datagram (nice-to-have on desktop, must-have for TUN/mobile clients)
 
-`dgram`: a fresh UDP association per query half the time, a reused one otherwise; one 60 B packet up, one 300 B packet down, nothing else; one query per second for 60 s. Metrics: response time p50/p99; fraction over 1 s (a stub resolver's first retry); loss. Bound: fraction over 1 s ≤ main + 0.5 pp. Stresses association set-up cost and a coded tail with no later symbol (test 15, "a lost tail with no further arrival"). With SOCKS5 hostname CONNECT the gateway resolves names and this workload does not occur; it matters for clients that capture all UDP.
+*Gate: deterministic test on an emulated path (Minimal live plan).* `dgram`: a fresh UDP association per query half the time, a reused one otherwise; one 60 B packet up, one 300 B packet down, nothing else; one query per second for 60 s. Metrics: response time p50/p99; fraction over 1 s (a stub resolver's first retry); loss. Bound: fraction over 1 s ≤ main + 0.5 pp. Stresses association set-up cost and a coded tail with no later symbol (test 15, "a lost tail with no further arrival"). With SOCKS5 hostname CONNECT the gateway resolves names and this workload does not occur; it matters for clients that capture all UDP.
 
 ## 4. Mixed scenarios
 
@@ -324,7 +352,7 @@ Coverage check:
 | Idle state vs load and memory | M6 |
 | Everything, long | M7 (existing "mixed") |
 
-M1–M6 are the minimal set. M7 is a soak, run for stage 10 only, 6 blocks, reported and gated on failures and memory.
+In the minimal live plan M1 is covered by B, M2 and M4 by C, M6 by D beside C, and M5 by a deterministic test; M3 and M7 are optional manual runs.
 
 ## 5. Classifier implications
 
@@ -408,56 +436,51 @@ Default profile (`wan-shared-bottleneck`, `internal/profile/profile.go:151`) use
 | R6 | Idle semantics | Make the tunnel never the shortest timer: raise the default flow idle timeout to at least 2 h while both outer TCP legs still answer kernel keepalives, and guarantee that a flow the tunnel ends reaches both applications as EOF or RST within 5 s. Localise the 900 s EOF with W9b first. | stage 8 (it activates the keepalive schedule) and stage 10 |
 | R7 | Do not use `ClassHints` for this | `Declare(Interactive)` buys only the first second and cannot prevent or undo BULK (`classifier.go:138-160`). Hints do not fix F1 or F2. | — |
 
-**Why R1–R3 block the stage 6/7 validation and the rest do not.** Stage 6 requires `sched=class`, and stage 7 removes isolation. A flow wrongly labelled BULK loses more in the candidate arm (lowest weight on one shared connection) than in main (its own lane, per-lane interactive reserve). A stage-7 A/B run with today's classifier would attribute that loss to `topology=single`. The fix is to land R1–R3 first as their own switch (`classifier=v2`), gate that switch on W1 (0.90 goodput, to prove R1b does not cost bulk), W5, W6 and W9a, and then run stages 6 and 7 with it enabled in both arms. R4–R6 concern behaviour that is unchanged from main in stages 6 and 7 (the design keeps UDP at INTERACTIVE deliberately), so they wait for the flip.
+**Why R1–R3 block the stage 6/7 validation and the rest do not.** Stage 6 requires `sched=class`, and stage 7 removes isolation. A flow wrongly labelled BULK loses more in the candidate arm (lowest weight on one shared connection) than in main (its own lane, per-lane interactive reserve). A stage-7 A/B run with today's classifier would attribute that loss to `topology=single`. The fix is to land R1–R3 first as their own switch (`classifier=v2`), gate that switch on trials A (0.90 goodput, to prove R1b does not cost bulk), B and D, and then run stages 6 and 7 with it enabled in both arms. R4–R6 concern behaviour that is unchanged from main in stages 6 and 7 (the design keeps UDP at INTERACTIVE deliberately), so they wait for the flip.
 
 ## 6. Prioritisation
+
+Priorities follow the Minimal live plan: the live gates are trials A–D and DC, and the deterministic tests replace the long and the UDP-heavy entries.
 
 ### 6.1 Before the stage 6/7 campaigns
 
 | Item | Reason |
 | --- | --- |
-| W1 (4 flows, 1 flow), interactive probe | the designed primary gate |
-| W5-single and W5-loop, U = 100 KB and 400 KB, with M1 and M2 | the owner's case; the workload on which the classifier and the class scheduler interact |
-| W6 with phases A–C under `BG-down4` and `BG-up1` | continuity with ab6, plus the latch ratio |
+| Trial A (W1, 4 downloads) | the designed primary gate |
+| Trial B (W5-loop at 100 KB, W6 with one burst, under bulk; covers M1 and the interactive probe) | the owner's case; classifier and class scheduler interact here; continuity with ab6, plus the latch ratio |
 | R1, R2, R3 | §5.4 |
 
 ### 6.2 Must-have before the stage-10 default flip
 
 | Item | Reason |
 | --- | --- |
-| W1, W2 (desktop and iOS memory profile) | goodput in both directions |
-| W3 (h1 and h2, with and without bulk) | OPEN storms and NEW-flow start-up under the new arbiter |
-| W4 | stage 9's gate already requires it |
-| W5 all three sequences, three backgrounds | as above, plus the swarm |
-| W6 | as above |
-| W7 (call; `BG-none` and `BG-down4`) | the only delivery-ratio workload; the datagram class against BULK |
-| W8 | the flip changes how heavy UDP is weighted against bulk TCP; Q5 must be decided on data |
-| W9a, W9b | stage 8 changes keepalive and binding ownership; idle regressions are invisible to every other workload |
-| M1–M6 | §4 coverage table |
-| M7 soak | one release of soak is in the plan; this is its pre-flight |
+| Trials A and B on the final bundle | as above |
+| DC | stage 9's gate |
+| Trial C (W1, W2, W3, W5, W6, W7 together; covers M2, M4) | goodput in both directions, OPEN storms, the datagram class against BULK, every class at once |
+| Trial D (W9a at 1, 5, 16 min beside C; covers M6) | stage 8 changes keepalive and binding ownership; idle regressions are invisible to every other workload |
+| W9b, W8, M5, W10, W11 deterministic tests | long idle and heavy UDP, without overnight or UDP-heavy live runs; Q5 is decided on W8 and M5 data |
 
-### 6.3 Nice-to-have
+### 6.3 Optional
 
 | Item | Why it can wait |
 | --- | --- |
-| W10 segment fetch and publish | covered in mechanism by W4 warm plus W1; adds the ABR-facing metric |
-| W11 one-shot datagram | does not occur with hostname CONNECT; promote to must-have for any client that captures all UDP |
-| `speedtest` variant of W1/W2 | W1 already measures start-up; this adds an 8-flow, 10 s shape users judge the product by |
-| `game` variant of W7 | thin UDP is the audio sub-stream of W7 |
-| W5-h2 | F6 is understood from the trace; measure once R1 is in |
-| W5 `reasoning` variant (15 s think) | exercises the idle-then-trickle restart; W9a covers the restart |
+| M3 swarm, M7 soak | manual runs; the release soak still follows the flip |
+| W1 one-flow and `speedtest`, W2 iOS profile, W3 sweep, W5 `U` sweep, h2 and `reasoning`, W7 `game` | variants of entries the gates already cover |
 | Real-application runs: a browser page set, a pion WebRTC call with GCC, a real LLM API, a real Telegram client | validation that the synthetic generators predict the real thing; not usable as gates because the far side is not controlled |
 
 ### 6.4 Campaign cost
 
-A block is 4 trials. With restarts, a 60 s workload costs about 6 minutes per block.
+Per path, a block is 4 trials with restarts. Each trial type runs 6 blocks, then one at a time until decided, at most 12 (design §15.4).
 
-| Set | Blocks × variants | Wall time per path |
-| --- | --- | --- |
-| Stage 6/7 set: W1 ×2, probe, W5 ×2 sizes × 3 backgrounds, W6 × 3 backgrounds | ~100 (W1 Beijing) + 30 × 11 | about 30 h |
-| Stage-10 set, additional: W2 ×2, W3 ×2, W4, W5-loop and swarm, W7 ×2, W8, M3–M6 | 25–30 × 14 | about 40 h |
-| W9a | 6 sessions × 20 min, arms concurrent | 2 h |
-| W9b | 8 sessions × 65 min, arms concurrent | 9 h (overnight, unattended) |
-| M7 | 6 blocks × 2 h | 12 h |
+| Trial | Per block | 6 blocks | 12 blocks (cap) |
+| --- | --- | --- | --- |
+| A | ~5 min | 30 min | 1 h |
+| B | ~7 min | 42 min | 1.4 h |
+| C | ~9 min | 54 min | 1.8 h |
+| DC | ~5 min | 30 min | 1 h |
+| D | one 17-minute session, overlapped with C | 0 | 0 |
+| **Total** | ~26 min | **2.6 h** | 5.2 h |
 
-Interleave workloads round-robin at block granularity rather than running one workload's blocks back to back, so that a path that drifts between 0 % and 50 % loss within minutes drifts under all of them equally.
+Most trial types are expected to decide at 6–7 blocks: about 2.5–3 h per path. The deterministic tests run in CI and cost no live time. The opt-in full matrix of §3–§4 is tens of hours per path and is not planned.
+
+Interleave trial types round-robin at block granularity rather than running one type's blocks back to back, so that a path that drifts between 0 % and 50 % loss within minutes drifts under all of them equally.
