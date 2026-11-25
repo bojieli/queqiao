@@ -3,6 +3,7 @@ package congestion
 import (
 	"math/rand/v2"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -564,68 +565,89 @@ func TestSharedAdmissionBoundsDoNotGrowWithAttachments(t *testing.T) {
 	}
 }
 
-// Per-attachment fairness and no starvation: attachments with the same
-// class of demand share the path's service about equally whatever their
-// number, and a sparse interactive attachment beside saturated bulk ones is
-// served at once.
+// Per-attachment fairness and no starvation, with a fixed caller order: the
+// first attachment always asks first when the window opens, as the
+// connection whose acknowledgement opened it would, and an attachment that
+// is woken asks at once, as its run loop would. Attachments with the same
+// class of demand still share the path's service about equally, and a
+// sparse interactive attachment beside saturated bulk ones is served ahead
+// of every bulk packet once it is queued.
 func TestAttachmentsShareServiceAndNoneStarves(t *testing.T) {
 	c := newPCController()
 	now := base()
 	const k = 4
-	conns := make([]*pcConn, k)
+	conns := make([]*pcConn, k+1)
+	var woken []int
 	for i := range conns {
-		conns[i] = attachPC(t, c, now)
-		conns[i].a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
-	}
-	inter := attachPC(t, c, now)
-	served := make([]quiccongestion.ByteCount, k)
-	var interDelays []time.Duration
-	var interQueued monotime.Time
-	// overtaken counts bulk packets admitted while an interactive packet
-	// was waiting.
-	overtaken, worst := 0, 0
-	end := now.Add(2 * time.Second)
-	step := 0
-	for ; now.Before(end); now = now.Add(time.Millisecond) {
-		step++
-		// Acknowledge everything a round trip old, so the window turns over.
-		for _, p := range append(conns, inter) {
-			var acked []quiccongestion.PacketNumber
-			for n := range p.sizes {
-				acked = append(acked, n)
+		p := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+		p.a = c.Attach(nil, nil)
+		// Wake-ups coalesce, as a connection's scheduleSending does.
+		p.a.OnAttach(now, 0, 1200, func() {
+			if !slices.Contains(woken, i) {
+				woken = append(woken, i)
 			}
-			if step%100 == 0 && len(acked) > 0 {
-				p.event(now, acked, nil)
-				clear(p.sizes)
+		})
+		p.a.SetRTTStatsProvider(&fixedRTT{min: 100 * time.Millisecond, smoothed: 100 * time.Millisecond})
+		conns[i] = p
+		if i < k {
+			p.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+		}
+	}
+	inter := conns[k]
+	served := make([]quiccongestion.ByteCount, k)
+	var interQueued monotime.Time
+	interServed, overtaken, worst := 0, 0, 0
+	// run is one attachment's send loop: it sends while admitted.
+	run := func(i int) {
+		p := conns[i]
+		if i == k {
+			if interQueued.IsZero() {
+				return
+			}
+			if p.a.Admit(now, 1200).OK {
+				p.sendKind(now, 300, quiccongestion.KindOrdinary, true)
+				interServed++
+				interQueued = 0
+				worst = max(worst, overtaken)
+				overtaken = 0
+				p.a.OnDemand(quiccongestion.Demand{})
+			}
+			return
+		}
+		for p.a.Admit(now, 1200).OK {
+			p.send(now, 1200)
+			served[i] += 1200
+			if !interQueued.IsZero() {
+				overtaken++
+			}
+		}
+	}
+	end := now.Add(2 * time.Second)
+	for step := 1; now.Before(end); now, step = now.Add(time.Millisecond), step+1 {
+		if step%100 == 0 {
+			// A round trip: every connection's outstanding packets are
+			// acknowledged, the first's first.
+			for _, p := range conns {
+				var acked []quiccongestion.PacketNumber
+				for n := range p.sizes {
+					acked = append(acked, n)
+				}
+				if len(acked) > 0 {
+					p.event(now, acked, nil)
+					clear(p.sizes)
+				}
 			}
 		}
 		if step%50 == 0 && interQueued.IsZero() {
 			interQueued = now
 			inter.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassInteractive: true}})
 		}
-		// Every attachment asks in a rotating order, as independent run
-		// loops would.
-		for j := range k + 1 {
-			i := (j + step) % (k + 1)
-			if i == k {
-				if !interQueued.IsZero() {
-					if p := inter.a.Admit(now, 1200); p.OK {
-						inter.sendKind(now, 300, quiccongestion.KindOrdinary, true)
-						interDelays = append(interDelays, now.Sub(interQueued))
-						interQueued = 0
-						worst = max(worst, overtaken)
-						overtaken = 0
-						inter.a.OnDemand(quiccongestion.Demand{})
-					}
-				}
-				continue
-			}
-			if p := conns[i].a.Admit(now, 1200); p.OK {
-				conns[i].send(now, 1200)
-				served[i] += 1200
-				if !interQueued.IsZero() {
-					overtaken++
-				}
+		for i := range conns {
+			run(i)
+			for len(woken) > 0 {
+				w := woken[0]
+				woken = woken[1:]
+				run(w)
 			}
 		}
 	}
@@ -633,15 +655,13 @@ func TestAttachmentsShareServiceAndNoneStarves(t *testing.T) {
 	for _, s := range served {
 		lo, hi = min(lo, s), max(hi, s)
 	}
-	t.Logf("served per attachment %v; interactive delays %v", served, interDelays)
+	t.Logf("served per attachment %v; interactive served %d times", served, interServed)
 	if lo == 0 || float64(hi)/float64(lo) > 1.25 {
 		t.Errorf("attachments with equal demand were served %v", served)
 	}
-	if len(interDelays) < 30 {
-		t.Fatalf("the interactive attachment was served %d times", len(interDelays))
+	if interServed < 15 {
+		t.Fatalf("the interactive attachment was served %d times", interServed)
 	}
-	// It may wait for the shared window to open, but no bulk packet is
-	// admitted ahead of it once it is queued.
 	if worst > 0 {
 		t.Errorf("%d bulk packets were admitted ahead of a waiting interactive packet", worst)
 	}
@@ -702,5 +722,58 @@ func TestANeverAttachedControllerIsIdle(t *testing.T) {
 	a.a.OnDetach(base())
 	if _, idle := c.IdleSince(); !idle {
 		t.Fatal("a controller whose last attachment detached is not idle")
+	}
+}
+
+// A correction past its own deadline is refused even if an older held loss,
+// recorded while the round trip was longer, still holds the front of the
+// queue.
+func TestACorrectionPastItsOwnDeadlineIsRefused(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.send(now, 1200) // 0: lost while the RTT is long
+	a.send(now, 1200) // 1: lost after it falls
+	c.mu.Lock()
+	c.rtt.observe(2 * time.Second)
+	c.mu.Unlock()
+	a.event(now, nil, []quiccongestion.PacketNumber{0})
+	c.mu.Lock()
+	c.rtt = pathRTT{fallback: c.rtt.fallback}
+	c.rtt.observe(10 * time.Millisecond)
+	c.mu.Unlock()
+	a.event(now, nil, []quiccongestion.PacketNumber{1})
+	now = now.Add(time.Second)
+	a.a.OnAckEvent(quiccongestion.AckEvent{Time: now, InFlight: 0, Spurious: a.refs([]quiccongestion.PacketNumber{1})})
+	if s := c.Stats(); s.Spurious != 0 || s.SamplerDelivered != 0 {
+		t.Fatalf("a correction past its deadline was accepted: spurious %d, delivered %d", s.Spurious, s.SamplerDelivered)
+	}
+}
+
+// A claimant that asks but cannot use the turn for a reason of its own -- a
+// PROBING attachment with its probe window full -- does not hold back a
+// healthy sibling, and a lapsed claim stays lapsed until the claimant sends.
+func TestAStalledClaimantDoesNotThrottleItsSibling(t *testing.T) {
+	c := newPCController()
+	now := base()
+	stuck, healthy := attachPC(t, c, now), attachPC(t, c, now)
+	for range pathProbingPTOProbes {
+		stuck.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
+	}
+	stuck.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	healthy.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	if p := stuck.a.Admit(now, 1200); p.OK {
+		t.Fatal("a PROBING attachment with a full probe window was admitted")
+	}
+	sent := 0
+	for range 20 {
+		now = now.Add(1200 * time.Microsecond) // about a packet time: budget for one packet
+		if healthy.a.Admit(now, 1200).OK {
+			healthy.send(now, 1200)
+			sent++
+		}
+	}
+	if sent < 18 {
+		t.Fatalf("the healthy sibling sent %d of 20 packets beside a stalled claimant", sent)
 	}
 }

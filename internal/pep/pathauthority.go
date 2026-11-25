@@ -12,6 +12,7 @@ import (
 
 	wancongestion "github.com/bojieli/queqiao/internal/congestion"
 	"github.com/bojieli/queqiao/internal/identity"
+	"github.com/bojieli/queqiao/internal/pathmodel"
 )
 
 // pathAuthorities holds the path controllers of congestion=path (design
@@ -72,10 +73,17 @@ func (r *pathAuthorityRegistry) controller(principal, key, egress string, cfg co
 		for k, c := range r.controllers {
 			if idle, ok := c.IdleSince(); ok && now.Sub(idle) > pathKnowledgeLifetime {
 				delete(r.controllers, k)
+				// The principal's model goes with its controller: a
+				// principal that does not return would otherwise keep it
+				// for the life of the process.
+				forgetPathModel(k, cfg.hierarchicalPath)
 			}
 		}
 	}
 	if c, ok := r.controllers[name]; ok {
+		// Handed out for an installation that attaches on the
+		// connection's run loop: a sweep in that gap must not evict it.
+		c.Touch()
 		return c
 	}
 	// The model is the principal's too: its pooled erasure sets the law's
@@ -86,11 +94,24 @@ func (r *pathAuthorityRegistry) controller(principal, key, egress string, cfg co
 	return c
 }
 
-// forget drops every controller, for tests that need a cold path.
+// forget drops every controller and its model, for tests that need a cold
+// path.
 func (r *pathAuthorityRegistry) forget() {
 	r.mu.Lock()
+	for k := range r.controllers {
+		forgetPathModel(k, false)
+	}
 	clear(r.controllers)
 	r.mu.Unlock()
+}
+
+// forgetPathModel drops the shared model a controller's law reports to.
+func forgetPathModel(name string, hierarchical bool) {
+	if hierarchical {
+		pathmodel.ForgetTree(name)
+		return
+	}
+	pathmodel.Forget(name)
 }
 
 // attachPathController attaches conn to its path's controller and installs

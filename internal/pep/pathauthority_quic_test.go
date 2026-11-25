@@ -14,7 +14,6 @@ import (
 
 	wancongestion "github.com/bojieli/queqiao/internal/congestion"
 	"github.com/bojieli/queqiao/internal/identity"
-	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/pathsim"
 )
 
@@ -32,6 +31,9 @@ type pathBed struct {
 	// connection, in dial order.
 	mu       sync.Mutex
 	received map[string]*atomic.Int64
+	// principal is this bed's client identity, so each bed starts from a
+	// cold controller and a cold path model.
+	principal string
 }
 
 func newPathBed(t *testing.T, cfg pathsim.Config) *pathBed {
@@ -55,7 +57,7 @@ func newPathBed(t *testing.T, cfg pathsim.Config) *pathBed {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = relay.Close() })
-	b := &pathBed{t: t, listener: listener, relay: relay, received: map[string]*atomic.Int64{}}
+	b := &pathBed{t: t, listener: listener, relay: relay, received: map[string]*atomic.Int64{}, principal: newClientPathPrincipal()}
 	go func() {
 		for {
 			conn, err := listener.Accept(context.Background())
@@ -122,7 +124,9 @@ func (b *pathBed) counter(remote string) *atomic.Int64 {
 // path's controller.
 func (b *pathBed) dial() (*quic.Conn, *wancongestion.PathAttachment) {
 	conn := b.clientTLS()
-	att, ok := configureQUICController(conn, pathScopeConfig).(*wancongestion.PathAttachment)
+	cfg := pathScopeConfig
+	cfg.principal = b.principal
+	att, ok := configureQUICController(conn, cfg).(*wancongestion.PathAttachment)
 	if !ok {
 		b.t.Fatal("congestion=path did not install a path attachment")
 	}
@@ -212,7 +216,6 @@ func TestConnectionsOnOnePathShareOneController(t *testing.T) {
 				t.Fatalf("k=%d: connection %d attached to another controller", k, i)
 			}
 		}
-		pathmodel.Forget(peerKey(conns[0]))
 		waitAttached(t, ctl, k)
 		ctx, cancel := context.WithTimeout(context.Background(), run)
 		for _, c := range conns {
@@ -235,8 +238,11 @@ func TestConnectionsOnOnePathShareOneController(t *testing.T) {
 		s := ctl.Stats()
 		t.Logf("k=%d: aggregate %.2f MB/s, per connection %v; refusals window %d pacing %d turn %d, lapsed %d",
 			k, aggregate[k]/1e6, per, s.RefusedWindow, s.RefusedPacing, s.RefusedTurn, s.LapsedClaims)
+		if total == 0 {
+			t.Fatalf("k=%d: nothing was delivered", k)
+		}
 		for i, b := range per {
-			if b < 0.4*total/float64(k) {
+			if b <= 0 || b < 0.4*total/float64(k) {
 				t.Errorf("k=%d: connection %d delivered %.0f of %.0f bytes; starved", k, i, b, total)
 			}
 		}
@@ -263,7 +269,6 @@ func TestClosingAConnectionReconcilesThePathsFlight(t *testing.T) {
 	a, attA := bed.dial()
 	b, _ := bed.dial()
 	ctl := attA.Controller()
-	pathmodel.Forget(peerKey(a))
 	waitAttached(t, ctl, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

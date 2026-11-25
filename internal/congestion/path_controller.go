@@ -74,6 +74,8 @@ type PathController struct {
 	// sendSeq counts registered packets, so a refused attachment can tell
 	// whether the attachment holding a claim on the turn has sent since.
 	sendSeq uint64
+	// permitSeq counts permits issued.
+	permitSeq uint64
 
 	// Scratch for the law's batches.
 	acked []quiccongestion.AckedPacketInfo
@@ -121,6 +123,10 @@ type sampleRef struct {
 	pseq  quiccongestion.PacketNumber
 	bytes quiccongestion.ByteCount
 	lost  bool
+	// correctable is, for a lost packet, until when a correction may
+	// restore it. Held losses expire in report order, which is not deadline
+	// order when the round trip falls, so it is checked again here.
+	correctable monotime.Time
 }
 
 type pathControllerCounters struct {
@@ -188,6 +194,14 @@ func (c *PathController) Attach(rekey func(oldLocal, newLocal, oldRemote, newRem
 
 // Attachments is the number of attachments currently attached.
 func (c *PathController) Attachments() int { return int(c.attached.Load()) }
+
+// Touch marks the controller as just handed out, so a registry does not
+// count the time before an attachment installs as idleness.
+func (c *PathController) Touch() {
+	if c.attached.Load() == 0 {
+		c.lastDetach.Store(time.Now().UnixNano())
+	}
+}
 
 // IdleSince reports when the last attachment detached -- or, if none ever
 // attached, when the controller was created -- and false while any is
@@ -413,7 +427,7 @@ func (c *PathController) collectBlocked(a *PathAttachment, wakes []func()) []fun
 // except a: the claim they waited on may have cleared.
 func (c *PathController) collectWaiting(a *PathAttachment, wakes []func()) []func() {
 	for o := range c.atts {
-		if o != a && !o.precedenceSince.IsZero() && o.wake != nil {
+		if o != a && o.deferred && o.wake != nil {
 			wakes = append(wakes, o.wake)
 		}
 	}
@@ -465,7 +479,8 @@ func (c *PathController) detach(a *PathAttachment, now monotime.Time) []func() {
 	}
 	a.gauge = 0
 	a.windowBlocked = false
-	a.precedenceSince = 0
+	a.claimDeadline = 0
+	a.waiting, a.deferred, a.unable = false, false, false
 	delete(c.atts, a)
 	c.attached.Store(int64(len(c.atts)))
 	if len(c.atts) == 0 {
@@ -503,62 +518,100 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	c.advance(now)
 	var wakes []func()
 
-	// The turn. An attachment without demand in the path's turn defers to
-	// one that has it, until that one has had a packet time in which it
-	// could have sent and did not.
+	// The turn. An attachment defers to another that has a claim on it:
+	// one with demand in the path's turn when this one has none, or, among
+	// attachments with demand in the turn, one that was refused and has been
+	// served less recently, so the connection whose acknowledgement opened
+	// the window cannot take every opening from a woken sibling.
+	//
+	// A claim is held by its claimant, not by the attachment deferring: the
+	// first deferral to it gives it one packet time to use the turn. If it
+	// sends, the claim is live; if it does not, the claim lapses and stays
+	// lapsed until the claimant sends again. A claimant that asks and cannot
+	// use the turn for a reason of its own (a PROBING attachment's full
+	// probe window) holds no claim until it next sends either.
 	turn := c.arb.Select()
-	deferring := false
-	if turn != quiccongestion.ClassExempt && !a.demand.Eligible[turn] {
+	if turn != quiccongestion.ClassExempt && !a.demand.Eligible[turn] && !c.claimed(a, turn, now) {
 		for o := range c.atts {
 			if o != a && o.demand.Eligible[turn] {
-				deferring = true
-				if o.lastSentSeq > a.precedenceSeq {
-					// The claimant has sent since this attachment started
-					// waiting: its claim is live, and the wait restarts.
-					a.precedenceSince = 0
-				}
-				if o.wake != nil {
-					wakes = append(wakes, o.wake)
-				}
+				// Another attachment has demand in the turn but no live
+				// claim: its claim lapsed.
+				c.stats.lapsedClaims.Add(1)
+				break
 			}
 		}
-		if !deferring {
-			turn = c.arb.SelectAmong(a.demand.Eligible)
-		}
+		turn = c.arb.SelectAmong(a.demand.Eligible)
 	}
 	// The window and the balance, for the turn the path would serve now.
 	borrowed, refusal := c.admissible(a, now, turn)
 	if refusal != nil {
-		// Nobody could have sent: a claim does not lapse while the path
-		// gives it no opportunity.
-		a.precedenceSince = 0
+		a.waiting = true
 		return *refusal, wakes
 	}
-	if deferring {
-		if a.precedenceSince.IsZero() {
-			a.precedenceSince, a.precedenceSeq = now, c.sendSeq
+	if c.claimed(a, turn, now) {
+		var retry monotime.Time
+		for o := range c.atts {
+			if !c.claims(o, a, turn, now) {
+				continue
+			}
+			if o.claimDeadline.IsZero() {
+				o.claimDeadline = now.Add(c.packetTime(maxBytes))
+			}
+			if retry.IsZero() || o.claimDeadline.Before(retry) {
+				retry = o.claimDeadline
+			}
+			if o.wake != nil {
+				wakes = append(wakes, o.wake)
+			}
 		}
-		if lapse := a.precedenceSince.Add(c.packetTime(maxBytes)); now.Before(lapse) {
-			c.stats.refusedTurn.Add(1)
-			return quiccongestion.Permit{RetryAt: lapse}, wakes
-		}
-		// The claim lapsed: the other attachment had an opportunity and did
-		// not use it. The class keeps its deficit, and this attachment is
-		// served from its own demand.
-		c.stats.lapsedClaims.Add(1)
-		a.precedenceSince, a.precedenceSeq = now, c.sendSeq
+		c.stats.refusedTurn.Add(1)
+		a.waiting, a.deferred = true, true
+		return quiccongestion.Permit{RetryAt: retry}, wakes
+	}
+	if !a.demand.Eligible[turn] && turn != quiccongestion.ClassExempt {
+		// Every claim on the path's turn lapsed: this attachment is served
+		// from its own demand, and the class keeps its deficit.
 		turn = c.arb.SelectAmong(a.demand.Eligible)
 		if borrowed, refusal = c.admissible(a, now, turn); refusal != nil {
+			a.waiting = true
 			return *refusal, wakes
 		}
-	} else {
-		a.precedenceSince = 0
 	}
 	if borrowed {
 		c.stats.debtPermits.Add(1)
 	}
 	a.windowBlocked = false
+	a.waiting, a.deferred = false, false
+	c.permitSeq++
+	a.lastPermit = c.permitSeq
 	return c.arb.PermitTurn(turn, maxBytes, !borrowed), wakes
+}
+
+// claims says whether o holds a claim on turn against a.
+func (c *PathController) claims(o, a *PathAttachment, turn quiccongestion.SendClass, now monotime.Time) bool {
+	if o == a || !o.demand.Eligible[turn] || o.unable {
+		return false
+	}
+	if !o.claimDeadline.IsZero() && !now.Before(o.claimDeadline) {
+		return false // lapsed: it was given a packet time and did not ask
+	}
+	if !a.demand.Eligible[turn] {
+		return true
+	}
+	return o.waiting && o.lastPermit < a.lastPermit
+}
+
+// claimed says whether any attachment holds a claim on turn against a.
+func (c *PathController) claimed(a *PathAttachment, turn quiccongestion.SendClass, now monotime.Time) bool {
+	if turn == quiccongestion.ClassExempt {
+		return false
+	}
+	for o := range c.atts {
+		if c.claims(o, a, turn, now) {
+			return true
+		}
+	}
+	return false
 }
 
 // admissible checks the window, against the path's flight or a PROBING
@@ -575,6 +628,7 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 	if a.probing {
 		if a.gauge >= pathProbeWindowPackets*c.maxPacket {
 			a.windowBlocked = true
+			a.unable = true
 			c.stats.refusedWindow.Add(1)
 			return false, &quiccongestion.Permit{}
 		}
@@ -608,6 +662,8 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 	c.arb.OnSent(s.ClassBytes)
 	c.sendSeq++
 	a.lastSentSeq = c.sendSeq
+	a.unable = false
+	a.claimDeadline = 0
 	if s.Exempt {
 		c.stats.exemptBytes.Add(byteTotal(s.Bytes))
 	}
@@ -695,6 +751,11 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 			continue
 		}
 		delete(a.pkts, key)
+		if ref.lost && !now.Before(ref.correctable) {
+			// Past its correction window: the loss stands.
+			c.law.inner.estimator.retire(ref.pseq)
+			continue
+		}
 		if !ref.lost {
 			c.resolve(ref.pseq, fateDelivered)
 		} else if rec := c.record(ref.pseq); rec != nil && rec.fate == fateLost {
@@ -714,6 +775,11 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 			continue
 		}
 		delete(a.pkts, key)
+		if !now.Before(ref.correctable) {
+			// Past its correction window: the loss stands.
+			c.law.inner.estimator.retire(ref.pseq)
+			continue
+		}
 		c.stats.spurious.Add(1)
 		// A correction flips the fate if the estimator has not observed it
 		// yet; beyond that the loss stands there. The sampler still has the
@@ -731,9 +797,10 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 			continue
 		}
 		ref.lost = true
+		ref.correctable = now.Add(c.horizon())
 		a.pkts[key] = ref
 		c.resolve(ref.pseq, fateLost)
-		c.lostHeld = append(c.lostHeld, heldLoss{att: a, key: key, pseq: ref.pseq, deadline: now.Add(c.horizon())})
+		c.lostHeld = append(c.lostHeld, heldLoss{att: a, key: key, pseq: ref.pseq, deadline: ref.correctable})
 		c.lost = append(c.lost, quiccongestion.LostPacketInfo{PacketNumber: ref.pseq, BytesLost: ref.bytes})
 		resolved += ref.bytes
 	}
@@ -785,15 +852,27 @@ type PathAttachment struct {
 	addrs func() (local, remote net.Addr)
 
 	// Under the controller's lock.
-	epoch           uint64
-	gauge           quiccongestion.ByteCount
-	probing         bool
-	demand          quiccongestion.Demand
-	pkts            map[packetKey]sampleRef
-	windowBlocked   bool
-	precedenceSince monotime.Time
-	precedenceSeq   uint64
-	lastSentSeq     uint64
+	epoch         uint64
+	gauge         quiccongestion.ByteCount
+	probing       bool
+	demand        quiccongestion.Demand
+	pkts          map[packetKey]sampleRef
+	windowBlocked bool
+	lastSentSeq   uint64
+	// claimDeadline is when this attachment's claim on a turn lapses unless
+	// it sends first; zero while nobody has deferred to it since it last
+	// sent.
+	claimDeadline monotime.Time
+	// unable says it asked and could not use the path's opportunity for a
+	// reason of its own; it holds no claim until it next sends.
+	unable bool
+	// deferred says its last Admit deferred to a claim.
+	deferred bool
+	// waiting says the attachment's last Admit was refused; lastPermit is
+	// the controller's permit count at its last permit. Together they rank
+	// attachments with demand in the same class.
+	waiting    bool
+	lastPermit uint64
 	// ptoSinceProgress counts PTO probes sent since the connection's packets
 	// were last acknowledged.
 	ptoSinceProgress int
