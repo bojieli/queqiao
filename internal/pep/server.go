@@ -262,13 +262,6 @@ func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, repla
 		}
 		if (handoff && old.kind != TransportTCP) || (replaceLane && replacedLaneID != lane.id && id == replacedLaneID) {
 			retired[id] = old
-		} else if s.retireControlOnJoin && lane.control && id != lane.id && f.laneIsControl(old) &&
-			(old.suspected.Load() || time.Since(old.admitted) >= laneDeadPathDetection) {
-			// RESERVE_CONTROL replaces a failed control generation, so the
-			// lane that held the role is retired with the admission. A young
-			// holder is a rescue that just won, and keeps the protection
-			// eviction gives it; the client closes the old stream itself.
-			retired[id] = old
 		} else {
 			remaining++
 		}
@@ -295,6 +288,46 @@ func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, repla
 		f.tcpStriping.Store(true)
 	}
 	return nil
+}
+
+// commitControlTransfer completes a RESERVE_CONTROL JOIN in owned admission
+// (design §10.3 step 1): the lane that held the control role is retired, but
+// only now, once the replacement's OPEN_OK has been written and the lane is
+// active. Admission merely stages the replacement beside it, so a JOIN whose
+// OPEN_OK cannot be delivered is rolled back by removing the staged lane and
+// leaves the old holder exactly as it was. A holder younger than the eviction
+// protection is a rescue that just won and is kept; the client closes the old
+// stream itself in any case.
+func (s *serverFlow) commitControlTransfer(replacement *mpLane) {
+	if !s.retireControlOnJoin || !replacement.control {
+		return
+	}
+	f := s.flow
+	s.mu.Lock()
+	f.lanesMu.Lock()
+	var retired []*mpLane
+	if f.lanes[replacement.id] == replacement && !replacement.closed.Load() {
+		for id, old := range f.lanes {
+			if id == replacement.id || old.closed.Load() || !f.laneIsControl(old) {
+				continue
+			}
+			if old.suspected.Load() || time.Since(old.admitted) >= laneDeadPathDetection {
+				delete(f.lanes, id)
+				old.closed.Store(true)
+				retired = append(retired, old)
+			}
+		}
+	}
+	f.lanesMu.Unlock()
+	s.mu.Unlock()
+	for _, old := range retired {
+		if sched := f.scheduler.Load(); sched != nil {
+			sched.RetireLane(old.id)
+		}
+		if old.fc != nil {
+			_ = old.fc.Close()
+		}
+	}
 }
 
 // wireVersion is the version the flow is pinned to.
@@ -1499,6 +1532,7 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 		serverSession.flow.removeLane(replacement)
 		return
 	}
+	serverSession.commitControlTransfer(replacement)
 	s.cfg.Logger.Debug("lane joined", "lane", laneID, "transport", kind, "control", controlReplacement, "lanes", serverSession.flow.laneCount())
 	s.observeLanes(serverSession.flow.laneCount())
 	// A replacement can arrive after the destination has already reached EOF

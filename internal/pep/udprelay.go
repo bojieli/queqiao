@@ -61,6 +61,9 @@ type udpRelayStore struct {
 
 	mu     sync.Mutex
 	relays map[[session.UDPResumeTokenSize]byte]retainedRelay
+	// count is the number of distinct relays in relays: one parked under two
+	// tokens is one socket, and maximum bounds sockets.
+	count int
 	// live names relays still held by a running association, under the
 	// token that association granted (owned admission only). An entry is
 	// bounded by the association that published it, which is bounded by
@@ -143,10 +146,11 @@ func (s *udpRelayStore) retainLocked(token [session.UDPResumeTokenSize]byte, pri
 			held.drop()
 		}
 	}
-	if len(s.relays) >= s.maximum {
+	if s.count >= s.maximum {
 		retainedRelay{conn: conn, lease: lease}.drop()
 		return false, false
 	}
+	s.count++
 	entry := retainedRelay{conn: conn, expires: now.Add(s.grace), principal: principal, lease: lease}
 	if also != nil && *also != token {
 		paired := entry
@@ -220,6 +224,10 @@ func (s *udpRelayStore) claim(token []byte, principal identity.Principal) server
 // removeLocked withdraws a retained relay under key and under the other
 // token it answers to, if any.
 func (s *udpRelayStore) removeLocked(key [session.UDPResumeTokenSize]byte, held retainedRelay) {
+	if _, ok := s.relays[key]; !ok {
+		return
+	}
+	s.count--
 	delete(s.relays, key)
 	if held.hasAlso {
 		if other, ok := s.relays[held.also]; ok && other.conn == held.conn {
@@ -258,7 +266,7 @@ func (s *udpRelayStore) retained() int {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.relays)
+	return s.count
 }
 
 // liveRelay is a relay its association still holds, published so that the
@@ -389,12 +397,22 @@ func (s *udpRelayStore) endLive(token [session.UDPResumeTokenSize]byte, entry *l
 		s.mu.Unlock()
 		return liveClosed
 	}
-	start, kept := s.retainLocked(token, entry.principal, conn, lease.detach(), also)
+	// The slots are kept with the relay only for a client known to be able
+	// to come back for them: one that has sent on the lane, so holds the
+	// grant, or a replacement, which still holds the token it presented. A
+	// fresh association whose OPEN_OK may never have been read leaves its
+	// socket reclaimable but gives its slots back, so the client's retry
+	// without a token is not refused by them.
+	var kept *flowLease
+	if entry.confirmed || entry.hasAlias {
+		kept = lease.detach()
+	}
+	start, retained := s.retainLocked(token, entry.principal, conn, kept, also)
 	s.mu.Unlock()
 	if start {
 		go s.sweep()
 	}
-	if !kept {
+	if !retained {
 		return liveDropped
 	}
 	return liveParked

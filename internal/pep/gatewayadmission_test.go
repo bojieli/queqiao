@@ -69,12 +69,17 @@ type rawCarrier struct {
 func dialRawCarrier(ctx context.Context, t *testing.T, carrier TransportKind, remote string, credentials identity.ClientCredentials, wire byte) (*rawCarrier, error) {
 	c := &rawCarrier{t: t, carrier: carrier, remote: remote, credentials: credentials, wire: []byte{wire}}
 	if carrier == TransportQUIC {
-		conn, _, err := dialQUICConnection(ctx, remote, credentials, c.wire, 3*time.Second, "", nil, nil, flowWindows{}, hopDialConfig{})
+		conn, packetConn, err := dialQUICConnection(ctx, remote, credentials, c.wire, 3*time.Second, "", nil, nil, flowWindows{}, hopDialConfig{})
 		if err != nil {
 			return nil, err
 		}
 		c.conn = conn
-		t.Cleanup(func() { _ = conn.CloseWithError(0, "test done") })
+		t.Cleanup(func() {
+			_ = conn.CloseWithError(0, "test done")
+			if packetConn != nil {
+				_ = packetConn.Close()
+			}
+		})
 	}
 	return c, nil
 }
@@ -763,6 +768,8 @@ func TestALiveRelayIsAlwaysTakenOverWhateverTheInterleaving(t *testing.T) {
 		stopped := make(chan struct{})
 		var stopOnce sync.Once
 		entry := store.publishLive(token, udpTestPrincipal, func() { stopOnce.Do(func() { close(stopped) }) })
+		// The association has been carrying traffic: the client holds its grant.
+		store.confirmLive(entry)
 		var wg sync.WaitGroup
 		var end liveEnd
 		wg.Add(1)
@@ -816,6 +823,7 @@ func TestAnUnclaimedParkedRelayReleasesItsLease(t *testing.T) {
 	var released atomic.Int32
 	lease.add(func() { released.Add(1) })
 	entry := store.publishLive(token, udpTestPrincipal, func() {})
+	store.confirmLive(entry)
 	if end := store.endLive(token, entry, relay, lease, true); end != liveParked {
 		t.Fatalf("owner end = %v, want parked", end)
 	}
@@ -834,9 +842,9 @@ func TestAnUnclaimedParkedRelayReleasesItsLease(t *testing.T) {
 // Design §10.3 step 1: a RESERVE_CONTROL JOIN replaces a failed control
 // generation. A released gateway with room in the lane table adds the new
 // lane beside the old one, which stays schedulable until it fails; an owned
-// gateway retires the previous holder of the control role as part of the
-// admission. A holder younger than the eviction protection is a rescue that
-// just won and is kept either way.
+// gateway retires the previous holder of the control role once the
+// replacement is committed. A holder younger than the eviction protection is
+// a rescue that just won and is kept either way.
 func TestAControlJoinRetiresThePreviousControlLaneInOwnedAdmission(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -863,6 +871,10 @@ func TestAControlJoinRetiresThePreviousControlLaneInOwnedAdmission(t *testing.T)
 			if err := serverSession.addLane(replacement); err != nil {
 				t.Fatalf("control JOIN refused: %v", err)
 			}
+			if old.closed.Load() {
+				t.Fatal("admission alone retired the previous control lane")
+			}
+			serverSession.commitControlTransfer(replacement)
 			if got := old.closed.Load(); got != tc.wantRetired {
 				t.Fatalf("previous control lane retired = %v, want %v", got, tc.wantRetired)
 			}
@@ -873,74 +885,89 @@ func TestAControlJoinRetiresThePreviousControlLaneInOwnedAdmission(t *testing.T)
 	}
 }
 
-// A standby takes over the general slot of whichever of its principal's
-// connections closes first, even when others remain, so the principal can
-// have a standby again for its next recovery and the bound is never
-// exceeded by more than one standby per principal.
-func TestAStandbyInheritsTheSlotOfAnyClosingConnection(t *testing.T) {
-	credentials, _ := testCertificate(t)
-	server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0", Credentials: credentials, MaxSessions: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
-	const key = "device"
-	general := func() *connectionTicket {
-		if !server.admitConnection() {
-			t.Fatal("general slot refused")
-		}
-		server.connMu.Lock()
-		p := server.principalConns[key]
-		if p == nil {
-			p = &principalConnections{}
-			server.principalConns[key] = p
-		}
-		p.general++
-		server.connMu.Unlock()
-		return &connectionTicket{principal: key}
-	}
-	first, second := general(), general()
-	standby := &connectionTicket{principal: key, standby: true}
-	server.principalConns[key].standby = standby
-	server.releaseQUICConnection(first)
-	if server.isStandby(standby) || len(server.connections) != 2 || server.principalConns[key].standby != nil || server.principalConns[key].general != 2 {
-		t.Fatalf("after one of two connections closed: standby=%v slots=%d general=%d", server.isStandby(standby), len(server.connections), server.principalConns[key].general)
-	}
-	server.releaseQUICConnection(second)
-	server.releaseQUICConnection(standby)
-	if len(server.connections) != 0 || len(server.principalConns) != 0 {
-		t.Fatalf("%d slots and %d principals left after every connection closed", len(server.connections), len(server.principalConns))
-	}
-}
+// pipeQUICStream is a QUIC stream over an in-memory pipe, so the JOIN
+// handler treats the lane as QUIC without a real connection.
+type pipeQUICStream struct{ net.Conn }
 
-// A replacement arriving after a parked relay expired, but before the sweep,
-// releases the slots that relay kept before it is admitted on its own.
-func TestAnExpiredParkedRelayReleasesItsLeaseToTheReplacement(t *testing.T) {
-	store := newUDPRelayStoreWith(time.Hour, udpRelaysRetained)
-	token, err := newUDPResumeToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease := &flowLease{}
-	var released atomic.Int32
-	lease.add(func() { released.Add(1) })
-	entry := store.publishLive(token, udpTestPrincipal, func() {})
-	if end := store.endLive(token, entry, relay, lease, true); end != liveParked {
-		t.Fatalf("owner end = %v, want parked", end)
-	}
-	store.mu.Lock()
-	held := store.relays[token]
-	held.expires = time.Now().Add(-time.Second)
-	store.relays[token] = held
-	store.mu.Unlock()
-	if got, _ := store.transfer(context.Background(), token[:], udpTestPrincipal, time.Second); got != nil {
-		t.Fatal("an expired relay was handed back")
-	}
-	if released.Load() != 1 || store.retained() != 0 {
-		t.Fatalf("lease released %d times, %d relays left", released.Load(), store.retained())
+func (p pipeQUICStream) CancelRead(quic.StreamErrorCode) {}
+
+// Design §10.3 step 1 against design review round 5: the control role moves
+// only when the replacement's OPEN_OK has been written. An OPEN_OK that
+// cannot be delivered while the old holder is still healthy rolls the JOIN
+// back and leaves the old lane carrying the flow; one that is delivered
+// retires it.
+func TestAControlTransferIsCommittedOnlyAfterItsOpenOK(t *testing.T) {
+	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "owner"}
+	for _, delivered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("open-ok-delivered=%v", delivered), func(t *testing.T) {
+			server, _ := pendingTestServer()
+			flow := newIsolationTestFlow(t, true)
+			serverSession := newServerFlow(flow, owner, TransportQUIC, 8)
+			serverSession.retireControlOnJoin = true
+			old := isolationLane(t, 0)
+			old.control = true
+			if err := serverSession.addLane(old); err != nil {
+				t.Fatal(err)
+			}
+			old.admitted = time.Now().Add(-2 * laneDeadPathDetection)
+			if !server.registerSession(flow.sessionID, serverSession) {
+				t.Fatal("register failed")
+			}
+			local, remote := net.Pipe()
+			t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
+			lane := &quicStreamConn{stream: pipeQUICStream{local}}
+			request := protocol.Frame{Header: protocol.Header{
+				Version: protocol.Version, Type: protocol.TypeJoin, Flags: protocol.FlagReserveControl,
+				SessionID: flow.sessionID, FlowID: flow.flowID, Class: protocol.ClassBulk,
+			}}
+			answered := make(chan protocol.Frame, 1)
+			if delivered {
+				go func() {
+					frame, err := newFrameConn(remote).Read()
+					if err == nil {
+						answered <- frame
+					}
+				}()
+			} else {
+				// The replacement's transport is gone: its OPEN_OK write fails.
+				_ = remote.Close()
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				server.handleLaneJoinOpen(context.Background(), lane, newFrameConn(lane), owner, flow.sessionID, 1, request)
+			}()
+			if !delivered {
+				select {
+				case <-done:
+				case <-time.After(3 * time.Second):
+					t.Fatal("the JOIN handler did not give up on an undeliverable OPEN_OK")
+				}
+				if old.closed.Load() {
+					t.Fatal("a JOIN whose OPEN_OK failed retired the healthy control lane")
+				}
+				if lanes := flow.healthyLanes(); len(lanes) != 1 || lanes[0] != old {
+					t.Fatalf("flow lanes after the failed JOIN: %d, want the old control lane", len(lanes))
+				}
+				return
+			}
+			select {
+			case frame := <-answered:
+				if frame.Header.Type != protocol.TypeOpenOK {
+					t.Fatalf("JOIN answered type %d", frame.Header.Type)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("JOIN not answered")
+			}
+			for deadline := time.Now().Add(2 * time.Second); !old.closed.Load(); {
+				if time.Now().After(deadline) {
+					t.Fatal("the committed control transfer kept the previous holder")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			_ = local.Close()
+			<-done
+		})
 	}
 }
 
@@ -1087,4 +1114,128 @@ func TestAnUnconfirmedReplacementIsParkedUnderBothTokens(t *testing.T) {
 		t.Fatalf("a colliding retention released the first lease %d times, %d relays held", firstReleased.Load(), store.retained())
 	}
 	store.closeAll()
+}
+
+// A fresh association whose OPEN_OK may never have been read keeps its relay
+// reclaimable but not its slots: the client's retry carries no token and must
+// not be refused by them. And a relay parked under two tokens is one socket
+// against the store's bound.
+func TestAnUnconfirmedFreshAssociationGivesItsSlotsBack(t *testing.T) {
+	store := newUDPRelayStoreWith(time.Hour, 1)
+	token, err := newUDPResumeToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	lease := &flowLease{}
+	var released atomic.Int32
+	lease.add(func() { released.Add(1) })
+	entry := store.publishLive(token, udpTestPrincipal, func() {})
+	if end := store.endLive(token, entry, relay, lease, true); end != liveParked {
+		t.Fatalf("owner end = %v, want parked", end)
+	}
+	lease.release()
+	if released.Load() != 1 {
+		t.Fatalf("a fresh unconfirmed association kept its lease (%d releases)", released.Load())
+	}
+	if store.claim(token[:], udpTestPrincipal) == nil {
+		t.Fatal("its relay is no longer reclaimable")
+	}
+
+	// One relay under two tokens fits a store bounded at one.
+	old, grant := token, token
+	old[0] ^= 1
+	second, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	entry = store.publishLive(grant, udpTestPrincipal, func() {})
+	store.aliasLive(entry, old[:])
+	if end := store.endLive(grant, entry, second, &flowLease{}, true); end != liveParked {
+		t.Fatalf("aliased owner end = %v, want parked", end)
+	}
+	if store.retained() != 1 {
+		t.Fatalf("retained %d relays, want 1", store.retained())
+	}
+	store.closeAll()
+	if store.retained() != 0 {
+		t.Fatalf("retained %d relays after closeAll", store.retained())
+	}
+}
+
+// A standby takes over the general slot of whichever of its principal's
+// connections closes first, even when others remain, so the principal can
+// have a standby again for its next recovery and the bound is never
+// exceeded by more than one standby per principal.
+func TestAStandbyInheritsTheSlotOfAnyClosingConnection(t *testing.T) {
+	credentials, _ := testCertificate(t)
+	server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0", Credentials: credentials, MaxSessions: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "device"
+	general := func() *connectionTicket {
+		if !server.admitConnection() {
+			t.Fatal("general slot refused")
+		}
+		server.connMu.Lock()
+		p := server.principalConns[key]
+		if p == nil {
+			p = &principalConnections{}
+			server.principalConns[key] = p
+		}
+		p.general++
+		server.connMu.Unlock()
+		return &connectionTicket{principal: key}
+	}
+	first, second := general(), general()
+	standby := &connectionTicket{principal: key, standby: true}
+	server.principalConns[key].standby = standby
+	server.releaseQUICConnection(first)
+	if server.isStandby(standby) || len(server.connections) != 2 || server.principalConns[key].standby != nil || server.principalConns[key].general != 2 {
+		t.Fatalf("after one of two connections closed: standby=%v slots=%d general=%d", server.isStandby(standby), len(server.connections), server.principalConns[key].general)
+	}
+	server.releaseQUICConnection(second)
+	server.releaseQUICConnection(standby)
+	if len(server.connections) != 0 || len(server.principalConns) != 0 {
+		t.Fatalf("%d slots and %d principals left after every connection closed", len(server.connections), len(server.principalConns))
+	}
+}
+
+// A replacement arriving after a parked relay expired, but before the sweep,
+// releases the slots that relay kept before it is admitted on its own.
+func TestAnExpiredParkedRelayReleasesItsLeaseToTheReplacement(t *testing.T) {
+	store := newUDPRelayStoreWith(time.Hour, udpRelaysRetained)
+	token, err := newUDPResumeToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := &flowLease{}
+	var released atomic.Int32
+	lease.add(func() { released.Add(1) })
+	entry := store.publishLive(token, udpTestPrincipal, func() {})
+	store.confirmLive(entry)
+	if end := store.endLive(token, entry, relay, lease, true); end != liveParked {
+		t.Fatalf("owner end = %v, want parked", end)
+	}
+	store.mu.Lock()
+	held := store.relays[token]
+	held.expires = time.Now().Add(-time.Second)
+	store.relays[token] = held
+	store.mu.Unlock()
+	if got, _ := store.transfer(context.Background(), token[:], udpTestPrincipal, time.Second); got != nil {
+		t.Fatal("an expired relay was handed back")
+	}
+	if released.Load() != 1 || store.retained() != 0 {
+		t.Fatalf("lease released %d times, %d relays left", released.Load(), store.retained())
+	}
 }
