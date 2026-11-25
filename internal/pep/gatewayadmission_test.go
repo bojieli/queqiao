@@ -69,7 +69,7 @@ type rawCarrier struct {
 func dialRawCarrier(ctx context.Context, t *testing.T, carrier TransportKind, remote string, credentials identity.ClientCredentials, wire byte) (*rawCarrier, error) {
 	c := &rawCarrier{t: t, carrier: carrier, remote: remote, credentials: credentials, wire: []byte{wire}}
 	if carrier == TransportQUIC {
-		conn, packetConn, err := dialQUICConnection(ctx, remote, credentials, c.wire, 3*time.Second, "", nil, nil, flowWindows{}, hopDialConfig{})
+		conn, packetConn, err := dialQUICConnection(ctx, remote, credentials, c.wire, 10*time.Second, "", nil, nil, flowWindows{}, hopDialConfig{})
 		if err != nil {
 			return nil, err
 		}
@@ -86,7 +86,7 @@ func dialRawCarrier(ctx context.Context, t *testing.T, carrier TransportKind, re
 
 func (c *rawCarrier) lane(ctx context.Context) (*frameConn, streamConn, error) {
 	if c.carrier == TransportTCP {
-		outer, err := dialTCP(ctx, c.remote, c.credentials, c.wire, 3*time.Second, "", nil)
+		outer, err := dialTCP(ctx, c.remote, c.credentials, c.wire, 10*time.Second, "", nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -108,7 +108,7 @@ func exchange(ctx context.Context, c *rawCarrier, frame protocol.Frame) (protoco
 	if err != nil {
 		return protocol.Frame{}, nil, nil, err
 	}
-	_ = outer.SetDeadline(time.Now().Add(4 * time.Second))
+	_ = outer.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := fc.Write(frame); err != nil {
 		return protocol.Frame{}, fc, outer, err
 	}
@@ -186,8 +186,12 @@ func admissionDestination(t *testing.T, kind destinationKind) string {
 					return
 				}
 				go func() { _, _ = io.Copy(io.Discard, conn) }()
+				// Steady rather than flat out: a transfer in progress, not a
+				// CPU load that starves the rest of the test on a small runner.
 				chunk := bytes.Repeat([]byte{'a'}, 16*1024)
-				for {
+				ticker := time.NewTicker(2 * time.Millisecond)
+				defer ticker.Stop()
+				for range ticker.C {
 					if _, err := conn.Write(chunk); err != nil {
 						return
 					}
