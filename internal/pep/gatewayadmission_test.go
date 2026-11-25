@@ -943,3 +943,65 @@ func TestAnExpiredParkedRelayReleasesItsLeaseToTheReplacement(t *testing.T) {
 		t.Fatalf("lease released %d times, %d relays left", released.Load(), store.retained())
 	}
 }
+
+// A replacement's OPEN_OK can be lost with its lane, leaving the client with
+// only the token it presented. Its retry with that token must still take the
+// relay and the slots over; at MaxSessions=1 anything else is a FLOW_LIMIT
+// refusal by the gateway's own stranded reservation.
+func TestALostResumeGrantCanBeRetriedWithTheOldToken(t *testing.T) {
+	serverCredentials, clientCredentials := testCertificate(t)
+	target, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{
+		Credentials: serverCredentials, MaxSessions: 1, GatewayAdmission: GatewayAdmissionOwned,
+	})
+	carrier, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, fc, _ := openRawUDPAssociation(ctx, t, carrier, [16]byte{0x63}, 1, nil)
+	_, token, ok := session.DecodeUDPResumeGrant(response.Payload)
+	if response.Header.Type != protocol.TypeOpenOK || !ok {
+		t.Fatalf("association answered %+v", response.Header)
+	}
+	before := udpRelaySource(t, fc, [16]byte{0x63}, 1, 0, target)
+	// The replacement's lane dies before its OPEN_OK is read.
+	payload, err := session.EncodeUDPResumeOpen(token[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	lost, outer, err := carrier.lane(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lost.Write(protocol.Frame{Header: protocol.Header{
+		Version: protocol.Version, Type: protocol.TypeOpen, SessionID: [16]byte{0x64}, FlowID: 2, Class: protocol.ClassInteractive,
+	}, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	_ = outer.Close()
+	// The retry presents the only token the client has.
+	for attempt := 0; ; attempt++ {
+		response, fc, _ = openRawUDPAssociation(ctx, t, carrier, [16]byte{0x65}, 3, token[:])
+		if response.Header.Type == protocol.TypeOpenOK {
+			break
+		}
+		if attempt == 10 {
+			t.Fatalf("retry answered %+v %q", response.Header, response.Payload)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	resumed, _, _ := session.DecodeUDPResumeGrant(response.Payload)
+	if !resumed {
+		t.Fatal("the retry got a fresh relay")
+	}
+	if after := udpRelaySource(t, fc, [16]byte{0x65}, 3, 0, target); after != before {
+		t.Fatalf("relay source moved from %s to %s", before, after)
+	}
+}

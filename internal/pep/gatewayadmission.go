@@ -1,12 +1,14 @@
 package pep
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/apernet/quic-go"
 	"github.com/bojieli/queqiao/internal/identity"
 )
 
@@ -68,10 +70,13 @@ const (
 	// probe at a time; the margin covers a probe overlapping its retry. The
 	// work of each is fixed by PROTOCOL.md §14.
 	probeStreams = 4
-	// tcpRecoveryLanes bounds, in legacy mode, the TLS/TCP connections
-	// accepted past a full session limit so that a JOIN or PROBE on them can
-	// be read. Each is bounded by the handshake deadline until it is admitted.
-	tcpRecoveryLanes = 64
+	// recoveryReads bounds, gateway-wide in legacy mode, the streams (QUIC)
+	// and connections (TLS/TCP) read past a full session limit so that a JOIN
+	// or PROBE on them can be found. Each is bounded by the handshake
+	// deadline until it is admitted. In owned mode the gateway-wide bounds
+	// are MaxSessions (at least this), the bound every stream used to be
+	// read under.
+	recoveryReads = 64
 )
 
 func (s *Server) admissionOwned() bool {
@@ -278,4 +283,16 @@ func (s *Server) udpTransferWait() time.Duration {
 		wait = 5 * time.Second
 	}
 	return wait
+}
+
+// waitForSlot waits for a slot of slots, giving up when the connection or
+// the server ends.
+func waitForSlot(ctx context.Context, conn *quic.Conn, slots chan struct{}) bool {
+	select {
+	case slots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+	case <-conn.Context().Done():
+	}
+	return false
 }

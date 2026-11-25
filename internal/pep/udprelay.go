@@ -245,6 +245,43 @@ type liveRelay struct {
 	handed chan struct{}
 	conn   serverUDPRelay
 	lease  *flowLease
+	// alias is the token this association was opened with, when it is a
+	// replacement. Until the client is known to hold the new grant, the
+	// client still holds only the alias: a retry after a lost OPEN_OK
+	// presents it, so the entry answers to it, and an unconfirmed
+	// association is parked under it.
+	alias     [session.UDPResumeTokenSize]byte
+	hasAlias  bool
+	confirmed bool
+}
+
+// aliasLive also publishes a live relay under the token its association was
+// opened with, until confirmLive.
+func (s *udpRelayStore) aliasLive(entry *liveRelay, alias []byte) {
+	if s == nil || entry == nil || len(alias) != session.UDPResumeTokenSize {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copy(entry.alias[:], alias)
+	entry.hasAlias = true
+	if !entry.claimed {
+		s.live[entry.alias] = entry
+	}
+}
+
+// confirmLive records that the client holds the association's grant: it has
+// sent a frame on the lane, which it does only after reading the OPEN_OK.
+func (s *udpRelayStore) confirmLive(entry *liveRelay) {
+	if s == nil || entry == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry.confirmed = true
+	if entry.hasAlias && s.live[entry.alias] == entry {
+		delete(s.live, entry.alias)
+	}
 }
 
 // publishLive records a running association's relay under the token it
@@ -292,6 +329,14 @@ func (s *udpRelayStore) endLive(token [session.UDPResumeTokenSize]byte, entry *l
 	s.mu.Lock()
 	if s.live[token] == entry {
 		delete(s.live, token)
+	}
+	if entry.hasAlias && s.live[entry.alias] == entry {
+		delete(s.live, entry.alias)
+	}
+	if !entry.confirmed && entry.hasAlias {
+		// The client never showed it received the new grant; it will retry
+		// with the token it still has.
+		token = entry.alias
 	}
 	if entry.claimed && !entry.abandoned {
 		entry.conn = conn

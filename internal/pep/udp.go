@@ -759,6 +759,9 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	var live *liveRelay
 	if resumable && s.admissionOwned() {
 		live = s.udpRelays.publishLive(grant, principal, cancel)
+		if len(resume) > 0 {
+			s.udpRelays.aliasLive(live, resume)
+		}
 	}
 
 	// How this association ends decides what happens to its socket. A clean
@@ -882,6 +885,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	defer lifetimeTimer.Stop()
 	defer authorizationTicker.Stop()
 	failed := false
+	confirmed := false
 	var endErr error
 	resetIdle := func() {
 		if !idleTimer.Stop() {
@@ -895,6 +899,10 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	for {
 		select {
 		case frame := <-frames:
+			if live != nil && !confirmed {
+				confirmed = true
+				s.udpRelays.confirmLive(live)
+			}
 			if frame.Header.SessionID != sessionID || frame.Header.FlowID != flowID {
 				endErr = errors.New("invalid UDP association frame")
 				failed = true

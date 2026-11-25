@@ -141,6 +141,12 @@ type Server struct {
 	// so one standby can be admitted beside them when the bound is full.
 	connMu         sync.Mutex
 	principalConns map[string]*principalConnections
+	// firstFrames bounds, gateway-wide, the QUIC streams being read before
+	// they hold a session slot: in owned mode every stream until admission,
+	// in legacy mode those read past a full session limit. Each holds a
+	// frame reader, so the per-connection bound alone would let the total
+	// grow with the connection count.
+	firstFrames chan struct{}
 }
 
 type serverFlow struct {
@@ -406,9 +412,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	budget := limiter.New(limiter.Config{TotalBytesPerSec: cfg.AggregateBytesPerSec, ReserveBytesPerSec: cfg.InteractiveReserveBytesPerSec})
 	cfg.ChunkSize = chunkSizeForBudget(cfg.ChunkSize, budget)
-	handshakes := tcpRecoveryLanes
+	handshakes := recoveryReads
 	if cfg.GatewayAdmission == GatewayAdmissionOwned {
-		handshakes = cfg.MaxSessions
+		handshakes = max(cfg.MaxSessions, recoveryReads)
 	}
 	server := &Server{
 		cfg:          cfg,
@@ -424,6 +430,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 		handshakes:     make(chan struct{}, handshakes),
 		principalConns: make(map[string]*principalConnections),
+		firstFrames:    make(chan struct{}, handshakes),
 	}
 	return server, nil
 }
@@ -848,10 +855,22 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	}
 	s.metrics.DataConnectionAccepted(wire)
 	auth := &quicAuthState{principal: principal}
-	// firstFrames and probes are this connection's own bounds (§10.5): the
+	// connFirstFrames and probes are this connection's own bounds (§10.5): the
 	// streams whose first frame is being read or whose JOIN is being
 	// admitted, and the PROBEs that hold no session slot.
-	firstFrames := make(chan struct{}, firstFrameStreams)
+	connFirstFrames := make(chan struct{}, firstFrameStreams)
+	releaseFirstFrame := func() { <-s.firstFrames; <-connFirstFrames }
+	// tryFirstFrame takes a slot of both first-frame bounds, or neither.
+	tryFirstFrame := func() bool {
+		if !tryAcquire(connFirstFrames) {
+			return false
+		}
+		if !tryAcquire(s.firstFrames) {
+			<-connFirstFrames
+			return false
+		}
+		return true
+	}
 	probes := make(chan struct{}, probeStreams)
 	owned := s.admissionOwned()
 	// Mutual TLS authenticates the whole QUIC connection before any stream is
@@ -863,7 +882,7 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 			wg.Add(1)
 			go func(lane streamConn) {
 				defer wg.Done()
-				s.handleSession(ctx, lane, principal, auth, streamAdmission{release: func() { <-firstFrames }, probes: probes})
+				s.handleSession(ctx, lane, principal, auth, streamAdmission{release: releaseFirstFrame, probes: probes})
 			}(lane)
 			return true
 		}
@@ -881,11 +900,11 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 			// trying to recover. A JOIN or a PROBE needs no slot, so the first
 			// frame is read under the connection's own bound before anything
 			// is refused (#170).
-			if !s.cfg.testReleasedAdmission && tryAcquire(firstFrames) {
+			if !s.cfg.testReleasedAdmission && tryFirstFrame() {
 				wg.Add(1)
 				go func(lane streamConn) {
 					defer wg.Done()
-					s.handleSession(ctx, lane, principal, auth, streamAdmission{recoveryOnly: true, release: func() { <-firstFrames }, probes: probes})
+					s.handleSession(ctx, lane, principal, auth, streamAdmission{recoveryOnly: true, release: releaseFirstFrame, probes: probes})
 				}(lane)
 				return true
 			}
@@ -898,11 +917,7 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 		if owned {
 			// Wait for room rather than refuse: streams beyond the bound stay
 			// in QUIC's accept queue, and only this connection waits.
-			select {
-			case firstFrames <- struct{}{}:
-			case <-ctx.Done():
-				return
-			case <-conn.Context().Done():
+			if !waitForSlot(ctx, conn, connFirstFrames) {
 				return
 			}
 		}
@@ -915,11 +930,18 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 		stream, err := acceptQUICStream(ctx, conn, controller)
 		if err != nil {
 			if owned {
-				<-firstFrames
+				<-connFirstFrames
 			}
 			if ctx.Err() == nil {
 				s.cfg.Logger.Debug("accept QUIC stream failed", "error", err)
 			}
+			return
+		}
+		// The gateway-wide bound is taken only for a stream that exists, so
+		// an idle connection waiting for its next stream holds none of it.
+		if owned && !waitForSlot(ctx, conn, s.firstFrames) {
+			_ = stream.Close()
+			<-connFirstFrames
 			return
 		}
 		dispatch(stream)
