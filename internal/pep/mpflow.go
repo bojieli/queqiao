@@ -389,6 +389,9 @@ type multipathFlow struct {
 	// reported, refreshed by observeTransport. The stall threshold is three
 	// of these.
 	minRTTNS atomic.Int64
+	// credit is the flow's one outstanding sender-side credit delay sample
+	// (creditdelay.go): passive telemetry, never read by a decision.
+	credit creditSampler
 	// stallSignal advises the lane manager that a stall episode is in
 	// progress. It is buffered at one and sent non-blockingly: the manager
 	// acts on the flow's current state when it wakes, so a coalesced signal
@@ -770,6 +773,7 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 		}
 		if frame.Header.Type == protocol.TypeData {
 			lane.sent.Add(uint64(len(frame.Payload)))
+			f.noteCarrierTook(lane, frame.Header.Sequence, len(frame.Payload))
 		}
 		// The transport has taken these bytes, which is what frees the lane to
 		// accept more. A QUIC stream write returns only once the packer has
@@ -2843,6 +2847,9 @@ func (f *multipathFlow) acknowledgeCoverage(sequence uint64, final bool, ranges 
 	}
 	if advanced && f.phased() {
 		f.noteAckedCoverage()
+	}
+	if advanced {
+		f.noteCreditCovered()
 	}
 	if end := f.codingRecoveryEnd.Load(); end != 0 &&
 		(f.acked >= end || f.ackTrack != nil && f.ackTrack.Covered(0, end)) {

@@ -136,6 +136,8 @@ type Registry struct {
 	quicCounters quicCounterTotals
 	// carrierShadow is written only by the carrier-liveness observer.
 	carrierShadow carrierShadowCounters
+	// creditDelay is the sender-side credit delay histogram (creditdelay.go).
+	creditDelay creditDelayHistogram
 	telemetryMu   sync.Mutex
 	quicFlows     map[uint64]quicObservation
 	// clock is the time source for observation freshness. Tests replace it;
@@ -391,6 +393,8 @@ type Snapshot struct {
 	LaneRescueWins [RescueAttemptSlots]uint64
 	// CarrierShadow is the carrier-liveness observer's record.
 	CarrierShadow CarrierShadowSnapshot
+	// CreditDelay is the sender-side credit delay histogram.
+	CreditDelay CreditDelaySnapshot
 }
 
 // QUICObservation is a point-in-time aggregate over the lanes of one logical
@@ -843,6 +847,7 @@ func (r *Registry) Snapshot() Snapshot {
 		s.LaneRescueWins[i] = r.laneRescueWins[i].Load()
 	}
 	s.CarrierShadow = r.carrierShadowSnapshot()
+	s.CreditDelay = r.creditDelaySnapshot()
 	now := r.now()
 	var expired uint64
 	r.telemetryMu.Lock()
@@ -1139,6 +1144,7 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	fmt.Fprintf(w, "queqiao_lane_grace_extensions_total %d\n", s.LaneGraceExtensions)
 	writeCarrierShadow(w, s.CarrierShadow)
+	writeCreditDelay(w, s.CreditDelay)
 }
 
 // ReceiveErasure is the share of the peer's source symbols that did not arrive,
