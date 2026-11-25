@@ -115,7 +115,7 @@ func classifierBacklogFor(cfg classifier.Config, limits flowMemoryLimits) classi
 	if threshold == 0 {
 		threshold = classifier.DefaultConfig().BulkBacklogBytes
 	}
-	if half := uint64(limits.maxSendBytes / 2); half < threshold {
+	if half := countBytes(limits.maxSendBytes / 2); half < threshold {
 		cfg.BulkBacklogBytes = max(half, 1)
 	}
 	return cfg
@@ -145,10 +145,10 @@ func (f *multipathFlow) admitSparse(n int) bool {
 	f.recentMu.Lock()
 	defer f.recentMu.Unlock()
 	f.advanceRecentLocked(f.clockNow())
-	if f.sparseCurrent+f.sparsePrior+uint64(n) > sparseAllowanceBytes {
+	if f.sparseCurrent+f.sparsePrior+countBytes(n) > sparseAllowanceBytes {
 		return false
 	}
-	f.sparseCurrent += uint64(n)
+	f.sparseCurrent += countBytes(n)
 	return true
 }
 
@@ -270,9 +270,9 @@ func (f *multipathFlow) noteDataBytes(class protocol.Class, coded bool, n int) {
 	if coded {
 		substrate = 1
 	}
-	f.classBytes[classByteIndex(class)][substrate].Add(uint64(n))
+	f.classBytes[classByteIndex(class)][substrate].Add(countBytes(n))
 	if f.metrics != nil {
-		f.metrics.DataClassBytes(classByteIndex(class), coded, uint64(n))
+		f.metrics.DataClassBytes(classByteIndex(class), coded, countBytes(n))
 	}
 }
 
@@ -292,4 +292,12 @@ func (f *multipathFlow) classLogFields() []any {
 		"data_bytes_bulk_coded", f.classBytes[2][1].Load(),
 		"data_bytes_bulk_stream", f.classBytes[2][0].Load(),
 	}
+}
+
+// countBytes converts a byte count held as an int; a negative one is zero.
+func countBytes(n int) uint64 {
+	if n <= 0 {
+		return 0
+	}
+	return uint64(n) // #nosec G115 -- n is positive, and every int fits in uint64.
 }
