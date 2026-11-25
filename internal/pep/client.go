@@ -167,6 +167,9 @@ type ClientConfig struct {
 	// CCAPI selects how QUIC congestion controllers are driven; see
 	// CCAPIVersion. Empty is v1.
 	CCAPI CCAPIVersion
+	// Sched selects how a QUIC connection orders the classes of work it
+	// sends; see SchedMode. Empty is legacy. Class requires CCAPI v2.
+	Sched SchedMode
 	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
 	// is legacy.
 	CodedRetry                    CodedRetryMode
@@ -654,6 +657,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, errors.New("brutal congestion requires a positive per-lane byte rate")
 	}
 	if err := validateBundle(&cfg.CCAPI, cfg.Congestion, cfg.Profile); err != nil {
+		return nil, err
+	}
+	if err := validateSched(&cfg.Sched, cfg.CCAPI); err != nil {
 		return nil, err
 	}
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
@@ -1707,7 +1713,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 			discoverGrouping: c.cfg.Profile.DiscoverGrouping,
 			kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 			adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-			ccAPI: c.cfg.CCAPI,
+			ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched,
 		}
 		if pooled {
 			outer, err = c.dialPooledQUICLane(ctx, ccfg)
@@ -2320,7 +2326,7 @@ func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
 		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-		ccAPI: c.cfg.CCAPI,
+		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched,
 	})
 	c.cfg.Logger.Debug("bulk QUIC pool authenticated", "duration", time.Since(started))
 	return entry, nil
