@@ -61,6 +61,31 @@ type ClassArbiter struct {
 	// eligible again within it; it never carries into a later round.
 	held      [quiccongestion.NumSendClasses]int64
 	heldRound [quiccongestion.NumSendClasses]uint64
+	// stuck marks a class whose turn built nothing although it had demand:
+	// its work does not fit the permit. It is passed over until its demand
+	// changes or a packet is sent, so another class can use the path and
+	// the connection does not spin on the same decision.
+	stuck [quiccongestion.NumSendClasses]bool
+}
+
+// OnEmptyBuild records that a turn of class built nothing, and reports
+// whether another decision is now possible.
+func (a *ClassArbiter) OnEmptyBuild(class quiccongestion.SendClass) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if class == quiccongestion.ClassExempt || class >= quiccongestion.NumSendClasses || a.stuck[class] {
+		return false
+	}
+	a.stuck[class] = true
+	return true
+}
+
+// Unstick clears every stuck mark: something changed that may let the work
+// fit (a packet was sent, flight changed).
+func (a *ClassArbiter) Unstick() {
+	a.mu.Lock()
+	a.stuck = [quiccongestion.NumSendClasses]bool{}
+	a.mu.Unlock()
 }
 
 // NewClassArbiter returns an arbiter with the given weights; a weight below
@@ -85,6 +110,9 @@ func (a *ClassArbiter) SetQuantum(q quiccongestion.ByteCount) {
 func (a *ClassArbiter) OnDemand(d quiccongestion.Demand) {
 	a.mu.Lock()
 	for _, c := range scheduledClasses {
+		if d.Eligible[c] != a.demand[c] {
+			a.stuck[c] = false
+		}
 		if d.Eligible[c] && !a.demand[c] && a.held[c] > 0 && a.heldRound[c] == a.round {
 			// Back within the round it went idle in: it keeps what it had
 			// not spent of this round's allocation, and nothing more.
@@ -117,9 +145,19 @@ func (a *ClassArbiter) Permit(maxBytes quiccongestion.ByteCount) quiccongestion.
 	p := quiccongestion.Permit{OK: true, MaxBytes: maxBytes, Turn: quiccongestion.ClassExempt}
 	turn := quiccongestion.ClassExempt
 	for _, c := range scheduledClasses {
-		if a.demand[c] && a.deficit[c] > 0 {
+		if a.demand[c] && !a.stuck[c] && a.deficit[c] > 0 {
 			turn = c
 			break
+		}
+	}
+	if turn == quiccongestion.ClassExempt {
+		// Every class with credit is stuck: give the turn to one with
+		// demand that is not, if any, before the round's credit says so.
+		for _, c := range scheduledClasses {
+			if a.demand[c] && !a.stuck[c] {
+				turn = c
+				break
+			}
 		}
 	}
 	if turn == quiccongestion.ClassExempt {
@@ -131,7 +169,7 @@ func (a *ClassArbiter) Permit(maxBytes quiccongestion.ByteCount) quiccongestion.
 	p.Turn = turn
 	a.turns[turn]++
 	for _, c := range scheduledClasses {
-		if c != turn && a.demand[c] && a.deficit[c] > 0 {
+		if c != turn && a.demand[c] && !a.stuck[c] && a.deficit[c] > 0 {
 			p.Fill[c] = quiccongestion.ByteCount(a.deficit[c])
 		}
 	}
@@ -141,6 +179,7 @@ func (a *ClassArbiter) Permit(maxBytes quiccongestion.ByteCount) quiccongestion.
 // OnSent charges each class for the bytes a packet carried of it.
 func (a *ClassArbiter) OnSent(classBytes [quiccongestion.NumSendClasses]quiccongestion.ByteCount) {
 	a.mu.Lock()
+	a.stuck = [quiccongestion.NumSendClasses]bool{}
 	for _, c := range scheduledClasses {
 		if b := int64(classBytes[c]); b > 0 {
 			a.served[c] += uint64(b)
