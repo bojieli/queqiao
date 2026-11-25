@@ -12,7 +12,7 @@ import (
 // Both modes acquire shared send memory only for bytes a producer already
 // holds, so an application socket waiting to be read holds none (issue
 // #169); that fix is not a policy and is not switchable. MemoryOwned adds the
-// rest of the bundle: first-come grants of the shared budgets, the
+// rest of the bundle: first-come grants of the shared send budget, the
 // flow-layer retention autotune in place of summed congestion windows, and
 // READY bytes counted as pending work by the no-progress budget.
 type MemoryMode string
@@ -154,8 +154,11 @@ func resolveMemoryLimits(configured *MemoryLimits, chunkSize int, modes ...Memor
 	}
 	if len(modes) > 0 && modes[0] == MemoryOwned {
 		// One chunk per waiting flow, in turn: a flow cannot be overtaken
-		// forever by others that happen to win the wake-up race.
-		return limits, memlimit.NewFair(configured.SendBudgetBytes), memlimit.NewFair(configured.ReceiveBudgetBytes), nil
+		// forever by others that happen to win the wake-up race. Only send
+		// admission waits; receive admission is TryAcquire by design (a
+		// lane reader that blocked on memory could not service ACKs), so
+		// there is no receive queue to order.
+		return limits, memlimit.NewFair(configured.SendBudgetBytes), memlimit.New(configured.ReceiveBudgetBytes), nil
 	}
 	return limits, memlimit.New(configured.SendBudgetBytes), memlimit.New(configured.ReceiveBudgetBytes), nil
 }

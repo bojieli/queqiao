@@ -740,6 +740,20 @@ func (s *Scheduler) RetentionBound() int {
 	return s.tune.bound
 }
 
+// HasReadyWork reports whether anything read from the source is waiting for
+// its first dispatch, including an empty final marker: work the flow owes
+// the peer although none of it has been sent.
+func (s *Scheduler) HasReadyWork() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, chunk := range s.pending {
+		if _, live := s.live[chunk.Offset]; !live || chunk.Final {
+			return true
+		}
+	}
+	return false
+}
+
 // ReadyBytes reports Q: bytes read from the source and not yet dispatched to
 // any lane. They are pending work although nothing has been sent.
 func (s *Scheduler) ReadyBytes() uint64 {

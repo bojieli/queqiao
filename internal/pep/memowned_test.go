@@ -241,6 +241,20 @@ func TestReadyBytesArePendingWorkOnlyUnderOwnedMemory(t *testing.T) {
 	}
 }
 
+// An end of stream queued with no lane to carry it is owed work too, though
+// it has no bytes.
+func TestQueuedFinalMarkerIsPendingWorkUnderOwnedMemory(t *testing.T) {
+	flow := newGraceTestFlow(t)
+	flow.memOwned = true
+	sched := stripe.New(bytes.NewReader(nil), stripe.Config{ChunkSize: 1024})
+	defer sched.Close()
+	flow.scheduler.Store(sched)
+	waitFor(t, time.Second, "the final marker", sched.HasReadyWork)
+	if sched.ReadyBytes() != 0 || !flow.pendingOutbound() {
+		t.Fatal("an undispatched final marker is not pending work")
+	}
+}
+
 func TestReadyBytesWithNoBindingEndTheOwnedFlow(t *testing.T) {
 	flow := newGraceTestFlow(t)
 	flow.memOwned = true

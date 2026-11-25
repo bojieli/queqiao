@@ -256,8 +256,8 @@ func (s *Session) SetRoutingRules(text string) string {
 }
 
 // SetMemoryBundle selects the memory-ownership bundle the next Start uses:
-// "legacy" (the default) or "owned", which grants the shared send and
-// receive budgets to waiting flows in turn and tunes each flow's retention
+// "legacy" (the default) or "owned", which grants the shared send budget to
+// waiting flows in turn and tunes each flow's retention
 // from its own flow credit. Any other value is refused and changes nothing.
 // A running tunnel keeps the bundle it started with.
 func (s *Session) SetMemoryBundle(mode string) error {

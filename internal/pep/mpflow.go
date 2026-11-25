@@ -2007,7 +2007,7 @@ func (f *multipathFlow) pendingOutbound() bool {
 		// main this predicate looks only at sent offsets and tracked chunks,
 		// so bytes read while no binding exists were waiting without a
 		// deadline (design §8.3).
-		if sched := f.scheduler.Load(); sched != nil && sched.ReadyBytes() > 0 {
+		if sched := f.scheduler.Load(); sched != nil && sched.HasReadyWork() {
 			return true
 		}
 	}
