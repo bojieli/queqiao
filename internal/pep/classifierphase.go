@@ -374,6 +374,11 @@ func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool, b
 	}
 	backlog = saturatingSub(upBytes, f.ackCovered)
 	if f.refillTracking {
+		if up && n > 0 && bufLen < 0 {
+			// A source read the scheduler will report as part of a logical
+			// read: until it does, the read's fullness is unknown.
+			f.readInProgress = true
+		}
 		if up && n > 0 && bufLen >= 0 {
 			full := n >= f.fullReadBytes
 			if bufLen > 0 {
@@ -383,6 +388,11 @@ func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool, b
 		} else if f.drainPending && now.Sub(f.drainPendingAt) > refillWindow {
 			f.drainLocked()
 		}
+		// Nothing that waits on a decision can complete a stretch: neither
+		// a drain still pending (whatever the bytes outstanding say, which
+		// the decision may yet show drained) nor a read whose fullness the
+		// scheduler has not yet reported.
+		provisional = f.drainPending || f.readInProgress
 		switch {
 		case f.lastReadFull && !f.drainPending && (f.continuing || backlog > f.refillThreshold):
 			// Still behind, or a prompt full refill took the room, however
@@ -392,9 +402,8 @@ func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool, b
 			// A drain is being decided: an observation before the read
 			// that decides it completes -- receive-side bytes, a
 			// re-examination, the first source read of a staged read still
-			// being extended, whatever it holds -- does not end the stretch,
-			// but it cannot complete one either.
-			backlog, provisional = max(backlog, f.refillThreshold+1), true
+			// being extended -- does not end the stretch.
+			backlog = max(backlog, f.refillThreshold+1)
 		case f.refillMode:
 			// Below the floor bytes outstanding say nothing; only full
 			// reads do.
@@ -410,6 +419,7 @@ func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool, b
 // was offered, and whether it took, within refillWindow, the room a pending
 // drain opened.
 func (f *multipathFlow) noteReadLocked(now time.Time, full bool) {
+	f.readInProgress = false
 	if f.drainPending {
 		if full && now.Sub(f.drainPendingAt) <= refillWindow {
 			f.drainPending, f.continuing = false, true

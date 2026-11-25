@@ -292,3 +292,36 @@ func TestReadDoneReportsTheCompletedRead(t *testing.T) {
 		t.Fatalf("ReadDone reported %v, want [true false]", done)
 	}
 }
+
+// An unextended staged read is reported complete before the scheduler waits
+// for shared memory to hold it: the wait says nothing about the source.
+func TestReadDoneComesBeforeTheMemoryWait(t *testing.T) {
+	src := &writesReader{writes: make(chan []byte, 2)}
+	defer close(src.writes)
+	memory := memlimit.New(2048)
+	if !memory.TryAcquire(1536) { // leave 512 bytes: a 1 KiB read must wait
+		t.Fatal("setup")
+	}
+	done := make(chan bool, 1)
+	s := New(src, Config{
+		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
+		Memory: memory, StagingBytes: 1024,
+		ReadDone: func(full bool) { done <- full },
+	})
+	defer s.Close()
+	src.writes <- make([]byte, 1024)
+	select {
+	case full := <-done:
+		if !full {
+			t.Fatal("a staging read that filled its buffer was reported short")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the read was not reported while the scheduler waited for memory")
+	}
+	memory.Release(1536)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if c, err := s.Next(ctx, 1, 0); err != nil || c == nil || len(c.Data) != 1024 {
+		t.Fatalf("chunk after the wait: %v %v", c, err)
+	}
+}

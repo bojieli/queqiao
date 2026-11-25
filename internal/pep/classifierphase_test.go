@@ -1335,3 +1335,104 @@ func TestAStagingReadDoesNotCommitBeforeItsFill(t *testing.T) {
 		t.Fatal("BULK was re-entered on a staging read whose fill then came back empty")
 	}
 }
+
+// cyclesToBulk runs cycle on a fresh harness from mk until the flow re-enters
+// BULK and reports how many cycles that took.
+func cyclesToBulk(t *testing.T, mk func() *phaseHarness, cycle func(*phaseHarness, bool)) int {
+	t.Helper()
+	h := mk()
+	for n := 1; n <= 400; n++ {
+		cycle(h, true)
+		if h.current() == classifier.ClassBulk {
+			return n
+		}
+	}
+	t.Fatal("setup: the cycles never re-entered BULK")
+	return 0
+}
+
+// endsShort runs n-1 ordinary cycles and a last one whose read comes back
+// short, on a fresh harness, and reports whether the flow is BULK after it.
+func endsShort(mk func() *phaseHarness, cycle func(*phaseHarness, bool), n int) bool {
+	h := mk()
+	for i := 0; i < n-1; i++ {
+		cycle(h, true)
+	}
+	cycle(h, false)
+	return h.current() == classifier.ClassBulk
+}
+
+// In refill mode with no drain pending, a read in progress is judged by the
+// read itself, not by the one before it: a short read landing as the backlog
+// hold elapses does not re-enter BULK on the previous read's fullness.
+func TestAReadInProgressIsNotJudgedByThePreviousRead(t *testing.T) {
+	mk := func() *phaseHarness {
+		h, _, _ := stagedHarnessSlots(t, 32<<10, 1<<20, 2)
+		if !h.f.refillMode {
+			t.Fatal("setup: not in refill mode")
+		}
+		return h
+	}
+	cycle := func(h *phaseHarness, full bool) {
+		f := h.f
+		if full {
+			f.observeCarriedRead(32<<10, true, -1)
+		} else {
+			f.observeCarriedRead(512, true, -1)
+		}
+		f.noteLogicalRead(full)
+		// The oldest of the two chunks is acknowledged; one stays
+		// outstanding, so no drain is pending.
+		if sent := f.bytesUp.Load(); sent > 32<<10 {
+			h.ackTo(sent - 32<<10)
+		}
+		h.advance(10 * time.Millisecond)
+	}
+	n := cyclesToBulk(t, mk, cycle)
+	if endsShort(mk, cycle, n) {
+		t.Fatal("BULK was re-entered on a short read, on the strength of the read before it")
+	}
+}
+
+// Above the refill floor, a drain pending when a source read pushes the
+// backlog back over the threshold is still being decided: the stretch does
+// not complete on that read, and the short read that then ends it is a
+// drain.
+func TestAPendingDrainHoldsAboveTheFloor(t *testing.T) {
+	mk := func() *phaseHarness {
+		h := newPhaseHarness(t, ClassifierPhased)
+		h.f.chunkSize = 32 << 10
+		h.f.memoryLimits.maxSendBytes = 128 << 10
+		h.f.fitBacklogThreshold()
+		if h.f.refillMode || h.f.classifier.BacklogBytes() != 16<<10 {
+			t.Fatalf("setup: threshold %d refill %v, want 16 KiB above the floor", h.f.classifier.BacklogBytes(), h.f.refillMode)
+		}
+		h.leaveBulk()
+		// 64 KiB outstanding: a backlog by bytes.
+		h.f.observeCarriedRead(64<<10, true, -1)
+		h.f.noteLogicalRead(false)
+		return h
+	}
+	cycle := func(h *phaseHarness, keep bool) {
+		f := h.f
+		if keep {
+			// Short reads, but the bytes outstanding stay over the
+			// threshold: the stretch goes on by bytes.
+			f.observeCarriedRead(8<<10, true, -1)
+			f.noteLogicalRead(false)
+			h.ackTo(f.bytesUp.Load() - 64<<10)
+		} else {
+			// The peer catches up to the threshold, opening a pending
+			// drain; a source read takes the backlog back over it; the
+			// read then completes short.
+			h.ackTo(f.bytesUp.Load() - 8<<10)
+			f.observeCarriedRead(16<<10, true, -1)
+			f.noteLogicalRead(false)
+		}
+		h.advance(10 * time.Millisecond)
+	}
+	n := cyclesToBulk(t, mk, cycle)
+	if endsShort(mk, cycle, n) {
+		t.Fatal("a stretch completed on a source read while the drain it followed was still pending")
+	}
+}

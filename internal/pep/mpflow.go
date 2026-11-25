@@ -478,6 +478,9 @@ type multipathFlow struct {
 	drainPendingAt  time.Time
 	lastReadFull    bool
 	continuing      bool
+	// readInProgress says source bytes were counted for a logical read the
+	// scheduler has not yet reported complete.
+	readInProgress bool
 	// ackSampleHook and afterAckSampleHook, when set by a test, run just
 	// before and just after an observation samples the acknowledgement state.
 	ackSampleHook, afterAckSampleHook func()
