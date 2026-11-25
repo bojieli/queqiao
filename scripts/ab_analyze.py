@@ -974,6 +974,12 @@ def build_identity(e: dict) -> Tuple[str, object]:
     return "binaries", digests
 
 
+def arm_config(e: dict) -> Tuple[Tuple[str, ...], ...]:
+    """The arm's configured flags: the same build with another flag bundle is
+    another configuration, not the same candidate."""
+    return tuple(tuple(e.get(k) or ()) for k in ("flags", "gateway_flags", "client_flags"))
+
+
 def same_build(a: Tuple[str, object], b: Tuple[str, object]) -> bool:
     if a[0] != b[0]:
         return False
@@ -985,6 +991,14 @@ def same_build(a: Tuple[str, object], b: Tuple[str, object]) -> bool:
     return bool(common) and all(a[1][k] == b[1][k] for k in common)
 
 
+def merge_build(a: Tuple[str, object], b: Tuple[str, object]) -> Tuple[str, object]:
+    """After a successful comparison, remember every role and platform seen,
+    so a later campaign is checked against all of them, whatever the order."""
+    if a[0] == "binaries":
+        return a[0], {**a[1], **b[1]}
+    return a
+
+
 def flip_report(campaigns: Sequence[str], gates: dict) -> Tuple[str, bool]:
     """The stage-10 default flip over a set of campaigns. One release: each
     arm the same build, in the same role, everywhere. Full coverage: every
@@ -994,6 +1008,7 @@ def flip_report(campaigns: Sequence[str], gates: dict) -> Tuple[str, bool]:
     seen = set()
     mismatch: List[str] = []
     builds: Dict[str, Tuple[str, object]] = {}
+    configs: Dict[str, Tuple[Tuple[str, ...], ...]] = {}
     roles: Dict[str, str] = {}
     paths_all: set = set()
     candidates: set = set()
@@ -1008,9 +1023,16 @@ def flip_report(campaigns: Sequence[str], gates: dict) -> Tuple[str, bool]:
             if roles.setdefault(arm, role) != role:
                 mismatch.append(f"arm `{arm}` is {role} in {base} but {roles[arm]} elsewhere")
             b = build_identity(e)
-            if arm in builds and not same_build(builds[arm], b):
-                mismatch.append(f"arm `{arm}` is a different build in {base}")
-            builds.setdefault(arm, b)
+            if arm in builds:
+                if not same_build(builds[arm], b):
+                    mismatch.append(f"arm `{arm}` is a different build in {base}")
+                else:
+                    builds[arm] = merge_build(builds[arm], b)
+            else:
+                builds[arm] = b
+            cfg_ = arm_config(e)
+            if configs.setdefault(arm, cfg_) != cfg_:
+                mismatch.append(f"arm `{arm}` has different flags in {base}")
             if role == "candidate":
                 candidates.add(arm)
         if name == "dc":
@@ -1030,13 +1052,19 @@ def flip_report(campaigns: Sequence[str], gates: dict) -> Tuple[str, bool]:
                         + ", ".join(sorted(a for a, r in roles.items() if r == "main")))
     # Coverage before verdicts: a combination with no row is missing, not
     # passed by the rows that happen to exist.
-    have = {(w_, p_, c_) for w_, p_, c_, _, _ in rows}
-    missing: List[str] = []
-    for w_ in sorted(set(FLIP_WORKLOADS) | (seen - {"dc"})):
+    # Per cell: a workload's required cells are every cell any campaign ran
+    # for it, and each must be there on every path for every candidate.
+    have = {(w_, p_, c_, cell) for w_, p_, c_, cell, _ in rows}
+    cells_of: Dict[str, set] = collections.defaultdict(set)
+    for w_, _, _, cell, _ in rows:
+        cells_of[w_].add(cell)
+    missing: List[str] = [f"{w_} (no campaign)" for w_ in FLIP_WORKLOADS if w_ not in seen]
+    for w_ in sorted((set(FLIP_WORKLOADS) | seen) - {"dc"}):
         for p_ in sorted(paths_all):
             for c_ in sorted(candidates):
-                if (w_, p_, c_) not in have:
-                    missing.append(f"{w_} on {p_} for {c_}")
+                for cell in sorted(cells_of.get(w_) or {"(any)"}):
+                    if (w_, p_, c_, cell) not in have:
+                        missing.append(f"{w_} {cell} on {p_} for {c_}")
     ok = bool(rows) and not missing and not mismatch and all(r[4] == "PASS" for r in rows)
     out = ["## Stage-10 default flip", "",
            "Every path x workload x cell of every candidate must PASS (DESIGN-PATH-AUTHORITY.md section 14, stage 10; "

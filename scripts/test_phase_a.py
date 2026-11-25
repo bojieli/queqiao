@@ -489,6 +489,65 @@ class Flip(unittest.TestCase):
                 self.assertEqual(an.main([late, "--flip"]), 1)
                 self.assertEqual(an.main([good, "--flip"]), 0)
 
+    def test_a_dc_campaign_alone_is_not_a_flip(self):
+        dc = importlib.import_module("dc_gate")
+        root = os.path.join(self.tmp.name, "dconly")
+        os.makedirs(root)
+        pathlib.Path(root, "plan.json").write_text(json.dumps(
+            {"workload": "dc", "main": "legacy", "paths": ["dc"],
+             "arms": {"legacy": {"commit": "a" * 40}, "cand": {"commit": "b" * 40}}}))
+        with mock.patch.object(dc, "evaluate", return_value=("", {"cand": "PASS"})):
+            text, ok = an.flip_report([root], self.gates)
+        self.assertFalse(ok)
+        self.assertIn("llm (no campaign)", text)
+
+    def test_every_cell_must_be_covered_on_every_path(self):
+        # Path a ran both cells; path b ran only one of them.
+        a_ = os.path.join(self.tmp.name, "cells-a")
+        write_llm_campaign(a_)
+        b_ = os.path.join(self.tmp.name, "cells-b")
+        write_llm_campaign(b_)
+        plan = json.loads(pathlib.Path(b_, "plan.json").read_text())
+        plan["paths"] = ["b"]
+        for sl in plan["schedule"]:
+            sl["path"] = "b"
+        pathlib.Path(b_, "plan.json").write_text(json.dumps(plan))
+        tsv = pathlib.Path(b_, "trials.tsv").read_text().splitlines()
+        keep = [tsv[0]] + ["\t".join(f[:1] + ["b"] + f[2:]) for f in (l.split("\t") for l in tsv[1:])
+                            if f[7] != "single-100k-down4"]
+        pathlib.Path(b_, "trials.tsv").write_text("\n".join(keep) + "\n")
+        recs = [json.loads(l) for l in pathlib.Path(b_, "measures.jsonl").read_text().splitlines()]
+        pathlib.Path(b_, "measures.jsonl").write_text("".join(json.dumps(dict(r, _path="b")) + "\n" for r in recs
+                                                              if r["_phase"] != "single-100k-down4"))
+        with mock.patch.object(an, "FLIP_WORKLOADS", ("llm",)):
+            text, ok = an.flip_report([a_, b_], self.gates)
+        self.assertFalse(ok)
+        self.assertIn("llm single-100k-down4 on b for cand", text)
+
+    def test_the_same_arm_with_other_flags_is_not_one_release(self):
+        a_ = os.path.join(self.tmp.name, "flags-a")
+        write_llm_campaign(a_)
+        b_ = os.path.join(self.tmp.name, "flags-b")
+        write_llm_campaign(b_)
+        plan = json.loads(pathlib.Path(b_, "plan.json").read_text())
+        plan["arms"]["cand"]["flags"] = ["--sched=class"]
+        pathlib.Path(b_, "plan.json").write_text(json.dumps(plan))
+        with mock.patch.object(an, "FLIP_WORKLOADS", ("llm",)):
+            text, ok = an.flip_report([a_, b_], self.gates)
+        self.assertFalse(ok)
+        self.assertIn("arm `cand` has different flags", text)
+
+    def test_binary_digests_accumulate_across_campaigns(self):
+        gw = {"gateway": {"platform": "linux/amd64", "sha256": "1" * 64}}
+        first = {"binaries": dict(gw, **{"client:p": {"platform": "linux/amd64", "sha256": "2" * 64}})}
+        second = {"binaries": dict(gw, **{"client:q": {"platform": "linux/arm64", "sha256": "3" * 64}})}
+        third = {"binaries": dict(gw, **{"client:r": {"platform": "linux/arm64", "sha256": "4" * 64}})}
+        acc = an.build_identity(first)
+        self.assertTrue(an.same_build(acc, an.build_identity(second)))
+        acc = an.merge_build(acc, an.build_identity(second))
+        # The third campaign's arm64 client differs from the second's.
+        self.assertFalse(an.same_build(acc, an.build_identity(third)))
+
     def test_prebuilt_binaries_are_compared_by_digest(self):
         a = {"binaries": {"gateway": {"platform": "linux/amd64", "sha256": "1" * 64},
                           "client:p": {"platform": "linux/amd64", "sha256": "2" * 64}}}

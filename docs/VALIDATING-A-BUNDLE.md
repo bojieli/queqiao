@@ -470,11 +470,12 @@ one release. Its gate is Gate 1 run on the release candidate:
 The flip passes only if every path × workload × cell of every candidate is
 PASS. INCOMPLETE is not PASS. `ab_analyze.py --flip` judges a set of
 campaign directories, prints that matrix, and exits non-zero unless it
-passes. Coverage is checked before any verdict: every candidate must have
-a campaign on every path in every required workload. A candidate tested in
+passes. Coverage is checked before any verdict, cell by cell: every
+candidate must have every cell any campaign ran for a workload, on every
+path, in every required workload. A DC campaign alone covers nothing else. A candidate tested in
 only some campaigns fails the flip rather than passing on the rows that
 exist. The campaigns must also be one release: each arm must be the same
-build, in the same role, everywhere. For arms built from refs that means
+build, with the same flags, in the same role, everywhere. For arms built from refs that means
 the same commits; for prebuilt binaries, the same SHA-256 for each role and
 platform.
 
