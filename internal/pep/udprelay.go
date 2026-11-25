@@ -386,6 +386,15 @@ func (s *udpRelayStore) endLive(token [session.UDPResumeTokenSize]byte, entry *l
 	if !entry.confirmed && entry.hasAlias {
 		also = &entry.alias
 	}
+	if entry.claimed && !entry.abandoned && !retain {
+		// The association ended for good -- its relay failed, or it was
+		// closed -- while a replacement was waiting. Wake it with nothing,
+		// so it opens a fresh relay instead of resuming a broken one.
+		entry.abandoned = true
+		close(entry.handed)
+		s.mu.Unlock()
+		return liveClosed
+	}
 	if entry.claimed && !entry.abandoned {
 		entry.conn = conn
 		entry.lease = lease.detach()
@@ -466,6 +475,9 @@ func (s *udpRelayStore) transfer(ctx context.Context, token []byte, principal id
 	defer timer.Stop()
 	select {
 	case <-entry.handed:
+		if entry.conn == nil {
+			return nil, nil
+		}
 		return entry.conn, entry.lease
 	case <-timer.C:
 	case <-ctx.Done():
@@ -474,6 +486,9 @@ func (s *udpRelayStore) transfer(ctx context.Context, token []byte, principal id
 	defer s.mu.Unlock()
 	select {
 	case <-entry.handed:
+		if entry.conn == nil {
+			return nil, nil
+		}
 		return entry.conn, entry.lease
 	default:
 	}

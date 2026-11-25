@@ -899,9 +899,13 @@ func (p pipeQUICStream) CancelRead(quic.StreamErrorCode) {}
 // displace a lane -- and prefers the control holder -- to make room.
 func TestAControlTransferIsCommittedOnlyAfterItsOpenOK(t *testing.T) {
 	owner := identity.Principal{ProviderID: "provider", AccountID: "account", DeviceID: "owner"}
-	for _, tc := range []struct{ delivered, full bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+	for _, tc := range []struct{ delivered, full, named bool }{
+		{false, false, false}, {true, false, false}, {false, true, false}, {true, true, false},
+		// A wire-2 rescue can also name the holder with REPLACE_LANE.
+		{false, false, true}, {true, false, true},
+	} {
 		delivered := tc.delivered
-		t.Run(fmt.Sprintf("open-ok-delivered=%v/full-table=%v", delivered, tc.full), func(t *testing.T) {
+		t.Run(fmt.Sprintf("open-ok-delivered=%v/full-table=%v/replace-lane=%v", delivered, tc.full, tc.named), func(t *testing.T) {
 			server, _ := pendingTestServer()
 			flow := newIsolationTestFlow(t, true)
 			serverSession := newServerFlow(flow, owner, TransportQUIC, 8)
@@ -948,6 +952,11 @@ func TestAControlTransferIsCommittedOnlyAfterItsOpenOK(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
+				if tc.named {
+					request.Header.Flags |= protocol.FlagReplaceLane
+					server.handleLaneJoinOpenWithReplacement(context.Background(), lane, newFrameConn(lane), owner, flow.sessionID, 1, old.id, true, request)
+					return
+				}
 				server.handleLaneJoinOpen(context.Background(), lane, newFrameConn(lane), owner, flow.sessionID, 1, request)
 			}()
 			if !delivered {
@@ -1295,14 +1304,53 @@ func TestCompletedSessionsDoNotBlockOwnedAdmission(t *testing.T) {
 			if server.lookupSession(firstID) == nil {
 				t.Fatal("the tombstone within its bound was not kept")
 			}
-			// Past the tombstone bound a completed session is not kept.
+			// Past the tombstone bound a completed session is not kept, and
+			// is gone before its flow's slot can be reused.
 			server.retainCompletedSession(secondID, second)
-			for deadline := time.Now().Add(2 * time.Second); server.lookupSession(secondID) != nil; {
-				if time.Now().After(deadline) {
-					t.Fatal("a tombstone past its bound was kept")
-				}
-				time.Sleep(time.Millisecond)
+			if server.lookupSession(secondID) != nil {
+				t.Fatal("a tombstone past its bound was kept")
+			}
+			third, thirdID := session(3)
+			if !server.registerSession(thirdID, third) {
+				t.Fatal("the next flow was refused by a record past the bound")
 			}
 		})
+	}
+}
+
+// An association that ends for good -- its relay failed, or it was closed --
+// while a replacement waits to take it over does not hand the replacement a
+// broken relay: the replacement is woken with nothing and opens a fresh one.
+func TestAFailedRelayIsNotHandedToAWaitingReplacement(t *testing.T) {
+	store := newUDPRelayStore()
+	token, err := newUDPResumeToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	stopped := make(chan struct{})
+	var stopOnce sync.Once
+	entry := store.publishLive(token, udpTestPrincipal, func() { stopOnce.Do(func() { close(stopped) }) })
+	store.confirmLive(entry)
+	ended := make(chan liveEnd, 1)
+	go func() {
+		<-stopped
+		// The relay failed while the replacement waited: no retention.
+		ended <- store.endLive(token, entry, relay, &flowLease{}, false)
+	}()
+	started := time.Now()
+	got, moved := store.transfer(context.Background(), token[:], udpTestPrincipal, 5*time.Second)
+	if got != nil || moved != nil {
+		t.Fatal("a failed relay was handed to the replacement")
+	}
+	if waited := time.Since(started); waited > 2*time.Second {
+		t.Fatalf("the replacement waited %v instead of being woken", waited)
+	}
+	if end := <-ended; end != liveClosed {
+		t.Fatalf("owner end = %v, want closed", end)
 	}
 }

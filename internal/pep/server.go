@@ -278,14 +278,17 @@ func (s *serverFlow) addLaneReplacing(lane *mpLane, replacedLaneID uint64, repla
 			clear(retired)
 			return errLaneLimitReached
 		}
-		if s.retireControlOnJoin && lane.control && lane.staged {
-			// A control transfer displaces its victim only on commit, so an
-			// OPEN_OK that cannot be delivered leaves the table as it was.
-			// The staged lane is one over the ceiling until then.
-			lane.evictOnCommit = victim
-		} else {
-			retired[victim.id] = victim
+		retired[victim.id] = victim
+	}
+	if s.retireControlOnJoin && lane.control && lane.staged {
+		// A control transfer displaces lanes only on commit -- the victim at
+		// the ceiling and any lane REPLACE_LANE names -- so an OPEN_OK that
+		// cannot be delivered leaves the table as it was. The staged lane
+		// may be over the ceiling until then.
+		for _, old := range retired {
+			lane.evictOnCommit = append(lane.evictOnCommit, old)
 		}
+		clear(retired)
 	}
 	for id, old := range retired {
 		delete(f.lanes, id)
@@ -320,10 +323,12 @@ func (s *serverFlow) commitControlTransfer(replacement *mpLane) {
 	f.lanesMu.Lock()
 	var retired []*mpLane
 	if f.lanes[replacement.id] == replacement && !replacement.closed.Load() {
-		if victim := replacement.evictOnCommit; victim != nil && f.lanes[victim.id] == victim && !victim.closed.Load() {
-			delete(f.lanes, victim.id)
-			victim.closed.Store(true)
-			retired = append(retired, victim)
+		for _, victim := range replacement.evictOnCommit {
+			if f.lanes[victim.id] == victim && !victim.closed.Load() {
+				delete(f.lanes, victim.id)
+				victim.closed.Store(true)
+				retired = append(retired, victim)
+			}
 		}
 		replacement.evictOnCommit = nil
 		for id, old := range f.lanes {
@@ -1325,7 +1330,6 @@ func (s *Server) watchFlowCompletion(ctx context.Context, sessionID [16]byte, se
 func (s *Server) retainCompletedSession(sessionID [16]byte, serverSession *serverFlow) {
 	serverSession.tombstone.Do(func() {
 		serverSession.completed.Store(true)
-		linger := completedSessionLinger
 		counted := false
 		if s.admissionOwned() {
 			// A completed flow gives its slot back at once; its replay
@@ -1334,12 +1338,17 @@ func (s *Server) retainCompletedSession(sessionID [16]byte, serverSession *serve
 			if s.tombstones < s.cfg.MaxSessions {
 				s.tombstones++
 				counted = true
-			} else {
-				linger = 0
 			}
 			s.sessionsMu.Unlock()
+			if !counted {
+				// Over the record bound: not kept at all, and removed now,
+				// before this flow's slot is released, so the next OPEN is
+				// not refused by a record counted as live.
+				s.unregisterSession(sessionID, serverSession)
+				return
+			}
 		}
-		time.AfterFunc(linger, func() {
+		time.AfterFunc(completedSessionLinger, func() {
 			s.cfg.Logger.Debug("session tombstone expired")
 			s.unregisterSession(sessionID, serverSession)
 			if counted {
@@ -1534,6 +1543,10 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 	}
 	if err := serverSession.addLaneReplacing(replacement, replacedLaneID, replaceLane); err != nil {
 		s.cfg.Logger.Debug("lane join admission refused", "lane", laneID, "error", err)
+		// The handshake deadline was cleared above; the refusal is bounded
+		// like the acknowledgement would have been, so a stalled RESET
+		// cannot hold the admission bound this JOIN is under.
+		_ = conn.SetDeadline(time.Now().Add(laneJoinAdmissionTimeout))
 		switch {
 		case errors.Is(err, errLaneFlowTCPMode):
 			// The flow committed to TCP fallback for the rest of its life, so
