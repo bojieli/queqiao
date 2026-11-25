@@ -1546,10 +1546,10 @@ func TestAMoveTakesNoRTTSampleFromTheOldUplink(t *testing.T) {
 		t.Fatal("the attachment did not move")
 	}
 	next.mu.Lock()
-	min := next.rtt.min
+	min, smoothed := next.rtt.MinRTT(), next.rtt.SmoothedRTT()
 	next.mu.Unlock()
-	if min != 0 {
-		t.Fatalf("the new path's RTT took %v from a packet sent on the old uplink", min)
+	if min != 0 || smoothed != 0 {
+		t.Fatalf("the new path's RTT reads min %v, smoothed %v from the old uplink's connection", min, smoothed)
 	}
 	// Its own packets on the new path are sampled as usual.
 	p.send(now, 1200)
@@ -1666,5 +1666,53 @@ func TestAPathControllerKeepsNoShareHistory(t *testing.T) {
 	}
 	if model.Current().ObservedSamples == 0 {
 		t.Fatal("the path controller reported no measurement at all")
+	}
+}
+
+// A spurious-loss correction of a new-path packet times nothing: it does
+// not end the guard, and a later ACK timing a packet from the old uplink
+// still takes no sample.
+func TestASpuriousCorrectionDoesNotEndTheMoveRTTGuard(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	p, gen := movingPC(t, old, next, now, 5*time.Millisecond)
+	oldPacket := p.send(now, 1200)
+	*gen = 1
+	now = now.Add(time.Millisecond)
+	fresh := p.send(now, 1200) // moves, and is the attachment's own packet on next
+	if p.a.Controller() != next {
+		t.Fatal("setup: no move")
+	}
+	p.event(now, nil, []quiccongestion.PacketNumber{fresh})
+	p.a.OnAckEvent(quiccongestion.AckEvent{Time: now, InFlight: p.inFlight, Spurious: p.refs([]quiccongestion.PacketNumber{fresh})})
+	p.event(now.Add(5*time.Millisecond), []quiccongestion.PacketNumber{oldPacket}, nil)
+	next.mu.Lock()
+	min := next.rtt.MinRTT()
+	next.mu.Unlock()
+	if min != 0 {
+		t.Fatalf("after a correction the new path took %v from a packet sent on the old uplink", min)
+	}
+}
+
+// Publishing fates released by a discard settles the balance at the old
+// rate first, as an ACK event does.
+func TestPublishingOutsideAnAckSettlesTheBalance(t *testing.T) {
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	c.clock = func() monotime.Time { return c.now }
+	now := base()
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	head := a.send(now, 1200)
+	for range 10 {
+		b.send(now, 1200)
+	}
+	b.event(now.Add(50*time.Millisecond), numbers(0, 10), nil)
+	later := now.Add(80 * time.Millisecond)
+	a.inFlight -= 1200
+	a.a.OnDiscarded(later, a.inFlight, a.refs([]quiccongestion.PacketNumber{head}), false, quiccongestion.DiscardPTOProbe)
+	c.mu.Lock()
+	settled := c.law.pacer.lastSentTime
+	c.mu.Unlock()
+	if settled != later {
+		t.Fatalf("the balance was last settled at %v, not at the discard that published (%v)", settled, later)
 	}
 }

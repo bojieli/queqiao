@@ -465,11 +465,33 @@ func (c *PathController) correct(r *fateRecord) {
 // outside an acknowledgement event -- a discard or a detach that unblocked
 // the send order -- so the erasure the coded readers size from is current
 // without waiting for the next ACK.
-func (c *PathController) publishObserved() {
-	if c.unpublished {
-		c.law.publishMeasurement()
-		c.unpublished = false
+//
+// The balance is settled at the old rate first, as an ACK event does, and
+// siblings refused for the balance are woken if the rate rose.
+func (c *PathController) publishObserved(a *PathAttachment, now monotime.Time, wakes []func()) []func() {
+	if !c.unpublished {
+		return wakes
 	}
+	c.unpublished = false
+	c.law.pacer.settle(now)
+	rateBefore := c.law.bandwidth()
+	c.law.publishMeasurement()
+	if c.law.bandwidth() > rateBefore {
+		wakes = c.collectPacing(a, wakes)
+	}
+	return wakes
+}
+
+// collectPacing returns the wakers of attachments refused for the balance,
+// except a, and clears their flag: the rate rose, so their retry is late.
+func (c *PathController) collectPacing(a *PathAttachment, wakes []func()) []func() {
+	for o := range c.pacingWaiters {
+		if o != a && o.wake != nil {
+			c.markPacing(o, false)
+			wakes = append(wakes, o.wake)
+		}
+	}
+	return wakes
 }
 
 // advance expires what has waited past the horizon and lets the estimator
@@ -725,8 +747,8 @@ func (c *PathController) detach(a *PathAttachment, now monotime.Time) []func() {
 	c.noteDemand(union, now)
 	c.arb.OnDemand(union)
 	c.advance(now)
-	c.publishObserved()
-	wakes := c.collectBlocked(a, nil)
+	wakes := c.publishObserved(a, now, nil)
+	wakes = c.collectBlocked(a, wakes)
 	return c.collectWaiting(a, wakes)
 }
 
@@ -1195,6 +1217,17 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 	a.stuckUntil = [quiccongestion.NumSendClasses]monotime.Time{}
 	c.acked, c.lost = c.acked[:0], c.lost[:0]
 	var resolved quiccongestion.ByteCount
+	// largestOwn says the largest application packet this event newly
+	// acknowledges -- the one its RTT sample times -- was registered on
+	// this controller by this attachment.
+	largestOwn := false
+	largestPN := quiccongestion.PacketNumber(-1)
+	for _, r := range ev.Acked {
+		if r.Space == quiccongestion.SpaceApplication && r.Number > largestPN {
+			largestPN = r.Number
+			_, largestOwn = a.pkts[packetKey{space: r.Space, number: r.Number}]
+		}
+	}
 	progress := false
 	for _, r := range ev.Acked {
 		if r.Space == quiccongestion.SpaceApplication {
@@ -1260,9 +1293,10 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		resolved += ref.bytes
 	}
 	// After a move to another controller, an RTT sample may time a packet
-	// sent on the old uplink; the path's delay model takes none until this
-	// attachment's own packets on this controller are acknowledged.
-	if len(c.acked) > 0 {
+	// sent on the old uplink; the path's delay model takes none until an
+	// event's sample times one of this attachment's own packets on this
+	// controller: the sample is the largest newly acknowledged packet's.
+	if a.staleRTT && ev.RTTSample > 0 && largestOwn {
 		a.staleRTT = false
 	}
 	if ev.RTTSample > 0 && !a.staleRTT {
@@ -1321,12 +1355,12 @@ func (c *PathController) discarded(a *PathAttachment, now monotime.Time, inFligh
 		c.discard(a, packetKey{space: r.Space, number: r.Number})
 	}
 	c.advance(now)
-	c.publishObserved()
+	wakes := c.publishObserved(a, now, nil)
 	c.law.recordInFlight(c.flight)
 	if c.flight < before {
-		return c.collectBlocked(a, nil)
+		wakes = c.collectBlocked(a, wakes)
 	}
-	return nil
+	return wakes
 }
 
 func (c *PathController) setDemand(a *PathAttachment, d quiccongestion.Demand) []func() {
@@ -1495,7 +1529,9 @@ func (a *PathAttachment) attachTo(c *PathController, now monotime.Time, inFlight
 	a.ctl.Store(c)
 	c.mu.Lock()
 	a.epoch = attachmentEpochs.Add(1)
-	if a.connRTT != nil && c.rtt.fallback == nil {
+	if a.connRTT != nil && c.rtt.fallback == nil && !a.staleRTT {
+		// A connection that moved here from another path does not seed
+		// this one's round trip: its statistics are the old path's.
 		c.rtt.fallback = a.connRTT
 	}
 	c.attach(a, now, inFlight, a.maxPacket)
