@@ -82,18 +82,16 @@ func (r *pathAuthorityRegistry) controller(principal, key string, initialPacketS
 		}
 	}
 	if c, ok := r.controllers[name]; ok {
-		// Handed out for an installation that attaches on the
-		// connection's run loop: a sweep in that gap must not evict it.
-		c.Touch()
-		return c
+		if idle, ok := c.IdleSince(); !ok || now.Sub(idle) <= pathKnowledgeLifetime {
+			// Handed out for an installation that attaches on the
+			// connection's run loop: a sweep in that gap must not evict it.
+			c.Touch()
+			return c
+		}
+		// Expired, whenever the last sweep ran: the path starts cold.
+		delete(r.controllers, name)
+		pathmodel.Forget(name)
 	}
-	// The model is the principal's too: its pooled erasure sets the law's
-	// compensation, and one device's loss must not move another's rate.
-	//
-	// It is flat: the hierarchical model is dc-long-haul's, and that profile
-	// stays on the legacy bundle (validateBundle), so the connection's
-	// readers, pointed at pathmodel.Shared(name) by rekeyPathModel, read
-	// exactly the model the law reports to.
 	c := wancongestion.NewPathController(initialPacketSize, pathmodel.Shared(name), wancongestion.DefaultClassWeights)
 	r.controllers[name] = c
 	return c

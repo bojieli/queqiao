@@ -134,6 +134,7 @@ type mpLane struct {
 	// every chunk offered to every lane.
 	cwndMu        sync.Mutex
 	cwndBytes     int
+	authorityID   uint64
 	inFlightBytes int
 	cwndSampled   time.Time
 	// admitted is when this lane joined the flow. It bounds eviction at the
@@ -887,6 +888,10 @@ func (f *multipathFlow) observeTransport(lanes []*mpLane) {
 	// on one pooled connection, and a congestion window or pacing rate added
 	// once per lane describes a transport that does not exist.
 	var folded map[uint64]struct{}
+	// authorities names the path controllers whose window, pacing rate and
+	// bandwidth have been added: connections attached to one report the
+	// same ones (congestion=path).
+	var authorities map[uint64]struct{}
 	for _, lane := range lanes {
 		provider, ok := lane.fc.transport().(laneStatsProvider)
 		if !ok {
@@ -921,7 +926,19 @@ func (f *multipathFlow) observeTransport(lanes []*mpLane) {
 			if controller.Mode > observation.ControllerMode {
 				observation.ControllerMode = controller.Mode
 			}
-			observation.ControllerMaxBandwidth += controller.MaxBandwidth
+			shared := false
+			if controller.Authority != 0 {
+				_, shared = authorities[controller.Authority]
+				if authorities == nil {
+					authorities = make(map[uint64]struct{})
+				}
+				authorities[controller.Authority] = struct{}{}
+			}
+			if !shared {
+				observation.ControllerMaxBandwidth += controller.MaxBandwidth
+				observation.ControllerPacingRate += controller.PacingRate
+				observation.ControllerCongestionWindow += controller.CongestionWindow
+			}
 			if controller.LatestSample > observation.ControllerLatestSample {
 				observation.ControllerLatestSample = controller.LatestSample
 			}
@@ -934,8 +951,6 @@ func (f *multipathFlow) observeTransport(lanes []*mpLane) {
 			if controller.Round > observation.ControllerRound {
 				observation.ControllerRound = controller.Round
 			}
-			observation.ControllerPacingRate += controller.PacingRate
-			observation.ControllerCongestionWindow += controller.CongestionWindow
 			observation.ControllerBytesInFlight += controller.BytesInFlight
 			if controller.MinRTT > observation.ControllerMinRTT {
 				observation.ControllerMinRTT = controller.MinRTT

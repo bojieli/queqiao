@@ -135,8 +135,20 @@ func (l *mpLane) windowBytes() int {
 // four times more than a slow one will ever use.
 func (f *multipathFlow) retentionBytes() int {
 	total := 0
+	// Lanes on connections attached to one path controller share its
+	// window: it counts once.
+	var authorities map[uint64]struct{}
 	for _, lane := range f.healthyLanes() {
 		cwnd, _ := lane.congestionState()
+		if id := lane.authority(); id != 0 {
+			if _, seen := authorities[id]; seen {
+				continue
+			}
+			if authorities == nil {
+				authorities = make(map[uint64]struct{})
+			}
+			authorities[id] = struct{}{}
+		}
 		total += cwnd
 	}
 	if total <= 0 {
@@ -241,8 +253,20 @@ func (l *mpLane) congestionState() (cwnd, inFlight int) {
 	controller := provider.transportStats().controller
 	l.cwndBytes = int(controller.CongestionWindow)
 	l.inFlightBytes = int(controller.BytesInFlight)
+	l.authorityID = controller.Authority
 	l.cwndSampled = now
 	return l.cwndBytes, l.inFlightBytes
+}
+
+// authority is the path controller the lane's connection is attached to,
+// as of its last congestion sample; zero for a connection-owned controller.
+func (l *mpLane) authority() uint64 {
+	if l == nil {
+		return 0
+	}
+	l.cwndMu.Lock()
+	defer l.cwndMu.Unlock()
+	return l.authorityID
 }
 
 // flowSource adapts the application connection to the scheduler's reader,

@@ -55,6 +55,12 @@ type ControllerTelemetry struct {
 	// queue and a rate that simply measured less look identical otherwise, and
 	// the two call for opposite responses.
 	DelayBrake float64
+	// Authority identifies the path controller this telemetry describes
+	// (congestion=path), zero for a controller one connection owns. Every
+	// connection attached to one controller reports the same window, pacing
+	// rate and bandwidth: a reader summing those over connections counts
+	// each authority once.
+	Authority uint64
 	// NonElicitingBytes is the size of the packets sent that elicit no
 	// acknowledgement (QUIC ACK-only packets), and NonElicitingDebited how
 	// much of it was charged to the pacer. Only the erasure sender reports

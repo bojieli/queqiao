@@ -115,6 +115,8 @@ type PathController struct {
 	attached   atomic.Int64
 	lastDetach atomic.Int64 // UnixNano
 	created    time.Time
+	// id names the controller in telemetry (ControllerTelemetry.Authority).
+	id uint64
 }
 
 type fate uint8
@@ -206,6 +208,7 @@ func NewPathController(initialPacketSize quiccongestion.ByteCount, path pathmode
 		ringBase:  1,
 		maxPacket: law.inner.maxDatagramSize,
 		created:   time.Now(),
+		id:        pathControllerIDs.Add(1),
 		clock:     monotime.Now,
 		datagrams: lossmodel.New(lossmodel.Config{}),
 	}
@@ -261,6 +264,8 @@ func (c *PathController) appLimited() bool {
 	c.opportunity = false
 	return o
 }
+
+var pathControllerIDs atomic.Uint64
 
 // pathDatagramEvidence is how many transitions between adjacent
 // datagram-bearing samples must have been observed before their own burst
@@ -322,6 +327,7 @@ func (c *PathController) IdleSince() (time.Time, bool) {
 func (c *PathController) Telemetry() ControllerTelemetry {
 	t := c.law.Telemetry()
 	t.Kind = "erasure-path"
+	t.Authority = c.id
 	// The counted flight, not the sampler's last view of it.
 	t.BytesInFlight = uint64(max(c.flightGauge.Load(), 0))
 	return t
@@ -544,6 +550,10 @@ func (c *PathController) noteDemand(union quiccongestion.Demand, now monotime.Ti
 	case any && !c.noDemandSince.IsZero():
 		if c.unused() {
 			c.opportunity = true
+			// Marked now, before the first packet of the resumed burst is
+			// registered: the sampler takes a packet's marker at send, and
+			// on a drained path no ACK may come between.
+			c.law.inner.estimator.markAppLimited()
 		}
 		c.noDemandSince, c.unusedTime = 0, 0
 	case !any && c.noDemandSince.IsZero():
@@ -696,8 +706,19 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	// passed over for it as if it had no demand in it, for a short hold or
 	// until something changes; once every class it has is passed over it is
 	// refused until the earliest hold ends.
+	if !hasDemand(a.demand) {
+		// No ordinary work: the connection asks from its send loop all the
+		// same. It takes no turn, defers to no one and registers no
+		// waiter or timer; whatever the demand query missed may go as
+		// CONTROL if the path has room for it now, and otherwise only
+		// exempt obligations are sent.
+		if !a.probing && c.flight+maxBytes <= c.law.GetCongestionWindow() && c.law.pacer.budget(now) >= maxBytes {
+			return quiccongestion.Permit{OK: true, Turn: quiccongestion.ClassControl, MaxBytes: maxBytes}, wakes
+		}
+		return quiccongestion.Permit{}, wakes
+	}
 	own := a.usable(now)
-	if hasDemand(a.demand) && !hasDemand(quiccongestion.Demand{Eligible: own}) {
+	if !hasDemand(quiccongestion.Demand{Eligible: own}) {
 		return quiccongestion.Permit{RetryAt: a.earliestUnstick(now)}, wakes
 	}
 	turn := c.arb.Select()
@@ -1207,17 +1228,12 @@ func (a *PathAttachment) Telemetry() ControllerTelemetry {
 	t.StateMisses, t.ZeroSamples = own.StateMisses, own.ZeroSamples
 	t.BytesLost, t.PacketsLost, t.PacketsLostObserved = own.BytesLost, own.PacketsLost, own.PacketsLostObserved
 	t.NonElicitingBytes, t.NonElicitingDebited = own.NonElicitingBytes, own.NonElicitingDebited
-	// The gauges a reader sums over a flow's lanes -- flight, window, pacing
-	// rate and bandwidth -- are this attachment's share, so a flow with two
-	// connections on one path counts the path's window, rate and flight
-	// once, not twice: flight is the connection's own, and the path's
-	// window, rate and bandwidth are split evenly between its attachments.
+	// Flight is the connection's own; the window, pacing rate and bandwidth
+	// are the path's, undivided -- they are what this connection's flow
+	// control may use, and the controller admits against them whatever the
+	// number of attachments. Readers that sum them over connections count
+	// each Authority once.
 	t.BytesInFlight = uint64(max(a.gaugeView.Load(), 0))
-	if n := uint64(max(a.ctl.Load().attached.Load(), 1)); n > 1 {
-		t.CongestionWindow /= n
-		t.PacingRate /= n
-		t.MaxBandwidth /= n
-	}
 	return t
 }
 

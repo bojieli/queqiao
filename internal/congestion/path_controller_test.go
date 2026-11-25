@@ -1115,3 +1115,68 @@ func TestTheEmptyBuildRetryIsAFutureHold(t *testing.T) {
 		t.Fatalf("with BULK held the permit is %+v; want a refusal until BULK's hold ends", p)
 	}
 }
+
+// Every attachment reports the path's undivided window and rate -- what its
+// connection's flow control may use -- with the controller's identity, so a
+// reader summing over connections counts the path once.
+func TestAttachmentsReportTheUndividedPathWithItsIdentity(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	ta, tb, path := a.a.Telemetry(), b.a.Telemetry(), c.Telemetry()
+	if ta.CongestionWindow != path.CongestionWindow || tb.PacingRate != path.PacingRate {
+		t.Fatalf("an attachment reports a divided window or rate: %d/%d against %d/%d", ta.CongestionWindow, tb.PacingRate, path.CongestionWindow, path.PacingRate)
+	}
+	if ta.Authority == 0 || ta.Authority != tb.Authority {
+		t.Fatalf("authority %d and %d", ta.Authority, tb.Authority)
+	}
+}
+
+// An attachment with no ordinary work asks from its send loop all the same;
+// beside a busy sibling it neither defers, nor wakes the sibling, nor
+// registers as a waiter.
+func TestAnIdleAttachmentDoesNotContend(t *testing.T) {
+	c := newPCController()
+	now := base()
+	idle, busy := attachPC(t, c, now), attachPC(t, c, now)
+	busy.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	window := c.law.GetCongestionWindow()
+	for busy.inFlight+1200 <= window {
+		busy.send(now, 1200)
+	}
+	wakes := busy.wakes
+	for range 10 {
+		if p := idle.a.Admit(now, 1200); p.OK || !p.RetryAt.IsZero() {
+			t.Fatalf("an idle attachment beside a full window got %+v", p)
+		}
+	}
+	busy.event(now.Add(100*time.Millisecond), numbers(0, 3), nil)
+	if busy.wakes != wakes || idle.wakes != 0 {
+		t.Fatalf("idle asking woke the sibling (%d) or registered itself as a waiter (%d)", busy.wakes-wakes, idle.wakes)
+	}
+	if s := c.Stats(); s.RefusedTurn != 0 {
+		t.Fatalf("the idle attachment deferred %d times", s.RefusedTurn)
+	}
+}
+
+// After an unused opportunity the marker is applied before the first packet
+// of the resumed burst is registered: on a drained path no ACK comes between
+// the idle interval and that packet.
+func TestTheFirstPacketAfterAnUnusedOpportunityIsApplicationLimited(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.a.OnDemand(quiccongestion.Demand{})
+	now = now.Add(200 * time.Millisecond)
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	a.send(now, 1200)
+	c.mu.Lock()
+	state, ok := c.law.inner.estimator.packetStates[1]
+	c.mu.Unlock()
+	if !ok || !state.appLimited {
+		t.Fatalf("the first packet after an unused opportunity was registered as a path measurement (state %v)", ok)
+	}
+}
