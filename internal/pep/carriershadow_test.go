@@ -519,7 +519,7 @@ func BenchmarkCarrierShadowSample(b *testing.B) {
 		b.Fatal(err)
 	}
 	observer := newCarrierShadow(cfg, carrierShadowClient, nil, metrics.New())
-	carrier := observer.track(&quicStreamConn{conn: conn})
+	carrier := observer.track(&quicStreamConn{conn: conn}, carrierProgress{})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -684,5 +684,35 @@ func TestCarrierShadowOutageRecordDoesNotExtendTheGrace(t *testing.T) {
 	record := waitForRecord(t, &logs, "carrier shadow outage", 2*time.Second, func(map[string]any) bool { return true })
 	if ms, ok := record["deadline_unix_ms"].(float64); !ok || int64(ms) > started.Add(grace+50*time.Millisecond).UnixMilli() {
 		t.Fatalf("outage record = %v", record)
+	}
+}
+
+// Episodes that end between a carrier being watched and its first sample are
+// counted from the counters read at registration. An episode whose recovery
+// sample saw several packets acknowledged has only an upper bound on its
+// duration; one acknowledged packet makes it exact.
+func TestCarrierShadowSeedsCountersAndBoundsDurations(t *testing.T) {
+	m := newCarrierMachine(2, 4)
+	m.seed(carrierProgress{Epoch: 10, Episodes: 5})
+	var reach [metrics.CarrierShadowPTOBuckets]uint64
+	reach[0], reach[1] = 1, 1
+	start := time.Unix(1_000_000, 0)
+	events := m.observe(carrierSample{At: start, Progress: carrierProgress{Epoch: 12, LastProgress: start, Episodes: 6, EpisodesReaching: reach}}, nil)
+	if episodes := episodesOf(events); len(episodes) != 1 || episodes[0].PTOs != 2 || !episodes[0].BetweenSamples {
+		t.Fatalf("an episode before the first sample = %+v", episodes)
+	}
+	if m.reached[1] != 1 || m.recovered[1] != 1 {
+		t.Fatalf("reached %v recovered %v", m.reached, m.recovered)
+	}
+
+	for _, acked := range []uint64{1, 3} {
+		trace := newShadowTrace(t, 2, 4)
+		trace.step(true, 0)
+		trace.step(false, 2)
+		trace.epoch += acked - 1 // recoverAfter acknowledges one more
+		episodes := episodesOf(trace.recoverAfter(2))
+		if len(episodes) != 1 || episodes[0].DurationUpperBound != (acked > 1) {
+			t.Fatalf("%d acknowledged: episodes = %+v", acked, episodes)
+		}
 	}
 }

@@ -1,7 +1,7 @@
 github.com/andybalholm/brotli v1.2.7 h1:UgafRPGMam5ySHfRkhthMqOFA6IFoeF3D7mWIDLjG5A=
 github.com/andybalholm/brotli v1.2.7/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
-github.com/bojieli/quic-go v0.61.1-0.20261125120359-00841b01a593 h1:FG/gnOgwaWRQ+5P/k3FXuMnuMz03EV5XefF0COhMnsw=
-github.com/bojieli/quic-go v0.61.1-0.20261125120359-00841b01a593/go.mod h1:x7qxEvX6MCVtDuBKHj3E+88+BtrbEMuAL5qGUKItjW8=
+github.com/bojieli/quic-go v0.61.1-0.20261125122232-3f43d44c8175 h1:PzDwrmUzm5UG6WDEa3WcPYrGKV5fZkTl5Mfazh2XHrU=
+github.com/bojieli/quic-go v0.61.1-0.20261125122232-3f43d44c8175/go.mod h1:x7qxEvX6MCVtDuBKHj3E+88+BtrbEMuAL5qGUKItjW8=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

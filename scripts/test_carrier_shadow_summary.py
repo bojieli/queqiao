@@ -292,18 +292,50 @@ class CalibrationFollowUpTest(unittest.TestCase):
         self.assertEqual(outcomes["carrier stayed live: design would not rescue"], 1)
         self.assertEqual(outcomes["unresolved: no later evidence about the carrier"], 1)
 
-    def test_rescue_requests_are_counted_against_actual_dials(self):
+    def test_rescue_requests_are_counted_against_rescue_rounds(self):
         client = [
             stall(10.0, 7, 4, 1),
+            rec(10.0, "carrier shadow rescue started", endpoint="client", session_id=SESSION, flow_id=7, healthy_lanes=1),
             rec(10.5, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=7, lane_id=1, transport="quic"),
             rec(11.0, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=7, lane_id=2, transport="tcp"),
+            # The manager skips the next request (backoff); a much later
+            # ordinary JOIN is not that request's.
             stall(20.0, 7, 4, 1),
+            rec(500.0, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=7, lane_id=3, transport="quic"),
         ]
-        report = summarize(client, [rec(30.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
-        dials = report["stalls"]["client"]["rescue_dials"]
-        self.assertEqual(dials, {"stalls_followed_by_a_dial": 1, "stalls_without_a_dial": 1, "dials": 2})
+        gateway = [stall(12.0, 7, 9, 1, endpoint="gateway", legacy_remedy="demote"),
+                   rec(30.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)]
+        report = summarize(client, gateway)
+        requests = report["stalls"]["client"]["rescue_requests"]
+        self.assertEqual(requests, {"requests_followed_by_a_rescue_round": 1, "requests_without_a_rescue_round": 1,
+                                    "join_attempts_in_those_rounds": 2})
+        self.assertIsNone(report["stalls"]["gateway"]["rescue_requests"], "a gateway stall requests nothing")
         self.assertEqual(report["stalls"]["client"]["by_kind"][0]["legacy_remedy"], "demote_and_request_rescue")
 
+    def test_a_newer_zero_count_observation_closes_an_open_episode(self):
+        client = [stall(1.0, 5, 3, 7, pto_since_progress=1), stall(2.0, 5, 3, 8, pto_since_progress=0)]
+        report = summarize(client, [rec(9.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
+        self.assertEqual(report["calibration"]["client"]["open_episodes_censored"], 0)
+
+    def test_incident_boundaries(self):
+        gateway = [rec(100.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=1, grace=45_000_000_000)]
+        # An unrelated carrier's recovery does not split the incident on
+        # carrier 1, and an incident that began before the window keeps its
+        # start: skew 60 s.
+        client = [
+            stall(40.0, 1, 1, 5),
+            rec(70.0, "carrier shadow state", endpoint="client", carrier_id=2, to="active", transport_epoch=3, **{"from": "suspect"}),
+            stall(90.0, 1, 1, 5),
+        ]
+        self.assertAlmostEqual(summarize(client, gateway)["recovery_deadline"]["skew_s"]["max"], 60.0, places=3)
+        # The client's own outage ending (a replacement lane came) ends the
+        # incident even though the old carrier never recovered.
+        client = [
+            stall(40.0, 1, 1, 5),
+            rec(70.0, "carrier shadow outage ended", endpoint="client", session_id=SESSION, flow_id=1),
+            stall(90.0, 1, 2, 1),
+        ]
+        self.assertAlmostEqual(summarize(client, gateway)["recovery_deadline"]["skew_s"]["max"], 10.0, places=3)
 
 if __name__ == "__main__":
     unittest.main()

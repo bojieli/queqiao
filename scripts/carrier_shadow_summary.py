@@ -258,15 +258,14 @@ def open_episode_peak(records: list[dict[str, Any]]) -> int:
         if record.get("msg") == STATE and record.get("to") in ("active", "dead", "closed"):
             epoch, peak = None, 0
             continue
-        pto = record.get("pto_since_progress")
-        if not isinstance(pto, int) or isinstance(pto, bool) or pto < 1:
-            continue
         this = record.get("transport_epoch")
-        if this != epoch:
+        if isinstance(this, int) and this != epoch:
             # A newer epoch is progress: the previous episode ended, and
             # its own episode line (or summary) counted it.
             epoch, peak = this, 0
-        peak = max(peak, pto)
+        pto = record.get("pto_since_progress")
+        if isinstance(pto, int) and not isinstance(pto, bool) and pto >= 1:
+            peak = max(peak, pto)
     return peak
 
 
@@ -326,9 +325,10 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
         else:
             outcomes["unresolved: no later evidence about the carrier"] += 1
     lane_failures = Counter((r.get("carrier_state"), r.get("design_remedy")) for r in endpoint.of(LANE_FAILED))
-    # Today's watchdog only requests a rescue; the dials it led to are the
-    # join attempts the client made before the flow's next stall.
-    dials = rescue_dials(endpoint)
+    # Today's client watchdog only requests a rescue; whether the lane
+    # manager starts a rescue round, and what JOINs it attempts, is in the
+    # client's own records.
+    requests = rescue_requests(endpoint) if endpoint.name == "client" else None
     return {
         "stalls": sum(by_kind.values()),
         "by_kind": [
@@ -338,30 +338,45 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
         "outcomes": dict(outcomes),
         "design_detection_delay_s": quantiles(later_failure_delay),
         "lane_failures": [{"carrier_state": k[0], "design_remedy": k[1], "count": n} for k, n in lane_failures.items()],
-        "rescue_dials": dials,
+        "rescue_requests": requests,
     }
 
 
-def rescue_dials(endpoint: Endpoint) -> dict[str, Any]:
-    """Join attempts made after each stall, up to the flow's next stall."""
-    attempts: dict[tuple, list[float]] = defaultdict(list)
-    for record in endpoint.of(ATTEMPT):
-        attempts[flow_key(record)].append(record["_t"])
-    stalls: dict[tuple, list[float]] = defaultdict(list)
-    for record in endpoint.of(STALL):
-        stalls[flow_key(record)].append(record["_t"])
-    with_dial = without_dial = total = 0
-    for key, times in stalls.items():
-        times.sort()
-        for index, start in enumerate(times):
-            stop = times[index + 1] if index + 1 < len(times) else math.inf
-            n = sum(1 for t in attempts.get(key, []) if start <= t < stop)
-            total += n
-            if n:
-                with_dial += 1
+def rescue_requests(endpoint: Endpoint) -> dict[str, Any]:
+    """What each client stall's rescue request led to: whether a rescue
+    round started before the flow's next stall, and the JOIN attempts of
+    that round -- those logged from its start until the flow's next rescue
+    round or stall. An attempt may be served from the connection pool
+    rather than a new dial, so these are attempts, not dials."""
+    events: dict[tuple, list[tuple[float, str]]] = defaultdict(list)
+    for msg, kind in ((STALL, "stall"), (RESCUE, "rescue"), (ATTEMPT, "attempt")):
+        for record in endpoint.of(msg):
+            events[flow_key(record)].append((record["_t"], kind))
+    with_round = without_round = attempts = 0
+    for values in events.values():
+        # A rescue logged at the same instant as its stall follows it.
+        order = {"stall": 0, "rescue": 1, "attempt": 2}
+        values.sort(key=lambda e: (e[0], order[e[1]]))
+        index = 0
+        while index < len(values):
+            if values[index][1] != "stall":
+                index += 1
+                continue
+            following = index + 1
+            while following < len(values) and values[following][1] == "attempt":
+                following += 1
+            if following < len(values) and values[following][1] == "rescue":
+                with_round += 1
+                round_end = following + 1
+                while round_end < len(values) and values[round_end][1] == "attempt":
+                    attempts += 1
+                    round_end += 1
+                index = round_end
             else:
-                without_dial += 1
-    return {"stalls_followed_by_a_dial": with_dial, "stalls_without_a_dial": without_dial, "dials": total}
+                without_round += 1
+                index = following
+    return {"requests_followed_by_a_rescue_round": with_round, "requests_without_a_rescue_round": without_round,
+            "join_attempts_in_those_rounds": attempts}
 
 
 def failure_observations(endpoint: Endpoint) -> dict[tuple, list[tuple[float, str]]]:
@@ -382,27 +397,36 @@ def failure_records(endpoint: Endpoint) -> dict[tuple, list[tuple[float, str, di
     return out
 
 
-def incident_starts(endpoint: Endpoint, observations: list[tuple[float, str, dict[str, Any]]], carriers: set) -> list[int]:
+def incident_starts(endpoint: Endpoint, key: tuple, observations: list[tuple[float, str, dict[str, Any]]]) -> list[int]:
     """For each of a flow's observations, the index of the first observation
-    of its incident. An incident ends at evidence the flow's carrier
-    progressed: a later stall on the same carrier in a newer epoch, or the
-    carrier returning to ACTIVE in between."""
-    recoveries = sorted(r["_t"] for r in endpoint.of(STATE)
-                        if r.get("to") == "active" and carrier_key(r) in carriers)
+    of its incident. An incident ends at evidence that it was over: the
+    flow's own outage ending on this endpoint (a lane came back), the carrier
+    of the incident's latest observation returning to ACTIVE, or a later
+    stall on that carrier in a newer epoch."""
+    recoveries: dict[tuple, list[float]] = defaultdict(list)
+    for r in endpoint.of(STATE):
+        if r.get("to") == "active":
+            recoveries[carrier_key(r)].append(r["_t"])
+    outage_ends = [r["_t"] for r in endpoint.of(OUTAGE_ENDED) if flow_key(r) == key]
     starts: list[int] = []
     epochs: dict[tuple, int] = {}
+    carrier = None
     for index, (t, _, record) in enumerate(observations):
         start = starts[-1] if starts else 0
         if index:
             previous = observations[index - 1][0]
-            if any(previous < r <= t for r in recoveries):
+            if any(previous < e <= t for e in outage_ends):
+                start = index
+            if carrier is not None and any(previous < r <= t for r in recoveries.get(carrier, [])):
                 start = index
             epoch = record.get("transport_epoch")
             seen = epochs.get(carrier_key(record))
             if isinstance(epoch, int) and isinstance(seen, int) and epoch > seen:
                 start = index
-        if isinstance(record.get("transport_epoch"), int) and record.get("carrier_id") is not None:
-            epochs[carrier_key(record)] = record["transport_epoch"]
+        if record.get("carrier_id") is not None:
+            carrier = carrier_key(record)
+            if isinstance(record.get("transport_epoch"), int):
+                epochs[carrier] = record["transport_epoch"]
         starts.append(start)
     return starts
 
@@ -420,11 +444,6 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
     """
     client_records = failure_records(client)
     gateway_obs = failure_observations(gateway)
-    # The carriers each client flow rode, for its incidents' boundaries.
-    flow_carriers: dict[tuple, set] = defaultdict(set)
-    for record in client.of(BOUND) + client.of(STALL) + client.of(LANE_FAILED):
-        if record.get("carrier_id") is not None:
-            flow_carriers[flow_key(record)].add(carrier_key(record))
     # A JOIN's transit runs from the client starting that attempt to the
     # gateway parsing it, matched by lane ID; the transport is kept, since a
     # TCP handoff and a QUIC JOIN have different budgets.
@@ -470,6 +489,7 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
             # Without an end record the window runs past the deadline, so a
             # JOIN that arrived late is found and counted late.
             window_end = end if end is not None else min(next_start, capture_end)
+            window_floor = previous_end
             window_start = max(previous_end if previous_end is not None else -math.inf, start - grace)
             previous_end = end if end is not None else min(next_start, deadline)
             row: dict[str, Any] = {"session_id": key[0], "flow_id": key[1], "gateway_outage_start": start, "gateway_deadline": deadline}
@@ -478,12 +498,19 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
             # resolved stall in the window is another incident. Skew runs
             # from the matched incident's first observation.
             observations = client_records.get(key, [])
-            starts = incident_starts(client, observations, flow_carriers.get(key, set()))
+            starts = incident_starts(client, key, observations)
             candidates = [i for i, (t, _, _) in enumerate(observations) if window_start <= t <= window_end]
             observed = None
             if candidates:
+                # The window selects the incident. Its start may lie before
+                # the window -- exactly a long skew -- but not before the
+                # flow's previous gateway outage ended, which was another
+                # incident's.
                 nearest = min(candidates, key=lambda i: abs(observations[i][0] - start))
-                first = max(starts[nearest], candidates[0])
+                first = starts[nearest]
+                floor = window_floor if window_floor is not None else -math.inf
+                while first < nearest and observations[first][0] < floor:
+                    first += 1
                 observed = observations[first][:2]
             if observed is not None:
                 # Positive: the gateway started its grace after the client
@@ -585,8 +612,9 @@ def render(report: dict[str, Any], out) -> None:
         for outcome, n in sorted(stalls["outcomes"].items()):
             print(f"   {n:>6}  {outcome}", file=out)
         print(f"   design detection delay after the stall: {format_q(stalls['design_detection_delay_s'])}", file=out)
-        dials = stalls["rescue_dials"]
-        print(f"   rescue requests followed by a dial {dials['stalls_followed_by_a_dial']}, without one {dials['stalls_without_a_dial']} ({dials['dials']} dials)", file=out)
+        requests = stalls["rescue_requests"]
+        if requests is not None:
+            print(f"   rescue requests followed by a rescue round {requests['requests_followed_by_a_rescue_round']}, without one {requests['requests_without_a_rescue_round']} ({requests['join_attempts_in_those_rounds']} JOIN attempts in those rounds)", file=out)
         for row in stalls["lane_failures"]:
             print(f"   lane failure: {row['count']:>6}  carrier={row['carrier_state']} design={row['design_remedy']}", file=out)
     deadline = report.get("recovery_deadline")

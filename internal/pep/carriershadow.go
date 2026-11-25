@@ -215,8 +215,13 @@ type carrierEvent struct {
 	SinceProgress time.Duration
 	Outcome       string
 	// BetweenSamples says the episode was counted by the transport, among
-	// several that ended between two samples; its duration is not known.
+	// several that ended between two samples or before the first one; its
+	// duration is not known.
 	BetweenSamples bool
+	// DurationUpperBound says SinceProgress runs to the newest progress, and
+	// more than one packet was acknowledged since the last sample: the ACK
+	// that ended the episode may have come earlier.
+	DurationUpperBound bool
 	// Epoch is the carrier's progress epoch after the event. A stall and a
 	// later transition with the same epoch belong to one no-progress
 	// episode.
@@ -241,6 +246,9 @@ type carrierMachine struct {
 	// shows progress also shows every episode that ended since.
 	srcEpisodes uint64
 	srcReaching [metrics.CarrierShadowPTOBuckets]uint64
+	// srcSeeded says the counters were read when the carrier was first
+	// watched, before its first sample.
+	srcSeeded bool
 	// Per-carrier histogram, index n-1 = episodes reaching n expiries.
 	reached, recovered, dead [metrics.CarrierShadowPTOBuckets]uint64
 	episodes                 uint64
@@ -296,9 +304,14 @@ func (m *carrierMachine) endEpisode(events []carrierEvent, at time.Time, silent 
 // says ended since the last sample, at the peak the transport counted. The
 // episode the samples followed is one of them, with a peak at least what was
 // sampled; without transport counters it is closed at its sampled peak.
-func (m *carrierMachine) endRecoveredEpisodes(events []carrierEvent, s carrierSample, silent time.Duration) []carrierEvent {
+func (m *carrierMachine) endRecoveredEpisodes(events []carrierEvent, s carrierSample, silent time.Duration, bound bool) []carrierEvent {
 	if s.Progress.Episodes <= m.srcEpisodes {
-		return m.endEpisode(events, s.At, silent, episodeRecovered)
+		n := len(events)
+		events = m.endEpisode(events, s.At, silent, episodeRecovered)
+		for i := n; i < len(events); i++ {
+			events[i].DurationUpperBound = bound
+		}
+		return events
 	}
 	ended := s.Progress.Episodes - m.srcEpisodes
 	var reach [metrics.CarrierShadowPTOBuckets]uint64
@@ -330,8 +343,8 @@ func (m *carrierMachine) endRecoveredEpisodes(events []carrierEvent, s carrierSa
 		}
 		for range exactly {
 			event := carrierEvent{Kind: carrierEpisodeEnd, At: s.At, PTOs: uint32(n), Outcome: episodeRecovered, Epoch: s.Progress.Epoch}
-			if ended == 1 {
-				event.SinceProgress = silent
+			if ended == 1 && m.started {
+				event.SinceProgress, event.DurationUpperBound = silent, bound
 			} else {
 				event.BetweenSamples = true
 			}
@@ -339,6 +352,12 @@ func (m *carrierMachine) endRecoveredEpisodes(events []carrierEvent, s carrierSa
 		}
 	}
 	return events
+}
+
+// seed records the transport's episode counters when the carrier starts
+// being watched, so its first sample counts episodes that ended since.
+func (m *carrierMachine) seed(p carrierProgress) {
+	m.srcEpisodes, m.srcReaching, m.srcSeeded = p.Episodes, p.EpisodesReaching, true
 }
 
 // countExpiries folds a sample's expiry count into the current episode,
@@ -362,6 +381,11 @@ func (m *carrierMachine) observe(s carrierSample, events []carrierEvent) []carri
 		return events
 	}
 	if !m.started {
+		if m.srcSeeded {
+			// Episodes that ended between the carrier being watched and
+			// this first sample.
+			events = m.endRecoveredEpisodes(events, s, 0, false)
+		}
 		m.started = true
 		m.epoch = s.Progress.Epoch
 		m.srcEpisodes, m.srcReaching = s.Progress.Episodes, s.Progress.EpisodesReaching
@@ -380,7 +404,9 @@ func (m *carrierMachine) observe(s carrierSample, events []carrierEvent) []carri
 		if !m.lastProgress.IsZero() && recoveredAt.After(m.lastProgress) {
 			silent = recoveredAt.Sub(m.lastProgress)
 		}
-		events = m.endRecoveredEpisodes(events, s, silent)
+		// One acknowledged packet since the last sample: the newest
+		// progress is the one that ended the episode.
+		events = m.endRecoveredEpisodes(events, s, silent, s.Progress.Epoch-m.epoch > 1)
 		m.epoch = s.Progress.Epoch
 		m.lastProgress = recoveredAt
 		if m.state != metrics.CarrierShadowActive {
@@ -501,7 +527,7 @@ func (o *carrierShadow) trackAssociation(fc *frameConn) {
 }
 
 // track starts watching the carrier under src, once per carrier.
-func (o *carrierShadow) track(src carrierProgressSource) *shadowCarrier {
+func (o *carrierShadow) track(src carrierProgressSource, progress carrierProgress) *shadowCarrier {
 	key := src.carrierKey()
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -509,6 +535,7 @@ func (o *carrierShadow) track(src carrierProgressSource) *shadowCarrier {
 		return c
 	}
 	c := &shadowCarrier{id: carrierShadowSeq.Add(1), src: src, tracked: time.Now(), m: newCarrierMachine(o.cfg.SuspectPTOs, o.cfg.ReplacePTOs)}
+	c.m.seed(progress)
 	o.carriers[key] = c
 	if !o.running {
 		o.running = true
@@ -600,6 +627,9 @@ func (o *carrierShadow) emit(c *shadowCarrier, event carrierEvent, srtt time.Dur
 				fields = append(fields, "between_samples", true)
 			} else {
 				fields = append(fields, "without_transport_progress", event.SinceProgress)
+				if event.DurationUpperBound {
+					fields = append(fields, "duration_upper_bound", true)
+				}
 			}
 			o.logger.Info("carrier shadow episode", append(fields, "srtt", srtt)...)
 		}
@@ -639,7 +669,7 @@ func (o *carrierShadow) trackLive(src carrierProgressSource) (*shadowCarrier, ca
 	if ended != nil {
 		return nil, carrierObservation{tracked: true, state: carrierEndState(ended), progress: progress}
 	}
-	return o.track(src), carrierObservation{}
+	return o.track(src, progress), carrierObservation{}
 }
 
 func (o *carrierShadow) flowFields(f *multipathFlow) []any {
