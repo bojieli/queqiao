@@ -38,7 +38,7 @@ CLIENT = [
     rec(1, "carrier shadow lane bound", endpoint="client", session_id=SESSION, flow_id=2, lane_id=0, carrier_id=2),
     # Flow 1: stall on a carrier that later fails -- design acts 1.5 s later.
     rec(2.0, "carrier shadow stall", endpoint="client", session_id=SESSION, flow_id=1, carrier_id=1, carrier_state="active", transport_epoch=40,
-        transport_acked=False, design_remedy="wait", legacy_remedy="demote_and_rescue_dial"),
+        transport_acked=False, design_remedy="wait", legacy_remedy="demote_and_request_rescue"),
     rec(2.0, "carrier shadow rescue started", endpoint="client", session_id=SESSION, flow_id=1, healthy_lanes=1),
     rec(2.0, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=1, lane_id=2, transport="quic"),
     # A different attempt of the same flow whose JOIN never arrived.
@@ -50,7 +50,7 @@ CLIENT = [
         pto_reached=[3, 2, 1, 1, 1, 0, 0, 0], pto_recovered=[2, 1, 0, 0, 0, 0, 0, 0], pto_dead=[1, 1, 1, 1, 1, 0, 0, 0]),
     # Flow 2: stall on a live carrier.
     rec(5.0, "carrier shadow stall", endpoint="client", session_id=SESSION, flow_id=2, carrier_id=2, carrier_state="active", transport_epoch=9,
-        transport_acked=True, design_remedy="wait", legacy_remedy="demote_and_rescue_dial"),
+        transport_acked=True, design_remedy="wait", legacy_remedy="demote_and_request_rescue"),
     # Carrier 2 progresses (unlogged), then fails hours later in a newer
     # epoch: not the consequence of the stall above.
     rec(3000.0, "carrier shadow state", endpoint="client", carrier_id=2, to="suspect", transport_epoch=900, **{"from": "active"}),
@@ -144,11 +144,7 @@ class CarrierShadowSummaryTest(unittest.TestCase):
     def test_text_report(self):
         text = self.run_script()
         self.assertIn("latest handoff start after the client's own observation, G - S - J", text)
-        self.assertIn("carrier=active acked=True design=wait today=demote_and_rescue_dial", text)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertIn("carrier=active acked=True design=wait today=demote_and_request_rescue", text)
 
 
 class CarrierShadowCensoringTest(unittest.TestCase):
@@ -156,7 +152,7 @@ class CarrierShadowCensoringTest(unittest.TestCase):
         client = [
             rec(1.0, "carrier shadow stall", endpoint="client", session_id=SESSION, flow_id=9, carrier_id=4,
                 carrier_state="active", transport_epoch=3, transport_acked=False, design_remedy="wait",
-                legacy_remedy="demote_and_rescue_dial"),
+                legacy_remedy="demote_and_request_rescue"),
             rec(1.5, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=9, lane_id=1, transport="quic"),
         ]
         gateway = [
@@ -204,3 +200,110 @@ class LateJoinTest(unittest.TestCase):
         self.assertEqual(deadline["outages_without_join"], 0)
         self.assertTrue(deadline["flows"][0]["join_refused_session_ended"])
         self.assertAlmostEqual(deadline["join_transit_s"]["max"], 11.5, places=3)
+
+
+def summarize(client, gateway):
+    with tempfile.TemporaryDirectory() as directory:
+        paths = []
+        for name, records in (("c", client), ("g", gateway)):
+            path = pathlib.Path(directory) / f"{name}.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+            paths.append(str(path))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            MODULE.main(["--client", paths[0], "--gateway", paths[1], "--json"])
+    return json.loads(out.getvalue())
+
+
+def stall(t, flow, carrier, epoch, **fields):
+    record = dict(endpoint="client", session_id=SESSION, flow_id=flow, carrier_id=carrier, carrier_state="active",
+                  transport_epoch=epoch, transport_acked=False, design_remedy="wait", legacy_remedy="demote_and_request_rescue")
+    record.update(fields)
+    return rec(t, "carrier shadow stall", **record)
+
+
+class CalibrationFollowUpTest(unittest.TestCase):
+    def test_skew_runs_from_the_first_observation_of_the_matched_incident(self):
+        client = [
+            # An earlier incident, resolved: the next stall is in a newer epoch.
+            stall(0.0, 1, 1, 4),
+            # The incident the gateway outage matches: first seen at 1.0.
+            stall(1.0, 1, 1, 5),
+            stall(3.0, 1, 1, 5),
+        ]
+        gateway = [
+            rec(4.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=1, grace=45_000_000_000),
+            rec(4.5, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=1),
+        ]
+        deadline = summarize(client, gateway)["recovery_deadline"]
+        self.assertAlmostEqual(deadline["skew_s"]["max"], 3.0, places=3)
+        self.assertEqual(deadline["skew_s"]["n"], 1)
+
+    def test_a_carrier_recovery_between_observations_starts_a_new_incident(self):
+        client = [
+            stall(0.0, 1, 1, 5),
+            rec(0.5, "carrier shadow state", endpoint="client", carrier_id=1, to="active", transport_epoch=6, **{"from": "suspect"}),
+            rec(2.0, "carrier shadow lane failed", endpoint="client", session_id=SESSION, flow_id=1, carrier_id=1, carrier_state="active"),
+        ]
+        gateway = [rec(3.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=1, grace=45_000_000_000)]
+        deadline = summarize(client, gateway)["recovery_deadline"]
+        self.assertAlmostEqual(deadline["skew_s"]["max"], 1.0, places=3)
+
+    def test_joins_started_after_recovery_are_not_transit(self):
+        client = [
+            stall(3.9, 2, 1, 5),
+            rec(4.2, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=2, lane_id=8, transport="quic"),
+            # Started after the outage ended: an ordinary JOIN.
+            rec(6.0, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=2, lane_id=9, transport="quic"),
+        ]
+        gateway = [
+            rec(4.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=2, grace=45_000_000_000),
+            rec(4.8, "carrier shadow join arrived", endpoint="gateway", session_id=SESSION, flow_id=2, lane_id=8, in_outage=True),
+            rec(4.9, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=2),
+            rec(6.5, "carrier shadow join arrived", endpoint="gateway", session_id=SESSION, flow_id=2, lane_id=9, in_outage=False),
+        ]
+        deadline = summarize(client, gateway)["recovery_deadline"]
+        self.assertEqual(deadline["join_transit_s"]["n"], 1)
+        self.assertAlmostEqual(deadline["join_transit_s"]["max"], 0.6, places=3)
+        self.assertEqual(deadline["joins_started_after_recovery"], 1)
+
+    def test_an_episode_open_at_capture_end_is_censored(self):
+        client = [
+            rec(1.0, "carrier shadow state", endpoint="client", carrier_id=3, to="suspect", transport_epoch=7, pto_since_progress=2, **{"from": "active"}),
+            stall(2.0, 5, 3, 7, carrier_state="suspect", pto_since_progress=3),
+            # A carrier whose episode ended in progress is not open.
+            rec(1.0, "carrier shadow state", endpoint="client", carrier_id=6, to="suspect", transport_epoch=1, pto_since_progress=2, **{"from": "active"}),
+            rec(1.5, "carrier shadow state", endpoint="client", carrier_id=6, to="active", transport_epoch=2, **{"from": "suspect"}),
+        ]
+        report = summarize(client, [rec(9.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
+        cal = report["calibration"]["client"]
+        self.assertEqual(cal["open_episodes_censored"], 1)
+        rows = cal["rows"]
+        for n in range(3):
+            self.assertEqual(rows[n]["reached"], 1)
+            self.assertEqual(rows[n]["censored"], 1)
+            self.assertIsNone(rows[n]["false_rate"], "a censored episode is not in the denominator")
+        self.assertEqual(rows[3]["reached"], 0)
+
+    def test_a_later_stall_in_a_newer_epoch_is_progress(self):
+        client = [stall(10.0, 7, 4, 1), stall(20.0, 7, 4, 2)]
+        report = summarize(client, [rec(30.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
+        outcomes = report["stalls"]["client"]["outcomes"]
+        self.assertEqual(outcomes["carrier stayed live: design would not rescue"], 1)
+        self.assertEqual(outcomes["unresolved: no later evidence about the carrier"], 1)
+
+    def test_rescue_requests_are_counted_against_actual_dials(self):
+        client = [
+            stall(10.0, 7, 4, 1),
+            rec(10.5, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=7, lane_id=1, transport="quic"),
+            rec(11.0, "carrier shadow join attempt", endpoint="client", session_id=SESSION, flow_id=7, lane_id=2, transport="tcp"),
+            stall(20.0, 7, 4, 1),
+        ]
+        report = summarize(client, [rec(30.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
+        dials = report["stalls"]["client"]["rescue_dials"]
+        self.assertEqual(dials, {"stalls_followed_by_a_dial": 1, "stalls_without_a_dial": 1, "dials": 2})
+        self.assertEqual(report["stalls"]["client"]["by_kind"][0]["legacy_remedy"], "demote_and_request_rescue")
+
+
+if __name__ == "__main__":
+    unittest.main()

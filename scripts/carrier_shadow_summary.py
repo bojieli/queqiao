@@ -204,6 +204,17 @@ def calibration(endpoint: Endpoint) -> dict[str, Any]:
                 recovered[i] += 1
             elif record.get("outcome") == "dead":
                 dead[i] += 1
+    # An episode still open when the log ends has no episode line: it is
+    # read from the carrier's state and stall records of its epoch, and
+    # counted as reached at every level it got to, and censored -- never in
+    # the false-rate denominator.
+    open_censored = 0
+    for key, records in open_carrier_records(endpoint, summarized).items():
+        peak = open_episode_peak(records)
+        if peak:
+            open_censored += 1
+            for i in range(min(peak, BUCKETS)):
+                reached[i] += 1
     rows = []
     for i in range(BUCKETS):
         decided = recovered[i] + dead[i]
@@ -218,10 +229,45 @@ def calibration(endpoint: Endpoint) -> dict[str, Any]:
     false_replacements = sum(1 for r in endpoint.of(STATE) if r.get("false_replacement") is True)
     thresholds = Counter((r.get("k_s"), r.get("k_p")) for r in endpoint.of(STATE))
     return {
-        "carriers_ended": len(summarized), "open_carrier_episodes": open_episodes, "rows": rows,
+        "carriers_ended": len(summarized), "open_carrier_episodes": open_episodes,
+        "open_episodes_censored": open_censored, "rows": rows,
         "transitions": dict(transitions), "false_replacements": false_replacements,
         "thresholds": [{"k_s": k[0], "k_p": k[1], "records": n} for k, n in thresholds.items()],
     }
+
+
+def open_carrier_records(endpoint: Endpoint, summarized: set) -> dict[tuple, list[dict[str, Any]]]:
+    """State and stall records of carriers with no closing summary."""
+    out: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
+    for msg in (STATE, STALL):
+        for record in endpoint.of(msg):
+            key = carrier_key(record)
+            if key[1] is not None and key not in summarized:
+                out[key].append(record)
+    for values in out.values():
+        values.sort(key=lambda r: r["_t"])
+    return out
+
+
+def open_episode_peak(records: list[dict[str, Any]]) -> int:
+    """The probe timeouts the carrier's last episode reached, if it was
+    still open at the last record: no return to ACTIVE, no end, and no newer
+    progress epoch after it. Zero if none was open."""
+    epoch, peak = None, 0
+    for record in records:
+        if record.get("msg") == STATE and record.get("to") in ("active", "dead", "closed"):
+            epoch, peak = None, 0
+            continue
+        pto = record.get("pto_since_progress")
+        if not isinstance(pto, int) or isinstance(pto, bool) or pto < 1:
+            continue
+        this = record.get("transport_epoch")
+        if this != epoch:
+            # A newer epoch is progress: the previous episode ended, and
+            # its own episode line (or summary) counted it.
+            epoch, peak = this, 0
+        peak = max(peak, pto)
+    return peak
 
 
 def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
@@ -231,6 +277,11 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
     # Hooks and the sampler can log out of order; walk by observation time
     # (stable, so file order breaks ties).
     for values in transitions.values():
+        values.sort(key=lambda r: r["_t"])
+    stalls_by_carrier: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
+    for record in endpoint.of(STALL):
+        stalls_by_carrier[carrier_key(record)].append(record)
+    for values in stalls_by_carrier.values():
         values.sort(key=lambda r: r["_t"])
     by_kind: Counter = Counter()
     later_failure_delay: list[float] = []
@@ -252,13 +303,18 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
         # Progress that changes no state is not logged, so a later failure
         # in a newer epoch is a different episode.
         following = [t for t in transitions.get(carrier_key(stall), []) if t["_t"] >= stall["_t"]]
+        # A later stall observation of the carrier in a newer epoch is
+        # progress too: the episode ended there.
+        progressed_at = next((s["_t"] for s in stalls_by_carrier.get(carrier_key(stall), [])
+                              if s["_t"] >= stall["_t"] and isinstance(s.get("transport_epoch"), int)
+                              and s.get("transport_epoch") > epoch), math.inf)
         same = []
         for t in following:
-            if t.get("transport_epoch") != epoch:
+            if t.get("transport_epoch") != epoch or t["_t"] > progressed_at:
                 break
             same.append(t)
         failure = next((t for t in same if t.get("to") in ("replace", "dead")), None)
-        newer = len(same) < len(following)
+        newer = len(same) < len(following) or progressed_at != math.inf
         if failure is not None:
             outcomes[f"carrier reached {failure.get('to')} after the stall"] += 1
             later_failure_delay.append(failure["_t"] - stall["_t"])
@@ -270,6 +326,9 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
         else:
             outcomes["unresolved: no later evidence about the carrier"] += 1
     lane_failures = Counter((r.get("carrier_state"), r.get("design_remedy")) for r in endpoint.of(LANE_FAILED))
+    # Today's watchdog only requests a rescue; the dials it led to are the
+    # join attempts the client made before the flow's next stall.
+    dials = rescue_dials(endpoint)
     return {
         "stalls": sum(by_kind.values()),
         "by_kind": [
@@ -279,18 +338,73 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
         "outcomes": dict(outcomes),
         "design_detection_delay_s": quantiles(later_failure_delay),
         "lane_failures": [{"carrier_state": k[0], "design_remedy": k[1], "count": n} for k, n in lane_failures.items()],
+        "rescue_dials": dials,
     }
+
+
+def rescue_dials(endpoint: Endpoint) -> dict[str, Any]:
+    """Join attempts made after each stall, up to the flow's next stall."""
+    attempts: dict[tuple, list[float]] = defaultdict(list)
+    for record in endpoint.of(ATTEMPT):
+        attempts[flow_key(record)].append(record["_t"])
+    stalls: dict[tuple, list[float]] = defaultdict(list)
+    for record in endpoint.of(STALL):
+        stalls[flow_key(record)].append(record["_t"])
+    with_dial = without_dial = total = 0
+    for key, times in stalls.items():
+        times.sort()
+        for index, start in enumerate(times):
+            stop = times[index + 1] if index + 1 < len(times) else math.inf
+            n = sum(1 for t in attempts.get(key, []) if start <= t < stop)
+            total += n
+            if n:
+                with_dial += 1
+            else:
+                without_dial += 1
+    return {"stalls_followed_by_a_dial": with_dial, "stalls_without_a_dial": without_dial, "dials": total}
 
 
 def failure_observations(endpoint: Endpoint) -> dict[tuple, list[tuple[float, str]]]:
     """Each flow's failure observations on this endpoint, in time order."""
     out: dict[tuple, list[tuple[float, str]]] = defaultdict(list)
+    for key, values in failure_records(endpoint).items():
+        out[key] = [(t, kind) for t, kind, _ in values]
+    return out
+
+
+def failure_records(endpoint: Endpoint) -> dict[tuple, list[tuple[float, str, dict[str, Any]]]]:
+    out: dict[tuple, list[tuple[float, str, dict[str, Any]]]] = defaultdict(list)
     for msg, kind in ((STALL, "stall"), (LANE_FAILED, "lane_failed"), (OUTAGE, "outage")):
         for record in endpoint.of(msg):
-            out[flow_key(record)].append((record["_t"], kind))
+            out[flow_key(record)].append((record["_t"], kind, record))
     for values in out.values():
-        values.sort()
+        values.sort(key=lambda o: o[0])
     return out
+
+
+def incident_starts(endpoint: Endpoint, observations: list[tuple[float, str, dict[str, Any]]], carriers: set) -> list[int]:
+    """For each of a flow's observations, the index of the first observation
+    of its incident. An incident ends at evidence the flow's carrier
+    progressed: a later stall on the same carrier in a newer epoch, or the
+    carrier returning to ACTIVE in between."""
+    recoveries = sorted(r["_t"] for r in endpoint.of(STATE)
+                        if r.get("to") == "active" and carrier_key(r) in carriers)
+    starts: list[int] = []
+    epochs: dict[tuple, int] = {}
+    for index, (t, _, record) in enumerate(observations):
+        start = starts[-1] if starts else 0
+        if index:
+            previous = observations[index - 1][0]
+            if any(previous < r <= t for r in recoveries):
+                start = index
+            epoch = record.get("transport_epoch")
+            seen = epochs.get(carrier_key(record))
+            if isinstance(epoch, int) and isinstance(seen, int) and epoch > seen:
+                start = index
+        if isinstance(record.get("transport_epoch"), int) and record.get("carrier_id") is not None:
+            epochs[carrier_key(record)] = record["transport_epoch"]
+        starts.append(start)
+    return starts
 
 
 def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offset_s: float = 0.0) -> dict[str, Any]:
@@ -304,8 +418,13 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
     the rescue the client's latest rescue start between its observation and
     that arrival. A pair that cannot be formed is left out, not guessed.
     """
-    client_obs = failure_observations(client)
+    client_records = failure_records(client)
     gateway_obs = failure_observations(gateway)
+    # The carriers each client flow rode, for its incidents' boundaries.
+    flow_carriers: dict[tuple, set] = defaultdict(set)
+    for record in client.of(BOUND) + client.of(STALL) + client.of(LANE_FAILED):
+        if record.get("carrier_id") is not None:
+            flow_carriers[flow_key(record)].add(carrier_key(record))
     # A JOIN's transit runs from the client starting that attempt to the
     # gateway parsing it, matched by lane ID; the transport is kept, since a
     # TCP handoff and a QUIC JOIN have different budgets.
@@ -331,7 +450,7 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
     transit_by: dict[str, list[float]] = defaultdict(list)
     arrival_margin: list[float] = []
     flows = []
-    late = expired = unfinished = 0
+    late = expired = unfinished = after_recovery = 0
     for key, records in outages.items():
         records.sort(key=lambda r: r["_t"])
         previous_end = None
@@ -354,11 +473,18 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
             window_start = max(previous_end if previous_end is not None else -math.inf, start - grace)
             previous_end = end if end is not None else min(next_start, deadline)
             row: dict[str, Any] = {"session_id": key[0], "flow_id": key[1], "gateway_outage_start": start, "gateway_deadline": deadline}
-            # The client observation nearest the gateway's grace start is the
-            # most plausible view of the same failure; an earlier, resolved
-            # stall in the window is not.
-            candidates = [(t, kind) for t, kind in client_obs.get(key, []) if window_start <= t <= window_end]
-            observed = min(candidates, key=lambda c: abs(c[0] - start)) if candidates else None
+            # The client observation nearest the gateway's grace start
+            # matches the client's incident to this outage; an earlier,
+            # resolved stall in the window is another incident. Skew runs
+            # from the matched incident's first observation.
+            observations = client_records.get(key, [])
+            starts = incident_starts(client, observations, flow_carriers.get(key, set()))
+            candidates = [i for i, (t, _, _) in enumerate(observations) if window_start <= t <= window_end]
+            observed = None
+            if candidates:
+                nearest = min(candidates, key=lambda i: abs(observations[i][0] - start))
+                first = max(starts[nearest], candidates[0])
+                observed = observations[first][:2]
             if observed is not None:
                 # Positive: the gateway started its grace after the client
                 # first saw the failure.
@@ -391,6 +517,10 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
                 if not start <= j["_t"] < min(next_start, capture_end + 1):
                     continue
                 attempt = attempts.get((*key, j.get("lane_id")))
+                if attempt is not None and end is not None and attempt[0] > end:
+                    # Started after the outage was over: not this recovery.
+                    after_recovery += 1
+                    continue
                 if attempt is not None and attempt[0] <= j["_t"]:
                     transit.append(j["_t"] - attempt[0])
                     transit_by[attempt[1]].append(j["_t"] - attempt[0])
@@ -402,6 +532,7 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
     result: dict[str, Any] = {
         "grace_s": grace_s, "gateway_outages": len(flows), "joins_after_deadline": late,
         "outages_without_join": expired, "outages_unfinished_at_capture_end": unfinished,
+        "joins_started_after_recovery": after_recovery,
         "skew_s": quantiles(skew), "first_observation_skew_s": quantiles(observation_skew),
         "join_transit_s": quantiles(transit), "join_arrival_margin_s": quantiles(arrival_margin),
         "join_transit_by_transport_s": {k: quantiles(v) for k, v in sorted(transit_by.items())},
@@ -440,7 +571,7 @@ def render(report: dict[str, Any], out) -> None:
             continue
         cal = report["calibration"][name]
         print(f"== {name}: probe-timeout episodes (k_s/k_p calibration)", file=out)
-        print(f"   carriers ended {cal['carriers_ended']}, episodes from still-open carriers {cal['open_carrier_episodes']}", file=out)
+        print(f"   carriers ended {cal['carriers_ended']}, episodes from still-open carriers {cal['open_carrier_episodes']}, open at capture end (censored) {cal['open_episodes_censored']}", file=out)
         print(f"   transitions {cal['transitions']}, false replacements {cal['false_replacements']}", file=out)
         print("   n   reached  recovered  dead  censored  P(recover|n)  upper95", file=out)
         for row in cal["rows"]:
@@ -454,6 +585,8 @@ def render(report: dict[str, Any], out) -> None:
         for outcome, n in sorted(stalls["outcomes"].items()):
             print(f"   {n:>6}  {outcome}", file=out)
         print(f"   design detection delay after the stall: {format_q(stalls['design_detection_delay_s'])}", file=out)
+        dials = stalls["rescue_dials"]
+        print(f"   rescue requests followed by a dial {dials['stalls_followed_by_a_dial']}, without one {dials['stalls_without_a_dial']} ({dials['dials']} dials)", file=out)
         for row in stalls["lane_failures"]:
             print(f"   lane failure: {row['count']:>6}  carrier={row['carrier_state']} design={row['design_remedy']}", file=out)
     deadline = report.get("recovery_deadline")
@@ -462,7 +595,7 @@ def render(report: dict[str, Any], out) -> None:
         print(f"   gateway outages {deadline['gateway_outages']}, JOINs after the deadline {deadline['joins_after_deadline']}, outages with no JOIN {deadline['outages_without_join']}, unfinished at capture end {deadline['outages_unfinished_at_capture_end']}", file=out)
         print(f"   skew (gateway grace start - client first observation): {format_q(deadline['skew_s'])}", file=out)
         print(f"   first-observation skew (gateway - client): {format_q(deadline['first_observation_skew_s'])}", file=out)
-        print(f"   JOIN transit (client attempt start -> gateway arrival, same lane): {format_q(deadline['join_transit_s'])}", file=out)
+        print(f"   JOIN transit (client attempt start -> gateway arrival, same lane): {format_q(deadline['join_transit_s'])}; excluded, started after recovery: {deadline['joins_started_after_recovery']}", file=out)
         for transport, q in deadline["join_transit_by_transport_s"].items():
             print(f"   JOIN transit over {transport}: {format_q(q)}", file=out)
         print(f"   JOIN arrival margin before the gateway deadline: {format_q(deadline['join_arrival_margin_s'])}", file=out)

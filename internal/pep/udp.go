@@ -498,6 +498,7 @@ func (c *Client) openUDPAssociationMode(ctx context.Context, resume []byte, fast
 		_ = lane.fc.Close()
 		return nil, err
 	}
+	c.carrierShadow.trackAssociation(lane.fc)
 	return association, nil
 }
 
@@ -819,6 +820,7 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
+	s.carrierShadow.trackAssociation(fc)
 
 	frames := make(chan protocol.Frame, 32)
 	frameErr := make(chan error, 1)

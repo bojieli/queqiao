@@ -137,8 +137,12 @@ func TestSuspectedLaneIsDemotedNotKilled(t *testing.T) {
 	if err != nil || len(candidates) != 1 || candidates[0] != data {
 		t.Fatalf("data candidates before stall = %v, %v", candidates, err)
 	}
-	if spare := flow.suspectDataLanes(); !spare {
+	spare, demoted := flow.suspectDataLanes()
+	if !spare {
 		t.Fatal("demoting the data lane found no warm spare in the control lane")
+	}
+	if demoted != data {
+		t.Fatalf("demoted lane = %v, want the data lane: the shadow observer looks at the lane the watchdog marked", demoted)
 	}
 	if data.closed.Load() {
 		t.Fatal("the watchdog closed a suspected lane")

@@ -53,10 +53,12 @@ const (
 	defaultCarrierShadowSuspectPTOs = 2
 	defaultCarrierShadowReplacePTOs = 4
 	maxCarrierShadowPTOs            = 16
-	// A probe timeout is at least one smoothed RTT plus the peer's ACK delay,
-	// and reaching n of them takes 2^n - 1 of those, so 50 ms resolves every
-	// episode of two or more expiries on any WAN path. A one-expiry episode
-	// on a path shorter than that can be missed; the log says so.
+	// The sample interval decides how soon a state is seen, not what the
+	// calibration counts: the transport counts every completed episode, with
+	// its peak, where the episode ends (carrierProgress.EpisodesReaching), so
+	// an episode that opens and closes between two samples, or whose last
+	// expiries come after the last sample that saw it, is still counted at
+	// the peak it reached.
 	defaultCarrierShadowInterval = 50 * time.Millisecond
 )
 
@@ -93,6 +95,12 @@ type carrierProgress struct {
 	PTOExpiries          uint32
 	ElicitingOutstanding bool
 	SmoothedRTT          time.Duration
+	// Episodes counts the carrier's completed probe-timeout episodes, and
+	// EpisodesReaching[n-1] those whose peak reached n expiries, as the
+	// transport counted them when each ended. Both only grow; a transport
+	// that does not count them leaves them zero.
+	Episodes         uint64
+	EpisodesReaching [metrics.CarrierShadowPTOBuckets]uint64
 }
 
 // carrierProgressSource is a lane transport that is a carrier the observer
@@ -118,6 +126,7 @@ func (c *quicStreamConn) carrierProgress() (carrierProgress, error) {
 	p := carrierProgress{
 		Epoch: s.ProgressEpoch, LastProgress: s.LastProgress, PTOExpiries: s.PTOExpiriesSinceProgress,
 		ElicitingOutstanding: s.ElicitingOutstanding, SmoothedRTT: s.SmoothedRTT,
+		Episodes: s.PTOEpisodes, EpisodesReaching: s.PTOEpisodesReaching,
 	}
 	ctx := c.conn.Context()
 	if ctx.Err() == nil {
@@ -205,6 +214,9 @@ type carrierEvent struct {
 	PTOs          uint32
 	SinceProgress time.Duration
 	Outcome       string
+	// BetweenSamples says the episode was counted by the transport, among
+	// several that ended between two samples; its duration is not known.
+	BetweenSamples bool
 	// Epoch is the carrier's progress epoch after the event. A stall and a
 	// later transition with the same epoch belong to one no-progress
 	// episode.
@@ -225,6 +237,10 @@ type carrierMachine struct {
 
 	inEpisode  bool
 	episodeMax uint32
+	// The transport's episode counters at the last sample, so a sample that
+	// shows progress also shows every episode that ended since.
+	srcEpisodes uint64
+	srcReaching [metrics.CarrierShadowPTOBuckets]uint64
 	// Per-carrier histogram, index n-1 = episodes reaching n expiries.
 	reached, recovered, dead [metrics.CarrierShadowPTOBuckets]uint64
 	episodes                 uint64
@@ -276,6 +292,55 @@ func (m *carrierMachine) endEpisode(events []carrierEvent, at time.Time, silent 
 	return events
 }
 
+// endRecoveredEpisodes closes, as recovered, every episode the transport
+// says ended since the last sample, at the peak the transport counted. The
+// episode the samples followed is one of them, with a peak at least what was
+// sampled; without transport counters it is closed at its sampled peak.
+func (m *carrierMachine) endRecoveredEpisodes(events []carrierEvent, s carrierSample, silent time.Duration) []carrierEvent {
+	if s.Progress.Episodes <= m.srcEpisodes {
+		return m.endEpisode(events, s.At, silent, episodeRecovered)
+	}
+	ended := s.Progress.Episodes - m.srcEpisodes
+	var reach [metrics.CarrierShadowPTOBuckets]uint64
+	for n := range reach {
+		if s.Progress.EpisodesReaching[n] > m.srcReaching[n] {
+			reach[n] = s.Progress.EpisodesReaching[n] - m.srcReaching[n]
+		}
+	}
+	m.srcEpisodes, m.srcReaching = s.Progress.Episodes, s.Progress.EpisodesReaching
+	for n := range reach {
+		counted := uint64(0)
+		if m.inEpisode && uint32(n) < m.episodeMax {
+			// The followed episode already counted this level as reached.
+			counted = 1
+		}
+		if reach[n] > counted {
+			m.reached[n] += reach[n] - counted
+		}
+		m.recovered[n] += reach[n]
+	}
+	m.episodes += ended
+	m.inEpisode, m.episodeMax = false, 0
+	// One event per episode, highest peak first: reach[n-1]-reach[n] of them
+	// peaked at exactly n.
+	for n := len(reach); n >= 1; n-- {
+		exactly := reach[n-1]
+		if n < len(reach) {
+			exactly -= min(exactly, reach[n])
+		}
+		for range exactly {
+			event := carrierEvent{Kind: carrierEpisodeEnd, At: s.At, PTOs: uint32(n), Outcome: episodeRecovered, Epoch: s.Progress.Epoch}
+			if ended == 1 {
+				event.SinceProgress = silent
+			} else {
+				event.BetweenSamples = true
+			}
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
 // countExpiries folds a sample's expiry count into the current episode,
 // opening one if needed.
 func (m *carrierMachine) countExpiries(pto uint32) {
@@ -299,6 +364,7 @@ func (m *carrierMachine) observe(s carrierSample, events []carrierEvent) []carri
 	if !m.started {
 		m.started = true
 		m.epoch = s.Progress.Epoch
+		m.srcEpisodes, m.srcReaching = s.Progress.Episodes, s.Progress.EpisodesReaching
 		m.lastProgress = s.At
 		if !s.Progress.LastProgress.IsZero() {
 			m.lastProgress = s.Progress.LastProgress
@@ -314,7 +380,7 @@ func (m *carrierMachine) observe(s carrierSample, events []carrierEvent) []carri
 		if !m.lastProgress.IsZero() && recoveredAt.After(m.lastProgress) {
 			silent = recoveredAt.Sub(m.lastProgress)
 		}
-		events = m.endEpisode(events, s.At, silent, episodeRecovered)
+		events = m.endRecoveredEpisodes(events, s, silent)
 		m.epoch = s.Progress.Epoch
 		m.lastProgress = recoveredAt
 		if m.state != metrics.CarrierShadowActive {
@@ -403,14 +469,35 @@ func (obs carrierObservation) live() bool {
 }
 
 func laneCarrierSource(lane *mpLane) carrierProgressSource {
-	if lane == nil || lane.fc == nil {
+	if lane == nil {
 		return nil
 	}
-	src, ok := lane.fc.transport().(carrierProgressSource)
+	return frameConnCarrierSource(lane.fc)
+}
+
+func frameConnCarrierSource(fc *frameConn) carrierProgressSource {
+	if fc == nil {
+		return nil
+	}
+	src, ok := fc.transport().(carrierProgressSource)
 	if !ok || src.carrierKey() == nil {
 		return nil
 	}
 	return src
+}
+
+// trackAssociation watches the carrier under a UDP association's stream. An
+// association has no multipath flow and no lane to bind, so without this a
+// carrier that only associations use would never be watched. Carriers are
+// tracked once per connection, however many associations and lanes share
+// one.
+func (o *carrierShadow) trackAssociation(fc *frameConn) {
+	if o == nil {
+		return
+	}
+	if src := frameConnCarrierSource(fc); src != nil {
+		o.trackLive(src)
+	}
 }
 
 // track starts watching the carrier under src, once per carrier.
@@ -508,9 +595,13 @@ func (o *carrierShadow) emit(c *shadowCarrier, event carrierEvent, srtt time.Dur
 		// One-expiry episodes are routine tail probes; they are counted in
 		// the metrics and in the carrier's closing summary, not logged.
 		if event.PTOs >= 2 {
-			o.logger.Info("carrier shadow episode", "endpoint", o.role, "carrier_id", c.id,
-				"max_pto", event.PTOs, "outcome", event.Outcome,
-				"without_transport_progress", event.SinceProgress, "srtt", srtt)
+			fields := []any{"endpoint", o.role, "carrier_id", c.id, "max_pto", event.PTOs, "outcome", event.Outcome}
+			if event.BetweenSamples {
+				fields = append(fields, "between_samples", true)
+			} else {
+				fields = append(fields, "without_transport_progress", event.SinceProgress)
+			}
+			o.logger.Info("carrier shadow episode", append(fields, "srtt", srtt)...)
 		}
 	}
 }
@@ -652,10 +743,14 @@ func designLaneFailureRemedyFor(role string, obs carrierObservation) metrics.Car
 	return metrics.CarrierShadowReplaceCarrier
 }
 
-// legacyStallRemedy names what today's watchdog does at a stall.
+// legacyStallRemedy names what today's watchdog does at a stall. On a client
+// it demotes the lane and asks the lane manager for a rescue; whether a dial
+// follows is the manager's decision (its backoff, a remaining healthy lane),
+// so the label is the request, and the dials actually made are the join
+// attempts the client logs.
 func (o *carrierShadow) legacyStallRemedy() string {
 	if o.role == carrierShadowClient {
-		return "demote_and_rescue_dial"
+		return "demote_and_request_rescue"
 	}
 	// A gateway cannot dial a client; its stall signal has no listener.
 	return "demote"
@@ -667,8 +762,8 @@ const (
 )
 
 // noteStall records a watchdog stall episode beside the carrier state. lane is
-// the data lane the watchdog is about to demote; pendingSince is when the
-// stalled work was first seen without progress.
+// the data lane the watchdog demoted; pendingSince is when the stalled work
+// was first seen without progress.
 func (o *carrierShadow) noteStall(f *multipathFlow, lane *mpLane, pendingSince time.Time, threshold time.Duration, coded, spare bool) {
 	if o == nil {
 		return

@@ -2169,16 +2169,8 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			}
 			// Coded bytes are pending only if the escape latched a frontier.
 			escapedCoding := f.codingRecoveryEnd.Load() != 0
-			// The shadow observer looks at the data lane before it is demoted.
-			var shadowLane *mpLane
-			if f.carrierShadow != nil {
-				if lanes := f.healthyLanes(); len(lanes) > 0 {
-					if data := f.dataLane(preferUnsuspectedLanes(lanes)); len(data) > 0 {
-						shadowLane = data[0]
-					}
-				}
-			}
-			spare := f.suspectDataLanes()
+			// The shadow observer looks at the lane the watchdog demotes.
+			spare, shadowLane := f.suspectDataLanes()
 			if f.metrics != nil {
 				f.metrics.FlowStallDetected()
 				if spare {
@@ -2246,11 +2238,13 @@ func (f *multipathFlow) recoverChunkReliably(offset uint64) bool {
 // suspectDataLanes marks the lanes currently carrying the flow's data as
 // stall-suspected and reports whether a non-suspected healthy lane remains to
 // take over new writes at once -- the warm-spare case, where the switch costs
-// one scheduler poll rather than a handshake.
-func (f *multipathFlow) suspectDataLanes() bool {
+// one scheduler poll rather than a handshake. demoted is the data lane it
+// marked, the one the rescue replaces, so that the carrier-shadow observer
+// looks at the lane the watchdog acted on, not one it selected separately.
+func (f *multipathFlow) suspectDataLanes() (spare bool, demoted *mpLane) {
 	lanes := f.healthyLanes()
 	if len(lanes) == 0 {
-		return false
+		return false, nil
 	}
 	data := f.dataLane(preferUnsuspectedLanes(lanes))
 	for _, lane := range data {
@@ -2259,14 +2253,15 @@ func (f *multipathFlow) suspectDataLanes() bool {
 	if len(data) > 0 {
 		// QUIC has one data lane. Keeping the explicit identity also makes a
 		// zero-numbered initial lane unambiguous to the replacement JOIN.
-		f.setRescueReplacement(data[0].id)
+		demoted = data[0]
+		f.setRescueReplacement(demoted.id)
 	}
 	for _, lane := range f.healthyLanes() {
 		if !lane.suspected.Load() {
-			return true
+			return true, demoted
 		}
 	}
-	return false
+	return false, demoted
 }
 
 // stallSignals exposes the watchdog's rescue request to the lane manager.
@@ -2578,6 +2573,11 @@ func (f *multipathFlow) waitForHealthyLane(ctx context.Context, timeout time.Dur
 		f.replacementTimeouts.Add(1)
 		return errLaneReplacementTimeout
 	}
+	// The timer runs to the outage's published deadline, not for a budget
+	// read some time ago: whatever ran since cannot extend the grace.
+	if deadline := f.replacementDeadlineTime(); !deadline.IsZero() {
+		remaining = min(remaining, time.Until(deadline))
+	}
 	timer := time.NewTimer(remaining)
 	defer timer.Stop()
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -2659,7 +2659,11 @@ func (f *multipathFlow) replacementBudget(now time.Time, grace time.Duration) ti
 			}
 		}
 		if f.replacementDeadline.CompareAndSwap(0, now.Add(grace).UnixNano()) {
-			f.carrierShadow.noteOutage(f, now, grace)
+			if f.carrierShadow != nil {
+				// Off the recovery path: a slow log sink must not lengthen
+				// the grace. The record carries its own observation time.
+				go f.carrierShadow.noteOutage(f, now, grace)
+			}
 			return grace
 		}
 	}
