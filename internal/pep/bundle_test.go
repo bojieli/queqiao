@@ -148,6 +148,15 @@ func TestCCAPISelectsHowTheErasureControllerIsDriven(t *testing.T) {
 				}
 				time.Sleep(5 * time.Millisecond)
 			}
+			// A migration whose resolved key differs from the one the
+			// controller was chosen for gets a controller for the new path.
+			rekey := erasureRekey(conn, congestionConfig{kind: CongestionErasure, ccAPI: api}, "another-uplink->"+conn.RemoteAddr().String())
+			if rekey(conn.LocalAddr(), conn.LocalAddr(), conn.RemoteAddr(), conn.RemoteAddr()) == nil {
+				t.Fatal("a migration to another path kept the old path's controller")
+			}
+			if rekey(conn.LocalAddr(), conn.LocalAddr(), conn.RemoteAddr(), conn.RemoteAddr()) != nil {
+				t.Fatal("the key was not updated on replacement")
+			}
 		default:
 			t.Fatalf("cc-api %s installed %T", api, controller)
 		}
@@ -155,13 +164,13 @@ func TestCCAPISelectsHowTheErasureControllerIsDriven(t *testing.T) {
 	}
 }
 
-// A migration that keeps the path key keeps the controller; erasureRekey is
-// asked only for a new path.
+// A migration that keeps the path key keeps the controller; the comparison is
+// against the key the controller was chosen for.
 func TestErasureRekeyKeepsTheControllerOnTheSamePath(t *testing.T) {
-	rekey := erasureRekey(nil, congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2})
 	local := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 5000}
 	oldRemote := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 443}
 	newRemote := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 61000}
+	rekey := erasureRekey(nil, congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2}, pathKey(local, oldRemote))
 	if next := rekey(local, local, oldRemote, newRemote); next != nil {
 		t.Fatal("a port-only rebinding replaced the controller")
 	}

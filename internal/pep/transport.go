@@ -1097,7 +1097,7 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 		controller := wancongestion.NewErasureSenderOn(
 			conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
 		if cfg.ccAPI == CCAPIV2 {
-			attached := wancongestion.NewErasurePathSender(controller, erasureRekey(conn, cfg))
+			attached := wancongestion.NewErasurePathSender(controller, erasureRekey(conn, cfg, peerKey(conn)))
 			conn.SetCongestionControl(attached)
 			return attached
 		}
@@ -1125,11 +1125,18 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 // uplink is another path, and gets a fresh controller for it, which is what
 // re-attaching to that path's state means while each connection still owns
 // its controller.
-func erasureRekey(conn *quic.Conn, cfg congestionConfig) func(oldLocal, newLocal, oldRemote, newRemote net.Addr) *wancongestion.ErasureSender {
-	return func(oldLocal, newLocal, oldRemote, newRemote net.Addr) *wancongestion.ErasureSender {
-		if pathKey(oldLocal, oldRemote) == pathKey(newLocal, newRemote) {
+//
+// The comparison is against the key resolved when the current controller was
+// chosen, not one recomputed from the old addresses: a wildcard-bound socket's
+// key comes from the routing table, which after an uplink change resolves the
+// old addresses to the new uplink too.
+func erasureRekey(conn *quic.Conn, cfg congestionConfig, current string) func(oldLocal, newLocal, oldRemote, newRemote net.Addr) *wancongestion.ErasureSender {
+	return func(_, newLocal, _, newRemote net.Addr) *wancongestion.ErasureSender {
+		next := pathKey(newLocal, newRemote)
+		if next == current {
 			return nil
 		}
+		current = next
 		return wancongestion.NewErasureSenderOn(conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
 	}
 }
