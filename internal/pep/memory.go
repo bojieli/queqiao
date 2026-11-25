@@ -6,6 +6,34 @@ import (
 	"github.com/bojieli/queqiao/internal/memlimit"
 )
 
+// MemoryMode selects the memory-ownership bundle of the path-authority
+// migration (docs/DESIGN-PATH-AUTHORITY.md §8.3, §14 stage 3).
+//
+// Both modes acquire shared send memory only for bytes a producer already
+// holds, so an application socket waiting to be read holds none (issue
+// #169); that fix is not a policy and is not switchable. MemoryOwned adds the
+// rest of the bundle: first-come grants of the shared budgets, the
+// flow-layer retention autotune in place of summed congestion windows, and
+// READY bytes counted as pending work by the no-progress budget.
+type MemoryMode string
+
+const (
+	MemoryLegacy MemoryMode = "legacy"
+	MemoryOwned  MemoryMode = "owned"
+)
+
+// ParseMemoryMode accepts the configuration spelling of the bundle. The empty
+// string is the legacy default.
+func ParseMemoryMode(value string) (MemoryMode, error) {
+	switch MemoryMode(value) {
+	case "", MemoryLegacy:
+		return MemoryLegacy, nil
+	case MemoryOwned:
+		return MemoryOwned, nil
+	}
+	return "", fmt.Errorf("memory bundle must be %s or %s, not %q", MemoryLegacy, MemoryOwned, value)
+}
+
 // MemoryLimits turns the transport's multiplicative per-flow buffering into
 // fixed endpoint budgets. A nil *MemoryLimits keeps the throughput-oriented
 // server defaults. Mobile clients provide an explicit profile.
@@ -52,7 +80,7 @@ func defaultFlowMemoryLimits() flowMemoryLimits {
 	}
 }
 
-func resolveMemoryLimits(configured *MemoryLimits, chunkSize int) (flowMemoryLimits, *memlimit.Budget, *memlimit.Budget, error) {
+func resolveMemoryLimits(configured *MemoryLimits, chunkSize int, modes ...MemoryMode) (flowMemoryLimits, *memlimit.Budget, *memlimit.Budget, error) {
 	limits := defaultFlowMemoryLimits()
 	if configured == nil {
 		return limits, nil, nil, nil
@@ -123,6 +151,11 @@ func resolveMemoryLimits(configured *MemoryLimits, chunkSize int) (flowMemoryLim
 	}
 	if limits.maxBulkConnections < 1 || limits.maxBulkConnections > isolatedBulkConns {
 		return flowMemoryLimits{}, nil, nil, fmt.Errorf("bulk connection limit must be between 1 and %d", isolatedBulkConns)
+	}
+	if len(modes) > 0 && modes[0] == MemoryOwned {
+		// One chunk per waiting flow, in turn: a flow cannot be overtaken
+		// forever by others that happen to win the wake-up race.
+		return limits, memlimit.NewFair(configured.SendBudgetBytes), memlimit.NewFair(configured.ReceiveBudgetBytes), nil
 	}
 	return limits, memlimit.New(configured.SendBudgetBytes), memlimit.New(configured.ReceiveBudgetBytes), nil
 }

@@ -51,7 +51,11 @@ type ServerConfig struct {
 	TCPFallbackLanes int
 	// TCPCongestion selects the Linux kernel congestion controller inherited by
 	// accepted fallback sockets. "system" leaves the host default untouched.
-	TCPCongestion                 string
+	TCPCongestion string
+	// Memory selects the memory-ownership bundle; empty is legacy. A gateway
+	// has no shared send budget, so only the retention autotune and the
+	// no-progress accounting of READY bytes apply to it.
+	Memory                        MemoryMode
 	Congestion                    CongestionControlKind
 	BrutalBytesPerSec             uint64
 	AdaptiveMinBytesSec           uint64
@@ -293,6 +297,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	// carries. It is not a receive limit -- protocol.MaxPayload is, and it is
 	// fixed by the wire version -- so an out-of-range value is corrected to the
 	// default rather than allowed to produce frames the peer must reject.
+	memoryMode, err := ParseMemoryMode(string(cfg.Memory))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Memory = memoryMode
 	if cfg.ChunkSize <= 0 || cfg.ChunkSize > protocol.MaxPayload {
 		cfg.ChunkSize = defaultChunkSize
 	}
@@ -890,6 +899,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	defer destinationConn.Close()
 	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
 	flow.classifier = classifier.New(s.classifierConfig())
+	flow.memOwned = s.cfg.Memory == MemoryOwned
 	// Wire version 1 requires range acknowledgements on both endpoints.
 	flow.ackRanges.Store(true)
 	flow.idleTimeout = s.cfg.FlowIdleTimeout

@@ -101,12 +101,29 @@ type Config struct {
 	// with a count-only bound, throughput fell across successive transfers in
 	// one process as the heap grew.
 	MaxOutstandingBytes int
-	// Memory is shared by every flow of an endpoint. The producer acquires one
-	// full ChunkSize before allocating a source buffer and holds it until the
-	// logical chunk is acknowledged. This turns aggregate read-ahead into a
-	// hard endpoint limit instead of MaxOutstandingBytes multiplied by flows.
-	// Nil preserves the unbounded server/default profile.
+	// Memory is shared by every flow of an endpoint. The producer acquires it
+	// only for bytes it already holds, sized to the chunk's backing
+	// allocation, and keeps that reservation until the logical chunk is
+	// acknowledged. This turns aggregate read-ahead into a hard endpoint limit
+	// instead of MaxOutstandingBytes multiplied by flows. Nil preserves the
+	// unbounded server/default profile.
+	//
+	// A producer waiting on the application holds none of it. It blocks
+	// reading into a private staging buffer of StagingBytes, and only once
+	// that read returns bytes does it reserve a chunk, copy them in, and try
+	// to fill the rest from what the source already holds (AvailableReader).
+	// Reserving first let enough idle application sockets -- each blocked in
+	// Read -- hold the whole endpoint budget forever, so a flow with a request
+	// in hand could not read it (issue #169).
 	Memory *memlimit.Budget
+	// StagingBytes sizes the producer's private read buffer when Memory is
+	// set. It is part of the per-session static footprint, so it must be
+	// small: with 1,024 sessions, 1 KiB is 1 MiB in the worst case. Zero
+	// selects DefaultStagingBytes, capped at ChunkSize.
+	StagingBytes int
+	// Autotune, when set, replaces Retention with the flow-layer bound of the
+	// owned-memory bundle; see Autotune.
+	Autotune *Autotune
 	// RetransmitAfter is asked how long a chunk may be outstanding before it is
 	// presumed lost and offered again. Re-issuing duplicates bytes the receiver
 	// discards, so this trades a little bandwidth for not waiting on a lane
@@ -150,6 +167,63 @@ type Config struct {
 	Now func() time.Time
 }
 
+// DefaultStagingBytes is the producer's private read buffer when a shared
+// Memory budget is configured.
+const DefaultStagingBytes = 1024
+
+// ErrUnsupported is returned by an AvailableReader that cannot read without
+// waiting for the application.
+var ErrUnsupported = errors.New("stripe: source cannot read without blocking")
+
+// AvailableReader is a source that can return what it already holds without
+// waiting for the application to write more.
+//
+// The producer calls it while holding a shared reservation, so it must not
+// block on the application: it fills p with bytes available now, waiting at
+// most a short fixed bound, and returns (n, nil) once it has none, however
+// small n is. An error other than ErrUnsupported ends the stream exactly as
+// the same error from Read would. A source that is not an AvailableReader,
+// or returns ErrUnsupported, has its chunks published at the size its
+// ordinary Read returned: a second ordinary Read is never issued while a
+// reservation is held.
+type AvailableReader interface {
+	ReadAvailable(p []byte) (int, error)
+}
+
+// Autotune is the flow-layer retention bound of the owned-memory bundle.
+//
+// The legacy bound sums the congestion windows of a flow's lanes, which on a
+// path with one shared window would let every flow claim the path twice. This
+// one follows two gauges the scheduler owns: U, dispatched-and-unacknowledged
+// unique bytes, and Q, READY bytes read but not yet dispatched. Once per
+// credit round trip it doubles (up to MaxOutstandingBytes) if newly validated
+// unique coverage arrived in that round, and the producer was blocked on the
+// bound at some point in it, and a lane had room to take more at that point.
+// Otherwise it moves toward 2 x max U over the last four rounds, never below
+// Startup, and never upward in a round without newly validated coverage. Q is
+// limited separately by ReadyLimit, so the bound cannot grow without credit.
+type Autotune struct {
+	// Round is the credit round trip: the path's smoothed RTT plus the peer's
+	// ACK delay. Non-positive answers select DefaultAutotuneRound.
+	Round func() time.Duration
+	// Startup is the bound before any credit has arrived, and its floor.
+	// Zero selects DefaultAutotuneStartupChunks chunks.
+	Startup int
+	// ReadyLimit bounds READY bytes; nil or a non-positive answer leaves them
+	// bounded only by the retention bound.
+	ReadyLimit func() int
+}
+
+const (
+	// DefaultAutotuneRound is the credit round used before the path has an
+	// RTT sample.
+	DefaultAutotuneRound = 100 * time.Millisecond
+	// DefaultAutotuneStartupChunks is the startup allowance, in chunks.
+	DefaultAutotuneStartupChunks = 4
+	// autotuneHistory is how many rounds of max U the bound decays toward.
+	autotuneHistory = 4
+)
+
 // DefaultConfig returns bounds suitable for a long-haul path.
 func DefaultConfig() Config {
 	return Config{
@@ -180,6 +254,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Now == nil {
 		c.Now = time.Now
+	}
+	if c.StagingBytes <= 0 {
+		c.StagingBytes = DefaultStagingBytes
+	}
+	if c.StagingBytes > c.ChunkSize {
+		c.StagingBytes = c.ChunkSize
 	}
 }
 
@@ -285,6 +365,27 @@ type Scheduler struct {
 	producerCtx context.Context
 	cancel      context.CancelFunc
 	stats       Stats
+
+	// uniqueBytes is U: bytes of logical chunks dispatched at least once and
+	// not yet acknowledged, each counted once however many attempts it has.
+	uniqueBytes uint64
+	// idleLanes counts lanes waiting in Next with room for work and nothing
+	// ready to take.
+	idleLanes int
+	tune      autotuneState
+}
+
+// autotuneState is the Autotune bound and the facts of its current round.
+type autotuneState struct {
+	bound      int
+	roundStart time.Time
+	covered    bool // newly validated unique coverage arrived this round
+	blocked    bool // the producer waited on the bound this round
+	room       bool // ...while a lane had room to take more
+	waiting    bool // the producer is waiting on the bound now
+	roundMaxU  uint64
+	history    [autotuneHistory]uint64
+	rounds     int
 }
 
 // New returns a scheduler that reads src and hands it out in chunks. It starts
@@ -306,6 +407,10 @@ func New(src io.Reader, cfg Config) *Scheduler {
 	s.stats.CompletedByLaneID = make(map[uint64]uint64)
 	s.ready.L = &s.mu
 	s.produced.L = &s.mu
+	if cfg.Autotune != nil {
+		s.tune.bound = s.autotuneStartup()
+		s.tune.roundStart = cfg.Now()
+	}
 	go s.produce()
 	return s
 }
@@ -313,64 +418,159 @@ func New(src io.Reader, cfg Config) *Scheduler {
 // produce reads the source into ready chunks, staying within MaxOutstanding so
 // a stalled transfer cannot buffer the whole stream in memory.
 func (s *Scheduler) produce() {
+	var staging []byte
+	if s.cfg.Memory != nil {
+		staging = make([]byte, s.cfg.StagingBytes)
+	}
 	for {
-		s.mu.Lock()
-		for !s.closed && (len(s.pending)+len(s.live) >= s.cfg.MaxOutstanding ||
-			s.retainedBytes() >= uint64(s.readAheadLimit())) {
-			s.produced.Wait()
-		}
-		if s.closed {
-			s.mu.Unlock()
+		if !s.waitForRoom() {
 			return
+		}
+		var (
+			buf      []byte
+			n        int
+			reserved int
+			err      error
+		)
+		if staging == nil {
+			buf = make([]byte, s.cfg.ChunkSize)
+			// One Read rather than ReadFull: a chunk is at most ChunkSize,
+			// not exactly it. Waiting for a full buffer would hold a small
+			// write -- a request, an interactive turn -- until enough later
+			// bytes arrived to fill the chunk, which is latency invented by
+			// the scheduler.
+			n, err = s.src.Read(buf)
+		} else {
+			var ok bool
+			buf, n, reserved, err, ok = s.readStaged(staging)
+			if !ok {
+				return
+			}
+		}
+		if !s.publish(buf, n, reserved, err) {
+			return
+		}
+	}
+}
+
+// waitForRoom blocks until the flow's bounds admit another read. It reports
+// false once the scheduler is closed.
+func (s *Scheduler) waitForRoom() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for {
+		if s.closed {
+			return false
+		}
+		if len(s.pending)+len(s.live) >= s.cfg.MaxOutstanding {
+			s.produced.Wait()
+			continue
+		}
+		if s.cfg.Autotune != nil {
+			s.autotuneLocked(s.cfg.Now())
+			if limit := s.readyLimit(); limit > 0 && s.readyBytesLocked() >= uint64(limit) {
+				s.tune.waiting = false
+				s.produced.Wait()
+				continue
+			}
+		}
+		if s.retainedBytes() >= uint64(s.readAheadLimit()) {
+			if s.cfg.Autotune != nil {
+				s.tune.waiting = true
+				s.tune.blocked = true
+				if s.idleLanes > 0 {
+					s.tune.room = true
+				}
+			}
+			s.produced.Wait()
+			continue
+		}
+		s.tune.waiting = false
+		return true
+	}
+}
+
+// readStaged blocks on the application holding no shared memory, then
+// reserves exactly the allocation the bytes in hand need. ok is false when
+// the scheduler closed while it waited for memory.
+func (s *Scheduler) readStaged(staging []byte) (buf []byte, n, reserved int, err error, ok bool) {
+	n, err = s.src.Read(staging)
+	if n <= 0 {
+		return nil, 0, 0, err, true
+	}
+	size := n
+	filler, canFill := s.src.(AvailableReader)
+	// A read that filled the staging buffer suggests more is waiting; one
+	// that did not has drained the source and the chunk is what it is.
+	fill := canFill && err == nil && n == len(staging) && s.cfg.ChunkSize > n
+	if fill {
+		size = s.cfg.ChunkSize
+	}
+	if acquireErr := s.cfg.Memory.Acquire(s.producerCtx, size); acquireErr != nil {
+		s.mu.Lock()
+		if !s.closed {
+			s.srcErr = acquireErr
+			s.eof = true
+			s.ready.Broadcast()
 		}
 		s.mu.Unlock()
-
-		if err := s.cfg.Memory.Acquire(s.producerCtx, s.cfg.ChunkSize); err != nil {
-			s.mu.Lock()
-			if !s.closed {
-				s.srcErr = err
-				s.eof = true
-				s.ready.Broadcast()
-			}
-			s.mu.Unlock()
-			return
+		return nil, 0, 0, nil, false
+	}
+	buf = make([]byte, size)
+	copy(buf, staging[:n])
+	reserved = size
+	if fill {
+		m, fillErr := filler.ReadAvailable(buf[n:])
+		if m > 0 {
+			n += m
 		}
-		buf := make([]byte, s.cfg.ChunkSize)
-		// One Read rather than ReadFull: a chunk is at most ChunkSize, not
-		// exactly it. Waiting for a full buffer would hold a small write --
-		// a request, an interactive turn -- until enough later bytes arrived
-		// to fill the chunk, which is latency invented by the scheduler.
-		n, err := s.src.Read(buf)
-
-		s.mu.Lock()
-		if s.closed {
-			s.mu.Unlock()
-			s.cfg.Memory.Release(s.cfg.ChunkSize)
-			return
+		if fillErr != nil && !errors.Is(fillErr, ErrUnsupported) {
+			err = fillErr
 		}
-		if n > 0 {
-			chunk := &Chunk{Offset: s.nextOffset, Data: buf[:n], reservation: s.cfg.ChunkSize}
-			s.nextOffset += uint64(n)
-			s.stats.SourceBytes += uint64(n)
-			s.pending = append(s.pending, chunk)
+		if n <= size/2 {
+			// Account the reservation at the backing allocation, and do not
+			// keep a mostly-empty one.
+			short := make([]byte, n)
+			copy(short, buf[:n])
+			s.cfg.Memory.Release(size - n)
+			buf, reserved = short, n
+		}
+	}
+	return buf, n, reserved, err, true
+}
+
+// publish files what one read produced. It reports false when the producer
+// must stop: the scheduler closed, or the source ended.
+func (s *Scheduler) publish(buf []byte, n, reserved int, err error) bool {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.cfg.Memory.Release(reserved)
+		return false
+	}
+	if n > 0 {
+		chunk := &Chunk{Offset: s.nextOffset, Data: buf[:n], reservation: reserved}
+		s.nextOffset += uint64(n)
+		s.stats.SourceBytes += uint64(n)
+		s.pending = append(s.pending, chunk)
+	} else {
+		s.cfg.Memory.Release(reserved)
+	}
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			s.markEOFLocked()
 		} else {
-			s.cfg.Memory.Release(s.cfg.ChunkSize)
+			s.srcErr = err
+			s.eof = true
 		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				s.markEOFLocked()
-			} else {
-				s.srcErr = err
-				s.eof = true
-			}
-			s.signalIfDoneLocked()
-			s.ready.Broadcast()
-			s.mu.Unlock()
-			return
-		}
+		s.signalIfDoneLocked()
 		s.ready.Broadcast()
 		s.mu.Unlock()
+		return false
 	}
+	s.ready.Broadcast()
+	s.mu.Unlock()
+	return true
 }
 
 // readAheadLimit is how much the flow may retain: chunks read and not yet
@@ -378,6 +578,9 @@ func (s *Scheduler) produce() {
 // transport accepted. It is a memory bound and nothing else -- what a lane may
 // commit is bounded separately, by Windows.
 func (s *Scheduler) readAheadLimit() int {
+	if s.cfg.Autotune != nil {
+		return s.tune.bound
+	}
 	if s.cfg.Retention == nil {
 		return s.cfg.MaxOutstandingBytes
 	}
@@ -396,6 +599,131 @@ func (s *Scheduler) retainedBytes() uint64 {
 		total += uint64(len(chunk.Data))
 	}
 	return total
+}
+
+// readyBytesLocked is Q: bytes read and not yet dispatched. A chunk waiting
+// for a retry is already counted in U and is not counted again.
+func (s *Scheduler) readyBytesLocked() uint64 {
+	var total uint64
+	for _, chunk := range s.pending {
+		if _, live := s.live[chunk.Offset]; !live {
+			total += uint64(len(chunk.Data))
+		}
+	}
+	return total
+}
+
+func (s *Scheduler) readyLimit() int {
+	if s.cfg.Autotune == nil || s.cfg.Autotune.ReadyLimit == nil {
+		return 0
+	}
+	return s.cfg.Autotune.ReadyLimit()
+}
+
+func (s *Scheduler) autotuneStartup() int {
+	startup := s.cfg.Autotune.Startup
+	if startup <= 0 {
+		startup = DefaultAutotuneStartupChunks * s.cfg.ChunkSize
+	}
+	if startup < s.cfg.ChunkSize {
+		startup = s.cfg.ChunkSize
+	}
+	if startup > s.cfg.MaxOutstandingBytes {
+		startup = s.cfg.MaxOutstandingBytes
+	}
+	return startup
+}
+
+func (s *Scheduler) autotuneRound() time.Duration {
+	if round := s.cfg.Autotune.Round; round != nil {
+		if d := round(); d > 0 {
+			return d
+		}
+	}
+	return DefaultAutotuneRound
+}
+
+// sampleUniqueLocked records U for the current round's maximum.
+func (s *Scheduler) sampleUniqueLocked() {
+	if s.uniqueBytes > s.tune.roundMaxU {
+		s.tune.roundMaxU = s.uniqueBytes
+	}
+}
+
+// autotuneLocked closes every credit round that has ended by now. It is
+// evaluated lazily, at the events that can change the answer: a round with
+// no event in it has no coverage, so it can only move the bound down, and a
+// producer blocked on the bound is woken by the completion that ends it.
+func (s *Scheduler) autotuneLocked(now time.Time) {
+	if s.cfg.Autotune == nil {
+		return
+	}
+	round := s.autotuneRound()
+	for i := 0; now.Sub(s.tune.roundStart) >= round; i++ {
+		if i >= autotuneHistory {
+			// Every further empty round is the same as the last one.
+			s.tune.roundStart = now
+			break
+		}
+		s.closeRoundLocked()
+		s.tune.roundStart = s.tune.roundStart.Add(round)
+	}
+}
+
+func (s *Scheduler) closeRoundLocked() {
+	t := &s.tune
+	s.sampleUniqueLocked()
+	copy(t.history[1:], t.history[:autotuneHistory-1])
+	t.history[0] = t.roundMaxU
+	if t.rounds < autotuneHistory {
+		t.rounds++
+	}
+	ceiling := s.cfg.MaxOutstandingBytes
+	floor := s.autotuneStartup()
+	if t.covered && t.blocked && t.room {
+		t.bound = min(2*t.bound, ceiling)
+	} else {
+		var peak uint64
+		for _, u := range t.history[:t.rounds] {
+			peak = max(peak, u)
+		}
+		target := int(min(2*peak, uint64(ceiling)))
+		target = max(target, floor)
+		switch {
+		case target < t.bound:
+			// Move toward it rather than to it: one quiet round is not
+			// proof the flow no longer needs what it was using.
+			t.bound -= (t.bound - target + 1) / 2
+		case target > t.bound && t.covered:
+			t.bound = target
+		}
+	}
+	t.bound = min(max(t.bound, floor), ceiling)
+	t.covered = false
+	// A producer still waiting on the bound is blocked in the new round
+	// too, and so is a lane still idle beside it.
+	t.blocked = t.waiting
+	t.room = t.waiting && s.idleLanes > 0
+	t.roundMaxU = s.uniqueBytes
+}
+
+// RetentionBound reports the current Autotune bound, or zero without one.
+func (s *Scheduler) RetentionBound() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.Autotune == nil {
+		return 0
+	}
+	s.autotuneLocked(s.cfg.Now())
+	return s.tune.bound
+}
+
+// ReadyBytes reports Q: bytes read from the source and not yet dispatched to
+// any lane. They are pending work although nothing has been sent.
+func (s *Scheduler) ReadyBytes() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readyBytesLocked()
 }
 
 // markEOFLocked records the end of the stream. The final marker rides on the
@@ -438,6 +766,7 @@ func (s *Scheduler) Next(ctx context.Context, laneID uint64, windowBytes int) (*
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		idle := false
 		if s.laneLoad[laneID] < s.cfg.LaneWindow {
 			if chunk := s.takeReadyLocked(laneID, windowBytes); chunk != nil {
 				return chunk, nil
@@ -447,8 +776,21 @@ func (s *Scheduler) Next(ctx context.Context, laneID uint64, windowBytes int) (*
 			} else if s.doneLocked() {
 				return nil, nil
 			}
+			idle = len(s.pending) == 0
+		}
+		if idle {
+			// This lane could carry more and has nothing to carry. If the
+			// producer is held by the retention bound at the same time, the
+			// bound -- not the path -- is what limits the flow.
+			s.idleLanes++
+			if s.tune.waiting {
+				s.tune.room = true
+			}
 		}
 		s.ready.Wait()
+		if idle {
+			s.idleLanes--
+		}
 	}
 }
 
@@ -483,6 +825,8 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		if !exists {
 			out = &outstanding{chunk: chunk}
 			s.live[chunk.Offset] = out
+			s.uniqueBytes += uint64(len(chunk.Data))
+			s.sampleUniqueLocked()
 			s.stats.ChunksIssued++
 			s.stats.BytesIssued += uint64(len(chunk.Data))
 		} else {
@@ -582,6 +926,14 @@ func (s *Scheduler) Complete(laneID uint64, chunk *Chunk) {
 			s.releaseLaneLocked(a.lane, uint64(len(live.chunk.Data)), !a.written)
 		}
 		delete(s.live, chunk.Offset)
+		if s.cfg.Autotune != nil {
+			// Validated coverage is the only thing that may grow the bound,
+			// and only for bytes newly covered: a chunk is removed from live
+			// once, whether cumulative or range coverage reached it first.
+			s.autotuneLocked(s.cfg.Now())
+			s.tune.covered = true
+		}
+		s.uniqueBytes -= min(s.uniqueBytes, uint64(len(live.chunk.Data)))
 		s.stats.ChunksCompleted++
 		s.stats.CompletedByLaneID[laneID]++
 	}
@@ -1114,6 +1466,7 @@ func (s *Scheduler) Close() {
 	}
 	s.pending = nil
 	s.live = make(map[uint64]*outstanding)
+	s.uniqueBytes = 0
 	s.ready.Broadcast()
 	s.produced.Broadcast()
 }
