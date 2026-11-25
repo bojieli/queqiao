@@ -18,7 +18,7 @@ sys.modules["ab_analyze"] = an
 SPEC.loader.exec_module(an)
 
 COLUMNS = ("block", "path", "slot", "arm", "role", "arm_trial", "cold", "phase", "job", "client", "kind", "flow",
-           "start_utc", "end_utc", "http", "bytes", "seconds", "curl_exit", "complete", "wall", "epoch")
+           "start_utc", "end_utc", "http", "bytes", "seconds", "curl_exit", "complete", "wall", "t_start", "t_end")
 T0 = 1_780_000_000.0
 
 
@@ -28,7 +28,7 @@ def iso(t):
 
 def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, late_every=5, zero_main=(), cand_stalls=3,
                    status="complete", drop_slot=None, workload="bulk", cand_probe=None, cand_fallbacks=0, missing_queue=(),
-                   cand_transport="auto"):
+                   cand_transport="auto", cand_capped=False, fetch_failures=()):
     """A two-arm campaign on one path with known outcomes.
 
     Main delivers ~40 MB per trial (four 10 MB flows) with 20% block-to-block
@@ -41,7 +41,7 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
     """
     rng = random.Random(seed)
     os.makedirs(root)
-    plan = {"main": "main", "workload": workload, "paths": ["p"], "dc": None, "schedule": [],
+    plan = {"main": "main", "workload": workload, "paths": ["p"], "dc": None, "schedule": [], "config": {"duration": 20},
             "arms": {"main": {"role": "main", "flags": [], "commit": "a" * 40},
                      "cand": {"role": "candidate", "flags": ["--cc-api=v2"], "commit": "b" * 40}},
             "clients": {"p": {"small": True, "platform": "linux/amd64"}}}
@@ -64,9 +64,14 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
             for i in range(1, flows + 1):
                 size = int(per_flow)
                 useful += size
+                # Backlogged flows: one object each, cut by the 20 s window
+                # (exit 28), unless cand_capped makes the candidate's finish in 5 s.
+                capped = arm == "cand" and cand_capped
+                secs = 5.0 if capped else 20.0
                 rows.append([b, "p", slot, arm, "main" if arm == "main" else "candidate", seen[arm], int(seen[arm] == 1),
-                             "main", 0, "p", "bulk", f"b{i}", iso(start), iso(end), 200 if size else "000", size, 20.0,
-                             0 if size else 28, 1 if size else 0, 20.0, int(end)])
+                             "main", 0, "p", "bulk", f"b{i}o1", iso(start), iso(end), 200 if size else "000", size, secs,
+                             (0 if capped else 28) if size else 7, 1 if capped and size else 0, 20.0,
+                             f"{start:.3f}", f"{start + secs:.3f}"])
             for k in range(1, 21) if workload == "interactive" else ():
                 # Main's probes take 0.1 s; the candidate's take cand_probe,
                 # where None means every other one fails.
@@ -74,7 +79,7 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
                 secs = 0.1 if arm == "main" else (cand_probe if cand_probe is not None else 0.05)
                 rows.append([b, "p", slot, arm, "x", seen[arm], 0, "main", 1, "p", "probe", f"p{k}", iso(start), iso(end),
                              200 if ok else "000", 1024 if ok else 0, secs if ok else 10.0, 0 if ok else 28, int(bool(ok)), 20.0,
-                             int(start) + k])
+                             f"{start + k * 0.5:.3f}", f"{start + k * 0.5 + (secs if ok else 10.0):.3f}"])
             tag = f"b{b:03d}-p"
             name = f"{tag}-s{slot}-{arm}"
             md = os.path.join(root, "metrics")
@@ -118,7 +123,8 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
         json.dump(plan, f)
     if status:
         with open(os.path.join(root, "status.json"), "w") as f:
-            json.dump({"status": status, "exit": 0 if status == "complete" else 1, "production": "unchanged"}, f)
+            json.dump({"status": status, "exit": 0 if status == "complete" else 1, "production": "unchanged",
+                       "fetch_failures": list(fetch_failures)}, f)
     with open(os.path.join(root, "trials.tsv"), "w") as f:
         f.write("\t".join(COLUMNS) + "\n")
         for r in rows:
@@ -235,16 +241,53 @@ class Analyzer(unittest.TestCase):
         self.assertEqual(v[("p", "cand", "wire_per_useful")], "n/a")
 
     def test_probes_outside_the_load_are_dropped(self):
-        load = [{"epoch": "1010", "seconds": "10"}, {"epoch": "1012", "seconds": "11"}]
-        probes = [{"epoch": "1005", "seconds": "0.1"}, {"epoch": "1020", "seconds": "0.1"},
-                  {"epoch": "995", "seconds": "0.1"}, {"epoch": "", "seconds": "0.1"}]
-        kept = an.under_load(probes, load)
-        self.assertEqual([p["epoch"] for p in kept], ["1005"])
+        r = lambda a, b: {"t_start": a, "t_end": b}
+        load = [r("1000.000", "1010.000"), r("1001.000", "1012.000")]
+        probes = [r("1004.900", "1005.000"), r("1019.900", "1020.000"), r("994.900", "995.000"), r("1005", "1006")]
+        self.assertEqual(an.under_load(probes, load), [probes[0]])
         # Without timed load, overlap cannot be shown: nothing counts.
-        self.assertEqual(an.under_load(probes, [{"epoch": "", "seconds": "1"}]), [])
+        self.assertEqual(an.under_load(probes, [r("", "")]), [])
         # A probe in the idle gap between two waves does not count.
-        waves = [{"epoch": "1010", "seconds": "2"}, {"epoch": "1030", "seconds": "2"}]
-        self.assertEqual(an.under_load([{"epoch": "1020", "seconds": "0.5"}], waves), [])
+        waves = [r("1008.000", "1010.000"), r("1028.000", "1030.000")]
+        self.assertEqual(an.under_load([r("1019.500", "1020.000")], waves), [])
+        # Whole seconds could not tell these apart: a 100 ms load ending at
+        # 10.1 and a 100 ms probe from 11.0 to 11.1 did not overlap.
+        self.assertEqual(an.under_load([r("11.000", "11.100")], [r("10.000", "10.100")]), [])
+        # Marginal overlap, below what clock error could explain, is ambiguous.
+        self.assertEqual(an.under_load([r("10.050", "10.150")], [r("10.000", "10.100")]), [])
+        self.assertEqual(len(an.under_load([r("10.000", "10.500")], [r("10.100", "11.000")])), 1)
+
+    def test_byte_capped_trials_void_the_gate_and_the_pilot(self):
+        # The candidate's flows finish their objects in 5 of 20 s: its bytes
+        # equal main's although it was four times faster, or a regression
+        # could hide the same way.
+        root = self.campaign("capped", cand_ratio=1.0, cand_capped=True)
+        text, v = an.report(root, self.measurable)
+        self.assertEqual(v[("p", "cand", "primary")], "VOID")
+        self.assertIn("ran out of bytes before the window closed", text)
+        text, res = an.pilot_report(root, self.gates)
+        self.assertIsNone(res[("p", "cand")])
+        self.assertIn("VOID", text)
+
+    def test_looped_flow_completion(self):
+        row = lambda f, c, e, h="200": {"flow": f, "complete": c, "curl_exit": e, "http": h}
+        self.assertTrue(an.flow_ok([row("b1o1", "1", "0"), row("b1o2", "0", "28")]))
+        self.assertFalse(an.flow_ok([row("b1o1", "0", "7", "000")]))
+        self.assertFalse(an.flow_ok([row("b1", "0", "28")]))  # a one-object flow must finish it
+        self.assertFalse(an.flow_ok([row("b1o1", "0", "56"), row("b1o2", "0", "28")]))
+
+    def test_unfetched_logs_withhold_the_trials_log_measures(self):
+        root = self.campaign("fetch", cand_ratio=1.0,
+                             fetch_failures=("gw:/home/u/qq-ab-x/gw-cand/logs/server-b004-p.jsonl.1.gz",))
+        plan, trials = an.read_campaign(root)
+        an.measure(root, plan, trials)
+        hit = [t for t in trials.values() if t.block == 4 and t.arm == "cand"]
+        other = [t for t in trials.values() if t.block == 4 and t.arm == "main"]
+        self.assertTrue(all(t.m["queue_p90_ms"] != t.m["queue_p90_ms"] for t in hit))
+        self.assertTrue(all(t.m["queue_p90_ms"] == 50.0 for t in other))
+        text, v = an.report(root, self.measurable)
+        self.assertEqual(v[("p", "cand", "queue_p90_ms")], "n/a")
+        self.assertEqual(v[("p", "cand", "overall")], "INCOMPLETE")
 
     def test_http_error_bodies_are_not_useful_bytes(self):
         t = an.Trial(1, "p", 1, "main", "main", 1, True)

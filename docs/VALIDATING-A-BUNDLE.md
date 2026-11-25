@@ -120,7 +120,11 @@ Flags that point a process at state, a listener, a log or a profile
 others) are set by the runner. A config that sets them is rejected, in either
 the `-name` or the `--name` spelling, since Go's flag parser accepts both.
 `--hop-port-count` is rejected too, because it opens listeners that the
-preflight cannot reserve.
+preflight cannot reserve. Enrollment always runs over TCP, so the runner enrolls
+each client against a gateway started with `--transport auto`, then restarts
+it with the arm's own flags for every block. A client's `--local-address`
+is taken from its full flag list in either spelling, and the last occurrence
+wins, as the client itself sees it, so enrollment uses the same interface.
 
 ## Gate 1: a stage's live A/B
 
@@ -150,11 +154,11 @@ followed by its mirror, and every arm is compared with the reference.
   `probe_interval` seconds. It measures interactive p99 under bulk. The probe
   stops as soon as the bulk flows finish, so every sample is taken under
   load. A probe that does not finish counts at its 10-second timeout. Each row
-  carries its remote completion time (`epoch`). A probe is used only if its
-  request overlapped an actual load transfer. A probe that falls in an idle
-  gap between waves, or whose overlap cannot be shown, is left out, and a
-  trial with none left is unmeasured. The hosts' clocks are assumed to be
-  NTP-synchronised, with one second of slack.
+  carries millisecond start and end times on its host's clock (`t_start`,
+  `t_end`). A probe is used only if it overlapped one actual load transfer by
+  at least 0.1 s (`OVERLAP_MIN`, which absorbs NTP-level clock error). A
+  probe in an idle gap between waves, with marginal overlap, or without
+  sub-second times is left out, and a trial with none left is unmeasured.
 
 A stage's gate needs all three. Run them as three campaigns with different
 names.
@@ -171,7 +175,16 @@ gateway keeps its state, and the gateway is the sender for these downloads.
 
 The outcome per arm per block is the useful bytes delivered within `duration`
 seconds, summed over the arm's two trials and all their flows. Useful bytes
-are HTTP 200 body bytes, whole or partial; an error page counts as zero. A failed flow
+are HTTP 200 body bytes, whole or partial; an error page counts as zero.
+
+Each bulk flow fetches object after object until the window closes, so it
+stays backlogged. Otherwise a fast arm would run out of bytes and be capped
+at the same total as a slow one. A flow is complete when every object
+arrived whole, except the last, which the window may cut. The analyzers
+check backlog the same way for the A/B and the DC gate: a flow whose last
+object finished while the flow had been active for clearly less than the
+window was byte-capped. Any capped flow makes the primary gate VOID, and
+the pilot refuses to size from it. A failed flow
 counts what it delivered. A flow that printed nothing counts as zero; it is
 not dropped.
 
@@ -314,9 +327,10 @@ and each client host is one leaf under a shared ancestor. The DC campaign
     measurement.
 - **A shared start:** a phase's jobs start on a barrier, five seconds ahead
   on the hosts' clocks. Request wave *w* starts at the barrier plus
-  (*w* − 1) × `request_timeout` on every leaf. The analysis requires each
-  wave's requests to overlap across all loaded leaves; otherwise latency and
-  spread are unmeasured. This also relies on NTP-synchronised clocks.
+  (*w* − 1) × `request_timeout` on every leaf. The analysis requires every
+  loaded leaf to have been in each wave together for at least 0.1 s, on
+  millisecond times; otherwise latency and spread are unmeasured. This also
+  relies on NTP-synchronised clocks.
 - **Calibration:** at the end of every block, each loaded leaf runs alone on
   the legacy arm. Every judged block needs its own usable calibration of every
   loaded leaf; otherwise the campaign is INCOMPLETE.
@@ -346,22 +360,31 @@ shared relay, but their groups spread out by 3.5×, while the shared relay
 finished every flow within 2 ms. A knowledge-only tree buys aggregate the same
 way, so a candidate that wins on goodput by starving a leaf fails here.
 
-The campaign is **VOID** in three cases:
+The campaign is **VOID** when the evidence contradicts the gate's premise:
+
+- **Carrier and leaves.** With the campaign trace on, the gateway's flow
+  record names each QUIC carrier's path-tree egress and leaf key
+  (`path_egress`, `path_key`, as `resolvePath` keys the tree). Each solo
+  calibration trial must show exactly one leaf key. The loaded leaves' keys
+  must be distinct: two hosts behind one address are one leaf. Each
+  simultaneous trial must show exactly those keys plus one control key, all
+  under one egress. Every flow must be QUIC, and no client's fallback counter
+  may move. If the records or counters are missing, there is no verdict.
 
 - The shared ancestor did not bind. The legacy arm's simultaneous rate must
   average at most 0.80 of the sum of the leaves' solo rates. Each rate is a
   leaf's bytes over the duration of its longest flow, so objects that finish
   early cannot hide a shared bottleneck. Otherwise the campaign did not test
   the regime, so add load and rerun.
-- More than 10% of the sustained flows finished their object inside the
-  window. Both arms were then capped at the object size, so raise
-  `object_bytes`.
+- A sustained flow was byte-capped (as in Gate 1). Raise `object_bytes`.
 - More than 10% of the legacy arm's blocks delivered nothing. Rerun.
 - The legacy arm completed fewer than 90% of its requests, so the workload
   does not work at all. Latency would otherwise compare two sets of
   substituted timeouts.
 
-An unfinished campaign is INCOMPLETE, as in Gate 1. So is one in which any
+A log file that could not be fetched withholds the log-derived measures of
+its trials, and the coverage rule then leaves the affected secondaries
+unmeasured. An unfinished campaign is INCOMPLETE, as in Gate 1. So is one in which any
 criterion lacks evidence in some judged block, for example a control probe
 that produced nothing or did not overlap the load. So is one in which any
 endpoint does not show `dc-long-haul`. The runner adds that flag to both

@@ -17,7 +17,7 @@ sys.modules["dc_gate"] = dc
 SPEC.loader.exec_module(dc)
 
 COLUMNS = ("block", "path", "slot", "arm", "role", "arm_trial", "cold", "phase", "job", "client", "kind", "flow",
-           "start_utc", "end_utc", "http", "bytes", "seconds", "curl_exit", "complete", "wall", "epoch")
+           "start_utc", "end_utc", "http", "bytes", "seconds", "curl_exit", "complete", "wall", "t_start", "t_end")
 LOADED = ["la", "lb", "lc"]
 
 
@@ -25,9 +25,14 @@ def iso(t):
     return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def ms(x):
+    return f"{x:.3f}"
+
+
 def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blocks=12, seed=3,
              cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False, no_solo=(),
-             profile="dc-long-haul", fail_requests=(), stagger=(), gw_args=True):
+             profile="dc-long-haul", fail_requests=(), stagger=(), gw_args=True, nat=False, tcp_leaf=None,
+             no_path_key=False, fallback_leaf=None):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -35,14 +40,34 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
     candidate's leaves get `cand_shares` of an aggregate `cand_total` times
     legacy's; their request times scale inversely with their share. Solo runs
     deliver legacy_leaf / binding each, so the ancestor binds iff binding < 1.
+    The gateway records each leaf's QUIC flows under its own key below one
+    egress; `nat` puts two leaves behind one address, `tcp_leaf` moves one
+    leaf's flows to TCP, `no_path_key` drops the leaf evidence, and
+    `fallback_leaf` has one client count a TCP fallback.
     """
     rng = random.Random(seed)
     os.makedirs(root)
-    plan = {"main": "legacy", "workload": "dc", "paths": ["dc"],
+    plan = {"main": "legacy", "workload": "dc", "paths": ["dc"], "config": {"duration": 60},
             "dc": {"loaded": LOADED, "control": "ctl", "request_timeout": 30},
             "arms": {"legacy": {"role": "main", "flags": []}, "cand": {"role": "candidate", "flags": ["--congestion=path"]}},
             "clients": {c: {"small": True} for c in LOADED + ["ctl"]}, "schedule": []}
-    rows = []
+    rows, srv, mets = [], {}, {}
+    egress = "203.0.113.1"
+    addr = {"la": "198.51.100.1", "lb": "198.51.100.2", "lc": "198.51.100.2" if nat else "198.51.100.3",
+            "ctl": "198.51.100.9"}
+
+    def flow_record(arm, b, when, leaf):
+        rec = {"time": iso(when), "msg": "remote flow complete", "transport": "tcp" if leaf == tcp_leaf else "quic"}
+        if not no_path_key:
+            rec.update(path_egress=egress, path_key=f"{egress}->{addr[leaf]}")
+        srv.setdefault((arm, b), []).append(rec)
+
+    def client_metrics(b, slot, arm, leaves):
+        for leaf in leaves:
+            name = f"b{b:03d}-dc-s{slot}-{arm}"
+            mets[f"{name}-pre-client-{leaf}"] = 3
+            mets[f"{name}-post-client-{leaf}"] = 3 + (1 if leaf == fallback_leaf else 0)
+
     t = 1_780_000_000.0
     norm = sum(cand_shares) / len(cand_shares)
     for b in range(1, blocks + 1):
@@ -57,36 +82,49 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
             for j, leaf in enumerate(LOADED):
                 share = 1.0 if arm == "legacy" else cand_shares[j] / norm * cand_total
                 size = 0 if (arm == "legacy" and b in zero_legacy) else int(level * share * noise / 2)
+                secs = 20 if finished else 60
                 for i in (1, 2):
-                    rows.append([b, "dc", slot] + base + ["sustained", j, leaf, "bulk", f"b{i}", iso(t), iso(t + 60),
-                                                          200, size, 60, 0 if finished else 28, int(finished), 60, int(t + 60)])
+                    rows.append([b, "dc", slot] + base + ["sustained", j, leaf, "bulk", f"b{i}o1", iso(t), iso(t + 60),
+                                                          200, size, secs, 0 if finished else 28, int(finished), 60,
+                                                          ms(t), ms(t + secs)])
                 rt = 0.30 * (1.0 if arm == "legacy" else cand_request / max(share, 1e-3)) * noise
                 failed = arm in fail_requests
                 for w in (1, 2, 3):
-                    # Wave w runs in [t+60+10w-1, t+60+10w] on every leaf, unless
-                    # this (block, leaf) is staggered past the others.
-                    end = int(t + 60 + 10 * w + (5 if (b, leaf) in stagger else 0))
+                    # Wave w ends at t+60+10w on every leaf, unless this
+                    # (block, leaf) is staggered past the others.
+                    end = t + 60 + 10 * w + (5 if (b, leaf) in stagger else 0)
+                    dur = 30.0 if failed else rt
                     for r in range(1, 9):
                         rows.append([b, "dc", slot] + base + ["requests", j, leaf, "requests", f"w{w}r{r}", iso(t + 60),
                                                               iso(t + 70), "000" if failed else 200, 0 if failed else 307200,
-                                                              30 if failed else f"{rt:.4f}", 28 if failed else 0, 0 if failed else 1, 10, end])
+                                                              30 if failed else f"{rt:.4f}", 28 if failed else 0,
+                                                              0 if failed else 1, 10, ms(end - dur), ms(end)])
+                flow_record(arm, b, t + 30, leaf)
             ctl = 0.20 * (1.0 if arm == "legacy" else cand_control) * noise
             for phase in ("sustained", "requests"):
                 if (b, slot, phase) in drop_control:
                     continue
                 for p in range(1, 15):
-                    ep = int(t + 1 + 4 * p) if phase == "sustained" else int(t + 70 + 10 * (p % 3))
+                    ep = t + 1 + 4 * p if phase == "sustained" else t + 70 + 10 * (p % 3)
                     rows.append([b, "dc", slot] + base + [phase, 3, "ctl", "probe", f"p{p}", iso(t), iso(t + 60),
-                                                          200, 307200, f"{ctl:.4f}", 0, 1, 60, ep])
-            t += 80
+                                                          200, 307200, f"{ctl:.4f}", 0, 1, 60, ms(ep - ctl), ms(ep)])
+            flow_record(arm, b, t + 30, "ctl")
+            client_metrics(b, slot, arm, LOADED + ["ctl"])
+            t += 100
         for j, leaf in enumerate(LOADED):
             if (b, leaf) in no_solo:
                 continue
             for i in (1, 2):
-                rows.append([b, "dc", 100 + j, "legacy", "main", 0, 0, "solo", 0, leaf, "bulk", f"b{i}", iso(t),
-                             iso(t + 60), 200, int(level / binding / 2), 60, 28, 0, 60, int(t + 60)])
+                rows.append([b, "dc", 100 + j, "legacy", "main", 0, 0, "solo", 0, leaf, "bulk", f"b{i}o1", iso(t),
+                             iso(t + 60), 200, int(level / binding / 2), 60, 28, 0, 60, ms(t), ms(t + 60)])
+            flow_record("legacy", b, t + 30, leaf)
+            client_metrics(b, 100 + j, "legacy", [leaf])
             t += 65
     os.makedirs(os.path.join(root, "effective"), exist_ok=True)
+    os.makedirs(os.path.join(root, "metrics"), exist_ok=True)
+    for name, v in mets.items():
+        with open(os.path.join(root, "metrics", name + ".txt"), "w") as f:
+            f.write(f"queqiao_fallbacks_total {v}\n")
     for arm in ("legacy", "cand"):
         if gw_args:
             with open(os.path.join(root, "effective", f"gw-{arm}.args"), "w") as f:
@@ -97,6 +135,10 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
             with open(os.path.join(root, "logs", d, "x-b001-dc.jsonl"), "w") as f:
                 f.write(json.dumps({"time": iso(t), "msg": "runtime configuration",
                                     "path_profile": profile if arm == "cand" else "dc-long-haul"}) + "\n")
+    for (arm, b), recs in srv.items():
+        with open(os.path.join(root, "logs", f"gw-{arm}", f"server-b{b:03d}-dc.jsonl"), "w") as f:
+            for rec in recs:
+                f.write(json.dumps(rec) + "\n")
     with open(os.path.join(root, "plan.json"), "w") as f:
         json.dump(plan, f)
     with open(os.path.join(root, "status.json"), "w") as f:
@@ -225,6 +267,43 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("nogw", gw_args=False)
         self.assertEqual(v["cand"], "INCOMPLETE")
         self.assertIn("gateway legacy: no evidence it ran --path-profile dc-long-haul", text)
+
+    def test_leaves_behind_one_address_are_one_leaf(self):
+        # Three ssh hosts, but two share an address at the gateway: the gate
+        # must not report cross-leaf fairness over leaves that did not exist.
+        text, v = self.run_gate("nat", nat=True)
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("not distinct at the gateway", text)
+
+    def test_a_leaf_on_tcp_voids_the_campaign(self):
+        text, v = self.run_gate("tcp", tcp_leaf="lb")
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("not only QUIC", text)
+
+    def test_a_client_fallback_voids_the_campaign(self):
+        text, v = self.run_gate("fallback", fallback_leaf="lc")
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("client lc fell back to TCP", text)
+
+    def test_without_leaf_evidence_there_is_no_verdict(self):
+        text, v = self.run_gate("nokey", no_path_key=True)
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("no gateway record of its carrier and leaf", text)
+
+    def test_waves_must_overlap_on_millisecond_times(self):
+        # Waves 0.3 s long whose ends are 0.25 s apart on two leaves overlap
+        # by only 0.05 s: ambiguous under clock error, so unmeasured.
+        root = os.path.join(self.tmp.name, "nearmiss")
+        write_dc(root, blocks=2)
+        plan, trials = dc.read_campaign(root)
+        t = next(t for t in trials.values() if t.arm == "legacy" and t.slot < 100)
+        for r in t.rows:
+            if r["client"] == "lb" and r["kind"] == "requests":
+                r["t_start"] = ms(float(r["t_start"]) + 0.25)
+                r["t_end"] = ms(float(r["t_end"]) + 0.25)
+        m = dc.dc_measures(t, LOADED, "ctl", 30, 60)
+        self.assertEqual(m["waves_overlap"], 0.0)
+        self.assertNotEqual(m["latency_p50"], m["latency_p50"])
 
     def test_unfinished_campaign_gets_no_verdict(self):
         root = os.path.join(self.tmp.name, "unfinished")

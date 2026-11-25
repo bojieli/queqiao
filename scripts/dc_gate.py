@@ -18,14 +18,15 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import glob
 import os
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
-from ab_analyze import (PROBE_TIMEOUT, Trial, completeness, fmt, iter_json, read_campaign,  # noqa: E402
-                        span, under_load, useful)
+from ab_analyze import (OVERLAP_MIN, PROBE_TIMEOUT, Trial, capped_flows, completeness, flow_rows,  # noqa: E402
+                        fmt, iter_json, metrics, read_campaign, span, ts, under_load, useful)
 
 BOUNDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "dc_gate.ini")
 
@@ -44,18 +45,20 @@ def load_bounds(path: str = BOUNDS) -> dict:
 
 def leaf_rate(rows: List[dict]) -> float:
     """Bytes per second while the leaf was loaded: its bytes over the longest
-    of its flows. A rate, not a byte total, so that objects finishing inside
-    the window cannot make a shared bottleneck look unshared."""
-    secs = max((float(r["seconds"]) for r in rows), default=0.0)
+    of its flows (a backlogged flow's objects back to back). A rate, not a
+    byte total, so that objects finishing inside the window cannot make a
+    shared bottleneck look unshared."""
+    secs = max((sum(float(r["seconds"] or 0) for r in rs) for rs in flow_rows(rows).values()), default=0.0)
     return sum(useful(r) for r in rows) / secs if secs > 0 else float("nan")
 
 
-def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: float) -> Dict[str, float]:
+def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: float, duration: float = 0.0) -> Dict[str, float]:
     m: Dict[str, float] = {}
     sus = [r for r in t.rows if r["phase"] == "sustained" and r["kind"] == "bulk"]
     m["sim_rate"] = sum(leaf_rate([r for r in sus if r["client"] == leaf]) for leaf in loaded)
-    m["sus_flows"] = len(sus)
-    m["sus_finished"] = sum(1 for r in sus if r["complete"] == "1")
+    # The same capping rule as the A/B analysis, leaf by leaf (flow names
+    # repeat across leaves).
+    m["capped"] = sum(capped_flows([r for r in sus if r["client"] == leaf], duration) for leaf in loaded)
     per_leaf = {leaf: float(sum(useful(r) for r in sus if r["client"] == leaf)) for leaf in loaded}
     m["aggregate_bytes"] = sum(per_leaf.values())
     m["worst_leaf_bytes"] = min(per_leaf.values()) if per_leaf else float("nan")
@@ -76,7 +79,9 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
                 overlap = False
                 break
             iv.append((min(a for a, _ in sp), max(b for _, b in sp)))
-        if overlap and not max(a for a, _ in iv) <= min(b for _, b in iv) + 1.0:
+        # Demonstrable overlap, on millisecond times: all leaves were in the
+        # wave together for at least OVERLAP_MIN.
+        if overlap and not min(b for _, b in iv) - max(a for a, _ in iv) >= OVERLAP_MIN - 1e-6:
             overlap = False
     m["waves_overlap"] = float(overlap)
     leaf_med = [st.median([done(r) for r in req if r["client"] == leaf]) for leaf in loaded]
@@ -107,6 +112,97 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     return m
 
 
+def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Trial], loaded: List[str],
+                     control: str) -> Tuple[List[str], List[str]]:
+    """Did each trial run on QUIC through the leaves the gate is about?
+
+    From the gateway's flow records (path_egress / path_key, written under
+    the campaign trace) and each client's fallback counter, per block:
+    every solo calibration trial shows exactly one leaf key, the loaded
+    leaves' keys are distinct (two hosts behind one NAT are one leaf), every
+    simultaneous trial shows exactly those keys plus the control leaf's, all
+    flows are QUIC under one common egress, and no client fell back to TCP.
+    Returns (missing evidence, which withholds the verdict; contrary
+    evidence, which voids the campaign)."""
+    missing: List[str] = []
+    wrong: List[str] = []
+    records: Dict[Tuple[str, int], List[dict]] = {}
+
+    def recs(arm: str, block: int) -> List[dict]:
+        k = (arm, block)
+        if k not in records:
+            files = glob.glob(os.path.join(campaign, "logs", f"gw-{arm}", f"server-b{block:03d}-dc.jsonl*"))
+            out = []
+            for r in iter_json(files, ('"remote flow complete"', '"remote flow ended with error"')):
+                try:
+                    r["_t"] = ts(r["time"])
+                except (KeyError, ValueError):
+                    continue
+                out.append(r)
+            records[k] = out
+        return records[k]
+
+    def in_trial(t: Trial) -> List[dict]:
+        return [r for r in recs(t.arm, t.block) if t.start - 1 <= r["_t"] <= t.end + 5]
+
+    def fallbacks(t: Trial, leaf: str) -> float:
+        name = f"{t.tag}-s{t.slot}-{t.arm}"
+        a, b = metrics(campaign, f"{name}-pre-client-{leaf}"), metrics(campaign, f"{name}-post-client-{leaf}")
+        return b.get("queqiao_fallbacks_total", float("nan")) - a.get("queqiao_fallbacks_total", float("nan"))
+
+    def check(t: Trial, leaves: List[str], what: str) -> Optional[set]:
+        rs = in_trial(t)
+        if not rs or any("path_key" not in r for r in rs):
+            missing.append(f"{what}: no gateway record of its carrier and leaf (needs QUEQIAO_LANE_TRACE=1 and a build "
+                           "that logs path_key)")
+            return None
+        if any(r.get("transport") != "quic" for r in rs):
+            wrong.append(f"{what}: flows ran over {sorted({r.get('transport') for r in rs})}, not only QUIC")
+        for leaf in leaves:
+            fb = fallbacks(t, leaf)
+            if fb != fb:
+                missing.append(f"{what}: no fallback counter from client {leaf}")
+            elif fb > 0:
+                wrong.append(f"{what}: client {leaf} fell back to TCP")
+        egress = {r.get("path_egress") for r in rs}
+        if len(egress) != 1:
+            wrong.append(f"{what}: flows under {len(egress)} egresses, not one common ancestor")
+        return {r["path_key"] for r in rs}
+
+    egress_seen = set()
+    for b in sorted({t.block for t in ab}):
+        keys: Dict[str, str] = {}
+        for t in [t for t in solo if t.block == b]:
+            leaf = next((r["client"] for r in t.rows), "")
+            got = check(t, [leaf], f"block {b} solo {leaf}")
+            if got is None:
+                continue
+            if len(got) != 1:
+                wrong.append(f"block {b} solo {leaf}: {len(got)} leaf keys at the gateway, expected 1")
+            else:
+                keys[leaf] = next(iter(got))
+        egress_seen |= {r.get("path_egress") for t in solo if t.block == b for r in in_trial(t)}
+        if set(keys) != set(loaded):
+            continue  # calibration problems are reported by the calibration check
+        if len(set(keys.values())) != len(loaded):
+            wrong.append(f"block {b}: the loaded leaves are not distinct at the gateway ({sorted(keys.values())}); "
+                         "hosts behind one address are one leaf")
+            continue
+        want = set(keys.values())
+        for t in [t for t in ab if t.block == b]:
+            got = check(t, loaded + [control], f"block {b} slot {t.slot} ({t.arm})")
+            if got is None:
+                continue
+            egress_seen |= {r.get("path_egress") for r in in_trial(t)}
+            extra = got - want
+            if not want <= got or len(extra) != 1:
+                wrong.append(f"block {b} slot {t.slot} ({t.arm}): gateway saw leaves {sorted(got)}, expected the loaded "
+                             f"leaves {sorted(want)} and one distinct control leaf")
+    if len(egress_seen) > 1:
+        wrong.append(f"leaves were under {len(egress_seen)} egresses, not one common ancestor")
+    return sorted(set(missing)), sorted(set(wrong))
+
+
 def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     plan, trials = read_campaign(campaign)
     if plan.get("workload") != "dc" or not plan.get("dc"):
@@ -118,8 +214,11 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     cands = [a for a in plan["arms"] if a != main]
     ab = [t for t in trials.values() if t.slot < 100]
     solo = [t for t in trials.values() if t.slot >= 100]
+    duration = float(plan.get("config", {}).get("duration") or 0)
     for t in ab:
-        t.m = dc_measures(t, loaded, control, dc["request_timeout"])
+        t.m = dc_measures(t, loaded, control, dc["request_timeout"], duration)
+    evidence_missing, evidence_wrong = carrier_evidence(campaign, plan, ab, solo, loaded, control)
+    problems = problems + evidence_missing
 
     def per_block(arm: str, key: str, agg) -> Dict[int, float]:
         out: Dict[int, List[float]] = {}
@@ -158,17 +257,14 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
                                f"(first: block {uncalibrated[0]})"]
     binding_mean = st.mean(binding)
     bound_ok = binding_mean == binding_mean and binding_mean <= bounds["binding_max"]
-    # The sustained outcome is bytes within the window; if the objects ran
-    # out first, both arms are capped at the object size and look alike.
-    flows = sum(t.m["sus_flows"] for t in ab)
-    finished = sum(t.m["sus_finished"] for t in ab) / flows if flows else float("nan")
-    backlogged = finished == finished and finished <= 0.10
+    # The sustained outcome is bytes within the window; if a flow ran out of
+    # bytes first, the arms are capped at the object size and look alike.
+    capped = sum(int(t.m["capped"]) for t in ab)
 
     # Every endpoint of every arm must have run dc-long-haul, checked one
     # endpoint at a time. Clients log their path profile; the gateway does
     # not, so its evidence is its running command line, recorded by the
     # runner at every start.
-    import glob
     for arm in plan["arms"]:
         try:
             with open(os.path.join(campaign, "effective", f"gw-{arm}.args")) as f:
@@ -192,12 +288,16 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     zero_void = not (zero_frac <= bounds["max_zero_main_fraction"])
     legacy_completion = st.mean([t.m["completion"] for t in ab if t.arm == main])
     workload_broken = not (legacy_completion >= bounds["min_legacy_completion"])
-    void_reason = ("more than the pre-registered fraction of legacy blocks delivered nothing" if zero_void else
+    # Order: what the traffic actually was (carrier, leaves), whether it was
+    # backlogged, then whether the workload worked and bound the ancestor;
+    # a later reason is meaningless when an earlier one holds.
+    void_reason = ("; ".join(evidence_wrong) if evidence_wrong else
+                   f"{capped} sustained flow(s) ran out of bytes before the window closed; raise object_bytes"
+                   if capped else
+                   "more than the pre-registered fraction of legacy blocks delivered nothing" if zero_void else
                    f"the legacy arm completed only {legacy_completion:.0%} of requests; the workload does not work"
                    if workload_broken else
-                   "the shared ancestor did not bind; add load" if not bound_ok else
-                   f"{finished:.0%} of sustained flows finished their object inside the window; raise object_bytes"
-                   if not backlogged else "")
+                   "the shared ancestor did not bind; add load" if not bound_ok else "")
     criteria = [
         # name, key, per-block aggregation, contrast builder (cand, legacy) -> d
         ("sustained goodput (aggregate bytes)", "aggregate_bytes", total,

@@ -111,29 +111,85 @@ def useful(row: dict) -> int:
     return int(row["bytes"] or 0) if row.get("http") == "200" else 0
 
 
+# Least overlap, in seconds, that counts as "at the same time" between rows
+# timed on different hosts: it absorbs NTP-level clock error and the few
+# milliseconds the timestamps bracket around curl. Less is ambiguous, and an
+# ambiguous sample is unmeasured, never assumed concurrent.
+OVERLAP_MIN = 0.1
+
+
 def span(r: dict) -> Optional[Tuple[float, float]]:
-    """A row's (start, end) on its host's clock: the remote completion time
-    (`epoch`, whole seconds) minus curl's duration; None if unrecorded."""
-    e = r.get("epoch") or ""
-    if not e.isdigit():
+    """A row's (start, end) on its host's clock, in milliseconds as the runner
+    records them; None when a row has no sub-second times, since whole
+    seconds cannot show that two requests overlapped."""
+    a, b = r.get("t_start") or "", r.get("t_end") or ""
+    if "." not in a or "." not in b:
         return None
-    return float(e) - float(r.get("seconds") or 0), float(e)
+    try:
+        return float(a), float(b)
+    except ValueError:
+        return None
 
 
-def under_load(probes: List[dict], load: List[dict], slack: float = 1.0) -> List[dict]:
-    """Probes whose request overlapped some load transfer: the union of the
-    load rows' intervals, so an idle gap between waves does not count. When
-    overlap cannot be established (no timed load, or an untimed probe) the
-    probe is left out, and the measure becomes unmeasured rather than idle.
-    The hosts' clocks are assumed NTP-synchronised; `slack` absorbs the
-    one-second rounding."""
+def overlap(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    return min(a[1], b[1]) - max(a[0], b[0])
+
+
+def under_load(probes: List[dict], load: List[dict]) -> List[dict]:
+    """Probes that demonstrably overlapped a load transfer, by at least
+    OVERLAP_MIN against some single load row: the union of load intervals,
+    so an idle gap between waves does not count. A probe whose overlap
+    cannot be shown (untimed, or only marginal) is left out, and the measure
+    becomes unmeasured rather than idle. Hosts are assumed NTP-synchronised."""
     spans = [sp for sp in (span(r) for r in load) if sp is not None]
     out = []
     for r in probes:
         sp = span(r)
-        if sp is not None and any(sp[1] >= a - slack and sp[0] <= b + slack for a, b in spans):
+        if sp is not None and any(overlap(sp, x) >= OVERLAP_MIN - 1e-6 for x in spans):
             out.append(r)
     return out
+
+
+def flow_rows(rows: List[dict]) -> Dict[str, List[dict]]:
+    """Bulk rows grouped by flow: b<i>o<k> is flow b<i>'s k-th object (a
+    runner that kept the flow backlogged); a bare b<i> is a one-object flow."""
+    out: Dict[str, List[dict]] = collections.OrderedDict()
+    for r in rows:
+        out.setdefault(r["flow"].split("o", 1)[0], []).append(r)
+    for v in out.values():
+        v.sort(key=lambda r: int(r["flow"].split("o", 1)[1]) if "o" in r["flow"] else 0)
+    return out
+
+
+def flow_ok(rows: List[dict]) -> bool:
+    """Every object complete, except that a looped flow's last object may be
+    cut by the window (HTTP 200, curl timeout)."""
+    if not rows:
+        return False
+    looped = "o" in rows[0]["flow"]
+    *done, last = rows
+    if any(r["complete"] != "1" for r in done):
+        return False
+    return last["complete"] == "1" or (looped and last.get("http") == "200" and last.get("curl_exit") == "28")
+
+
+def capped_flows(rows: List[dict], duration: float) -> int:
+    """Bulk flows that ran out of bytes before the window closed: the last
+    object finished (curl exit 0) and the flow was active for clearly less
+    than the window. Its bytes are then capped at the objects' size, so a
+    fast and a slow arm can deliver the same total. The A/B and DC analyses
+    both void a campaign with any capped flow."""
+    n = 0
+    slack = max(2.0, 0.05 * duration)
+    for rs in flow_rows(rows).values():
+        last = rs[-1]
+        if last.get("curl_exit") != "0":
+            continue
+        spans = [span(r) for r in rs]
+        active = (spans[-1][1] - spans[0][0]) if all(spans) else sum(float(r["seconds"] or 0) for r in rs)
+        if active < duration - slack:
+            n += 1
+    return n
 
 
 class Trial:
@@ -172,6 +228,18 @@ def read_campaign(campaign: str) -> Tuple[dict, Dict[Tuple[int, str, int], Trial
     return plan, trials
 
 
+def fetch_failed(campaign: str) -> List[str]:
+    """Remote log paths the runner could not fetch (status.json)."""
+    try:
+        with open(os.path.join(campaign, "status.json")) as f:
+            return list(json.load(f).get("fetch_failures") or [])
+    except (OSError, ValueError):
+        return []
+
+
+LOG_MEASURES = ("queue_p90_ms", "reissued_per_source", "transit_p50_s", "transit_p90_s", "cpu_p90")
+
+
 def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]) -> Tuple[List[str], Dict[Tuple[int, str, int], Trial]]:
     """Problems that forbid a verdict, and the trials of complete blocks only.
 
@@ -192,6 +260,9 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
             problems.append(f"the campaign {status.get('status')} (exit {status.get('exit')})")
         if status.get("production") != "unchanged":
             problems.append("production changed during the campaign")
+        if status.get("fetch_failures"):
+            problems.append(f"{len(status['fetch_failures'])} log file(s) could not be fetched; the log-derived "
+                            "measures of the affected trials are withheld")
     planned: Dict[Tuple[int, str], set] = collections.defaultdict(set)
     for sl in plan.get("schedule", []):
         planned[(sl["block"], sl["path"])].add(sl["slot"])
@@ -328,6 +399,7 @@ def effective(r: dict) -> str:
 def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]) -> str:
     """Fill each trial's measures; returns which transit method was used."""
     method = set()
+    failed = fetch_failed(campaign)
     cache: Dict[Tuple[str, str], List[dict]] = {}
     current = None
     for t in trials.values():
@@ -343,9 +415,11 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         wall = max((float(r["wall"]) for r in bulk), default=float("nan"))
         t.m["useful_bytes"] = useful
         t.m["goodput_mbps"] = useful * 8 / wall / 1e6 if wall and wall == wall and wall > 0 else float("nan")
-        t.m["flows"] = len(bulk)
-        t.m["ok"] = sum(int(r["complete"]) for r in bulk)
-        t.m["completion"] = t.m["ok"] / len(bulk) if bulk else float("nan")
+        flows = flow_rows(bulk)
+        t.m["flows"] = len(flows)
+        t.m["ok"] = sum(1 for rs in flows.values() if flow_ok(rs))
+        t.m["completion"] = t.m["ok"] / len(flows) if flows else float("nan")
+        t.m["capped"] = capped_flows(bulk, float(plan.get("config", {}).get("duration") or 0))
         sent = d("queqiao_quic_packets_sent")
         t.m["loss"] = d("queqiao_quic_loss_observed_packets_total") / sent if sent and sent == sent else float("nan")
         t.m["stalls_per_trial"] = d("queqiao_flow_stalls_detected_total")
@@ -417,6 +491,12 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         t.m["transit_p50_s"] = st.quantile(ex, 0.5)
         t.m["transit_p90_s"] = st.quantile(ex, 0.9)
         t.m["cpu_p90"] = cpu_p90(cpus, t)
+        # A trial whose logs were not all fetched has partial telemetry: a
+        # finite number from a subset is not a measurement of the trial.
+        if any(f"-{t.tag}" in x and (f"/gw-{t.arm}/" in x or f"-{t.arm}/" in x) for x in failed):
+            for k in LOG_MEASURES:
+                t.m[k] = float("nan")
+            t.m["_transit"] = []
     return "/".join(sorted(method)) or "none"
 
 
@@ -545,6 +625,13 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
             g = st.gate(c, m, ratio=gates["ratio"], alpha=gates["alpha"], resamples=gates["resamples"],
                         seed=gates["seed"], max_zero_main_fraction=gates["max_zero_main_fraction"])
             verdict = "VOID" if g.void else ("**PASS**" if g.passed else "**FAIL**")
+            capped = sum(int(t.m.get("capped", 0)) for t in trials.values()
+                         if t.path == path and t.arm in (main, cand) and t.block in set(common))
+            if capped:
+                # Byte-capped outcomes make a fast and a slow arm look alike.
+                verdict = "VOID"
+                g.reason = f"void: {capped} bulk flow(s) ran out of bytes before the window closed; raise object_bytes"
+                g.passed = False
             if problems:
                 # No verdict from an incomplete campaign, whatever the numbers say.
                 verdict = "INCOMPLETE"
@@ -609,8 +696,10 @@ def pilot_report(campaign: str, gates: dict) -> Tuple[str, dict]:
     # A DC campaign's solo calibration slots are not part of the A/B, and its
     # bulk rows are the sustained phase that dc_gate.py tests.
     trials = {k: t for k, t in trials.items() if k[2] < 100}
+    duration = float(plan.get("config", {}).get("duration") or 0)
     for t in trials.values():
         t.m["useful_bytes"] = t.useful_bytes()
+        t.m["capped"] = capped_flows(t.bulk(), duration)
     main = plan["main"]
     arms = [a for a in plan["arms"] if a != main]
     out = [f"## Pilot: {os.path.basename(os.path.normpath(campaign))}", "",
@@ -626,6 +715,13 @@ def pilot_report(campaign: str, gates: dict) -> Tuple[str, dict]:
         for cand in arms:
             c, m, common = paired(trials, path, main, cand, block_outcome)
             if len(common) < 2:
+                continue
+            capped = sum(int(t.m["capped"]) for t in trials.values()
+                         if t.path == path and t.arm in (main, cand) and t.block in set(common))
+            if capped:
+                res[(path, cand)] = None
+                out.append(f"| {path} | {cand} | {len(common)} | n/a | n/a | VOID: {capped} bulk flow(s) ran out of "
+                           "bytes before the window closed; raise object_bytes and rerun the pilot |")
                 continue
             d = st.contrasts(c, m, gates["ratio"])
             sd, em = st.stdev(d), st.mean(m)

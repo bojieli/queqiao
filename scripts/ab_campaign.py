@@ -63,6 +63,11 @@ WORKLOADS = ("bulk", "single", "interactive", "dc")
 PROBE_TIMEOUT = 10
 # Seconds between dispatching a DC phase's jobs and their shared start.
 BARRIER_LEAD = 5
+# Millisecond wall-clock time on a campaign host. Whole seconds (the last
+# fallback) are not precise enough to show overlap, and the analyzers treat
+# such rows as unmeasured rather than guess.
+NOW_SH = ("now() { perl -MTime::HiRes=time -e 'printf \"%.3f\", time' 2>/dev/null || "
+          "python3 -c 'import time; print(\"%.3f\" % time.time(), end=\"\")' 2>/dev/null || date +%s; }; ")
 # The runner owns these options; an arm or host that set them could point a
 # temporary process at production state, a production port or a production log.
 OWNED_FLAGS = ("state", "listen", "metrics-listen", "log-file", "profile",
@@ -73,7 +78,7 @@ CURL_ENV = ("env -u NO_PROXY -u no_proxy -u ALL_PROXY -u all_proxy -u HTTP_PROXY
             "-u HTTPS_PROXY -u http_proxy -u https_proxy curl --noproxy ''")
 TRIAL_COLUMNS = ("block", "path", "slot", "arm", "role", "arm_trial", "cold", "phase", "job",
                  "client", "kind", "flow", "start_utc", "end_utc", "http", "bytes", "seconds",
-                 "curl_exit", "complete", "wall", "epoch")
+                 "curl_exit", "complete", "wall", "t_start", "t_end")
 
 
 class ConfigError(Exception):
@@ -611,48 +616,83 @@ def cfg_work_in(text: str, work: str) -> bool:
 
 # --- the campaign ------------------------------------------------------------
 
-def local_address_args(flags: Sequence[str]) -> List[str]:
-    """The --local-address option of a client's flags, which enrollment needs
-    too so its connection takes the same physical interface."""
+def flag_value(flags: Sequence[str], name: str) -> Optional[str]:
+    """The value Go's flag package would take for -name/--name from these
+    flags: either spelling, "=value" or a separate value, last one wins."""
+    value = None
+    i = 0
+    while i < len(flags):
+        f = flags[i]
+        if f.startswith("-"):
+            key, eq, v = f.lstrip("-").partition("=")
+            if key == name:
+                if eq:
+                    value = v
+                elif i + 1 < len(flags):
+                    value = flags[i + 1]
+                    i += 1
+        i += 1
+    return value
+
+
+def without_flag(flags: Sequence[str], name: str) -> List[str]:
+    """flags with every -name/--name option (and its value) removed."""
     out: List[str] = []
-    for i, f in enumerate(flags):
-        if f.startswith("--local-address="):
-            out.append(f)
-        elif f == "--local-address" and i + 1 < len(flags):
-            out += [f, flags[i + 1]]
+    i = 0
+    while i < len(flags):
+        f = flags[i]
+        if f.startswith("-") and f.lstrip("-").partition("=")[0] == name:
+            i += 1 if "=" in f else 2
+            continue
+        out.append(f)
+        i += 1
     return out
+
+
+def local_address_args(flags: Sequence[str]) -> List[str]:
+    """The client's effective --local-address, which enrollment needs too so
+    its connection takes the same physical interface. Pass the flags in the
+    order the client gets them."""
+    v = flag_value(flags, "local-address")
+    return ["--local-address", v] if v else []
 
 
 def _q(s: str) -> str:
     return shlex.quote(s)
 
 
-def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[Tuple[str, str, str, str, str, str]]:
-    """Parse a job's output into (flow, http, bytes, seconds, curl_exit, epoch),
-    epoch being the remote host's clock when the request ended ("" if unknown).
+FLOW_RE = re.compile(r"^(b[0-9]+o[0-9]+|w[0-9]+r[0-9]+|p[0-9]+)$")
+TIME_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
 
-    A flow that printed nothing usable (curl killed, ssh dropped) is still a
-    row: 0 bytes, HTTP 000, exit -1, so it counts against completion instead
-    of disappearing from the denominator. A probe has no fixed count.
+
+def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[Tuple[str, ...]]:
+    """Parse a job's output into (flow, http, bytes, seconds, curl_exit,
+    t_start, t_end), the times on the job host's clock ("" if unknown).
+
+    Bulk flows are b<i>o<k>: flow i's k-th object. A flow that printed
+    nothing usable (curl killed, ssh dropped) is still a row: 0 bytes, HTTP
+    000, exit -1, so it counts against completion instead of disappearing
+    from the denominator. A probe has no fixed count.
     """
-    got: Dict[str, Tuple[str, str, str, str, str, str]] = {}
+    got: Dict[str, Tuple[str, ...]] = {}
     order: List[str] = []
     for line in out.splitlines():
         parts = line.rstrip("\n").split("\t")
-        if len(parts) < 2 or not re.match(r"^[bwp][0-9r]+$", parts[1]):
+        if len(parts) < 3 or not FLOW_RE.match(parts[2]):
             continue
-        flow = parts[1]
-        f = (parts[2:] + ["", "", "", ""])[:4]
+        t0 = parts[0] if TIME_RE.match(parts[0]) else ""
+        t1 = parts[1] if TIME_RE.match(parts[1]) else ""
+        flow = parts[2]
+        f = (parts[3:] + ["", "", "", ""])[:4]
         code = f[0] if f[0].isdigit() else "000"
         size = f[1] if f[1].isdigit() else "0"
         secs = f[2] or f"{duration:.3f}"
         ex = f[3] if re.match(r"^-?[0-9]+$", f[3] or "") else "-1"
-        epoch = parts[0] if parts[0].isdigit() else ""
         if flow not in got:
             order.append(flow)
-        got[flow] = (flow, code, size, secs, ex, epoch)
+        got[flow] = (flow, code, size, secs, ex, t0, t1)
     if kind == "bulk":
-        want = [f"b{i}" for i in range(1, n + 1)]
+        want = [f"b{i}o1" for i in range(1, n + 1)]
     elif kind == "requests":
         want = [f"w{w}r{i}" for w in range(1, waves + 1) for i in range(1, n + 1)]
     else:
@@ -660,7 +700,7 @@ def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[T
     for flow in want:
         if flow not in got:
             order.append(flow)
-            got[flow] = (flow, "000", "0", f"{duration:.3f}", "-1", "")
+            got[flow] = (flow, "000", "0", f"{duration:.3f}", "-1", "", "")
     return [got[f] for f in order]
 
 
@@ -725,6 +765,7 @@ class Campaign:
         self.active_small: Dict[str, str] = {}   # host -> running temporary client tag
         self.fetch_failures: List[str] = []
         self.reserved: List[str] = []
+        self.production_changed = False
         self.token = "dry-run-token" if dry else os.urandom(16).hex()
         self.started = False
 
@@ -771,6 +812,9 @@ class Campaign:
         for host, snap in now.items():
             changes += [f"{host}: {c}" for c in snapshot_diff(self.before.get(host, {}), snap)]
         if changes:
+            # Latched: a change seen once stays in the final status even if
+            # it is gone by the last snapshot.
+            self.production_changed = True
             with open(os.path.join(self.out, f"prod-diff-{tag}.txt"), "w") as f:
                 f.write("\n".join(changes) + "\n")
             raise ProductionChanged("; ".join(changes))
@@ -805,8 +849,15 @@ class Campaign:
         directories this invocation owns."""
         for host in self.cfg.hosts():
             W = self.w(host)
-            rc, out = self.hosts[host].run(f"mkdir {W} || exit 3\nmkdir {W}/run && printf %s {self.token} > {W}/.owner",
-                                           what="reserve the work directory")
+            try:
+                rc, out = self.hosts[host].run(f"mkdir {W} || exit 3\nmkdir {W}/run && printf %s {self.token} > {W}/.owner",
+                                               what="reserve the work directory")
+            except BaseException as e:
+                # The mkdir may or may not have happened: give back what is
+                # confirmed and name the host whose state is unknown.
+                self.release()
+                raise Refused(f"{host}: reserving {W} failed ({type(e).__name__}: {e}); its outcome is unknown, so check "
+                              f"for {W} there (owner token {self.token}) before retrying") from e
             if rc != 0 and not self.dry:
                 self.release()
                 raise Refused(f"{host}: {W} already exists (another campaign with this name, or a kept one); "
@@ -821,9 +872,12 @@ class Campaign:
     def release(self) -> None:
         for host in list(self.reserved):
             W = self.w(host)
-            self.hosts[host].run(self.owned(host) + f"rm -f {W}/.owner; rmdir {W}/run {W} 2>/dev/null; true",
-                                 what="release an unused reservation")
-            self.reserved.remove(host)
+            try:
+                self.hosts[host].run(self.owned(host) + f"rm -f {W}/.owner; rmdir {W}/run {W} 2>/dev/null; true",
+                                     what="release an unused reservation")
+                self.reserved.remove(host)
+            except Exception as e:
+                self.log(f"{host}: could not release {W} ({e}); remove it by hand (owner token {self.token})")
 
     # -- builds
     def refs(self) -> Dict[str, List[str]]:
@@ -927,7 +981,7 @@ class Campaign:
                       f"temporary provider state for {arm.name}")
         # Enrollment needs a running gateway; start each, enroll every client, stop.
         for arm in cfg.arms:
-            self.start_gateway(arm, "enroll")
+            self.start_gateway(arm, "enroll", enroll=True)
             for client in cfg.clients.values():
                 self.enroll(client, arm)
             self.stop(gh, f"gw-{arm.name}")
@@ -943,7 +997,7 @@ class Campaign:
             raise RuntimeError(f"no invitation from gateway {arm.name}: {out.strip()[:300]}")
         self.must(ch, f"mkdir -p {d}/logs", f"client directory {client.name}/{arm.name}")
         ch.put(self.binary(arm, client.platform, "client"), f"{d}/queqiaod")
-        local = " ".join(_q(x) for x in local_address_args(client.flags))
+        local = " ".join(_q(x) for x in local_address_args(self.client_flags(client, arm)))
         # A profile left by an earlier run would point at another gateway:
         # remove it, enroll, and fail the campaign if enrollment fails.
         self.must(ch, f"chmod +x {d}/queqiaod\ncd {d} && rm -f {d}/profile.json && ./queqiaod enroll --invite {_q(invite)} "
@@ -981,20 +1035,30 @@ rm -f "$f"''', what=f"stop {tag}")
         if rc != 0 and not self.dry:
             raise RuntimeError(f"{host.dest}: {what} is not listening on {port} from its own process ({out.strip()[:200]})")
 
-    def gw_cmd(self, arm: Arm, logname: str) -> str:
+    def client_flags(self, client: Client, arm: Arm) -> List[str]:
+        """A client's configured flags in the order its command line has them."""
+        return [*client.flags, *arm.flags, *arm.client_flags]
+
+    def gw_cmd(self, arm: Arm, logname: str, enroll: bool = False) -> str:
         g, cfg = self.cfg.gateway, self.cfg
         d = self.gw_dir(arm)
+        flags = [*g.flags, *arm.flags, *arm.gateway_flags]
+        if enroll:
+            # Enrollment always runs over TCP; an arm measured with
+            # --transport quic has no TCP listener, so enroll against a
+            # TCP-capable gateway and restart with the arm's transport.
+            flags = without_flag(flags, "transport") + ["--transport", "auto"]
         args = [f"{d}/queqiaod", "server", "--state", f"{d}/state", "--listen", f":{g.port_base + arm.index}",
                 "--metrics-listen", f"127.0.0.1:{g.metrics_port_base + arm.index}", "--log-file", f"{d}/logs/{logname}.jsonl",
-                "--log-max-size-mib", str(cfg.log_max_mib), "--log-stderr=false", *g.flags, *arm.flags, *arm.gateway_flags]
+                "--log-max-size-mib", str(cfg.log_max_mib), "--log-stderr=false", *flags]
         if cfg.dc:
             args += ["--path-profile", "dc-long-haul"]
         return " ".join(_q(a) for a in args)
 
-    def start_gateway(self, arm: Arm, logname: str) -> None:
+    def start_gateway(self, arm: Arm, logname: str, enroll: bool = False) -> None:
         gh = self.hosts[self.cfg.gateway.host]
         env = "QUEQIAO_LANE_TRACE=1" if self.cfg.lane_trace else ""
-        self.spawn(gh, f"gw-{arm.name}", self.gw_dir(arm), self.gw_cmd(arm, logname), env)
+        self.spawn(gh, f"gw-{arm.name}", self.gw_dir(arm), self.gw_cmd(arm, logname, enroll), env)
         self.wait_port(gh, self.cfg.gateway.metrics_port_base + arm.index, f"gateway {arm.name} metrics", f"gw-{arm.name}")
         # The gateway's runtime configuration record has no path profile, so
         # keep its actual command line as evidence of what it ran.
@@ -1010,7 +1074,7 @@ rm -f "$f"''', what=f"stop {tag}")
                 "--listen", f"127.0.0.1:{client.socks_port_base + arm.index}",
                 "--metrics-listen", f"127.0.0.1:{client.metrics_port_base + arm.index}",
                 "--log-file", f"{d}/logs/{logname}.jsonl", "--log-max-size-mib", str(min(self.cfg.log_max_mib, 256)),
-                "--log-stderr=false", *client.flags, *arm.flags, *arm.client_flags]
+                "--log-stderr=false", *self.client_flags(client, arm)]
         if self.cfg.dc:
             args += ["--path-profile", "dc-long-haul"]
         return " ".join(_q(a) for a in args)
@@ -1068,24 +1132,34 @@ rm -f "$f"''', what=f"stop {tag}")
         barrier = f"while [ $(date +%s) -lt {start_at} ]; do sleep 0.1; done; " if start_at else ""
         url = f"http://127.0.0.1:{self.cfg.gateway.origin_port}/"
         curl = f"{CURL_ENV} --socks5-hostname 127.0.0.1:{port} -o /dev/null -s -w '%{{http_code}}\\t%{{size_download}}\\t%{{time_total}}\\t%{{exitcode}}'"
+        # Every request prints "start end flow http bytes seconds exit", the
+        # times in milliseconds on this host's clock (NOW_SH), so overlap
+        # with other hosts' load can be shown rather than assumed.
+        row = "printf '%s\\t%s\\t%s\\t%s\\n' \"$t0\" \"$t1\""
         if kind == "bulk":
-            return (barrier + f"for i in $(seq 1 {n}); do ( r=$({curl} --max-time {int(duration)} {url}obj-{self.cfg.object_bytes} 2>/dev/null); "
-                    f"printf '%s\\t%s\\t%s\\n' \"$(date +%s)\" \"b$i\" \"$r\" ) & done; wait")
+            # Each flow fetches object after object until the window closes,
+            # so it stays backlogged: a fast arm cannot run out of bytes and
+            # be capped at the same total as a slow one.
+            return (NOW_SH + barrier + f"end=$(( $(date +%s) + {int(duration)} )); "
+                    f"for i in $(seq 1 {n}); do ( k=0; while :; do rem=$(( end - $(date +%s) )); [ $rem -gt 0 ] || break; "
+                    f"k=$((k+1)); t0=$(now); r=$({curl} --max-time $rem {url}obj-{self.cfg.object_bytes} 2>/dev/null); t1=$(now); "
+                    f"{row} \"b${{i}}o$k\" \"$r\"; "
+                    f"[ \"${{r##*$'\\t'}}\" = 0 ] && [ \"${{r%%$'\\t'*}}\" = 200 ] || break; done ) & done; wait")
         if kind == "requests":
             dc = self.cfg.dc
             wave = (f"ws=$(( {start_at} + (w - 1) * {dc.request_timeout} )); while [ $(date +%s) -lt $ws ]; do sleep 0.1; done; "
                     if start_at else "")
-            return (f"for w in $(seq 1 {dc.waves}); do {wave}for i in $(seq 1 {n}); do ( r=$({curl} --max-time {dc.request_timeout} "
-                    f"{url}obj-{dc.request_bytes} 2>/dev/null); printf '%s\\t%s\\t%s\\n' \"$(date +%s)\" \"w${{w}}r$i\" \"$r\" ) & done; wait; done")
+            return (NOW_SH + f"for w in $(seq 1 {dc.waves}); do {wave}for i in $(seq 1 {n}); do ( t0=$(now); r=$({curl} --max-time {dc.request_timeout} "
+                    f"{url}obj-{dc.request_bytes} 2>/dev/null); t1=$(now); {row} \"w${{w}}r$i\" \"$r\" ) & done; wait; done")
         if kind == "probe":
             # The probe measures latency under load, so it stops as soon as
             # the runner drops the stop file after the phase's load finishes.
             size = self.cfg.dc.request_bytes if self.cfg.dc else self.cfg.probe_bytes
             interval = self.cfg.dc.control_interval if self.cfg.dc else self.cfg.probe_interval
             stop = self.stop_file(client, arm)
-            return (f"end=$(( $(date +%s) + {int(duration)} )); i=0; "
+            return (NOW_SH + f"end=$(( $(date +%s) + {int(duration)} )); i=0; "
                     f"while [ $(date +%s) -lt $end ] && [ ! -e {stop} ]; do i=$((i+1)); "
-                    f"r=$({curl} --max-time {PROBE_TIMEOUT} {url}obj-{size} 2>/dev/null); printf '%s\\t%s\\t%s\\n' \"$(date +%s)\" \"p$i\" \"$r\"; "
+                    f"t0=$(now); r=$({curl} --max-time {PROBE_TIMEOUT} {url}obj-{size} 2>/dev/null); t1=$(now); {row} \"p$i\" \"$r\"; "
                     f"sleep {interval}; done; rm -f {stop}")
         raise ValueError(kind)
 
@@ -1152,10 +1226,10 @@ rm -f "$f"''', what=f"stop {tag}")
             return
         for i, (client, kind, n) in enumerate(jobs):
             t0, t1, rc, out = results[i]
-            for flow, code, size, secs, ex, epoch in job_rows(out, kind, n, self.cfg.dc.waves if self.cfg.dc else 1, duration):
+            for flow, code, size, secs, ex, ts0, ts1 in job_rows(out, kind, n, self.cfg.dc.waves if self.cfg.dc else 1, duration):
                 complete = int(ex == "0" and code == "200" and size == str(self.expected(kind)))
                 writer([slot.block, slot.path, slot.slot, arm.name, arm.role, slot.arm_trial, int(slot.cold), phase, i,
-                        client.name, kind, flow, utc(t0), utc(t1), code, size, secs, ex, complete, f"{t1 - t0:.3f}", epoch])
+                        client.name, kind, flow, utc(t0), utc(t1), code, size, secs, ex, complete, f"{t1 - t0:.3f}", ts0, ts1])
 
     def clients_for(self, path: str) -> List[Client]:
         if self.cfg.workload == "dc":
@@ -1217,8 +1291,10 @@ rm -f "$f"''', what=f"stop {tag}")
             if leaf.small:
                 self.start_client(leaf, arm, f"client-{tagp}-s{slot.slot}")
             self.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
+            self.scrape_client(leaf, arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
             self.run_phase(slot, arm, "solo", cfg.duration, [(leaf, "bulk", cfg.dc.bulk_flows_per_leaf)], writer)
             self.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
+            self.scrape_client(leaf, arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
             if leaf.small:
                 self.stop_client(leaf, arm)
             if not self.dry:
@@ -1245,7 +1321,9 @@ rm -f "$f"''', what=f"stop {tag}")
         # NAME.jsonl[.N][.gz], NAME.cpu, or NAME-sSLOT.*: never another path
         # whose label merely starts with this one. Labels are [a-z0-9_-], so
         # the prefix needs no regex escaping.
-        rc, out = host.run(f"cd {remote_dir} || exit 3\nls -1 | grep -E '^{prefix}(\\.|-s[0-9]+\\.)'\nexit 0",
+        # exit 3/4: the directory could not be entered or listed; a listing
+        # with no match is exit 0 with no names.
+        rc, out = host.run(f"cd {remote_dir} || exit 3\nl=$(ls -1) || exit 4\nprintf '%s\\n' \"$l\" | grep -E '^{prefix}(\\.|-s[0-9]+\\.)'\nexit 0",
                            what=f"list {prefix} logs")
         if rc != 0 and not self.dry:
             # A failed listing is not an empty one: keep the work directory.
@@ -1327,12 +1405,12 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         if not self.dry:
             os.makedirs(self.out, exist_ok=False)
         self.print_plan(slots)
-        self.preflight()
         try:
+            self.preflight()
             manifest = self.build()
         except BaseException:
-            # Nothing was started; give the reservations back so a corrected
-            # rerun is not refused.
+            # Nothing was started; give back whatever was reserved so a
+            # corrected rerun is not refused.
             self.release()
             raise
         plan = {"config": {k: v for k, v in cfg.__dict__.items() if k not in ("gateway", "clients", "arms", "production", "dc")},
@@ -1397,12 +1475,12 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 self.clean()
             for sig, h in prev.items():
                 signal.signal(sig, h)
-        production = "unchanged"
         try:
             self.check_production("after")
         except ProductionChanged as e:
             self.log(f"PRODUCTION CHANGED during the campaign: {e}")
-            production, status = "changed", 3
+            status = 3
+        production = "changed" if self.production_changed else "unchanged"
         if leftovers and status == 0:
             status = 5
         if not self.dry:

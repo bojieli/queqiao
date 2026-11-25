@@ -3,6 +3,7 @@ import configparser
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import subprocess
@@ -86,7 +87,7 @@ class DryRun(unittest.TestCase):
 
     def test_dc_leaves_start_on_a_shared_barrier(self):
         _, text = self.run_dry(DC_EXAMPLE)
-        self.assertRegex(text, r"while \[ \$\(date \+%s\) -lt \d+ \]; do sleep 0.1; done; for i in")
+        self.assertRegex(text, r"while \[ \$\(date \+%s\) -lt \d+ \]; do sleep 0.1; done; end=")
         self.assertIn("ws=$((", text)
 
     def test_metrics_scrapes_bypass_environment_proxies(self):
@@ -324,6 +325,51 @@ class Safety(unittest.TestCase):
                  "c1": ab.parse_snapshot("leftover 42 /root/qq-ab-t1/cl-a-main/queqiaod client\n")}
         self.assertTrue(any("earlier campaign" in x for x in ab.refusal_reasons(cfg, snaps)))
 
+    def test_a_host_failing_during_reservation_releases_the_others(self):
+        text = BASE + "[client:b]\nhost = c2\nsocks_port_base = 24581\nmetrics_port_base = 24591\n[production:c2]\nhost = c2\n"
+        cfg = parse(text)
+        camp = ab.Campaign(cfg, "/x", ".", dry=False, stream=io.StringIO())
+        calls = []
+
+        def run(host_self, script, timeout=120, what=""):
+            calls.append((host_self.dest, what))
+            if what == "reserve the work directory" and host_self.dest == "c1":
+                raise subprocess.TimeoutExpired("ssh", 120)
+            return 0, ""
+        for h in camp.hosts.values():
+            h.home = "/home/u"
+        with mock.patch.object(ab.Host, "run", run):
+            with self.assertRaises(ab.Refused) as cm:
+                camp.reserve()
+        self.assertIn("c1: reserving", str(cm.exception))
+        self.assertIn("outcome is unknown", str(cm.exception))
+        self.assertIn(("gw", "release an unused reservation"), calls)
+        self.assertEqual(camp.reserved, [])
+
+    def test_a_mid_run_production_change_stays_in_the_status(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            camp = ab.Campaign(parse(BASE), os.path.join(tmp, "out"), ".", dry=False, stream=io.StringIO())
+            changed = {"gw": ab.parse_snapshot(SNAP.replace("active 1234 0", "active 5678 1")), "c1": ab.parse_snapshot("listen-ok")}
+            same = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("listen-ok")}
+            snaps = iter([same, changed, same])  # before, mid-run, after: the change came and went
+
+            def snapshot_all(self_, tag):
+                return next(snaps) if tag != "teardown" else {"gw": ab.parse_snapshot("listen-ok"), "c1": ab.parse_snapshot("listen-ok")}
+
+            def run_block(self_, *a, **k):
+                self_.check_production("mid")
+            with mock.patch.object(ab.Campaign, "snapshot_all", snapshot_all), \
+                    mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
+                    mock.patch.object(ab.Campaign, "setup"), mock.patch.object(ab.Campaign, "record_effective"), \
+                    mock.patch.object(ab.Campaign, "run_block", run_block), mock.patch.object(ab.Campaign, "teardown"), \
+                    mock.patch.object(ab.Campaign, "clean"), mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), \
+                    mock.patch.object(ab.time, "sleep"):
+                rc = camp.run()
+            status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
+        self.assertEqual(rc, 3)
+        self.assertEqual(status["production"], "changed")
+
     def test_refused_campaign_starts_nothing(self):
         cfg = parse(BASE)
         camp = ab.Campaign(cfg, "/nonexistent/out", ".", dry=False, stream=io.StringIO())
@@ -343,12 +389,14 @@ class Safety(unittest.TestCase):
 
 class Parsing(unittest.TestCase):
     def test_missing_flows_become_failed_rows(self):
-        out = "1700000000\tb1\t200\t100\t1.5\t0\ngarbage\n1700000001\tb3\n"
+        out = ("1700000000.100\t1700000001.600\tb1o1\t200\t100\t1.5\t0\n"
+               "1700000001.600\t1700000003.000\tb1o2\t200\t40\t1.4\t28\ngarbage\n"
+               "1700000000.100\t1700000001.000\tb3o1\n")
         rows = ab.job_rows(out, "bulk", 3, 1, 90)
-        self.assertEqual([r[0] for r in rows], ["b1", "b3", "b2"])
-        self.assertEqual(rows[0], ("b1", "200", "100", "1.5", "0", "1700000000"))
-        self.assertEqual(rows[1], ("b3", "000", "0", "90.000", "-1", "1700000001"))
-        self.assertEqual(rows[2], ("b2", "000", "0", "90.000", "-1", ""))
+        self.assertEqual([r[0] for r in rows], ["b1o1", "b1o2", "b3o1", "b2o1"])
+        self.assertEqual(rows[0], ("b1o1", "200", "100", "1.5", "0", "1700000000.100", "1700000001.600"))
+        self.assertEqual(rows[2], ("b3o1", "000", "0", "90.000", "-1", "1700000000.100", "1700000001.000"))
+        self.assertEqual(rows[3], ("b2o1", "000", "0", "90.000", "-1", "", ""))
 
     def test_request_waves_are_expected(self):
         rows = ab.job_rows("", "requests", 2, 2, 30)
@@ -360,7 +408,32 @@ class Parsing(unittest.TestCase):
     def test_local_address_passes_to_enrollment(self):
         self.assertEqual(ab.local_address_args(["--wire-versions", "2", "--local-address", "if:en0"]),
                          ["--local-address", "if:en0"])
-        self.assertEqual(ab.local_address_args(["--local-address=192.0.2.4"]), ["--local-address=192.0.2.4"])
+        self.assertEqual(ab.local_address_args(["--local-address=192.0.2.4"]), ["--local-address", "192.0.2.4"])
+        # Go's spellings, and the last occurrence wins, as for the client.
+        self.assertEqual(ab.local_address_args(["-local-address", "if:en0", "--wire-versions", "2", "-local-address=if:en1"]),
+                         ["--local-address", "if:en1"])
+
+    def test_enrollment_uses_the_clients_effective_local_address(self):
+        # The arm's client_flags bind the client to an interface; enrollment
+        # must take the same interface, in the same spelling-independent way.
+        text = BASE.replace("[arm:cand]\nbinary_linux_amd64 = /bin/true\nflags = --cc-api=v2",
+                            "[arm:cand]\nbinary_linux_amd64 = /bin/true\nflags = --cc-api=v2\nclient_flags = -local-address=if:eth1")
+        cfg = parse(text)
+        out = io.StringIO()
+        camp = ab.Campaign(cfg, "/o", ".", dry=True, stream=out)
+        camp.enroll(cfg.clients["a"], cfg.arms[1])
+        self.assertIn("--local-address if:eth1", out.getvalue())
+        self.assertEqual(ab.flag_value(camp.client_flags(cfg.clients["a"], cfg.arms[1]), "local-address"), "if:eth1")
+
+    def test_enrollment_gateway_is_tcp_capable(self):
+        text = BASE.replace("[arm:cand]\nbinary_linux_amd64 = /bin/true\nflags = --cc-api=v2",
+                            "[arm:cand]\nbinary_linux_amd64 = /bin/true\nflags = --cc-api=v2\ngateway_flags = -transport=quic")
+        cfg = parse(text)
+        camp = ab.Campaign(cfg, "/o", ".", dry=True, stream=io.StringIO())
+        enroll = camp.gw_cmd(cfg.arms[1], "enroll", enroll=True)
+        self.assertIn("--transport auto", enroll)
+        self.assertNotIn("quic", enroll)
+        self.assertIn("-transport=quic", camp.gw_cmd(cfg.arms[1], "server-b001-a"))
 
 
 class LocalProcesses(unittest.TestCase):
@@ -503,6 +576,41 @@ class LocalProcesses(unittest.TestCase):
                 camp.run()
         self.assertFalse(os.path.exists(os.path.join(self.home, "qq-ab-t2")))
         cfg.name = "t1"
+
+    def test_bulk_flows_stay_backlogged_for_the_whole_window(self):
+        # A fake curl that delivers a whole object in 0.3 s: one fetch per flow
+        # would end the flow three seconds early; the loop keeps it busy.
+        fake = pathlib.Path(self.home, "fakebin")
+        fake.mkdir()
+        (fake / "curl").write_text("#!/bin/sh\nsleep 0.3\nprintf '200\\t67108864\\t0.300\\t0'\n")
+        (fake / "curl").chmod(0o755)
+        cfg = self.cfg
+        script = self.camp.job_script(cfg.clients["a"], cfg.arms[0], "bulk", 2, 3)
+        rc, out = self.host.run(f"export PATH={fake}:$PATH\n" + script, timeout=30)
+        rows = ab.job_rows(out, "bulk", 2, 1, 3)
+        self.assertEqual(rc, 0)
+        for i in (1, 2):
+            mine = [r for r in rows if r[0].startswith(f"b{i}o")]
+            self.assertGreaterEqual(len(mine), 4, mine)
+            self.assertTrue(all("." in r[5] and "." in r[6] for r in mine), mine)  # millisecond times
+            self.assertGreater(float(mine[-1][6]) - float(mine[0][5]), 2.0)
+
+    def test_a_listing_that_fails_is_not_an_empty_listing(self):
+        d = pathlib.Path(self.home, "logs")
+        d.mkdir()
+        (d / "server-b001-a.jsonl.gz").write_text("x")
+        d.chmod(0o111)  # can be entered, cannot be listed
+        try:
+            self.camp._fetch_glob(self.host, str(d), "server-b001-a", os.path.join(self.home, "fetched"))
+        finally:
+            d.chmod(0o755)
+        self.assertEqual(len(self.camp.fetch_failures), 1, self.camp.fetch_failures)
+        self.assertIn("listing failed", self.camp.fetch_failures[0])
+        # An empty but readable directory is a successful listing with no match.
+        e = pathlib.Path(self.home, "empty")
+        e.mkdir()
+        self.camp._fetch_glob(self.host, str(e), "server-b001-a", os.path.join(self.home, "fetched"))
+        self.assertEqual(len(self.camp.fetch_failures), 1)
 
     def test_teardown_leftovers_are_reported(self):
         snap = {"local": ab.parse_snapshot("listen-ok\nlisten udp 23471\nleftover 99 " + self.W + "/gw-main/queqiaod server\n")}
