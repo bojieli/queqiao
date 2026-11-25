@@ -245,6 +245,17 @@ func (s *udpRelayStore) sweepLocked(now time.Time) {
 	}
 }
 
+// expire drops the relays whose grace has passed now, releasing what they
+// held, rather than at the sweeper's next tick.
+func (s *udpRelayStore) expire() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.sweepLocked(time.Now())
+	s.mu.Unlock()
+}
+
 // closeAll drops every retained relay, for server shutdown.
 func (s *udpRelayStore) closeAll() {
 	if s == nil {
@@ -389,7 +400,10 @@ func (s *udpRelayStore) endLive(token [session.UDPResumeTokenSize]byte, entry *l
 	if entry.claimed && !entry.abandoned && !retain {
 		// The association ended for good -- its relay failed, or it was
 		// closed -- while a replacement was waiting. Wake it with nothing,
-		// so it opens a fresh relay instead of resuming a broken one.
+		// so it opens a fresh relay instead of resuming a broken one. The
+		// association's slots go back first, so that fresh open is not
+		// refused by the very association it replaces.
+		lease.detach().release()
 		entry.abandoned = true
 		close(entry.handed)
 		s.mu.Unlock()

@@ -803,12 +803,16 @@ func (s *Server) handleUDPAssociation(ctx context.Context, conn streamConn, fc *
 	if resumable {
 		openOK.Payload = session.EncodeUDPResumeGrant(resumed, grant)
 	}
-	// The acknowledgement is bounded by the handshake deadline as before,
-	// and also by assocCtx, so a replacement taking this relay over does not
-	// wait out a stalled write before the relay is handed to it.
-	ackCtx, cancelAck := context.WithTimeout(assocCtx, handshakeBound(conn, s.cfg.HandshakeTimeout))
-	ackErr := fc.WriteContext(ackCtx, openOK)
-	cancelAck()
+	// The acknowledgement keeps the stream's handshake deadline, as it
+	// always has. In owned admission a replacement taking this relay over
+	// also interrupts it, so it does not wait out a stalled write before the
+	// relay is handed to it; nothing else about the deadline changes.
+	stopInterrupt := func() bool { return false }
+	if live != nil {
+		stopInterrupt = context.AfterFunc(assocCtx, func() { _ = conn.SetDeadline(time.Now()) })
+	}
+	ackErr := fc.Write(openOK)
+	stopInterrupt()
 	if ackErr != nil {
 		// The lane went before the client could learn the new grant. A
 		// relay it reclaimed is kept for the retry, which presents the old

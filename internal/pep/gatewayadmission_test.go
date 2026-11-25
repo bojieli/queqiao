@@ -1337,15 +1337,27 @@ func TestAFailedRelayIsNotHandedToAWaitingReplacement(t *testing.T) {
 	entry := store.publishLive(token, udpTestPrincipal, func() { stopOnce.Do(func() { close(stopped) }) })
 	store.confirmLive(entry)
 	ended := make(chan liveEnd, 1)
+	lease := &flowLease{}
+	var released atomic.Int32
+	lease.add(func() { released.Add(1) })
 	go func() {
 		<-stopped
 		// The relay failed while the replacement waited: no retention.
-		ended <- store.endLive(token, entry, relay, &flowLease{}, false)
+		ended <- store.endLive(token, entry, relay, lease, false)
 	}()
 	started := time.Now()
 	got, moved := store.transfer(context.Background(), token[:], udpTestPrincipal, 5*time.Second)
 	if got != nil || moved != nil {
 		t.Fatal("a failed relay was handed to the replacement")
+	}
+	// The replacement opens afresh against the slots the failed association
+	// held, so they are back before it is woken.
+	if released.Load() != 1 {
+		t.Fatalf("the replacement was woken with the failed association's lease still held (%d releases)", released.Load())
+	}
+	lease.release()
+	if released.Load() != 1 {
+		t.Fatalf("lease released %d times", released.Load())
 	}
 	if waited := time.Since(started); waited > 2*time.Second {
 		t.Fatalf("the replacement waited %v instead of being woken", waited)
@@ -1362,5 +1374,108 @@ func TestBundleNamesGatewayAdmission(t *testing.T) {
 	}
 	if got := Bundle(CCAPIV2, MemoryOwned, GatewayAdmissionOwned); got != "cc-api=v2,mem=owned,gateway-admission=owned" {
 		t.Fatalf("bundle = %q", got)
+	}
+}
+
+// In owned admission a parked relay keeps its association's slots until its
+// grace ends, and the sweeper reaches it only some time later. An OPEN that
+// finds the limit full takes back the slots of relays already expired rather
+// than being refused for them.
+func TestAnExpiredParkedRelayDoesNotRefuseANewFlow(t *testing.T) {
+	serverCredentials, clientCredentials := testCertificate(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	destination := admissionDestination(t, idleFlows)
+	server, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{
+		Credentials: serverCredentials, MaxSessions: 1, GatewayAdmission: GatewayAdmissionOwned,
+	})
+	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := newUDPResumeToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A parked relay holding the only session slot, past its grace.
+	server.semaphore <- struct{}{}
+	lease := &flowLease{}
+	lease.add(func() { <-server.semaphore })
+	server.udpRelays.mu.Lock()
+	server.udpRelays.retainLocked(token, udpTestPrincipal, relay, lease, nil)
+	held := server.udpRelays.relays[token]
+	held.expires = time.Now().Add(-time.Second)
+	server.udpRelays.relays[token] = held
+	server.udpRelays.mu.Unlock()
+	carrier, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, _, _, err := exchange(ctx, carrier, openFrame(t, [16]byte{0x71}, 9, destination))
+	if err != nil || response.Header.Type != protocol.TypeOpenOK {
+		t.Fatalf("OPEN answered %+v %q, %v; want OPEN_OK once the expired relay's slot is back", response.Header, response.Payload, err)
+	}
+}
+
+// deadlineRecorder is a stream that records every deadline set on it.
+type deadlineRecorder struct {
+	net.Conn
+	mu  sync.Mutex
+	set []time.Time
+}
+
+func (d *deadlineRecorder) SetDeadline(t time.Time) error {
+	d.mu.Lock()
+	d.set = append(d.set, t)
+	d.mu.Unlock()
+	return d.Conn.SetDeadline(t)
+}
+
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.mu.Lock()
+	d.set = append(d.set, t)
+	d.mu.Unlock()
+	return d.Conn.SetWriteDeadline(t)
+}
+
+// A UDP association's OPEN_OK is written under the stream's existing
+// handshake deadline, in every admission mode: nothing re-arms it with a fresh
+// timeout before the acknowledgement is on its way.
+func TestAUDPOpenAcknowledgementKeepsItsHandshakeDeadline(t *testing.T) {
+	credentials, _ := testCertificate(t)
+	for _, mode := range []GatewayAdmission{GatewayAdmissionLegacy, GatewayAdmissionOwned} {
+		t.Run(string(mode), func(t *testing.T) {
+			server, err := NewServer(ServerConfig{
+				ListenAddr: "127.0.0.1:0", Credentials: credentials, GatewayAdmission: mode,
+				DestinationPolicy: DestinationPolicy{AllowPrivate: true},
+				Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			local, remote := net.Pipe()
+			defer remote.Close()
+			conn := &deadlineRecorder{Conn: local}
+			fc := newFrameConn(conn)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				server.handleUDPAssociation(context.Background(), conn, fc, udpTestPrincipal, [16]byte{0x72}, 1, nil, true, &flowLease{}, nil)
+			}()
+			answer, err := newFrameConn(remote).Read()
+			if err != nil || answer.Header.Type != protocol.TypeOpenOK {
+				t.Fatalf("association answered %+v, %v", answer.Header, err)
+			}
+			conn.mu.Lock()
+			for _, deadline := range conn.set {
+				if !deadline.IsZero() {
+					conn.mu.Unlock()
+					t.Fatalf("a deadline of %v was armed before the acknowledgement", time.Until(deadline))
+				}
+			}
+			conn.mu.Unlock()
+			_ = remote.Close()
+			<-done
+		})
 	}
 }

@@ -1124,6 +1124,12 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		// here at OPEN. The refusal is FLOW_LIMIT, a code every wire version
 		// knows and the answer a peer already gets for an account's limit.
 		if !tryAcquire(s.semaphore) {
+			// A parked relay's slots are due back at its expiry, which the
+			// sweeper may not have reached yet; take them back before
+			// refusing anyone.
+			s.udpRelays.expire()
+		}
+		if !tryAcquire(s.semaphore) {
 			s.cfg.Logger.Warn("remote session limit reached")
 			_ = fc.Write(protocol.Frame{Header: protocol.Header{Version: protocol.Version, Type: protocol.TypeReset, SessionID: sessionID, FlowID: open.Header.FlowID, Class: protocol.ClassNew}, Payload: session.ResetPayload(session.ResetFlowLimit, "remote session limit reached")})
 			return
@@ -1131,7 +1137,13 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		lease.add(func() { <-s.semaphore })
 	}
 	releaseFirstFrame()
-	if refusal := s.admitAccountFlow(principal); refusal != nil {
+	refusal := s.admitAccountFlow(principal)
+	if refusal == errAccountFlowLimit && s.admissionOwned() {
+		// The same for the account's slots.
+		s.udpRelays.expire()
+		refusal = s.admitAccountFlow(principal)
+	}
+	if refusal != nil {
 		s.refuseAccountFlow(fc, sessionID, open.Header.FlowID, principal, refusal)
 		return
 	}
