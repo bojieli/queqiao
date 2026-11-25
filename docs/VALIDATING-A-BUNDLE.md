@@ -56,9 +56,11 @@ built to refuse rather than to trust:
   - every process that matches the pattern;
   - every listening port.
 
-  It then refuses to start if any planned temporary port is declared or
-  already listening, or if a process from an earlier campaign with the same
-  name is still running.
+  It then refuses to start in any of these cases:
+  - a planned temporary port is declared or already listening;
+  - a host's listening ports could not be read (it needs `ss` on Linux and
+    `lsof` elsewhere; an empty list is never trusted);
+  - a process from an earlier campaign with the same name is still running.
 - **One directory per host.** Everything temporary lives under
   `~/qq-ab-<name>`. Every process is started from there with a pid file. A
   process is signalled only after its command line has been checked to
@@ -106,7 +108,10 @@ usually today's `origin/main`, but not always: see stage 7 below.
 
 Flags that point a process at state, a listener, a log or a profile
 (`--state`, `--listen`, `--metrics-listen`, `--log-file`, `--profile`, and
-others) are set by the runner. A config that sets them is rejected.
+others) are set by the runner. A config that sets them is rejected, in either
+the `-name` or the `--name` spelling, since Go's flag parser accepts both.
+`--hop-port-count` is rejected too, because it opens listeners that the
+preflight cannot reserve.
 
 ## Gate 1: a stage's live A/B
 
@@ -133,7 +138,9 @@ followed by its mirror, and every arm is compared with the reference.
 - `bulk`: four concurrent downloads.
 - `single`: one flow.
 - `interactive`: the bulk load plus a small-object probe every
-  `probe_interval` seconds. It measures interactive p99 under bulk.
+  `probe_interval` seconds. It measures interactive p99 under bulk. The probe
+  stops as soon as the bulk flows finish, so every sample is taken under
+  load. A probe that does not finish counts at its 10-second timeout.
 
 A stage's gate needs all three. Run them as three campaigns with different
 names.
@@ -185,6 +192,8 @@ A campaign directory holds:
 - `metrics/`: gateway scrapes before and after each trial.
 - `logs/`: gateway and client logs, gzipped, and client CPU samples.
 - `prod-*.txt`: the production snapshots.
+- `status.json`: written last, saying whether the campaign completed and
+  whether production was unchanged.
 
 The analyzer adds `per_trial.tsv` and `summary.md`.
 
@@ -235,8 +244,12 @@ The last line per candidate is the overall verdict:
 
 - **PASS**: the primary gate passes and so does every secondary.
 - **FAIL**: any of them fails.
-- **INCOMPLETE**: a required secondary could not be measured. That is not a
-  pass.
+- **INCOMPLETE**: there is no verdict. Either a required secondary could not
+  be measured, or the campaign itself is incomplete: `status.json` is missing
+  or not `complete`, production changed, or a planned trial has no rows. The
+  analyzer leaves out any block with a missing trial, so an interrupted block
+  cannot pair two candidate trials with one main trial, and it still prints
+  the numbers for diagnosis. INCOMPLETE is not a pass.
 
 ## Gate 2: the DC gate (stage 9)
 
@@ -259,7 +272,8 @@ and each client host is one leaf under a shared ancestor. The DC campaign
 - **Loaded leaves:** two or more client hosts, each its own leaf, that load
   the shared ancestor at the same time.
 - **A control leaf:** the uncongested sibling. It fetches one request-sized
-  object every `control_interval` seconds and nothing else.
+  object every `control_interval` seconds and nothing else, and only while the
+  loaded leaves are running.
 - **Each trial, two phases, with every leaf at once:**
   - *sustained*: `bulk_flows_per_leaf` downloads per loaded leaf, for
     `duration` seconds;
@@ -290,10 +304,14 @@ shared relay, but their groups spread out by 3.5×, while the shared relay
 finished every flow within 2 ms. A knowledge-only tree buys aggregate the same
 way, so a candidate that wins on goodput by starving a leaf fails here.
 
-The campaign is **VOID** unless the shared ancestor actually bound. The legacy
-arm's simultaneous aggregate must average at most 0.80 of the sum of the
-leaves' solo rates. A void campaign did not test the regime, so add load and
-rerun.
+The campaign is **VOID** in two cases:
+
+- The shared ancestor did not bind. The legacy arm's simultaneous aggregate
+  must average at most 0.80 of the sum of the leaves' solo rates. Otherwise
+  the campaign did not test the regime, so add load and rerun.
+- More than 10% of the legacy arm's blocks delivered nothing. Rerun.
+
+An unfinished campaign is INCOMPLETE, as in Gate 1.
 
 ```sh
 ./scripts/ab_campaign.py --config scripts/validation/dc.local.ini --dry-run

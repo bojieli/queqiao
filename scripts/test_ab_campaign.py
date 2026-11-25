@@ -77,6 +77,18 @@ class DryRun(unittest.TestCase):
         self.assertIn("--cc-api=v2 --sched=class --congestion=path", text)
         self.assertNotIn("CAMPAIGN-DONE", text)
 
+    def test_probe_stops_when_the_load_finishes(self):
+        rc, text = self.run_dry(DC_EXAMPLE)
+        lines = text.splitlines()
+        i = next(k for k, l in enumerate(lines) if "load finished, stop the probe on leaf-ctl" in l)
+        self.assertIn("touch ~/qq-ab-example-dc-gate/run/stop-probe-leaf-ctl-", lines[i + 1])
+        self.assertIn("[ ! -e ~/qq-ab-example-dc-gate/run/stop-probe-leaf-ctl-", text)
+
+    def test_every_client_host_gets_a_run_directory(self):
+        _, text = self.run_dry(DC_EXAMPLE)
+        for host in ("dc-client-a", "dc-client-b", "dc-client-c", "dc-client-d"):
+            self.assertIn(f"[{host}] create work directory:\n    mkdir -p ~/qq-ab-example-dc-gate/run", text)
+
     def test_dc_dry_run_has_phases_and_calibration(self):
         rc, text = self.run_dry(DC_EXAMPLE)
         self.assertEqual(rc, 0)
@@ -167,6 +179,14 @@ class Config(unittest.TestCase):
                             "--state is set by the runner")
         self.assertRejected(BASE.replace("flags = --cc-api=v2", "gateway_flags = --listen :443"), "--listen")
 
+    def test_single_dash_spelling_is_also_owned(self):
+        # Go's flag package treats -state and --state alike.
+        self.assertRejected(BASE.replace("flags = --cc-api=v2", "flags = -state /var/lib/queqiao/provider"), "--state")
+        self.assertRejected(BASE.replace("flags = --cc-api=v2", "client_flags = -profile=/etc/p.json"), "--profile")
+
+    def test_hop_ports_are_not_supported(self):
+        self.assertRejected(BASE.replace("flags = --cc-api=v2", "gateway_flags = --hop-port-count 100"), "hop-port-count")
+
     def test_every_host_needs_a_production_section(self):
         self.assertRejected(BASE.replace("[production:c1]\nhost = c1\n", ""), "missing: c1")
 
@@ -210,6 +230,7 @@ class Config(unittest.TestCase):
 
 
 SNAP = """os Linux
+listen-ok
 unit queqiaod active 1234 0 99999 exe=/usr/local/bin/queqiaod sha=abc
 proc 1234 Tue Nov 24 09:28:24 2026 /usr/local/bin/queqiaod server --listen :12540
 listen udp 12540
@@ -240,19 +261,26 @@ class Safety(unittest.TestCase):
 
     def test_clean_hosts_are_not_refused(self):
         cfg = parse(BASE)
-        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\n")}
+        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\nlisten-ok\n")}
         self.assertEqual(ab.refusal_reasons(cfg, snaps), [])
+
+    def test_unreadable_listener_table_is_refused(self):
+        cfg = parse(BASE)
+        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\n")}
+        r = ab.refusal_reasons(cfg, snaps)
+        self.assertEqual(len(r), 1)
+        self.assertIn("c1: could not read the listening ports", r[0])
 
     def test_listening_planned_port_is_refused(self):
         cfg = parse(BASE)
-        snaps = {"gw": ab.parse_snapshot(SNAP + "listen tcp 23472\n"), "c1": ab.parse_snapshot("")}
+        snaps = {"gw": ab.parse_snapshot(SNAP + "listen tcp 23472\n"), "c1": ab.parse_snapshot("listen-ok\n")}
         r = ab.refusal_reasons(cfg, snaps)
         self.assertEqual(len(r), 1)
         self.assertIn("23472 is already listening", r[0])
 
     def test_declared_production_port_is_refused(self):
         cfg = parse(BASE.replace("ports = 443 12540-12549", "ports = 443 23470-23480"))
-        r = ab.refusal_reasons(cfg, {"gw": ab.parse_snapshot(""), "c1": ab.parse_snapshot("")})
+        r = ab.refusal_reasons(cfg, {"gw": ab.parse_snapshot("listen-ok"), "c1": ab.parse_snapshot("listen-ok")})
         self.assertTrue(any("declared production port" in x for x in r), r)
         self.assertTrue(any("origin port 23480" in x for x in r), r)
 
@@ -350,6 +378,7 @@ class LocalProcesses(unittest.TestCase):
         finally:
             srv.close()
         self.assertIn(port, snap["listen"])
+        self.assertTrue(snap["listen_ok"])
         self.assertTrue(any(f"{self.W}/marker" in x for x in snap["leftover"]), snap["leftover"])
         self.assertTrue(all(self.W + "/" not in p for p in snap["procs"]))
 
@@ -360,6 +389,24 @@ class LocalProcesses(unittest.TestCase):
         snap = self.camp.snapshot_all("clean")["local"]
         self.assertEqual(snap["leftover"], [])
         self.assertIn(snap.get("os"), ("Linux", "Darwin"))
+
+    def test_cpu_sampler_reads_a_busy_process(self):
+        busy = subprocess.Popen([sys.executable, "-c", "while True: pass"])
+        self.procs.append(busy)
+        pid_file = os.path.join(self.W, "run", "busy.pid")
+        out_file = os.path.join(self.W, "busy.cpu")
+        pathlib.Path(pid_file).write_text(str(busy.pid))
+        rc, _ = self.host.run(ab.cpu_sampler(pid_file, out_file))
+        self.assertEqual(rc, 0)
+        time.sleep(3.5)
+        busy.kill()
+        busy.wait()
+        rows = [tuple(map(float, l.split())) for l in pathlib.Path(out_file).read_text().splitlines() if l.strip()]
+        self.assertGreaterEqual(len(rows), 2, rows)
+        (t0, c0), (t1, c1) = rows[0], rows[-1]
+        if t1 > t0:
+            # A spinning process uses about one core: 100 ticks a second.
+            self.assertGreater((c1 - c0) / 100 / (t1 - t0), 0.3)
 
     def test_spawn_then_stop_kills_only_work_directory_processes(self):
         decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "decoy-not-in-workdir"])

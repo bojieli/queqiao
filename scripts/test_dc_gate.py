@@ -26,7 +26,7 @@ def iso(t):
 
 
 def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blocks=12, seed=3,
-             cand_request=1.0, cand_control=1.0):
+             cand_request=1.0, cand_control=1.0, zero_legacy=()):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -40,9 +40,7 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
     plan = {"main": "legacy", "workload": "dc", "paths": ["dc"],
             "dc": {"loaded": LOADED, "control": "ctl", "request_timeout": 30},
             "arms": {"legacy": {"role": "main", "flags": []}, "cand": {"role": "candidate", "flags": ["--congestion=path"]}},
-            "clients": {c: {"small": True} for c in LOADED + ["ctl"]}}
-    with open(os.path.join(root, "plan.json"), "w") as f:
-        json.dump(plan, f)
+            "clients": {c: {"small": True} for c in LOADED + ["ctl"]}, "schedule": []}
     rows = []
     t = 1_780_000_000.0
     norm = sum(cand_shares) / len(cand_shares)
@@ -52,11 +50,12 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
         seen = {}
         for slot, arm in enumerate(order, start=1):
             seen[arm] = seen.get(arm, 0) + 1
+            plan["schedule"].append({"block": b, "path": "dc", "slot": slot, "arm": arm})
             noise = 1 + rng.gauss(0, 0.02)
             base = [arm, "main" if arm == "legacy" else "candidate", seen[arm], int(seen[arm] == 1)]
             for j, leaf in enumerate(LOADED):
                 share = 1.0 if arm == "legacy" else cand_shares[j] / norm * cand_total
-                size = int(level * share * noise / 2)
+                size = 0 if (arm == "legacy" and b in zero_legacy) else int(level * share * noise / 2)
                 for i in (1, 2):
                     rows.append([b, "dc", slot] + base + ["sustained", j, leaf, "bulk", f"b{i}", iso(t), iso(t + 60),
                                                           200, size, 60, 28, 0, 60])
@@ -75,6 +74,10 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
                 rows.append([b, "dc", 100 + j, "legacy", "main", 0, 0, "solo", 0, leaf, "bulk", f"b{i}", iso(t),
                              iso(t + 60), 200, int(level / binding / 2), 60, 28, 0, 60])
             t += 65
+    with open(os.path.join(root, "plan.json"), "w") as f:
+        json.dump(plan, f)
+    with open(os.path.join(root, "status.json"), "w") as f:
+        json.dump({"status": "complete", "exit": 0, "production": "unchanged"}, f)
     with open(os.path.join(root, "trials.tsv"), "w") as f:
         f.write("\t".join(COLUMNS) + "\n")
         for r in rows:
@@ -136,6 +139,28 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("free", binding=0.95)
         self.assertEqual(v["cand"], "VOID")
         self.assertIn("did not bind", text)
+
+    def test_zero_legacy_blocks_void_rather_than_fail(self):
+        text, v = self.run_gate("zero", zero_legacy=(1, 2))
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("delivered nothing", text)
+
+    def test_unfinished_campaign_gets_no_verdict(self):
+        root = os.path.join(self.tmp.name, "unfinished")
+        write_dc(root)
+        os.remove(os.path.join(root, "status.json"))
+        text, v = dc.evaluate(root, self.bounds)
+        self.assertEqual(v["cand"], "INCOMPLETE")
+
+    def test_pilot_ignores_calibration(self):
+        import ab_analyze as an
+        root = os.path.join(self.tmp.name, "pilot")
+        write_dc(root)
+        g = an.load_gates()
+        g["resamples"] = 500
+        text, res = an.pilot_report(root, g)
+        self.assertIn(("dc", "cand"), res)
+        self.assertNotIn("incomplete", text)
 
     def test_measures(self):
         root = os.path.join(self.tmp.name, "m")

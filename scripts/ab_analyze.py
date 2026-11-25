@@ -34,7 +34,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
 
 GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "gates.ini")
-CLK_TCK = 100  # /proc/<pid>/stat ticks per second on Linux
+CLK_TCK = 100  # ticks per second in the runner's CPU samples
+PROBE_TIMEOUT = 10.0  # ab_campaign.PROBE_TIMEOUT: an unfinished probe counts this long
 
 
 # --- inputs -------------------------------------------------------------------
@@ -137,6 +138,41 @@ def read_campaign(campaign: str) -> Tuple[dict, Dict[Tuple[int, str, int], Trial
             t.start = min(t.start, ts(r["start_utc"]))
             t.end = max(t.end, ts(r["end_utc"]))
     return plan, trials
+
+
+def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]) -> Tuple[List[str], Dict[Tuple[int, str, int], Trial]]:
+    """Problems that forbid a verdict, and the trials of complete blocks only.
+
+    A verdict needs a campaign that finished (status.json from the runner)
+    with production unchanged, and every planned slot present. A block with
+    a missing slot is dropped, so an interrupted block cannot pair two
+    candidate trials with one main trial; the problems list says so and the
+    verdict becomes INCOMPLETE.
+    """
+    problems: List[str] = []
+    try:
+        with open(os.path.join(campaign, "status.json")) as f:
+            status = json.load(f)
+    except (OSError, ValueError):
+        problems.append("no status.json: the campaign did not finish")
+    else:
+        if status.get("status") != "complete":
+            problems.append(f"the campaign {status.get('status')} (exit {status.get('exit')})")
+        if status.get("production") != "unchanged":
+            problems.append("production changed during the campaign")
+    planned: Dict[Tuple[int, str], set] = collections.defaultdict(set)
+    for sl in plan.get("schedule", []):
+        planned[(sl["block"], sl["path"])].add(sl["slot"])
+    have: Dict[Tuple[int, str], set] = collections.defaultdict(set)
+    for (b, p, slot) in trials:
+        if slot < 100:
+            have[(b, p)].add(slot)
+    bad = sorted(k for k, slots in planned.items() if not slots <= have.get(k, set()))
+    if bad:
+        problems.append(f"{len(bad)} of {len(planned)} planned blocks are missing trials "
+                        f"(first: block {bad[0][0]} on {bad[0][1]}); they are left out")
+    keep = {k: t for k, t in trials.items() if (k[0], k[1]) not in set(bad)}
+    return problems, keep
 
 
 # --- per-trial measures ---------------------------------------------------------
@@ -261,7 +297,13 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
     """Fill each trial's measures; returns which transit method was used."""
     method = set()
     cache: Dict[Tuple[str, str], List[dict]] = {}
+    current = None
     for t in trials.values():
+        # Trials are in block order: a block's gateway records are never
+        # needed again once the next block starts.
+        if t.tag != current:
+            cache.clear()
+            current = t.tag
         pre, post = metrics(campaign, f"{t.tag}-s{t.slot}-{t.arm}-pre"), metrics(campaign, f"{t.tag}-s{t.slot}-{t.arm}-post")
         d = lambda k: post.get(k, float("nan")) - pre.get(k, float("nan"))
         bulk = t.bulk()
@@ -277,7 +319,9 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         t.m["stalls_per_trial"] = d("queqiao_flow_stalls_detected_total")
         wire = d("queqiao_quic_bytes_sent")
         t.m["wire_per_useful"] = wire / useful if useful else float("nan")
-        probes = [float(r["seconds"]) for r in t.rows if r["kind"] == "probe" and r["complete"] == "1"]
+        # A probe that did not finish counts at its timeout: dropping it
+        # would let an arm improve its p99 by failing its slowest requests.
+        probes = [float(r["seconds"]) if r["complete"] == "1" else PROBE_TIMEOUT for r in t.rows if r["kind"] == "probe"]
         t.m["interactive_p99_s"] = st.quantile(probes, 0.99) if probes else float("nan")
 
         key = (t.arm, t.tag)
@@ -379,6 +423,7 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
     if plan.get("workload") == "dc":
         raise SystemExit("this is a DC gate campaign: evaluate it with scripts/dc_gate.py")
     EFFECTIVE.clear()
+    problems, trials = completeness(campaign, plan, trials)
     method = measure(campaign, plan, trials)
     main = plan["main"]
     arms = [main] + [a for a in plan["arms"] if a != main]
@@ -404,6 +449,9 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
     out.append(f"Gate: per block `candidate - {gates['ratio']:.2f} x main` in useful bytes; pass when the one-sided "
                f"{1 - gates['alpha']:.0%} t and bootstrap ({gates['resamples']} resamples) lower bounds are both above zero "
                f"(DESIGN-PATH-AUTHORITY.md section 15.4). Flow-ACK transit: {method}.")
+    if problems:
+        out += ["", "**No verdict: the campaign is incomplete.** " + "; ".join(problems) + ". "
+                "The numbers below are for diagnosis only."]
     if EFFECTIVE:
         out.append("")
         out.append("Effective configuration, from each endpoint's runtime configuration record:")
@@ -443,6 +491,8 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
             g = st.gate(c, m, ratio=gates["ratio"], alpha=gates["alpha"], resamples=gates["resamples"],
                         seed=gates["seed"], max_zero_main_fraction=gates["max_zero_main_fraction"])
             verdict = "VOID" if g.void else ("**PASS**" if g.passed else "**FAIL**")
+            if problems and verdict == "**PASS**":
+                verdict = "INCOMPLETE"
             verdicts[(path, cand, "primary")] = verdict
             out.append(f"| {cand} | {g.n} | {fmt(g.ratio_of_means, '.3f')} | {fmt(g.mean_contrast / 1e6, '.2f')} | "
                        f"{fmt(g.t_lower / 1e6, '.2f')} | {fmt(g.boot_lower / 1e6, '.2f')} | {fmt(g.zero_main_fraction, '.0%')} | "
@@ -471,6 +521,7 @@ def report(campaign: str, gates: dict) -> Tuple[str, dict]:
             sv = [verdicts[(path, cand, k)] for k in secondary]
             fails, missing = sv.count("**FAIL**"), sv.count("n/a")
             overall = ("VOID" if prim == "VOID" else
+                       "INCOMPLETE" if prim == "INCOMPLETE" else
                        "FAIL" if prim != "**PASS**" or fails else
                        "INCOMPLETE" if missing else "PASS")
             verdicts[(path, cand, "overall")] = overall
@@ -497,6 +548,10 @@ def pilot_report(campaign: str, gates: dict) -> Tuple[str, dict]:
     """Section 15.4 sample size: the contrast's variance and E[main] from the
     pilot, power for the alternative "true ratio 1"."""
     plan, trials = read_campaign(campaign)
+    problems, trials = completeness(campaign, plan, trials)
+    # A DC campaign's solo calibration slots are not part of the A/B, and its
+    # bulk rows are the sustained phase that dc_gate.py tests.
+    trials = {k: t for k, t in trials.items() if k[2] < 100}
     for t in trials.values():
         t.m["useful_bytes"] = t.useful_bytes()
     main = plan["main"]
@@ -507,6 +562,8 @@ def pilot_report(campaign: str, gates: dict) -> Tuple[str, dict]:
            f"(expected contrast {gates['true_ratio'] - gates['ratio']:.2f} x E[main]). Freeze the largest number "
            "before the campaign, and do not reuse the pilot's blocks.", "",
            "| path | candidate | pilot blocks | E[main], MB | sd(contrast), MB | blocks needed |", "|---|---|---:|---:|---:|---:|"]
+    if problems:
+        out[2:2] = ["**The pilot is incomplete:** " + "; ".join(problems) + ".", ""]
     res = {}
     for path in plan["paths"]:
         for cand in arms:

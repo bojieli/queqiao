@@ -59,10 +59,14 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 ARM_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 WORK_PREFIX = "qq-ab-"
 WORKLOADS = ("bulk", "single", "interactive", "dc")
+# curl --max-time of one probe request; an unfinished probe counts as this long.
+PROBE_TIMEOUT = 10
 # The runner owns these options; an arm or host that set them could point a
 # temporary process at production state, a production port or a production log.
-OWNED_FLAGS = ("--state", "--listen", "--metrics-listen", "--log-file", "--profile",
-               "--log-stderr", "--log-max-size-mib", "--providers", "--endpoint")
+OWNED_FLAGS = ("state", "listen", "metrics-listen", "log-file", "profile",
+               "log-stderr", "log-max-size-mib", "providers", "endpoint")
+# Options that open listeners the preflight does not reserve.
+UNSUPPORTED_FLAGS = ("hop-port-count",)
 CURL_ENV = ("env -u NO_PROXY -u no_proxy -u ALL_PROXY -u all_proxy -u HTTP_PROXY "
             "-u HTTPS_PROXY -u http_proxy -u https_proxy curl --noproxy ''")
 TRIAL_COLUMNS = ("block", "path", "slot", "arm", "role", "arm_trial", "cold", "phase", "job",
@@ -109,9 +113,14 @@ def _bool(v: str) -> bool:
 
 def _check_flags(where: str, flags: Sequence[str]) -> None:
     for f in flags:
-        name = f.split("=", 1)[0]
+        if not f.startswith("-"):
+            continue
+        # Go's flag package accepts -name and --name alike.
+        name = f.split("=", 1)[0].lstrip("-")
         if name in OWNED_FLAGS:
-            raise ConfigError(f"{where}: {name} is set by the runner and may not be configured")
+            raise ConfigError(f"{where}: --{name} is set by the runner and may not be configured")
+        if name in UNSUPPORTED_FLAGS:
+            raise ConfigError(f"{where}: --{name} opens listeners the preflight cannot reserve; not supported")
 
 
 @dataclass
@@ -478,10 +487,19 @@ for l in {launchd}; do
   echo "launchd $l $(launchctl list 2>/dev/null | awk -v l="$l" '$3==l{{print $1, $2}}')"
 done
 ps -eo pid=,lstart=,args= 2>/dev/null | grep -i -E -- {pattern} | grep -v -F -- "$W/" | grep -v -E 'grep|ps -eo' | sed 's/^ */proc /'
+# "listen-ok" only when the listener table was actually read; without it the
+# preflight refuses, rather than trusting an empty list.
 if [ "$os" = Linux ]; then
-  ss -Hltnu 2>/dev/null | awk '{{print $1, $5}}' | sed -E 's/^([a-z]+) .*:([0-9]+)$/listen \1 \2/'
-else
-  lsof -nP -iTCP -sTCP:LISTEN -iUDP 2>/dev/null | awk 'NR>1{{print $8, $9}}' | sed -E 's/^([A-Z]+) .*:([0-9]+)$/listen \1 \2/' | tr 'A-Z' 'a-z'
+  if l=$(ss -Hltnu 2>/dev/null); then
+    echo listen-ok
+    printf '%s\n' "$l" | awk '{{print $1, $5}}' | sed -E 's/^([a-z]+) .*:([0-9]+)$/listen \1 \2/'
+  fi
+elif command -v lsof >/dev/null 2>&1; then
+  l=$(lsof -nP -iTCP -sTCP:LISTEN -iUDP 2>/dev/null)
+  if [ -n "$l" ]; then
+    echo listen-ok
+    printf '%s\n' "$l" | awk 'NR>1{{print $8, $9}}' | sed -E 's/^([A-Z]+) .*:([0-9]+)$/listen \1 \2/' | tr 'A-Z' 'a-z'
+  fi
 fi
 ps -eo pid=,args= 2>/dev/null | grep -F -- "$W/" | grep -v -F 'grep' | sed 's/^ */leftover /'
 exit 0
@@ -511,6 +529,7 @@ def parse_snapshot(text: str) -> dict:
             snap["leftover"].append(rest.strip())
         elif kind == "os":
             snap["os"] = rest.strip()
+    snap["listen_ok"] = any(line.strip() == "listen-ok" for line in text.splitlines())
     return snap
 
 
@@ -538,6 +557,8 @@ def refusal_reasons(cfg: Config, snaps: Dict[str, dict]) -> List[str]:
             declared.setdefault(p.host, {})[port] = p.name
     for host, ports in cfg.planned_ports().items():
         snap = snaps.get(host, {})
+        if not snap.get("listen_ok"):
+            reasons.append(f"{host}: could not read the listening ports (need ss on Linux, lsof elsewhere)")
         listening = snap.get("listen", set())
         for port, what in ports:
             if port in declared.get(host, {}):
@@ -612,6 +633,18 @@ def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[T
     return [got[f] for f in order]
 
 
+def cpu_sampler(pid_file: str, out_file: str) -> str:
+    """Shell that samples a process's cumulative CPU once a second as
+    "epoch ticks" lines, 100 ticks per second: /proc on Linux, ps's
+    cumulative time ([[H:]M]M:SS.ss) elsewhere. It ends with the process."""
+    return f'''p=$(cat {pid_file})
+( while kill -0 $p 2>/dev/null; do
+    if [ -r /proc/$p/stat ]; then t=$(awk '{{print $14+$15}}' /proc/$p/stat)
+    else t=$(ps -o time= -p $p | awk -F: '{{s=0; for (i=1;i<=NF;i++) s=s*60+$i; printf "%d", s*100}}'); fi
+    [ -n "$t" ] && echo "$(date +%s) $t"; sleep 1
+  done ) > {out_file} 2>/dev/null < /dev/null &'''
+
+
 def utc(t: float) -> str:
     return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
@@ -620,7 +653,8 @@ class Campaign:
     def __init__(self, cfg: Config, out_dir: str, repo: str, dry: bool, stream=None):
         stream = stream or sys.stdout
         self.cfg = cfg
-        self.out = out_dir
+        # Builds run with the worktree as their directory: paths must be absolute.
+        self.out = out_dir if dry else os.path.abspath(out_dir)
         self.repo = repo
         self.dry = dry
         self.stream = stream
@@ -771,6 +805,9 @@ class Campaign:
         for name, size in self.objects():
             mk.append(f"[ -s {W}/origin/{name} ] || head -c {size} /dev/urandom > {W}/origin/{name}")
         gh.run("\n".join(mk), what="create work directory and origin objects")
+        for host in cfg.hosts():
+            if host != g.host:
+                self.hosts[host].run(f"mkdir -p {self.w(host)}/run", what="create work directory")
         # --directory puts the work directory in the command line, which is
         # what stop() and teardown() check before signalling anything.
         self.spawn(gh, "origin", f"{W}/origin",
@@ -873,10 +910,8 @@ rm -f "$f"''', what=f"stop {tag}")
         self.wait_port(ch, client.socks_port_base + arm.index, f"client {tag}")
         if client.cpu_sample:
             W = self.w(client.host)
-            ch.run(f'''p=$(cat {W}/run/{tag}.pid)
-if [ -d /proc/$p ]; then
-  ( while [ -d /proc/$p ]; do echo "$(date +%s) $(awk '{{print $14+$15}}' /proc/$p/stat)"; sleep 1; done ) > {self.cl_dir(client, arm)}/logs/{logname}.cpu 2>/dev/null < /dev/null &
-fi''', what=f"sample {tag} CPU once a second (Linux only)")
+            ch.run(cpu_sampler(f"{W}/run/{tag}.pid", f"{self.cl_dir(client, arm)}/logs/{logname}.cpu"),
+                   what=f"sample {tag} CPU once a second")
 
     def stop_client(self, client: Client, arm: Arm) -> None:
         tag = f"cl-{client.name}-{arm.name}"
@@ -906,12 +941,19 @@ fi''', what=f"sample {tag} CPU once a second (Linux only)")
             return (f"for w in $(seq 1 {dc.waves}); do for i in $(seq 1 {n}); do ( r=$({curl} --max-time {dc.request_timeout} "
                     f"{url}obj-{dc.request_bytes} 2>/dev/null); printf '%s\\t%s\\t%s\\n' \"$(date +%s)\" \"w${{w}}r$i\" \"$r\" ) & done; wait; done")
         if kind == "probe":
+            # The probe measures latency under load, so it stops as soon as
+            # the runner drops the stop file after the phase's load finishes.
             size = self.cfg.dc.request_bytes if self.cfg.dc else self.cfg.probe_bytes
             interval = self.cfg.dc.control_interval if self.cfg.dc else self.cfg.probe_interval
-            return (f"end=$(( $(date +%s) + {int(duration)} )); i=0; while [ $(date +%s) -lt $end ]; do i=$((i+1)); "
-                    f"r=$({curl} --max-time 10 {url}obj-{size} 2>/dev/null); printf '%s\\t%s\\t%s\\n' \"$(date +%s)\" \"p$i\" \"$r\"; "
-                    f"sleep {interval}; done")
+            stop = self.stop_file(client, arm)
+            return (f"rm -f {stop}; end=$(( $(date +%s) + {int(duration)} )); i=0; "
+                    f"while [ $(date +%s) -lt $end ] && [ ! -e {stop} ]; do i=$((i+1)); "
+                    f"r=$({curl} --max-time {PROBE_TIMEOUT} {url}obj-{size} 2>/dev/null); printf '%s\\t%s\\t%s\\n' \"$(date +%s)\" \"p$i\" \"$r\"; "
+                    f"sleep {interval}; done; rm -f {stop}")
         raise ValueError(kind)
+
+    def stop_file(self, client: Client, arm: Arm) -> str:
+        return f"{self.w(client.host)}/run/stop-probe-{client.name}-{arm.name}"
 
     def expected(self, kind: str) -> int:
         if kind == "bulk":
@@ -952,6 +994,12 @@ fi''', what=f"sample {tag} CPU once a second (Linux only)")
         threads = [threading.Thread(target=go, args=(i, c, k, n)) for i, (c, k, n) in enumerate(jobs)]
         for t in threads:
             t.start()
+        for t, (c, k, n) in zip(threads, jobs):
+            if k != "probe":
+                t.join()
+        for t, (c, k, n) in zip(threads, jobs):
+            if k == "probe":
+                self.hosts[c.host].run(f"touch {self.stop_file(c, arm)}", what=f"{phase}: load finished, stop the probe on {c.name}")
         for t in threads:
             t.join()
         if self.dry:
@@ -1162,11 +1210,18 @@ ps -eo pid=,args= | grep -F -- "{W}/" | grep -v -F grep || true''', what="stop e
                 self.clean()
             for sig, h in prev.items():
                 signal.signal(sig, h)
+        production = "unchanged"
         try:
             self.check_production("after")
         except ProductionChanged as e:
             self.log(f"PRODUCTION CHANGED during the campaign: {e}")
-            return 3
+            production, status = "changed", 3
+        if not self.dry:
+            # The analyzers issue a verdict only for a campaign that finished
+            # and left production as it found it.
+            with open(os.path.join(self.out, "status.json"), "w") as f:
+                json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
+                           "production": production, "finished_utc": utc(time.time())}, f)
         return status
 
     def print_plan(self, slots: List[Slot]) -> None:

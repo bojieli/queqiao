@@ -24,7 +24,7 @@ from typing import Dict, List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
-from ab_analyze import Trial, fmt, read_campaign  # noqa: E402
+from ab_analyze import PROBE_TIMEOUT, Trial, completeness, fmt, read_campaign  # noqa: E402
 
 BOUNDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "dc_gate.ini")
 
@@ -57,7 +57,7 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     lat = [done(r) for r in req]
     m["latency_p50"] = st.quantile(lat, 0.5)
     m["latency_p99"] = st.quantile(lat, 0.99)
-    ctl = [float(r["seconds"]) if r["complete"] == "1" else 10.0
+    ctl = [float(r["seconds"]) if r["complete"] == "1" else PROBE_TIMEOUT
            for r in t.rows if r["client"] == control and r["kind"] == "probe"]
     m["control_p50"] = st.quantile(ctl, 0.5)
     m["requests_ok"] = sum(1 for r in req if r["complete"] == "1")
@@ -69,6 +69,7 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     plan, trials = read_campaign(campaign)
     if plan.get("workload") != "dc" or not plan.get("dc"):
         raise SystemExit(f"{campaign} is not a dc campaign")
+    problems, trials = completeness(campaign, plan, trials)
     dc = plan["dc"]
     loaded, control = dc["loaded"], dc["control"]
     main = plan["main"]
@@ -100,6 +101,11 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     bound_ok = binding_mean == binding_mean and binding_mean <= bounds["binding_max"]
 
     a, r, s = bounds["alpha"], bounds["resamples"], bounds["seed"]
+    # Section 15.4's void rule, on the sustained outcome: a campaign in which
+    # too many legacy blocks delivered nothing is rerun, not judged.
+    legacy_sus = per_block(main, "aggregate_bytes", total)
+    zero_frac = (sum(1 for v in legacy_sus.values() if v == 0) / len(legacy_sus)) if legacy_sus else float("nan")
+    zero_void = not (zero_frac <= bounds["max_zero_main_fraction"])
     criteria = [
         # name, key, per-block aggregation, contrast builder (cand, legacy) -> d
         ("sustained goodput (aggregate bytes)", "aggregate_bytes", total,
@@ -127,6 +133,8 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
            f"Ancestor binding (legacy simultaneous / sum of solo, mean over {len(binding)} blocks): "
            f"{fmt(binding_mean, '.2f')} (must be <= {bounds['binding_max']:g})"
            + ("" if bound_ok else " -- **the shared ancestor did not bind: campaign VOID**"), ""]
+    if problems:
+        out += ["**No verdict: the campaign is incomplete.** " + "; ".join(problems) + ".", ""]
     arms = [main] + cands
     out += ["| per block, mean | " + " | ".join(arms) + " |", "|---|" + "---:|" * len(arms)]
     for label, key, agg, scale, spec in (("aggregate sustained MB", "aggregate_bytes", total, 1e-6, ".1f"),
@@ -150,20 +158,19 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
             common = sorted(set(cb) & set(lb))
             d = [build(cb[b], lb[b]) for b in common if cb[b] == cb[b] and lb[b] == lb[b]]
             mean_d, tl, bl, ok = st.lower_bounds(d, a, int(r), int(s))
-            if key == "aggregate_bytes":
-                zeros = sum(1 for b in common if lb[b] == 0)
-                if common and zeros / len(common) > bounds["max_zero_main_fraction"]:
-                    ok = False
-                    label += " (VOID: legacy zero blocks)"
             all_pass &= ok
             out.append(f"| {label} | `{desc}` | {len(d)} | {fmt(mean_d, '.4g')} | {fmt(tl, '.4g')} | {fmt(bl, '.4g')} | "
                        f"{'pass' if ok else '**FAIL**'} |")
-        verdict = "VOID" if not bound_ok else ("PASS" if all_pass else "FAIL")
+        verdict = ("VOID" if not bound_ok or zero_void else
+                   "INCOMPLETE" if problems and all_pass else
+                   "PASS" if all_pass else "FAIL")
         verdicts[cand] = verdict
         out += ["", f"**Verdict for {cand}: {verdict}.** "
                 + {"PASS": "The profile may move to the new architecture and the legacy bundle may be deleted (section 11.3).",
                    "FAIL": "The legacy bundle stays for dc-long-haul; joint limiting waits for the tree-arbiter design (Q2).",
-                   "VOID": "Rerun with more load on the loaded leaves so the common ancestor binds."}[verdict]]
+                   "VOID": ("Rerun: more than the pre-registered fraction of legacy blocks delivered nothing."
+                            if zero_void else "Rerun with more load on the loaded leaves so the common ancestor binds."),
+                   "INCOMPLETE": "No verdict: " + "; ".join(problems) + "."}[verdict]]
     return "\n".join(out) + "\n", verdicts
 
 

@@ -26,7 +26,8 @@ def iso(t):
     return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, late_every=5, zero_main=(), cand_stalls=3):
+def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, late_every=5, zero_main=(), cand_stalls=3,
+                   status="complete", drop_slot=None, workload="bulk", cand_probe=None):
     """A two-arm campaign on one path with known outcomes.
 
     Main delivers ~40 MB per trial (four 10 MB flows) with 20% block-to-block
@@ -39,12 +40,10 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
     """
     rng = random.Random(seed)
     os.makedirs(root)
-    plan = {"main": "main", "workload": "bulk", "paths": ["p"], "dc": None,
+    plan = {"main": "main", "workload": workload, "paths": ["p"], "dc": None, "schedule": [],
             "arms": {"main": {"role": "main", "flags": [], "commit": "a" * 40},
                      "cand": {"role": "candidate", "flags": ["--cc-api=v2"], "commit": "b" * 40}},
             "clients": {"p": {"small": True, "platform": "linux/amd64"}}}
-    with open(os.path.join(root, "plan.json"), "w") as f:
-        json.dump(plan, f)
     rows = []
     t = T0
     for b in range(1, blocks + 1):
@@ -53,6 +52,9 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
         seen = {}
         for slot, arm in enumerate(order, start=1):
             seen[arm] = seen.get(arm, 0) + 1
+            plan["schedule"].append({"block": b, "path": "p", "slot": slot, "arm": arm})
+            if drop_slot == (b, slot):
+                continue
             per_flow = level if arm == "main" else level * cand_ratio * (1 + rng.gauss(0, noise))
             if arm == "main" and b in zero_main:
                 per_flow = 0
@@ -64,6 +66,13 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
                 rows.append([b, "p", slot, arm, "main" if arm == "main" else "candidate", seen[arm], int(seen[arm] == 1),
                              "main", 0, "p", "bulk", f"b{i}", iso(start), iso(end), 200 if size else "000", size, 20.0,
                              0 if size else 28, 1 if size else 0, 20.0])
+            for k in range(1, 21) if workload == "interactive" else ():
+                # Main's probes take 0.1 s; the candidate's take cand_probe,
+                # where None means every other one fails.
+                ok = arm == "main" or cand_probe is not None or k % 2
+                secs = 0.1 if arm == "main" else (cand_probe if cand_probe is not None else 0.05)
+                rows.append([b, "p", slot, arm, "x", seen[arm], 0, "main", 1, "p", "probe", f"p{k}", iso(start), iso(end),
+                             200 if ok else "000", 1024 if ok else 0, secs if ok else 10.0, 0 if ok else 28, int(bool(ok)), 20.0])
             tag = f"b{b:03d}-p"
             name = f"{tag}-s{slot}-{arm}"
             md = os.path.join(root, "metrics")
@@ -97,6 +106,11 @@ def write_campaign(root, cand_ratio, blocks=12, noise=0.05, seed=1, flows=4, lat
                 for s in range(22):
                     f.write(f"{start + s:.0f} {s * 50}\n")  # 50 ticks/s = 0.5 core
             t = end + 5
+    with open(os.path.join(root, "plan.json"), "w") as f:
+        json.dump(plan, f)
+    if status:
+        with open(os.path.join(root, "status.json"), "w") as f:
+            json.dump({"status": status, "exit": 0 if status == "complete" else 1, "production": "unchanged"}, f)
     with open(os.path.join(root, "trials.tsv"), "w") as f:
         f.write("\t".join(COLUMNS) + "\n")
         for r in rows:
@@ -188,6 +202,33 @@ class Analyzer(unittest.TestCase):
         self.assertEqual(v[("p", "cand", "primary")], "**PASS**")
         self.assertEqual(v[("p", "cand", "stalls_per_trial")], "**FAIL**")
         self.assertEqual(v[("p", "cand", "overall")], "FAIL")
+
+    def test_unfinished_campaign_gets_no_verdict(self):
+        text, v = an.report(self.campaign("nostatus", cand_ratio=1.0, status=None), self.gates)
+        self.assertEqual(v[("p", "cand", "primary")], "INCOMPLETE")
+        self.assertEqual(v[("p", "cand", "overall")], "INCOMPLETE")
+        self.assertIn("did not finish", text)
+        _, v = an.report(self.campaign("aborted", cand_ratio=1.0, status="aborted"), self.gates)
+        self.assertEqual(v[("p", "cand", "overall")], "INCOMPLETE")
+
+    def test_interrupted_block_is_left_out(self):
+        text, v = an.report(self.campaign("hole", cand_ratio=1.0, drop_slot=(5, 3)), self.gates)
+        self.assertIn("| cand | 11 |", text)
+        self.assertIn("1 of 12 planned blocks are missing trials (first: block 5 on p)", text)
+        self.assertEqual(v[("p", "cand", "overall")], "INCOMPLETE")
+
+    def test_failed_probes_count_at_their_timeout(self):
+        # The candidate's probes are faster when they finish but half of them
+        # fail: its p99 must be the timeout, not its fast survivors.
+        root = self.campaign("probes", cand_ratio=1.0, workload="interactive")
+        plan, trials = an.read_campaign(root)
+        an.measure(root, plan, trials)
+        cand = [t for t in trials.values() if t.arm == "cand"]
+        main = [t for t in trials.values() if t.arm == "main"]
+        self.assertAlmostEqual(cand[0].m["interactive_p99_s"], an.PROBE_TIMEOUT)
+        self.assertAlmostEqual(main[0].m["interactive_p99_s"], 0.1)
+        _, v = an.report(root, self.gates)
+        self.assertEqual(v[("p", "cand", "interactive_p99_s")], "**FAIL**")
 
     def test_pilot_estimates_blocks(self):
         text, res = an.pilot_report(self.campaign("pilot", cand_ratio=1.0, noise=0.10), self.gates)
