@@ -426,12 +426,27 @@ func (c *frameConn) needsOpenSafetyCopy(f protocol.Frame) bool {
 func (c *frameConn) writeControlContext(ctx context.Context, f protocol.Frame) error {
 	ctx, cancel := context.WithTimeout(ctx, frameWriteTimeout)
 	defer cancel()
-	if err := c.writeMu.LockContext(ctx); err != nil {
+	timing, _ := ctx.Value(ackTimingKey{}).(*ackTiming)
+	var lockStart time.Time
+	if timing != nil {
+		lockStart = time.Now()
+	}
+	err := c.writeMu.LockContext(ctx)
+	if timing != nil {
+		// Counted whether or not the lock was won: a wait that timed out
+		// on one lane is still where an acknowledgement's time went.
+		timing.lockNS += int64(time.Since(lockStart))
+	}
+	if err != nil {
 		return err
 	}
 	defer c.writeMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if timing != nil {
+		writeStart := time.Now()
+		defer func() { timing.writeNS += int64(time.Since(writeStart)) }()
 	}
 	if deadlineConn, ok := c.control.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		deadline := time.Now().Add(frameWriteTimeout)

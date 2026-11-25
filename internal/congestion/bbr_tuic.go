@@ -32,8 +32,11 @@ type TUICBBRSender struct {
 	// a sender that is not told about a loss believes the pipe is fuller than
 	// it is and throttles itself for a packet that is already gone.
 	lossIsCongestion bool
-	maxDatagramSize  quiccongestion.ByteCount
-	pacer            *pacer
+	// startupHeld defers the decision to leave startup to the caller; see
+	// checkFullBandwidth.
+	startupHeld     bool
+	maxDatagramSize quiccongestion.ByteCount
+	pacer           *pacer
 
 	mode                 tuicBbrMode
 	pacingGain           float64
@@ -755,8 +758,29 @@ func (b *TUICBBRSender) nextCycleOffset() uint8 {
 	return offset
 }
 
+// reenterStartup puts a controller that has left startup back into it, from
+// its current estimate, for a caller that has evidence the pipe is no longer
+// full (ErasureSender.maybeRearm). A controller in ProbeRTT finishes it and
+// then takes startup rather than ProbeBW.
+func (b *TUICBBRSender) reenterStartup() {
+	b.fullBandwidth = false
+	b.bwAtLastRound = b.estimator.estimate()
+	b.roundsNoGain = 0
+	b.recovery = tuicNotInRecovery
+	b.recoveryWindow = 0
+	if b.mode == tuicBbrProbeRTT {
+		return
+	}
+	b.mode = tuicBbrStartup
+	b.pacingGain = b.highGain
+	b.cwndGain = b.highCwndGain
+}
+
 func (b *TUICBBRSender) checkFullBandwidth(lastSendState tuicSendState) {
-	if b.lastSampleAppLimited {
+	// A lane ramping past its share has its full-pipe test made for it by
+	// the ramp (ErasureSender.rampGate), against the pool's erasure floor;
+	// this one's loss exit would end startup on ordinary erasure.
+	if b.lastSampleAppLimited || b.startupHeld {
 		return
 	}
 	target := uint64(float64(b.bwAtLastRound) * tuicStartupGrowth)

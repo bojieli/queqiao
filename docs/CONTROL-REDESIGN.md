@@ -339,3 +339,462 @@ that collapses a joining lane on an erasure channel, which this test cannot
 see. That trade-off, and whether the higher starting rate on a high-erasure
 link pays for itself in goodput, is what the live-path A/B in the pull request
 has to settle.
+
+### A joining lane ramps before its share caps it
+
+The live A/B for #73 found the honest pool had made the share a ceiling. On a
+fast path with a moderate erasure floor (about 150 Mbit/s, 170 ms, 15%) four
+concurrent downloads ran at 52.5 Mbit/s against main's 142, slower in every
+paired round, with the loss at the path's floor and a queue p90 of 0.5 ms:
+under-used, not overdriven. Each trial was a burst of joins onto a pool that
+had idled down to about 40 kB/s.
+
+The share is `shareProbeGain` times an even split of the pooled bottleneck,
+and the bottleneck is what the members delivered. That lets the members grow
+the bottleneck by a quarter per measurement only if every member is using its
+share. A member that is not -- the pooled control connection, a lane that
+finished or stalled and has not expired -- still takes an even split, so four
+bulk lanes beside one idle member get `1.25 x 4/5 = 1.0` times what they
+delivered, and the bottleneck does not grow at all. The trace showed exactly
+that: lanes plateaued with the reported delivery, the pooled share and the
+estimate all equal. Main hid it, because the echoed seeds inflated the share
+until it did not bind.
+
+A second fault made it permanent. A lane held below its window by a share
+looks application-limited at every acknowledgement, and BBR's startup exit
+tests skip application-limited rounds, so every capped lane in the trace sat
+in STARTUP for the whole transfer, pacing at the startup gain over its last
+estimate, with the share as its only bound.
+
+**The change.** A lane that joins from a pooled seed starts *ramping*
+(`ErasureSender.rampGate`). While it ramps the share does not cap it; its own
+BBR startup, from its honest seed, does. The ramp ends at the first of
+(it can start again; see "Follow-ups" below):
+
+- a quarter round trip of queue (`SmoothedRTT >= 1.25 x minRTT`);
+- a round losing more than its floor -- as first shipped, the erasure the
+  pool had measured when the lane joined; since the follow-ups, the higher of
+  that and the lane's own confirmed first rounds -- by three standard deviations of the two-proportion test between
+  them (`lossAboveFloor`) and by at least three packets. The floor's weight
+  is `State.ErasureSamples`: the outcomes the current erasure rests on, from
+  each estimator's effective (forgetting) count and carried through a
+  `Chain` from the node that supplies the erasure -- not the lifetime
+  high-water mark `ObservedSamples`, which can belong to an expired member
+  and grows without bound. Both sides are deflated by the pool's burst
+  factor, since losses in runs of b are about n/b independent trials; Both are estimates:
+  a pool that has decided ten packets reports a floor of zero with nothing
+  behind it, and against a fixed zero one ordinary loss would read as
+  significant. Rounds, or floors, resting on fewer than 64 packets are not
+  judged;
+- three rounds without a quarter's growth in the delivery this lane measured
+  itself, counting only rounds in which it had at least half its window in
+  flight -- BBR's own full-pipe test, minus the application-limited skip that
+  never let a capped lane leave startup, and minus the rounds in which a lane
+  carrying requests before its transfer was not probing anything. (A refused
+  pacing poll is not that evidence: quic-go polls after the last packet of a
+  request too.) This is what catches a policer whose drops are already the
+  floor.
+
+When it ends, the lane takes its share and its controller leaves startup, as
+BBR would have at a full pipe. While it ramps, the inner controller's own
+startup exits are held (`TUICBBRSender.startupHeld`): their loss exit fires at
+2% loss, which an erasure channel exceeds every round, and the first live run
+showed lanes leaving startup on ordinary erasure at a fraction of their share
+and crawling in ProbeBW. The ramp's queue check also measures against the
+pool's minimum round trip at join, so a lane that joins behind a standing
+queue -- and so measures its own minimum inside it -- still sees the queue.
+Nothing reported to the pool changes:
+`Delivered` is still only what the lane measured, so the seed and bottleneck
+stay honest. Only the cap moves. A lane that joins an empty model has no seed
+and no share, and behaves as before.
+
+**Compensation.** The first simulation of the ramp found it filled the path
+and then held a shallow buffer dropping a third of what was sent, for the rest
+of the transfer. The ramp was not the cause; it was what let the lanes reach
+the regime in which the compensation gate fails. Overflow loss is pooled as
+erasure, the gate judges each step by a max filter that drifts up with noise,
+and it granted the overflow its compensation a step at a time, until the
+shares were paced at twice the path. So a joined lane is granted no increase
+in compensation while it ramps (delivery rises because the ramp raised the
+rate, which says nothing about the compensation), nor afterwards while its
+last round, or the pool's erasure, is significantly above the floor it joined
+with. The pool has to be read as well as the lane, because a shared tail-drop
+queue does not share its drops evenly: the lane that took its compensation
+from 0.85 to 0.43 lost at the floor itself while its siblings lost 35-50%.
+Reducing compensation is still immediate. The veto expires: overflow lasts
+only while the lanes overdrive, and the shares that let them are sized from a
+ten-second bottleneck window, so a pool still above the floor a whole window
+later is a path whose erasure changed, and the lane re-bases its floor on the
+pool's current erasure and earns compensation against it as any lane does.
+The window must be watched, not merely elapse: a gap of more than a second
+between the lane's own events restarts it.
+
+**Simulated.** `internal/congestion/joinburst_sim_test.go` runs the real
+`ErasureSender`, its own pacer, and the real `PathModel` against a
+packet-level bottleneck (finite FIFO buffer, seeded erasure after the queue,
+fixed propagation) on simulated time (`pathmodel.NewPathModelClocked`), so a
+run is identical on every machine. Four lanes join 20 ms apart beside one
+pool member delivering 60 kB/s. Goodput is a fraction of what the path
+delivers after erasure; caused loss is the fraction of sent packets the
+buffer or policer dropped. #146 is its own `erasure.go` under the same test.
+8 s runs, except where noted.
+
+| Path | #146 goodput | This goodput | #146 caused loss | This caused loss | #146 queue p90 | This queue p90 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 18 MB/s, 170 ms, 15%, 12 ms buffer | 0.10 | 0.88 | 0 | 0.15 | 0.1 ms | 11.8 ms |
+| same, 12 s | 0.16 | 0.87 | 0 | 0.12 | 0.2 ms | 11.8 ms |
+| same, 20 s (after 10 s: caused loss 0.011) | | 0.91 | | 0.07 | | 11.7 ms |
+| same, clean (0.1%) | 0.06 | 0.88 | 0 | 0.10 | 0.1 ms | 11.8 ms |
+| same, 85 ms buffer | 0.10 | 0.88 | 0 | 0.06 | 0.1 ms | 85 ms |
+| 2.6 MB/s, 200 ms, 40%, 300 ms buffer | 0.69 | 0.92 | 0 | 0 | 202 ms | 259 ms |
+| same, 12 s | 0.69 | 0.84 | 0 | 0 | 288 ms | 260 ms |
+| 2 MB/s policer, 300 ms, 8 ms bucket | 0.30 | 0.89 | 0 | 0.14 | 0 | 0 |
+| same, plus 42% erasure | 0.61 | 0.90 | 0.09 | 0.19 | 0 | 0 |
+| fast path, four lanes into an empty pool | 0.66 | 0.66 | 0.55 | 0.55 | 11.8 ms | 11.8 ms |
+
+The last row is #146's own regime at capacity, which this change does not
+enter: no seed, so no ramp. A late joiner beside a lane already filling the
+fast path (85 ms buffer) ends its ramp 0.49 s after joining, and caused loss
+over the rest of the run is under 0.001; on #146 the first lane never filled the
+path, so the comparison does not arise.
+
+The high-erasure deep-buffer rows are the path #146 improved live (queue p90
+992 ms to 168 ms). Over 8 s #146's queue reads lower only because it has not
+yet filled the path; over 12 s both hold about the delay bound's queue, and
+the ramp's is the lower.
+
+**What it does not fix.** The pooled bottleneck is a sum of per-lane windowed
+maxima, which overstates the aggregate when lanes peak at different times, as
+they do when they end their ramps a round or two apart. That is most of the
+0.12-0.15 caused loss left on the shallow buffer, concentrated in the seconds
+after the ramps end and gone once the windows turn over; the same burst into an empty
+pool, untouched here, loses 0.55. And the even split itself: one bulk lane
+beside one idle member is held to 5/8 of what it delivers, which this change
+only postpones by ramping first (simulated on the high-erasure path, 0.08 of
+capacity on #146 and 0.62 here). Both are follow-ups.
+
+**Live.** Three arms -- main (`f6e6d34`), #146 (`602438b`) and this change
+(`89ced9b`) -- 12 interleaved rounds per path with the arm order rotated, each
+trial four concurrent downloads through temporary servers on the US gateway.
+Medians, with IQR where it matters:
+
+| Path | Metric | main | #146 | this |
+| --- | --- | ---: | ---: | ---: |
+| fast, ~15% floor (Beijing) | goodput, Mbit/s | 143 | 57.6 | 107 [97-136] |
+| | completed flows | 48/48 | 48/48 | 48/48 |
+| | server loss | 0.17 [0.16-0.32] | 0.162 | 0.178 |
+| | queue p90, ms | 2.2 | 0.55 | 0.81 |
+| | stalls / trial | 8 | 51 | 18 |
+| ~22% loss, ~90 Mbit/s (Mac, this night) | goodput, Mbit/s | 89 | 30 | 29 |
+| | completed flows | 42/48 | 48/48 | 47/48 |
+| | server loss | 0.31 | 0.23 | 0.22 |
+| | queue p90, ms | 35 | 2.9 | 3.1 |
+| | wire bytes / useful byte | 2.28 | 1.92 | 1.47 |
+
+On the fast path this is faster than #146 in 12 of 12 paired rounds (median
+2.1x) at the path's loss floor, and reaches 0.87x of main. The remaining gap is
+the tail of each trial: a lane that ended its ramp is in ProbeBW, and when its
+siblings' flows finish it grows into the freed capacity at a quarter per gain
+cycle, where main's lanes, which never leave startup, refill it at once. The
+Mac path ran fast that night rather than as the 20 Mbit/s high-erasure path of
+the first A/B; there neither #146 nor this change reaches main's goodput, and
+this change keeps #146's loss, queue and completion.
+
+### Follow-ups: the lane's own floor, earned compensation, re-arming (#160)
+
+**The Mac path, explained.** On the night of the three-arm run the Mac path
+lost about 22% at about 90 Mbit/s, and #146 and the ramp both delivered about
+30 Mbit/s against main's 89. The ramp's loss exit and the compensation veto
+both judged against the erasure floor frozen at join, and on that path the
+floor the joiners inherited was lower than what the path erased. Every
+well-sampled round then read as overflow: the ramp ended at its first one,
+and every later round set the lane's `aboveFloor`, which vetoes compensation,
+so the lane paced its delivered rate uncompensated -- sending S delivers
+0.78 S, which is the next estimate -- and BBR's loop walked down. The floor
+only re-bases after ten observed seconds of the *pool* above it, which the
+short-lived rescue joiners never live. The shipped simulation missed it
+because its idle member reported a perfectly earned compensation of
+`1 - erasure` and the true floor; a request-shaped control connection earns
+nothing, and with the idle member reporting that, the shipped high-erasure
+scenario falls from 0.92 to 0.59 of capacity and decays by the second.
+
+**A lane's own floor** (`ErasureSender.floor`, `confirmOwnFloor`). The
+question the ramp asks is whether this lane loses more as it sends faster,
+and its own rounds can answer it. Its first rounds -- until 64
+burst-deflated packets have been decided, at the lowest rate it will send --
+are gathered as its own floor and not judged. The own floor counts only once
+a later ramp round carrying at least twice the packets of any first round,
+and delivering a quarter more than the round before, lost the same, by a
+two-sided two-proportion test at two deviations; from then it rests on both.
+The floor every test uses is then the higher of the confirmed own floor and
+the pool's floor at join. Without the confirmation, rescue joiners whose
+first flight met a full queue lost 98% of it, took that as a floor, lifted
+the overflow veto for good, and the pool's erasure climbed from 0.15 to 0.5
+as the gate compensated it. Without the delivery condition, a lane wedged
+behind a full queue confirmed a floor of 0.97: it loses as much at every rate,
+but delivers no more for it.
+
+**Compensation earned by the ramp** (`earnFromRamp`). A joiner takes the
+compensation its siblings earned, and when none earned any it started at none
+and stayed there. The ramp is the evidence the gate looks for, and more of it
+than one step gets: round after round the lane sent faster, delivered
+proportionally more, and lost no more. So the rounds that grew by a quarter
+without losing above the floor are counted, and at the end of a ramp with a
+confirmed own floor and at least two such rounds the lane compensates for
+the lesser of what those rounds lost and its confirmed floor. It never
+compensates more than the pooled erasure allows (`compensationFor` still
+takes `1 - Erasure` whenever that asks for less).
+
+**Re-arming** (`maybeRearm`, `TUICBBRSender.reenterStartup`). A ramp still
+ends startup, but no longer for good. A lane that is not ramping ramps again,
+from its current estimate, when its share stands twice above what it
+delivers, or when it was capped and no longer is because no other member is
+busy (below) -- the latter kept pending through the backoff, since a lane
+left alone has no share to compare with. Either needs a backlog (half of
+what its pacing rate or window, whichever binds first, allows in flight), and
+no re-arm comes sooner than four rounds after the last ramp ended, doubling
+to at most 64 each time a re-armed ramp found no more than it started from.
+A re-armed ramp ends on the same signals as a first one, and judges its
+queue against the pool's current minimum round trip, not the one at join.
+A bare drop in the number of members was tried as a third trigger and
+removed: every survivor of a burst re-entered startup at once into a path the
+others still filled (one lane of four finishing had the three left lose a
+quarter of what they sent for two seconds), and rescue joiners coming and
+going re-armed the long lanes 26 times in twelve seconds.
+
+**The pool counts who is using it** (`pathmodel.splitLocked`). Re-arming
+alone did not fix the tail. When three of four downloads finish, the last
+lane sits beside the pooled control connection, which counts as a member, and
+the even split holds the last lane at 5/8 of what it delivers, then 5/8 of
+that as the bottleneck window turns over (#160 item 3); and the finished
+lanes still count as members for five seconds. So a share is imposed only
+when at least two members are *busy* (`pathmodel.busyLocked`): reported
+within `activeWindow` of their own round trip -- four round trips, at least
+500 ms -- and delivering at least a quarter of an even split of what the
+active members deliver *now*. Judged against the ten-second bottleneck peak
+instead, a shared drop in capacity -- a policer cutting every lane to a
+fifth -- left every lane below a quarter of the peak's split while still
+reporting, took every cap off and read to each lane as its siblings leaving. With one busy member there is nothing to
+compound, which is the reason a lone member already went uncapped; and a
+finished lane stops being busy within a second rather than expiring after
+five. The split itself does not move.
+
+Two alternatives were simulated and rejected: dividing the bottleneck between
+the active members only (with the sum still holding departed lanes' delivery,
+or with both active-only), which let rescue joiners seed from a bottleneck
+summed over lanes no longer there and took the churn scenario's caused loss
+from 0.04 to 0.2; and handing idle members' splits to busy ones, rejected
+earlier for the same reason (#160 item 3).
+
+**Review findings fixed with it.**
+
+- A lane whose pool has too few samples to judge by no longer falls back to
+  its own unconfirmed first rounds, which may be a first flight's overflow;
+  and an under-sampled floor matures only from what the siblings measured:
+  the pool now publishes the weight behind its erasure
+  (`State.ErasureWeight`), so a lane takes its own report back out exactly.
+- The siblings' evidence is exact: their effective sample count is
+  recomputed with the lane's own term taken out of the pool's Kish sums (it
+  is not additive), and their erasure uses the pool's figure at full
+  precision rather than the published parts per million, whose rounding the
+  subtraction magnifies beside a long-lived lane. A lane with a confirmed
+  own floor over a thin pool can still have that floor expire by the timed
+  re-base.
+- A growing ramp round that loses what the lane's first rounds lost, but is
+  not yet the evidence that confirms them (fewer than 64 independent trials
+  after burst deflation, or less than twice the packets of any first round),
+  is a confirmation pending and is not judged against the pool's floor: a
+  joiner growing 30% a round at a constant 40% over an inherited 15% would
+  otherwise end its ramp before it could confirm what it was showing.
+- Each side of a floor test is deflated by its own burst factor (the
+  floor's, and the pool's, or for a lane's own round the lane's own once it
+  has measured one), and a member counts as active by
+  its own round trip, not the node's minimum, so a long-haul lane beside a
+  short-haul one is not taken for gone between acknowledgements.
+- ProbeRTT's held-down rounds are not ramp evidence: they neither count as
+  flat nor act on a pending re-arm, which waits for the probe to end.
+- A round counts as probing (for the flat-delivery exit, and as a backlog for
+  re-arming) when half of the smaller of the window and the pacing rate over
+  a round trip was in flight. The window alone missed a pacer-bound lane
+  whose window was sized from a seed's longer round trip; on a queue-free
+  policer nothing else would have ended its ramp.
+- In hierarchical (`Chain`) mode the queue baseline came from the chain's
+  `RoundTrip`, which can be an ancestor's -- a shorter path to another
+  destination -- when the leaf has measured none, so every ramp ended at
+  once. A joiner now takes `State.LeafRoundTrip`, the leaf's, and has no
+  pooled baseline when the leaf has none.
+- The floor re-base could fire on a pool figure no packet had refreshed: the
+  estimator forgets by packets, so an overflow burst holds its figure for as
+  long as nothing is sent. It now also requires the lane's own outcomes over
+  the window to be above the floor.
+- The ramp's growth baseline only rose, so a lane that carried requests after
+  a burst counted its growth back from the lull as flat. A round with less
+  than half the window in flight now resets the baseline to what the lane
+  delivers.
+
+**Simulated.** The same simulator, with three changes to the harness: the
+idle member reports an earned compensation of 1 (nothing earned) and a floor
+from 2,000 packets rather than 5,000; lanes can have their own join and stop
+times and a request phase; and four scenarios are new. Each arm runs its own
+`erasure.go` (and, for the shipped ramp, its own pathmodel) under the same
+harness. Goodput is a fraction of what the path delivers after erasure, over
+the interval shown; caused loss is the fraction of packets sent in that
+interval that the buffer or policer dropped.
+
+| Scenario | #146 | ramp as shipped (`1ae1846`) | this |
+| --- | ---: | ---: | ---: |
+| fast, 18 MB/s, 170 ms, 15%, 12 ms buffer | 0.10 / 0 | 0.85 / 0.074 | 0.86 / 0.128 |
+| high erasure, 2.6 MB/s, 200 ms, 40%, 300 ms buffer | 0.52 / 0 | 0.59 / 0 | 0.86 / 0 |
+| policer, 2 MB/s, 300 ms, 8 ms bucket | 0.31 / 0.002 | 0.89 / 0.138 | 0.89 / 0.209 |
+| late joiner beside a full lane, 85 ms buffer (5-9 s) | 0.02 / 0 | 0.98 / 0.038 | 1.00 / 0.023 |
+| **new:** stale floor (0.15 inherited, 0.22 real), nothing earned; 11.25 MB/s, 180 ms, 50 ms buffer, 12 s | 0.14 / 0 | 0.42 / 0 | 0.85 / 0.035 |
+| **new:** tail -- three of four lanes finish by 4 s; fast path (6-14 s) | 0.04 / 0 | 0.27 / 0 | 0.93 / 0.111 |
+| **new:** rescue churn -- two lanes plus one joining every 0.5 s for 1.5 s; lossy path | 0.10 / 0 | 0.78 / 0.048 | 0.86 / 0.078 |
+| **new:** requests then bulk -- 4 packets a round trip for 2 s (3-10 s) | 0.11 / 0 | 0.95 / 0.082 | 0.94 / 0.166 |
+
+Each cell is goodput / caused loss. Queue p90 is unchanged by this change
+where both arms fill the path (11.8 ms on the 12 ms buffer, 84 ms on the 85 ms
+one, about 50 ms on the 50 ms one); on the high-erasure path it is 241 ms,
+against 36 ms for the shipped ramp, which never filled that path, and 188 ms
+for #146.
+
+The cost is caused loss on shallow buffers: 0.13 rather than 0.07 on the fast
+path, and 0.17 rather than 0.08 after a request phase. It is the
+compensation: on a 15% channel the lanes now pace 1/0.85 of their share, as
+the ramp's first simulation did when its idle member was credited with that
+compensation (0.15 caused loss there). In the tail the last lane is alone and
+uncapped, as any first flow is, and a single lane alone on that 12 ms buffer
+has the bottleneck drop 0.24 of what it sends from ProbeBW's probes; the
+refill costs 0.11. The churn scenario's 0.08 is mostly the pool's own
+erasure settling above the 0.22 channel: rescue joiners take that inflated
+figure as their floor at join, as before. All are bounded and inside the
+scenarios' limits; whether they show live is what the A/B below is for.
+
+**Live, after the follow-ups.** The same three-arm harness: main (`0e71930`,
+with #156 and #158), #146 with main merged (`f46ae58`), and this change
+(`d448e5d`), each a temporary server on the US server with identical flags
+and an unmodified build; 12 interleaved rounds per path with the arm order
+rotated; each trial four concurrent downloads (16 MiB each from the Mac, 64
+MiB each from the Beijing host). Run 2026-11-24 07:37-08:35 UTC, a Beijing
+afternoon, when both paths were lossy: the Mac path lost 35-50% at about 20
+Mbit/s -- the high-erasure path of the first #146 A/B, not the fast one of
+the second -- and the Beijing host's path ran at 50-120 Mbit/s, below the
+previous night's 143, with about 12% loss and a standing queue of tens of
+milliseconds in every arm. Medians, with the paired per-round ratio as a
+geometric mean and its 95% bootstrap interval:
+
+| Path | Metric | main | #146 | this |
+| --- | --- | ---: | ---: | ---: |
+| Mac (35-50% loss, ~20 Mbit/s) | goodput, Mbit/s | 9.85 | 18.9 | **18.1** |
+| | completed flows | 45/48 | 48/48 | 48/48 |
+| | server loss | 0.51 | 0.46 | **0.35** |
+| | wire bytes / useful byte | 3.29 | 2.66 | 2.27 |
+| | queue p90, ms | 1,870 | 264 | **167** |
+| | this / main, paired | | | 1.70 [1.30-2.17], faster 11/12 |
+| Beijing host (~12% loss) | goodput, Mbit/s | 77.2 | 46.0 | **72.4** |
+| | completed flows | 48/48 | 48/48 | 48/48 |
+| | server loss | 0.125 | 0.122 | 0.125 |
+| | queue p90, ms | 71 | 75 | 73 |
+| | stalls / trial | 12 | 54 | 38 |
+| | wire bytes / useful byte | 1.22 | 1.60 | 1.63 |
+| | this / main, paired | | | 0.87 [0.64-1.16], faster 4/12 |
+| | this / #146, paired | | | 1.49 [1.11-2.02], faster 8/12 |
+
+On the lossy Mac path this change is well above main and at #146's goodput
+(this/#146 0.94 [0.85-1.03]) with the least loss, the least wire overhead and
+the shortest queue of the three. On the Beijing host it recovers most of what
+#146 lost (1.49x #146) at main's loss and queue, but parity with main is not
+shown: the paired point estimate is 0.87 and this change was faster in 4 of 12
+rounds, though the interval includes parity on a path whose main arm alone
+ranged from 50 to 118 Mbit/s. It still carries #146's higher stall count and
+wire overhead there (38 stalls a trial against main's 12; 1.63 wire bytes per
+useful byte against 1.22), which points at the stall-rescue path rather than
+the ramp. A first run of the same campaign, on an earlier commit, was stopped in
+its second round: the Beijing host's resolver had failed every lookup of the
+server's name, and review round 5 had since changed the code. The profiles
+were switched to the server's address and the campaign re-run from the start
+on the final commit.
+
+### Stalls and wire overhead on the fast lossy path
+
+The live A/B above left this change at 0.87x main on the Beijing host with 38
+stall detections a trial against main's 12, and 1.63 wire bytes per useful
+byte against 1.22. From the server lane traces of that run (Beijing host, 12
+trials per arm; stalls counted in trials only):
+
+- **Where the extra wire bytes come from.** Not loss: dividing wire per useful
+  byte by what the path's loss alone explains, 1/(1-loss), leaves 1.07 for
+  main, 1.37 for #146 and 1.44 here. Not the code: the coded datagram path
+  carried a few hundred source symbols per trial; bulk rides QUIC streams.
+  Scheduler re-issues: 43% of chunks re-issued here and 45% on #146, against
+  4% on main. A chunk on a QUIC lane is a reliable attempt, and its only
+  re-issue is a speculative copy on another lane once two round trips have
+  passed since a lane took it -- so copies follow the flow's data lane
+  moving, and each move copies what the old lane was still holding (median
+  5.2 MB per flow at a stall here, 1.2 MB on main).
+- **What the stalls are.** 93% fired with data in flight and the lane's QUIC
+  connection still being acknowledged (hundreds of packets received in every
+  stall window, all arms): the flow's own acknowledgements had stopped, not
+  the transport. 54% fired on lanes still in startup (#146: 83%; main: 38%).
+  After a stall the flow's data moved to a lane pacing a third as fast
+  (median 0.33 of the stalled lane here, 0.32 on #146, 0.73 on main), and
+  the flow's acknowledgements stayed silent for a median 1.96 thresholds
+  around it (#146: 3.12; main: 1.11).
+- **Why the lanes it moved to were slow.** Two things the honest pool exposed
+  that main's inflated shares hid. A QUIC lane's admission counted only what
+  its writer had not yet handed to the transport, and a QUIC stream takes a
+  write as soon as its buffer has room, so a lane paced well below the others
+  went on taking chunks at the rate the fast lanes freed them -- 1.2-1.5 MB
+  queued behind lanes pacing 0.7-1 MB/s -- and every one of them outlived the
+  re-issue deadline before it left. And every stall rescue leaves a lane
+  behind that carried a few chunks and stays connected; the even split counts
+  it, so the more a flow stalled, the smaller every data lane's share.
+
+**Changes.**
+
+- The pool's share is split between its busy members and at most one that is
+  not (`pathmodel.Report`, and `Current` for a joining lane, which the coded
+  path sizes its window from); only the sole busy member itself goes
+  uncapped, and whether a member is busy is judged against what the members
+  reporting now deliver. One idle member's split is kept: it is the brake
+  that holds a burst's shares, sized from summed peaks, to what was
+  delivered, and every simulated scenario still passes with it. Seeds still
+  split over every member.
+- The bottleneck sample sums only members that are still reporting: a lane
+  that stopped keeps its last rate until it expires, and summed with the lanes
+  still sending it is a peak nobody delivers (#160 item 2, for that case).
+
+Lane telemetry now reports the rate the pacer uses, after the share and the
+delay brake, rather than the inner rate over the arrival: what a trace shows
+is what went on the wire.
+
+Tried and dropped. Bounding what a QUIC lane may hold unacknowledged by its
+own pacing rate over a few round trips -- so that a slow lane could not hoard
+chunks until they outlived the re-issue deadline -- cut stalls and wire
+overhead in emulation, but live it made the fast lossy path worse: in a
+bisect on the Beijing host (6 interleaved rounds), the build with it was
+slower than the same build without it in five of six rounds, and was the only
+build that failed flows (one of four, and two of four, in two trials). Also
+dropped, for no measurable gain: keeping a live suspected lane as
+the data lane when the spare is much slower; re-basing a ramping lane's
+startup pacing after rounds that were not backlogged; splitting the share
+between busy members only (it fails four simulated scenarios on caused loss,
+0.21-0.26).
+
+**Reproduced.** `TestFourDownloadsOnAFastLossyPath` (opt-in) runs the real
+client and server across `pathsim` at 25 MB/s, 220 ms, a 1.75 MB buffer, 12%
+erasure in bursts of three, and 40 ms of delay wander -- without the wander
+and the bursts it reproduced neither the gap nor the stalls. Four concurrent
+32 MiB downloads, five seeds per build, all builds run side by side; means:
+
+| Build | goodput, Mbit/s | stalls | excess wire |
+| --- | ---: | ---: | ---: |
+| main | 64.1 | 16 | 1.30 |
+| this change before the fixes | 48.4 | 21 | 1.37 |
+| with the split and bottleneck fix (kept) | 61.5 | 24 | 1.31 |
+| with that and the lane bound (dropped, see above) | 60.7 | 17 | 1.20 |
+
+Single runs varied by tens of percent (main 36-95 Mbit/s over the same five
+seeds), so this ranks the builds and does not measure them; the live A/B
+below is the measurement.
+

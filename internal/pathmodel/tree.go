@@ -195,11 +195,16 @@ func (c *Chain) Current() State {
 //     the longest is the one that describes this flow's path.
 //   - ObservedSamples takes the maximum, because it is a statement about how
 //     much is known rather than a constraint.
+//   - LeafRoundTrip is the leaf's: an ancestor's can describe another
+//     destination's lanes.
 func combine(states []State) State {
 	var out State
 	for _, s := range states {
-		if s.Erasure > out.Erasure {
-			out.Erasure = s.Erasure
+		// The samples behind the erasure travel with it, from whichever node
+		// supplies it; among equal figures, including a measured clean
+		// floor, the best-measured one.
+		if s.Erasure > out.Erasure || (s.Erasure == out.Erasure && s.ErasureSamples > out.ErasureSamples) {
+			out.Erasure, out.ErasureSamples, out.ErasureBurst, out.ErasureWeight = s.Erasure, s.ErasureSamples, s.ErasureBurst, s.ErasureWeight
 		}
 		if s.BurstFactor > out.BurstFactor {
 			out.BurstFactor = s.BurstFactor
@@ -229,8 +234,17 @@ func combine(states []State) State {
 			out.Seed = s.Seed
 		}
 	}
+	// The leaf is this destination; an ancestor's round trip can be
+	// another destination's.
+	if len(states) > 0 {
+		leaf := states[len(states)-1]
+		out.LeafRoundTrip = leaf.LeafRoundTrip
+	}
 	if out.BurstFactor < 1 {
 		out.BurstFactor = 1
+	}
+	if out.ErasureBurst < 1 {
+		out.ErasureBurst = 1
 	}
 	// A chain that constrained nothing still seeds from whatever any node
 	// knows, because a seed is not a ceiling: starting a lane from a

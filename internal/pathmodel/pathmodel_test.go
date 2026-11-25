@@ -287,3 +287,275 @@ func TestArrivalIsPooledBySamplesAndRemembered(t *testing.T) {
 		t.Fatalf("arrival %.3f survived knowledgeLifetime", got)
 	}
 }
+
+// The samples behind the erasure are the ones behind it now, not the most the
+// path ever observed: those may belong to a member that has expired.
+func TestErasureSamplesAreTheOnesBehindTheCurrentEstimate(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Erasure: 0.1, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6})
+	now = now.Add(2 * memberIdle)
+	state := m.Report(2, Observation{Erasure: 0, BurstFactor: 1, ObservedSamples: 10, Delivered: 1e6})
+	if state.ObservedSamples != 5000 || state.ErasureSamples != 10 {
+		t.Fatalf("observed %.0f, erasure samples %.0f; want 5000 and 10", state.ObservedSamples, state.ErasureSamples)
+	}
+	if got := m.Members(); got != 1 {
+		t.Fatalf("Members reads the model's clock: %d, want 1", got)
+	}
+}
+
+// An estimator that forgets rests its figure on fewer outcomes than it has
+// ever decided; the pool reports the former.
+func TestErasureSamplesAreTheEstimatorsEffectiveCount(t *testing.T) {
+	m := NewPathModel()
+	state := m.Report(1, Observation{Erasure: 0.15, BurstFactor: 1, ObservedSamples: 2e6, ErasureSamples: 8000, Delivered: 1e6})
+	if state.ErasureSamples != 8000 || state.ObservedSamples != 2e6 {
+		t.Fatalf("erasure samples %.0f, observed %.0f; want 8000 and 2000000", state.ErasureSamples, state.ObservedSamples)
+	}
+}
+
+// An old lane that dominates the pooled erasure's weights is not made more
+// precise by new lanes' samples beside it.
+func TestErasureSamplesFollowTheWeightsBehindTheEstimate(t *testing.T) {
+	m := NewPathModel()
+	m.Report(1, Observation{Erasure: 0.15, BurstFactor: 1, ObservedSamples: 1e6, ErasureSamples: 100, Delivered: 1e6})
+	state := m.Report(2, Observation{Erasure: 0.15, BurstFactor: 1, ObservedSamples: 8000, ErasureSamples: 8000, Delivered: 1e6})
+	if state.ErasureSamples > 200 {
+		t.Fatalf("an estimate weighted 99%% by a lane resting on 100 samples claims %.0f", state.ErasureSamples)
+	}
+}
+
+// A lane beside members that are not using the path has nothing to compound
+// with, and is not capped: the last download of a burst, beside the pooled
+// control connection, was held to 5/8 of what it delivered and then 5/8 of
+// that. Two busy lanes are capped as before, idle member and all.
+func TestALaneBesideIdleMembersIsNotCapped(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 60e3, ObservedSamples: 100})
+	state := m.Report(2, Observation{Delivered: 8e6, ObservedSamples: 1000})
+	if state.Share != 0 {
+		t.Fatalf("one busy lane beside an idle member is capped at %.0f", state.Share)
+	}
+	state = m.Report(3, Observation{Delivered: 8e6, ObservedSamples: 1000})
+	if want := shareProbeGain * 16.06e6 / 3; math.Abs(state.Share-want) > 1e3 {
+		t.Fatalf("two busy lanes and an idle member: share %.0f, want the even split's %.0f", state.Share, want)
+	}
+	// A joiner beside one busy lane takes a share: it will be the second.
+	if got := m.Current(); got.Share == 0 {
+		t.Fatal("a lane joining a busy one is not capped")
+	}
+}
+
+// A lane that stops reporting stops being busy within a few round trips, so
+// the lane left behind is uncapped long before its siblings expire; the split
+// itself still counts them until then.
+func TestAFinishedLaneStopsCountingAsBusy(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	if state := m.Report(2, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond}); state.Share == 0 {
+		t.Fatal("two busy lanes are not capped")
+	}
+	now = now.Add(time.Second)
+	state := m.Report(2, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	if state.Share != 0 {
+		t.Fatalf("a second after its sibling stopped reporting, the lane is capped at %.0f", state.Share)
+	}
+	if want := 12e6 / 2; state.Seed != want {
+		t.Fatalf("the split stopped counting the quiet lane before it expired: seed %.0f, want %.0f", state.Seed, want)
+	}
+	if got := m.Members(); got != 2 {
+		t.Fatalf("a quiet lane expired after a second: %d members", got)
+	}
+}
+
+// The pooled erasure carries the weight it was averaged by, so a member can
+// take its own report back out of it.
+func TestErasureWeightIsTheObservationsBehindIt(t *testing.T) {
+	m := NewPathModel()
+	m.Report(1, Observation{Erasure: 0.9, BurstFactor: 1, ObservedSamples: 1000, Delivered: 1e6})
+	state := m.Report(2, Observation{Erasure: 0, BurstFactor: 1, ObservedSamples: 200, Delivered: 1e6})
+	if state.ErasureWeight != 1200 {
+		t.Fatalf("erasure weight %.0f, want 1200", state.ErasureWeight)
+	}
+	if others := (state.Erasure*state.ErasureWeight - 0.9*1000) / (state.ErasureWeight - 1000); math.Abs(others) > 1e-9 {
+		t.Fatalf("with member 1 taken out, the erasure is %.3f, want member 2's 0", others)
+	}
+}
+
+// Each member is judged active by its own round trip: a long-haul lane
+// acknowledged once a round trip is not gone between acknowledgements
+// because a short-haul member sets the node's minimum.
+func TestALongHaulMemberIsActiveByItsOwnRoundTrip(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 800 * time.Millisecond})
+	now = now.Add(600 * time.Millisecond)
+	state := m.Report(2, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 30 * time.Millisecond})
+	if state.Share == 0 {
+		t.Fatal("a long-haul lane 600 ms into its 800 ms round trip was taken for gone")
+	}
+}
+
+// A shared drop in capacity is not every sibling leaving: lanes that all
+// deliver a fifth of the bottleneck's peak, reporting each round, are still
+// busy and still capped.
+func TestASharedCapacityDropKeepsTheCap(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 10e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	m.Report(2, Observation{Delivered: 10e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	now = now.Add(100 * time.Millisecond)
+	m.Report(1, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	state := m.Report(2, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 150 * time.Millisecond})
+	if state.Share == 0 {
+		t.Fatal("both lanes cut to a fifth of the peak, still reporting, and the cap came off")
+	}
+}
+
+// Every stall rescue leaves a lane behind that carried a few chunks and stays
+// connected. One idle member keeps its split, as the brake against summed
+// peaks; more do not take a share of a path they are not using.
+func TestIdleRescueLanesDoNotDiluteTheShare(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	for member := Member(10); member < 15; member++ {
+		m.Report(member, Observation{Delivered: 60e3, ObservedSamples: 100, RoundTrip: 200 * time.Millisecond})
+	}
+	var state State
+	for member := Member(1); member <= 4; member++ {
+		state = m.Report(member, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	}
+	bottleneck := 4*6e6 + 5*60e3
+	if want := shareProbeGain * bottleneck / 5; math.Abs(state.Share-want) > 1 {
+		t.Fatalf("four busy lanes beside five idle ones: share %.0f, want %.0f (busy plus one idle)", state.Share, want)
+	}
+	if want := bottleneck / 9; math.Abs(state.Seed-want) > 1 {
+		t.Fatalf("the seed %.0f no longer splits over every member (%.0f)", state.Seed, want)
+	}
+}
+
+// The bottleneck sample is what the members deliver now. A member that has
+// stopped reporting keeps its last rate until it expires, and summed beside
+// the lanes still sending it is a peak nobody delivers.
+func TestAQuietMembersLastRateIsNotSummedIntoTheBottleneck(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 10e6, ObservedSamples: 1000, RoundTrip: 100 * time.Millisecond})
+	m.Report(2, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 100 * time.Millisecond})
+	var state State
+	for step := 0; step < 23; step++ {
+		now = now.Add(500 * time.Millisecond)
+		state = m.Report(2, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 100 * time.Millisecond})
+	}
+	// Eleven and a half seconds on: the samples taken while member 1 was still
+	// sending have aged out of the window, and those taken since did not
+	// count it.
+	if state.Seed > 2e6+1 {
+		t.Fatalf("the bottleneck still holds a quiet member's rate: seed %.0f, want 2000000", state.Seed)
+	}
+}
+
+// Only the sole busy member goes uncapped. A lane beside it that has slowed
+// keeps a share: uncapped, it would read the vanished cap as being left alone
+// and ramp into a path its sibling still fills.
+func TestOnlyTheSoleBusyMemberIsUncapped(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	m.Report(2, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	slowed := m.Report(2, Observation{Delivered: 100e3, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	if slowed.Share == 0 {
+		t.Fatal("a lane that slowed beside a busy sibling lost its cap")
+	}
+	if busy := m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond}); busy.Share != 0 {
+		t.Fatalf("the only busy member is capped at %.0f", busy.Share)
+	}
+}
+
+// A lane about to join takes the same split the members report: the coded
+// path sizes its window from Current's share, and a share that still divided
+// by every idle rescue lane would size it for a policy the lanes no longer
+// follow.
+func TestAJoinersShareFollowsTheBoundedSplit(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	for member := Member(10); member < 15; member++ {
+		m.Report(member, Observation{Delivered: 60e3, ObservedSamples: 100, RoundTrip: 200 * time.Millisecond})
+	}
+	for member := Member(1); member <= 4; member++ {
+		m.Report(member, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	}
+	bottleneck := 4*6e6 + 5*60e3
+	state := m.Current()
+	if want := shareProbeGain * bottleneck / 6; math.Abs(state.Share-want) > 1 {
+		t.Fatalf("a joiner beside four busy lanes and five idle ones: share %.0f, want %.0f (five busy with it, plus one idle)", state.Share, want)
+	}
+	if want := bottleneck / 10; math.Abs(state.Seed-want) > 1 {
+		t.Fatalf("seed %.0f, want the split over every member, %.0f", state.Seed, want)
+	}
+}
+
+// Whether a lane is busy is judged against what the members reporting now
+// deliver, between them: rescue lanes that have gone silent but not yet
+// expired do not lower the bar until the control connection clears it.
+func TestSilentRescueLanesDoNotMakeTheControlLaneBusy(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	for member := Member(10); member < 18; member++ {
+		m.Report(member, Observation{Delivered: 0, ObservedSamples: 100, RoundTrip: 200 * time.Millisecond})
+	}
+	now = now.Add(2 * time.Second)
+	m.Report(2, Observation{Delivered: 40e3, ObservedSamples: 100, RoundTrip: 200 * time.Millisecond})
+	state := m.Report(1, Observation{Delivered: 1e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	if state.Share != 0 {
+		t.Fatalf("the only busy lane beside a control lane and eight silent rescue lanes is capped at %.0f", state.Share)
+	}
+}
+
+// A member that says it is application-limited is never capped, whatever it
+// delivers: its measured delivery is its offered load, and a share sized from
+// that caps it at its own load. The live case is the client's upstream pool,
+// whose members carry only a download's flow acknowledgements.
+func TestAnApplicationLimitedMemberIsNotCapped(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	ack := func(member Member, appLimited bool) State {
+		return m.Report(member, Observation{Delivered: 5e3, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond, AppLimited: appLimited})
+	}
+	for member := Member(1); member <= 4; member++ {
+		ack(member, false)
+	}
+	if capped := ack(1, false); capped.Share == 0 {
+		t.Fatal("four equal members that do not say they are application-limited should share the path")
+	}
+	for member := Member(1); member <= 4; member++ {
+		if state := ack(member, true); state.Share != 0 {
+			t.Fatalf("application-limited member %d capped at %.0f B/s", member, state.Share)
+		}
+	}
+}
+
+// An application-limited member does not count as busy, so a bulk lane
+// beside acknowledgement-only members is the sole busy one and is not split
+// with them.
+func TestApplicationLimitedMembersAreNotBusy(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	for member := Member(2); member <= 4; member++ {
+		m.Report(member, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond, AppLimited: true})
+	}
+	bulk := m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	if bulk.Share != 0 {
+		t.Fatalf("the only send-limited member beside application-limited ones is capped at %.0f", bulk.Share)
+	}
+	// Without the verdict the same delivery makes all four busy, and the bulk
+	// lane is split four ways.
+	for member := Member(2); member <= 4; member++ {
+		m.Report(member, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	}
+	if again := m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond}); again.Share == 0 {
+		t.Fatal("four busy members and no cap")
+	}
+}

@@ -73,6 +73,7 @@ type pathKnowledge struct {
 	erasure         float64
 	burst           float64
 	erasureKnown    bool
+	erasureSamples  float64
 	observedSamples float64
 	roundTrip       time.Duration
 	// arrival is the pooled earned compensation; see State.Arrival.
@@ -117,10 +118,13 @@ type report struct {
 	erasure   float64
 	burst     float64
 	observed  float64
+	effective float64
 	delivered float64
 	arrival   float64
 	roundTrip time.Duration
 	at        time.Time
+	// appLimited is the member's last Observation.AppLimited.
+	appLimited bool
 }
 
 // Observation is what one contributor has measured about the direction it
@@ -144,6 +148,11 @@ type Observation struct {
 	// still unknown, which is what distinguishes a measured clean path from an
 	// unmeasured one.
 	ObservedSamples float64
+	// ErasureSamples is how many outcomes Erasure itself rests on, which for
+	// an estimator that forgets is fewer than ObservedSamples: it stops
+	// growing at the estimator's memory. Zero means the same as
+	// ObservedSamples.
+	ErasureSamples float64
 	// Delivered is this contributor's delivered rate in bytes per second, and
 	// RoundTrip the smallest round trip it has seen. Delivered must be what it
 	// measured, not a rate it was seeded with: the pool sums it into the
@@ -156,6 +165,20 @@ type Observation struct {
 	// that sending more delivered more, 1 for none. Zero means it has not
 	// decided yet and contributes nothing.
 	Arrival float64
+	// AppLimited says the contributor is sending less than its own controller
+	// would let it: neither its window nor its pacing rate, before any share,
+	// is what holds it back. Such a member is given no share and is not
+	// counted as busy. A share exists to stop lanes that each have more to
+	// send compounding their probes; a member with nothing more to send has
+	// no probe to compound, and capping it at 1.25x what it measured
+	// delivering caps it at its own offered load. Measured live, that was the
+	// client's upstream lane, whose only traffic is a download's flow
+	// acknowledgements: held to 1.25x the acknowledgements it had carried, it
+	// paced at 6 kB/s where main's paced at 1.3 MB/s, the acknowledgements
+	// queued behind the pacer while QUIC's own ACK-only packets (which bypass
+	// it) kept the lane looking healthy, and the gateway's sender, clocked by
+	// those flow acknowledgements, stalled.
+	AppLimited bool
 }
 
 // State is what an endpoint pair has been measured to do, from the point of
@@ -171,6 +194,22 @@ type State struct {
 	// floor. It distinguishes a measured clean path from an unmeasured one
 	// without giving an untrusted zero any weight in Floor.
 	ObservedSamples float64
+	// ErasureSamples is how many packet outcomes stand behind Erasure itself:
+	// the live contributors' effective counts (Observation.ErasureSamples)
+	// when any has measured, or those behind the remembered value.
+	// ObservedSamples is a lifetime high-water mark and can belong to a member
+	// that has since expired.
+	ErasureSamples float64
+	// ErasureBurst is the burst factor that belongs to Erasure, for judging
+	// its sampling noise. It equals BurstFactor for one model; a Chain takes
+	// BurstFactor as the worst of its nodes, for sizing a code, but this from
+	// the node whose erasure it took.
+	ErasureBurst float64
+	// ErasureWeight is what Erasure is weighted by: the sum of the live
+	// contributors' ObservedSamples, each member's figure counting in
+	// proportion to its own, so that a member can take its report back out.
+	// Zero when Erasure is remembered rather than reported by anyone live.
+	ErasureWeight float64
 	// Share is this contributor's allowance of the bottleneck in bytes per
 	// second. Zero means the contributor must not cap itself -- either because
 	// the bottleneck is not yet known, or because it is the only one here and
@@ -190,6 +229,12 @@ type State struct {
 	// RoundTrip is the path's minimum round trip, which is the smallest any
 	// lane has seen: a larger one is that lane's queueing, not the path.
 	RoundTrip time.Duration
+	// LeafRoundTrip is RoundTrip as the most specific node measured it: the
+	// same thing for one model, and for a Chain the leaf's, zero while the
+	// leaf has measured none. A joining lane judges a queue against it; the
+	// chain's RoundTrip can come from an ancestor that pools other
+	// destinations, whose round trips say nothing about this one's queue.
+	LeafRoundTrip time.Duration
 	// Arrival is the erasure compensation the contributors have earned,
 	// pooled by their sample counts, or zero when none has decided. It is not
 	// 1-Erasure: on an erasure channel the two converge, but on a policer the
@@ -210,6 +255,12 @@ const (
 	// stops counting. It is several round trips on a long-haul path, so one
 	// that is merely quiet is not evicted and made to rediscover the path.
 	memberIdle = 5 * time.Second
+	// memberActiveFloor and memberActiveRounds bound activeWindow.
+	memberActiveFloor  = 500 * time.Millisecond
+	memberActiveRounds = 4
+	// busyFraction is the part of an even split a member must deliver to be
+	// counted as using the bottleneck; see splitLocked.
+	busyFraction = 0.25
 	// bottleneckWindow is how long a delivered-rate sample stands. Long enough
 	// to survive a probe cycle, short enough that a path which genuinely
 	// narrowed is believed within a few seconds.
@@ -235,6 +286,17 @@ const (
 // NewPathModel returns an empty model. Callers normally want SharedPath.
 func NewPathModel() *PathModel {
 	return &PathModel{members: make(map[Member]*report)}
+}
+
+// NewPathModelClocked returns an empty model that reads the time from now
+// rather than the wall clock. It exists for simulations that run a path faster
+// than real time: membership and the bottleneck window are measured in the
+// path's time, and a simulation driving them from the wall clock would expire
+// nothing and remember everything.
+func NewPathModelClocked(now func() time.Time) *PathModel {
+	m := NewPathModel()
+	m.now = now
+	return m
 }
 
 // Report records what one lane currently believes, and returns what the
@@ -263,15 +325,20 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	}
 	entry.erasure, entry.burst = o.Erasure, o.BurstFactor
 	entry.observed, entry.delivered, entry.at = o.ObservedSamples, o.Delivered, now
+	entry.effective = o.ErasureSamples
+	if entry.effective <= 0 || entry.effective > o.ObservedSamples {
+		entry.effective = o.ObservedSamples
+	}
 	if o.Arrival > 0 {
 		entry.arrival = o.Arrival
 	}
 	if o.RoundTrip > 0 {
 		entry.roundTrip = o.RoundTrip
 	}
+	entry.appLimited = o.AppLimited
 
 	var state State
-	var observed, sum float64
+	var observed, spread, sum float64
 	var erasureWeighted, burstWeighted float64
 	var arrival arrivalPool
 	live := 0
@@ -282,12 +349,21 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		}
 		live++
 		arrival.add(other)
-		sum += other.delivered
+		// The bottleneck sample is what the members deliver now: a member
+		// that stopped reporting -- a finished flow, a rescue lane that went
+		// quiet -- still carries its last rate until it expires, and summed
+		// with the lanes now using the path it is a peak nobody is delivering.
+		if other.reporting(now, m.knowledge.roundTrip) {
+			sum += other.delivered
+		}
 		// A lane with few samples should not move the pooled estimate much,
 		// which is also what lets a new lane join without disturbing it.
 		erasureWeighted += other.erasure * other.observed
 		burstWeighted += other.burst * other.observed
 		observed += other.observed
+		if other.effective > 0 {
+			spread += other.observed * other.observed / other.effective
+		}
 		if other.roundTrip > 0 && (state.RoundTrip == 0 || other.roundTrip < state.RoundTrip) {
 			state.RoundTrip = other.roundTrip
 		}
@@ -296,9 +372,20 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		state.Erasure = erasureWeighted / observed
 		state.BurstFactor = burstWeighted / observed
 		m.knowledge.erasure, m.knowledge.burst = state.Erasure, state.BurstFactor
-		m.knowledge.erasureKnown = true
+		// The estimate is weighted by lifetime counts, so its precision is
+		// that of a weighted mean of members each resting on its effective
+		// count: Kish's effective sample size, (sum w)^2 / sum(w^2/n). An old
+		// lane that dominates the weights is not made more precise by the
+		// new lanes' samples beside it.
+		effective := 0.0
+		if spread > 0 {
+			effective = observed * observed / spread
+		}
+		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, effective
+		state.ErasureSamples, state.ErasureWeight = effective, observed
 	} else if m.knowledge.erasureKnown {
 		state.Erasure, state.BurstFactor = m.knowledge.erasure, m.knowledge.burst
+		state.ErasureSamples = m.knowledge.erasureSamples
 	}
 	if state.BurstFactor < 1 {
 		// A burst factor below one is not a channel, it is an unmeasured or
@@ -306,6 +393,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		// code weakest, so it is the safe one to fall back to.
 		state.BurstFactor = 1
 	}
+	state.ErasureBurst = state.BurstFactor
 	if observed > m.knowledge.observedSamples {
 		m.knowledge.observedSamples = observed
 	}
@@ -333,6 +421,11 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	}
 	m.aggregate = kept
 
+	busy, even := m.busyLocked(now, state.RoundTrip, 0)
+	// Whether the reporter is itself one of the busy members: alone on the
+	// path is a statement about the reporter, not about the count.
+	reporterBusy := even > 0 && !entry.appLimited && entry.delivered >= busyFraction*even
+	state.LeafRoundTrip = state.RoundTrip
 	if live > 0 && bottleneck > 0 {
 		state.Seed = bottleneck / float64(live)
 		// A lone member has nothing to compound with, so there is nothing for
@@ -342,11 +435,116 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		// never probe past it. Measured, that is a transport that runs at line
 		// rate and then collapses to a fiftieth of it for the rest of the
 		// process's life.
-		if live > 1 {
-			state.Share = shareProbeGain * state.Seed
+		//
+		// A lane beside members that are not using the path is alone in the
+		// same sense. One bulk lane next to the pooled control connection
+		// was held to 5/8 of what it delivered, then 5/8 of that as the
+		// window turned over: the last download of a burst, its siblings
+		// finished, crawled at a quarter of a path it had to itself.
+		//
+		// The split is between the busy members and at most one that is not.
+		// One idle member's split is the brake a burst needs: four lanes
+		// beside it are held to what they delivered, which is what keeps
+		// shares sized from summed peaks off a shallow buffer (handing it to
+		// the busy lanes raised a simulated burst's caused loss from 0.11 to
+		// 0.29). Every further idle member was a further split taken from the
+		// lanes using the path. Each stall rescue leaves one behind -- a lane
+		// that carried a few chunks and stays connected -- so on the fast
+		// lossy path the pool counted twice the lanes carrying data, held
+		// each to a fraction of what it delivered, and the bottleneck walked
+		// down: emulated, four downloads reached 0.75x main's goodput, and
+		// 0.95x with the split bounded.
+		//
+		// Only the sole busy member goes uncapped. A member beside it that is
+		// not busy -- a lane that slowed, or one about to start -- keeps a
+		// share: the path is the busy one's, not its, and uncapped it would
+		// read the vanished cap as being left alone and ramp into a path its
+		// sibling still fills.
+		// An application-limited reporter is not capped at all (see
+		// Observation.AppLimited).
+		if live > 1 && !(busy == 1 && reporterBusy) && !o.AppLimited {
+			state.Share = splitShare(bottleneck, busy, live)
 		}
 	}
 	return state
+}
+
+// reporting reports whether a member has reported within activeWindow of its
+// own round trip, or of the node's when it has none.
+func (r *report) reporting(now time.Time, roundTrip time.Duration) bool {
+	if r.roundTrip > 0 {
+		roundTrip = r.roundTrip
+	}
+	return now.Sub(r.at) <= activeWindow(roundTrip)
+}
+
+// activeWindow is how recently a member must have reported to count as
+// busy: a few round trips, in which a lane that is
+// sending is acknowledged many times over, bounded below for short paths and
+// above by memberIdle.
+func activeWindow(roundTrip time.Duration) time.Duration {
+	window := memberActiveRounds * roundTrip
+	if window < memberActiveFloor {
+		window = memberActiveFloor
+	}
+	if window > memberIdle {
+		window = memberIdle
+	}
+	return window
+}
+
+// busyLocked counts the busy members: those that reported within
+// activeWindow of their own round trip and deliver at least busyFraction of
+// an even split of what those members, and joining lanes about to join,
+// deliver now. A finished lane
+// stops counting within a few round trips, long before it expires from the
+// model.
+//
+// Busy is judged against current delivery, not against the bottleneck the
+// shares are sized from: that is a ten-second peak, and when a policer or a
+// narrower route cut every lane to a fifth of it, every lane fell below a
+// quarter of the peak's split while still reporting each round, the caps came
+// off, and every lane read the change as its siblings leaving.
+//
+// It does not change the split. Every live member, busy, quiet or not, still
+// takes an even split when there is a cap: the split is also what brakes a
+// burst whose shares were sized from summed per-lane peaks. Handing an idle
+// member's split to the busy ones raised the caused loss of a simulated burst
+// on a shallow buffer from 0.11 to 0.29; dividing by the active members alone,
+// while the bottleneck still summed the departed ones' delivery, let rescue
+// joiners on a lossy path seed from it, and took their caused loss from 0.04
+// to 0.2. What busy decides is whether there is a cap at all -- with one busy
+// member there is nothing to compound -- and how many of the idle members
+// take a split (splitShare).
+func (m *PathModel) busyLocked(now time.Time, roundTrip time.Duration, joining int) (busy int, even float64) {
+	// Each member by its own round trip where it has one: at a shared egress
+	// a long-haul lane acknowledged in bursts once a round trip is not gone
+	// between them because a short-haul one is faster.
+	active := func(r *report) bool {
+		return r.reporting(now, roundTrip)
+	}
+	current, reporting := 0.0, joining
+	for _, r := range m.members {
+		if active(r) {
+			current += r.delivered
+			reporting++
+		}
+	}
+	if current <= 0 || reporting == 0 {
+		return 0, 0
+	}
+	// The even split of what is delivered now, between those delivering it
+	// now: a lane that went quiet is no more a reason to call a slower lane
+	// busy than it is part of the delivery.
+	even = current / float64(reporting)
+	// An application-limited member is never busy, whatever it delivers: it
+	// is not using the path as much as it could, which is what busy means.
+	for _, r := range m.members {
+		if active(r) && !r.appLimited && r.delivered >= busyFraction*even {
+			busy++
+		}
+	}
+	return busy, even
 }
 
 // Current is what the model already knows, without contributing to it: the
@@ -366,7 +564,7 @@ func (m *PathModel) Current() State {
 	now := m.clock()
 	m.expireKnowledgeLocked(now)
 	var state State
-	var observed, bottleneck float64
+	var observed, spread, bottleneck float64
 	var erasureWeighted, burstWeighted float64
 	var arrival arrivalPool
 	live := 0
@@ -380,6 +578,9 @@ func (m *PathModel) Current() State {
 		erasureWeighted += entry.erasure * entry.observed
 		burstWeighted += entry.burst * entry.observed
 		observed += entry.observed
+		if entry.effective > 0 {
+			spread += entry.observed * entry.observed / entry.effective
+		}
 		if entry.roundTrip > 0 && (state.RoundTrip == 0 || entry.roundTrip < state.RoundTrip) {
 			state.RoundTrip = entry.roundTrip
 		}
@@ -388,9 +589,20 @@ func (m *PathModel) Current() State {
 		state.Erasure = erasureWeighted / observed
 		state.BurstFactor = burstWeighted / observed
 		m.knowledge.erasure, m.knowledge.burst = state.Erasure, state.BurstFactor
-		m.knowledge.erasureKnown = true
+		// The estimate is weighted by lifetime counts, so its precision is
+		// that of a weighted mean of members each resting on its effective
+		// count: Kish's effective sample size, (sum w)^2 / sum(w^2/n). An old
+		// lane that dominates the weights is not made more precise by the
+		// new lanes' samples beside it.
+		effective := 0.0
+		if spread > 0 {
+			effective = observed * observed / spread
+		}
+		m.knowledge.erasureKnown, m.knowledge.erasureSamples = true, effective
+		state.ErasureSamples, state.ErasureWeight = effective, observed
 	} else if m.knowledge.erasureKnown {
 		state.Erasure, state.BurstFactor = m.knowledge.erasure, m.knowledge.burst
+		state.ErasureSamples = m.knowledge.erasureSamples
 	}
 	if state.BurstFactor < 1 {
 		// A burst factor below one is not a channel, it is an unmeasured or
@@ -398,6 +610,7 @@ func (m *PathModel) Current() State {
 		// code weakest, so it is the safe one to fall back to.
 		state.BurstFactor = 1
 	}
+	state.ErasureBurst = state.BurstFactor
 	if observed > m.knowledge.observedSamples {
 		m.knowledge.observedSamples = observed
 	}
@@ -413,6 +626,8 @@ func (m *PathModel) Current() State {
 			bottleneck = sample.rate
 		}
 	}
+	busy, _ := m.busyLocked(now, state.RoundTrip, 1)
+	state.LeafRoundTrip = state.RoundTrip
 	if bottleneck > 0 {
 		// The joining lane counts too, or the first thing it does is take a
 		// share sized for a path with one fewer lane on it.
@@ -420,12 +635,22 @@ func (m *PathModel) Current() State {
 		// Only a lane that will actually share the path takes a ceiling with
 		// it. A lane joining an empty model is alone, and capping it at what
 		// the last occupant delivered is how a fresh connection inherits a
-		// dead one's collapse.
-		if live > 0 {
-			state.Share = shareProbeGain * state.Seed
+		// dead one's collapse. So is one joining beside members that are
+		// not using the path (see Report).
+		// The joining lane is counted as busy: it joins to carry something.
+		if live > 0 && busy > 0 {
+			state.Share = splitShare(bottleneck, busy+1, live+1)
 		}
 	}
 	return state
+}
+
+// splitShare is a member's share of the bottleneck: shareProbeGain times an
+// even split between the busy members and at most one that is not (see
+// Report). Current uses it for a joining lane, and the coded path sizes its
+// window from that, so both have to describe the same split.
+func splitShare(bottleneck float64, busy, live int) float64 {
+	return shareProbeGain * bottleneck / float64(max(busy+min(live-busy, 1), 1))
 }
 
 // arrivalPool pools the members' earned compensation by their sample counts,
@@ -461,7 +686,9 @@ func (m *PathModel) Members() int {
 	if m == nil {
 		return 0
 	}
-	now := time.Now()
+	m.mu.Lock()
+	now := m.clock()
+	m.mu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	live := 0

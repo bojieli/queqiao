@@ -209,6 +209,11 @@ type Chunk struct {
 	// lets local completion callbacks distinguish a retired unreliable attempt
 	// from the replacement carrying the same bytes on the same lane.
 	attempt uint64
+	// requeuedFor and requeuedFromReliable say why the chunk last returned to
+	// the ready set and over which substrate its replaced attempt went, so its
+	// reissue is counted under that cause (Stats.Reissue).
+	requeuedFor          ReissueCause
+	requeuedFromReliable bool
 	// reservation is charged once for the backing allocation, not once per
 	// retransmission. Copies handed to lanes clear it; only the scheduler's
 	// canonical chunk releases it.
@@ -245,8 +250,32 @@ type outstanding struct {
 	attempts []attempt
 }
 
+// ReissueCause is why a chunk was offered again.
+type ReissueCause uint8
+
+const (
+	// ReissueLane is a lane that failed a chunk or died.
+	ReissueLane ReissueCause = iota
+	// ReissueTimer is an attempt whose recovery deadline passed.
+	ReissueTimer
+	// ReissueGap is receiver evidence: data acknowledged beyond the chunk.
+	ReissueGap
+	// ReissueRescue is a lane retired because a rescue replaced it, which is
+	// what a stall the watchdog suspected leads to.
+	ReissueRescue
+	reissueCauses
+)
+
+// ReissueStats breaks reissued bytes down by cause and by the substrate of
+// the attempt being replaced.
+type ReissueStats struct {
+	Bytes, Chunks           [reissueCauses]uint64
+	FromReliable, FromCoded uint64
+}
+
 // Stats reports what the scheduler did, for tests and metrics.
 type Stats struct {
+	Reissue           ReissueStats
 	ChunksIssued      uint64
 	ChunksRetransmit  uint64
 	ChunksCompleted   uint64
@@ -488,6 +517,13 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		} else {
 			s.stats.ChunksRetransmit++
 			s.stats.BytesRetransmit += uint64(len(chunk.Data))
+			s.stats.Reissue.Bytes[chunk.requeuedFor] += uint64(len(chunk.Data))
+			s.stats.Reissue.Chunks[chunk.requeuedFor]++
+			if chunk.requeuedFromReliable {
+				s.stats.Reissue.FromReliable += uint64(len(chunk.Data))
+			} else {
+				s.stats.Reissue.FromCoded += uint64(len(chunk.Data))
+			}
 		}
 		var deadline time.Time
 		if after := s.retransmitAfter(); after > 0 {
@@ -620,6 +656,12 @@ func (s *Scheduler) Fail(laneID uint64, chunk *Chunk) {
 	if !ok {
 		return
 	}
+	failedReliable := false
+	for _, a := range out.attempts {
+		if a.id == chunk.attempt && a.lane == laneID {
+			failedReliable = a.reliable
+		}
+	}
 	if !s.dropAttemptLocked(out, laneID, chunk.attempt) {
 		// This callback belongs to an unreliable attempt already retired by
 		// timeout or receiver evidence. It must not fail its replacement merely
@@ -632,14 +674,18 @@ func (s *Scheduler) Fail(laneID uint64, chunk *Chunk) {
 		// attempt ended. Keeping that distinction makes a replacement a retry,
 		// preserves late logical completion, and avoids briefly treating the
 		// same retained bytes as new source work.
-		s.requeueLocked(out.chunk)
+		s.requeueLocked(out, ReissueLane, failedReliable)
 	}
 	s.ready.Broadcast()
 }
 
 // RetireLane releases every chunk a lane was carrying, for a lane that has
 // died rather than a single chunk that failed.
-func (s *Scheduler) RetireLane(laneID uint64) {
+func (s *Scheduler) RetireLane(laneID uint64) { s.RetireLaneFor(laneID, ReissueLane) }
+
+// RetireLaneFor is RetireLane with the reason recorded against the chunks it
+// returns to the ready set.
+func (s *Scheduler) RetireLaneFor(laneID uint64, cause ReissueCause) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, out := range s.live {
@@ -647,9 +693,10 @@ func (s *Scheduler) RetireLane(laneID uint64) {
 			continue
 		}
 		s.stats.LaneFailures++
+		retiredReliable := laneHasReliableAttempt(out, laneID)
 		s.dropLaneAttemptsLocked(out, laneID)
 		if len(out.attempts) == 0 {
-			s.requeueLocked(out.chunk)
+			s.requeueLocked(out, cause, retiredReliable)
 		}
 	}
 	delete(s.laneLoad, laneID)
@@ -764,10 +811,14 @@ func (s *Scheduler) retransmitAfter() time.Duration {
 
 // requeueLocked returns a chunk to the ready set in offset order, so the
 // receiver's contiguous point is always what the next free lane works on.
-func (s *Scheduler) requeueLocked(chunk *Chunk) {
+// It records why, and whether the attempt being replaced went over a reliable
+// substrate (Stats.Reissue).
+func (s *Scheduler) requeueLocked(out *outstanding, cause ReissueCause, fromReliable bool) {
+	chunk := out.chunk
 	if s.pendingHas(chunk.Offset) {
 		return
 	}
+	chunk.requeuedFor, chunk.requeuedFromReliable = cause, fromReliable
 	// A chunk only returns to the ready set because a lane stalled or failed,
 	// which makes it the work most likely to be blocking delivery.
 	chunk.urgent = true
@@ -830,7 +881,9 @@ func (s *Scheduler) ReissueUnacknowledgedBelow(offset uint64) int {
 			// callback will make it eligible for the normal timed retry.
 			continue
 		}
-		s.requeueLocked(out.chunk)
+		// Only chunks with no reliable attempt are re-offered here: what
+		// was lost went over a coded substrate.
+		s.requeueLocked(out, ReissueGap, false)
 		reissued++
 	}
 	if reissued > 0 {
@@ -913,7 +966,7 @@ func (s *Scheduler) ReissueExpired() int {
 		if len(out.attempts) > 0 {
 			out.attempts[0].deadline = now.Add(after)
 		}
-		s.requeueLocked(out.chunk)
+		s.requeueLocked(out, ReissueTimer, reliable)
 		reissued++
 	}
 	if reissued > 0 {
