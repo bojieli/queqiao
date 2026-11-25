@@ -123,6 +123,8 @@ type report struct {
 	arrival   float64
 	roundTrip time.Duration
 	at        time.Time
+	// appLimited is the member's last Observation.AppLimited.
+	appLimited bool
 }
 
 // Observation is what one contributor has measured about the direction it
@@ -163,6 +165,20 @@ type Observation struct {
 	// that sending more delivered more, 1 for none. Zero means it has not
 	// decided yet and contributes nothing.
 	Arrival float64
+	// AppLimited says the contributor is sending less than its own controller
+	// would let it: neither its window nor its pacing rate, before any share,
+	// is what holds it back. Such a member is given no share and is not
+	// counted as busy. A share exists to stop lanes that each have more to
+	// send compounding their probes; a member with nothing more to send has
+	// no probe to compound, and capping it at 1.25x what it measured
+	// delivering caps it at its own offered load. Measured live, that was the
+	// client's upstream lane, whose only traffic is a download's flow
+	// acknowledgements: held to 1.25x the acknowledgements it had carried, it
+	// paced at 6 kB/s where main's paced at 1.3 MB/s, the acknowledgements
+	// queued behind the pacer while QUIC's own ACK-only packets (which bypass
+	// it) kept the lane looking healthy, and the gateway's sender, clocked by
+	// those flow acknowledgements, stalled.
+	AppLimited bool
 }
 
 // State is what an endpoint pair has been measured to do, from the point of
@@ -319,6 +335,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	if o.RoundTrip > 0 {
 		entry.roundTrip = o.RoundTrip
 	}
+	entry.appLimited = o.AppLimited
 
 	var state State
 	var observed, spread, sum float64
@@ -407,7 +424,7 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	busy, even := m.busyLocked(now, state.RoundTrip, 0)
 	// Whether the reporter is itself one of the busy members: alone on the
 	// path is a statement about the reporter, not about the count.
-	reporterBusy := even > 0 && entry.delivered >= busyFraction*even
+	reporterBusy := even > 0 && !entry.appLimited && entry.delivered >= busyFraction*even
 	state.LeafRoundTrip = state.RoundTrip
 	if live > 0 && bottleneck > 0 {
 		state.Seed = bottleneck / float64(live)
@@ -443,7 +460,9 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		// share: the path is the busy one's, not its, and uncapped it would
 		// read the vanished cap as being left alone and ramp into a path its
 		// sibling still fills.
-		if live > 1 && !(busy == 1 && reporterBusy) {
+		// An application-limited reporter is not capped at all (see
+		// Observation.AppLimited).
+		if live > 1 && !(busy == 1 && reporterBusy) && !o.AppLimited {
 			state.Share = splitShare(bottleneck, busy, live)
 		}
 	}
@@ -518,8 +537,10 @@ func (m *PathModel) busyLocked(now time.Time, roundTrip time.Duration, joining i
 	// now: a lane that went quiet is no more a reason to call a slower lane
 	// busy than it is part of the delivery.
 	even = current / float64(reporting)
+	// An application-limited member is never busy, whatever it delivers: it
+	// is not using the path as much as it could, which is what busy means.
 	for _, r := range m.members {
-		if active(r) && r.delivered >= busyFraction*even {
+		if active(r) && !r.appLimited && r.delivered >= busyFraction*even {
 			busy++
 		}
 	}

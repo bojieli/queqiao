@@ -80,6 +80,19 @@ type ErasureSender struct {
 	deliveredAtCompensation float64
 	appliedArrival          float64
 
+	// limitPeak, limitHeld, limitRound and limitIdle judge whether the lane is
+	// application-limited, for the pool (see judgeAppLimited): the most it
+	// had in flight in the round in progress, whether a refused poll held an
+	// ack-eliciting packet back in it, the round last judged, and how many
+	// closed rounds in a row were not send-limited. appLimited is the
+	// verdict, and starts false: a lane is capped as before until it has
+	// shown it has less to send.
+	limitPeak  quiccongestion.ByteCount
+	limitHeld  bool
+	limitRound uint64
+	limitIdle  int
+	appLimited bool
+
 	// erasure is the pooled measured erasure of the direction this sender
 	// sends into, in parts per million. It is what the code is sized from, and
 	// it is published because a floor is not a substitute for it: on the live
@@ -268,6 +281,10 @@ const (
 	rampRearmShare     = 2
 	rampRearmRounds    = 4
 	rampRearmMaxRounds = 64
+	// appLimitedRounds is how many closed rounds in a row a lane must go
+	// without being send-limited before the pool stops capping it; one
+	// send-limited round caps it again.
+	appLimitedRounds = 3
 )
 
 // NewErasureSender returns a controller for a path whose loss is mostly not
@@ -984,6 +1001,49 @@ func (e *ErasureSender) backlogged() bool {
 	return 2*float64(e.rampPeak) >= allowed
 }
 
+// judgeAppLimited decides, once per closed round, whether the lane was
+// send-limited in it, and from that whether the pool should cap it at all
+// (pathmodel.Observation.AppLimited). It runs from the congestion event, not
+// from the rate calculation, and reads only the inner controller's rate and
+// the window, neither of which depends on the share.
+//
+// A round is send-limited when both hold:
+//   - a refused pacing or window poll held an ack-eliciting packet back: the
+//     lane had something to send and was made to wait;
+//   - it had in flight at least a quarter of what its own window and its own
+//     pacing rate, before any share, would allow: its demand is a rate the
+//     path has to make room for, not a trickle.
+//
+// The second is what keeps the verdict from making itself true. A cap below
+// a lane's demand makes every round of it pacer-limited, so the first alone
+// would keep capping the client's flow-acknowledgement lane at 1.25x the
+// acknowledgements it had carried, which is the live failure. Held to a
+// share, a bulk lane still fills its share's worth of the path, which is a
+// fair split of a bottleneck its own estimate is part of, and keeps its cap.
+func (e *ErasureSender) judgeAppLimited() {
+	round := e.inner.round
+	if round == e.limitRound {
+		return
+	}
+	e.limitRound = round
+	peak, held := float64(e.limitPeak), e.limitHeld
+	e.limitPeak, e.limitHeld = 0, false
+	allowed := float64(e.GetCongestionWindow())
+	rtt := e.inner.minRoundTrip()
+	if rtt <= 0 {
+		rtt = e.rampBaseRTT
+	}
+	if rtt > 0 {
+		allowed = math.Min(allowed, float64(e.inner.bandwidth())/e.arrivalRate()*rtt.Seconds())
+	}
+	if held && 4*peak >= allowed {
+		e.limitIdle, e.appLimited = 0, false
+	} else if e.limitIdle++; e.limitIdle >= appLimitedRounds {
+		e.appLimited = true
+	}
+	e.appLimitedTrace.Store(e.appLimited)
+}
+
 // rearm puts a lane back into its ramp, and its controller into startup.
 func (e *ErasureSender) rearm(delivered float64) {
 	e.ramping.Store(true)
@@ -1325,6 +1385,10 @@ func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 		if e.denied {
 			e.heldSends.Add(1)
 			e.denied = false
+			e.limitHeld = true
+		}
+		if bytesInFlight > e.limitPeak {
+			e.limitPeak = bytesInFlight
 		}
 	} else {
 		e.ackOnlyBytes.Add(uint64(bytes))
@@ -1424,6 +1488,7 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	}
 	erasure := snapshot.Loss
 	if e.path != nil {
+		e.judgeAppLimited()
 		// Pool with the other lanes: the estimate converges on all their
 		// samples together, and the share is what stops their probes
 		// compounding.
@@ -1441,7 +1506,8 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 			Delivered: float64(e.inner.estimator.measuredEstimate()),
 			RoundTrip: e.inner.minRoundTrip(),
 			// What the gate has accepted so far, zero before it has run.
-			Arrival: e.appliedArrival,
+			Arrival:    e.appliedArrival,
+			AppLimited: e.appLimited,
 		})
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))

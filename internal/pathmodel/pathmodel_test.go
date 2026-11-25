@@ -513,3 +513,49 @@ func TestSilentRescueLanesDoNotMakeTheControlLaneBusy(t *testing.T) {
 		t.Fatalf("the only busy lane beside a control lane and eight silent rescue lanes is capped at %.0f", state.Share)
 	}
 }
+
+// A member that says it is application-limited is never capped, whatever it
+// delivers: its measured delivery is its offered load, and a share sized from
+// that caps it at its own load. The live case is the client's upstream pool,
+// whose members carry only a download's flow acknowledgements.
+func TestAnApplicationLimitedMemberIsNotCapped(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	ack := func(member Member, appLimited bool) State {
+		return m.Report(member, Observation{Delivered: 5e3, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond, AppLimited: appLimited})
+	}
+	for member := Member(1); member <= 4; member++ {
+		ack(member, false)
+	}
+	if capped := ack(1, false); capped.Share == 0 {
+		t.Fatal("four equal members that do not say they are application-limited should share the path")
+	}
+	for member := Member(1); member <= 4; member++ {
+		if state := ack(member, true); state.Share != 0 {
+			t.Fatalf("application-limited member %d capped at %.0f B/s", member, state.Share)
+		}
+	}
+}
+
+// An application-limited member does not count as busy, so a bulk lane
+// beside acknowledgement-only members is the sole busy one and is not split
+// with them.
+func TestApplicationLimitedMembersAreNotBusy(t *testing.T) {
+	now := time.Now()
+	m := NewPathModelClocked(func() time.Time { return now })
+	for member := Member(2); member <= 4; member++ {
+		m.Report(member, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond, AppLimited: true})
+	}
+	bulk := m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	if bulk.Share != 0 {
+		t.Fatalf("the only send-limited member beside application-limited ones is capped at %.0f", bulk.Share)
+	}
+	// Without the verdict the same delivery makes all four busy, and the bulk
+	// lane is split four ways.
+	for member := Member(2); member <= 4; member++ {
+		m.Report(member, Observation{Delivered: 2e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond})
+	}
+	if again := m.Report(1, Observation{Delivered: 6e6, ObservedSamples: 1000, RoundTrip: 200 * time.Millisecond}); again.Share == 0 {
+		t.Fatal("four busy members and no cap")
+	}
+}
