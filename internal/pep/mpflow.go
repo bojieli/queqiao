@@ -553,7 +553,8 @@ type multipathFlow struct {
 	// sparseCurrent and sparsePrior are the same two buckets for the bytes
 	// sent under the phased bundle's sparse-write rule.
 	sparseCurrent, sparsePrior uint64
-	// clock, when set by a test, replaces time.Now for classification.
+	// clock, when set by a test, replaces time.Now for classification and
+	// for the idle limit (watchLimits).
 	clock func() time.Time
 	// classifyMu serialises observe: sampling, classifying and publishing.
 	classifyMu sync.Mutex
@@ -1805,7 +1806,18 @@ func (f *multipathFlow) runFlow(ctx context.Context) (FlowStats, error) {
 			if f.metrics != nil {
 				f.metrics.FlowTimeout()
 			}
-			f.resetLanes(err)
+			if errors.Is(err, errFlowIdleTimeout) || errors.Is(err, errFlowLifetime) {
+				// An idle or lifetime limit is this end deciding the flow is
+				// over, not a path failing, so the peer is told whichever end
+				// this is. A client that only closed its streams left the
+				// gateway to take that for a path failure and hold the
+				// destination open for a replacement lane that was never
+				// coming (laneReplacementWait, 45 s): the destination saw
+				// the flow end that long after the application did.
+				f.resetOnce.Do(func() { f.broadcastReset(err) })
+			} else {
+				f.resetLanes(err)
+			}
 			cancelRun()
 			f.closeAll()
 			stats.Ended = time.Now()
@@ -1943,7 +1955,7 @@ func (f *multipathFlow) watchLimits(stop <-chan struct{}, out chan<- error) {
 		case <-ticker.C:
 			if idle > 0 {
 				last := f.lastActivity.Load()
-				if last == 0 || time.Since(time.Unix(0, last)) >= idle {
+				if last == 0 || f.clockNow().Sub(time.Unix(0, last)) >= idle {
 					select {
 					case out <- errFlowIdleTimeout:
 					case <-stop:
