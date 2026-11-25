@@ -167,6 +167,8 @@ type congestionConfig struct {
 	// discoverGrouping lets the tree's shape follow the evidence rather than
 	// the static hierarchy. It does nothing without hierarchicalPath.
 	discoverGrouping bool
+	// ccAPI selects how the controller is driven; see CCAPIVersion.
+	ccAPI CCAPIVersion
 }
 
 type udpHealth struct {
@@ -1094,6 +1096,11 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 		// delivered about 8 Mbit/s where one delivered 11.
 		controller := wancongestion.NewErasureSenderOn(
 			conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
+		if cfg.ccAPI == CCAPIV2 {
+			attached := wancongestion.NewErasurePathSender(controller, erasureRekey(conn, cfg))
+			conn.SetCongestionControl(attached)
+			return attached
+		}
 		conn.SetCongestionControl(controller)
 		return controller
 	case CongestionBrutal:
@@ -1109,6 +1116,22 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 		// controller if a future caller constructs an invalid config directly.
 	}
 	return nil
+}
+
+// erasureRekey decides, after a connection migrated, whether it moved to
+// another path. A NAT rebinding that changes only the port, or a local
+// rebinding onto the same uplink, keeps the path key and so keeps the
+// controller with everything it has measured. A new remote host or a new
+// uplink is another path, and gets a fresh controller for it, which is what
+// re-attaching to that path's state means while each connection still owns
+// its controller.
+func erasureRekey(conn *quic.Conn, cfg congestionConfig) func(oldLocal, newLocal, oldRemote, newRemote net.Addr) *wancongestion.ErasureSender {
+	return func(oldLocal, newLocal, oldRemote, newRemote net.Addr) *wancongestion.ErasureSender {
+		if pathKey(oldLocal, oldRemote) == pathKey(newLocal, newRemote) {
+			return nil
+		}
+		return wancongestion.NewErasureSenderOn(conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
+	}
 }
 
 // peerKey identifies the endpoint pair a connection belongs to. It is the
