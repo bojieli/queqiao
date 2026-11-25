@@ -173,8 +173,10 @@ func ValidateBundle(ccAPI CCAPIVersion, congestion CongestionControlKind, p prof
 // configuration: "legacy" when every switch is off. admission is a gateway's
 // (stage 5, independent of the others); a client passes the empty value.
 // sched is the class scheduler (stage 2); classifierMode is the
-// flow-classifier bundle; scope is the path controller switch (stage 6).
-func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, admission GatewayAdmission, sched SchedMode, classifierMode ClassifierMode, scope CongestionScope) string {
+// flow-classifier bundle; scope is the path controller switch (stage 6);
+// topology is a client's placement of flows on connections (stage 7), and a
+// gateway passes the empty topology.
+func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, admission GatewayAdmission, sched SchedMode, classifierMode ClassifierMode, scope CongestionScope, topology Topology) string {
 	var on []string
 	if ccAPI == CCAPIV2 {
 		on = append(on, "cc-api=v2")
@@ -184,6 +186,9 @@ func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, ad
 	}
 	if scope == CongestionScopePath {
 		on = append(on, "congestion=path")
+	}
+	if topology == TopologySingle {
+		on = append(on, "topology=single")
 	}
 	if codedRetry == CodedRetrySticky {
 		on = append(on, "coded-retry=sticky")
@@ -201,4 +206,72 @@ func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, ad
 		return "legacy"
 	}
 	return strings.Join(on, ",")
+}
+
+// Topology selects how a client places its flows on QUIC connections. It is
+// the switch of the seventh migration bundle (§7, §14 stage 7,
+// topology=single), which requires the sixth.
+type Topology string
+
+const (
+	// TopologyIsolated is today's placement: flows open as streams on the
+	// pooled connection, and a bulk flow that shares it with another flow
+	// moves its data to a secondary connection of its own from the bounded
+	// bulk pool (reactive isolation).
+	TopologyIsolated Topology = "isolated"
+	// TopologySingle keeps every flow a stream on one preferred QUIC
+	// connection per path; nothing isolates. Priority between flows is the
+	// path controller's class arbitration (§4.3), executed by the packet
+	// builder, not a second connection and controller. Extra connections
+	// exist only during a handover (a replacement generation), for per-flow
+	// rescue, which still dials, and for an explicit fan-out
+	// (ClientConfig.TopologyFanOut); each is an attachment to the same
+	// PathController. It requires congestion=path, and the pooled connection.
+	TopologySingle Topology = "single"
+)
+
+// maxTopologyFanOut bounds an explicit fan-out: the preferred connection
+// plus at most every slot of the bulk pool.
+const maxTopologyFanOut = 1 + isolatedBulkConns
+
+// validateTopology rejects a topology the migration does not support with
+// the given congestion scope, and a fan-out that is not an explicit request
+// on top of topology=single. The empty topology is the default, isolated; a
+// fan-out of zero or one is off.
+func validateTopology(topology *Topology, scope CongestionScope, fanOut int) error {
+	if *topology == "" {
+		*topology = TopologyIsolated
+	}
+	switch *topology {
+	case TopologyIsolated:
+		if fanOut > 1 {
+			// Isolation already spreads bulk flows over the bulk pool;
+			// a fan-out is a policy of the single topology only.
+			return fmt.Errorf("topology fan-out requires topology=%s", TopologySingle)
+		}
+	case TopologySingle:
+		if scope != CongestionScopePath {
+			// Without one authority per path the flows' isolated
+			// connections are what keep bulk out of the interactive
+			// congestion window; removing them needs the path
+			// controller's class arbitration (§4.3, §7).
+			return fmt.Errorf("topology=%s requires congestion=%s", TopologySingle, CongestionScopePath)
+		}
+	default:
+		return fmt.Errorf("unsupported topology %q (want %s or %s)", *topology, TopologyIsolated, TopologySingle)
+	}
+	if fanOut < 0 || fanOut > maxTopologyFanOut {
+		return fmt.Errorf("topology fan-out must be between 0 and %d connections per path", maxTopologyFanOut)
+	}
+	return nil
+}
+
+// ValidateTopology reports whether a client topology and fan-out are
+// supported with a congestion scope. Check the scope with
+// ValidateCongestionScope first.
+func ValidateTopology(topology Topology, scope CongestionScope, fanOut int) error {
+	if scope == "" {
+		scope = CongestionScopeConnection
+	}
+	return validateTopology(&topology, scope, fanOut)
 }

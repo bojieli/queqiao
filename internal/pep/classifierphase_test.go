@@ -401,7 +401,7 @@ func TestClassifierModeValidation(t *testing.T) {
 	if err := ValidateClassifier(ClassifierPhased, profile.Default()); err != nil {
 		t.Fatal(err)
 	}
-	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedLegacy, ClassifierPhased, CongestionScopeConnection); got != "classifier=phased" {
+	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedLegacy, ClassifierPhased, CongestionScopeConnection, ""); got != "classifier=phased" {
 		t.Fatalf("bundle %q", got)
 	}
 }

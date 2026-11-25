@@ -200,7 +200,17 @@ type ClientConfig struct {
 	// Classifier selects the flow-classifier bundle; see ClassifierMode.
 	// Empty is legacy.
 	Classifier ClassifierMode
-	Metrics    *metrics.Registry
+	// Topology selects how flows are placed on QUIC connections; see
+	// Topology. Empty is isolated. Single requires CongestionScope path and
+	// EnableQUICPool.
+	Topology Topology
+	// TopologyFanOut, above one and only under TopologySingle, is an
+	// explicit fan-out: at most this many QUIC connections per path, the
+	// extra ones carrying bulk flows that would otherwise share the preferred
+	// connection with another flow (§7; see Client.fanOutWanted). Zero or one
+	// is off, the default. It is bounded by the profile's bulk pool.
+	TopologyFanOut int
+	Metrics        *metrics.Registry
 	// FallbackDelay is when AUTO starts connecting its warm-standby TCP
 	// candidate. It is not a deadline for QUIC and not a transport-selection
 	// race.
@@ -248,6 +258,9 @@ type Client struct {
 	// congestion=path; empty in a client built without NewClient, which
 	// then shares the process-wide client label.
 	pathPrincipal string
+	// windowCredit is the receive-window credit topology=single grants its
+	// preferred connections, bounded over every live one (topology.go).
+	windowCredit windowCredit
 	// uplinkGeneration counts uplink changes (watchUplink). It is part of
 	// the client's path keys: two networks can hand out the same private
 	// address, so the source address alone does not tell their paths apart.
@@ -680,6 +693,14 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := validateCongestionScope(&cfg.CongestionScope, cfg.CCAPI, cfg.Sched); err != nil {
 		return nil, err
 	}
+	if err := validateTopology(&cfg.Topology, cfg.CongestionScope, cfg.TopologyFanOut); err != nil {
+		return nil, err
+	}
+	if cfg.Topology == TopologySingle && !cfg.EnableQUICPool {
+		// Without the pool every flow dials a connection of its own, which is
+		// the opposite of one connection per path.
+		return nil, fmt.Errorf("topology=%s requires the pooled QUIC connection", TopologySingle)
+	}
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
 		return nil, err
 	}
@@ -742,6 +763,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	memoryLimits, sendMemory, receiveMemory, err := resolveMemoryLimits(cfg.MemoryLimits, cfg.ChunkSize, memoryMode)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.TopologyFanOut > 1 && cfg.TopologyFanOut-1 > memoryLimits.maxBulkConnections {
+		// The extra connections come from the bulk pool, whose size is the
+		// profile's connection budget (one on iOS).
+		return nil, fmt.Errorf("topology fan-out of %d connections exceeds the profile's %d secondary connections", cfg.TopologyFanOut, memoryLimits.maxBulkConnections)
 	}
 	// A misspelled class name fails here rather than matching nothing at
 	// runtime, where it would be indistinguishable from a rule whose workload
@@ -852,11 +878,12 @@ func (c *Client) fallbackGrace() time.Duration {
 }
 
 func (c *Client) windows() flowWindows {
-	return flowWindows{
+	w := flowWindows{
 		stream: c.cfg.StreamReceiveWindow, connection: c.cfg.ConnectionReceiveWindow,
 		maxStream: c.cfg.MaxStreamReceiveWindow, maxConnection: c.cfg.MaxConnectionReceiveWindow,
 		maxStreams: c.cfg.MaxIncomingStreams, codedQueue: c.memoryLimits.eventQueue,
 	}
+	return w
 }
 
 func (c *Client) Serve(ctx context.Context) error {
@@ -1923,8 +1950,16 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 }
 
 func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDial, ccfg congestionConfig) {
-	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.WireVersions, c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
+	windows, credit := c.reservePreferredWindows()
+	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.WireVersions, c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, windows, c.hopDialConfig())
 	var generation *controlQUICGeneration
+	if err != nil {
+		credit.release()
+	} else {
+		// The connection's window is fixed at dial; its credit returns to
+		// the ledger only when it ends.
+		credit.bind(conn.Context())
+	}
 	if err == nil {
 		borrowing, stopBorrowing := context.WithCancelCause(conn.Context())
 		generation = &controlQUICGeneration{borrowing: borrowing, stopBorrowing: stopBorrowing,
@@ -2067,7 +2102,10 @@ func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID
 	if kind == TransportQUIC && c.cfg.EnableQUICPool {
 		if lane, poolErr := c.openPooledJoinLane(ctx, sessionID, flowID, laneID); poolErr == nil {
 			return lane, nil
-		} else if !dedicatedBulkFallbackAllowed(poolErr) {
+		} else if !dedicatedBulkFallbackAllowed(poolErr) || c.singleTopology() {
+			// Under topology=single the only secondary connections are the
+			// fan-out's, and a dedicated dial would escape its budget; the
+			// flow stays on the preferred connection.
 			return nil, poolErr
 		} else {
 			c.cfg.Logger.Debug("pooled lane join unavailable; using dedicated lane", "error", poolErr)
@@ -2328,7 +2366,14 @@ func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
 // stays on the pooled connection, which is where it started.
 const isolatedBulkConns = 8
 
-func (c *Client) maxBulkConns() int { return c.memoryLimits.maxBulkConnections }
+// maxBulkConns is the bulk pool's connection budget: the profile's under
+// isolation, and the explicit fan-out's (zero when off) under topology=single.
+func (c *Client) maxBulkConns() int {
+	if c.singleTopology() {
+		return min(c.fanOutConnections(), c.memoryLimits.maxBulkConnections)
+	}
+	return c.memoryLimits.maxBulkConnections
+}
 
 func (c *Client) bulkConnCount() int {
 	c.bulkMu.Lock()
@@ -2770,15 +2815,9 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 			if isolated || controlReserve == 0 || joinPending {
 				continue
 			}
-			// Isolation earns its cost only while another flow shares the
-			// control connection. A bulk transfer alone on it has nothing to
-			// protect, and moving it would spend a handshake and a fresh
-			// congestion window for no benefit: measured on an otherwise idle
-			// path that costs about 8% of bulk goodput.
-			if c.quicPoolActive.Load() <= 1 {
-				continue
-			}
-			if snapshot.Class != classifier.ClassBulk && !shouldPrewarmBulkLane(snapshot) {
+			// Reactive isolation, or under topology=single only an explicit
+			// fan-out (§7).
+			if !c.secondConnectionWanted(snapshot) {
 				continue
 			}
 			// Do not consume the decision interval while the flow is still NEW

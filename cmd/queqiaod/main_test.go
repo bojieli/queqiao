@@ -443,3 +443,48 @@ func TestCarrierShadowFlags(t *testing.T) {
 		}
 	}
 }
+
+// The topology bundle (design §14 stage 7) is a client switch: single needs
+// the path controller and the pool, and a fan-out needs single.
+func TestTopologyIsValidatedAtStartup(t *testing.T) {
+	path := []string{"--cc-api=v2", "--sched=class", "--congestion-scope=path"}
+	if opts := parseRuntimeForTest(t, true); opts.topology != "isolated" || opts.topologyFanOut != 0 {
+		t.Fatalf("default topology %q fan-out %d", opts.topology, opts.topologyFanOut)
+	}
+	if opts := parseRuntimeForTest(t, true, append(path, "--topology=single", "--classifier=phased")...); opts.topology != "single" {
+		t.Fatalf("topology=single not parsed: %q", opts.topology)
+	}
+	if opts := parseRuntimeForTest(t, true, append(path, "--topology=single", "--topology-fanout=4")...); opts.topologyFanOut != 4 {
+		t.Fatalf("fan-out not parsed: %d", opts.topologyFanOut)
+	}
+	for _, args := range [][]string{
+		{"--topology=single"},
+		{"--cc-api=v2", "--sched=class", "--topology=single"},
+		append(path, "--topology=single", "--quic-pool=false"),
+		append(path, "--topology=ring"),
+		append(path, "--topology="),
+		append(path, "--topology-fanout=2"),
+		append(path, "--topology=single", "--topology-fanout=10"),
+		append(path, "--topology=single", "--topology-fanout=-1"),
+	} {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		var opts runtimeOptions
+		bindRuntimeFlags(fs, &opts, true)
+		if err := fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateRuntime(opts, true); err == nil {
+			t.Errorf("%v accepted", args)
+		}
+	}
+	// A gateway has no topology flag: it never isolates, and it attaches an
+	// isolating client's connections to one controller either way.
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var opts runtimeOptions
+	bindRuntimeFlags(fs, &opts, false)
+	if err := fs.Parse([]string{"--topology=single"}); err == nil {
+		t.Fatal("the gateway accepted --topology")
+	}
+}
