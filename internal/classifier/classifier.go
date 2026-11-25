@@ -169,6 +169,12 @@ type Observation struct {
 	// at some point since the previous observation, even if it is above it
 	// again now. Only the phased classifier reads it.
 	BacklogDrained bool
+	// BacklogProvisional says the send backlog is reported only because a
+	// drain is still being decided (a refill may yet take the room). It
+	// keeps a backlog stretch going but cannot by itself complete one, so
+	// re-entry into BULK waits for the decision. Only the phased classifier
+	// reads it.
+	BacklogProvisional bool
 }
 
 // Classifier is stateful. Once a flow becomes bulk it remains bulk until it
@@ -390,7 +396,7 @@ func (c *Classifier) observeCurrent(o Observation, before Class) {
 		if rtts := 4 * o.SmoothedRTT; rtts > hold {
 			hold = rtts
 		}
-		if c.inBacklog && o.Age-c.backlogSince >= hold {
+		if c.inBacklog && !o.BacklogProvisional && o.Age-c.backlogSince >= hold {
 			c.current = ClassBulk
 			c.quietWindows = 0
 			c.reentries++

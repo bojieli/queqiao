@@ -1082,10 +1082,16 @@ func TestObserveCarriedCountsTheBytes(t *testing.T) {
 
 // scriptedConn is an application socket that returns a script of reads, one
 // entry per Read, and a timeout once the script for this read runs out. It
-// takes read deadlines, so a staged fill is attempted.
+// takes read deadlines, so a staged fill is attempted. An entry's before
+// runs just before its read returns.
 type scriptedConn struct {
 	net.Conn
-	reads []int
+	reads []scriptedRead
+}
+
+type scriptedRead struct {
+	n      int
+	before func()
 }
 
 type scriptTimeout struct{}
@@ -1098,17 +1104,33 @@ func (c *scriptedConn) Read(p []byte) (int, error) {
 	if len(c.reads) == 0 {
 		return 0, scriptTimeout{}
 	}
-	n := min(c.reads[0], len(p))
+	step := c.reads[0]
 	c.reads = c.reads[1:]
-	return n, nil
+	if step.before != nil {
+		step.before()
+	}
+	return min(step.n, len(p)), nil
 }
 
 func (c *scriptedConn) SetReadDeadline(time.Time) error { return nil }
+
+func reads(sizes ...int) []scriptedRead {
+	out := make([]scriptedRead, len(sizes))
+	for i, n := range sizes {
+		out[i] = scriptedRead{n: n}
+	}
+	return out
+}
 
 // stagedHarness is a phased, single-slot flow with shared send memory (so its
 // reads are staged) reading through the real flowSource from a scripted
 // socket.
 func stagedHarness(t *testing.T, chunk, sendBound int) (*phaseHarness, *scriptedConn, *flowSource) {
+	t.Helper()
+	return stagedHarnessSlots(t, chunk, sendBound, 1)
+}
+
+func stagedHarnessSlots(t *testing.T, chunk, sendBound, slots int) (*phaseHarness, *scriptedConn, *flowSource) {
 	t.Helper()
 	h := newPhaseHarness(t, ClassifierPhased)
 	f := h.f
@@ -1116,15 +1138,17 @@ func stagedHarness(t *testing.T, chunk, sendBound int) (*phaseHarness, *scripted
 	f.inner = conn
 	f.chunkSize = chunk
 	f.sendMemory = memlimit.New(1 << 20)
-	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = sendBound, 1
+	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = sendBound, slots
 	f.fitBacklogThreshold()
 	h.leaveBulk()
 	return h, conn, &flowSource{flow: f}
 }
 
 // stagedRead does what the scheduler's readStaged does with a staging buffer
-// of stagingBytes and a chunk of chunk bytes: one socket read into staging,
-// then, if that filled it, a fill of the rest.
+// of stagingBytes and a chunk of chunk bytes: one source read into staging,
+// then, if that filled it, a fill of the rest; and it reports the completed
+// read as the scheduler does (stripe.Config.ReadDone), full only if the fill
+// filled the chunk.
 func stagedRead(t *testing.T, src *flowSource, chunk int) int {
 	t.Helper()
 	staging := make([]byte, stagingBytes)
@@ -1133,12 +1157,14 @@ func stagedRead(t *testing.T, src *flowSource, chunk int) int {
 		t.Fatal(err)
 	}
 	if n < len(staging) {
+		src.flow.noteLogicalRead(false)
 		return n
 	}
 	m, err := src.ReadAvailable(make([]byte, chunk-n))
 	if err != nil {
 		t.Fatal(err)
 	}
+	src.flow.noteLogicalRead(n+m == chunk)
 	return n + m
 }
 
@@ -1176,7 +1202,7 @@ func TestAWholeFlightAckAboveTheRefillFloorIsNotADrain(t *testing.T) {
 func TestAStagedFillInTwoReadsIsOneFullRead(t *testing.T) {
 	h, conn, src := stagedHarness(t, 32<<10, 1<<20)
 	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
-		conn.reads = []int{1 << 10, 15 << 10, 16 << 10} // staging, then the fill in two
+		conn.reads = reads(1<<10, 15<<10, 16<<10) // staging, then the fill in two
 		if got := stagedRead(t, src, 32<<10); got != 32<<10 {
 			t.Fatalf("staged read of %d bytes, want the 32 KiB chunk", got)
 		}
@@ -1195,7 +1221,7 @@ func TestAStagedFillInTwoReadsIsOneFullRead(t *testing.T) {
 func TestAStagedFillThatTimesOutEmptyIsShort(t *testing.T) {
 	h, conn, src := stagedHarness(t, 32<<10, 1<<20)
 	for i := 0; i < 400; i++ {
-		conn.reads = []int{1 << 10} // staging fills; the fill finds nothing
+		conn.reads = reads(1 << 10) // staging fills; the fill finds nothing
 		if got := stagedRead(t, src, 32<<10); got != 1<<10 {
 			t.Fatalf("staged read of %d bytes, want 1 KiB", got)
 		}
@@ -1224,12 +1250,88 @@ func TestARefillSmallerThanTheThresholdContinuesTheStretch(t *testing.T) {
 	}
 	h.leaveBulk()
 	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
-		f.observeCarriedRead(1<<10, true, 1<<10) // a full staged read; no fill possible
+		// A full staged read whose fill the connection cannot do.
+		f.observeCarriedRead(1<<10, true, -1)
+		f.noteLogicalRead(true)
 		h.advance(10 * time.Millisecond)
 		h.ackTo(f.bytesUp.Load())
 		h.advance(time.Millisecond)
 	}
 	if h.current() != classifier.ClassBulk {
 		t.Fatal("prompt full 1 KiB refills below a 4 KiB threshold never re-entered BULK")
+	}
+}
+
+// An acknowledgement that arrives while a staged read is being extended is
+// decided by the completed read, at the time it completes: a full chunk
+// within the refill window is a refill, not a drain recorded later.
+//
+// The threshold (4 KiB: a 104 KiB bound, 32 KiB chunks) is above the 1 KiB
+// staging read, so the acknowledgement does open a pending drain.
+func TestAnAckDuringAStagedFillIsDecidedByTheCompletedRead(t *testing.T) {
+	h, conn, src := stagedHarnessSlots(t, 32<<10, 104<<10, 16384)
+	if !h.f.refillMode || h.f.classifier.BacklogBytes() != 4<<10 {
+		t.Fatalf("setup: threshold %d refill mode %v, want 4 KiB with refill evidence", h.f.classifier.BacklogBytes(), h.f.refillMode)
+	}
+	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
+		previous := h.f.bytesUp.Load()
+		conn.reads = []scriptedRead{
+			{n: 1 << 10},
+			// The previous chunk is acknowledged between the staging read
+			// and the end of the fill.
+			{n: 31 << 10, before: func() { h.ackTo(previous) }},
+		}
+		if got := stagedRead(t, src, 32<<10); got != 32<<10 {
+			t.Fatalf("staged read of %d bytes, want the 32 KiB chunk", got)
+		}
+		// The next look comes well after the refill window.
+		h.advance(30 * time.Millisecond)
+		h.refresh()
+	}
+	if h.current() != classifier.ClassBulk {
+		t.Fatal("acknowledgements arriving during staged fills kept a backlogged transfer INTERACTIVE")
+	}
+}
+
+// The first source read of a staged read is not the read: if the backlog
+// hold elapses just as it lands, BULK is not re-entered on its strength, and
+// a fill that then comes back empty ends the stretch.
+func TestAStagingReadDoesNotCommitBeforeItsFill(t *testing.T) {
+	run := func(lastFill int) *phaseHarness {
+		h, conn, src := stagedHarness(t, 32<<10, 1<<20)
+		cycle := func(fill int) {
+			conn.reads = reads(1<<10, fill)
+			if fill == 0 {
+				conn.reads = reads(1 << 10)
+			}
+			stagedRead(t, src, 32<<10)
+			h.advance(10 * time.Millisecond)
+			h.ackTo(h.f.bytesUp.Load())
+			h.advance(time.Millisecond)
+		}
+		// Full cycles until one more would complete the backlog hold.
+		probe, probeConn, probeSrc := stagedHarness(t, 32<<10, 1<<20)
+		cycles := 0
+		for ; cycles < 400 && probe.current() != classifier.ClassBulk; cycles++ {
+			probeConn.reads = reads(1<<10, 31<<10)
+			stagedRead(t, probeSrc, 32<<10)
+			probe.advance(10 * time.Millisecond)
+			probe.ackTo(probe.f.bytesUp.Load())
+			probe.advance(time.Millisecond)
+		}
+		if probe.current() != classifier.ClassBulk {
+			t.Fatal("setup: full staged cycles never re-entered BULK")
+		}
+		for i := 0; i < cycles-1; i++ {
+			cycle(31 << 10)
+		}
+		cycle(lastFill)
+		return h
+	}
+	if full := run(31 << 10); full.current() != classifier.ClassBulk {
+		t.Fatal("setup: the same cycles ending in a full read did not re-enter BULK")
+	}
+	if short := run(0); short.current() == classifier.ClassBulk {
+		t.Fatal("BULK was re-entered on a staging read whose fill then came back empty")
 	}
 }

@@ -261,3 +261,34 @@ func TestAnUnsupportedStagedFillIsNotSparse(t *testing.T) {
 		t.Fatal("a 36-byte write on the staged path was not marked sparse")
 	}
 }
+
+// ReadDone reports each completed read once, full only if it filled what it
+// was offered: a staged read whose fill the source cannot do stands as full,
+// and a short read is not.
+func TestReadDoneReportsTheCompletedRead(t *testing.T) {
+	src := &noDeadlineSource{more: make(chan struct{}, 8)}
+	defer close(src.more)
+	var done []bool
+	var mu sync.Mutex
+	s := New(src, Config{
+		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
+		Memory: memlimit.New(1 << 20), StagingBytes: 1024,
+		ReadDone: func(full bool) { mu.Lock(); done = append(done, full); mu.Unlock() },
+	})
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	src.write(make([]byte, 1024)) // fills staging; the fill is unsupported
+	if c, err := s.Next(ctx, 1, 0); err != nil || c == nil {
+		t.Fatal(err)
+	}
+	src.write(make([]byte, 36)) // short
+	if c, err := s.Next(ctx, 1, 0); err != nil || c == nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(done) != 2 || !done[0] || done[1] {
+		t.Fatalf("ReadDone reported %v, want [true false]", done)
+	}
+}

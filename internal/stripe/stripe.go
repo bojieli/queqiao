@@ -167,6 +167,12 @@ type Config struct {
 	// sending bulk may still code a sparse write, so the lane's answer for it
 	// can differ. Nil uses Reliable.
 	ReliableSparse func(laneID uint64) bool
+	// ReadDone, when set, is told of each completed read from the source --
+	// a staged read together with its fill -- and whether it filled what it
+	// was offered, which is the evidence that the source had more. A fill the
+	// source cannot do leaves the staging read standing as full. It is
+	// called from the producer without the scheduler's lock.
+	ReadDone func(full bool)
 	// ForceReliable pins selected byte ranges to a reliable carrier even when
 	// the lane normally uses datagrams. The decision is snapshotted at dispatch
 	// just like Reliable, so an in-flight recovery cannot change substrates
@@ -533,6 +539,12 @@ func (s *Scheduler) produce() {
 			if !ok {
 				return
 			}
+		}
+		if n > 0 && s.cfg.ReadDone != nil {
+			// The logical read is complete -- a staged read with its fill,
+			// however many source reads that took -- and only now is it
+			// known whether it filled what it was offered.
+			s.cfg.ReadDone(!drained)
 		}
 		if !s.publish(buf, n, reserved, drained, err) {
 			return

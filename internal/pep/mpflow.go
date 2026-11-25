@@ -3622,7 +3622,7 @@ func (f *multipathFlow) observeLocked(n int, up, publish bool, bufLen int) bool 
 	if f.ackSampleHook != nil {
 		f.ackSampleHook()
 	}
-	upBytes, downBytes, sendBacklog, backlogDrained := f.countAndSample(now, n, up, publish, bufLen)
+	upBytes, downBytes, sendBacklog, backlogDrained, backlogProvisional := f.countAndSample(now, n, up, publish, bufLen)
 	if f.afterAckSampleHook != nil {
 		f.afterAckSampleHook()
 	}
@@ -3660,10 +3660,11 @@ func (f *multipathFlow) observeLocked(n int, up, publish bool, bufLen int) bool 
 		SmallBidirectionalBursts: recentUp <= smallExchangeBytes && recentDown <= smallExchangeBytes,
 		// What this endpoint has read from its application and the peer has
 		// not acknowledged. Only the phased classifier reads it.
-		SendBacklog:    sendBacklog,
-		BacklogDrained: backlogDrained,
-		SmoothedRTT:    time.Duration(f.currentRTTNS.Load()),
-		CarriedPayload: n > 0,
+		SendBacklog:        sendBacklog,
+		BacklogDrained:     backlogDrained,
+		BacklogProvisional: backlogProvisional,
+		SmoothedRTT:        time.Duration(f.currentRTTNS.Load()),
+		CarriedPayload:     n > 0,
 	}
 	oldClass := classifier.Class(f.class.Load())
 	newClass := f.classifier.Observe(obs)
