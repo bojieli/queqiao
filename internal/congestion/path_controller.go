@@ -76,6 +76,18 @@ type PathController struct {
 	sendSeq uint64
 	// permitSeq counts permits issued.
 	permitSeq uint64
+	// noDemandSince is when the path last ran out of eligible demand, zero
+	// while some attachment has demand; opportunity records an interval
+	// without demand, at least a packet time long, in which the window was
+	// open: an unused admission opportunity (§4.2), consumed by the next
+	// event that marks the sampler.
+	noDemandSince monotime.Time
+	opportunity   bool
+	// clock reads the time of a demand change, which carries none. It is
+	// monotime.Now; a simulation substitutes its own.
+	clock func() monotime.Time
+	// flightGauge mirrors flight for telemetry readers.
+	flightGauge atomic.Int64
 
 	// Scratch for the law's batches.
 	acked []quiccongestion.AckedPacketInfo
@@ -176,9 +188,35 @@ func NewPathController(initialPacketSize quiccongestion.ByteCount, path pathmode
 		ringBase:  1,
 		maxPacket: law.inner.maxDatagramSize,
 		created:   time.Now(),
+		clock:     monotime.Now,
 	}
 	law.SetRTTStatsProvider(&c.rtt)
+	law.inner.appLimitedBy = c.appLimited
 	return c
+}
+
+// unused says whether the path, without demand since noDemandSince, has had
+// an admission opportunity of at least one packet time by now: the window
+// open for a packet, and the balance accrued over that time.
+func (c *PathController) unused(now monotime.Time) bool {
+	if c.noDemandSince.IsZero() {
+		return false
+	}
+	return now.Sub(c.noDemandSince) >= c.packetTime(c.maxPacket) &&
+		c.flight+c.maxPacket <= c.law.GetCongestionWindow()
+}
+
+// appLimited is the law's application-limited marker under a path
+// controller: an unused opportunity since the last marking, or one in
+// progress. A sender that always has eligible demand -- held back only by
+// the path's window, its pacer or a sibling's turn -- is never marked; one
+// whose queue empties only between writes for less than a packet time is
+// not either. A sender blocked on peer flow control or a full send queue
+// has no eligible demand, and is.
+func (c *PathController) appLimited() bool {
+	o := c.opportunity || c.unused(c.now)
+	c.opportunity = false
+	return o
 }
 
 // Attach returns a new attachment of this controller, to be installed on one
@@ -222,6 +260,8 @@ func (c *PathController) IdleSince() (time.Time, bool) {
 func (c *PathController) Telemetry() ControllerTelemetry {
 	t := c.law.Telemetry()
 	t.Kind = "erasure-path"
+	// The counted flight, not the sampler's last view of it.
+	t.BytesInFlight = uint64(max(c.flightGauge.Load(), 0))
 	return t
 }
 
@@ -248,8 +288,11 @@ type PathControllerStats struct {
 	SamplerStates    int
 	// Refusals by reason.
 	RefusedWindow, RefusedPacing, RefusedTurn, LapsedClaims, DebtPermits uint64
-	Demotions, Promotions                                                uint64
-	Classes                                                              ClassArbiterStats
+	// AppSamples and NonAppSamples are the sampler's delivery samples by
+	// whether they were application-limited.
+	AppSamples, NonAppSamples uint64
+	Demotions, Promotions     uint64
+	Classes                   ClassArbiterStats
 }
 
 // Stats returns a snapshot.
@@ -273,7 +316,8 @@ func (c *PathController) Stats() PathControllerStats {
 		RefusedTurn: c.stats.refusedTurn.Load(), LapsedClaims: c.stats.lapsedClaims.Load(),
 		DebtPermits: c.stats.debtPermits.Load(),
 		Demotions:   c.stats.demotions.Load(), Promotions: c.stats.promotions.Load(),
-		Classes: c.arb.Stats(),
+		Classes:    c.arb.Stats(),
+		AppSamples: c.law.inner.estimator.appSamples, NonAppSamples: c.law.inner.estimator.nonAppSamples,
 	}
 	for a := range c.atts {
 		s.Gauges[a.epoch] = a.gauge
@@ -396,8 +440,27 @@ func (c *PathController) setGauge(a *PathAttachment, inFlight quiccongestion.Byt
 	}
 	if !a.probing {
 		c.flight += inFlight - a.gauge
+		c.flightGauge.Store(int64(c.flight))
 	}
 	a.gauge = inFlight
+	a.gaugeView.Store(int64(inFlight))
+}
+
+// noteDemand tracks intervals in which the path has no eligible demand.
+func (c *PathController) noteDemand(union quiccongestion.Demand, now monotime.Time) {
+	any := false
+	for _, e := range union.Eligible {
+		any = any || e
+	}
+	switch {
+	case any && !c.noDemandSince.IsZero():
+		if c.unused(now) {
+			c.opportunity = true
+		}
+		c.noDemandSince = 0
+	case !any && c.noDemandSince.IsZero():
+		c.noDemandSince = now
+	}
 }
 
 // demand is the union of the attachments' demand.
@@ -448,7 +511,10 @@ func (c *PathController) attach(a *PathAttachment, now monotime.Time, inFlight, 
 	a.gauge = 0
 	c.setGauge(a, inFlight)
 	c.notePacketSize(maxPacket)
-	c.arb.OnDemand(c.demand())
+	a.ptoSinceProgress = 0
+	union := c.demand()
+	c.noteDemand(union, c.now)
+	c.arb.OnDemand(union)
 }
 
 // detach takes a out of the controller: its gauge leaves the sum and its
@@ -476,17 +542,23 @@ func (c *PathController) detach(a *PathAttachment, now monotime.Time) []func() {
 	c.lostHeld = kept
 	if !a.probing {
 		c.flight -= a.gauge
+		c.flightGauge.Store(int64(c.flight))
 	}
 	a.gauge = 0
+	a.gaugeView.Store(0)
 	a.windowBlocked = false
 	a.claimDeadline = 0
 	a.waiting, a.deferred, a.unable = false, false, false
 	delete(c.atts, a)
-	c.attached.Store(int64(len(c.atts)))
 	if len(c.atts) == 0 {
+		// Published before the count, so a sweep that sees no attachment
+		// reads this detach's time.
 		c.lastDetach.Store(time.Now().UnixNano())
 	}
-	c.arb.OnDemand(c.demand())
+	c.attached.Store(int64(len(c.atts)))
+	union := c.demand()
+	c.noteDemand(union, now)
+	c.arb.OnDemand(union)
 	c.advance(now)
 	wakes := c.collectBlocked(a, nil)
 	return c.collectWaiting(a, wakes)
@@ -546,6 +618,12 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 	borrowed, refusal := c.admissible(a, now, turn, maxBytes)
 	if refusal != nil {
 		a.waiting = true
+		// It asked and the path had no opportunity for it: its own claim,
+		// if anyone deferred to it, is renewed rather than spent. A
+		// claimant that is admitted keeps its deadline until it sends.
+		if !a.unable {
+			a.claimDeadline = 0
+		}
 		return *refusal, wakes
 	}
 	if c.claimed(a, turn, now) {
@@ -566,6 +644,7 @@ func (c *PathController) admit(a *PathAttachment, now monotime.Time, maxBytes qu
 		}
 		c.stats.refusedTurn.Add(1)
 		a.waiting, a.deferred = true, true
+		a.claimDeadline = 0
 		return quiccongestion.Permit{RetryAt: retry}, wakes
 	}
 	if !a.demand.Eligible[turn] && turn != quiccongestion.ClassExempt {
@@ -712,6 +791,7 @@ func (c *PathController) demote(a *PathAttachment) {
 		return
 	}
 	c.flight -= a.gauge
+	c.flightGauge.Store(int64(c.flight))
 	a.probing = true
 	c.stats.demotions.Add(1)
 	// Its sample packets still in flight are not measurements of the path
@@ -730,6 +810,7 @@ func (c *PathController) promote(a *PathAttachment) {
 	}
 	a.probing = false
 	c.flight += a.gauge
+	c.flightGauge.Store(int64(c.flight))
 	c.stats.promotions.Add(1)
 }
 
@@ -849,7 +930,15 @@ func (c *PathController) discarded(a *PathAttachment, now monotime.Time, inFligh
 
 func (c *PathController) setDemand(a *PathAttachment, d quiccongestion.Demand) []func() {
 	a.demand = d
-	c.arb.OnDemand(c.demand())
+	union := c.demand()
+	// Demand carries no time: it is read from the clock, without moving
+	// the event clock.
+	now := c.clock()
+	if now.Before(c.now) {
+		now = c.now
+	}
+	c.noteDemand(union, now)
+	c.arb.OnDemand(union)
 	return c.collectWaiting(a, nil)
 }
 
@@ -888,6 +977,8 @@ type PathAttachment struct {
 	// were last acknowledged.
 	ptoSinceProgress int
 
+	// gaugeView mirrors gauge for telemetry readers.
+	gaugeView atomic.Int64
 	// counters are this attachment's share of the path's cumulative
 	// counters, read from any goroutine.
 	countersMu sync.Mutex
@@ -928,6 +1019,17 @@ func (a *PathAttachment) Telemetry() ControllerTelemetry {
 	t.StateMisses, t.ZeroSamples = own.StateMisses, own.ZeroSamples
 	t.BytesLost, t.PacketsLost, t.PacketsLostObserved = own.BytesLost, own.PacketsLost, own.PacketsLostObserved
 	t.NonElicitingBytes, t.NonElicitingDebited = own.NonElicitingBytes, own.NonElicitingDebited
+	// The gauges a reader sums over a flow's lanes -- flight, window, pacing
+	// rate and bandwidth -- are this attachment's share, so a flow with two
+	// connections on one path counts the path's window, rate and flight
+	// once, not twice: flight is the connection's own, and the path's
+	// window, rate and bandwidth are split evenly between its attachments.
+	t.BytesInFlight = uint64(max(a.gaugeView.Load(), 0))
+	if n := uint64(max(a.ctl.Load().attached.Load(), 1)); n > 1 {
+		t.CongestionWindow /= n
+		t.PacingRate /= n
+		t.MaxBandwidth /= n
+	}
 	return t
 }
 

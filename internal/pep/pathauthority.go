@@ -128,9 +128,12 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal strin
 			return nil
 		}
 		current = next
-		// The connection's other readers of the path follow it too.
+		// Resolve the controller first: a lookup may sweep an expired entry
+		// and its model, and the readers must follow the model the
+		// controller reports to.
+		c := pathAuthorities.controller(principal, next, initial)
 		rekeyPathModel(conn, principal+"|"+next)
-		return pathAuthorities.controller(principal, next, initial)
+		return c
 	}
 	attachment := controller.Attach(rekey, func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
 	markClassScheduled(conn)

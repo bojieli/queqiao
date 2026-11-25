@@ -207,6 +207,7 @@ func runPCSim(path pcSimPath, lanes []pcSimLane, duration, measureFrom time.Dura
 	if authority {
 		ctl = NewPathController(pcSimPacketSize, model, DefaultClassWeights)
 		ctl.law.inner.randomState = 0x9e3779b97f4a7c15
+		ctl.clock = func() monotime.Time { return base.Add(now) }
 	}
 	conns := make([]*pcSimConn, len(lanes))
 	for i, plan := range lanes {

@@ -28,7 +28,11 @@ type pcConn struct {
 }
 
 func newPCController() *PathController {
-	return NewPathController(1200, nil, DefaultClassWeights)
+	c := NewPathController(1200, nil, DefaultClassWeights)
+	// These tests run on a fixed clock: the latest event's time stands for
+	// a demand change's.
+	c.clock = func() monotime.Time { return c.now }
+	return c
 }
 
 func attachPC(t *testing.T, c *PathController, now monotime.Time) *pcConn {
@@ -821,5 +825,54 @@ func TestAPacketMustFitTheWindow(t *testing.T) {
 	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true, quiccongestion.ClassBulk: true}})
 	if p := a.a.Admit(now, 1200); !p.OK || p.Turn != quiccongestion.ClassControl || p.Fill != [4]quiccongestion.ByteCount{} {
 		t.Fatalf("a CONTROL packet on the debt: %+v", p)
+	}
+}
+
+// Test 7 of §15: application-limited is an unused admission opportunity,
+// measured by the controller from demand. A continuously backlogged sender
+// held back only by the path's pacer and window, and one whose queue empties
+// only between writes, produce no application-limited samples; one with no
+// eligible demand while the window is open -- blocked on peer flow control,
+// say -- does.
+func TestApplicationLimitedIsAnUnusedOpportunity(t *testing.T) {
+	run := func(gap func(step int) bool, blink bool) PathControllerStats {
+		c := newPCController()
+		now := base()
+		a := attachPC(t, c, now)
+		for step := 1; step <= 3000; step++ {
+			now = now.Add(time.Millisecond)
+			if step%100 == 0 {
+				var acked []quiccongestion.PacketNumber
+				for n := range a.sizes {
+					acked = append(acked, n)
+				}
+				a.event(now, acked, nil)
+				clear(a.sizes)
+			}
+			if gap(step) {
+				a.a.OnDemand(quiccongestion.Demand{})
+				continue
+			}
+			if blink {
+				// The queue empties for an instant between two writes.
+				a.a.OnDemand(quiccongestion.Demand{})
+			}
+			a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+			for a.a.Admit(now, 1200).OK {
+				a.send(now, 1200)
+			}
+		}
+		return c.Stats()
+	}
+	appSamples := func(c PathControllerStats) uint64 { return c.AppSamples }
+	if s := run(func(int) bool { return false }, false); appSamples(s) != 0 {
+		t.Errorf("a backlogged sender produced %d application-limited samples", appSamples(s))
+	}
+	if s := run(func(int) bool { return false }, true); appSamples(s) != 0 {
+		t.Errorf("a sender idle only between writes produced %d application-limited samples", appSamples(s))
+	}
+	// No eligible demand for half of every round trip, with the window open.
+	if s := run(func(step int) bool { return step%100 >= 50 }, false); appSamples(s) == 0 {
+		t.Error("a sender without demand while the window was open produced no application-limited samples")
 	}
 }

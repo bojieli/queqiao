@@ -81,6 +81,13 @@ type TUICBBRSender struct {
 	pacingRate    uint64
 	bytesInFlight quiccongestion.ByteCount
 	telemetry     telemetryState
+
+	// appLimitedBy, if set, decides whether the packets sent after an event
+	// are application-limited, in place of the window-headroom rule. A path
+	// controller sets it: it observes demand and unused admission directly
+	// (design §4.2), where the window rule cannot tell a sender held back by
+	// the path's shared pacer from one with nothing to send.
+	appLimitedBy func() bool
 }
 
 type tuicBbrMode uint8
@@ -462,6 +469,9 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	// ends it only after an ACK for a later packet, rather than suppressing an
 	// entire event based on an idle-gap guess.
 	appLimited := b.appLimited(priorInFlight)
+	if b.appLimitedBy != nil {
+		appLimited = b.appLimitedBy()
+	}
 	if appLimited {
 		b.estimator.markAppLimited()
 	}
