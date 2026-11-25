@@ -254,6 +254,15 @@ const (
 	// round halves the remaining distance, so this reaches the floor from any
 	// int-sized bound.
 	autotuneMaxCatchUp = autotuneHistory + 64
+	// autotuneIdleHold is how long an application-idle flow keeps its bound:
+	// RFC 7661's non-validated period, for the same reason. A flow with
+	// nothing read, nothing in flight and no producer waiting holds no memory
+	// whatever its bound, so its idle rounds say nothing about what it needs
+	// when the application writes again; decaying through them made every
+	// restart after a few seconds' pause start over from the startup
+	// allowance (W10 in docs/WORKLOAD-MODEL.md). Past the hold, the elapsed
+	// rounds decay the bound as before.
+	autotuneIdleHold = 5 * time.Minute
 )
 
 // DefaultConfig returns bounds suitable for a long-haul path.
@@ -466,6 +475,12 @@ type autotuneState struct {
 	roundMaxU  uint64
 	history    [autotuneHistory]uint64
 	rounds     int
+	// reading is when the producer began its current read of the source,
+	// holding nothing back; zero while it is not reading.
+	reading time.Time
+	// idleSince is the start of the first application-idle round of the
+	// current idle stretch; zero outside one.
+	idleSince time.Time
 }
 
 // New returns a scheduler that reads src and hands it out in chunks. It starts
@@ -590,6 +605,9 @@ func (s *Scheduler) waitForRoom() (int, bool) {
 			continue
 		}
 		s.tune.waiting = false
+		if s.cfg.Autotune != nil {
+			s.tune.reading = s.cfg.Now()
+		}
 		return allowance, true
 	}
 }
@@ -659,6 +677,10 @@ func (s *Scheduler) publish(buf []byte, n, reserved int, drained bool, err error
 		s.cfg.Memory.Release(reserved)
 		return false
 	}
+	// Close the rounds that ended during the read with the state they had:
+	// an application-idle flow was idle in them.
+	s.autotuneLocked(s.cfg.Now())
+	s.tune.reading = time.Time{}
 	if n > 0 {
 		chunk := &Chunk{Offset: s.nextOffset, Data: buf[:n], reservation: reserved}
 		if s.cfg.Sparse != nil && drained && n <= s.cfg.SparseBytes && s.sendQueueEmptyLocked() {
@@ -789,9 +811,40 @@ func (s *Scheduler) autotuneLocked(now time.Time) {
 			s.tune.roundStart = now
 			break
 		}
+		if !s.applicationIdleLocked(s.tune.roundStart) {
+			s.tune.idleSince = time.Time{}
+		} else {
+			if s.tune.idleSince.IsZero() {
+				s.tune.idleSince = s.tune.roundStart
+			}
+			// Within the hold an idle round neither moves the bound nor
+			// enters the history: skip every whole round that ended by
+			// now and inside the hold, in one step.
+			hold := s.tune.idleSince.Add(autotuneIdleHold)
+			if end := s.tune.roundStart.Add(round); !end.After(hold) {
+				limit := now
+				if hold.Before(limit) {
+					limit = hold
+				}
+				s.tune.roundStart = s.tune.roundStart.Add(max(1, limit.Sub(s.tune.roundStart)/round) * round)
+				continue
+			}
+		}
 		s.closeRoundLocked()
 		s.tune.roundStart = s.tune.roundStart.Add(round)
 	}
+}
+
+// applicationIdleLocked reports whether the round that started at start has
+// been application-idle throughout: the producer was already waiting on the
+// application when it began, with nothing read and waiting and nothing in
+// flight, and no coverage arrived in it. None of that can change until the
+// application writes, which closes the elapsed rounds before it counts.
+func (s *Scheduler) applicationIdleLocked(start time.Time) bool {
+	t := &s.tune
+	return !t.reading.IsZero() && !start.Before(t.reading) &&
+		t.roundMaxU == 0 && s.uniqueBytes == 0 && s.readyBytes == 0 &&
+		!t.waiting && !t.blocked && !t.covered
 }
 
 func (s *Scheduler) closeRoundLocked() {
