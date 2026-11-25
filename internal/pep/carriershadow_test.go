@@ -742,3 +742,29 @@ func TestCarrierShadowPeakPastTheLastBucket(t *testing.T) {
 		t.Fatalf("two episodes past the last bucket = %+v", episodes)
 	}
 }
+
+// An outage and its end carry the same identifier, so a reader can pair
+// them even when they fall in the same millisecond and are logged in either
+// order.
+func TestCarrierShadowOutageEndNamesItsOutage(t *testing.T) {
+	shadowCfg := CarrierShadowConfig{Enabled: true}
+	if err := shadowCfg.resolve(); err != nil {
+		t.Fatal(err)
+	}
+	var logs lockedBuffer
+	flow := newStallTestFlow(t, metrics.New())
+	flow.carrierShadow = newCarrierShadow(shadowCfg, carrierShadowClient, slog.New(slog.NewJSONHandler(&logs, nil)), nil)
+	if flow.replacementBudget(time.Now(), time.Minute) != time.Minute {
+		t.Fatal("no outage opened")
+	}
+	flow.endReplacementOutage()
+	anyRecord := func(map[string]any) bool { return true }
+	started := waitForRecord(t, &logs, "carrier shadow outage", 2*time.Second, anyRecord)
+	ended := waitForRecord(t, &logs, "carrier shadow outage ended", 2*time.Second, anyRecord)
+	if started == nil || ended == nil {
+		t.Fatalf("records: %v %v", started, ended)
+	}
+	if id, ok := started["outage_id"].(float64); !ok || id == 0 || ended["outage_id"] != id {
+		t.Fatalf("outage %v, end %v: not paired", started["outage_id"], ended["outage_id"])
+	}
+}

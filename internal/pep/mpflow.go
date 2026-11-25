@@ -255,6 +255,12 @@ type multipathFlow struct {
 	// carrierShadow is the endpoint's carrier-liveness observer, nil when it
 	// is off. It only records; nothing here reads what it computes.
 	carrierShadow *carrierShadow
+	// shadowOutage identifies the current outage to the observer, so its
+	// end record names the outage it ends; zero when none is recorded.
+	// With the observer on, shadowOutageMu makes opening or ending an
+	// outage and publishing its identity one step; off, it is never taken.
+	shadowOutageMu sync.Mutex
+	shadowOutage   uint64
 
 	sendAckFlag uint16
 	recvAckFlag uint16
@@ -2696,12 +2702,24 @@ func (f *multipathFlow) replacementBudget(now time.Time, grace time.Duration) ti
 				continue
 			}
 		}
-		if f.replacementDeadline.CompareAndSwap(0, now.Add(grace).UnixNano()) {
-			if f.carrierShadow != nil {
-				// Off the recovery path: a slow log sink must not lengthen
-				// the grace. The record carries its own observation time.
-				go f.carrierShadow.noteOutage(f, now, grace)
+		if f.carrierShadow == nil {
+			if f.replacementDeadline.CompareAndSwap(0, now.Add(grace).UnixNano()) {
+				return grace
 			}
+			continue
+		}
+		f.shadowOutageMu.Lock()
+		opened := f.replacementDeadline.CompareAndSwap(0, now.Add(grace).UnixNano())
+		var id uint64
+		if opened {
+			id = shadowOutageSeq.Add(1)
+			f.shadowOutage = id
+		}
+		f.shadowOutageMu.Unlock()
+		if opened {
+			// Off the recovery path: a slow log sink must not lengthen the
+			// grace. The record carries its own observation time.
+			go f.carrierShadow.noteOutage(f, id, now, grace)
 			return grace
 		}
 	}
@@ -2710,10 +2728,21 @@ func (f *multipathFlow) replacementBudget(now time.Time, grace time.Duration) ti
 // endReplacementOutage forgets the current outage's deadline, so the next one
 // starts from a full grace.
 func (f *multipathFlow) endReplacementOutage() {
-	if deadline := f.replacementDeadline.Swap(0); deadline != 0 && f.carrierShadow != nil {
+	if f.carrierShadow == nil {
+		f.replacementDeadline.Swap(0)
+		return
+	}
+	f.shadowOutageMu.Lock()
+	deadline := f.replacementDeadline.Swap(0)
+	id := f.shadowOutage
+	if deadline != 0 {
+		f.shadowOutage = 0
+	}
+	f.shadowOutageMu.Unlock()
+	if deadline != 0 {
 		// The caller may hold the lane admission lock: log off it.
 		ended := time.Now()
-		go f.carrierShadow.noteOutageEnd(f, ended, time.Unix(0, deadline))
+		go f.carrierShadow.noteOutageEnd(f, id, ended, time.Unix(0, deadline))
 	}
 }
 

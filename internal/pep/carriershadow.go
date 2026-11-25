@@ -897,21 +897,26 @@ func (o *carrierShadow) noteLaneFailure(f *multipathFlow, lane *mpLane, err erro
 // for a flow with no lane, and when that grace ends. This is each side's
 // failure-observation time for the recovery deadline: the gateway's grace is
 // what a client's JOIN or TCP handoff has to beat.
-func (o *carrierShadow) noteOutage(f *multipathFlow, now time.Time, grace time.Duration) {
+// id pairs the outage with its end record: both are logged to the
+// millisecond, and asynchronously, so neither time nor file order tells an
+// outage that ended in the millisecond it started from one still open.
+func (o *carrierShadow) noteOutage(f *multipathFlow, id uint64, now time.Time, grace time.Duration) {
 	if o == nil {
 		return
 	}
-	o.logger.Info("carrier shadow outage", append(o.flowFields(f),
+	o.logger.Info("carrier shadow outage", append(o.flowFields(f), "outage_id", id,
 		"observed_unix_ms", now.UnixMilli(), "grace", grace, "deadline_unix_ms", now.Add(grace).UnixMilli())...)
 }
 
-func (o *carrierShadow) noteOutageEnd(f *multipathFlow, ended, deadline time.Time) {
+func (o *carrierShadow) noteOutageEnd(f *multipathFlow, id uint64, ended, deadline time.Time) {
 	if o == nil {
 		return
 	}
-	o.logger.Info("carrier shadow outage ended", append(o.flowFields(f),
+	o.logger.Info("carrier shadow outage ended", append(o.flowFields(f), "outage_id", id,
 		"observed_unix_ms", ended.UnixMilli(), "deadline_remaining", deadline.Sub(ended))...)
 }
+
+var shadowOutageSeq atomic.Uint64
 
 // noteRescue records the client starting a rescue round: the start of the
 // JOIN whose arrival the gateway records with noteJoinArrival.

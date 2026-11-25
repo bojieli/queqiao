@@ -36,7 +36,9 @@ per process and are keyed by the logger's pid when present.
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime
+import itertools
 import json
 import math
 import re
@@ -284,6 +286,50 @@ def open_episode_peak(records: list[dict[str, Any]]) -> int:
     return peak
 
 
+class CarrierProgress:
+    """Each carrier's epoch-bearing observations in time order -- stalls,
+    lane failures and recovered episode lines, from every flow on it -- so
+    the first observation of a newer epoch after a moment is found by
+    binary search rather than a scan."""
+
+    def __init__(self, endpoint: Endpoint) -> None:
+        points: dict[tuple, list[tuple[float, int]]] = defaultdict(list)
+        for record in endpoint.records:
+            msg = record.get("msg")
+            if msg not in (STALL, LANE_FAILED, EPISODE) or (msg == EPISODE and record.get("outcome") != "recovered"):
+                continue
+            epoch = record.get("transport_epoch")
+            if record.get("carrier_id") in (None, 0) or not isinstance(epoch, int) or isinstance(epoch, bool):
+                continue
+            points[carrier_key(record)].append((record["_t"], epoch))
+        self.times: dict[tuple, list[float]] = {}
+        self.highest: dict[tuple, list[int]] = {}
+        self.epochs: dict[tuple, list[int]] = {}
+        for key, values in points.items():
+            values.sort(key=lambda p: p[0])
+            self.times[key] = [t for t, _ in values]
+            self.epochs[key] = [e for _, e in values]
+            # The highest epoch seen up to each point: non-decreasing, so
+            # where it first passes an epoch is found by bisection.
+            self.highest[key] = list(itertools.accumulate(self.epochs[key], max))
+
+    def after(self, carrier: tuple, since: float, epoch: int, inclusive: bool = True) -> float:
+        """When the carrier was first observed in an epoch newer than epoch,
+        at or after since (after it, if not inclusive); inf if never."""
+        times = self.times.get(carrier)
+        if not times:
+            return math.inf
+        start = (bisect.bisect_left if inclusive else bisect.bisect_right)(times, since)
+        start = max(start, bisect.bisect_right(self.highest[carrier], epoch))
+        epochs = self.epochs[carrier]
+        # The epoch a sampler logs only grows; the scan guards a capture
+        # that mixes processes or restarts.
+        for i in range(start, len(times)):
+            if epochs[i] > epoch:
+                return times[i]
+        return math.inf
+
+
 def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
     transitions: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     for record in endpoint.of(STATE):
@@ -292,20 +338,8 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
     # (stable, so file order breaks ties).
     for values in transitions.values():
         values.sort(key=lambda r: r["_t"])
-    stalls_by_carrier: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
-    for record in endpoint.of(STALL):
-        stalls_by_carrier[carrier_key(record)].append(record)
-    for values in stalls_by_carrier.values():
-        values.sort(key=lambda r: r["_t"])
-    episodes_by_carrier: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
-    for record in endpoint.of(EPISODE):
-        episodes_by_carrier[carrier_key(record)].append(record)
-    for record in endpoint.of(LANE_FAILED):
-        stalls_by_carrier[carrier_key(record)].append(record)
-    for values in stalls_by_carrier.values():
-        values.sort(key=lambda r: r["_t"])
-    for values in episodes_by_carrier.values():
-        values.sort(key=lambda r: r["_t"])
+    transition_times = {key: [t["_t"] for t in values] for key, values in transitions.items()}
+    progress = CarrierProgress(endpoint)
     by_kind: Counter = Counter()
     later_failure_delay: list[float] = []
     outcomes: Counter = Counter()
@@ -325,24 +359,21 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
         # progress epoch unchanged since the stall -- are its consequence.
         # Progress that changes no state is not logged, so a later failure
         # in a newer epoch is a different episode.
-        following = [t for t in transitions.get(carrier_key(stall), []) if t["_t"] >= stall["_t"]]
+        carrier_transitions = transitions.get(carrier_key(stall), [])
+        first = bisect.bisect_left(transition_times.get(carrier_key(stall), []), stall["_t"])
         # A later stall or lane-failure observation of the carrier in a
-        # newer epoch is progress too: the episode ended there.
-        progressed_at = next((s["_t"] for s in stalls_by_carrier.get(carrier_key(stall), [])
-                              if s["_t"] >= stall["_t"] and isinstance(s.get("transport_epoch"), int)
-                              and s.get("transport_epoch") > epoch), math.inf)
-        # So is an episode the transport saw recover, though the sampled
-        # state never left ACTIVE.
-        progressed_at = min(progressed_at, next((e["_t"] for e in episodes_by_carrier.get(carrier_key(stall), [])
-                                                 if e["_t"] >= stall["_t"] and e.get("outcome") == "recovered"
-                                                 and isinstance(e.get("transport_epoch"), int) and e["transport_epoch"] > epoch), math.inf))
+        # newer epoch, from any flow, is progress too: the episode ended
+        # there. So is an episode the transport saw recover, though the
+        # sampled state never left ACTIVE.
+        progressed_at = progress.after(carrier_key(stall), stall["_t"], epoch)
         same = []
-        for t in following:
+        for i in range(first, len(carrier_transitions)):
+            t = carrier_transitions[i]
             if t.get("transport_epoch") != epoch or t["_t"] > progressed_at:
                 break
             same.append(t)
         failure = next((t for t in same if t.get("to") in ("replace", "dead")), None)
-        newer = len(same) < len(following) or progressed_at != math.inf
+        newer = first + len(same) < len(carrier_transitions) or progressed_at != math.inf
         if failure is not None:
             outcomes[f"carrier reached {failure.get('to')} after the stall"] += 1
             later_failure_delay.append(failure["_t"] - stall["_t"])
@@ -424,68 +455,118 @@ def failure_records(endpoint: Endpoint) -> dict[tuple, list[tuple[float, str, di
     return out
 
 
-def incident_index(endpoint: Endpoint) -> tuple[dict[tuple, list[float]], dict[tuple, list[float]]]:
-    """Carrier recoveries and per-flow outage ends on this endpoint."""
-    recoveries: dict[tuple, list[float]] = defaultdict(list)
-    for r in endpoint.of(STATE):
-        if r.get("to") == "active":
-            recoveries[carrier_key(r)].append(r["_t"])
-    for r in endpoint.of(EPISODE):
-        if r.get("outcome") == "recovered":
-            recoveries[carrier_key(r)].append(r["_t"])
-    outage_ends: dict[tuple, list[float]] = defaultdict(list)
-    for r in endpoint.of(OUTAGE_ENDED):
-        outage_ends[flow_key(r)].append(r["_t"])
-    return recoveries, outage_ends
+def outage_identity(record: dict[str, Any]) -> tuple | None:
+    """The (process, flow, outage_id) an outage or outage-end record names,
+    or None for a record without an identifier."""
+    outage = record.get("outage_id")
+    if not isinstance(outage, int) or isinstance(outage, bool) or outage <= 0:
+        return None
+    return (record["_process"], *flow_key(record), outage)
 
 
-def incident_starts(index: tuple[dict[tuple, list[float]], dict[tuple, list[float]]], key: tuple,
+class IncidentIndex:
+    """What ends a client incident, indexed once per capture: carrier
+    recoveries, epoch-bearing progress on each carrier from every flow,
+    and each flow's outage ends -- paired with their outage by identifier
+    where the log has one, since an outage can end in the millisecond it
+    started and the two records are logged asynchronously."""
+
+    def __init__(self, endpoint: Endpoint) -> None:
+        self.recoveries: dict[tuple, list[float]] = defaultdict(list)
+        for r in endpoint.of(STATE):
+            if r.get("to") == "active":
+                self.recoveries[carrier_key(r)].append(r["_t"])
+        for r in endpoint.of(EPISODE):
+            if r.get("outcome") == "recovered":
+                self.recoveries[carrier_key(r)].append(r["_t"])
+        for values in self.recoveries.values():
+            values.sort()
+        self.progress = CarrierProgress(endpoint)
+        # Ends paired with their outage: (process, flow, outage_id) -> time.
+        # Ends without an identifier (older logs), or whose outage is not in
+        # the capture, are flow-level evidence by time.
+        starts = {outage_identity(r) for r in endpoint.of(OUTAGE)} - {None}
+        self.outage_ends: dict[tuple, list[float]] = defaultdict(list)
+        self.paired_ends: dict[tuple, float] = {}
+        for r in endpoint.of(OUTAGE_ENDED):
+            identity = outage_identity(r)
+            if identity in starts:
+                self.paired_ends.setdefault(identity, r["_t"])
+            else:
+                self.outage_ends[flow_key(r)].append(r["_t"])
+
+    def recovered(self, carrier: tuple, after: float, until: float) -> float:
+        """The first recovery of the carrier in (after, until]; inf if none."""
+        values = self.recoveries.get(carrier, [])
+        i = bisect.bisect_right(values, after)
+        return values[i] if i < len(values) and values[i] <= until else math.inf
+
+    def paired_end(self, record: dict[str, Any]) -> float:
+        identity = outage_identity(record)
+        return math.inf if identity is None else self.paired_ends.get(identity, math.inf)
+
+
+def incident_starts(index: IncidentIndex, key: tuple,
                     observations: list[tuple[float, str, dict[str, Any]]]) -> tuple[list[int], list[float]]:
     """For each of a flow's observations, the index of the first observation
     of its incident, and when that incident was known to be over (inf if
-    never). An incident ends at evidence that it was over: the
-    flow's own outage ending on this endpoint (a lane came back), the carrier
-    of the incident's latest observation returning to ACTIVE, or a later
-    stall on that carrier in a newer epoch."""
-    recoveries, ends = index
-    outage_ends = ends.get(key, [])
+    never). An incident ends at evidence that it was over: the flow's own
+    outage ending on this endpoint (a lane came back); the carrier of the
+    incident's latest observation returning to ACTIVE; or that carrier
+    observed in a newer epoch, by this flow or any other."""
+    outage_ends = index.outage_ends.get(key, [])
     starts: list[int] = []
     ended_at: dict[int, float] = {}
+    carrier, epoch = None, None
+    # Each carrier's epoch as this incident last observed it.
     epochs: dict[tuple, int] = {}
-    carrier = None
-    for index, (t, kind, record) in enumerate(observations):
+    # The paired end of the latest outage observed in this incident.
+    outage_end = math.inf
+
+    def evidence_in(after: float, until: float) -> float:
+        found = min((e for e in outage_ends if after < e <= until), default=math.inf)
+        if outage_end <= until:
+            found = min(found, outage_end)
+        if carrier is not None:
+            found = min(found, index.recovered(carrier, after, until))
+            if epoch is not None:
+                # From the same millisecond: a strictly newer epoch is
+                # progress whoever logged it.
+                newer = index.progress.after(carrier, after, epoch)
+                if newer <= until:
+                    found = min(found, newer)
+        return found
+
+    for position, (t, kind, record) in enumerate(observations):
         start = starts[-1] if starts else 0
-        if index:
-            previous = observations[index - 1][0]
-            evidence = [e for e in outage_ends if previous < e <= t]
-            if carrier is not None:
-                evidence += [r for r in recoveries.get(carrier, []) if previous < r <= t]
-            epoch = record.get("transport_epoch")
-            seen = epochs.get(carrier_key(record))
-            if isinstance(epoch, int) and isinstance(seen, int) and epoch > seen:
-                evidence.append(t)
-            if evidence:
-                ended_at[start] = min(evidence)
-                start = index
-                # A new incident compares epochs from its own observations.
+        if position:
+            found = evidence_in(observations[position - 1][0], t)
+            own = record.get("transport_epoch")
+            seen = epochs.get(carrier_key(record)) if record.get("carrier_id") is not None else None
+            if isinstance(own, int) and isinstance(seen, int) and own > seen:
+                found = min(found, t)
+            if found != math.inf:
+                ended_at[start] = found
+                start = position
+                carrier, epoch, outage_end = None, None, math.inf
                 epochs.clear()
         if kind == "outage":
             # The flow has no lane: only its own outage end, not progress on
             # a former carrier (which may serve other flows), ends this.
-            carrier = None
+            carrier, epoch = None, None
+            outage_end = index.paired_end(record)
         elif record.get("carrier_id") is not None:
             carrier = carrier_key(record)
-            if isinstance(record.get("transport_epoch"), int):
-                epochs[carrier] = record["transport_epoch"]
+            own = record.get("transport_epoch")
+            epoch = own if isinstance(own, int) and not isinstance(own, bool) else None
+            if epoch is not None:
+                epochs[carrier] = epoch
         starts.append(start)
     if observations:
         # Evidence after the last observation ends the last incident too.
-        last = observations[-1][0]
-        evidence = [e for e in outage_ends if e > last]
-        if carrier is not None:
-            evidence += [r for r in recoveries.get(carrier, []) if r > last]
-        if evidence:
-            ended_at[starts[-1]] = min(evidence)
+        found = evidence_in(observations[-1][0], math.inf)
+        if found != math.inf:
+            ended_at[starts[-1]] = found
     return starts, [ended_at.get(start, math.inf) for start in starts]
 
 
@@ -501,7 +582,7 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
     that arrival. A pair that cannot be formed is left out, not guessed.
     """
     client_records = failure_records(client)
-    client_incidents = incident_index(client)
+    client_incidents = IncidentIndex(client)
     incident_cache: dict[tuple, tuple[list[int], list[float]]] = {}
     gateway_obs = failure_observations(gateway)
     # A JOIN's transit runs from the client starting that attempt to the
@@ -514,9 +595,18 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
     joins: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     for record in gateway.of(JOIN):
         joins[flow_key(record)].append(record)
+    # An end that names its outage belongs to that outage, even in the
+    # millisecond the next one starts; ends without one (older logs), or
+    # whose outage is not in the capture, are assigned by time.
+    gateway_starts = {outage_identity(r) for r in gateway.of(OUTAGE)} - {None}
+    paired_end: dict[tuple, float] = {}
     ended: dict[tuple, list[float]] = defaultdict(list)
     for record in gateway.of(OUTAGE_ENDED):
-        ended[flow_key(record)].append(record["_t"])
+        identity = outage_identity(record)
+        if identity in gateway_starts:
+            paired_end.setdefault(identity, record["_t"])
+        else:
+            ended[flow_key(record)].append(record["_t"])
     outages: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     for record in gateway.of(OUTAGE):
         outages[flow_key(record)].append(record)
@@ -545,7 +635,9 @@ def recovery_deadline(client: Endpoint, gateway: Endpoint, grace_s: float, offse
                 deadline = recorded / 1000.0 - offset_s
                 start = deadline - grace
             next_start = records[index + 1]["_t"] if index + 1 < len(records) else math.inf
-            end = next((t for t in sorted(ended.get(key, [])) if start <= t < next_start), None)
+            end = paired_end.get(outage_identity(outage))
+            if end is None:
+                end = next((t for t in sorted(ended.get(key, [])) if start <= t < next_start), None)
             # Without an end record the window runs past the deadline, so a
             # JOIN that arrived late is found and counted late.
             window_end = end if end is not None else min(next_start, capture_end)
