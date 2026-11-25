@@ -849,6 +849,9 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		if !exists {
 			out = &outstanding{chunk: chunk}
 			s.live[chunk.Offset] = out
+			// Close the rounds that ended before this dispatch with the U
+			// they had: bytes that sat READY were not in flight then.
+			s.autotuneLocked(s.cfg.Now())
 			s.uniqueBytes += uint64(len(chunk.Data))
 			s.sampleUniqueLocked()
 			s.stats.ChunksIssued++

@@ -301,6 +301,7 @@ func TestStagedReservationIsReleasedOnlyByAcknowledgement(t *testing.T) {
 		src := newAvailableSource()
 		src.write(bytes.Repeat([]byte{3}, 4000))
 		s := New(src, cfg)
+		defer src.close()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		first, err := s.Next(ctx, 1, 0)
 		if err != nil {
@@ -581,5 +582,32 @@ func TestRetriesAreChargedOnceAgainstTheRetentionBound(t *testing.T) {
 	again, err := s.Next(ctx, 2, 0)
 	if err != nil || again.Offset != first.Offset {
 		t.Fatalf("retry not offered first: %v %v", again, err)
+	}
+}
+
+// Bytes that waited READY with no lane are not in flight: when a lane
+// attaches after a long gap, the elapsed rounds are closed with the U they
+// had, so the bound still decays across the gap.
+func TestDelayedLaneAttachDoesNotBackdateU(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	s := newTunedScheduler(t, clock)
+	ctx, cancel := context.WithCancel(context.Background())
+	lane := startLane(ctx, s)
+	for range 8 {
+		waitBlockedOnBound(t, s)
+		clock.advance(tuneRound)
+		lane.completeAll(s)
+	}
+	cancel()
+	<-lane.done
+	lane.completeAll(s)
+	waitUntil(t, "READY bytes to fill the bound", func() bool { return s.ReadyBytes() >= tuneMax })
+	clock.advance(time.Hour)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	startLane(ctx2, s)
+	waitUntil(t, "the new lane to take the READY bytes", func() bool { return s.ReadyBytes() == 0 })
+	if bound, startup := s.RetentionBound(), DefaultAutotuneStartupChunks*tuneChunk; bound != startup {
+		t.Fatalf("after an hour with no lane the bound is %d, want %d", bound, startup)
 	}
 }

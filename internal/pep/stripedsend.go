@@ -164,13 +164,18 @@ func (f *multipathFlow) creditRound() time.Duration {
 }
 
 // readyLimit is the write-ahead bound on READY bytes under the owned-memory
-// bundle: what the flow's healthy lanes may queue ahead of their transports.
-// With no lane, READY bytes stay within one lane's minimum, and the
-// no-progress budget ends the flow if no binding arrives.
+// bundle: what the lanes that will carry this flow's data may queue ahead of
+// their transports -- the same candidates dispatch uses, so a pooled control
+// lane beside an isolated data lane does not count. With no lane, READY bytes
+// stay within one lane's minimum, and the no-progress budget ends the flow if
+// no binding arrives.
 func (f *multipathFlow) readyLimit() int {
 	total := 0
-	for _, lane := range f.healthyLanes() {
-		total += lane.windowBytes()
+	bulk := protocol.Class(f.class.Load()) == protocol.ClassBulk
+	if candidates, err := f.laneCandidates(bulk); err == nil {
+		for _, lane := range candidates {
+			total += lane.windowBytes()
+		}
 	}
 	return max(total, minLaneQueueBytes)
 }
