@@ -523,11 +523,20 @@ func (e *ErasureSender) HasPacingBudget(now monotime.Time) bool {
 
 func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount, retransmittable bool) {
 	if !retransmittable {
-		e.nonElicitingDebited.Add(uint64(bytes))
-		e.nonEliciting.Add(uint64(bytes))
+		e.nonElicitingDebited.Add(byteTotal(bytes))
+		e.nonEliciting.Add(byteTotal(bytes))
 	}
 	e.pacer.sentPacket(sentTime, bytes)
 	e.inner.OnPacketSent(sentTime, bytesInFlight, number, bytes, retransmittable)
+}
+
+// byteTotal converts a packet size for a byte counter; a negative size
+// counts as none.
+func byteTotal(b quiccongestion.ByteCount) uint64 {
+	if b <= 0 {
+		return 0
+	}
+	return uint64(b) // #nosec G115 -- b is positive, and every ByteCount fits in uint64.
 }
 
 // onNonElicitingSent registers a packet that elicits no acknowledgement
@@ -535,7 +544,7 @@ func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 // such a packet nothing, so charging it limits traffic by an estimate that was
 // not measured on it; see ErasurePathSender.
 func (e *ErasureSender) onNonElicitingSent(sentTime monotime.Time, bytesInFlight quiccongestion.ByteCount, number quiccongestion.PacketNumber, bytes quiccongestion.ByteCount) {
-	e.nonEliciting.Add(uint64(bytes))
+	e.nonEliciting.Add(byteTotal(bytes))
 	e.inner.OnPacketSent(sentTime, bytesInFlight, number, bytes, false)
 }
 

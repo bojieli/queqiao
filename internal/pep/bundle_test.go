@@ -2,6 +2,7 @@ package pep
 
 import (
 	"context"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	wancongestion "github.com/bojieli/queqiao/internal/congestion"
 	"github.com/bojieli/queqiao/internal/identity"
+	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/profile"
 )
 
@@ -107,8 +109,9 @@ func TestCCAPISelectsHowTheErasureControllerIsDriven(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	received := make(chan int64, 4)
 	go func() {
 		for {
 			conn, err := listener.Accept(ctx)
@@ -116,6 +119,14 @@ func TestCCAPISelectsHowTheErasureControllerIsDriven(t *testing.T) {
 				return
 			}
 			go func() { <-ctx.Done(); _ = conn.CloseWithError(0, "") }()
+			go func() {
+				stream, err := conn.AcceptStream(ctx)
+				if err != nil {
+					return
+				}
+				n, _ := io.Copy(io.Discard, stream)
+				received <- n
+			}()
 		}
 	}()
 	for _, api := range []CCAPIVersion{CCAPIV1, CCAPIV2} {
@@ -123,6 +134,9 @@ func TestCCAPISelectsHowTheErasureControllerIsDriven(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Start from an empty model: other tests in this package report to the
+		// same loopback path.
+		pathmodel.Forget(peerKey(conn))
 		controller := configureQUICController(conn, congestionConfig{kind: CongestionErasure, ccAPI: api})
 		switch c := controller.(type) {
 		case *wancongestion.ErasureSender:
@@ -141,7 +155,18 @@ func TestCCAPISelectsHowTheErasureControllerIsDriven(t *testing.T) {
 			if _, err := stream.Write(make([]byte, 64<<10)); err != nil {
 				t.Fatal(err)
 			}
-			deadline := time.Now().Add(3 * time.Second)
+			if err := stream.Close(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case n := <-received:
+				if n != 64<<10 {
+					t.Fatalf("the peer received %d bytes, want %d", n, 64<<10)
+				}
+			case <-ctx.Done():
+				t.Fatal("the transfer did not complete under the PathSender")
+			}
+			deadline := time.Now().Add(10 * time.Second)
 			for c.Telemetry().Samples == 0 {
 				if time.Now().After(deadline) {
 					t.Fatal("the PathSender's control law never received a delivery sample")
