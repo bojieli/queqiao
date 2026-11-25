@@ -292,11 +292,7 @@ func (r *topologyRig) download(n int, during func()) error {
 			defer wg.Done()
 			defer conn.Close()
 			_ = conn.SetDeadline(time.Now().Add(40 * time.Second))
-			got, err := io.ReadAll(conn)
-			if err == nil {
-				err = checkDownload(got)
-			}
-			if err != nil {
+			if err := checkDownload(conn); err != nil {
 				errs <- fmt.Errorf("flow %d: %w", i, err)
 			}
 		}()
@@ -309,14 +305,29 @@ func (r *topologyRig) download(n int, during func()) error {
 	return <-errs
 }
 
-func checkDownload(got []byte) error {
-	if len(got) != rigDownload {
-		return fmt.Errorf("downloaded %d bytes, want %d", len(got), rigDownload)
-	}
-	for i, b := range got {
-		if b != byte(i%251) {
-			return fmt.Errorf("byte %d is %d, want %d", i, b, byte(i%251))
+// checkDownload reads a whole download through a fixed buffer, checking the
+// pattern as it goes, so verification retains nothing the memory test would
+// count.
+func checkDownload(r io.Reader) error {
+	buf := make([]byte, 16*1024)
+	n := 0
+	for {
+		k, err := r.Read(buf)
+		for i, b := range buf[:k] {
+			if want := byte((n + i) % 251); b != want {
+				return fmt.Errorf("byte %d is %d, want %d", n+i, b, want)
+			}
 		}
+		n += k
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if n != rigDownload {
+		return fmt.Errorf("downloaded %d bytes, want %d", n, rigDownload)
 	}
 	return nil
 }
@@ -620,6 +631,9 @@ func TestSingleTopologyStaysInsideTheIOSMemoryProfile(t *testing.T) {
 				t.Fatalf("client held %d attached connections and %d bulk connections, want one", maxAttached, rig.client.bulkConnCount())
 			}
 		})
+	}
+	if len(commitment) < 2 {
+		return // a filtered run of one arm has nothing to compare
 	}
 	if commitment[TopologySingle] >= commitment[TopologyIsolated] {
 		t.Errorf("one connection commits %d receive bytes, isolation %d", commitment[TopologySingle], commitment[TopologyIsolated])

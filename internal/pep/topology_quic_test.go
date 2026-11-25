@@ -225,16 +225,19 @@ func messageStream(ctx context.Context, conn *quic.Conn, index uint32, class qui
 	if _, err := stream.WriteClass(streamHeader(streamKindMessage, index), quiccongestion.ClassControl); err != nil {
 		return
 	}
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
+	// A fixed emission schedule: delta i is due at start + i×25 ms and is
+	// stamped with that due time, not with when the writer got to it, so a
+	// write that blocks shows up as lateness of every delta behind it.
+	start := time.Now()
 	var msg [messageSize]byte
-	for {
+	for i := 1; ; i++ {
+		due := start.Add(time.Duration(i) * 25 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(time.Until(due)):
 		}
-		binary.BigEndian.PutUint64(msg[:8], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(msg[:8], uint64(due.UnixNano()))
 		if _, err := stream.WriteClass(msg[:], class); err != nil {
 			return
 		}
