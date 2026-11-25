@@ -442,3 +442,55 @@ func TestCodedRetryRequiresCCAPIV2(t *testing.T) {
 		t.Errorf("server rejected coded-retry=sticky on cc-api=v2: %v", err)
 	}
 }
+
+// Before OPEN_OK the first DATA frame still goes coded with one stream safety
+// copy (PROTOCOL.md §8.1). The stream copy owns the bytes, so the code's
+// report about its own copy, whichever it is, retries nothing.
+func TestOpenSafetyCopyIsKeptUnderCodedRetry(t *testing.T) {
+	for _, registered := range []bool{true, false} {
+		x := newCodedRetryFixture(t, true, true)
+		x.fc.openUnconfirmed = func() bool { return true }
+		x.fc.openSafetyCopy.Store(true)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		now := time.Unix(1000, 0)
+		sched := x.scheduler(t, func() time.Time { return now })
+		first, err := sched.Next(ctx, 0, 0)
+		if err != nil || first.Reliable {
+			cancel()
+			t.Fatalf("first attempt = %+v, %v; want the code", first, err)
+		}
+		if err := x.flow.sendChunk(ctx, x.lane, first, true); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		queued := <-x.lane.writeQ
+		settled := make(chan coded.Outcome, 1)
+		onCoded := queued.onCoded
+		reliable, err := x.fc.writeContextObserved(ctx, queued.frame, queued.forceReliable, func(o coded.Outcome) { onCoded(o); settled <- o })
+		if err != nil || !reliable {
+			cancel()
+			t.Fatalf("write = %v, %v; want the coded frame plus its stream safety copy", reliable, err)
+		}
+		queued.onWritten(reliable)
+		x.streamDelivers(t)
+		waitHeld(t, x.carrier)
+		x.carrier.release(registered)
+		<-settled
+		// The stream attempt keeps the deadline any stream attempt has.
+		now = now.Add(x.flow.reissueDelay() - time.Millisecond)
+		if n := sched.ReissueExpired(); n != 0 {
+			t.Fatalf("registered=%v: a chunk the stream carried was retried by the code's deadline", registered)
+		}
+		if got := sched.Stats().CodedAbandoned; got != 0 {
+			t.Fatalf("registered=%v: the stream's attempt was retired as abandoned", registered)
+		}
+		short, stop := context.WithTimeout(ctx, 20*time.Millisecond)
+		if again, _ := sched.Next(short, 0, 0); again != nil && len(again.Data) > 0 {
+			stop()
+			cancel()
+			t.Fatalf("registered=%v: a chunk the stream carried was dispatched again", registered)
+		}
+		stop()
+		cancel()
+	}
+}
