@@ -1236,3 +1236,107 @@ func TestADetachDoesNotMakeThePastLookUnused(t *testing.T) {
 		t.Fatal("the time before the detach was counted as an unused opportunity")
 	}
 }
+
+// On a fast path an unused opportunity is measured in packet times, not in
+// the pacing timer's 1 ms floor: at about 100 MB/s a packet takes some
+// 12 µs, and half a millisecond with nothing to send and the window open is
+// many missed packets.
+func TestAnUnusedOpportunityIsMeasuredInPacketTimesOnAFastPath(t *testing.T) {
+	c := newPCController()
+	now := base()
+	p := &pcConn{t: t, a: c.Attach(nil, nil), sizes: make(map[quiccongestion.PacketNumber]quiccongestion.ByteCount)}
+	p.a.OnAttach(now, 0, 1200, func() {})
+	p.a.SetRTTStatsProvider(&fixedRTT{min: time.Millisecond, smoothed: time.Millisecond})
+	if pt := c.serialTime(1200); pt >= 100*time.Microsecond {
+		t.Fatalf("the test needs a fast path; a packet takes %v", pt)
+	}
+	p.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	p.send(now, 1200)
+	p.a.OnDemand(quiccongestion.Demand{})
+	now = now.Add(500 * time.Microsecond)
+	p.event(now, numbers(0, 1), nil)
+	if !c.law.inner.estimator.appLimited {
+		t.Fatal("half a millisecond of open window with nothing to send, at many packets per millisecond, was not an unused opportunity")
+	}
+}
+
+// Admission never visits idle attachments: with thousands of idle siblings
+// on the path, a busy attachment's permit costs what it costs alone.
+func TestAdmissionCostDoesNotGrowWithIdleSiblings(t *testing.T) {
+	permitCost := func(idle int) time.Duration {
+		c := newPCController()
+		now := base()
+		busy := attachPC(t, c, now)
+		for range idle {
+			attachPC(t, c, now)
+		}
+		busy.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+		const n = 2000
+		start := time.Now()
+		for range n {
+			now = now.Add(time.Millisecond)
+			if busy.a.Admit(now, 1200).OK {
+				busy.send(now, 1200)
+			}
+			if busy.inFlight > 20*1200 {
+				busy.event(now, numbers(busy.next-20, busy.next), nil)
+			}
+		}
+		return time.Since(start) / n
+	}
+	alone, crowded := permitCost(0), permitCost(5000)
+	t.Logf("per packet: %v alone, %v beside 5000 idle siblings", alone, crowded)
+	if crowded > 10*alone+20*time.Microsecond {
+		t.Fatalf("admission beside 5000 idle siblings costs %v per packet against %v alone", crowded, alone)
+	}
+}
+
+func BenchmarkAdmissionBesideIdleSiblings(b *testing.B) {
+	c := NewPathController(1200, nil, DefaultClassWeights)
+	c.clock = func() monotime.Time { return c.now }
+	now := base()
+	t := &testing.T{}
+	busy := attachPC(t, c, now)
+	for range 5000 {
+		attachPC(t, c, now)
+	}
+	busy.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	b.ResetTimer()
+	for range b.N {
+		now = now.Add(time.Millisecond)
+		if busy.a.Admit(now, 1200).OK {
+			busy.send(now, 1200)
+		}
+		if busy.inFlight > 20*1200 {
+			busy.event(now, numbers(busy.next-20, busy.next), nil)
+		}
+	}
+}
+
+// A CONTROL-only attachment beside a sibling holding the BULK turn, with the
+// window full: the sibling cannot send BULK, so its claim gives it nothing,
+// and the CONTROL packet goes on the control debt at once instead of
+// waiting for the flight to drain.
+func TestControlUsesItsDebtWhenTheBulkClaimantCannotSend(t *testing.T) {
+	c := newPCController()
+	now := base()
+	bulk, ctrl := attachPC(t, c, now), attachPC(t, c, now)
+	bulk.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	window := c.law.GetCongestionWindow()
+	for bulk.inFlight+1200 <= window {
+		bulk.sendClass(now, 1200, quiccongestion.ClassBulk)
+	}
+	now = now.Add(time.Second) // the balance refills; the window stays full
+	ctrl.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	if turn := c.arb.Select(); turn != quiccongestion.ClassBulk {
+		// Make BULK the path's turn: CONTROL has spent its credit.
+		c.arb.OnSent([4]quiccongestion.ByteCount{quiccongestion.ClassControl: 1 << 20})
+	}
+	if c.arb.Select() != quiccongestion.ClassBulk {
+		t.Fatal("setup: BULK is not the path's turn")
+	}
+	p := ctrl.a.Admit(now, 1200)
+	if !p.OK || p.Turn != quiccongestion.ClassControl || p.Fill != [4]quiccongestion.ByteCount{} {
+		t.Fatalf("CONTROL beside a BULK claimant that cannot send got %+v; want CONTROL on the debt", p)
+	}
+}

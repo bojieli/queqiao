@@ -52,6 +52,27 @@ func newClientPathPrincipal() string {
 	return clientPathPrincipal + ":" + strconv.FormatUint(clientPathPrincipals.Add(1), 10)
 }
 
+// pathPrincipalNow is the client's identity in path keys for a connection
+// dialled now: its principal and the generation of its uplink. The key's
+// address part distinguishes uplinks by source address; the generation
+// distinguishes the networks behind an uplink change that kept the address.
+// A port-only rebinding changes neither.
+func (c *Client) pathPrincipalNow() string {
+	if c.pathPrincipal == "" {
+		return ""
+	}
+	return c.pathPrincipal + "@" + strconv.FormatUint(c.uplinkGeneration.Load(), 10)
+}
+
+// authorizePathPrincipal checks, before a gateway data connection attaches
+// to its principal's controller, that the principal is still authorised. A
+// variable so a test can withdraw authorisation between the handshake and
+// this check.
+var authorizePathPrincipal = func(store *identity.Store, p identity.Principal, now time.Time) error {
+	_, err := store.Authorize(p, now)
+	return err
+}
+
 // gatewayPathPrincipal names an authorised principal in a path key.
 func gatewayPathPrincipal(p identity.Principal) string {
 	return "principal:" + p.ProviderID + "/" + p.AccountID + "/" + p.DeviceID
