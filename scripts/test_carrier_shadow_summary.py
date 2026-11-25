@@ -388,5 +388,37 @@ class CalibrationFollowUpTest(unittest.TestCase):
         report = summarize(client, [rec(9.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
         self.assertEqual(report["calibration"]["client"]["open_episodes_censored"], 1)
 
+    def test_round_four_review(self):
+        # A recovery after the last client observation ends that incident.
+        client = [stall(9.0, 1, 1, 5),
+                  rec(9.5, "carrier shadow state", endpoint="client", carrier_id=1, to="active", transport_epoch=6, **{"from": "suspect"})]
+        gateway = [rec(10.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=1, grace=45_000_000_000),
+                   rec(13.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=1)]
+        self.assertIsNone(summarize(client, gateway)["recovery_deadline"]["skew_s"])
+        # A terminal or unwatched lane observation is no open episode, and a
+        # newer-epoch lane failure is progress after a stall.
+        client = [
+            rec(3.0, "carrier shadow lane failed", endpoint="client", session_id=SESSION, flow_id=5, carrier_id=0,
+                carrier_state="dead", pto_since_progress=4, transport_epoch=0),
+            stall(4.0, 6, 9, 2, pto_since_progress=1),
+            rec(5.0, "carrier shadow lane failed", endpoint="client", session_id=SESSION, flow_id=6, carrier_id=9,
+                carrier_state="dead", pto_since_progress=3, transport_epoch=2),
+            stall(6.0, 7, 4, 1),
+            rec(7.0, "carrier shadow lane failed", endpoint="client", session_id=SESSION, flow_id=7, carrier_id=4,
+                carrier_state="active", pto_since_progress=0, transport_epoch=2),
+        ]
+        report = summarize(client, [rec(30.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])
+        self.assertEqual(report["calibration"]["client"]["open_episodes_censored"], 0)
+        self.assertEqual(report["stalls"]["client"]["outcomes"].get("carrier stayed live: design would not rescue"), 1)
+        # A round the manager started to replace a lost lane answers no request.
+        client = [
+            rec(1.0, "carrier shadow rescue requested", endpoint="client", session_id=SESSION, flow_id=7),
+            rec(1.1, "carrier shadow rescue started", endpoint="client", session_id=SESSION, flow_id=7, healthy_lanes=0, rescue_round=3, trigger="stall"),
+            rec(2.0, "carrier shadow rescue requested", endpoint="client", session_id=SESSION, flow_id=7),
+            rec(2.1, "carrier shadow rescue started", endpoint="client", session_id=SESSION, flow_id=7, healthy_lanes=0, rescue_round=4, trigger="outage"),
+        ]
+        requests = summarize(client, [rec(30.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=99)])["stalls"]["client"]["rescue_requests"]
+        self.assertEqual((requests["requests_followed_by_a_rescue_round"], requests["requests_without_a_rescue_round"]), (1, 1))
+
 if __name__ == "__main__":
     unittest.main()

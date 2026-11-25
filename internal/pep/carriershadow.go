@@ -720,6 +720,20 @@ type shadowRescueRoundKey struct{}
 
 var shadowRescueRounds atomic.Uint64
 
+// shadowRescueTriggerKey names what started a rescue round, as the lane
+// manager decided it: a stall request beside a live lane, or the
+// replacement of a lost one.
+type shadowRescueTriggerKey struct{}
+
+const (
+	shadowRescueStall  = "stall"
+	shadowRescueOutage = "outage"
+)
+
+func withShadowRescueTrigger(ctx context.Context, trigger string) context.Context {
+	return context.WithValue(ctx, shadowRescueTriggerKey{}, trigger)
+}
+
 // noteJoinAfterEnd records a JOIN that reached the gateway after the flow's
 // session had ended, which is refused.
 func (o *carrierShadow) noteJoinAfterEnd(sessionID [16]byte, flowID, laneID uint64) {
@@ -907,8 +921,12 @@ func (o *carrierShadow) noteRescue(ctx context.Context, f *multipathFlow) contex
 		return ctx
 	}
 	round := shadowRescueRounds.Add(1)
+	trigger, _ := ctx.Value(shadowRescueTriggerKey{}).(string)
+	if trigger == "" {
+		trigger = "unknown"
+	}
 	o.logger.Info("carrier shadow rescue started", append(o.flowFields(f),
-		"healthy_lanes", len(f.healthyLanes()), "rescue_round", round)...)
+		"healthy_lanes", len(f.healthyLanes()), "rescue_round", round, "trigger", trigger)...)
 	return context.WithValue(ctx, shadowRescueRoundKey{}, round)
 }
 

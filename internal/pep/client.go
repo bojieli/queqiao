@@ -2562,7 +2562,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 			if now.Before(nextStallRescue) {
 				continue
 			}
-			if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
+			if err := c.runRescueRound(withShadowRescueTrigger(manageCtx, shadowRescueStall), flow, sessionID, flowID); err != nil {
 				if manageCtx.Err() != nil || flow.doneChanClosed() {
 					return
 				}
@@ -2673,7 +2673,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 				recoveryAttempts++
 				lastRecoveryAttempt = now
 				attempt := flow.noteReplacementAttempt()
-				if err := c.runRescueRound(manageCtx, flow, sessionID, flowID); err != nil {
+				if err := c.runRescueRound(withShadowRescueTrigger(manageCtx, shadowRescueOutage), flow, sessionID, flowID); err != nil {
 					err = classifyUnconfirmedRefusal(flow, err)
 					flow.noteReplacementFailure(err)
 					// The flow this belongs to is the whole point of the
@@ -2857,7 +2857,7 @@ func (c *Client) manageTCPBundle(ctx context.Context, flow *multipathFlow, sessi
 			if stall != nil {
 				joinCtx = context.WithValue(joinCtx, laneReplacementContextKey{}, *stall)
 				// A stall-driven bundle join is this manager's rescue round.
-				joinCtx = flow.carrierShadow.noteRescue(joinCtx, flow)
+				joinCtx = flow.carrierShadow.noteRescue(withShadowRescueTrigger(joinCtx, shadowRescueStall), flow)
 			}
 			lane, joinErr := c.openJoinLane(joinCtx, TransportTCP, sessionID, flowID, laneID)
 			select {

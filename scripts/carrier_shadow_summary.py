@@ -247,7 +247,8 @@ def open_carrier_records(endpoint: Endpoint, summarized: set) -> dict[tuple, lis
         if record.get("msg") not in (STATE, STALL, EPISODE, LANE_FAILED):
             continue
         key = carrier_key(record)
-        if key[1] is not None and key not in summarized:
+        # Carrier 0 is a lane observation of a carrier no longer watched.
+        if key[1] not in (None, 0) and key not in summarized:
             out[key].append(record)
     for values in out.values():
         values.sort(key=lambda r: (r["_t"], r["_seq"]))
@@ -261,6 +262,9 @@ def open_episode_peak(records: list[dict[str, Any]]) -> int:
     epoch, peak = None, 0
     for record in records:
         if record.get("msg") == STATE and record.get("to") in ("active", "dead", "closed"):
+            epoch, peak = None, 0
+            continue
+        if record.get("carrier_state") in ("dead", "closed"):
             epoch, peak = None, 0
             continue
         if record.get("msg") == EPISODE:
@@ -296,6 +300,10 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
     episodes_by_carrier: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
     for record in endpoint.of(EPISODE):
         episodes_by_carrier[carrier_key(record)].append(record)
+    for record in endpoint.of(LANE_FAILED):
+        stalls_by_carrier[carrier_key(record)].append(record)
+    for values in stalls_by_carrier.values():
+        values.sort(key=lambda r: r["_t"])
     for values in episodes_by_carrier.values():
         values.sort(key=lambda r: r["_t"])
     by_kind: Counter = Counter()
@@ -318,8 +326,8 @@ def stall_comparison(endpoint: Endpoint) -> dict[str, Any]:
         # Progress that changes no state is not logged, so a later failure
         # in a newer epoch is a different episode.
         following = [t for t in transitions.get(carrier_key(stall), []) if t["_t"] >= stall["_t"]]
-        # A later stall observation of the carrier in a newer epoch is
-        # progress too: the episode ended there.
+        # A later stall or lane-failure observation of the carrier in a
+        # newer epoch is progress too: the episode ended there.
         progressed_at = next((s["_t"] for s in stalls_by_carrier.get(carrier_key(stall), [])
                               if s["_t"] >= stall["_t"] and isinstance(s.get("transport_epoch"), int)
                               and s.get("transport_epoch") > epoch), math.inf)
@@ -374,9 +382,9 @@ def rescue_requests(endpoint: Endpoint) -> dict[str, Any]:
         requests[flow_key(record)].append(record["_t"])
     rounds: dict[tuple, list[tuple[float, Any]]] = defaultdict(list)
     for record in endpoint.of(RESCUE):
-        # A round with no healthy lane is the outage path's, not an answer
-        # to a stall request.
-        if record.get("healthy_lanes") == 0:
+        # Only a round the manager started for a stall answers a request;
+        # a replacement for a lost lane does not.
+        if record.get("trigger", "stall") != "stall":
             continue
         rounds[flow_key(record)].append((record["_t"], (record["_process"], record.get("rescue_round"))))
     per_round: Counter = Counter()
@@ -464,6 +472,14 @@ def incident_starts(index: tuple[dict[tuple, list[float]], dict[tuple, list[floa
             if isinstance(record.get("transport_epoch"), int):
                 epochs[carrier] = record["transport_epoch"]
         starts.append(start)
+    if observations:
+        # Evidence after the last observation ends the last incident too.
+        last = observations[-1][0]
+        evidence = [e for e in outage_ends if e > last]
+        if carrier is not None:
+            evidence += [r for r in recoveries.get(carrier, []) if r > last]
+        if evidence:
+            ended_at[starts[-1]] = min(evidence)
     return starts, [ended_at.get(start, math.inf) for start in starts]
 
 
