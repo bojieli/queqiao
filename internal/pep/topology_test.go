@@ -892,29 +892,53 @@ func TestFanOutJudgesSharingPerGeneration(t *testing.T) {
 		}
 		return lane, s.generation
 	}
-	_, old := pooled(1)
+	// Each pooled lane is the control lane of a flow, so the decision goes
+	// through flowGeneration as the lane manager's does.
+	flowOn := func(lane *authenticatedLane) *multipathFlow {
+		f := newIsolationTestFlow(t, true)
+		if err := f.addLane(&mpLane{id: 0, kind: TransportQUIC, fc: lane.fc, control: true}); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	wanted := func(f *multipathFlow) bool {
+		return client.secondConnectionWanted(flowSnapshot{Class: classifier.ClassBulk}, func() *controlQUICGeneration { return flowGeneration(f) })
+	}
+	oldLane, old := pooled(1)
+	oldFlow := flowOn(oldLane)
 	// A handover: the old generation stops lending and drains while its
 	// flow lives on.
 	client.supersedeSilentGeneration(old, nil)
-	_, replacement := pooled(2)
+	newLane, replacement := pooled(2)
+	newFlow := flowOn(newLane)
 	if replacement == old || old.conn.Context().Err() != nil {
 		t.Fatal("no draining generation beside the replacement")
 	}
-	bulk := flowSnapshot{Class: classifier.ClassBulk}
+	if flowGeneration(oldFlow) != old || flowGeneration(newFlow) != replacement {
+		t.Fatal("flowGeneration does not report the generation a flow's control lane is on")
+	}
 	if n := client.quicPoolActive.Load(); n != 2 {
 		t.Fatalf("pooled flows across generations = %d, want 2 (the count the old trigger read)", n)
 	}
-	if client.secondConnectionWanted(bulk, func() *controlQUICGeneration { return replacement }) {
+	if wanted(newFlow) {
 		t.Fatal("a bulk flow alone on the replacement fans out because a flow drains on the old generation")
+	}
+	if wanted(oldFlow) {
+		t.Fatal("the flow alone on the draining generation fans out")
 	}
 	_, again := pooled(3)
 	if again != replacement {
 		t.Fatal("the second flow landed on another generation")
 	}
-	if !client.secondConnectionWanted(bulk, func() *controlQUICGeneration { return replacement }) {
+	if !wanted(newFlow) {
 		t.Fatal("a bulk flow sharing the replacement does not fan out")
 	}
-	if client.secondConnectionWanted(bulk, func() *controlQUICGeneration { return nil }) {
+	// Two flows on the current generation do not make the lone flow on the
+	// draining one look shared.
+	if wanted(oldFlow) {
+		t.Fatal("the flow alone on the draining generation fans out once the replacement is shared")
+	}
+	if client.secondConnectionWanted(flowSnapshot{Class: classifier.ClassBulk}, func() *controlQUICGeneration { return nil }) {
 		t.Fatal("a flow on no pooled generation fans out")
 	}
 }
