@@ -1,0 +1,1023 @@
+import collections
+import configparser
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import pathlib
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+import unittest
+from unittest import mock
+
+HERE = pathlib.Path(__file__).parent
+# Import by name from scripts/, so every test module shares one copy (the
+# workload registry and the exception classes live in these modules).
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+ab = importlib.import_module("ab_campaign")
+
+EXAMPLE = HERE / "validation" / "campaign.example.ini"
+DC_EXAMPLE = HERE / "validation" / "dc-campaign.example.ini"
+
+
+def parse(text):
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+    cp.read_string(text)
+    return ab.parse_config(cp)
+
+
+BASE = """
+[campaign]
+name = t1
+blocks = 4
+[gateway]
+host = gw
+address = 192.0.2.1
+[client:a]
+host = c1
+small = true
+[arm:main]
+role = main
+binary_linux_amd64 = /bin/true
+[arm:cand]
+binary_linux_amd64 = /bin/true
+flags = --cc-api=v2
+[production:gw]
+host = gw
+units = queqiaod
+ports = 443 12540-12549
+[production:c1]
+host = c1
+"""
+
+
+class DryRun(unittest.TestCase):
+    def run_dry(self, config):
+        out = io.StringIO()
+        forbidden = mock.Mock(side_effect=AssertionError("dry run must not run a command"))
+        with mock.patch.object(subprocess, "run", forbidden), mock.patch.object(subprocess, "Popen", forbidden), \
+                contextlib.redirect_stdout(out):
+            rc = ab.main(["--config", str(config), "--dry-run"])
+        return rc, out.getvalue()
+
+    def test_dry_run_prints_the_plan_and_touches_nothing(self):
+        rc, text = self.run_dry(EXAMPLE)
+        self.assertEqual(rc, 0)
+        self.assertIn("# campaign example-stage6: workload bulk, 12 block(s)", text)
+        self.assertIn("b001 path-a:", text)
+        self.assertIn("b012 path-b:", text)
+        self.assertIn("read-only production snapshot (before)", text)
+        self.assertIn("[preflight] would refuse", text)
+        self.assertIn("main: bulk x4 via path-a/cand", text)
+        self.assertIn("stop every process this campaign started", text)
+        self.assertIn("blocks 2-12 repeat", text)
+        # The runner owns these; the arm's bundle is appended after them.
+        self.assertIn("--cc-api=v2 --sched=class --congestion=path", text)
+        self.assertNotIn("CAMPAIGN-DONE", text)
+
+    def test_probe_stops_when_the_load_finishes(self):
+        rc, text = self.run_dry(DC_EXAMPLE)
+        lines = text.splitlines()
+        i = next(k for k, l in enumerate(lines) if "load finished, stop the probe on leaf-ctl" in l)
+        self.assertIn("touch ~/qq-ab-example-dc-gate/run/stop-probe-leaf-ctl-", lines[i + 1])
+        self.assertIn("[ ! -e ~/qq-ab-example-dc-gate/run/stop-probe-leaf-ctl-", text)
+
+    def test_the_control_probe_waits_for_the_barrier(self):
+        _, text = self.run_dry(DC_EXAMPLE)
+        probe = next(l for l in text.splitlines() if "stop-probe-leaf-ctl" in l and "while [ $(date +%s) -lt $end ]" in l)
+        self.assertRegex(probe, r"while \[ \$\(date \+%s\) -lt \d+ \]; do sleep 0.1; done; end=")
+
+    def test_bulk_windows_have_a_subsecond_deadline(self):
+        _, text = self.run_dry(EXAMPLE)
+        self.assertIn("end=$(awk -v n=\"$(now)\" 'BEGIN{printf \"%.3f\", n + 90.0}')", text)
+        self.assertIn("--max-time $rem", text)
+
+    def test_dc_leaves_start_on_a_shared_barrier(self):
+        _, text = self.run_dry(DC_EXAMPLE)
+        self.assertRegex(text, r"while \[ \$\(date \+%s\) -lt \d+ \]; do sleep 0.1; done; end=")
+        self.assertIn("ws=$((", text)
+
+    def test_metrics_scrapes_bypass_environment_proxies(self):
+        _, text = self.run_dry(EXAMPLE)
+        self.assertIn("env -u NO_PROXY", text.split("scrape gateway cand metrics")[1].split("\n")[1])
+        self.assertIn("env -u NO_PROXY", text.split("scrape client path-a/cand metrics")[1].split("\n")[1])
+
+    def test_every_client_host_gets_a_run_directory(self):
+        _, text = self.run_dry(DC_EXAMPLE)
+        for host in ("dc-client-a", "dc-client-b", "dc-client-c", "dc-client-d"):
+            self.assertIn(f"[{host}] create work directory:\n    mkdir -p ~/qq-ab-example-dc-gate/run", text)
+
+    def test_dc_dry_run_has_phases_and_calibration(self):
+        rc, text = self.run_dry(DC_EXAMPLE)
+        self.assertEqual(rc, 0)
+        for want in ("sustained: bulk x2 via leaf-a/pathauth", "requests: requests x8 via leaf-c/legacy",
+                     "sustained: probe x1 via leaf-ctl", "solo: bulk x2 via leaf-b/legacy", "--path-profile dc-long-haul"):
+            self.assertIn(want, text)
+
+    def test_small_hosts_never_run_two_temporary_clients(self):
+        _, text = self.run_dry(EXAMPLE)
+        running = collections.Counter()
+        for line in text.splitlines():
+            if line.startswith("[small-client-host] start cl-"):
+                running["small-client-host"] += 1
+                self.assertEqual(running["small-client-host"], 1, line)
+            elif line.startswith("[small-client-host] stop cl-"):
+                running["small-client-host"] = max(0, running["small-client-host"] - 1)
+
+    def test_runtime_guard_refuses_a_second_client_on_a_small_host(self):
+        cfg = parse(BASE)
+        camp = ab.Campaign(cfg, "<out>", ".", dry=True, stream=io.StringIO())
+        camp.start_client(cfg.clients["a"], cfg.arms[0], "x")
+        with self.assertRaises(RuntimeError):
+            camp.start_client(cfg.clients["a"], cfg.arms[1], "x")
+        camp.stop_client(cfg.clients["a"], cfg.arms[0])
+        camp.start_client(cfg.clients["a"], cfg.arms[1], "x")
+
+    def test_stop_signals_only_processes_from_the_work_directory(self):
+        cfg = parse(BASE)
+        out = io.StringIO()
+        camp = ab.Campaign(cfg, "<out>", ".", dry=True, stream=out)
+        camp.stop(camp.hosts["gw"], "gw-main")
+        camp.reserve()
+        camp.teardown()
+        text = out.getvalue()
+        self.assertIn('grep -q -F -- "~/qq-ab-t1/"', text)
+        self.assertNotIn("pkill", text)
+        self.assertNotIn("killall", text)
+
+
+class Schedule(unittest.TestCase):
+    def test_two_arms_are_abba_or_baab(self):
+        cfg = parse(BASE.replace("blocks = 4", "blocks = 40"))
+        orders = collections.Counter()
+        for b in range(1, 41):
+            slots = [s for s in ab.schedule(cfg) if s.block == b]
+            seq = tuple(s.arm for s in slots)
+            self.assertIn(seq, {("main", "cand", "cand", "main"), ("cand", "main", "main", "cand")})
+            self.assertEqual([s.cold for s in slots], [True, True, False, False])
+            self.assertEqual([s.arm_trial for s in slots], [1, 1, 2, 2])
+            orders[seq] += 1
+        self.assertEqual(len(orders), 2)  # both orders occur
+
+    def test_seed_reproduces_the_schedule(self):
+        a = [s.__dict__ for s in ab.schedule(parse(BASE))]
+        b = [s.__dict__ for s in ab.schedule(parse(BASE))]
+        self.assertEqual(a, b)
+
+    def test_three_arms_rotate_through_every_position(self):
+        text = BASE.replace("blocks = 4", "blocks = 6") + "[arm:third]\nbinary_linux_amd64 = /bin/true\n"
+        cfg = parse(text)
+        pos = collections.defaultdict(collections.Counter)
+        for s in ab.schedule(cfg):
+            pos[s.arm][s.slot] += 1
+            if s.block == 1:
+                pass
+        for arm, c in pos.items():
+            self.assertEqual(sum(c.values()), 12)        # twice per block
+            self.assertEqual(set(c.values()), {2}, (arm, c))  # every slot equally often over 2N blocks
+
+    def test_paths_rotate(self):
+        text = BASE + "[client:b]\nhost = c1\nsocks_port_base = 24581\nmetrics_port_base = 24591\n"
+        firsts = [next(s.path for s in ab.schedule(parse(text)) if s.block == b) for b in (1, 2, 3)]
+        self.assertEqual(firsts, ["a", "b", "a"])
+
+
+class Config(unittest.TestCase):
+    def test_examples_parse(self):
+        for f in (EXAMPLE, DC_EXAMPLE, HERE / "validation" / "scenario-campaign.example.ini"):
+            cfg = ab.load_config(str(f))
+            self.assertEqual(cfg.main.role, "main")
+
+    def assertRejected(self, text, fragment):
+        with self.assertRaises(ab.ConfigError) as cm:
+            parse(text)
+        self.assertIn(fragment, str(cm.exception))
+
+    def test_runner_owned_flags_are_rejected(self):
+        self.assertRejected(BASE.replace("flags = --cc-api=v2", "flags = --cc-api=v2 --state=/var/lib/queqiao/provider"),
+                            "--state is set by the runner")
+        self.assertRejected(BASE.replace("flags = --cc-api=v2", "gateway_flags = --listen :443"), "--listen")
+
+    def test_reversed_or_invalid_port_ranges_are_rejected(self):
+        self.assertRejected(BASE.replace("ports = 443 12540-12549", "ports = 12639-12540"), "low-high")
+        self.assertRejected(BASE.replace("ports = 443 12540-12549", "ports = 70000"), "out of range")
+
+    def test_single_dash_spelling_is_also_owned(self):
+        # Go's flag package treats -state and --state alike.
+        self.assertRejected(BASE.replace("flags = --cc-api=v2", "flags = -state /var/lib/queqiao/provider"), "--state")
+        self.assertRejected(BASE.replace("flags = --cc-api=v2", "client_flags = -profile=/etc/p.json"), "--profile")
+
+    def test_hop_ports_are_not_supported(self):
+        self.assertRejected(BASE.replace("flags = --cc-api=v2", "gateway_flags = --hop-port-count 100"), "hop-port-count")
+
+    def test_every_host_needs_a_production_section(self):
+        self.assertRejected(BASE.replace("[production:c1]\nhost = c1\n", ""), "missing: c1")
+
+    def test_exactly_one_main(self):
+        self.assertRejected(BASE.replace("[arm:cand]\n", "[arm:cand]\nrole = main\n"), "exactly one arm")
+
+    def test_windows_must_be_positive(self):
+        # curl --max-time 0 disables the limit: no fixed window.
+        self.assertRejected(BASE.replace("blocks = 4", "blocks = 4\nduration = 0"), "duration must be positive")
+        text = DC_EXAMPLE.read_text().replace("request_timeout = 30", "request_timeout = 0")
+        self.assertRejected(text, "request_timeout must be positive")
+
+    def test_bad_names(self):
+        self.assertRejected(BASE.replace("name = t1", "name = ../etc"), "campaign name")
+        self.assertRejected(BASE.replace("name = t1", "name = Prod"), "campaign name")
+
+    def test_planned_ports_may_not_collide(self):
+        text = BASE + "[client:b]\nhost = c1\n"
+        self.assertRejected(text, "planned twice")
+
+    def test_dc_leaves_need_their_own_hosts(self):
+        text = BASE.replace("workload", "x").replace("blocks = 4", "blocks = 4\nworkload = dc") + \
+            "[client:b]\nhost = c1\nsocks_port_base = 24581\nmetrics_port_base = 24591\n" \
+            "[client:ctl]\nhost = c1\nsocks_port_base = 25581\nmetrics_port_base = 25591\n" \
+            "[dc]\nloaded = a b\ncontrol = ctl\n"
+        self.assertRejected(text, "own host")
+
+    def test_crossover_arm_needs_both_ends(self):
+        self.assertRejected(BASE.replace("binary_linux_amd64 = /bin/true\nflags", "gateway_ref = origin/main\nflags"),
+                            "both gateway_ref")
+
+    def test_crossover_arm_builds_each_ref_once(self):
+        text = BASE.replace("[arm:main]\nrole = main\nbinary_linux_amd64 = /bin/true",
+                            "[arm:main]\nrole = main\nref = origin/main") \
+                   .replace("[arm:cand]\nbinary_linux_amd64 = /bin/true",
+                            "[arm:cand]\ngateway_ref = feat/x\nclient_ref = origin/main")
+        cfg = parse(text)
+        camp = ab.Campaign(cfg, "/out", ".", dry=True, stream=io.StringIO())
+        self.assertEqual(list(camp.refs()), ["origin/main", "feat/x"])
+        main, cand = cfg.arms
+        self.assertEqual(camp.binary(cand, "linux/amd64", "client"), camp.binary(main, "linux/amd64", "gateway"))
+        self.assertNotEqual(camp.binary(cand, "linux/amd64", "gateway"), camp.binary(main, "linux/amd64", "gateway"))
+
+    def test_dc_profile_cannot_be_overridden(self):
+        text = DC_EXAMPLE.read_text().replace("flags = --cc-api=v2 --sched=class", "flags = --path-profile=wan-shared-bottleneck --cc-api=v2 --sched=class")
+        self.assertRejected(text, "workload dc sets --path-profile on both ends")
+
+    def test_prebuilt_binaries_must_cover_every_platform(self):
+        text = BASE + "[client:mac]\nhost = gw\nplatform = darwin/arm64\nsocks_port_base = 24581\nmetrics_port_base = 24591\n"
+        self.assertRejected(text, "binary_darwin_arm64")
+
+
+SNAP = """os Linux
+listen-ok
+ps-ok
+unit queqiaod active 1234 0 99999 exe=/usr/local/bin/queqiaod sha=abc
+proc 1234 Tue Nov 24 09:28:24 2026 /usr/local/bin/queqiaod server --listen :12540
+listen udp 12540
+listen tcp 19090
+"""
+
+
+class Safety(unittest.TestCase):
+    def test_snapshot_parse(self):
+        s = ab.parse_snapshot(SNAP)
+        self.assertEqual(s["units"]["queqiaod"], "active 1234 0 99999 exe=/usr/local/bin/queqiaod sha=abc")
+        self.assertEqual(s["listen"], {12540, 19090})
+        self.assertEqual(len(s["procs"]), 1)
+
+    def test_identical_snapshots_have_no_diff(self):
+        self.assertEqual(ab.snapshot_diff(ab.parse_snapshot(SNAP), ab.parse_snapshot(SNAP)), [])
+
+    def test_restart_is_detected(self):
+        after = SNAP.replace("active 1234 0", "active 5678 1").replace("proc 1234 Tue", "proc 5678 Wed")
+        d = ab.snapshot_diff(ab.parse_snapshot(SNAP), ab.parse_snapshot(after))
+        self.assertTrue(any(x.startswith("unit queqiaod") for x in d), d)
+        self.assertTrue(any("ended or restarted" in x for x in d), d)
+        self.assertTrue(any("appeared" in x for x in d), d)
+
+    def test_new_binary_is_detected(self):
+        d = ab.snapshot_diff(ab.parse_snapshot(SNAP), ab.parse_snapshot(SNAP.replace("sha=abc", "sha=def")))
+        self.assertEqual(len(d), 1)
+
+    def test_clean_hosts_are_not_refused(self):
+        cfg = parse(BASE)
+        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\nlisten-ok\nps-ok\n")}
+        self.assertEqual(ab.refusal_reasons(cfg, snaps), [])
+
+    def test_unreadable_listener_table_is_refused(self):
+        cfg = parse(BASE)
+        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\nps-ok\n")}
+        r = ab.refusal_reasons(cfg, snaps)
+        self.assertEqual(len(r), 1)
+        self.assertIn("c1: could not read the listening ports", r[0])
+
+    def test_a_process_table_that_becomes_unreadable_is_a_change(self):
+        d = ab.snapshot_diff(ab.parse_snapshot(SNAP), ab.parse_snapshot(SNAP.replace("ps-ok\n", "")))
+        self.assertTrue(any("process table can no longer be read" in x for x in d), d)
+
+    def test_clean_reports_a_directory_it_does_not_own(self):
+        camp = ab.Campaign(parse(BASE), "/o", ".", dry=False, stream=io.StringIO())
+        camp.reserved = ["gw"]
+        for h in camp.hosts.values():
+            h.home = "/home/u"
+        with mock.patch.object(ab.Host, "run", return_value=(ab.NOT_OWNER, "not owner of /home/u/qq-ab-t1")):
+            failed = camp.clean()
+        self.assertEqual(len(failed), 1)
+        self.assertIn("ownership could not be verified", failed[0])
+        self.assertEqual(camp.reserved, ["gw"])
+
+    def test_unreadable_process_table_is_refused(self):
+        cfg = parse(BASE)
+        snaps = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("os Linux\nlisten-ok\n")}
+        r = ab.refusal_reasons(cfg, snaps)
+        self.assertEqual(len(r), 1)
+        self.assertIn("c1: could not read the process table", r[0])
+
+    def test_listening_planned_port_is_refused(self):
+        cfg = parse(BASE)
+        snaps = {"gw": ab.parse_snapshot(SNAP + "listen tcp 23472\n"), "c1": ab.parse_snapshot("listen-ok\nps-ok\n")}
+        r = ab.refusal_reasons(cfg, snaps)
+        self.assertEqual(len(r), 1)
+        self.assertIn("23472 is already listening", r[0])
+
+    def test_declared_production_port_is_refused(self):
+        cfg = parse(BASE.replace("ports = 443 12540-12549", "ports = 443 23470-23480"))
+        r = ab.refusal_reasons(cfg, {"gw": ab.parse_snapshot("listen-ok\nps-ok"), "c1": ab.parse_snapshot("listen-ok\nps-ok")})
+        self.assertTrue(any("declared production port" in x for x in r), r)
+        self.assertTrue(any("origin port 23480" in x for x in r), r)
+
+    def test_unobservable_production_unit_is_refused(self):
+        cfg = parse(BASE)
+        snaps = {"gw": ab.parse_snapshot("listen-ok\nps-ok\nunit-error queqiaod\n"), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
+        self.assertTrue(any("cannot be observed" in x for x in ab.refusal_reasons(cfg, snaps)))
+        d = ab.snapshot_diff(ab.parse_snapshot(SNAP), ab.parse_snapshot(SNAP + "unit-error other\n"))
+        self.assertTrue(any("can no longer be observed" in x for x in d))
+
+    def test_unsafe_home_is_refused(self):
+        camp = ab.Campaign(parse(BASE), "/x", ".", dry=False, stream=io.StringIO())
+        with mock.patch.object(ab.Host, "run", return_value=(0, "/home/a b")):
+            with self.assertRaises(ab.Refused):
+                camp.preflight()
+
+    def test_leftover_campaign_process_is_refused(self):
+        cfg = parse(BASE)
+        snaps = {"gw": ab.parse_snapshot(""),
+                 "c1": ab.parse_snapshot("listen-ok\nps-ok\nleftover 42 /root/qq-ab-t1/cl-a-main/queqiaod client\n")}
+        self.assertTrue(any("earlier campaign" in x for x in ab.refusal_reasons(cfg, snaps)))
+
+    def test_a_host_failing_during_reservation_releases_the_others(self):
+        text = BASE + "[client:b]\nhost = c2\nsocks_port_base = 24581\nmetrics_port_base = 24591\n[production:c2]\nhost = c2\n"
+        cfg = parse(text)
+        camp = ab.Campaign(cfg, "/x", ".", dry=False, stream=io.StringIO())
+        calls = []
+
+        def run(host_self, script, timeout=120, what=""):
+            calls.append((host_self.dest, what))
+            if what == "reserve the work directory" and host_self.dest == "c1":
+                raise subprocess.TimeoutExpired("ssh", 120)
+            return 0, ""
+        for h in camp.hosts.values():
+            h.home = "/home/u"
+        with mock.patch.object(ab.Host, "run", run):
+            with self.assertRaises(ab.Refused) as cm:
+                camp.reserve()
+        self.assertIn("c1: reserving", str(cm.exception))
+        self.assertIn("outcome is unknown", str(cm.exception))
+        self.assertIn(("gw", "release an unused reservation"), calls)
+        self.assertEqual(camp.reserved, [])
+
+    def test_a_mid_run_production_change_stays_in_the_status(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            camp = ab.Campaign(parse(BASE), os.path.join(tmp, "out"), ".", dry=False, stream=io.StringIO())
+            changed = {"gw": ab.parse_snapshot(SNAP.replace("active 1234 0", "active 5678 1")), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
+            same = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
+            snaps = iter([same, changed, same])  # before, mid-run, after: the change came and went
+
+            def snapshot_all(self_, tag):
+                return next(snaps) if tag != "teardown" else {"gw": ab.parse_snapshot("listen-ok\nps-ok"), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
+
+            def run_block(self_, *a, **k):
+                self_.check_production("mid")
+            with mock.patch.object(ab.Campaign, "snapshot_all", snapshot_all), \
+                    mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
+                    mock.patch.object(ab.Campaign, "setup"), mock.patch.object(ab.Campaign, "record_effective"), \
+                    mock.patch.object(ab.Campaign, "run_block", run_block), mock.patch.object(ab.Campaign, "teardown"), \
+                    mock.patch.object(ab.Campaign, "clean", return_value=[]), mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), \
+                    mock.patch.object(ab.time, "sleep"):
+                rc = camp.run()
+            status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
+        self.assertEqual(rc, 3)
+        self.assertEqual(status["production"], "changed")
+
+    def test_signals_are_caught_from_the_first_reservation(self):
+        import signal
+        seen = {}
+        camp = ab.Campaign(parse(BASE), "/nonexistent/out", ".", dry=False, stream=io.StringIO())
+        before = signal.getsignal(signal.SIGTERM)
+
+        def preflight(self_):
+            seen["handler"] = signal.getsignal(signal.SIGTERM)
+            raise KeyboardInterrupt
+        with mock.patch.object(ab.os, "makedirs"), mock.patch.object(ab.Campaign, "preflight", preflight), \
+                mock.patch.object(ab.Campaign, "release") as release:
+            with self.assertRaises(KeyboardInterrupt):
+                camp.run()
+        self.assertIs(seen["handler"], ab._interrupt)
+        release.assert_called_once()
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+    def test_an_unverifiable_final_snapshot_is_an_abort(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            camp = ab.Campaign(parse(BASE), os.path.join(tmp, "out"), ".", dry=False, stream=io.StringIO())
+            same = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
+
+            def snapshot_all(self_, tag):
+                if tag == "after":
+                    raise ab.Refused("gw: snapshot failed (exit 255)")
+                return same if tag != "teardown" else {"gw": ab.parse_snapshot("listen-ok\nps-ok"), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
+            with mock.patch.object(ab.Campaign, "snapshot_all", snapshot_all), \
+                    mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
+                    mock.patch.object(ab.Campaign, "setup"), mock.patch.object(ab.Campaign, "record_effective"), \
+                    mock.patch.object(ab.Campaign, "run_block"), mock.patch.object(ab.Campaign, "teardown"), \
+                    mock.patch.object(ab.Campaign, "clean", return_value=[]), mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), \
+                    mock.patch.object(ab.time, "sleep"):
+                rc = camp.run()
+            status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
+        self.assertEqual(rc, 6)
+        self.assertEqual(status["status"], "aborted")
+        self.assertEqual(status["production"], "unknown")
+
+    def test_a_cleanup_failure_reaches_the_status(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            camp = ab.Campaign(parse(BASE), os.path.join(tmp, "out"), ".", dry=False, stream=io.StringIO())
+            same = {"gw": ab.parse_snapshot(SNAP), "c1": ab.parse_snapshot("listen-ok\nps-ok")}
+            with mock.patch.object(ab.Campaign, "snapshot_all", return_value=same), \
+                    mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
+                    mock.patch.object(ab.Campaign, "setup"), mock.patch.object(ab.Campaign, "record_effective"), \
+                    mock.patch.object(ab.Campaign, "run_block"), mock.patch.object(ab.Campaign, "teardown"), \
+                    mock.patch.object(ab.Campaign, "verify_teardown", return_value=[]), \
+                    mock.patch.object(ab.Campaign, "clean", return_value=["gw: ~/qq-ab-t1 could not be removed"]), \
+                    mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), mock.patch.object(ab.time, "sleep"):
+                rc = camp.run()
+            status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
+        self.assertEqual(rc, 7)
+        self.assertEqual(status["status"], "aborted")
+        self.assertEqual(status["cleanup_failures"], ["gw: ~/qq-ab-t1 could not be removed"])
+
+    def test_clean_keeps_a_directory_it_could_not_remove(self):
+        cfg = parse(BASE)
+        camp = ab.Campaign(cfg, "/o", ".", dry=False, stream=io.StringIO())
+        camp.reserved = ["gw", "c1"]
+        for h in camp.hosts.values():
+            h.home = "/home/u"
+
+        def run(host_self, script, timeout=120, what=""):
+            if host_self.dest == "gw":
+                raise subprocess.TimeoutExpired("ssh", 120)
+            return 0, ""
+        with mock.patch.object(ab.Host, "run", run):
+            failed = camp.clean()
+        self.assertEqual(len(failed), 1)
+        self.assertIn("gw:", failed[0])
+        self.assertEqual(camp.reserved, ["gw"])     # c1 was cleaned anyway
+
+    def test_refused_campaign_starts_nothing(self):
+        cfg = parse(BASE)
+        camp = ab.Campaign(cfg, "/nonexistent/out", ".", dry=False, stream=io.StringIO())
+        with mock.patch.object(ab.os, "makedirs"), \
+                mock.patch.object(ab.Campaign, "snapshot_all",
+                                  return_value={"gw": ab.parse_snapshot(SNAP + "listen tcp 23471\n"), "c1": {}}), \
+                mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")) as run, \
+                mock.patch.object(ab.Campaign, "build") as build, \
+                mock.patch.object(ab.Campaign, "setup") as setup:
+            with self.assertRaises(ab.Refused):
+                camp.run()
+        build.assert_not_called()
+        setup.assert_not_called()
+        # Only the $HOME lookups ran.
+        self.assertTrue(all("HOME" in c.args[0] for c in run.call_args_list))
+
+
+class Parsing(unittest.TestCase):
+    def test_missing_flows_become_failed_rows(self):
+        out = ("1700000000.100\t1700000001.600\tb1o1\t200\t100\t1.5\t0\n"
+               "1700000001.600\t1700000003.000\tb1o2\t200\t40\t1.4\t28\ngarbage\n"
+               "1700000000.100\t1700000001.000\tb3o1\n")
+        rows = ab.job_rows(out, "bulk", 3, 1, 90)
+        self.assertEqual([r[0] for r in rows], ["b1o1", "b1o2", "b3o1", "b2o1"])
+        self.assertEqual(rows[0], ("b1o1", "200", "100", "1.5", "0", "1700000000.100", "1700000001.600"))
+        self.assertEqual(rows[2], ("b3o1", "000", "0", "90.000", "-1", "1700000000.100", "1700000001.000"))
+        self.assertEqual(rows[3], ("b2o1", "000", "0", "90.000", "-1", "", ""))
+
+    def test_request_waves_are_expected(self):
+        rows = ab.job_rows("", "requests", 2, 2, 30)
+        self.assertEqual([r[0] for r in rows], ["w1r1", "w1r2", "w2r1", "w2r2"])
+
+    def test_probe_has_no_fixed_count(self):
+        self.assertEqual(ab.job_rows("", "probe", 1, 1, 30), [])
+
+    def test_local_address_passes_to_enrollment(self):
+        self.assertEqual(ab.local_address_args(["--wire-versions", "2", "--local-address", "if:en0"]),
+                         ["--local-address", "if:en0"])
+        self.assertEqual(ab.local_address_args(["--local-address=192.0.2.4"]), ["--local-address", "192.0.2.4"])
+        # Go's spellings, and the last occurrence wins, as for the client.
+        self.assertEqual(ab.local_address_args(["-local-address", "if:en0", "--wire-versions", "2", "-local-address=if:en1"]),
+                         ["--local-address", "if:en1"])
+
+    def test_enrollment_uses_the_clients_effective_local_address(self):
+        # The arm's client_flags bind the client to an interface; enrollment
+        # must take the same interface, in the same spelling-independent way.
+        text = BASE.replace("[arm:cand]\nbinary_linux_amd64 = /bin/true\nflags = --cc-api=v2",
+                            "[arm:cand]\nbinary_linux_amd64 = /bin/true\nflags = --cc-api=v2\nclient_flags = -local-address=if:eth1")
+        cfg = parse(text)
+        out = io.StringIO()
+        camp = ab.Campaign(cfg, "/o", ".", dry=True, stream=out)
+        camp.enroll(cfg.clients["a"], cfg.arms[1])
+        self.assertIn("--local-address if:eth1", out.getvalue())
+        self.assertEqual(ab.flag_value(camp.client_flags(cfg.clients["a"], cfg.arms[1]), "local-address"), "if:eth1")
+
+    def test_enrollment_gateway_is_tcp_capable(self):
+        text = BASE.replace("[arm:cand]\nbinary_linux_amd64 = /bin/true\nflags = --cc-api=v2",
+                            "[arm:cand]\nbinary_linux_amd64 = /bin/true\nflags = --cc-api=v2\ngateway_flags = -transport=quic")
+        cfg = parse(text)
+        camp = ab.Campaign(cfg, "/o", ".", dry=True, stream=io.StringIO())
+        enroll = camp.gw_cmd(cfg.arms[1], "enroll", enroll=True)
+        self.assertIn("--transport auto", enroll)
+        self.assertNotIn("quic", enroll)
+        self.assertIn("-transport=quic", camp.gw_cmd(cfg.arms[1], "server-b001-a"))
+
+
+class SnapshotObservation(unittest.TestCase):
+    """The read-only production snapshot against a stub systemctl."""
+
+    def snapshot(self, pid):
+        import tempfile
+        d = tempfile.mkdtemp()
+        stub = os.path.join(d, "systemctl")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\n"
+                    f'case "$*" in *--value*) echo {pid};; '
+                    f'*) printf "LoadState=loaded\\nActiveState=active\\nMainPID={pid}\\nNRestarts=0\\n";; esac\n')
+        os.chmod(stub, 0o755)
+        script = ab.SNAPSHOT_SH.format(work="/nonexistent/qq-ab-x", units="queqiaod", launchd="", pattern="'queqiao'")
+        p = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
+                           env=dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"]))
+        return ab.parse_snapshot(p.stdout)
+
+    def test_an_unreadable_executable_is_not_an_observation(self):
+        # A running unit (nonzero MainPID) whose /proc/<pid>/exe cannot be
+        # read: an observation error, refused before the run and a change
+        # during it -- never two equal empty identities.
+        snap = self.snapshot(4194303)
+        self.assertEqual(snap["unit_errors"], ["queqiaod"])
+        self.assertNotIn("queqiaod", snap["units"])
+        before = dict(snap, unit_errors=[], units={"queqiaod": "x exe=/usr/local/bin/queqiaod sha=" + "a" * 64})
+        self.assertIn("production unit queqiaod can no longer be observed", ab.snapshot_diff(before, snap))
+
+    def test_a_stopped_unit_is_observed(self):
+        snap = self.snapshot(0)
+        self.assertEqual(snap["unit_errors"], [])
+        self.assertIn("MainPID=0", snap["units"]["queqiaod"])
+
+
+class LocalProcesses(unittest.TestCase):
+    """Runs the runner's own shell against this machine only: the read-only
+    snapshot, and spawn/stop/teardown on processes the test itself starts in
+    a temporary directory. No other host is contacted."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = os.path.realpath(self.tmp.name)
+        cfg = parse(BASE.replace("host = gw", "host = local").replace("host = c1", "host = local")
+                    .replace("[client:a]\nhost = local", "[client:a]\nhost = local\nsocks_port_base = 24581\nmetrics_port_base = 24591"))
+        self.cfg = cfg
+        self.out = io.StringIO()
+        self.camp = ab.Campaign(cfg, os.path.join(self.home, "out"), ".", dry=False, stream=self.out)
+        self.host = self.camp.hosts["local"]
+        self.host.home = self.home
+        self.W = self.camp.w("local")
+        self.camp.reserve()
+        self.procs = []
+
+    def tearDown(self):
+        for p in self.procs:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+        self.tmp.cleanup()
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        # A zombie child of this test still answers kill -0.
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(out) and not out.startswith("Z")
+
+    def test_snapshot_runs_cleanly_and_sees_a_listener_and_a_leftover(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        port = srv.getsockname()[1]
+        left = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", f"{self.W}/marker"])
+        self.procs.append(left)
+        try:
+            os.makedirs(self.camp.out)
+            snap = self.camp.snapshot_all("t")["local"]
+        finally:
+            srv.close()
+        self.assertIn(port, snap["listen"])
+        self.assertTrue(snap["listen_ok"])
+        self.assertTrue(any(f"{self.W}/marker" in x for x in snap["leftover"]), snap["leftover"])
+        self.assertTrue(all(self.W + "/" not in p for p in snap["procs"]))
+
+    def test_snapshot_of_a_clean_host_succeeds(self):
+        # Nothing under the work directory: the last grep matches nothing,
+        # which must not read as a failed snapshot under pipefail.
+        os.makedirs(self.camp.out)
+        snap = self.camp.snapshot_all("clean")["local"]
+        self.assertEqual(snap["leftover"], [])
+        self.assertIn(snap.get("os"), ("Linux", "Darwin"))
+
+    def test_origin_objects_have_their_exact_size(self):
+        objs = [("obj-1000", 1000), ("obj-5", 5)]
+        rc, out = self.host.run(ab.origin_script(self.W, objs))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(os.path.getsize(os.path.join(self.W, "origin", "obj-1000")), 1000)
+        # A truncated object from an interrupted run is regenerated.
+        with open(os.path.join(self.W, "origin", "obj-1000"), "r+b") as f:
+            f.truncate(10)
+        rc, out = self.host.run(ab.origin_script(self.W, objs))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(os.path.getsize(os.path.join(self.W, "origin", "obj-1000")), 1000)
+
+    def test_a_second_invocation_with_the_same_name_is_refused(self):
+        other = ab.Campaign(self.cfg, os.path.join(self.home, "out2"), ".", dry=False, stream=io.StringIO())
+        other.hosts["local"].home = self.home
+        with self.assertRaises(ab.Refused):
+            other.reserve()
+        self.assertTrue(os.path.isdir(self.W))  # the first campaign's directory is untouched
+        # Neither its teardown nor its cleanup touches a directory it does not own.
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", f"{self.W}/marker"])
+        self.procs.append(victim)
+        pathlib.Path(self.W, "run", "v.pid").write_text(str(victim.pid))
+        other.reserved = ["local"]
+        other.teardown()
+        other.clean()
+        time.sleep(0.3)
+        self.assertTrue(self.alive(victim.pid))
+        self.assertTrue(os.path.isdir(self.W))
+
+    def test_readiness_requires_the_spawned_process_to_own_the_port(self):
+        listener = subprocess.Popen([sys.executable, "-c",
+                                     "import socket,sys,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen();"
+                                     "print(s.getsockname()[1], flush=True); time.sleep(30)", f"{self.W}/marker"],
+                                    stdout=subprocess.PIPE, text=True)
+        self.procs.append(listener)
+        port = int(listener.stdout.readline())
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.procs.append(other)
+        own = pathlib.Path(self.W, "run", "own.pid")
+        own.write_text(str(listener.pid))
+        rc, out = self.host.run(ab.wait_owned_script(str(own), port))
+        self.assertEqual(rc, 0, out)
+        # Someone else's listener on the port is not readiness of ours.
+        own.write_text(str(other.pid))
+        rc, out = self.host.run(ab.wait_owned_script(str(own), port).replace("seq 1 80", "seq 1 2"))
+        self.assertEqual(rc, 1, out)
+        # A dead child is reported at once.
+        other.kill()
+        other.wait()
+        rc, out = self.host.run(ab.wait_owned_script(str(own), port))
+        self.assertEqual(rc, 1)
+        self.assertIn("exited", out)
+
+    def test_teardown_kills_only_what_it_started(self):
+        # An operator's process that merely mentions the work directory (a
+        # `tail -f` on a log) survives teardown, and verification reports it.
+        tail = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", f"{self.W}/run/x.out"])
+        self.procs.append(tail)
+        self.camp.teardown()
+        time.sleep(0.3)
+        self.assertTrue(self.alive(tail.pid))
+        os.makedirs(self.camp.out)
+        left = self.camp.verify_teardown()
+        self.assertTrue(any(str(tail.pid) in x for x in left), left)
+
+    def test_build_failure_releases_the_reservations(self):
+        cfg = self.cfg
+        camp = ab.Campaign(cfg, os.path.join(self.home, "out3"), ".", dry=False, stream=io.StringIO())
+        camp.hosts["local"].home = self.home
+        camp.cfg = cfg
+        cfg.name = "t2"
+        # preflight resolves $HOME through the shell: point it at the test's
+        # directory, so the reservation and its release happen there.
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\nps-ok\n")}), \
+                mock.patch.dict(os.environ, {"HOME": self.home}), \
+                mock.patch.object(ab.Campaign, "reserve", wraps=camp.reserve) as reserve, \
+                mock.patch.object(ab.Campaign, "build", side_effect=subprocess.CalledProcessError(1, "go")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                camp.run()
+        reserve.assert_called_once()
+        self.assertEqual(camp.hosts["local"].home, self.home)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "qq-ab-t2")))
+        cfg.name = "t1"
+
+    def test_bulk_flows_stay_backlogged_for_the_whole_window(self):
+        # A fake curl that delivers a whole object in 0.3 s: one fetch per flow
+        # would end the flow three seconds early; the loop keeps it busy.
+        fake = pathlib.Path(self.home, "fakebin")
+        fake.mkdir()
+        (fake / "curl").write_text("#!/bin/sh\nsleep 0.3\nprintf '200\\t67108864\\t0.300\\t0'\n")
+        (fake / "curl").chmod(0o755)
+        cfg = self.cfg
+        script = self.camp.job_script(cfg.clients["a"], cfg.arms[0], "bulk", 2, 3)
+        rc, out = self.host.run(f"export PATH={fake}:$PATH\n" + script, timeout=30)
+        rows = ab.job_rows(out, "bulk", 2, 1, 3)
+        self.assertEqual(rc, 0)
+        for i in (1, 2):
+            mine = [r for r in rows if r[0].startswith(f"b{i}o")]
+            # More than one object per flow: the flow kept fetching after the
+            # first finished (a loaded test host makes each one slower).
+            self.assertGreaterEqual(len(mine), 2, mine)
+            self.assertTrue(all("." in r[5] and "." in r[6] for r in mine), mine)  # millisecond times
+            self.assertGreater(float(mine[-1][6]) - float(mine[0][5]), 1.5)
+
+    def test_a_listing_that_fails_is_not_an_empty_listing(self):
+        d = pathlib.Path(self.home, "logs")
+        d.mkdir()
+        (d / "server-b001-a.jsonl.gz").write_text("x")
+        d.chmod(0o111)  # can be entered, cannot be listed
+        try:
+            self.camp._fetch_glob(self.host, str(d), "server-b001-a", os.path.join(self.home, "fetched"))
+        finally:
+            d.chmod(0o755)
+        self.assertEqual(len(self.camp.fetch_failures), 1, self.camp.fetch_failures)
+        self.assertIn("listing failed", self.camp.fetch_failures[0])
+        # An empty but readable directory is a successful listing with no match.
+        e = pathlib.Path(self.home, "empty")
+        e.mkdir()
+        self.camp._fetch_glob(self.host, str(e), "server-b001-a", os.path.join(self.home, "fetched"))
+        self.assertEqual(len(self.camp.fetch_failures), 1)
+
+    CHILD = ("import signal, sys, os, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+             "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)")
+
+    def start_job(self, child_ignores_term=True):
+        """A job whose shell loops (a forked shell, as the request and probe
+        generators are) and whose child ignores TERM and has no work-directory
+        path in its command line. Returns (job shell pid, child pid, done)."""
+        pidfile = os.path.join(self.home, f"child-{time.monotonic_ns()}.pid")
+        prog = self.CHILD if child_ignores_term else "import sys, os, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)"
+        script = self.camp.as_job("local", f"{sys.executable} -c \"{prog}\" {pidfile} &\n"
+                                           f"while :; do sleep 0.2; done")
+        done = threading.Event()
+        threading.Thread(target=lambda: (self.host.run(script, timeout=120), done.set()), daemon=True).start()
+        for _ in range(200):
+            if os.path.exists(pidfile) and pathlib.Path(pidfile).read_text():
+                break
+            time.sleep(0.05)
+        files = list(pathlib.Path(self.W, "run").glob("job-*.pgid"))
+        self.assertEqual(len(files), 1)
+        shell = int(files[0].read_text().split()[0])
+        child = int(pathlib.Path(pidfile).read_text())
+        self.assertNotIn(self.W, subprocess.run(["ps", "-o", "args=", "-p", str(child)], capture_output=True,
+                                                text=True).stdout)
+        return shell, child, done, files[0]
+
+    def own_mode(self):
+        return subprocess.run(["bash", "-s"], input=ab.JOB_OWN_SH + "\nown_mode", capture_output=True,
+                              text=True).stdout.strip()
+
+    @unittest.skipUnless(os.path.exists("/proc/self/environ"), "needs /proc/<pid>/environ (Linux)")
+    def test_an_interrupted_job_is_stopped_with_everything_it_started(self):
+        # The job's shell (a loop that would start more traffic) and its
+        # TERM-ignoring child both carry the token from exec on: teardown
+        # KILLs both, verifies none is left, and removes the descriptor.
+        self.assertEqual(self.own_mode(), "proc")
+        shell, child, done, desc = self.start_job()
+        self.camp.teardown()
+        self.assertFalse(self.alive(shell))
+        self.assertFalse(self.alive(child))
+        self.assertTrue(done.wait(10), "the job's ssh did not end")
+        self.assertFalse(desc.exists())
+        ok = {"local": ab.parse_snapshot("listen-ok\nps-ok")}
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok):
+            self.assertEqual(self.camp.verify_teardown(), [])
+
+    def test_without_a_way_to_establish_ownership_nothing_is_signalled(self):
+        # As on a macOS host whose ps does not show environments: the job's
+        # processes are left alone, the descriptor stays, and teardown is
+        # reported as unverified for manual cleanup.
+        no_owner = ab.JOB_OWN_SH.replace("own_mode() {", "own_mode() { echo none; return\n", 1)
+        with mock.patch.object(ab, "JOB_OWN_SH", no_owner):
+            shell, child, done, desc = self.start_job()
+            try:
+                self.camp.teardown()
+                time.sleep(0.3)
+                self.assertTrue(self.alive(shell))
+                self.assertTrue(self.alive(child))
+                self.assertTrue(desc.exists())
+                ok = {"local": ab.parse_snapshot("listen-ok\nps-ok")}
+                with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok):
+                    notes = self.camp.verify_teardown()
+                self.assertTrue(any("ownership cannot be established" in x for x in notes), notes)
+                self.assertTrue(any("not verified gone" in x for x in notes), notes)
+            finally:
+                for p in (child, shell):
+                    try:
+                        os.kill(p, 9)
+                    except OSError:
+                        pass
+            self.assertTrue(done.wait(10))
+
+    def members(self, tok, mode, env=None, jobpid=""):
+        p = subprocess.run(["bash", "-s"], input=ab.JOB_OWN_SH + f"\nmembers {tok} {mode} {jobpid}",
+                           capture_output=True, text=True, env=env)
+        return p.returncode, p.stdout.split()
+
+    def test_job_tokens_are_fixed_length_random(self):
+        script = self.camp.as_job("local", "true")
+        toks = set(re.findall(r"env QQ_AB_TOKEN=(\S+) bash", script))
+        self.assertEqual(len(toks), 1)
+        tok = toks.pop()
+        self.assertRegex(tok, r"^[0-9a-f]{32}$")
+        ok = subprocess.run(["bash", "-s"], input=ab.JOB_OWN_SH + f"\ntok_ok {tok} && echo yes; tok_ok abc-1 || echo no",
+                            capture_output=True, text=True).stdout.split()
+        self.assertEqual(ok, ["yes", "no"])
+
+    @unittest.skipUnless(os.path.exists("/proc/self/environ"), "needs /proc/<pid>/environ (Linux)")
+    def test_ownership_is_the_exact_token_entry(self):
+        tok = "a" * 32
+        mine = subprocess.Popen(["sleep", "30"], env=dict(os.environ, QQ_AB_TOKEN=tok))
+        longer = subprocess.Popen(["sleep", "30"], env=dict(os.environ, QQ_AB_TOKEN=tok + "b"))
+        in_args = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", f"QQ_AB_TOKEN={tok}"])
+        self.procs += [mine, longer, in_args]
+        rc, pids = self.members(tok, "proc")
+        self.assertEqual((rc, pids), (0, [str(mine.pid)]))
+        rc, pids = self.members("b" * 32, "proc")
+        self.assertEqual((rc, pids), (1, []))
+
+    @unittest.skipUnless(os.path.exists("/proc/self/environ"), "needs /proc/<pid>/environ (Linux)")
+    def test_an_unreadable_process_is_skipped_unless_it_is_the_jobs_own(self):
+        # A non-dumpable process of this user: its environ is unreadable.
+        prog = ("import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); "    # PR_SET_DUMPABLE 0
+                "print('ready', flush=True); time.sleep(30)")
+        hidden = subprocess.Popen([sys.executable, "-c", prog], stdout=subprocess.PIPE, text=True)
+        self.procs.append(hidden)
+        self.assertEqual(hidden.stdout.readline().strip(), "ready")
+        with self.assertRaises(OSError):
+            open(f"/proc/{hidden.pid}/environ", "rb").read()
+        tok = "d" * 32
+        # Someone else's unreadable process: skipped, so a verified none.
+        rc, pids = self.members(tok, "proc", jobpid=os.getpid())
+        self.assertEqual((rc, pids), (1, []))
+        # The job's own recorded pid unreadable: the scan cannot vouch for it.
+        rc, pids = self.members(tok, "proc", jobpid=hidden.pid)
+        self.assertEqual(rc, 2)
+
+    def test_a_failed_inspection_is_never_verified_absence(self):
+        self.assertEqual(self.members("c" * 32, "bogus")[0], 2)
+        # A host whose inspection fails: the job ends, yet its descriptor is
+        # kept, and teardown reports it unverified instead of removing it.
+        failing = ab.JOB_OWN_SH.replace("own_mode() {", "own_mode() { echo proc; return\n", 1) \
+                               .replace("members() {", "members() { return 2\n", 1)
+        with mock.patch.object(ab, "JOB_OWN_SH", failing):
+            script = self.camp.as_job("local", "true")
+            self.assertEqual(self.host.run(script, timeout=30)[0], 0)
+            desc = list(pathlib.Path(self.W, "run").glob("job-*.pgid"))
+            self.assertEqual(len(desc), 1)
+            self.camp.teardown()
+            self.assertTrue(desc[0].exists())
+            self.assertTrue(any("could not be inspected" in x for x in self.camp.teardown_notes), self.camp.teardown_notes)
+
+    def test_a_run_directory_that_cannot_be_searched_is_unverified(self):
+        run = pathlib.Path(self.W, "run")
+        os.chmod(run, 0o444)                     # listable, not searchable
+        try:
+            ok = {"local": ab.parse_snapshot("listen-ok\nps-ok")}
+            with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok):
+                notes = self.camp.verify_teardown()
+        finally:
+            os.chmod(run, 0o755)
+        if os.geteuid() != 0:
+            self.assertTrue(any("could not check for surviving job processes" in x for x in notes), notes)
+
+    def test_descriptor_fields_are_each_validated(self):
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.procs.append(other)
+        run = pathlib.Path(self.W, "run")
+        for n, text in enumerate((f"{other.pid}\n", f"x abc-1\n", f"{other.pid} abc-1 extra\n",
+                                  f"{other.pid} Thu-Jan\n", f"{other.pid} abc\n"), start=20):
+            (run / f"job-{n}.pgid").write_text(text)
+        self.camp.teardown()
+        time.sleep(0.3)
+        self.assertTrue(self.alive(other.pid))
+        self.assertEqual(len(list(run.glob("job-*.pgid"))), 5)        # left for a human
+
+    def test_an_unreadable_run_directory_is_not_a_clean_teardown(self):
+        run = pathlib.Path(self.W, "run")
+        os.chmod(run, 0)
+        try:
+            ok = {"local": ab.parse_snapshot("listen-ok\nps-ok")}
+            with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok):
+                notes = self.camp.verify_teardown()
+        finally:
+            os.chmod(run, 0o755)
+        if os.geteuid() != 0:
+            self.assertTrue(any("could not check for surviving job processes" in x for x in notes), notes)
+
+    def test_a_stale_job_descriptor_is_not_signalled(self):
+        # The pid in a left-over descriptor now belongs to another process
+        # (a different start time): teardown must leave it alone.
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        self.procs.append(other)
+        # Its identity cannot be confirmed: a bare pid (the old format, or a
+        # truncated write) and, separately, a start time that does not match.
+        pathlib.Path(self.W, "run", "job-8.pgid").write_text(f"{other.pid}\n")
+        pathlib.Path(self.W, "run", "job-9.pgid").write_text(f"{other.pid} Thu Jan  1 00:00:00 1970\n")
+        self.camp.teardown()
+        time.sleep(0.3)
+        self.assertTrue(self.alive(other.pid))
+
+    def test_teardown_leftovers_are_reported(self):
+        snap = {"local": ab.parse_snapshot("listen-ok\nps-ok\nlisten udp 23471\nleftover 99 " + self.W + "/gw-main/queqiaod server\n")}
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value=snap):
+            left = self.camp.verify_teardown()
+        self.assertTrue(any("gateway main port 23471 is still listening" in x for x in left), left)
+        self.assertTrue(any("still running: 99" in x for x in left), left)
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\nps-ok\n")}):
+            self.assertEqual(self.camp.verify_teardown(), [])
+        with mock.patch.object(ab.Campaign, "snapshot_all", return_value={"local": ab.parse_snapshot("listen-ok\n")}):
+            left = self.camp.verify_teardown()
+        self.assertTrue(any("process table" in x for x in left), left)
+
+    def test_cpu_sampler_reads_a_busy_process(self):
+        busy = subprocess.Popen([sys.executable, "-c", "while True: pass"])
+        self.procs.append(busy)
+        pid_file = os.path.join(self.W, "run", "busy.pid")
+        out_file = os.path.join(self.W, "busy.cpu")
+        pathlib.Path(pid_file).write_text(str(busy.pid))
+        rc, _ = self.host.run(ab.cpu_sampler(pid_file, out_file))
+        self.assertEqual(rc, 0)
+        time.sleep(3.5)
+        busy.kill()
+        busy.wait()
+        rows = [tuple(map(float, l.split())) for l in pathlib.Path(out_file).read_text().splitlines() if l.strip()]
+        self.assertGreaterEqual(len(rows), 2, rows)
+        (t0, c0), (t1, c1) = rows[0], rows[-1]
+        if t1 > t0:
+            # A spinning process uses CPU the sampler can see (about one core
+            # on an idle host; less on a loaded one).
+            self.assertGreater((c1 - c0) / 100 / (t1 - t0), 0.05)
+
+    def held(self, tag):
+        """Spawn, as campaign process `tag`, a sleeper that holds a Unix
+        socket connection to this test; return the test's end. Its exit is
+        then an event: the kernel closes the connection when the process
+        ends, so recv() returns b"" exactly then, with no polling interval
+        to outrun on a slow host."""
+        path = os.path.join(self.W, f"{tag}.sock")
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(path)
+        srv.listen(1)
+        srv.settimeout(60)
+        self.camp.spawn(self.host, tag, self.W,
+                        f"{sys.executable} -c 'import socket, sys, time; s = socket.socket(socket.AF_UNIX); "
+                        f"s.connect(sys.argv[1]); time.sleep(3600)' {path} {self.W}/marker")
+        conn, _ = srv.accept()          # the event "it is running"
+        srv.close()
+        conn.settimeout(60)             # a guard against a hang, not a deadline the test races
+        return conn
+
+    @staticmethod
+    def ended(conn):
+        try:
+            return conn.recv(1) == b""
+        except socket.timeout:
+            return False
+
+    def test_spawn_then_stop_kills_only_work_directory_processes(self):
+        decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3600)", "decoy-not-in-workdir"])
+        self.procs.append(decoy)
+        c1 = self.held("t1")
+        # A pid file pointing at a process outside the work directory is not signalled.
+        with open(os.path.join(self.W, "run", "t2.pid"), "w") as f:
+            f.write(str(decoy.pid))
+        self.camp.stop(self.host, "t2")
+        self.camp.stop(self.host, "t1")
+        self.assertTrue(self.ended(c1))
+        c3 = self.held("t3")
+        self.camp.teardown()
+        self.assertTrue(self.ended(c3))
+        # Our own child: poll() would reap it had any of the above signalled it.
+        self.assertIsNone(decoy.poll())
+
+
+if __name__ == "__main__":
+    unittest.main()

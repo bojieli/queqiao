@@ -22,6 +22,8 @@ __pycache__/
 # Local configuration and secrets
 *.local.yaml
 *.local.json
+# Live validation campaigns name real hosts (docs/VALIDATING-A-BUNDLE.md).
+*.local.ini
 /.env
 /.dev/
 

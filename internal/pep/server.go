@@ -1334,6 +1334,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	logFields = append(logFields, flow.classLogFields()...)
 	logFields = append(logFields, codedSubstrateLogFields(substrate, hasCoded)...)
 	logFields = append(logFields, flow.replacementLogFields()...)
+	logFields = append(logFields, pathTraceFields(conn)...)
 	if !flowComplete && err != nil && !errors.Is(err, context.Canceled) {
 		s.cfg.Logger.Warn("remote flow ended with error", append(logFields, "error", err)...)
 		return
@@ -2052,6 +2053,25 @@ func (s *Server) observeLanes(count int) {
 // since this server instance started. It is safe for benchmark instrumentation
 // and does not expose session IDs or destination metadata.
 func (s *Server) MaxObservedLanes() int { return int(s.maxObservedLanes.Load()) }
+
+// pathTraceFields names the path-tree node a flow's QUIC carrier was keyed
+// under, as resolvePath derives it: the egress (the tree's root and the
+// ancestor every leaf on this gateway shares) and the egress->peer leaf key.
+// A live validation campaign uses it to confirm that the leaves it meant to
+// load are distinct at the gateway (two clients behind one NAT are one leaf)
+// and that the flows ran on QUIC at all. Only with QUEQIAO_LANE_TRACE=1, the
+// campaign trace; it changes nothing but the log record.
+func pathTraceFields(conn streamConn) []any {
+	if !laneTrace.Load() {
+		return nil
+	}
+	q, ok := conn.(*quicStreamConn)
+	if !ok || q.conn == nil {
+		return nil
+	}
+	egress, key := resolvePath(q.conn.LocalAddr(), q.conn.RemoteAddr())
+	return []any{"path_egress", egress, "path_key", key}
+}
 
 func transportKindForConn(conn streamConn) TransportKind {
 	if _, ok := conn.(*quicStreamConn); ok {

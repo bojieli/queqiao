@@ -179,6 +179,29 @@ There is no lane count to set: a flow's data goes over one connection. See
 `docs/DESIGN.md` for why striping was deleted. `--quic-pool` is enabled by
 default and provides the bounded multiplexed QUIC control connection.
 
+## Path-authority validation gates
+
+`ab_campaign.py` runs an N-arm interleaved live A/B. Each arm is a build (a git
+ref or prebuilt binaries) plus a flag bundle. The runner starts temporary
+gateways on spare ports of a remote host beside a loopback origin, and
+temporary clients on the configured hosts. It refuses to start next to a
+production service and tears everything down afterwards. `ab_analyze.py`
+applies the statistical gate of `docs/DESIGN-PATH-AUTHORITY.md` section 15.4
+and prints a markdown table for a pull-request comment. `dc_gate.py`
+evaluates the stage 9 DC gate against the frozen bounds in
+`validation/dc_gate.ini`. Hosts come from a git-ignored `*.local.ini`; never
+commit one.
+
+```sh
+cp scripts/validation/campaign.example.ini scripts/validation/stage6.local.ini
+./scripts/ab_campaign.py --config scripts/validation/stage6.local.ini --dry-run
+./scripts/ab_campaign.py --config scripts/validation/stage6.local.ini --output ~/campaigns/stage6
+./scripts/ab_analyze.py ~/campaigns/stage6
+```
+
+See [`docs/VALIDATING-A-BUNDLE.md`](../docs/VALIDATING-A-BUNDLE.md) for each
+gate, the safety model, and how to read the output.
+
 ## Dedicated upload sink
 
 Public upload endpoints are unsuitable throughput oracles. For a controlled

@@ -75,6 +75,10 @@ you choose the next document based on what you want to do.
   where it is probing from.
 - [Benchmarking](BENCHMARKING.md) — reproducible short-lived, interactive, and
   bulk workload measurements.
+- [Validating a bundle](VALIDATING-A-BUNDLE.md) — the live gates of the
+  path-authority migration: the 0.90 block-contrast A/B per stage, the
+  datacenter-profile gate, and the default flip, with a runner that refuses to
+  start beside production.
 - [Reproducing the datacenter measurements](MEASURING-A-DC-PATH.md) — how to
   characterize a long hop, compare arms without fooling yourself, and measure a
   real inference endpoint rather than a stand-in.
