@@ -350,6 +350,17 @@ type attempt struct {
 	gapFloor uint64
 }
 
+// gapAdvance is receiver gap evidence reaching offset, seen at a time.
+type gapAdvance struct {
+	at     time.Time
+	offset uint64
+}
+
+// gapHistory bounds how many advances of the gap evidence are remembered for
+// placing a late registration report. One that predates all of them counts
+// the oldest as already seen, which errs towards the deadline.
+const gapHistory = 16
+
 type outstanding struct {
 	chunk    *Chunk
 	attempts []attempt
@@ -409,9 +420,13 @@ type Scheduler struct {
 	// ready to take.
 	idleLanes int
 	// gapHigh is the highest offset ReissueUnacknowledgedBelow has been
-	// given, and gapNow the one it is acting on (CodedRetry only).
+	// given, and gapNow the one it is acting on (CodedRetry only). gapSeen
+	// records recent advances of gapHigh with when they were seen, so a
+	// registration reported late can be placed among them.
 	gapHigh uint64
 	gapNow  uint64
+	gapSeen [gapHistory]gapAdvance
+	gapNext int
 	tune    autotuneState
 }
 
@@ -1263,7 +1278,13 @@ func (s *Scheduler) ReissueUnacknowledgedBelow(offset uint64) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gapNow = offset
-	defer func() { s.gapHigh = max(s.gapHigh, offset) }()
+	defer func() {
+		if offset > s.gapHigh && s.cfg.CodedRetry {
+			s.gapSeen[s.gapNext%gapHistory] = gapAdvance{at: s.cfg.Now(), offset: offset}
+			s.gapNext++
+		}
+		s.gapHigh = max(s.gapHigh, offset)
+	}()
 	reissued := 0
 	for _, out := range s.live {
 		if out.chunk.End() > offset || len(out.attempts) == 0 {
@@ -1534,7 +1555,9 @@ func (s *Scheduler) wrote(laneID uint64, chunk *Chunk, reliable *bool) {
 		if s.cfg.CodedRetry && a.abandoned && !a.reliable {
 			// The coded path gave these bytes up before the write was
 			// reported, and they went nowhere else.
-			s.retireAttemptLocked(out, a.id)
+			s.retireAttemptLocked(out, a.id, true)
+		} else if s.cfg.CodedRetry && s.provenLostLocked(out, a) {
+			s.retireAttemptLocked(out, a.id, false)
 		}
 		s.ready.Broadcast()
 		return
@@ -1577,12 +1600,12 @@ func (s *Scheduler) RegisteredAgo(laneID uint64, chunk *Chunk, age time.Duration
 	registeredAt := s.cfg.Now().Add(-max(age, 0))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, a := s.attemptLocked(laneID, chunk)
+	out, a := s.attemptLocked(laneID, chunk)
 	if a == nil || a.registered {
 		return
 	}
 	a.registered = true
-	a.gapFloor = s.gapHigh
+	a.gapFloor = s.gapFloorAtLocked(registeredAt)
 	if a.reliable {
 		// A stream copy (the pre-OPEN_OK safety copy) owns these bytes.
 		return
@@ -1591,6 +1614,41 @@ func (s *Scheduler) RegisteredAgo(laneID uint64, chunk *Chunk, age time.Duration
 	if after := s.retransmitAfter(); after > 0 {
 		a.deadline = registeredAt.Add(after)
 	}
+	// Gap evidence that arrived after the packet left, but before this
+	// report did, was skipped while the attempt looked unregistered. It
+	// shows the attempt lost now.
+	if s.provenLostLocked(out, a) {
+		s.retireAttemptLocked(out, a.id, false)
+		s.ready.Broadcast()
+	}
+}
+
+// provenLostLocked reports whether gap evidence newer than a registered,
+// written coded attempt already covers beyond its chunk.
+func (s *Scheduler) provenLostLocked(out *outstanding, a *attempt) bool {
+	return a.registered && a.written && !a.reliable &&
+		s.gapHigh > a.gapFloor && out.chunk.End() <= s.gapHigh
+}
+
+// gapFloorAtLocked is the gap evidence already seen at an instant.
+func (s *Scheduler) gapFloorAtLocked(at time.Time) uint64 {
+	floor := uint64(0)
+	oldest := s.gapHigh
+	for i := 0; i < min(s.gapNext, gapHistory); i++ {
+		seen := s.gapSeen[i]
+		oldest = min(oldest, seen.offset)
+		if !seen.at.After(at) {
+			floor = max(floor, seen.offset)
+		}
+	}
+	if s.gapNext > gapHistory {
+		// Advances older than the history happened before any it holds.
+		floor = max(floor, oldest)
+	}
+	if floor == 0 && s.gapNext == 0 {
+		return s.gapHigh
+	}
+	return floor
 }
 
 // Abandoned reports, under CodedRetry, that the coded path gave up an
@@ -1616,7 +1674,7 @@ func (s *Scheduler) Abandoned(laneID uint64, chunk *Chunk) {
 	if a.reliable {
 		return
 	}
-	s.retireAttemptLocked(out, a.id)
+	s.retireAttemptLocked(out, a.id, true)
 	s.ready.Broadcast()
 }
 
@@ -1635,14 +1693,16 @@ func (s *Scheduler) attemptLocked(laneID uint64, chunk *Chunk) (*outstanding, *a
 
 // retireAttemptLocked ends one unreliable attempt and, if it was the chunk's
 // last, returns the chunk to the ready set.
-func (s *Scheduler) retireAttemptLocked(out *outstanding, id uint64) {
+func (s *Scheduler) retireAttemptLocked(out *outstanding, id uint64, abandoned bool) {
 	for i, a := range out.attempts {
 		if a.id != id {
 			continue
 		}
 		out.attempts = append(out.attempts[:i], out.attempts[i+1:]...)
 		s.releaseLaneLocked(a.lane, uint64(len(out.chunk.Data)), !a.written)
-		s.stats.CodedAbandoned++
+		if abandoned {
+			s.stats.CodedAbandoned++
+		}
 		break
 	}
 	if len(out.attempts) == 0 {

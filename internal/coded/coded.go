@@ -335,7 +335,9 @@ func (p *Path) send(ctx context.Context, frame []byte, track *frameTrack) error 
 			// abandons them: the send loop as it stops, or this.
 			select {
 			case <-p.done:
-				p.abandonQueued()
+				// Not on this goroutine: a caller may hold a lock its
+				// observer takes, and this may settle other callers' frames.
+				go p.abandonQueued()
 			default:
 			}
 		}
@@ -401,6 +403,12 @@ func (p *Path) abandon(tracks ...*frameTrack) {
 	for _, track := range report {
 		track.notify(Abandoned, now)
 	}
+}
+
+func (p *Path) isSettled(track *frameTrack) bool {
+	p.tagMu.Lock()
+	defer p.tagMu.Unlock()
+	return track.settled
 }
 
 // tagFor allocates a tag for a datagram carrying a source symbol of tracks,
@@ -685,6 +693,12 @@ func (p *Path) sendFragments(frame []byte, limit int, track *frameTrack) error {
 				p.abandon(track)
 			}
 			return err
+		}
+		if track != nil && i+1 < count && p.isSettled(track) {
+			// A symbol of this frame was refused or discarded, so it is
+			// abandoned and its owner is already sending it another way.
+			// Its remaining symbols would only compete with that.
+			return nil
 		}
 	}
 	return nil

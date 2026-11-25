@@ -107,6 +107,29 @@ func TestStaleGapEvidenceDoesNotRetryAFreshCodedAttempt(t *testing.T) {
 	}
 }
 
+// Gap evidence that arrived after the packet left but before the report of
+// its registration did is not stale: the attempt is retired once the report
+// arrives.
+func TestGapEvidenceBeforeALateRegistrationReport(t *testing.T) {
+	f := newCodedRetryFixture(t, true, bytes.Repeat([]byte("x"), 64), 16)
+	a := f.next(0)
+	f.sched.WroteAs(0, a, false)
+	f.now = f.now.Add(10 * time.Millisecond)
+	if n := f.sched.ReissueUnacknowledgedBelow(48); n != 0 {
+		t.Fatal("gap evidence retried an attempt not yet reported registered")
+	}
+	// The packet left 5 ms before that evidence; the report comes later.
+	f.now = f.now.Add(5 * time.Millisecond)
+	f.sched.RegisteredAgo(0, a, 10*time.Millisecond)
+	retry := f.next(0)
+	if !retry.Reliable || retry.Offset != a.Offset {
+		t.Fatalf("retry = %+v; want the chunk on the stream", retry)
+	}
+	if got := f.sched.Stats().CodedAbandoned; got != 0 {
+		t.Fatalf("a chunk proven lost was counted abandoned (%d)", got)
+	}
+}
+
 // A stream safety write that completes after the code's registration gets
 // the stream's own deadline, from the write, not the code's.
 func TestStreamWriteAfterRegistrationGetsTheStreamsDeadline(t *testing.T) {

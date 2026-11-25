@@ -17,6 +17,7 @@ type taggedCarrier struct {
 	tags     []uint64
 	untagged int
 	refuse   bool
+	offered  int
 	// gate, when set, holds untagged sends until it is closed, after
 	// signalling entered.
 	gate    chan struct{}
@@ -44,6 +45,7 @@ func (c *taggedCarrier) Send([]byte) error {
 func (c *taggedCarrier) SendTagged(_ []byte, tag uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.offered++
 	if c.refuse {
 		return ErrDatagramTooLarge
 	}
@@ -229,6 +231,28 @@ func TestDiscardedSymbolAbandonsItsFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	got.want(t, Abandoned)
+}
+
+// Once a fragment of an observed frame is refused, the frame is abandoned
+// and its remaining fragments are not offered: they would only compete with
+// the stream retry its owner is already making.
+func TestAbandonedFrameStopsFragmenting(t *testing.T) {
+	carrier := newTaggedCarrier()
+	carrier.refuse = true
+	path := New(carrier, Config{SymbolBytes: 200})
+	defer path.Close()
+	got := make(outcomes, 1)
+	if err := path.SendObserved(context.Background(), bytes.Repeat([]byte("r"), 1000), got.notify); err != nil {
+		t.Fatal(err)
+	}
+	got.want(t, Abandoned)
+	waitDrained(t, path)
+	carrier.mu.Lock()
+	offered := carrier.offered
+	carrier.mu.Unlock()
+	if offered != 1 {
+		t.Fatalf("%d fragments offered after the first was refused, want 1", offered)
+	}
 }
 
 // Closing the path abandons every observed frame it still holds, whether it
