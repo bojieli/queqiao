@@ -176,31 +176,29 @@ def useful_bg(rows: Sequence[dict]) -> float:
     return float(sum(int(r["bytes"] or 0) for r in rows if r.get("http") == "200"))
 
 
-def _cum_at(samples: Sequence[Sequence[float]], t: float) -> float:
-    """A flow's cumulative qualifying bytes at wall-clock t: the last sample
-    at or before t (wlclient samples every 250 ms, whatever the I/O is doing).
-    Never interpolated, so no byte is placed earlier than it was counted."""
-    got = 0.0
-    for when, cum in samples:
-        if when > t:
-            break
-        got = float(cum)
-    return got
-
-
 def progress_flows(records: Sequence[dict], direction: str) -> List[List[Sequence[float]]]:
     """The background flows' progress timelines (wlclient "bgprog" records)."""
     return [r["samples"] for r in records if r.get("kind") == "bgprog" and r.get("dir") == direction
             and r.get("samples")]
 
 
-def progress_in_window(flows: Sequence[Sequence[Sequence[float]]], window: Tuple[float, float]) -> Tuple[float, float]:
-    """(bytes, seconds) the background moved inside `window`: the difference
-    of each flow's samples at the window's two edges, so bytes moved before
-    or after the foreground are never credited to it."""
+def window_bytes(samples: Sequence[Sequence[float]], window: Tuple[float, float]) -> float:
+    """A flow's bytes over the sample intervals lying wholly inside `window`:
+    from its first sample at or after the window's start to its last at or
+    before the end. Conservative: a byte counted at an edge sample may have
+    moved just outside, so the edge intervals are left out, never credited."""
     a, b = window
-    got = sum(_cum_at(s, b) - _cum_at(s, a) for s in flows)
-    return got, max(0.0, b - a)
+    inside = [s for s in samples if a <= s[0] <= b]
+    if len(inside) < 2:
+        return 0.0
+    return float(inside[-1][1]) - float(inside[0][1])
+
+
+def progress_in_window(flows: Sequence[Sequence[Sequence[float]]], window: Tuple[float, float]) -> Tuple[float, float]:
+    """(bytes, seconds) the background moved inside `window`, over each
+    flow's sample intervals wholly inside it (window_bytes)."""
+    a, b = window
+    return sum(window_bytes(s, window) for s in flows), max(0.0, b - a)
 
 
 def progress_covered(fg: Tuple[float, float], flows: Sequence[Sequence[Sequence[float]]], n: int) -> bool:
@@ -213,7 +211,7 @@ def progress_covered(fg: Tuple[float, float], flows: Sequence[Sequence[Sequence[
         if not s or float(s[-1][1]) <= 0:
             return False                 # no qualifying (200) bytes at all
         inside = max(0.0, min(s[-1][0], fg[1]) - max(s[0][0], fg[0]))
-        if inside < COVERAGE * (fg[1] - fg[0]) or _cum_at(s, fg[1]) - _cum_at(s, fg[0]) <= 0:
+        if inside < COVERAGE * (fg[1] - fg[0]) or window_bytes(s, fg) <= 0:
             return False
     return True
 

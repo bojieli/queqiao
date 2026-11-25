@@ -411,10 +411,12 @@ class Progress:
         with self.lock:
             self.total += n
 
-    def sample(self, now: float) -> None:
+    def sample(self) -> None:
+        # The time and the counter are read together, under the lock, so no
+        # byte added after the time is read is dated before it.
         with self.lock:
             if not self.closed:
-                self.samples.append([round(now, 3), self.total])
+                self.samples.append([round(time.time(), 3), self.total])
 
     def close(self, t: float) -> None:
         """The transfer ended at t: the last sample, and no more."""
@@ -439,9 +441,8 @@ class Sampler(threading.Thread):
         while not self.done.is_set():
             nxt += self.every
             self.done.wait(max(0.0, nxt - time.time()))
-            now = time.time()
             for p in self.flows:
-                p.sample(now)
+                p.sample()
 
 
 def cmd_bgdown(args) -> None:

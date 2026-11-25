@@ -1442,12 +1442,35 @@ class MeasuredProgress(unittest.TestCase):
         self.assertGreaterEqual(len(stalled), 5)
         self.assertEqual(p.samples[-1][1], 1500)
 
+    def test_only_intervals_wholly_inside_the_window_count(self):
+        # Samples at 5.00 (0) and 5.25 (1000): the burst happened at 5.05,
+        # before a window that starts at 5.10, then the flow stalled.
+        pa = sys.modules["ab_workload_phase_a"]
+        samples = [[5.0, 0], [5.25, 1000]] + [[5.25 + k * 0.25, 1000] for k in range(1, 40)]
+        self.assertEqual(pa.progress_in_window([samples], (5.10, 15.0))[0], 0.0)
+        self.assertFalse(pa.progress_covered((5.10, 15.0), [samples], 1))
+
+    def test_a_samples_time_is_read_with_its_counter(self):
+        cl = load_script(CLIENT, "wlclient_progress3")
+        p = cl.Progress("down", 1)
+        p.lock.acquire()                         # the flow holds its lock while adding
+        th = threading.Thread(target=p.sample)
+        th.start()
+        time.sleep(0.2)
+        p.total += 500
+        added = time.time()
+        p.lock.release()
+        th.join()
+        t, c = p.samples[-1]
+        self.assertEqual(c, 500)
+        self.assertGreaterEqual(t, round(added, 3) - 0.001)     # never dated before the bytes
+
     def test_an_uploads_timeline_ends_at_the_transfer_not_the_receipt(self):
         cl = load_script(CLIENT, "wlclient_progress2")
         p = cl.Progress("up", 1)
         p.add(10)
         p.close(100.0)
-        p.sample(130.0)                  # the receipt fetch comes later: no new sample
+        p.sample()                       # the receipt fetch comes later: no new sample
         self.assertEqual(p.samples[-1], [100.0, 10])
 
     def test_error_responses_are_not_credited(self):

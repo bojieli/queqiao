@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -834,6 +835,60 @@ class LocalProcesses(unittest.TestCase):
                     except OSError:
                         pass
             self.assertTrue(done.wait(10))
+
+    def members(self, tok, mode, env=None):
+        p = subprocess.run(["bash", "-s"], input=ab.JOB_OWN_SH + f"\nmembers {tok} {mode}", capture_output=True,
+                           text=True, env=env)
+        return p.returncode, p.stdout.split()
+
+    def test_job_tokens_are_fixed_length_random(self):
+        script = self.camp.as_job("local", "true")
+        toks = set(re.findall(r"env QQ_AB_TOKEN=(\S+) bash", script))
+        self.assertEqual(len(toks), 1)
+        tok = toks.pop()
+        self.assertRegex(tok, r"^[0-9a-f]{32}$")
+        ok = subprocess.run(["bash", "-s"], input=ab.JOB_OWN_SH + f"\ntok_ok {tok} && echo yes; tok_ok abc-1 || echo no",
+                            capture_output=True, text=True).stdout.split()
+        self.assertEqual(ok, ["yes", "no"])
+
+    @unittest.skipUnless(os.path.exists("/proc/self/environ"), "needs /proc/<pid>/environ (Linux)")
+    def test_ownership_is_the_exact_token_entry(self):
+        tok = "a" * 32
+        mine = subprocess.Popen(["sleep", "30"], env=dict(os.environ, QQ_AB_TOKEN=tok))
+        longer = subprocess.Popen(["sleep", "30"], env=dict(os.environ, QQ_AB_TOKEN=tok + "b"))
+        in_args = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", f"QQ_AB_TOKEN={tok}"])
+        self.procs += [mine, longer, in_args]
+        rc, pids = self.members(tok, "proc")
+        self.assertEqual((rc, pids), (0, [str(mine.pid)]))
+        rc, pids = self.members("b" * 32, "proc")
+        self.assertEqual((rc, pids), (1, []))
+
+    def test_a_failed_inspection_is_never_verified_absence(self):
+        self.assertEqual(self.members("c" * 32, "bogus")[0], 2)
+        # A host whose inspection fails: the job ends, yet its descriptor is
+        # kept, and teardown reports it unverified instead of removing it.
+        failing = ab.JOB_OWN_SH.replace("own_mode() {", "own_mode() { echo proc; return\n", 1) \
+                               .replace("members() {", "members() { return 2\n", 1)
+        with mock.patch.object(ab, "JOB_OWN_SH", failing):
+            script = self.camp.as_job("local", "true")
+            self.assertEqual(self.host.run(script, timeout=30)[0], 0)
+            desc = list(pathlib.Path(self.W, "run").glob("job-*.pgid"))
+            self.assertEqual(len(desc), 1)
+            self.camp.teardown()
+            self.assertTrue(desc[0].exists())
+            self.assertTrue(any("could not be inspected" in x for x in self.camp.teardown_notes), self.camp.teardown_notes)
+
+    def test_a_run_directory_that_cannot_be_searched_is_unverified(self):
+        run = pathlib.Path(self.W, "run")
+        os.chmod(run, 0o444)                     # listable, not searchable
+        try:
+            ok = {"local": ab.parse_snapshot("listen-ok\nps-ok")}
+            with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok):
+                notes = self.camp.verify_teardown()
+        finally:
+            os.chmod(run, 0o755)
+        if os.geteuid() != 0:
+            self.assertTrue(any("could not check for surviving job processes" in x for x in notes), notes)
 
     def test_descriptor_fields_are_each_validated(self):
         other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])

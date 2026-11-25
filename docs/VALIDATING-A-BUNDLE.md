@@ -115,14 +115,18 @@ built to refuse rather than to trust:
   while the job's ssh session was still open. Each job is a file run as
   `env QQ_AB_TOKEN=<token> bash <file>`, so the job's shell and every
   process it starts carry the token from exec on, and ownership is that
-  token alone: on Linux read from `/proc/<pid>/environ`, elsewhere from
-  `ps -E` where it shows environments. Teardown signals exactly the owners
-  (TERM, then KILL), checks that none is left, and only then removes the
-  job's record. Where ownership cannot be established (a macOS host whose
+  token alone: a fixed-length random token, matched as the exact entry
+  `QQ_AB_TOKEN=<token>` (a whole NUL-separated entry of
+  `/proc/<pid>/environ` on Linux; a whole word of `ps -E`'s line where it
+  shows environments). Teardown signals exactly the owners (TERM, then
+  KILL), checks that none is left, and only then removes the job's record:
+  only a verified absence retires it, and an inspection that fails leaves it
+  in place, reported as unverified. Where ownership cannot be established (a macOS host whose
   `ps` hides environments), nothing is signalled: the record stays and the
   teardown is reported as unverified, for manual cleanup. A record whose
-  fields do not each check out is left alone; an unreadable `run/`
-  directory or a failed check is unverified, never clean. A job that does not run to its end (ssh dropped, timed out, the
+  fields do not each check out is left alone; a `run/` directory that
+  cannot be read and searched, or a failed check, is unverified, never
+  clean. A job that does not run to its end (ssh dropped, timed out, the
   generator crashed) is a harness failure, not the arm's, and its block gets
   no verdict.
 - **Teardown always runs**, on success, on error, and on SIGINT or SIGTERM.
@@ -563,8 +567,10 @@ from the model):
   flows moved inside the foreground's window: each flow adds to a counter
   after every chunk of at most 64 KiB (a download's only for a 200
   response; an upload's as handed to the tunnel), a sampler records the
-  counter every 250 ms whatever the I/O is doing, and the window's bytes are
-  the difference of the samples at its edges, never interpolated. An
+  counter (with its time, read together) every 250 ms whatever the I/O is
+  doing, and the window's bytes are those of the sample intervals lying
+  wholly inside it: conservative, never interpolated, never crediting a
+  byte from outside. An
   upload's timeline ends at its transfer's end, before any receipt is
   fetched. The same timelines show that every flow was running across the
   window; a flow with no qualifying bytes fails that check. Each

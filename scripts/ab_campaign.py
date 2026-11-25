@@ -43,6 +43,7 @@ import configparser
 import dataclasses
 import datetime as dt
 import hashlib
+import secrets
 import json
 import os
 import random
@@ -847,20 +848,52 @@ def job_rows(out: str, kind: str, n: int, waves: int, duration: float) -> List[T
 # environment), or "none" -- then nothing is signalled and the job is
 # reported for manual cleanup. members TOKEN MODE lists the owners' pids.
 JOB_OWN_SH = r'''own_mode() {
+  command -v python3 >/dev/null 2>&1 || { echo none; return; }
   if [ -r /proc/self/environ ]; then echo proc; return; fi
   env QQ_AB_PROBE=yes sleep 5 & q=$!
-  if ps -E -ww -o command= -p "$q" 2>/dev/null | grep -q -F 'QQ_AB_PROBE=yes'; then echo ps; else echo none; fi
+  if ps -E -ww -o command= -p "$q" 2>/dev/null | tr ' ' '\n' | grep -q -x -F 'QQ_AB_PROBE=yes'; then echo ps; else echo none; fi
   kill "$q" 2>/dev/null; wait "$q" 2>/dev/null
 }
+# members TOKEN MODE: the owners' pids on stdout; exit 0 found, 1 verified
+# none, 2 the processes could not be inspected. An owner has the exact entry
+# QQ_AB_TOKEN=<token> in its environment: a whole NUL-separated entry of
+# /proc/<pid>/environ, or a whole whitespace-separated word of ps -E's line.
 members() {
-  case "$2" in
-    proc) grep -l -z -x -F -- "QQ_AB_TOKEN=$1" /proc/[0-9]*/environ 2>/dev/null \
-            | sed 's#^/proc/##; s#/environ$##' | grep -v -x -F -- "$$" ;;
-    ps) ps -E -ww -ax -o pid=,command= 2>/dev/null \
-            | awk -v a="QQ_AB_" -v b="TOKEN=$1" 'index($0, a b) {print $1}' | grep -v -x -F -- "$$" ;;
-  esac
+  python3 - "$1" "$2" "$$" <<'QQ_AB_PY'
+import os, subprocess, sys
+tok, mode, me = sys.argv[1], sys.argv[2], sys.argv[3]
+want = ("QQ_AB_TOKEN=" + tok).encode()
+found = []
+try:
+    if mode == "proc":
+        uid = os.getuid()
+        for d in os.listdir("/proc"):
+            if not d.isdigit() or d in (me, str(os.getpid())):
+                continue
+            try:
+                if os.stat("/proc/" + d).st_uid != uid:
+                    continue
+                with open("/proc/%s/environ" % d, "rb") as f:
+                    env = f.read()
+            except (FileNotFoundError, ProcessLookupError):
+                continue          # it ended meanwhile
+            if want in env.split(b"\0"):
+                found.append(d)
+    elif mode == "ps":
+        out = subprocess.run(["ps", "-E", "-ww", "-ax", "-o", "pid=,command="], capture_output=True, check=True).stdout
+        for line in out.splitlines():
+            words = line.split()
+            if len(words) > 1 and want in words[1:] and words[0].decode() not in (me, str(os.getpid())):
+                found.append(words[0].decode())
+    else:
+        sys.exit(2)
+except Exception:
+    sys.exit(2)
+print(" ".join(found))
+sys.exit(0 if found else 1)
+QQ_AB_PY
 }
-tok_ok() { case "$1" in ""|*[!0-9a-f-]*) return 1;; *-*) return 0;; *) return 1;; esac; }'''
+tok_ok() { [ ${#1} -eq 32 ] || return 1; case "$1" in *[!0-9a-f]*) return 1;; esac; return 0; }'''
 
 
 def wait_owned_script(pid_file: str, port: int) -> str:
@@ -1375,14 +1408,17 @@ rm -f "$f"''', what=f"stop {tag}")
         self.job_seq += 1
         f = f"{W}/run/job-{self.job_seq}.pgid"
         body = f"{W}/run/job-{self.job_seq}.sh"
-        tok = f"{self.token}-{self.job_seq}"
+        # A fixed-length random token per job: no job's token is a prefix of
+        # another's, and none appears in any argument.
+        tok = secrets.token_hex(16)
         return (f"{JOB_OWN_SH}\n"
                 f"cat > {body} <<'QQ_AB_JOB_EOF'\n{script}\nQQ_AB_JOB_EOF\n"
                 f"env QQ_AB_TOKEN={tok} bash {body} &\nj=$!\n"
                 f"echo \"$j {tok}\" > {f}\n"
                 f"wait $j\nrc=$?\n"
                 f"m=$(own_mode)\n"
-                f"if [ \"$m\" != none ] && [ -z \"$(members {tok} $m)\" ]; then rm -f {f} {body}; fi\n"
+                # Only a verified absence (exit 1) retires the descriptor.
+                f"if [ \"$m\" != none ]; then members {tok} $m >/dev/null; [ $? -eq 1 ] && rm -f {f} {body}; fi\n"
                 f"exit $rc")
 
     def interim(self, path: str, trial: str = "") -> Tuple[bool, str]:
@@ -1693,14 +1729,16 @@ rm -f "$f"''', what=f"stop {tag}")
 # nothing is signalled and the descriptor stays, reported as unverified.
 ''' + JOB_OWN_SH + f'''
 m=$(own_mode)
-if [ -e {W}/run ] && ! ls -A {W}/run >/dev/null 2>&1; then echo "UNVERIFIED: cannot list {W}/run"; fi
+if [ ! -r {W}/run ] || [ ! -x {W}/run ]; then echo "UNVERIFIED: cannot read and search {W}/run"; fi
 for f in {W}/run/job-*.pgid; do
   [ -f "$f" ] || continue
   read -r p t x < "$f" 2>/dev/null || {{ echo "UNVERIFIED: cannot read $f"; continue; }}
   case "$p" in ""|*[!0-9]*) echo "stale job descriptor $f left alone"; continue;; esac
   tok_ok "$t" && [ -z "$x" ] || {{ echo "stale job descriptor $f left alone"; continue; }}
   [ "$m" = none ] && {{ echo "UNVERIFIED: $f: job ownership cannot be established on this host"; continue; }}
-  ps_=$(members "$t" "$m"); [ -n "$ps_" ] && kill -TERM $ps_ 2>/dev/null
+  ps_=$(members "$t" "$m"); r=$?
+  [ $r -eq 2 ] && {{ echo "UNVERIFIED: $f: the processes could not be inspected"; continue; }}
+  [ $r -eq 0 ] && kill -TERM $ps_ 2>/dev/null
 done
 sleep 1
 for f in {W}/run/job-*.pgid; do
@@ -1708,9 +1746,15 @@ for f in {W}/run/job-*.pgid; do
   read -r p t x < "$f" 2>/dev/null || continue
   case "$p" in ""|*[!0-9]*) continue;; esac
   tok_ok "$t" && [ -z "$x" ] && [ "$m" != none ] || continue
-  ps_=$(members "$t" "$m"); [ -n "$ps_" ] && kill -KILL $ps_ 2>/dev/null
-  for i in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(members "$t" "$m")" ] && break; sleep 0.2; done
-  if [ -z "$(members "$t" "$m")" ]; then rm -f "$f" "${{f%.pgid}}.sh"; else echo "job processes survive: $f"; fi
+  ps_=$(members "$t" "$m"); r=$?
+  [ $r -eq 0 ] && kill -KILL $ps_ 2>/dev/null
+  for i in 1 2 3 4 5 6 7 8 9 10; do members "$t" "$m" >/dev/null; r=$?; [ $r -ne 0 ] && break; sleep 0.2; done
+  # Only a verified absence retires the descriptor.
+  case $r in
+    1) rm -f "$f" "${{f%.pgid}}.sh" ;;
+    0) echo "job processes survive: $f" ;;
+    *) echo "UNVERIFIED: $f: the processes could not be inspected" ;;
+  esac
 done
 # Only the processes this campaign spawned (its pid files), each checked to
 # be running from the work directory; anything else that mentions the
@@ -1950,7 +1994,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             # An unreadable directory or a failed check is unverified, not clean.
             W = self.w(host)
             rc, text = self.hosts[host].run(
-                f"[ -e {W}/run ] || exit 0\nls -A {W}/run >/dev/null || exit 3\n"
+                f"[ -d {W}/run ] && [ -r {W}/run ] && [ -x {W}/run ] || exit 3\n"
                 f"for f in {W}/run/job-*.pgid; do [ -e \"$f\" ] && echo \"$f\"; done; exit 0",
                 what="verify no job process survived")
             if rc != 0 and not self.dry:
