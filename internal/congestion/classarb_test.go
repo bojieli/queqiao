@@ -334,3 +334,23 @@ func TestClassArbiterIdleChargeWithinHeldCreditLeavesNoDebtAcrossRounds(t *testi
 		t.Fatalf("turn %v: the returning ACK waits behind BULK", p.Turn)
 	}
 }
+
+// With no class demand the turn is EXEMPT with no fill: a run of ACK-only
+// packets charges no class, and the next CONTROL frame gets the turn at once.
+func TestClassArbiterAckOnlyPacketsChargeNoClass(t *testing.T) {
+	a := NewClassArbiter(DefaultClassWeights, arbPacket)
+	a.OnDemand(quiccongestion.Demand{})
+	for range 1000 {
+		p := a.Permit(arbPacket)
+		if p.Turn != quiccongestion.ClassExempt || p.Fill != ([quiccongestion.NumSendClasses]quiccongestion.ByteCount{}) {
+			t.Fatalf("permit %+v with no demand, want an EXEMPT turn and no fill", p)
+		}
+		// The fork charges overhead to the turn: here, to EXEMPT.
+		a.OnSent([quiccongestion.NumSendClasses]quiccongestion.ByteCount{quiccongestion.ClassExempt: 60})
+	}
+	cb := demandOf(quiccongestion.ClassControl, quiccongestion.ClassBulk)
+	a.OnDemand(cb)
+	if p := a.Permit(arbPacket); p.Turn != quiccongestion.ClassControl {
+		t.Fatalf("turn %v: ACK-only traffic left CONTROL in debt", p.Turn)
+	}
+}

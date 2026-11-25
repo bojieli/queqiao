@@ -114,7 +114,7 @@ func (a *ClassArbiter) Permit(maxBytes quiccongestion.ByteCount) quiccongestion.
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.normalize()
-	p := quiccongestion.Permit{OK: true, MaxBytes: maxBytes, Turn: quiccongestion.ClassControl}
+	p := quiccongestion.Permit{OK: true, MaxBytes: maxBytes, Turn: quiccongestion.ClassExempt}
 	turn := quiccongestion.ClassExempt
 	for _, c := range scheduledClasses {
 		if a.demand[c] && a.deficit[c] > 0 {
@@ -123,8 +123,9 @@ func (a *ClassArbiter) Permit(maxBytes quiccongestion.ByteCount) quiccongestion.
 		}
 	}
 	if turn == quiccongestion.ClassExempt {
-		// No class has demand. Whatever the builder finds is control work
-		// the demand query missed; its empty build refreshes demand.
+		// No class has demand: an EXEMPT turn with no fill, so a packet
+		// that carries only an ACK charges no class. Work the demand query
+		// missed is found after the empty build refreshes demand.
 		return p
 	}
 	p.Turn = turn
