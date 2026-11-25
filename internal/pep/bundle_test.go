@@ -103,10 +103,10 @@ func TestSchedValidatorRequiresCCAPIV2(t *testing.T) {
 			t.Errorf("ValidateSched(%q, %q) = %v, disagrees with the constructors", c.sched, c.api, exported)
 		}
 	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, SchedClass); got != "cc-api=v2,sched=class" {
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, SchedClass, CongestionScopeConnection); got != "cc-api=v2,sched=class" {
 		t.Errorf("bundle %q", got)
 	}
-	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, SchedLegacy); got != "legacy" {
+	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, SchedLegacy, CongestionScopeConnection); got != "legacy" {
 		t.Errorf("bundle %q, want legacy", got)
 	}
 }
@@ -265,5 +265,71 @@ func TestErasureRekeyKeepsTheControllerOnTheSamePath(t *testing.T) {
 	rekey := erasureRekey(nil, congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2}, pathKey(local, oldRemote))
 	if next := rekey(local, local, oldRemote, newRemote); next != nil {
 		t.Fatal("a port-only rebinding replaced the controller")
+	}
+}
+
+// congestion=path is the stage-6 bundle: it requires cc-api=v2 and
+// sched=class, and the default is one controller per connection.
+func TestCongestionScopeValidatorRequiresStagesOneAndTwo(t *testing.T) {
+	for _, c := range []struct {
+		scope CongestionScope
+		api   CCAPIVersion
+		sched SchedMode
+		want  string
+	}{
+		{"", CCAPIV1, SchedLegacy, ""},
+		{"", CCAPIV2, SchedClass, ""},
+		{CongestionScopeConnection, CCAPIV2, SchedLegacy, ""},
+		{CongestionScopePath, CCAPIV2, SchedClass, ""},
+		{CongestionScopePath, CCAPIV1, SchedLegacy, "requires cc-api=v2"},
+		{CongestionScopePath, "", "", "requires cc-api=v2"},
+		{CongestionScopePath, CCAPIV2, SchedLegacy, "requires sched=class"},
+		{CongestionScopePath, CCAPIV2, "", "requires sched=class"},
+		{"lane", CCAPIV2, SchedClass, "unsupported congestion scope"},
+	} {
+		scope := c.scope
+		sched := c.sched
+		if sched == "" {
+			sched = SchedLegacy
+		}
+		api := c.api
+		if api == "" {
+			api = CCAPIV1
+		}
+		err := validateCongestionScope(&scope, api, sched)
+		if c.want == "" {
+			if err != nil {
+				t.Errorf("scope %q with cc-api %q, sched %q rejected: %v", c.scope, c.api, c.sched, err)
+			}
+			if c.scope == "" && scope != CongestionScopeConnection {
+				t.Errorf("the default scope is %q", scope)
+			}
+		} else if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("scope %q with cc-api %q, sched %q: got %v, want an error containing %q", c.scope, c.api, c.sched, err, c.want)
+		}
+		if exported := ValidateCongestionScope(c.scope, c.api, c.sched); (exported == nil) != (c.want == "") {
+			t.Errorf("ValidateCongestionScope(%q, %q, %q) = %v, disagrees", c.scope, c.api, c.sched, exported)
+		}
+	}
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, SchedClass, CongestionScopePath); got != "cc-api=v2,sched=class,congestion=path" {
+		t.Errorf("bundle %q", got)
+	}
+	certificate, credentials := testCertificate(t)
+	if _, err := NewClient(ClientConfig{
+		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
+		CCAPI: CCAPIV2, CongestionScope: CongestionScopePath,
+	}); err == nil {
+		t.Fatal("client accepted congestion=path without sched=class")
+	}
+	if _, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, CongestionScope: CongestionScopePath,
+	}); err == nil {
+		t.Fatal("server accepted congestion=path without cc-api=v2")
+	}
+	if _, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true,
+		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+	}); err != nil {
+		t.Fatalf("server rejected the congestion=path bundle: %v", err)
 	}
 }

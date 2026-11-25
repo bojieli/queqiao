@@ -311,6 +311,12 @@ func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
 		if opts := parseRuntimeForTest(t, client); opts.sched != "legacy" {
 			t.Fatalf("the default sched is %q, want legacy", opts.sched)
 		}
+		if opts := parseRuntimeForTest(t, client, "--cc-api=v2", "--sched=class", "--congestion-scope=path"); opts.congestionScope != "path" {
+			t.Fatalf("congestion-scope=path not parsed: %q", opts.congestionScope)
+		}
+		if opts := parseRuntimeForTest(t, client); opts.congestionScope != "connection" {
+			t.Fatalf("the default congestion scope is %q, want connection", opts.congestionScope)
+		}
 		for _, args := range [][]string{
 			{"--cc-api=v3"},
 			{"--cc-api=v2", "--congestion=reno"},
@@ -319,6 +325,13 @@ func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
 			{"--cc-api=v1", "--sched=class"},
 			{"--cc-api=v2", "--sched=fifo"},
 			{"--cc-api=v2", "--sched="},
+			{"--congestion-scope=path"},
+			{"--cc-api=v2", "--congestion-scope=path"},
+			{"--sched=class", "--congestion-scope=path"},
+			{"--cc-api=v2", "--sched=class", "--congestion-scope=lane"},
+			{"--cc-api=v2", "--sched=class", "--congestion-scope="},
+			{"--cc-api=v2", "--sched=class", "--congestion-scope=path", "--path-profile=dc-long-haul"},
+			{"--cc-api=v2", "--sched=class", "--congestion-scope=path", "--congestion=bbr"},
 		} {
 			fs := flag.NewFlagSet("test", flag.ContinueOnError)
 			fs.SetOutput(io.Discard)

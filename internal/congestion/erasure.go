@@ -137,6 +137,14 @@ type ErasureSender struct {
 	// total and debited figures are always consistent.
 	nonElicitingDebited   atomic.Uint64
 	nonElicitingUndebited atomic.Uint64
+
+	// authority says this sender is the control law of a PathController
+	// (congestion=path): the one controller of its path and direction. It
+	// takes no share and no seed, because nothing is divided; its estimator
+	// is fed in the path's send order by the controller rather than from
+	// each acknowledgement batch; its sampler retires packet states by fate;
+	// and its pacer keeps debt.
+	authority bool
 }
 
 type packetOutcome struct {
@@ -208,6 +216,27 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 				e.share.Store(uint64(state.Share))
 			}
 			e.inner.seedBandwidth(uint64(state.Seed/e.arrivalRate()), state.RoundTrip)
+		}
+	}
+	return e
+}
+
+// newPathLaw returns the erasure control law a PathController hosts. It
+// reports what it measures to path, which the coded path's FEC and the
+// prewarm read, and reads back only the path's knowledge of its erasure as a
+// prior for the compensation, exactly as a lane did. It takes no seed and no
+// share: those divided the path between controllers, and a path controller is
+// the only one.
+func newPathLaw(initialPacketSize quiccongestion.ByteCount, path pathmodel.Model) *ErasureSender {
+	e := newErasureSender(initialPacketSize)
+	e.authority = true
+	e.inner.estimator.retireByFate = true
+	e.pacer.keepDebt = true
+	e.path = path
+	if path != nil {
+		if state := path.Current(); state.Erasure > 0 {
+			e.arrival.Store(uint64((1 - state.Erasure) * partsPerMillion))
+			e.erasure.Store(uint64(state.Erasure * partsPerMillion))
 		}
 	}
 	return e
@@ -613,6 +642,14 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	for _, outcome := range e.outcomes {
 		e.estimator.ObserveOutcome(outcome.arrived)
 	}
+	e.afterOutcomes(priorInFlight, eventTime, acked, lost)
+}
+
+// afterOutcomes is the rest of a congestion event once the estimator has
+// observed its outcomes: the compensation, the path report, and the inner
+// controller. A PathController observes the outcomes itself, in send order,
+// and then calls this.
+func (e *ErasureSender) afterOutcomes(priorInFlight quiccongestion.ByteCount, eventTime monotime.Time, acked []quiccongestion.AckedPacketInfo, lost []quiccongestion.LostPacketInfo) {
 	snapshot := e.estimator.Snapshot()
 	if snapshot.Samples > 0 {
 		e.samples.Store(uint64(snapshot.Samples))
@@ -635,7 +672,9 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		})
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))
-		e.share.Store(uint64(state.Share))
+		if !e.authority {
+			e.share.Store(uint64(state.Share))
+		}
 	}
 	// The compensation rides on the measurement rather than on a floor biased
 	// low for pacing. Under-compensating is not the safe direction it looks

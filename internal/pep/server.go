@@ -63,6 +63,10 @@ type ServerConfig struct {
 	// Sched selects how a QUIC connection orders the classes of work it
 	// sends; see SchedMode. Empty is legacy. Class requires CCAPI v2.
 	Sched SchedMode
+	// CongestionScope selects what one congestion controller governs; see
+	// CongestionScope. Empty is connection. Path requires CCAPI v2 and
+	// Sched class.
+	CongestionScope CongestionScope
 	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
 	// is legacy.
 	CodedRetry                    CodedRetryMode
@@ -363,6 +367,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, err
 	}
 	if err := validateSched(&cfg.Sched, cfg.CCAPI); err != nil {
+		return nil, err
+	}
+	if err := validateCongestionScope(&cfg.CongestionScope, cfg.CCAPI, cfg.Sched); err != nil {
 		return nil, err
 	}
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
@@ -730,7 +737,10 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	controller := configureQUICController(conn, congestionConfig{
 		kind: s.cfg.Congestion, brutalBytesPerSecond: s.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: s.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: s.cfg.AdaptiveMaxBytesSec,
-		ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched,
+		ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched, scope: s.cfg.CongestionScope,
+		// The ALPN and the principal are checked below: only an authorised
+		// data connection attaches to its path's controller.
+		provisional: true,
 	})
 	state := conn.ConnectionState().TLS
 	if state.NegotiatedProtocol == identity.EnrollmentALPN {
@@ -780,6 +790,18 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	principal, err := identity.PrincipalFromTLS(state)
 	if err != nil {
 		return
+	}
+	if s.cfg.CCAPI == CCAPIV2 && s.cfg.Congestion == CongestionErasure && s.cfg.CongestionScope == CongestionScopePath {
+		// An authorised data connection leaves its provisional controller
+		// for the authority of its path: the principal's, over this uplink,
+		// to this remote host (§4.1). Every connection of one device -- an
+		// old client's isolated and rescue lanes too -- attaches to the same
+		// one.
+		if _, err := s.cfg.Credentials.Store.Authorize(principal, time.Now()); err == nil {
+			controller = attachPathController(conn, congestionConfig{
+				kind: s.cfg.Congestion, ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched, scope: s.cfg.CongestionScope,
+			}, gatewayPathPrincipal(principal))
+		}
 	}
 	s.metrics.DataConnectionAccepted(wire)
 	auth := &quicAuthState{principal: principal}

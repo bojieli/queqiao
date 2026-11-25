@@ -569,6 +569,8 @@ type runtimeOptions struct {
 	ccAPI           string
 	// sched is the class scheduler (design §14 stage 2).
 	sched string
+	// congestionScope is the path controller switch (design §14 stage 6).
+	congestionScope string
 	// codedRetry is the coded-retry bundle (design §14 stage 4).
 	codedRetry string
 	// memory is the memory-ownership bundle (design §14 stage 3).
@@ -620,6 +622,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.IntVar(&opts.hopPortCount, "hop-port-count", 0, "number of UDP ports to listen on for port hopping (0/1 = disabled)")
 	fs.StringVar(&opts.congestion, "congestion", string(pep.CongestionErasure), "QUIC congestion controller")
 	fs.StringVar(&opts.ccAPI, "cc-api", string(pep.CCAPIV1), "how QUIC congestion controllers are driven: v1 (per-packet callbacks) or v2 (the path-authority controller API; requires --congestion=erasure)")
+	fs.StringVar(&opts.congestionScope, "congestion-scope", string(pep.CongestionScopeConnection), "what one QUIC congestion controller governs: connection (one per connection), or path (one controller per path and direction that every connection on the path attaches to; requires --cc-api=v2 and --sched=class)")
 	fs.StringVar(&opts.sched, "sched", string(pep.SchedLegacy), "packet scheduler: legacy, or class (CONTROL, INTERACTIVE and BULK arbitrated by weighted deficit round robin; requires --cc-api=v2)")
 	fs.StringVar(&opts.codedRetry, "coded-retry", string(pep.CodedRetryLegacy), "coded-retry bundle: legacy, or sticky (a coded chunk's deadline starts when its datagrams are registered, and its retry stays on the stream; requires --cc-api=v2)")
 	fs.StringVar(&opts.memory, "mem", string(pep.MemoryLegacy), "memory-ownership bundle: legacy, or owned (fair shared send-memory grants and the credit-driven retention bound)")
@@ -745,6 +748,12 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 		return errors.New("--sched must be legacy or class")
 	}
 	if err := pep.ValidateSched(pep.SchedMode(opts.sched), pep.CCAPIVersion(opts.ccAPI)); err != nil {
+		return err
+	}
+	if opts.congestionScope == "" {
+		return errors.New("--congestion-scope must be connection or path")
+	}
+	if err := pep.ValidateCongestionScope(pep.CongestionScope(opts.congestionScope), pep.CCAPIVersion(opts.ccAPI), pep.SchedMode(opts.sched)); err != nil {
 		return err
 	}
 	if err := pep.ValidateCodedRetry(pep.CodedRetryMode(opts.codedRetry), pep.CCAPIVersion(opts.ccAPI)); err != nil {
@@ -924,6 +933,7 @@ func runServer(args []string) (returnErr error) {
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
 		CCAPI:               pep.CCAPIVersion(opts.ccAPI),
 		Sched:               pep.SchedMode(opts.sched),
+		CongestionScope:     pep.CongestionScope(opts.congestionScope),
 		CodedRetry:          pep.CodedRetryMode(opts.codedRetry),
 		Memory:              pep.MemoryMode(opts.memory),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
@@ -1043,8 +1053,9 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("congestion", opts.congestion),
 		slog.String("cc_api", opts.ccAPI),
 		slog.String("sched", opts.sched),
+		slog.String("congestion_scope", opts.congestionScope),
 		slog.String("coded_retry", opts.codedRetry),
-		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.SchedMode(opts.sched))),
+		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.SchedMode(opts.sched), pep.CongestionScope(opts.congestionScope))),
 		slog.String("mem", opts.memory),
 		slog.Int("max_sessions", opts.maxSessions),
 		slog.Uint64("max_payload_bytes", uint64(protocol.MaxPayload)),

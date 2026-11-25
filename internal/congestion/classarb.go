@@ -125,6 +125,70 @@ func (a *ClassArbiter) Permit(maxBytes quiccongestion.ByteCount) quiccongestion.
 	return p
 }
 
+// Select normalises the deficits and returns the turn the path's demand
+// gives: the highest-priority class with eligible demand and a positive
+// deficit, or ClassExempt when no class has demand. It issues nothing.
+func (a *ClassArbiter) Select() quiccongestion.SendClass {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.normalize()
+	for _, c := range scheduledClasses {
+		if a.demand[c] && a.deficit[c] > 0 {
+			return c
+		}
+	}
+	return quiccongestion.ClassExempt
+}
+
+// SelectAmong returns the highest-priority class in mask that has demand and
+// a positive deficit, or, failing that, the highest-priority class in mask
+// that has demand at all, which then overdraws its deficit; ClassExempt when
+// no class in mask has demand. A path controller uses it when another
+// attachment's claim on the path's turn has lapsed: the attachment asking is
+// served from its own demand, and an overdraft is carried like any other.
+func (a *ClassArbiter) SelectAmong(mask [quiccongestion.NumSendClasses]bool) quiccongestion.SendClass {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.normalize()
+	fallback := quiccongestion.ClassExempt
+	for _, c := range scheduledClasses {
+		if !mask[c] || !a.demand[c] {
+			continue
+		}
+		if a.deficit[c] > 0 {
+			return c
+		}
+		if fallback == quiccongestion.ClassExempt {
+			fallback = c
+		}
+	}
+	return fallback
+}
+
+// PermitTurn issues a permit for a turn already chosen. With fill, the other
+// classes with demand and a positive deficit may fill the rest of the packet
+// up to their deficit; without it the packet carries the turn's class only,
+// which is what a permit that relies on borrowed budget must do.
+func (a *ClassArbiter) PermitTurn(turn quiccongestion.SendClass, maxBytes quiccongestion.ByteCount, fill bool) quiccongestion.Permit {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	p := quiccongestion.Permit{OK: true, MaxBytes: maxBytes, Turn: turn}
+	if turn == quiccongestion.ClassExempt {
+		p.Turn = quiccongestion.ClassControl
+		return p
+	}
+	a.turns[turn]++
+	if !fill {
+		return p
+	}
+	for _, c := range scheduledClasses {
+		if c != turn && a.demand[c] && a.deficit[c] > 0 {
+			p.Fill[c] = quiccongestion.ByteCount(a.deficit[c])
+		}
+	}
+	return p
+}
+
 // OnSent charges each class for the bytes a packet carried of it.
 func (a *ClassArbiter) OnSent(classBytes [quiccongestion.NumSendClasses]quiccongestion.ByteCount) {
 	a.mu.Lock()

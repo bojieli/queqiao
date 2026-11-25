@@ -170,6 +170,10 @@ type ClientConfig struct {
 	// Sched selects how a QUIC connection orders the classes of work it
 	// sends; see SchedMode. Empty is legacy. Class requires CCAPI v2.
 	Sched SchedMode
+	// CongestionScope selects what one congestion controller governs; see
+	// CongestionScope. Empty is connection. Path requires CCAPI v2 and
+	// Sched class.
+	CongestionScope CongestionScope
 	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
 	// is legacy.
 	CodedRetry                    CodedRetryMode
@@ -652,6 +656,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, err
 	}
 	if err := validateSched(&cfg.Sched, cfg.CCAPI); err != nil {
+		return nil, err
+	}
+	if err := validateCongestionScope(&cfg.CongestionScope, cfg.CCAPI, cfg.Sched); err != nil {
 		return nil, err
 	}
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
@@ -1700,7 +1707,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 			discoverGrouping: c.cfg.Profile.DiscoverGrouping,
 			kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 			adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-			ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched,
+			ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope,
 		}
 		if pooled {
 			outer, err = c.dialPooledQUICLane(ctx, ccfg)
@@ -2311,7 +2318,7 @@ func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
 		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
 		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched,
+		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope,
 	})
 	c.cfg.Logger.Debug("bulk QUIC pool authenticated", "duration", time.Since(started))
 	return entry, nil

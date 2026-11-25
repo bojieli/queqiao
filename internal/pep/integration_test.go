@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -431,7 +432,19 @@ func TestQUICOneLaneSOCKSEndToEndUnderCodedRetry(t *testing.T) {
 	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, "", CodedRetrySticky)
 }
 
+// The congestion=path bundle (cc-api=v2, sched=class and one controller per
+// path) starts, both ends, and carries the same flows: the client's
+// connection and the gateway's are attachments of their paths' controllers.
+func TestQUICOneLaneSOCKSEndToEndUnderCongestionPath(t *testing.T) {
+	pathAuthorities.forget()
+	testQUICOneLaneSOCKSEndToEndScoped(t, CCAPIV2, SchedClass, CongestionScopePath)
+}
+
 func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedMode, codedRetry ...CodedRetryMode) {
+	testQUICOneLaneSOCKSEndToEndScoped(t, ccAPI, sched, CongestionScopeConnection, codedRetry...)
+}
+
+func testQUICOneLaneSOCKSEndToEndScoped(t *testing.T, ccAPI CCAPIVersion, sched SchedMode, scope CongestionScope, codedRetry ...CodedRetryMode) {
 	var retry CodedRetryMode
 	if len(codedRetry) > 0 {
 		retry = codedRetry[0]
@@ -452,7 +465,7 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedM
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
-		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond, CCAPI: ccAPI, Sched: sched, CodedRetry: retry,
+		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond, CCAPI: ccAPI, Sched: sched, CongestionScope: scope, CodedRetry: retry,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -463,7 +476,7 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedM
 	}
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true, Logger: logger,
-		Metrics: metrics.New(), CCAPI: ccAPI, Sched: sched, CodedRetry: retry,
+		Metrics: metrics.New(), CCAPI: ccAPI, Sched: sched, CongestionScope: scope, CodedRetry: retry,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -587,6 +600,25 @@ func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedM
 		})
 		if !clientSide || !gatewaySide {
 			t.Fatalf("sched=class installed on the client: %v, on the gateway: %v", clientSide, gatewaySide)
+		}
+	}
+	if scope == CongestionScopePath {
+		// The client's path and the gateway's -- keyed by the client's
+		// principal -- each have a controller with the live connection
+		// attached.
+		var clientSide, gatewaySide int
+		pathAuthorities.mu.Lock()
+		for name, c := range pathAuthorities.controllers {
+			switch {
+			case strings.HasPrefix(name, clientPathPrincipal+"|"):
+				clientSide += c.Attachments()
+			case strings.HasPrefix(name, "principal:"):
+				gatewaySide += c.Attachments()
+			}
+		}
+		pathAuthorities.mu.Unlock()
+		if clientSide == 0 || gatewaySide == 0 {
+			t.Fatalf("congestion=path attachments: client %d, gateway %d", clientSide, gatewaySide)
 		}
 	}
 	cancel()

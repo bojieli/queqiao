@@ -234,6 +234,7 @@ func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtim
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
 		CCAPI:               pep.CCAPIVersion(opts.ccAPI),
 		Sched:               pep.SchedMode(opts.sched),
+		CongestionScope:     pep.CongestionScope(opts.congestionScope),
 		CodedRetry:          pep.CodedRetryMode(opts.codedRetry),
 		Memory:              pep.MemoryMode(opts.memory),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
