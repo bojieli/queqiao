@@ -318,6 +318,26 @@ Refusals are counted at `queqiao_account_admission_refused_total` by reason —
 open refused"` naming the account and device. Check those first when a user
 reports that some sites work and others do not.
 
+The gateway-wide `--max-sessions` ceiling is charged by `--gateway-admission`:
+
+- `legacy`, the default, charges one slot to every stream before reading it,
+  as earlier releases did. When every slot is held, a stream is still read
+  under a small separate bound, and a JOIN or PROBE for a flow the gateway
+  already carries is admitted without a slot; a new flow is refused as before.
+  Without that, a saturated gateway refused exactly the recovery streams that
+  would let its own flows survive a lost lane.
+- `owned` charges the ceiling to flows, at OPEN, on QUIC and TLS/TCP alike.
+  Lanes a flow adds by JOIN count against that flow's lane limit and PROBEs
+  against a small per-connection allowance; a refused flow is told `remote
+  session limit reached` with the flow-limit code. A UDP association whose
+  replacement arrives while it is still running hands its relay, and its
+  slots, to the replacement, so the destination keeps the same source address.
+
+In both modes a full QUIC connection limit still admits one standby connection
+beside a device's existing data connections, which is what the client dials to
+move its flows off a failing one. Gateways are upgraded before clients, so set
+`owned` on gateways first.
+
 Create a one-time invitation and deliver the single printed URI through an
 authenticated private channel:
 
