@@ -318,6 +318,12 @@ type Chunk struct {
 // End returns the offset one past this chunk's last byte.
 func (c *Chunk) End() uint64 { return c.Offset + uint64(len(c.Data)) }
 
+// Ref is this dispatch's identity without its bytes, for a callback that may
+// outlive the chunk's memory reservation.
+func (c *Chunk) Ref() *Chunk {
+	return &Chunk{Reliable: c.Reliable, Offset: c.Offset, Final: c.Final, attempt: c.attempt}
+}
+
 type attempt struct {
 	id       uint64
 	lane     uint64

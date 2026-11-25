@@ -188,6 +188,8 @@ func TestCodedTailLostAloneIsRecoveredWithoutTheWatchdog(t *testing.T) {
 	go x.flow.writeLane(x.lane)
 	t.Cleanup(func() { x.flow.signalDone(); <-x.lane.writeDone })
 	go x.flow.superviseChunks(ctx, sched)
+	// Taken before anything can be dispatched, so registration is later.
+	start := time.Now()
 	go func() {
 		for {
 			chunk, err := sched.Next(ctx, 0, 0)
@@ -199,7 +201,6 @@ func TestCodedTailLostAloneIsRecoveredWithoutTheWatchdog(t *testing.T) {
 			}
 		}
 	}()
-	start := time.Now()
 	deadline := x.flow.reissueDelay()
 	frame := waitFrameWithin(t, x.capture, deadline+chunkReissueInterval+time.Second)
 	elapsed := time.Since(start)

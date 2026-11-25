@@ -194,14 +194,14 @@ func TestAbandonedCodedAttemptIsRetriedOnTheStream(t *testing.T) {
 	// A late report for the retired attempt changes nothing.
 	f.sched.Abandoned(0, first)
 	f.sched.Registered(0, first)
-	if ready, _ := f.sched.Pending(); ready != 0 {
+	if f.sched.pendingHasForTest(first.Offset) {
 		t.Fatal("a late report for a retired attempt requeued the chunk again")
 	}
 
 	early := newCodedRetryFixture(t, true, []byte("response"), 64)
 	a := early.next(0)
 	early.sched.Abandoned(0, a)
-	if ready, _ := early.sched.Pending(); ready != 0 {
+	if early.sched.pendingHasForTest(a.Offset) {
 		t.Fatal("abandonment before the write report retried bytes whose substrate is not known yet")
 	}
 	early.sched.WroteAs(0, a, false)
@@ -213,7 +213,7 @@ func TestAbandonedCodedAttemptIsRetriedOnTheStream(t *testing.T) {
 	b := safety.next(0)
 	safety.sched.Abandoned(0, b)
 	safety.sched.WroteAs(0, b, true)
-	if ready, _ := safety.sched.Pending(); ready != 0 {
+	if safety.sched.pendingHasForTest(b.Offset) {
 		t.Fatal("bytes the stream also carried were copied again")
 	}
 }
@@ -307,4 +307,15 @@ func TestEveryChunkHasOneRepairOwner(t *testing.T) {
 			f.sched.mu.Unlock()
 		}
 	}
+}
+
+func (s *Scheduler) pendingHasForTest(offset uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.pending {
+		if c.Offset == offset && len(c.Data) > 0 {
+			return true
+		}
+	}
+	return false
 }

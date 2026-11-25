@@ -621,12 +621,16 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 	if sched := f.scheduler.Load(); sched != nil {
 		queued.onWritten = func(reliable bool) { sched.WroteAs(lane.id, chunk, reliable) }
 		if f.codedRetrySticky && !chunk.Reliable {
+			// The outcome can arrive after the chunk was acknowledged and its
+			// memory released, so the callback holds its identity, not its
+			// bytes.
+			ref := chunk.Ref()
 			queued.onCoded = func(outcome coded.Outcome, at time.Time) {
 				if outcome == coded.Registered {
-					sched.RegisteredAgo(lane.id, chunk, time.Since(at))
+					sched.RegisteredAgo(lane.id, ref, time.Since(at))
 					return
 				}
-				sched.Abandoned(lane.id, chunk)
+				sched.Abandoned(lane.id, ref)
 			}
 		}
 	}
