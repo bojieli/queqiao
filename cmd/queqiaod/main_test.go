@@ -324,10 +324,20 @@ func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
 		if opts := parseRuntimeForTest(t, client, "--cc-api=v2"); opts.ccAPI != "v2" {
 			t.Fatalf("cc-api=v2 not parsed: %q", opts.ccAPI)
 		}
+		if opts := parseRuntimeForTest(t, client, "--cc-api=v2", "--sched=class"); opts.sched != "class" {
+			t.Fatalf("sched=class not parsed: %q", opts.sched)
+		}
+		if opts := parseRuntimeForTest(t, client); opts.sched != "legacy" {
+			t.Fatalf("the default sched is %q, want legacy", opts.sched)
+		}
 		for _, args := range [][]string{
 			{"--cc-api=v3"},
 			{"--cc-api=v2", "--congestion=reno"},
 			{"--cc-api=v2", "--path-profile=dc-long-haul"},
+			{"--sched=class"},
+			{"--cc-api=v1", "--sched=class"},
+			{"--cc-api=v2", "--sched=fifo"},
+			{"--cc-api=v2", "--sched="},
 		} {
 			fs := flag.NewFlagSet("test", flag.ContinueOnError)
 			fs.SetOutput(io.Discard)
@@ -382,6 +392,37 @@ func TestCodedRetryBundleIsValidatedAtStartup(t *testing.T) {
 			bindRuntimeFlags(fs, &opts, client)
 			if err := fs.Parse(args); err != nil {
 				t.Fatal(err)
+			}
+			if err := validateRuntime(opts, client); err == nil {
+				t.Errorf("client=%v %v accepted", client, args)
+			}
+		}
+	}
+}
+
+// The carrier-liveness observer is off by default, works with every bundle
+// (it only records), and refuses thresholds it cannot honour.
+func TestCarrierShadowFlags(t *testing.T) {
+	for _, client := range []bool{true, false} {
+		if opts := parseRuntimeForTest(t, client); opts.carrierShadowConfig().Enabled {
+			t.Fatalf("carrier shadow on by default (client=%v)", client)
+		}
+		opts := parseRuntimeForTest(t, client, "--carrier-shadow", "--carrier-shadow-ks=3", "--carrier-shadow-kp=5")
+		if cfg := opts.carrierShadowConfig(); !cfg.Enabled || cfg.SuspectPTOs != 3 || cfg.ReplacePTOs != 5 {
+			t.Fatalf("carrier shadow config = %+v", cfg)
+		}
+		parseRuntimeForTest(t, client, "--carrier-shadow", "--cc-api=v2", "--coded-retry=sticky")
+		for _, args := range [][]string{
+			{"--carrier-shadow", "--carrier-shadow-ks=4", "--carrier-shadow-kp=3"},
+			{"--carrier-shadow", "--carrier-shadow-kp=99"},
+			{"--carrier-shadow-ks=4294967297"},
+		} {
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			var opts runtimeOptions
+			bindRuntimeFlags(fs, &opts, client)
+			if err := fs.Parse(args); err != nil {
+				continue
 			}
 			if err := validateRuntime(opts, client); err == nil {
 				t.Errorf("client=%v %v accepted", client, args)

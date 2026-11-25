@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/apernet/quic-go"
+	quiccongestion "github.com/apernet/quic-go/congestion"
 	"github.com/bojieli/queqiao/internal/coded"
 	wancongestion "github.com/bojieli/queqiao/internal/congestion"
 	"github.com/bojieli/queqiao/internal/identity"
@@ -169,6 +170,9 @@ type congestionConfig struct {
 	discoverGrouping bool
 	// ccAPI selects how the controller is driven; see CCAPIVersion.
 	ccAPI CCAPIVersion
+	// sched selects the class scheduler; see SchedMode. It applies only
+	// with ccAPI v2.
+	sched SchedMode
 }
 
 type udpHealth struct {
@@ -454,6 +458,48 @@ func (c *quicStreamConn) transportStats() laneTransportStats {
 
 func (c *quicStreamConn) Read(p []byte) (int, error)  { return c.stream.Read(p) }
 func (c *quicStreamConn) Write(p []byte) (int, error) { return c.stream.Write(p) }
+
+// classedStream is a QUIC stream that records the send class of what it is
+// given.
+type classedStream interface {
+	WriteClass(p []byte, class quiccongestion.SendClass) (int, error)
+	SetBoost(on bool)
+}
+
+// classScheduled says whether this lane's connection schedules classes
+// (sched=class), and so whether class tags and boost mean anything on it.
+func (c *quicStreamConn) classScheduled() (classedStream, bool) {
+	if c.conn == nil || !isClassScheduled(c.conn) {
+		return nil, false
+	}
+	s, ok := c.stream.(classedStream)
+	return s, ok
+}
+
+// writeClass writes p as bytes of class when the connection schedules
+// classes, and as an ordinary write otherwise.
+func (c *quicStreamConn) writeClass(p []byte, class quiccongestion.SendClass) (int, error) {
+	if s, ok := c.classScheduled(); ok {
+		return s.WriteClass(p, class)
+	}
+	return c.stream.Write(p)
+}
+
+// classed says whether this lane's connection schedules classes.
+func (c *quicStreamConn) classed() bool {
+	_, ok := c.classScheduled()
+	return ok
+}
+
+// setBoost sets the stream's boost property, and reports whether the
+// connection schedules classes at all.
+func (c *quicStreamConn) setBoost(on bool) bool {
+	s, ok := c.classScheduled()
+	if ok {
+		s.SetBoost(on)
+	}
+	return ok
+}
 
 func (c *quicStreamConn) SetDeadline(t time.Time) error {
 	return c.stream.SetDeadline(t)
@@ -1101,6 +1147,10 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 				conn.InitialPacketSize(), pathModelForKey(key, egress, cfg.hierarchicalPath, cfg.discoverGrouping))
 			attached := wancongestion.NewErasurePathSender(controller, erasureRekey(conn, cfg, key))
 			attached.SetAddresses(func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
+			if cfg.sched == SchedClass {
+				attached.EnableClassScheduling(wancongestion.DefaultClassWeights)
+				markClassScheduled(conn)
+			}
 			conn.SetCongestionControl(attached)
 			return attached
 		}

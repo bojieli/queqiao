@@ -567,8 +567,14 @@ type runtimeOptions struct {
 	resolvedProfile profile.Profile
 	congestion      string
 	ccAPI           string
+	// sched is the class scheduler (design §14 stage 2).
+	sched string
 	// codedRetry is the coded-retry bundle (design §14 stage 4).
 	codedRetry string
+	// carrierShadow runs the carrier-liveness observer (design §10, §14
+	// stage 0 and the groundwork of stage 8). It only records.
+	carrierShadow                    bool
+	carrierShadowKS, carrierShadowKP uint
 	// memory is the memory-ownership bundle (design §14 stage 3).
 	memory                                                      string
 	brutalBytesPerSec, adaptiveMinBytesSec, adaptiveMaxBytesSec uint64
@@ -621,7 +627,11 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.IntVar(&opts.hopPortCount, "hop-port-count", 0, "number of UDP ports to listen on for port hopping (0/1 = disabled)")
 	fs.StringVar(&opts.congestion, "congestion", string(pep.CongestionErasure), "QUIC congestion controller")
 	fs.StringVar(&opts.ccAPI, "cc-api", string(pep.CCAPIV1), "how QUIC congestion controllers are driven: v1 (per-packet callbacks) or v2 (the path-authority controller API; requires --congestion=erasure)")
+	fs.StringVar(&opts.sched, "sched", string(pep.SchedLegacy), "packet scheduler: legacy, or class (CONTROL, INTERACTIVE and BULK arbitrated by weighted deficit round robin; requires --cc-api=v2)")
 	fs.StringVar(&opts.codedRetry, "coded-retry", string(pep.CodedRetryLegacy), "coded-retry bundle: legacy, or sticky (a coded chunk's deadline starts when its datagrams are registered, and its retry stays on the stream; requires --cc-api=v2)")
+	fs.BoolVar(&opts.carrierShadow, "carrier-shadow", false, "record the carrier state the path-authority design would assign to every QUIC connection, and the remedy it would take at every flow stall, beside today's recovery (observation only)")
+	fs.UintVar(&opts.carrierShadowKS, "carrier-shadow-ks", 0, "carrier-shadow k_s: probe timeouts without transport progress before a carrier is labelled suspect (0 = default)")
+	fs.UintVar(&opts.carrierShadowKP, "carrier-shadow-kp", 0, "carrier-shadow k_p: probe timeouts before a suspect carrier is labelled for replacement (0 = default)")
 	fs.StringVar(&opts.memory, "mem", string(pep.MemoryLegacy), "memory-ownership bundle: legacy, or owned (fair shared send-memory grants and the credit-driven retention bound)")
 	fs.Uint64Var(&opts.brutalBytesPerSec, "brutal-bytes-per-sec", 0, "Brutal fixed byte rate")
 	fs.Uint64Var(&opts.adaptiveMinBytesSec, "adaptive-min-bytes-per-sec", 64*1024, "Adaptive minimum byte rate")
@@ -747,8 +757,20 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	if err := pep.ValidateBundle(pep.CCAPIVersion(opts.ccAPI), pep.CongestionControlKind(opts.congestion), bundleProfile); err != nil {
 		return err
 	}
+	if opts.sched == "" {
+		return errors.New("--sched must be legacy or class")
+	}
+	if err := pep.ValidateSched(pep.SchedMode(opts.sched), pep.CCAPIVersion(opts.ccAPI)); err != nil {
+		return err
+	}
 	if err := pep.ValidateCodedRetry(pep.CodedRetryMode(opts.codedRetry), pep.CCAPIVersion(opts.ccAPI)); err != nil {
 		return fmt.Errorf("--coded-retry: %w", err)
+	}
+	if opts.carrierShadowKS > 64 || opts.carrierShadowKP > 64 {
+		return errors.New("--carrier-shadow-ks and --carrier-shadow-kp must be small probe-timeout counts")
+	}
+	if err := pep.ValidateCarrierShadow(uint32(opts.carrierShadowKS), uint32(opts.carrierShadowKP)); err != nil {
+		return fmt.Errorf("--carrier-shadow: %w", err)
 	}
 	if opts.logFormat != "json" && opts.logFormat != "text" {
 		return errors.New("--log-format must be json or text")
@@ -923,7 +945,9 @@ func runServer(args []string) (returnErr error) {
 		TCPFallbackLanes:  opts.tcpFallbackLanes, TCPCongestion: opts.tcpCongestion,
 		Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: opts.brutalBytesPerSec,
 		CCAPI:               pep.CCAPIVersion(opts.ccAPI),
+		Sched:               pep.SchedMode(opts.sched),
 		CodedRetry:          pep.CodedRetryMode(opts.codedRetry),
+		CarrierShadow:       opts.carrierShadowConfig(),
 		Memory:              pep.MemoryMode(opts.memory),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
@@ -1042,9 +1066,13 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("transport", opts.transport),
 		slog.String("congestion", opts.congestion),
 		slog.String("cc_api", opts.ccAPI),
-		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)))),
+		slog.String("sched", opts.sched),
 		slog.String("coded_retry", opts.codedRetry),
+		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)), pep.SchedMode(opts.sched))),
 		slog.String("mem", opts.memory),
+		slog.Bool("carrier_shadow", opts.carrierShadow),
+		slog.Uint64("carrier_shadow_ks", uint64(opts.carrierShadowKS)),
+		slog.Uint64("carrier_shadow_kp", uint64(opts.carrierShadowKP)),
 		slog.Int("max_sessions", opts.maxSessions),
 		slog.Uint64("max_payload_bytes", uint64(protocol.MaxPayload)),
 		slog.Int("chunk_size_bytes", opts.chunkSize),
@@ -1337,6 +1365,15 @@ func parseInvitationPaths(values []string) ([]identity.InvitationPath, error) {
 		routes = append(routes, route)
 	}
 	return routes, nil
+}
+
+// carrierShadowConfig is the carrier-liveness observer's configuration.
+func (opts runtimeOptions) carrierShadowConfig() pep.CarrierShadowConfig {
+	return pep.CarrierShadowConfig{
+		Enabled:     opts.carrierShadow,
+		SuspectPTOs: uint32(opts.carrierShadowKS),
+		ReplacePTOs: uint32(opts.carrierShadowKP),
+	}
 }
 
 // effectiveGatewayAdmission is the admission mode a gateway runs, as its

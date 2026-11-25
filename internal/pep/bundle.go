@@ -27,6 +27,55 @@ const (
 	CCAPIV2 CCAPIVersion = "v2"
 )
 
+// SchedMode selects how a QUIC connection orders the classes of work it sends.
+// It is the switch of the second migration bundle (§14 stage 2), which
+// requires the first.
+type SchedMode string
+
+const (
+	// SchedLegacy fills packets as quic-go always has: datagrams first, then
+	// control frames, then every stream round-robin. Today's behaviour.
+	SchedLegacy SchedMode = "legacy"
+	// SchedClass has each connection's controller arbitrate between the
+	// CONTROL, INTERACTIVE and BULK classes with a weighted deficit round
+	// robin (§4.3), and the packet builder execute its decision. Flow
+	// control frames are CONTROL, and a flow's DATA ahead of a waiting
+	// control frame is boosted to CONTROL; DATA of NEW and INTERACTIVE flows
+	// and the datagram substrate are INTERACTIVE; DATA of BULK flows is BULK.
+	// It requires cc-api=v2.
+	SchedClass SchedMode = "class"
+)
+
+// validateSched rejects a scheduler the migration does not support with the
+// given controller API. The empty mode is the default, legacy.
+func validateSched(sched *SchedMode, ccAPI CCAPIVersion) error {
+	if *sched == "" {
+		*sched = SchedLegacy
+	}
+	switch *sched {
+	case SchedLegacy:
+		return nil
+	case SchedClass:
+	default:
+		return fmt.Errorf("unsupported sched %q (want %s or %s)", *sched, SchedLegacy, SchedClass)
+	}
+	if ccAPI != CCAPIV2 {
+		// The arbiter lives in the PathSender, and only cc-api=v2 installs
+		// one; validateBundle has already checked the rest of v2's bundle.
+		return fmt.Errorf("sched=%s requires cc-api=%s", SchedClass, CCAPIV2)
+	}
+	return nil
+}
+
+// ValidateSched reports whether a scheduler is supported with a controller
+// API. Check the API with ValidateBundle first.
+func ValidateSched(sched SchedMode, ccAPI CCAPIVersion) error {
+	if ccAPI == "" {
+		ccAPI = CCAPIV1
+	}
+	return validateSched(&sched, ccAPI)
+}
+
 // dcLongHaulProfile is the profile that stays on today's code throughout the
 // migration (§0 decision 9).
 const dcLongHaulProfile = "dc-long-haul"
@@ -64,10 +113,14 @@ func ValidateBundle(ccAPI CCAPIVersion, congestion CongestionControlKind, p prof
 // Bundle names the switches in effect, for publishing an endpoint's effective
 // configuration: "legacy" when every switch is off. admission is a gateway's
 // (stage 5, independent of the others); a client passes the empty value.
-func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, admission GatewayAdmission) string {
+// sched is the class scheduler (stage 2).
+func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, admission GatewayAdmission, sched SchedMode) string {
 	var on []string
 	if ccAPI == CCAPIV2 {
 		on = append(on, "cc-api=v2")
+	}
+	if sched == SchedClass {
+		on = append(on, "sched=class")
 	}
 	if codedRetry == CodedRetrySticky {
 		on = append(on, "coded-retry=sticky")

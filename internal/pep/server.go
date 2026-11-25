@@ -60,6 +60,9 @@ type ServerConfig struct {
 	// CCAPI selects how QUIC congestion controllers are driven; see
 	// CCAPIVersion. Empty is v1.
 	CCAPI CCAPIVersion
+	// Sched selects how a QUIC connection orders the classes of work it
+	// sends; see SchedMode. Empty is legacy. Class requires CCAPI v2.
+	Sched SchedMode
 	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
 	// is legacy.
 	CodedRetry                    CodedRetryMode
@@ -106,6 +109,11 @@ type ServerConfig struct {
 	// lets package integration tests reproduce loss of a specific logical
 	// frame without depending on encrypted QUIC packet layout.
 	testLaneWriteHook func(protocol.Frame) error
+
+	// CarrierShadow runs the carrier-liveness observer beside today's
+	// recovery; see CarrierShadowConfig. Off by default; it never changes a
+	// decision.
+	CarrierShadow CarrierShadowConfig
 }
 
 type Server struct {
@@ -162,6 +170,9 @@ type Server struct {
 	// count of live sessions leaves them out, and they have a bound of their
 	// own. Guarded by sessionsMu.
 	tombstones int
+
+	// carrierShadow is the carrier-liveness observer; nil when it is off.
+	carrierShadow *carrierShadow
 }
 
 type serverFlow struct {
@@ -457,7 +468,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err := validateBundle(&cfg.CCAPI, cfg.Congestion, cfg.Profile); err != nil {
 		return nil, err
 	}
+	if err := validateSched(&cfg.Sched, cfg.CCAPI); err != nil {
+		return nil, err
+	}
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
+		return nil, err
+	}
+	if err := cfg.CarrierShadow.resolve(); err != nil {
 		return nil, err
 	}
 	if cfg.AdaptiveMinBytesSec == 0 {
@@ -510,6 +527,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		principalConns: make(map[string]*principalConnections),
 		firstFrames:    make(chan struct{}, handshakes),
 	}
+	server.carrierShadow = newCarrierShadow(cfg.CarrierShadow, carrierShadowGateway, cfg.Logger, cfg.Metrics)
 	return server, nil
 }
 
@@ -881,7 +899,7 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	controller := configureQUICController(conn, congestionConfig{
 		kind: s.cfg.Congestion, brutalBytesPerSecond: s.cfg.BrutalBytesPerSec,
 		adaptiveMinBytesPerSec: s.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: s.cfg.AdaptiveMaxBytesSec,
-		ccAPI: s.cfg.CCAPI,
+		ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched,
 	})
 	state := conn.ConnectionState().TLS
 	if state.NegotiatedProtocol == identity.EnrollmentALPN {
@@ -1190,6 +1208,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow.classifier = classifier.New(s.classifierConfig())
 	flow.memOwned = s.cfg.Memory == MemoryOwned
 	flow.codedRetrySticky = s.cfg.CodedRetry == CodedRetrySticky
+	flow.carrierShadow = s.carrierShadow
 	// Wire version 1 requires range acknowledgements on both endpoints.
 	flow.ackRanges.Store(true)
 	flow.idleTimeout = s.cfg.FlowIdleTimeout
@@ -1497,6 +1516,9 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinOpenFailed, session.ResetDestination, "pending open failed")
 			return
 		} else if held {
+			// A rescue that reached the gateway after the session's grace
+			// ended it: the late tail of the recovery deadline.
+			s.carrierShadow.noteJoinAfterEnd(sessionID, open.Header.FlowID, laneID)
 			s.refuseLaneJoin(fc, sessionID, open.Header.FlowID, laneID, metrics.LaneJoinSessionEnded, session.ResetProtocol, "unknown session: "+sessionEndedAnswer)
 			return
 		}
@@ -1523,10 +1545,18 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 	// here rather than expiring underneath the handshake it was waiting for.
 	// The grace is per outage, so a rescue that dials several JOINs in
 	// parallel extends it once per arriving JOIN, each one fresh evidence.
-	if !serverSession.completed.Load() && serverSession.flow.extendReplacementOutage(time.Now(), laneReplacementWait) {
+	// The shadow record needs the deadline in force when the JOIN arrived;
+	// it is written after the extension so logging cannot delay it.
+	var shadowDeadline time.Time
+	if s.carrierShadow != nil {
+		shadowDeadline = serverSession.flow.replacementDeadlineTime()
+	}
+	shadowArrival := time.Now()
+	if !serverSession.completed.Load() && serverSession.flow.extendReplacementOutage(shadowArrival, laneReplacementWait) {
 		s.metrics.LaneGraceExtended()
 		s.cfg.Logger.Debug("lane replacement grace extended by rescue join", "lane", laneID, "flow_id", open.Header.FlowID)
 	}
+	s.carrierShadow.noteJoinArrival(serverSession.flow, laneID, shadowArrival, shadowDeadline)
 	kind := transportKindForConn(conn)
 	controlReplacement := open.Header.Flags&protocol.FlagReserveControl != 0
 	if controlReplacement && (!serverSession.flow.reserveControlLane || kind != TransportQUIC) {
