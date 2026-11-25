@@ -1423,8 +1423,14 @@ func TestTheClaimantIsJudgedByItsOwnPacketSize(t *testing.T) {
 	now = now.Add(time.Second)
 	c.arb.OnSent([4]quiccongestion.ByteCount{quiccongestion.ClassControl: 1 << 20})
 	ctrl.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	wakes := bulk.wakes
 	if p := ctrl.a.Admit(now, 1500); p.OK {
 		t.Fatalf("CONTROL went past a claimant that could send its own packet: %+v", p)
+	} else if p.RetryAt.IsZero() || !p.RetryAt.After(now) {
+		t.Fatalf("the caller was refused as for the window, not deferred to the claimant: %+v", p)
+	}
+	if bulk.wakes == wakes {
+		t.Fatal("the claimant that can send was not woken")
 	}
 	if p := bulk.a.Admit(now, 1200); !p.OK || p.Turn != quiccongestion.ClassBulk {
 		t.Fatalf("the claimant could not use its turn: %+v", p)
@@ -1482,5 +1488,24 @@ func TestABypassIsChargedOnlyWhenGranted(t *testing.T) {
 	ctrl.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
 	if p := ctrl.a.Admit(now, 1200); !p.OK || p.Turn != quiccongestion.ClassControl {
 		t.Fatalf("the healthy CONTROL attachment found the bypass spent by one that got no permit: %+v", p)
+	}
+}
+
+// Migration leaves an attachment's bypass standing behind: it starts on the
+// new controller with none.
+func TestABypassDoesNotFollowAMigration(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	a := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+	a.a = old.Attach(func(_, _, _, _ net.Addr) *PathController { return next }, nil)
+	a.a.OnAttach(now, 0, 1200, func() {})
+	old.mu.Lock()
+	a.a.bypassed = true
+	old.mu.Unlock()
+	a.a.OnPathMigrated(now, nil, nil, nil, nil)
+	next.mu.Lock()
+	defer next.mu.Unlock()
+	if a.a.bypassed {
+		t.Fatal("a bypass charged on the old controller followed the attachment to the new one")
 	}
 }

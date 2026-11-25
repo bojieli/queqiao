@@ -528,6 +528,7 @@ func TestAnUplinkChangeWithTheSameAddressStartsANewController(t *testing.T) {
 	captured.principal = client.pathPrincipalNow
 	late := bed.clientTLS()
 	waitAttached(t, before.Controller(), 2)
+	oldPrincipal := client.pathPrincipalNow()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	client.onUplinkChanged(ctx)
@@ -539,22 +540,21 @@ func TestAnUplinkChangeWithTheSameAddressStartsANewController(t *testing.T) {
 		t.Fatal("a connection installed after the uplink change resolved the old generation's controller")
 	}
 	// A migration after the change -- with the addresses unchanged --
-	// moves a connection to the current generation's controller: the whole
-	// key is compared. The rekey is exercised on its own, as the run loop
-	// would call it.
+	// moves a connection to the current generation's controller, the one a
+	// connection dialled after the change got: the whole key is compared.
+	// The rekey is exercised on its own, with the client's principal before
+	// the change, as the run loop would call it.
 	conn := bed.clientTLS()
 	local, remote := conn.LocalAddr(), conn.RemoteAddr()
 	_, addrs := resolvePath(local, remote)
 	var followed string
-	rekey := pathRekey(func() string { return "gen-before" }, "gen-before|"+addrs, 1200, func(next string) { followed = next })
-	if rekey(local, local, remote, remote) != nil {
-		t.Fatal("a migration with the same key moved the connection")
+	rekey := pathRekey(client.pathPrincipalNow, oldPrincipal+"|"+addrs, 1200, func(next string) { followed = next })
+	if c := rekey(local, local, remote, remote); c != after.Controller() || followed != client.pathPrincipalNow()+"|"+addrs {
+		t.Fatalf("a migration after the uplink change moved the connection to %p, readers following %q; want the current generation's %p", c, followed, after.Controller())
 	}
-	generation := "gen-before"
-	rekey = pathRekey(func() string { return generation }, generation+"|"+addrs, 1200, func(next string) { followed = next })
-	generation = "gen-after"
-	if c := rekey(local, local, remote, remote); c == nil || followed != "gen-after|"+addrs {
-		t.Fatalf("a migration after the generation changed did not move the connection (readers follow %q)", followed)
+	same := pathRekey(client.pathPrincipalNow, client.pathPrincipalNow()+"|"+addrs, 1200, func(string) {})
+	if same(local, local, remote, remote) != nil {
+		t.Fatal("a migration that kept the whole key moved the connection")
 	}
 }
 
