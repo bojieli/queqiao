@@ -304,7 +304,7 @@ class DCGate(unittest.TestCase):
             out.append("\t".join(f))
         pathlib.Path(path).write_text("\n".join(out) + "\n")
         text, v = dc.evaluate(root, self.bounds)
-        self.assertIn("sum of solo rates, mean over 12 blocks): 0.33", text)
+        self.assertIn("sum of solo rates, each leaf's the larger arm median, mean over 12 blocks): 0.33", text)
         self.assertNotEqual(v["cand"], "VOID")
 
     def test_every_judged_block_needs_its_own_calibration(self):
@@ -612,17 +612,41 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("collapse3", calibrate="first", solo_factors=(1.0, 1.0, 0.03),
                                 no_solo=tuple((b, leaf) for b in range(2, 13) for leaf in LOADED))
         self.assertEqual(v["cand"], "PASS", text)
-        self.assertRegex(text, r"sum of solo rates, mean over 12 blocks\): 0\.(49|50|51) ")
+        self.assertRegex(text, r"sum of solo rates, each leaf.s the larger arm median, mean over 12 blocks\): 0\.(49|50|51) ")
 
-    def test_candidate_solos_are_reported_not_used_for_binding(self):
-        text, v = self.run_gate("candsolo", cand_solo_factor=4.0, solo_factors=(1.0, 1.0))
-        self.assertEqual(v["cand"], "PASS", text)
-        self.assertRegex(text, r"sum of solo rates, mean over 12 blocks\): 0\.(49|50|51) ")
+    def test_every_arms_solos_are_reported(self):
+        text, v = self.run_gate("candsolo", cand_solo_factor=1.2, solo_factors=(1.0, 1.0))
         row = next(l for l in text.splitlines() if l.startswith("| la |"))
         legacy, cand = row.split("|")[2:4]
         # Each arm's median and every run (12 blocks x 2 repeats).
         self.assertEqual(legacy.count(",") + 1, 24)
-        self.assertGreater(float(cand.split()[0]), 3.5 * float(legacy.split()[0]))
+        self.assertEqual(cand.count(",") + 1, 24)
+        self.assertAlmostEqual(float(cand.split()[0]) / float(legacy.split()[0]), 1.2, delta=0.1)
+
+    def test_capacity_is_the_larger_arms_median(self):
+        # The legacy arm cannot fill a lone leaf (its solos deliver 40 % of
+        # the path): measured against its own solos the ancestor looks
+        # unbound (ratio about 1.25) and the campaign is void. The
+        # candidate's solos show the path's capacity, and the ancestor binds.
+        weak = dict(binding=0.5, solo_factors=(0.4, 0.4, 0.4), cand_solo_factor=2.5)
+        b = dict(self.bounds, binding_reference="main_median")
+        root = os.path.join(self.tmp.name, "weak-main")
+        write_dc(root, **weak)
+        text, v = dc.evaluate(root, b)
+        self.assertEqual(v["cand"], "VOID", text)
+        self.assertIn("main arm median", text)
+        text, v = self.run_gate("weak-max", **weak)
+        self.assertRegex(text, r"each leaf's the larger arm median, mean over 12 blocks\): 0\.(49|50|51) ")
+        self.assertEqual(v["cand"], "PASS", text)
+
+    def test_capacity_rule_is_frozen_in_the_bounds(self):
+        self.assertEqual(dc.load_bounds()["binding_reference"], "max_arm_median")
+        bad = os.path.join(self.tmp.name, "bad.ini")
+        text = (HERE / "validation" / "dc_gate.ini").read_text().replace("binding_reference = max_arm_median",
+                                                                         "binding_reference = whatever")
+        pathlib.Path(bad).write_text(text)
+        with self.assertRaises(SystemExit):
+            dc.load_bounds(bad)
 
     def test_the_uplink_binding_is_printed(self):
         text, v = self.run_gate("upbind", uploads=True, up_binding=0.5)

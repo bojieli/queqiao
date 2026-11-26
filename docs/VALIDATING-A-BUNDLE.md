@@ -474,7 +474,18 @@ Both run several leaves in one client process. The DC campaign
   (*w* − 1) × `request_timeout` on every leaf. A W4 client (`wlclient rpc`)
   is given the barrier's absolute time, starts at once and waits for the
   barrier after initialising, so the leaf hosts' interpreter start-up times
-  do not shift their waves. The analysis requires every loaded leaf to have
+  do not shift their waves. Each W4 request has an absolute slot, the
+  barrier plus (*i* − 1) × `rpc_spacing`, and is measured from that slot.
+  W4 sends one request at a time on one connection, so a request whose slot
+  comes while the previous one is still running waits for the connection.
+  It is late, not concurrent: its row starts at its slot, its seconds
+  include the wait, and its `request_timeout` budget runs from the slot (one
+  whose budget is gone before it can start fails at the timeout). A slow
+  request therefore counts against its arm, and every leaf's wave *i* still
+  starts at the same instant, so one slow leaf cannot make the trial
+  unmeasured. Before, each request started only when the previous one
+  ended: a leaf with one slow request drifted out of step and every later
+  wave lost its overlap. The upload phase's sibling uses the same rule. The analysis requires every loaded leaf to have
   been in each wave together, on millisecond times, for at least half of the
   shortest leaf's time in that wave, and never less than 20 ms or more than
   0.1 s. Otherwise latency and spread are unmeasured. The bound scales
@@ -505,8 +516,16 @@ Both run several leaves in one client process. The DC campaign
     void the binding check or decide it. On a live path a single legacy
     solo once collapsed to 10 Mbit/s against 356 for its sibling, and that
     one run voided the campaign. The minimal example uses 3.
+  - **A leaf's capacity** in the binding check is the larger of the arms'
+    median solo rates for that leaf (`dc_gate.ini [validity]
+    binding_reference = max_arm_median`, frozen). Capacity belongs to the
+    path, not to an arm: a legacy arm that cannot fill a lone leaf (medians
+    of 286 and 133 Mbit/s against the candidate's 324 and 377 on one run)
+    would otherwise make a binding ancestor look unbound. With
+    `calibrate_arms = main` only the main arm's solos exist, and they are
+    the reference.
   - `calibrate_arms = all` also runs every candidate arm's solos, after the
-    main arm's in each round. They are not used for binding. The report
+    main arm's in each round. Besides the capacity rule above, the report
     lists every arm's solo runs per leaf (median and each run): the rate one
     leaf gets alone on one connection, which is the evidence for or against
     fan-out (design §11.3, Q3).

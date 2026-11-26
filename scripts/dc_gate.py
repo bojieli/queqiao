@@ -44,7 +44,10 @@ def load_bounds(path: str = BOUNDS) -> dict:
         out.update({"up_" + k: cp["upload"].getfloat(k) for k in cp["upload"]})
     out.update(alpha=s.getfloat("alpha"), resamples=s.getint("bootstrap_resamples"), seed=s.getint("bootstrap_seed"),
                max_zero_main_fraction=s.getfloat("max_zero_main_fraction"), binding_max=v.getfloat("binding_max"),
-               min_legacy_completion=v.getfloat("min_legacy_completion"))
+               min_legacy_completion=v.getfloat("min_legacy_completion"),
+               binding_reference=v.get("binding_reference", "main_median"))
+    if out["binding_reference"] not in ("main_median", "max_arm_median"):
+        raise SystemExit(f"{path}: [validity] binding_reference must be main_median or max_arm_median")
     with open(path, "rb") as f:
         out["sha256"] = hashlib.sha256(f.read()).hexdigest()
     return out
@@ -465,6 +468,25 @@ def calibrated_rates(solos: List[Trial], kind: str, duration: float) -> Dict[str
             for leaf, v in by_leaf.items()}
 
 
+def capacity_rates(solos: List[Trial], kind: str, duration: float, main: str, reference: str) -> Dict[str, float]:
+    """Each leaf's capacity for the binding check. `main_median`: the main
+    arm's median usable solo rate. `max_arm_median` (dc_gate.ini [validity]
+    binding_reference): the larger of the arms' medians -- capacity belongs
+    to the path, so an arm that cannot fill a lone leaf does not lower it.
+    An arm whose median is unmeasured contributes nothing; a leaf no arm
+    measured is NaN."""
+    if reference == "main_median":
+        return calibrated_rates([t for t in solos if t.arm == main], kind, duration)
+    per_arm = [calibrated_rates([t for t in solos if t.arm == a], kind, duration) for a in sorted({t.arm for t in solos})]
+    out: Dict[str, float] = {}
+    for rates in per_arm:
+        for leaf, x in rates.items():
+            if x == x and not (out.get(leaf, float("nan")) >= x):
+                out[leaf] = x
+            out.setdefault(leaf, float("nan"))
+    return out
+
+
 def solo_table(solo: List[Trial], upsolo: List[Trial], arms: List[str], duration: float) -> List[str]:
     """Every arm's solo runs per leaf (calibrate_arms = all runs them on
     every arm): the single-connection rate a lone leaf gets, reported, not
@@ -551,7 +573,8 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     # every block.
     once = str(dc.get("calibrate")) == "first"
     for b in sorted({t.block for t in ab}):
-        rates = calibrated_rates([t for t in solo if t.block == (1 if once else b) and t.arm == main], "bulk", duration)
+        rates = capacity_rates([t for t in solo if t.block == (1 if once else b)], "bulk", duration, main,
+                               bounds["binding_reference"])
         sim = [t.m["sim_rate"] for t in ab if t.block == b and t.arm == main]
         ok = (set(loaded) <= set(rates) and all(rates[x] == rates[x] and rates[x] > 0 for x in loaded)
               and sim and all(x == x for x in sim))
@@ -571,8 +594,8 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
         up_leaves = dc["upload_leaves"]
         up_uncal: List[int] = []
         for b in sorted({t.block for t in ab}):
-            rates = calibrated_rates([t for t in upsolo if t.block == (1 if once else b) and t.arm == main], "dc-upload",
-                                     duration)
+            rates = capacity_rates([t for t in upsolo if t.block == (1 if once else b)], "dc-upload", duration, main,
+                                   bounds["binding_reference"])
             sim = [t.m.get("up_sim_rate", float("nan")) for t in ab if t.block == b and t.arm == main]
             if not (set(up_leaves) <= set(rates) and all(rates[x] == rates[x] and rates[x] > 0 for x in up_leaves)
                     and sim and all(x == x for x in sim)):
@@ -677,7 +700,9 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
            "Bounds frozen in `scripts/validation/dc_gate.ini` (DESIGN-PATH-AUTHORITY.md section 11.3). Each row is a "
            f"paired per-block contrast that must be positive: one-sided {1 - a:.0%} t and bootstrap lower bounds both above zero.",
            "", f"Loaded leaves: {', '.join(loaded)}; control leaf: {control}.",
-           f"Ancestor binding (legacy simultaneous rate / sum of solo rates, mean over {len(binding)} blocks): "
+           f"Ancestor binding (legacy simultaneous rate / sum of solo rates, each leaf's the "
+           f"{'larger arm median' if bounds['binding_reference'] == 'max_arm_median' else 'main arm median'}, "
+           f"mean over {len(binding)} blocks): "
            f"{fmt(binding_mean, '.2f')} (must be <= {bounds['binding_max']:g})"
            + ("" if bound_ok else " -- **the shared ancestor did not bind: campaign VOID**")]
     if uploads:
