@@ -270,10 +270,11 @@ dev=$(ip -4 route get {self.remote} 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\
 echo "route-dev $dev"
 want={self.dev or '"$dev"'}
 [ -n "$want" ] && [ "$dev" = "$want" ] || echo "REFUSE the route to the remote address leaves by '$dev', not '$want'"
-tc qdisc show dev "$want" 2>/dev/null | grep -qE '^qdisc (clsact|ingress) ' && echo "REFUSE $want already has a clsact or ingress qdisc"
+[ "$(tc qdisc show dev "$want" 2>/dev/null | grep -cE '^qdisc (clsact|ingress) ')" = 0 ] || echo "REFUSE $want already has a clsact or ingress qdisc"
 for x in /sys/class/net/{IFB_PREFIX}*; do [ -e "$x" ] && echo "REFUSE device $(basename $x) already exists"; done
 for m in ifb sch_netem cls_flower act_mirred act_police; do modinfo $m >/dev/null 2>&1 || grep -qw "^$m" /proc/modules || echo "REFUSE kernel module $m is unavailable"; done
-ls /usr/lib/tc/normal.dist /usr/lib/*/tc/normal.dist 2>/dev/null | head -1 | grep -q . || echo "REFUSE netem's normal distribution table is missing"
+nd=""; for f in /usr/lib/tc/normal.dist /usr/lib/*/tc/normal.dist; do [ -f "$f" ] && nd=$f; done
+[ -n "$nd" ] || echo "REFUSE netem's normal distribution table is missing"
 ''', what="check that the impairment can be applied safely (read-only)")
         if rc != 0:
             out.append(f"{self.icfg.host}: the impairment check failed ({text.strip()[:200]})")
@@ -349,7 +350,7 @@ run() {{ "$@" || {{ echo "IMPAIR-FAIL: $*"; bash $R/impair-remove-{s}.sh; exit 1
 grep -qw '^ifb' /proc/modules || run modprobe ifb numifbs=0
 setsid nohup bash $R/impair-wd-{s}.sh > $R/impair-wd-{s}.out 2>&1 < /dev/null &
 echo $! > $R/impair-wd-{s}.pid
-{body}if ! tc qdisc show dev {self.dev} | grep -q '^qdisc clsact '; then
+{body}if [ "$(tc qdisc show dev {self.dev} | grep -c '^qdisc clsact ')" = 0 ]; then
   run tc qdisc add dev {self.dev} clsact
   touch $R/impair-clsact
 fi
