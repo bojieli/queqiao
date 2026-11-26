@@ -88,6 +88,48 @@ type TUICBBRSender struct {
 	// (design §4.2), where the window rule cannot tell a sender held back by
 	// the path's shared pacer from one with nothing to send.
 	appLimitedBy func() bool
+
+	// skipAppLimitedProbeRTT has the sender skip a ProbeRTT that its own
+	// flight cannot have made necessary (design §4.2). A sender builds a
+	// queue at the bottleneck only by sending faster than the bottleneck
+	// drains, which it can do only while it has more to send than it is
+	// let: while its window or its pacer, not its application, holds it.
+	// When the minimum RTT expires and every packet acknowledged since the
+	// minimum was measured was sent in an application-limited phase, and no
+	// admission found the flight at the window (filledSinceMinRTT unset),
+	// the sender built no queue of its own: the minimum is renewed from the
+	// least RTT sampled in that time (rttSinceMinRTT) without entering
+	// ProbeRTT. A path controller sets it, and reports each admission its
+	// window refused (noteWindowLimited) and each unused opportunity
+	// (caughtUp), and each refused by the balance (notePacingLimited); a
+	// sender held at its pacer in most rounds of the window is filling too.
+	// probeRTTs and probeRTTsSkipped count entries and skips.
+	//
+	// catchingUp is set when a ProbeRTT ends, until the sender is next
+	// application-limited: until the backlog the ProbeRTT held back has
+	// drained, however long that takes beside the sender's own demand.
+	// catchUpEndPN is then the last packet it had sent. The packets up to it
+	// carry the ProbeRTT's backlog, not the sender's own, and do not count
+	// as filling. A sender that never drains, as a bulk one does not, is
+	// filling on its own account: an expiry that finds it still catching up
+	// is taken.
+	skipAppLimitedProbeRTT bool
+	filledSinceMinRTT      bool
+	rttSinceMinRTT         time.Duration
+	rttSinceMinRTTAt       monotime.Time
+	// roundsSinceMinRTT counts the rounds since the minimum was measured,
+	// and pacedRounds those in which the pacer refused an admission
+	// (notePacingLimited) outside a ProbeRTT and its catch-up. A sender
+	// held at its pacer in most rounds is filling the path, however often
+	// it also runs out of work: one that pauses more often than once a
+	// round trip keeps every packet's application-limited marker set.
+	roundsSinceMinRTT uint64
+	pacedRounds       uint64
+	pacedThisRound    bool
+	catchingUp        bool
+	catchUpEndPN      quiccongestion.PacketNumber
+	probeRTTs         uint64
+	probeRTTsSkipped  uint64
 }
 
 type tuicBbrMode uint8
@@ -173,6 +215,7 @@ func NewTUICBBRSender(initialPacketSize quiccongestion.ByteCount) *TUICBBRSender
 		lossIsCongestion: true,
 		maxAckedPN:       quiccongestion.PacketNumber(-1),
 		maxSentPN:        quiccongestion.PacketNumber(-1),
+		catchUpEndPN:     quiccongestion.PacketNumber(-1),
 		endRecoveryPN:    quiccongestion.PacketNumber(-1),
 		roundEndPN:       quiccongestion.PacketNumber(-1),
 		estimator:        newTUICBandwidthEstimator(),
@@ -474,6 +517,7 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 	}
 	if appLimited {
 		b.estimator.markAppLimited()
+		b.caughtUp()
 	}
 
 	// QUIC's round counter advances before the delivery sampler is evaluated.
@@ -484,6 +528,11 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		isRoundStart = true
 		b.roundEndPN = b.maxSentPN
 		b.round++
+		b.roundsSinceMinRTT++
+		if b.pacedThisRound {
+			b.pacedRounds++
+		}
+		b.pacedThisRound = false
 	}
 	// TUIC changes recovery only on events with an ACK. A loss-only callback
 	// updates sampler/loss accounting, but waits for an ACK-clocked event before
@@ -513,8 +562,46 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 				rttSample = latest
 			}
 		}
+		// A packet sent while the sender caught up on what a ProbeRTT
+		// held back carries the ProbeRTT's backlog, not the sender's own.
+		fill := sample.filled && !b.catchingUp && sample.filledPN > b.catchUpEndPN
+		ownQueue := b.filledSinceMinRTT || fill || b.catchingUp || 2*b.pacedRounds > b.roundsSinceMinRTT
+		least, leastAt := b.rttSinceMinRTT, b.rttSinceMinRTTAt
+		if least > 0 && eventTime.Sub(leastAt) >= tuicProbeRTTInterval {
+			// Sampled before an idle as long as the filter's window: too
+			// old to stand for the path now.
+			least = 0
+		}
+		if rttSample > 0 && (least <= 0 || rttSample < least) {
+			least, leastAt = rttSample, eventTime
+		}
 		if rttSample > 0 {
+			stamped := b.minRTTAt
 			minRTTExpired = b.refreshRTTSample(eventTime, rttSample)
+			if b.minRTTAt != stamped {
+				// A new minimum-RTT window starts with this event.
+				b.filledSinceMinRTT, b.rttSinceMinRTT = false, 0
+				b.roundsSinceMinRTT, b.pacedRounds = 0, 0
+			} else {
+				b.filledSinceMinRTT = b.filledSinceMinRTT || fill
+				b.rttSinceMinRTT, b.rttSinceMinRTTAt = least, leastAt
+			}
+		} else {
+			b.filledSinceMinRTT = b.filledSinceMinRTT || fill
+		}
+		if minRTTExpired && b.skipAppLimitedProbeRTT && !ownQueue && b.mode != tuicBbrProbeRTT {
+			// Application-limited throughout this window of the minimum:
+			// the sender built no queue for ProbeRTT to drain. A higher
+			// minimum is other traffic's queue, on the path or on the
+			// acknowledgements' return, which capping this sender cannot
+			// remove; the cap would only hold its packets for a round trip
+			// and 200 ms. The minimum becomes the least RTT the window
+			// sampled, as a windowed minimum filter would have it.
+			minRTTExpired = false
+			if least > 0 {
+				b.minRTT = least
+			}
+			b.probeRTTsSkipped++
 		}
 		b.maxAckedPN = largestAck
 	}
@@ -789,8 +876,35 @@ func (b *TUICBBRSender) shouldExitStartupForLoss(lastSendState tuicSendState) bo
 	return float64(b.bytesLostInRound) > float64(lastSendState.bytesInFlight)*tuicStartupLossFraction
 }
 
+// caughtUp is told that the sender has just been found application-limited:
+// a backlog a ProbeRTT left has drained.
+func (b *TUICBBRSender) caughtUp() {
+	if b.catchingUp && b.mode != tuicBbrProbeRTT {
+		b.catchingUp, b.catchUpEndPN = false, b.maxSentPN
+	}
+}
+
+// noteWindowLimited is told that an admission found the flight at the
+// window. Inside a ProbeRTT, and while catching up on the backlog it left,
+// the window is the ProbeRTT's.
+func (b *TUICBBRSender) noteWindowLimited() {
+	if b.mode != tuicBbrProbeRTT && !b.catchingUp {
+		b.filledSinceMinRTT = true
+	}
+}
+
+// notePacingLimited is told that an admission found the balance short of a
+// packet. Inside a ProbeRTT, and while catching up on the backlog it left,
+// the shortfall is the ProbeRTT's.
+func (b *TUICBBRSender) notePacingLimited() {
+	if b.mode != tuicBbrProbeRTT && !b.catchingUp {
+		b.pacedThisRound = true
+	}
+}
+
 func (b *TUICBBRSender) maybeProbeRTT(now monotime.Time, roundStart bool, inFlight quiccongestion.ByteCount, minRTTExpired bool) {
 	if minRTTExpired && !b.exitingQuiescence && b.mode != tuicBbrProbeRTT {
+		b.probeRTTs++
 		b.mode = tuicBbrProbeRTT
 		b.pacingGain = 1
 		b.exitProbeRTT = 0
@@ -812,6 +926,9 @@ func (b *TUICBBRSender) maybeProbeRTT(now monotime.Time, roundStart bool, inFlig
 	}
 	if !b.exitProbeRTT.IsZero() && b.probeRTTRoundPassed && !now.Before(b.exitProbeRTT) {
 		b.minRTTAt = now
+		b.filledSinceMinRTT, b.rttSinceMinRTT = false, 0
+		b.roundsSinceMinRTT, b.pacedRounds = 0, 0
+		b.catchingUp = true
 		if b.fullBandwidth {
 			b.mode = tuicBbrProbeBW
 			b.cwndGain = tuicCwndGain
