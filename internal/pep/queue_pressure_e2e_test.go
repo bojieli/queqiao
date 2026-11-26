@@ -47,6 +47,41 @@ type qpResult struct {
 
 func (r qpResult) share(i int) float64 { return r.mbps[i] / (r.mbps[0] + r.mbps[1]) }
 
+// measureQueuePressure waits out the warm-up and then measures, over the
+// window (QQ_QP_WINDOW overrides it), what each sender's receivers took, got,
+// and the queue and drops at link.
+func measureQueuePressure(link *pathsim.Bottleneck, got *[2]atomic.Int64, names [2]string, window time.Duration) qpResult {
+	time.Sleep(qpWarmup)
+	res := qpResult{arms: names}
+	var start [2]int64
+	for i := range got {
+		start[i] = got[i].Load()
+	}
+	_, down0 := link.Stats()
+	began := time.Now()
+	nextTelemetry := began
+	if d, err := time.ParseDuration(os.Getenv("QQ_QP_WINDOW")); err == nil && d > 0 {
+		window = d
+	}
+	for time.Since(began) < window {
+		_, q := link.QueueDelay()
+		res.queue = append(res.queue, q)
+		if time.Now().After(nextTelemetry) {
+			nextTelemetry = nextTelemetry.Add(qpTelemetryEvery())
+			res.telemetry = append(res.telemetry, qpTelemetry(time.Since(began), q))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	elapsed := time.Since(began).Seconds()
+	_, down1 := link.Stats()
+	for i := range got {
+		res.mbps[i] = float64(got[i].Load()-start[i]) * 8 / elapsed / 1e6
+	}
+	res.drops = down1.PacketsDropped - down0.PacketsDropped
+	res.delivered = down1.PacketsOut - down0.PacketsOut
+	return res
+}
+
 func runQueuePressure(t *testing.T, a, b dcArm) qpResult {
 	t.Helper()
 	bed := newDCBed(t, a)
@@ -67,35 +102,7 @@ func runQueuePressure(t *testing.T, a, b dcArm) qpResult {
 			}()
 		}
 	}
-	time.Sleep(qpWarmup)
-	res := qpResult{arms: [2]string{a.name, b.name}}
-	var start [2]int64
-	for i := range got {
-		start[i] = got[i].Load()
-	}
-	_, down0 := link.Stats()
-	began := time.Now()
-	nextTelemetry := began
-	window := qpWindow
-	if d, err := time.ParseDuration(os.Getenv("QQ_QP_WINDOW")); err == nil && d > 0 {
-		window = d
-	}
-	for time.Since(began) < window {
-		_, q := link.QueueDelay()
-		res.queue = append(res.queue, q)
-		if time.Now().After(nextTelemetry) {
-			nextTelemetry = nextTelemetry.Add(qpTelemetryEvery())
-			res.telemetry = append(res.telemetry, qpTelemetry(time.Since(began), q))
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	elapsed := time.Since(began).Seconds()
-	_, down1 := link.Stats()
-	for i := range got {
-		res.mbps[i] = float64(got[i].Load()-start[i]) * 8 / elapsed / 1e6
-	}
-	res.drops = down1.PacketsDropped - down0.PacketsDropped
-	res.delivered = down1.PacketsOut - down0.PacketsOut
+	res := measureQueuePressure(link, &got, [2]string{a.name, b.name}, qpWindow)
 	close(stop)
 	wg.Wait()
 	return res
