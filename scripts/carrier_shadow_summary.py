@@ -244,12 +244,13 @@ def calibration(endpoint: Endpoint) -> dict[str, Any]:
         "carriers_ended": len(summarized), "open_carrier_episodes": open_episodes,
         "open_episodes_censored": open_censored, "rows": rows,
         "transitions": dict(transitions), "false_replacements": false_replacements,
-        **promotion_rate(endpoint, rows, thresholds),
+        **promotion_rate(endpoint, rows, thresholds, bool(open_carrier_records(endpoint, summarized))),
         "thresholds": [{"k_s": k[0], "k_p": k[1], "records": n} for k, n in thresholds.items()],
     }
 
 
-def promotion_rate(endpoint: Endpoint, rows: list[dict[str, Any]], thresholds: Counter) -> dict[str, Any]:
+def promotion_rate(endpoint: Endpoint, rows: list[dict[str, Any]], thresholds: Counter,
+                   open_carriers: bool = False) -> dict[str, Any]:
     """The shadow false-promotion rate (design section 15.4): the calibration
     row at the endpoint's own k_p, so a promotion is an episode that reached
     k_p and was resolved, and a false one is such an episode that then
@@ -270,6 +271,13 @@ def promotion_rate(endpoint: Endpoint, rows: list[dict[str, Any]], thresholds: C
     kps |= {r.get("k_p") for r in endpoint.records
             if isinstance(r.get("k_p"), int) and not isinstance(r.get("k_p"), bool) and r.get("k_p") > 0}
     kp = next(iter(kps)) if len(kps) == 1 else None
+    if kp == 1 and open_carriers:
+        # One-expiry episodes are counted only in a carrier's closing
+        # summary, never logged one by one: a carrier still open at capture
+        # end has resolved promotions at k_p = 1 these logs cannot count.
+        # The /metrics counters can; the logs cannot give the rate.
+        return {"observer": observed, "k_p": kp, "promotions_resolved": None, "false_promotion_rate": None,
+                "incomplete": "carriers still open at capture end hide their k_p=1 episodes"}
     row = rows[min(kp, BUCKETS) - 1] if observed and kp else None
     return {"observer": observed, "k_p": kp,
             "promotions_resolved": None if row is None else row["recovered"] + row["dead"],
@@ -794,6 +802,8 @@ def render(report: dict[str, Any], out) -> None:
         print(f"   transitions {cal['transitions']}, false replacements {cal['false_replacements']}", file=out)
         if not cal["observer"]:
             rate = "not measured: the observer did not run"
+        elif cal.get("incomplete"):
+            rate = f"not measured: {cal['incomplete']} (read the /metrics counters)"
         elif cal["false_promotion_rate"] is None:
             rate = (f"none resolved at k_p={cal['k_p']} (zero denominator)" if cal["k_p"] else
                     "not measured: k_p unknown or differs between processes")

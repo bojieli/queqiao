@@ -344,7 +344,10 @@ Sender-side credit delay p95 comes from every endpoint's
 `queqiao_credit_delay_seconds` histogram, scraped before and after each
 trial. Each endpoint times what it sends over a QUIC stream: from a chunk's
 last byte being taken by the carrier to the flow acknowledgement that covers
-it, minus the path's minimum round trip, one chunk per flow at a time. An
+it, minus the path's minimum round trip as the QUIC transport measures it
+(whatever congestion controller runs), one chunk per flow at a time. Only an
+original transmission starts a sample; a re-issue can complete one but never
+starts one, so a repair is timed from the first take. An
 arm's block p95 is taken over the histograms of its trials, gateway and
 client, pooled, never as a mean of per-trial percentiles; a block with fewer
 than 20 samples per arm is pooled over blocks like any sparse tail. A build
@@ -360,7 +363,13 @@ denominator together. It is the calibration rate at `n = k_p` that
 `carrier_shadow_summary.py` prints from the logs. Promotions are rare, so
 the rate is pooled over every block's promotions and tested by resampling
 blocks; an arm with no promotion at all has a zero denominator, and the rate
-is reported, not gated (design section 15.4). It needs `--carrier-shadow` on
+is reported, not gated (design section 15.4). A block resample that leaves
+out every block with an arm's promotions has no rate; such draws count
+against both bounds rather than being dropped, so a rate seen in one block
+is never certain. With `k_p = 1` the summary script cannot count a carrier
+still open at capture end (its one-expiry episodes are in no log line) and
+reports the rate as unmeasured; the analyzer reads the `/metrics` counters,
+which count them. It needs `--carrier-shadow` on
 every endpoint of both arms, as each endpoint's runtime configuration
 record shows; otherwise it is unmeasured. Both read the existing
 `[secondary]` bounds in `gates.ini`, which is unchanged, so campaigns that

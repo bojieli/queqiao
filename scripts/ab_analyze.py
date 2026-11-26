@@ -954,7 +954,10 @@ def report(campaign: str, gates: dict, interim: bool = False,
                         # sparse (section 15.4), as in a rule.
                         hb = lambda ts_: gm.pool([t.m.get("_credit_hist") for t in ts_])
                         hc, hm, common = paired(trials, path, main, cand, hb)
-                        have = [(gm.Tail(x), gm.Tail(y)) for x, y in zip(hc, hm) if x is not None and y is not None]
+                        # A pair counts only when both arms have samples: a
+                        # complete histogram that did not move measured nothing.
+                        have = [(gm.Tail(x), gm.Tail(y)) for x, y in zip(hc, hm)
+                                if x is not None and y is not None and len(gm.Tail(x)) and len(gm.Tail(y))]
                         if have and min(min(len(x), len(y)) for x, y in have) < tail_min(0.95):
                             a_ = gates["alpha"]
                             d_, lo_, _ = st.pooled_quantile_bounds(

@@ -18,41 +18,69 @@ import (
 // completes starts the next one. A chunk the flow later re-issues keeps its
 // first take time, so a repair's cost is part of the delay it caused.
 //
-// Only a QUIC stream write is timed. Its return is the moment the carrier
-// took the bytes; a coded write returns when the frame is queued for the
-// code, before its symbols are registered or even sent, and a TCP lane has
-// no path minimum round trip to subtract.
+// Only a QUIC stream write of bytes no carrier had before is timed. Its
+// return is the moment the carrier took the bytes; a coded write returns
+// when the frame is queued for the code, before its symbols are registered
+// or even sent; a TCP lane has no path minimum round trip to subtract; and
+// a re-issue would time the repair instead of the delay that caused it (it
+// may still complete a sample already armed).
 type creditSampler struct {
 	pending atomic.Bool
-	mu      sync.Mutex
-	start   uint64
-	end     uint64
-	taken   time.Time
-	minRTT  time.Duration
+	// takenEnd is the highest offset any carrier has taken, on any lane and
+	// substrate: a write that does not start at or above it re-issues bytes
+	// a carrier already had, and must not start a sample, which would time
+	// the repair and not the delay that caused it.
+	takenEnd atomic.Uint64
+	mu       sync.Mutex
+	start    uint64
+	end      uint64
+	taken    time.Time
+	minRTT   time.Duration
 }
 
-// noteCarrierTook is called when a lane's carrier has taken a DATA frame.
-func (f *multipathFlow) noteCarrierTook(lane *mpLane, sequence uint64, n int) {
-	if f.metrics == nil || n <= 0 || lane.kind != TransportQUIC || f.credit.pending.Load() {
+// noteTaken advances takenEnd to end and reports whether [sequence, end)
+// lies wholly above what any carrier had taken before: an original
+// transmission.
+func (c *creditSampler) noteTaken(sequence, end uint64) bool {
+	for {
+		high := c.takenEnd.Load()
+		if end <= high {
+			return false
+		}
+		if c.takenEnd.CompareAndSwap(high, end) {
+			return sequence >= high
+		}
+	}
+}
+
+// noteCarrierTook is called when a lane's carrier has taken a DATA frame;
+// reliable says it went on the QUIC stream rather than the code.
+func (f *multipathFlow) noteCarrierTook(lane *mpLane, sequence uint64, n int, reliable bool) {
+	if f.metrics == nil || n <= 0 {
+		return
+	}
+	end := sequence + uint64(n)
+	original := f.credit.noteTaken(sequence, end)
+	if !original || !reliable || lane.kind != TransportQUIC || f.credit.pending.Load() {
 		return
 	}
 	taken := time.Now()
-	minRTT := time.Duration(f.minRTTNS.Load())
-	if minRTT <= 0 {
-		// The flow has not refreshed its telemetry yet: ask this lane.
-		if provider, ok := lane.fc.transport().(laneStatsProvider); ok {
-			minRTT = provider.transportStats().controller.MinRTT
-		}
+	// The baseline is the path's own minimum round trip, as the transport
+	// measures it, whatever controller runs: Reno installs none, and
+	// another controller's figure can be a smoothed or fallback value that
+	// would subtract the very queueing this measures.
+	var minRTT time.Duration
+	if provider, ok := lane.fc.transport().(laneStatsProvider); ok {
+		minRTT = provider.transportStats().minRTT
 	}
 	if minRTT <= 0 {
 		// No round trip measured yet: nothing to subtract, so no sample.
 		return
 	}
-	end := sequence + uint64(n)
 	// Armed under replayMu, the lock acknowledgements are applied under,
 	// so an acknowledgement is either already reflected here or will find
-	// the sample armed. A chunk already covered (a re-issue of acknowledged
-	// bytes) has no covering acknowledgement still to come.
+	// the sample armed. A chunk already covered has no covering
+	// acknowledgement still to come.
 	f.replayMu.Lock()
 	defer f.replayMu.Unlock()
 	if f.acked >= end || f.ackTrack != nil && f.ackTrack.Covered(sequence, end) {

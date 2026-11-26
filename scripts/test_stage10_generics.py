@@ -383,5 +383,83 @@ class RoundThree(unittest.TestCase):
             self.assertIsNone(shadow.calibration(ep)["false_promotion_rate"])
 
 
+class LeadReview(unittest.TestCase):
+    def test_draws_without_the_event_count_against_the_bound(self):
+        # One resolved, non-false promotion per arm, in one block of six:
+        # about a third of block resamples leave it out. Those draws have no
+        # rate; dropping them made every remaining draw equal and the lower
+        # bound positive, a pass on one event.
+        none = gm.Events((0, 0))
+        one = gm.Events((0, 1))
+        c = [one] + [none] * 5
+        m = [one] + [none] * 5
+        obs, lo, hi = st.pooled_quantile_bounds(c, m, None, lambda x, y: (y + 0.01) - x, 0.05, 2000, 1,
+                                                combine=gm.Events.rate)
+        self.assertAlmostEqual(obs, 0.01)
+        self.assertEqual(lo, -math.inf)
+        self.assertEqual(hi, math.inf)
+        verdict, *_ = an.proportion_verdict(list(zip(c, m)), 6, lambda x, y: (y + 0.01) - x, None, gates(), False)
+        self.assertEqual(verdict, "**FAIL**")      # never a pass: undecided at a fixed look is a failure
+        # With every draw defined the bounds are the ordinary percentiles.
+        full = [gm.Events((0, 20))] * 6
+        _, lo, hi = st.pooled_quantile_bounds(full, full, None, lambda x, y: (y + 0.01) - x, 0.05, 500, 1,
+                                              combine=gm.Events.rate)
+        self.assertAlmostEqual(lo, 0.01)
+        self.assertAlmostEqual(hi, 0.01)
+
+    def test_a_pair_without_credit_samples_is_not_coverage(self):
+        # Six blocks, five of them with complete but unmoved histograms in
+        # the candidate: one sampled pair is not six measured blocks.
+        g = gates()
+        root_trials = {}
+        for b in range(1, 7):
+            for slot, arm in enumerate(("main", "cand"), start=1):
+                t = an.Trial(b, "a", slot, arm, "x", 1, False)
+                xs = [0.01] if (arm == "main" or b == 1) else []
+                t.m["_credit_hist"] = gm.credit_histogram([(histogram([]), histogram(xs))])
+                t.m.update(useful_bytes=1, ok=1, flows=1)
+                root_trials[(b, "a", slot)] = t
+        hb = lambda ts_: gm.pool([t.m.get("_credit_hist") for t in ts_])
+        hc, hm, _ = an.paired(root_trials, "a", "main", "cand", hb)
+        have = [(x, y) for x, y in zip(hc, hm) if len(gm.Tail(x)) and len(gm.Tail(y))]
+        self.assertEqual(len(have), 1)
+        # And through the full profile's [secondary] gate: unmeasured.
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            os.makedirs(root)
+            plan = {"main": "main", "workload": "bulk", "paths": ["a"], "schedule": [], "config": {"duration": 60},
+                    "arms": {"main": {"role": "main", "flags": []}, "cand": {"role": "candidate", "flags": []}}}
+            pathlib.Path(root, "plan.json").write_text(json.dumps(plan))
+            with unittest.mock.patch.object(an, "read_campaign", return_value=(plan, root_trials)), \
+                    unittest.mock.patch.object(an, "completeness", return_value=([], root_trials)), \
+                    unittest.mock.patch.object(an, "measure", return_value="none"), \
+                    unittest.mock.patch.object(an, "write_per_trial"):
+                text, v = an.report(root, g)
+        self.assertEqual(v[("a", "cand", "credit_delay_p95_s")], "n/a", text)
+
+    def test_k_p_1_with_a_carrier_still_open_is_unmeasured(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "c.jsonl")
+            with open(log, "w") as f:
+                f.write(json.dumps({"time": "2026-06-01T00:00:00Z", "msg": "runtime configuration",
+                                    "carrier_shadow": True, "carrier_shadow_ks": 1, "carrier_shadow_kp": 1}) + "\n")
+                f.write(json.dumps({"time": "2026-06-01T00:00:05Z", "msg": shadow.ENDED, "carrier_id": 1,
+                                    "pto_reached": [4] + [0] * 15, "pto_recovered": [1] + [0] * 15,
+                                    "pto_dead": [3] + [0] * 15}) + "\n")
+            ep = shadow.Endpoint("client")
+            ep.load([log])
+            self.assertEqual(shadow.calibration(ep)["false_promotion_rate"], 0.25)
+            # A second carrier, still open: its one-expiry episodes are in no log.
+            with open(log, "a") as f:
+                f.write(json.dumps({"time": "2026-06-01T00:00:06Z", "msg": shadow.STATE, "carrier_id": 2,
+                                    "from": "active", "to": "suspect", "k_s": 1, "k_p": 1,
+                                    "pto_since_progress": 1, "transport_epoch": 3}) + "\n")
+            ep = shadow.Endpoint("client")
+            ep.load([log])
+            cal = shadow.calibration(ep)
+            self.assertIsNone(cal["false_promotion_rate"])
+            self.assertIn("open", cal["incomplete"])
+
+
 if __name__ == "__main__":
     unittest.main()

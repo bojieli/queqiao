@@ -374,11 +374,21 @@ def pooled_quantile_bounds(cand_blocks: Sequence[Sequence[float]], main_blocks: 
     observed = stat(range(n))
     rng = random.Random(seed)
     reps = resamples
-    ds = sorted(d for d in (stat([rng.randrange(n) for _ in range(n)]) for _ in range(reps)) if d == d)
-    if not ds:
+    draws = [stat([rng.randrange(n) for _ in range(n)]) for _ in range(reps)]
+    defined = sorted(d for d in draws if d == d)
+    if not defined:
         return observed, float("nan"), float("nan")
-    k = int(math.floor(alpha * len(ds)))
-    return observed, ds[k], ds[min(len(ds) - 1, len(ds) - 1 - k)]
+    # A draw that left out every block with an arm's samples (a rare event
+    # seen in one block) has no statistic. Dropping such draws would compute
+    # the bounds conditional on seeing the event, which can make a single
+    # event look certain. They count against each bound instead: as minus
+    # infinity for the lower bound and plus infinity for the upper, so a
+    # bound is finite only when fewer than alpha of all draws are undefined.
+    undefined = reps - len(defined)
+    k = int(math.floor(alpha * reps))
+    lower = defined[k - undefined] if k >= undefined else -math.inf
+    upper = defined[reps - 1 - k] if reps - 1 - k < len(defined) else math.inf
+    return observed, lower, upper
 
 
 def _phi(x: float) -> float:

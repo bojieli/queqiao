@@ -773,9 +773,7 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 		}
 		if frame.Header.Type == protocol.TypeData {
 			lane.sent.Add(uint64(len(frame.Payload)))
-			if reliable {
-				f.noteCarrierTook(lane, frame.Header.Sequence, len(frame.Payload))
-			}
+			f.noteCarrierTook(lane, frame.Header.Sequence, len(frame.Payload), reliable)
 		}
 		// The transport has taken these bytes, which is what frees the lane to
 		// accept more. A QUIC stream write returns only once the packer has
