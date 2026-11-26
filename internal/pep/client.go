@@ -328,6 +328,8 @@ type Client struct {
 	// its classification read it instead of time.Now, so a test can move a
 	// flow through an hour of idleness without waiting one.
 	flowClockForTest func() time.Time
+	// flowLimitTickerForTest, when set, is every flow's limitTicker.
+	flowLimitTickerForTest func() (<-chan time.Time, func(), func())
 
 	// quicPoolActive counts flows currently sharing the pooled control
 	// connection. A bulk flow only needs to move off it when another flow
@@ -1118,6 +1120,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
 	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
 	flowSession.clock = c.flowClockForTest
+	flowSession.limitTicker = c.flowLimitTickerForTest
 	flowSession.memOwned = c.cfg.Memory == MemoryOwned
 	flowSession.codedRetrySticky = c.cfg.CodedRetry == CodedRetrySticky
 	flowSession.carrierShadow = c.carrierShadow

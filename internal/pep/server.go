@@ -182,8 +182,10 @@ type Server struct {
 	// carrierShadow is the carrier-liveness observer; nil when it is off.
 	carrierShadow *carrierShadow
 
-	// flowClockForTest, when set, is every flow's clock; see the client's.
-	flowClockForTest func() time.Time
+	// flowClockForTest and flowLimitTickerForTest, when set, are every
+	// flow's clock and limit ticker; see the client's.
+	flowClockForTest       func() time.Time
+	flowLimitTickerForTest func() (<-chan time.Time, func(), func())
 }
 
 type serverFlow struct {
@@ -1242,6 +1244,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
 	flow.classifier = classifier.New(s.classifierConfig())
 	flow.clock = s.flowClockForTest
+	flow.limitTicker = s.flowLimitTickerForTest
 	flow.memOwned = s.cfg.Memory == MemoryOwned
 	flow.codedRetrySticky = s.cfg.CodedRetry == CodedRetrySticky
 	flow.carrierShadow = s.carrierShadow

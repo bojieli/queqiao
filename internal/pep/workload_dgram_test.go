@@ -203,6 +203,11 @@ func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 					durationQuantile(answered[kind], 0.50).Round(time.Millisecond),
 					durationQuantile(answered[kind], 0.99).Round(time.Millisecond))
 			}
+			for kind, name := range []string{"reused", "fresh"} {
+				if len(answered[kind]) == 0 {
+					t.Fatalf("no query on a %s association was answered", name)
+				}
+			}
 			over[arm.name] = counts
 		})
 	}
