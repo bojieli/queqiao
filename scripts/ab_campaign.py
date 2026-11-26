@@ -208,6 +208,19 @@ class Client:
 
 
 @dataclass
+class Relay:
+    """A fixed relay hop in front of the gateway ([relay]), as production
+    clients reach their gateway through one: per arm a temporary
+    `queqiaod relay` on `host` listening on that arm's gateway port and
+    forwarding TCP and UDP to the gateway. Clients enroll with, and dial,
+    `address` (the relay's) instead of the gateway's."""
+    host: str
+    address: str
+    platform: str
+    flags: List[str]
+
+
+@dataclass
 class Production:
     name: str
     host: str
@@ -254,6 +267,8 @@ class Config:
     # Sample every host's CPU (and production's) through each trial, for the
     # contention void rule (gates.ini [contention]).
     host_cpu: bool = False
+    # A relay hop in front of the gateway ([relay]); None: clients dial it.
+    relay: Optional[Relay] = None
 
     @property
     def work_dir(self) -> str:
@@ -265,7 +280,7 @@ class Config:
 
     def hosts(self) -> List[str]:
         seen: List[str] = []
-        for h in [self.gateway.host] + [c.host for c in self.clients.values()]:
+        for h in [self.gateway.host] + [c.host for c in self.clients.values()] + ([self.relay.host] if self.relay else []):
             if h not in seen:
                 seen.append(h)
         return seen
@@ -275,7 +290,14 @@ class Config:
         for c in self.clients.values():
             if c.platform not in out:
                 out.append(c.platform)
+        if self.relay and self.relay.platform not in out:
+            out.append(self.relay.platform)
         return out
+
+    @property
+    def endpoint_address(self) -> str:
+        """What clients dial: the relay's address when there is one."""
+        return self.relay.address if self.relay else self.gateway.address
 
     def paths(self) -> List[str]:
         """Clients that are measured paths. The DC workload runs every leaf at
@@ -303,6 +325,9 @@ class Config:
         for ep in (self.wl.endpoints(self) if self.wl else []):
             for port, what in ep.tcp_ports + ep.udp_ports:
                 out.setdefault(g.host, []).append((port, f"{ep.tag} {what}"))
+        if self.relay:
+            for a in self.arms + self.beside_arms():
+                out.setdefault(self.relay.host, []).append((g.port_base + a.index, f"relay {a.name}"))
         for c in self.clients.values():
             for a in self.arms + (self.beside_arms() if c.name in self.paths() else []):
                 out.setdefault(c.host, []).append((c.socks_port_base + a.index, f"client {c.name} socks {a.name}"))
@@ -315,6 +340,21 @@ def load_config(path: str) -> Config:
     if not cp.read(path):
         raise ConfigError(f"cannot read {path}")
     return parse_config(cp)
+
+
+def _relay(cp: configparser.ConfigParser) -> Optional["Relay"]:
+    if not cp.has_section("relay"):
+        return None
+    r = cp["relay"]
+    for k in ("host", "address"):
+        if not r.get(k):
+            raise ConfigError(f"[relay] {k} is required")
+    flags = _words(r.get("flags", "--dial-timeout 3s --idle-timeout 15m --max-connections 8192"))
+    _check_flags("[relay] flags", flags)
+    for f in flags:
+        if f.lstrip("-").split("=", 1)[0] in ("listen", "upstream"):
+            raise ConfigError("[relay] flags: the runner sets --listen and --upstream")
+    return Relay(host=r["host"], address=r["address"], platform=r.get("platform", "linux/amd64"), flags=flags)
 
 
 def _sequential(c) -> Any:
@@ -420,6 +460,7 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  probe_bytes=c.getint("probe_bytes", 1024), probe_interval=c.getfloat("probe_interval", 0.5),
                  snapshot_every=c.getint("snapshot_every", 4), lane_trace=_bool(c.get("lane_trace", "true")),
                  sequential=_sequential(c), host_cpu=_bool(c.get("host_cpu", "false")),
+                 relay=_relay(cp),
                  log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=15")),
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
@@ -1289,9 +1330,11 @@ class Campaign:
             # the gateway's --max-sessions), so a campaign measures the path,
             # not account admission.
             self.must(gh, f"chmod +x {d}/queqiaod\ncd {d} && rm -rf ./state && ./queqiaod provider init --state ./state "
-                      f"--name {cfg.work_dir}-{arm.name} --endpoint {g.address}:{g.port_base + arm.index} >/dev/null && "
+                      f"--name {cfg.work_dir}-{arm.name} --endpoint {cfg.endpoint_address}:{g.port_base + arm.index} >/dev/null && "
                       f"./queqiaod provider add-user --state ./state --name ab --max-flows 0 --max-clients 0 >/dev/null",
                       f"temporary provider state for {arm.name}")
+        if cfg.relay:
+            self.start_relays()
         # Enrollment needs a running gateway; start each, enroll every client, stop.
         for arm in cfg.arms + cfg.beside_arms():
             self.start_gateway(arm, "enroll", enroll=True)
@@ -1711,8 +1754,28 @@ rm -f "$f"''', what=f"stop {tag}")
         self.collect(tagp, clients)
 
     def host_cpu_hosts(self, path: str) -> List[str]:
-        """The hosts a trial on this path loads: the gateway's and its clients'."""
-        return list(dict.fromkeys([self.cfg.gateway.host] + [c.host for c in self.clients_for(path)]))
+        """The hosts a trial on this path loads: the gateway's, the relay's
+        and its clients'."""
+        relay = [self.cfg.relay.host] if self.cfg.relay else []
+        return list(dict.fromkeys([self.cfg.gateway.host] + relay + [c.host for c in self.clients_for(path)]))
+
+    def start_relays(self) -> None:
+        """Per arm, a temporary relay on the relay host on that arm's gateway
+        port, forwarding TCP and UDP to the gateway; the main arm's build for
+        every arm, so the hop is the same for both. Started from the work
+        directory with a pid file, so teardown stops it; it stays up for the
+        whole campaign (a relay keeps no path knowledge)."""
+        cfg, r, g = self.cfg, self.cfg.relay, self.cfg.gateway
+        rh = self.hosts[r.host]
+        W = self.w(r.host)
+        self.must(rh, f"mkdir -p {W}/relay {W}/run", "relay directory")
+        rh.put(self.binary(cfg.main, r.platform, "gateway"), f"{W}/relay/queqiaod")
+        self.must(rh, f"chmod +x {W}/relay/queqiaod", "relay binary")
+        for arm in cfg.arms + cfg.beside_arms():
+            port = g.port_base + arm.index
+            args = [f"{W}/relay/queqiaod", "relay", "--listen", f":{port}", "--upstream", f"{g.address}:{port}", *r.flags]
+            self.spawn(rh, f"relay-{arm.name}", f"{W}/relay", " ".join(_q(a) for a in args))
+            self.wait_port(rh, port, f"relay {arm.name}", f"relay-{arm.name}")
 
     def start_host_cpu(self, name: str, path: str) -> Dict[str, Any]:
         """Start a read-only CPU sampler (a job, so teardown stops it) on every
@@ -2139,7 +2202,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         for line in cfg.wl.plan_notes(cfg):
             p(f"# {line}")
         p(f"# work directory on every host: ~/{cfg.work_dir}")
-        p(f"# gateway host {cfg.gateway.host} ({cfg.gateway.platform}), clients dial {cfg.gateway.address}")
+        p(f"# gateway host {cfg.gateway.host} ({cfg.gateway.platform}), clients dial {cfg.endpoint_address}"
+          + (f" (relay on {cfg.relay.host}, forwarding each arm's port to {cfg.gateway.address})" if cfg.relay else ""))
         for a in cfg.arms:
             src = (a.ref if a.gateway_ref == a.client_ref else f"gateway {a.gateway_ref}, client {a.client_ref}") \
                 if not a.binaries else ", ".join(f"{k}={v}" for k, v in a.binaries.items())

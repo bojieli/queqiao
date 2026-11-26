@@ -134,6 +134,16 @@ built to refuse rather than to trust:
   clean. A job that does not run to its end (ssh dropped, timed out, the
   generator crashed) is a harness failure, not the arm's, and its block gets
   no verdict.
+- **A relay hop is declared, and temporary.** Where production clients
+  reach their gateway through a relay, a `[relay]` section (`host`,
+  `address`, optional `platform` and `flags`) puts the same hop in the
+  measured path: per arm the runner starts `queqiaod relay` (the main arm's
+  build, for both arms) on the relay host on that arm's gateway port,
+  forwarding TCP and UDP to the gateway's same port, and clients enroll with
+  and dial the relay's address. The relay host needs its own
+  `[production:...]` section; its ports are reserved and checked like every
+  other, its relays are stopped by teardown, and with `host_cpu` its CPU and
+  production's are sampled too.
 - **Teardown always runs**, on success, on error, and on SIGINT or SIGTERM.
   It stops every temporary process, checks that no planned port is still
   listening, and removes the work directory (pass `--keep-remote` to keep it).
