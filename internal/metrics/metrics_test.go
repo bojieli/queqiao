@@ -626,6 +626,7 @@ func TestCarrierRecoveryCountersAreExported(t *testing.T) {
 		`queqiao_carrier_rebinds_total{carrier="new"} 1`,
 		"queqiao_carrier_binding_deadline_failures_total 1",
 		"queqiao_carrier_tcp_handoffs_total 0",
+		"queqiao_carrier_path_probes_total 0",
 	} {
 		if !strings.Contains(body, want+"\n") {
 			t.Fatalf("metrics output is missing %q", want)

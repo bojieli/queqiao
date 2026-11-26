@@ -36,6 +36,8 @@ const (
 	// CarrierTCPHandoff: a flow moved to a TCP lane at its latest handoff
 	// start.
 	CarrierTCPHandoff
+	// CarrierPathProbe: a path-return probe was sent on a silent carrier.
+	CarrierPathProbe
 	// CarrierRecoveryEvents is how many events there are.
 	CarrierRecoveryEvents
 )
@@ -52,6 +54,7 @@ var carrierRecoveryMetrics = [CarrierRecoveryEvents]string{
 	`queqiao_carrier_rebinds_total{carrier="new"}`,
 	"queqiao_carrier_binding_deadline_failures_total",
 	"queqiao_carrier_tcp_handoffs_total",
+	"queqiao_carrier_path_probes_total",
 }
 
 // CarrierRecovery records one carrier-manager event.
