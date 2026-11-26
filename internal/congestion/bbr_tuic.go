@@ -393,7 +393,7 @@ func (b *TUICBBRSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 	// adapter boundary; otherwise every packet's sampler flight is one packet
 	// too large and a first packet can never be recognized as opening a flight.
 	preSendFlight := preSendBytesInFlight(bytesInFlight, bytes, retransmittable)
-	if preSendFlight == 0 {
+	if retransmittable && bytes > 0 && b.estimator.opensFlight(uint64(preSendFlight)) || preSendFlight == 0 {
 		b.exitingQuiescence = true
 		b.restartFromIdle(sentTime)
 	}
