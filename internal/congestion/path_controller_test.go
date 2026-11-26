@@ -11,6 +11,7 @@ import (
 	"github.com/apernet/quic-go/monotime"
 
 	"github.com/bojieli/queqiao/internal/lossmodel"
+	"github.com/bojieli/queqiao/internal/pathmodel"
 )
 
 type lossSnapshot = lossmodel.Snapshot
@@ -1507,5 +1508,399 @@ func TestABypassDoesNotFollowAMigration(t *testing.T) {
 	defer next.mu.Unlock()
 	if a.a.bypassed {
 		t.Fatal("a bypass charged on the old controller followed the attachment to the new one")
+	}
+}
+
+// movingPC is an attachment whose key changes with a generation: a move to
+// next when the generation moves, as a client's uplink change does.
+func movingPC(t *testing.T, old, next *PathController, now monotime.Time, latest time.Duration) (*pcConn, *uint64) {
+	t.Helper()
+	gen := new(uint64)
+	seen := uint64(0)
+	p := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+	p.a = old.Attach(func(_, _, _, _ net.Addr) *PathController {
+		if *gen == seen {
+			return nil
+		}
+		seen = *gen
+		return next
+	}, func() (net.Addr, net.Addr) { return nil, nil })
+	p.a.SetGeneration(func() uint64 { return *gen })
+	p.a.OnAttach(now, 0, 1200, func() {})
+	p.a.SetRTTStatsProvider(&fixedRTT{min: latest, smoothed: latest})
+	return p, gen
+}
+
+// The first callback after an uplink change is an ACK of a packet sent on
+// the old uplink: the attachment moves, but that packet's RTT does not
+// become the new path's minimum.
+func TestAMoveTakesNoRTTSampleFromTheOldUplink(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	p, gen := movingPC(t, old, next, now, 5*time.Millisecond)
+	p.send(now, 1200)
+	*gen = 1
+	now = now.Add(5 * time.Millisecond)
+	p.event(now, numbers(0, 1), nil)
+	if p.a.Controller() != next {
+		t.Fatal("the attachment did not move")
+	}
+	next.mu.Lock()
+	min, smoothed := next.rtt.MinRTT(), next.rtt.SmoothedRTT()
+	next.mu.Unlock()
+	if min != 0 || smoothed != 0 {
+		t.Fatalf("the new path's RTT reads min %v, smoothed %v from the old uplink's connection", min, smoothed)
+	}
+	// Its own packets on the new path are sampled as usual.
+	p.send(now, 1200)
+	p.event(now.Add(5*time.Millisecond), []quiccongestion.PacketNumber{1}, nil)
+	next.mu.Lock()
+	min = next.rtt.min
+	next.mu.Unlock()
+	if min == 0 {
+		t.Fatal("the new path took no RTT sample from the attachment's own packet")
+	}
+}
+
+// A packet built without admission -- a PTO probe -- as the first callback
+// after an uplink change is charged to the current path's controller.
+func TestASendAfterAnUplinkChangeIsChargedToTheCurrentPath(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	p, gen := movingPC(t, old, next, now, 100*time.Millisecond)
+	*gen = 1
+	before := next.law.pacer.budget(now)
+	p.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
+	if p.a.Controller() != next {
+		t.Fatal("a send after the uplink change left the attachment on the old controller")
+	}
+	if next.law.pacer.budget(now) >= before {
+		t.Fatal("the probe was not charged to the current path's balance")
+	}
+}
+
+// When CONTROL is the path's turn, a claimant is ready if its own packet
+// fits with CONTROL's allowance -- the control debt -- even though the
+// caller's larger packet does not: the claimant is woken and the caller
+// deferred, rather than refused as for the window.
+func TestAControlClaimantIsJudgedWithTheControlDebt(t *testing.T) {
+	c := newPCController()
+	now := base()
+	claimant := attachPC(t, c, now)
+	caller := &pcConn{t: t, a: c.Attach(nil, nil), sizes: make(map[quiccongestion.PacketNumber]quiccongestion.ByteCount)}
+	caller.a.OnAttach(now, 0, 1500, func() { caller.wakes++ })
+	debt := pathControlDebtPackets * c.maxPacket
+	window := c.law.GetCongestionWindow()
+	// Flight past the window, so that 1,200 bytes fit in the debt and
+	// 1,500 do not.
+	for claimant.inFlight+1200 <= window+debt-1400 {
+		claimant.sendKind(now, 1200, quiccongestion.KindAckPing, true)
+	}
+	claimant.sendKind(now, window+debt-1300-claimant.inFlight, quiccongestion.KindAckPing, true)
+	now = now.Add(time.Second)
+	claimant.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
+	caller.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	if c.arb.Select() != quiccongestion.ClassControl {
+		t.Fatal("setup: CONTROL is not the path's turn")
+	}
+	wakes := claimant.wakes
+	p := caller.a.Admit(now, 1500)
+	if p.OK || p.RetryAt.IsZero() {
+		t.Fatalf("the caller got %+v; want a deferral to the claimant", p)
+	}
+	if claimant.wakes == wakes {
+		t.Fatal("a CONTROL claimant whose packet fits on the debt was not woken")
+	}
+	if q := claimant.a.Admit(now, 1200); !q.OK || q.Turn != quiccongestion.ClassControl {
+		t.Fatalf("the claimant could not use its turn: %+v", q)
+	}
+}
+
+// A discard that unblocks the send order publishes what the estimator then
+// observes: the erasure is current without waiting for another ACK.
+func TestADiscardThatReleasesFatesPublishesTheErasure(t *testing.T) {
+	// The erasure is published through the path model the law reports to.
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	c.clock = func() monotime.Time { return c.now }
+	now := base()
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	head := a.send(now, 1200) // holds the head of the send order
+	for range 400 {
+		b.send(now, 1200)
+	}
+	now = now.Add(100 * time.Millisecond)
+	var lost, acked []quiccongestion.PacketNumber
+	for n := range quiccongestion.PacketNumber(400) {
+		if n%2 == 0 {
+			lost = append(lost, n)
+		} else {
+			acked = append(acked, n)
+		}
+	}
+	b.event(now, acked, lost)
+	if e := c.Telemetry().Erasure; e != 0 {
+		t.Fatalf("setup: erasure %.2f published while the head was unresolved", e)
+	}
+	a.inFlight -= 1200
+	a.a.OnDiscarded(now, a.inFlight, a.refs([]quiccongestion.PacketNumber{head}), false, quiccongestion.DiscardPTOProbe)
+	if e := c.Telemetry().Erasure; e < 0.4 {
+		t.Fatalf("after the discard released half-lost fates the published erasure is %.2f", e)
+	}
+}
+
+// A path controller keeps the path model's bandwidth-share history out of
+// its reports: nothing in path scope reads a share, and keeping the history
+// costs a scan under the controller's lock at every ACK.
+func TestAPathControllerKeepsNoShareHistory(t *testing.T) {
+	model := pathmodel.NewPathModel()
+	c := NewPathController(1200, model, DefaultClassWeights)
+	c.clock = func() monotime.Time { return c.now }
+	now := base()
+	a := attachPC(t, c, now)
+	for range 20 {
+		a.send(now, 1200)
+	}
+	a.event(now.Add(100*time.Millisecond), numbers(0, 20), nil)
+	if share := model.Current().Share; share != 0 {
+		t.Fatalf("the path controller's reports built a bandwidth share of %.0f", share)
+	}
+	if model.Current().ObservedSamples == 0 {
+		t.Fatal("the path controller reported no measurement at all")
+	}
+}
+
+// A spurious-loss correction of a new-path packet times nothing: it does
+// not end the guard, and a later ACK timing a packet from the old uplink
+// still takes no sample.
+func TestASpuriousCorrectionDoesNotEndTheMoveRTTGuard(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	p, gen := movingPC(t, old, next, now, 5*time.Millisecond)
+	oldPacket := p.send(now, 1200)
+	*gen = 1
+	now = now.Add(time.Millisecond)
+	fresh := p.send(now, 1200) // moves, and is the attachment's own packet on next
+	if p.a.Controller() != next {
+		t.Fatal("setup: no move")
+	}
+	p.event(now, nil, []quiccongestion.PacketNumber{fresh})
+	p.a.OnAckEvent(quiccongestion.AckEvent{Time: now, InFlight: p.inFlight, Spurious: p.refs([]quiccongestion.PacketNumber{fresh})})
+	p.event(now.Add(5*time.Millisecond), []quiccongestion.PacketNumber{oldPacket}, nil)
+	next.mu.Lock()
+	min := next.rtt.MinRTT()
+	next.mu.Unlock()
+	if min != 0 {
+		t.Fatalf("after a correction the new path took %v from a packet sent on the old uplink", min)
+	}
+}
+
+// Publishing fates released by a discard settles the balance at the old
+// rate first, as an ACK event does.
+func TestPublishingOutsideAnAckSettlesTheBalance(t *testing.T) {
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	c.clock = func() monotime.Time { return c.now }
+	now := base()
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	head := a.send(now, 1200)
+	for range 10 {
+		b.send(now, 1200)
+	}
+	b.event(now.Add(50*time.Millisecond), numbers(0, 10), nil)
+	later := now.Add(80 * time.Millisecond)
+	a.inFlight -= 1200
+	a.a.OnDiscarded(later, a.inFlight, a.refs([]quiccongestion.PacketNumber{head}), false, quiccongestion.DiscardPTOProbe)
+	c.mu.Lock()
+	settled := c.law.pacer.lastSentTime
+	c.mu.Unlock()
+	if settled != later {
+		t.Fatalf("the balance was last settled at %v, not at the discard that published (%v)", settled, later)
+	}
+}
+
+// After a move to a path whose round trip exceeds the fresh controller's
+// initial fate horizon, the guard still ends on the first sample timing the
+// attachment's own packet: ownership is by packet number, not by fate
+// records that expired while the ACK was on its way.
+func TestTheMoveRTTGuardEndsOnALongRoundTrip(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	p, gen := movingPC(t, old, next, now, 600*time.Millisecond)
+	*gen = 1
+	fresh := p.send(now, 1200) // moves; its record expires before the ACK
+	if p.a.Controller() != next {
+		t.Fatal("setup: no move")
+	}
+	p.event(now.Add(600*time.Millisecond), []quiccongestion.PacketNumber{fresh}, nil)
+	next.mu.Lock()
+	min := next.rtt.MinRTT()
+	next.mu.Unlock()
+	if min != 600*time.Millisecond {
+		t.Fatalf("the new path never learned its round trip (min %v): the guard outlived the attachment's own packet", min)
+	}
+}
+
+// The packet-number boundary outlives the first fresh sample: packets on
+// both sides of a move can share a send time, and a reordered ACK of an old
+// one, arriving after a new one was timed, still carries no sample in.
+func TestTheMoveBoundaryOutlivesTheFirstFreshSample(t *testing.T) {
+	old, next := newPCController(), newPCController()
+	now := base()
+	p, gen := movingPC(t, old, next, now, 50*time.Millisecond)
+	rtt := p.a.connRTT.(*fixedRTT)
+	oldPacket := p.send(now, 1200)
+	*gen = 1
+	fresh := p.send(now, 1200) // same send time, after the move
+	if p.a.Controller() != next {
+		t.Fatal("setup: no move")
+	}
+	p.event(now.Add(50*time.Millisecond), []quiccongestion.PacketNumber{fresh}, nil)
+	rtt.min, rtt.smoothed = time.Millisecond, time.Millisecond // the old packet's sample
+	p.event(now.Add(51*time.Millisecond), []quiccongestion.PacketNumber{oldPacket}, nil)
+	next.mu.Lock()
+	min := next.rtt.MinRTT()
+	next.mu.Unlock()
+	if min != 50*time.Millisecond {
+		t.Fatalf("the new path's minimum is %v: a reordered ACK of an old-path packet was sampled", min)
+	}
+}
+
+// A connection whose path changed between choosing its controller and its
+// installation is guarded as after a migration: its RTT does not seed the
+// new controller, and an ACK of a packet already in flight is not sampled.
+func TestAnInstallationOntoAnotherPathIsGuarded(t *testing.T) {
+	chosen, actual := newPCController(), newPCController()
+	now := base()
+	p := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+	p.a = chosen.Attach(func(_, _, _, _ net.Addr) *PathController { return actual }, func() (net.Addr, net.Addr) { return nil, nil })
+	p.inFlight = 1200 // a packet sent before installation
+	p.sizes[0] = 1200
+	p.next = 1
+	p.a.OnAttach(now, p.inFlight, 1200, func() {})
+	p.a.SetRTTStatsProvider(&fixedRTT{min: 5 * time.Millisecond, smoothed: 5 * time.Millisecond})
+	if p.a.Controller() != actual {
+		t.Fatal("setup: the installation did not switch controllers")
+	}
+	actual.mu.Lock()
+	min := actual.rtt.MinRTT()
+	actual.mu.Unlock()
+	if min != 0 {
+		t.Fatalf("the connection seeded the new path's RTT with %v from the old one", min)
+	}
+	p.event(now.Add(5*time.Millisecond), []quiccongestion.PacketNumber{0}, nil)
+	actual.mu.Lock()
+	min = actual.rtt.MinRTT()
+	actual.mu.Unlock()
+	if min != 0 {
+		t.Fatalf("an ACK of a packet sent before installation set the new path's RTT to %v", min)
+	}
+}
+
+// A PTO demotion that releases siblings' resolved outcomes publishes them
+// at once, as an explicit discard does.
+func TestADemotionThatReleasesFatesPublishesTheErasure(t *testing.T) {
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	c.clock = func() monotime.Time { return c.now }
+	now := base()
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	a.send(now, 1200) // holds the head of the send order
+	for range 400 {
+		b.send(now, 1200)
+	}
+	now = now.Add(100 * time.Millisecond)
+	var lost, acked []quiccongestion.PacketNumber
+	for n := range quiccongestion.PacketNumber(400) {
+		if n%2 == 0 {
+			lost = append(lost, n)
+		} else {
+			acked = append(acked, n)
+		}
+	}
+	b.event(now, acked, lost)
+	if e := c.Telemetry().Erasure; e != 0 {
+		t.Fatalf("setup: erasure %.2f published while the head was unresolved", e)
+	}
+	for range pathProbingPTOProbes {
+		now = now.Add(10 * time.Millisecond)
+		a.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
+	}
+	if e := c.Telemetry().Erasure; e < 0.4 {
+		t.Fatalf("after the demotion released half-lost fates the published erasure is %.2f", e)
+	}
+}
+
+// Releasing only records without an outcome -- a discard of a packet nobody
+// measured -- changes no statistic and publishes nothing.
+func TestReleasingNoOutcomePublishesNothing(t *testing.T) {
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	c.clock = func() monotime.Time { return c.now }
+	now := base()
+	a := attachPC(t, c, now)
+	n := a.send(now, 1200)
+	a.inFlight -= 1200
+	a.a.OnDiscarded(now, a.inFlight, a.refs([]quiccongestion.PacketNumber{n}), false, quiccongestion.DiscardPTOProbe)
+	if s := c.Stats(); s.Publications != 0 {
+		t.Fatalf("a discard that released no outcome published %d measurements", s.Publications)
+	}
+}
+
+// A demotion found from transport progress, before the callback's own time
+// is taken in, publishes with the balance settled at the demotion's time.
+func TestADemotionFromProgressSettlesAtItsOwnTime(t *testing.T) {
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	now := base()
+	clock := now
+	c.clock = func() monotime.Time { return clock }
+	var tp TransportProgress
+	a := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+	a.a = c.Attach(nil, nil)
+	a.a.SetTransportProgress(func() TransportProgress { return tp })
+	a.a.OnAttach(now, 0, 1200, func() {})
+	a.a.SetRTTStatsProvider(&fixedRTT{min: 100 * time.Millisecond, smoothed: 100 * time.Millisecond})
+	b := attachPC(t, c, now)
+	a.send(now, 1200) // holds the head of the send order
+	for range 40 {
+		b.send(now, 1200)
+	}
+	b.event(now.Add(50*time.Millisecond), numbers(0, 40), numbers(40, 40))
+	clock = now.Add(80 * time.Millisecond)
+	tp.PTOExpiries = pathProbingPTOExpiries
+	a.a.OnDemand(quiccongestion.Demand{}) // a callback without a time
+	c.mu.Lock()
+	settled := c.law.pacer.lastSentTime
+	c.mu.Unlock()
+	if settled != clock {
+		t.Fatalf("the demotion's publication settled the balance at %v, not at the demotion (%v)", settled, clock)
+	}
+}
+
+// A PTO probe that demotes its attachment, with the clock already past the
+// probe's send time: the publication the demotion causes settles the
+// balance at the probe's own time, so the probe's debit applies to the
+// balance as of then and the interval to the clock is not credited twice.
+func TestAProbeDemotionSettlesAtTheProbesTime(t *testing.T) {
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	now := base()
+	clock := now
+	c.clock = func() monotime.Time { return clock }
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	a.send(now, 1200) // holds the head of the send order
+	for range 40 {
+		b.send(now, 1200) // and puts the balance in debt
+	}
+	b.event(now.Add(50*time.Millisecond), numbers(0, 20), numbers(20, 40))
+	probeAt := now.Add(60 * time.Millisecond)
+	for range pathProbingPTOProbes - 1 {
+		a.sendKind(probeAt, 1200, quiccongestion.KindPTOProbe, true)
+	}
+	clock = now.Add(90 * time.Millisecond) // the clock runs ahead of the probe
+	c.mu.Lock()
+	want := c.law.pacer.budget(probeAt) - 1200
+	c.mu.Unlock()
+	a.sendKind(probeAt, 1200, quiccongestion.KindPTOProbe, true) // demotes
+	c.mu.Lock()
+	got, last := c.law.pacer.budgetAtLastSent, c.law.pacer.lastSentTime
+	c.mu.Unlock()
+	if last != probeAt || got != want {
+		t.Fatalf("after the demoting probe the balance is %d at %v; want %d at the probe's time %v", got, last, want, probeAt)
 	}
 }

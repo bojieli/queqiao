@@ -219,6 +219,10 @@ class Production:
     # binary, logs): no flag may name them and no work directory may be
     # inside them.
     paths: List[str] = field(default_factory=list)
+    # Read the units' state and executable through `sudo -n` (the snapshot
+    # only; nothing else the campaign does uses sudo). A sudo that fails is
+    # an observation error.
+    snapshot_sudo: bool = False
 
 
 @dataclass
@@ -247,6 +251,9 @@ class Config:
     # Sequential stopping (ab_stats.Sequential): looks after `first_blocks`
     # ... `blocks`; None for a fixed number of blocks.
     sequential: Any = None
+    # Sample every host's CPU (and production's) through each trial, for the
+    # contention void rule (gates.ini [contention]).
+    host_cpu: bool = False
 
     @property
     def work_dir(self) -> str:
@@ -395,7 +402,8 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
             prod.append(Production(name=sec.split(":", 1)[1], host=s["host"], units=_words(s.get("units", "")),
                                    launchd=_words(s.get("launchd", "")), ports=_ports(s.get("ports", "")),
                                    process_pattern=s.get("process_pattern", "queqiao"),
-                                   paths=_words(s.get("paths", ""))))
+                                   paths=_words(s.get("paths", "")),
+                                   snapshot_sudo=_bool(s.get("snapshot_sudo", "false"))))
             for path_ in prod[-1].paths:
                 if not path_.startswith("/") or path_.rstrip("/") == "":
                     raise ConfigError(f"[{sec}] paths must be absolute directories or files, not {path_!r}")
@@ -411,7 +419,7 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  duration=c.getint("duration", 90), gap=c.getfloat("gap", 5.0), block_gap=c.getfloat("block_gap", 10.0),
                  probe_bytes=c.getint("probe_bytes", 1024), probe_interval=c.getfloat("probe_interval", 0.5),
                  snapshot_every=c.getint("snapshot_every", 4), lane_trace=_bool(c.get("lane_trace", "true")),
-                 sequential=_sequential(c),
+                 sequential=_sequential(c), host_cpu=_bool(c.get("host_cpu", "false")),
                  log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=15")),
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
@@ -602,23 +610,29 @@ SNAPSHOT_SH = r'''
 W={work}
 os=$(uname -s)
 echo "os $os"
-for u in {units}; do
+# observe AS UNIT: AS is "" or "sudo -n" (a [production] section with
+# snapshot_sudo, for this observation only; a sudo that fails leaves v empty,
+# an observation error).
+observe() {{
+  S=$1; u=$2
   # unit-error when the unit cannot be observed: the preflight refuses then,
   # rather than comparing two empty observations as "unchanged".
-  if ! v=$(systemctl show "$u" -p LoadState -p ActiveState -p MainPID -p NRestarts -p ExecMainStartTimestampMonotonic 2>/dev/null | sort | tr '\n' ' ') \
+  if ! v=$($S systemctl show "$u" -p LoadState -p ActiveState -p MainPID -p NRestarts -p ExecMainStartTimestampMonotonic 2>/dev/null | sort | tr '\n' ' ') \
      || [ -z "$v" ] || echo "$v" | grep -q 'LoadState=not-found'; then
-    echo "unit-error $u"; continue
+    echo "unit-error $u"; return
   fi
-  pid=$(systemctl show "$u" -p MainPID --value 2>/dev/null)
+  pid=$($S systemctl show "$u" -p MainPID --value 2>/dev/null)
   exe=""; sha=""
   if [ -n "$pid" ] && [ "$pid" != 0 ]; then
-    exe=$(readlink -f /proc/$pid/exe 2>/dev/null); sha=$( (sha256sum "/proc/$pid/exe" 2>/dev/null || true) | cut -c1-64)
+    exe=$($S readlink -f /proc/$pid/exe 2>/dev/null); sha=$( ($S sha256sum "/proc/$pid/exe" 2>/dev/null || true) | cut -c1-64)
     # A running unit whose executable cannot be read or hashed is not
     # observed: two empty identities must never compare as "unchanged".
-    if [ -z "$exe" ] || [ ${{#sha}} -ne 64 ]; then echo "unit-error $u"; continue; fi
+    if [ -z "$exe" ] || [ ${{#sha}} -ne 64 ]; then echo "unit-error $u"; return; fi
   fi
   echo "unit $u $v exe=$exe sha=$sha"
-done
+}}
+for u in {units}; do observe "" "$u"; done
+for u in {sudo_units}; do observe "sudo -n" "$u"; done
 for l in {launchd}; do
   v=$(launchctl list 2>/dev/null | awk -v l="$l" '$3==l{{print $1, $2}}')
   if [ -n "$v" ]; then echo "launchd $l $v"; else echo "unit-error $l"; fi
@@ -946,6 +960,29 @@ def cpu_sampler(pid_file: str, out_file: str) -> str:
   done ) > {out_file} 2>/dev/null < /dev/null &'''
 
 
+HOST_CPU_EVERY = 2   # seconds between host CPU samples
+
+
+def host_cpu_sampler(stop_file: str, units: Sequence[str]) -> str:
+    """Read-only shell that samples the host's CPU and production's, every
+    HOST_CPU_EVERY s until the stop file appears: lines "S <epoch ms> <the
+    /proc/stat cpu fields user nice system idle iowait irq softirq steal>
+    <load1> <production units' utime+stime ticks, or nan> <cpus>". Nothing
+    here needs or uses sudo: /proc/<pid>/stat is world-readable."""
+    return (NOW_SH + f"stop={stop_file}\npids=''\n"
+            f"for u in {' '.join(_q(u) for u in units)}; do "
+            "p=$(systemctl show -p MainPID --value \"$u\" 2>/dev/null); "
+            "[ -n \"$p\" ] && [ \"$p\" != 0 ] && pids=\"$pids $p\"; done\n"
+            "n=$(nproc 2>/dev/null || echo 1)\n"
+            "while [ ! -e \"$stop\" ]; do\n"
+            "  set -- $(head -1 /proc/stat 2>/dev/null)\n"
+            "  pt=0; for p in $pids; do x=$(awk '{print $14+$15}' /proc/$p/stat 2>/dev/null); "
+            "if [ -n \"$x\" ]; then pt=$((pt + x)); else pt=nan; break; fi; done\n"
+            "  [ \"$1\" = cpu ] && echo \"S $(now) $2 $3 $4 $5 $6 $7 $8 $9 $(cut -d' ' -f1 /proc/loadavg) $pt $n\"\n"
+            f"  sleep {HOST_CPU_EVERY}\n"
+            "done\nrm -f \"$stop\"")
+
+
 def utc(t: float) -> str:
     return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
@@ -1001,10 +1038,12 @@ class Campaign:
         for p in self.cfg.production:
             by_host.setdefault(p.host, []).append(p)
         for host, prods in by_host.items():
-            units = " ".join(_q(u) for p in prods for u in p.units)
+            units = " ".join(_q(u) for p in prods if not p.snapshot_sudo for u in p.units)
+            sudo_units = " ".join(_q(u) for p in prods if p.snapshot_sudo for u in p.units)
             launchd = " ".join(_q(u) for p in prods for u in p.launchd)
             pattern = "|".join(p.process_pattern for p in prods if p.process_pattern) or "queqiao"
-            script = SNAPSHOT_SH.format(work=_q(self.w(host)), units=units, launchd=launchd, pattern=_q(pattern))
+            script = SNAPSHOT_SH.format(work=_q(self.w(host)), units=units, sudo_units=sudo_units, launchd=launchd,
+                                        pattern=_q(pattern))
             rc, text = self.hosts[host].run(script, what=f"read-only production snapshot ({tag})")
             if not self.dry and rc != 0:
                 raise Refused(f"{host}: snapshot failed (exit {rc}): {text.strip()[:400]}")
@@ -1648,8 +1687,13 @@ rm -f "$f"''', what=f"stop {tag}")
             self.scrape(arm, name + "-pre")
             for c in clients:
                 self.scrape_client(c, arm, name + "-pre")
-            for phase in cfg.wl.type_phases(cfg, path, trial):
-                self.run_phase(s, arm, phase, writer)
+            samplers = self.start_host_cpu(name, path) if cfg.host_cpu else None
+            try:
+                for phase in cfg.wl.type_phases(cfg, path, trial):
+                    self.run_phase(s, arm, phase, writer)
+            finally:
+                if samplers is not None:
+                    self.stop_host_cpu(name, samplers)
             self.scrape(arm, name + "-post")
             for c in clients:
                 self.scrape_client(c, arm, name + "-post")
@@ -1665,6 +1709,45 @@ rm -f "$f"''', what=f"stop {tag}")
         for arm in cfg.arms:
             self.stop(self.hosts[cfg.gateway.host], f"gw-{arm.name}")
         self.collect(tagp, clients)
+
+    def host_cpu_hosts(self, path: str) -> List[str]:
+        """The hosts a trial on this path loads: the gateway's and its clients'."""
+        return list(dict.fromkeys([self.cfg.gateway.host] + [c.host for c in self.clients_for(path)]))
+
+    def start_host_cpu(self, name: str, path: str) -> Dict[str, Any]:
+        """Start a read-only CPU sampler (a job, so teardown stops it) on every
+        host the trial loads; returns what stop_host_cpu needs."""
+        out: Dict[str, Any] = {}
+        for host in self.host_cpu_hosts(path):
+            h = self.hosts[host]
+            stop = f"{self.w(host)}/run/stop-hostcpu"
+            h.run(f"rm -f {stop}", what=f"clear the host CPU sampler's stop file on {host}")
+            units = [u for p in self.cfg.production if p.host == host for u in p.units]
+            script = self.as_job(host, host_cpu_sampler(stop, units))
+            res: Dict[str, Any] = {}
+
+            def go(h=h, script=script, res=res, host=host):
+                try:
+                    res["rc"], res["out"] = h.run(script, timeout=6 * 3600, what=f"host CPU sampler on {host} ({name})")
+                except Exception as e:  # recorded as missing evidence, not a dead campaign
+                    res["rc"], res["out"] = -1, ""
+                    self.log(f"host CPU sampler on {host} failed: {e}")
+            th = threading.Thread(target=go, daemon=True)
+            th.start()
+            out[host] = (th, stop, res)
+        return out
+
+    def stop_host_cpu(self, name: str, samplers: Dict[str, Any]) -> None:
+        """Stop the samplers and keep their samples as hostcpu/<name>-<host>.tsv."""
+        for host, (th, stop, res) in samplers.items():
+            self.hosts[host].run(f"touch {stop}", what=f"stop the host CPU sampler on {host}")
+        for host, (th, stop, res) in samplers.items():
+            th.join(timeout=60)
+            if self.dry:
+                continue
+            os.makedirs(os.path.join(self.out, "hostcpu"), exist_ok=True)
+            with open(os.path.join(self.out, "hostcpu", f"{name}-{host}.tsv"), "w") as f:
+                f.write("".join(line[2:] + "\n" for line in (res.get("out") or "").splitlines() if line.startswith("S ")))
 
     def collect(self, tagp: str, clients: List[Client], arms: Optional[List[Arm]] = None,
                 out: Optional[str] = None) -> None:
@@ -1837,6 +1920,9 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                     # Behaviour switches every arm's endpoints also get, for
                     # the flip's final-bundle identity.
                     "gateway_flags": cfg.gateway.flags,
+                    # Hosts whose CPU each path's trials record (host_cpu).
+                    "hostcpu_hosts": {p: self.host_cpu_hosts(p) for p in cfg.paths()} if cfg.host_cpu else None,
+                    "gateway_host": cfg.gateway.host,
                     # The gates in force, frozen before the first block: the
                     # analyzer refuses a verdict under other ones.
                     "gates_sha256": gates_digest(),

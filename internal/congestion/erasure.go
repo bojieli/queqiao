@@ -650,6 +650,17 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 // controller. A PathController observes the outcomes itself, in send order,
 // and then calls this.
 func (e *ErasureSender) afterOutcomes(priorInFlight quiccongestion.ByteCount, eventTime monotime.Time, acked []quiccongestion.AckedPacketInfo, lost []quiccongestion.LostPacketInfo) {
+	e.publishMeasurement()
+	e.passed.Add(uint64(len(lost)))
+	e.inner.OnCongestionEventEx(priorInFlight, eventTime, acked, lost)
+}
+
+// publishMeasurement publishes what the estimator has observed: the
+// sample and congestive figures, the path model's erasure, and the
+// compensation that rides on it. A path controller also calls it when fates
+// are observed outside an acknowledgement event -- a discard or a detach
+// that unblocks the send order -- so readers do not wait for the next ACK.
+func (e *ErasureSender) publishMeasurement() {
 	snapshot := e.estimator.Snapshot()
 	if snapshot.Samples > 0 {
 		e.samples.Store(uint64(snapshot.Samples))
@@ -664,10 +675,19 @@ func (e *ErasureSender) afterOutcomes(priorInFlight quiccongestion.ByteCount, ev
 		// Pool with the other lanes: the estimate converges on all their
 		// samples together, and the share is what stops their probes
 		// compounding.
+		delivered := float64(e.inner.bandwidth())
+		if e.authority {
+			// A path controller divides nothing, so it keeps the model's
+			// bandwidth-share history out of it: a delivered rate would
+			// make every report append to and scan that history, under
+			// the lock every sibling's admission waits on, for a share
+			// nothing reads.
+			delivered = 0
+		}
 		state := e.path.Report(e.id(), pathmodel.Observation{
 			Erasure: snapshot.Loss, BurstFactor: snapshot.BurstFactor,
 			ObservedSamples: float64(snapshot.Decided),
-			Delivered:       float64(e.inner.bandwidth()),
+			Delivered:       delivered,
 			RoundTrip:       e.inner.minRoundTrip(),
 		})
 		erasure = state.Erasure
@@ -696,9 +716,6 @@ func (e *ErasureSender) afterOutcomes(priorInFlight quiccongestion.ByteCount, ev
 	if _, minRTT := e.queueDelay(); minRTT > 0 {
 		e.arrival.Store(uint64(e.compensationFor(1-erasure) * partsPerMillion))
 	}
-
-	e.passed.Add(uint64(len(lost)))
-	e.inner.OnCongestionEventEx(priorInFlight, eventTime, acked, lost)
 }
 
 func (e *ErasureSender) OnRetransmissionTimeout(retransmitted bool) {

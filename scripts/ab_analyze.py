@@ -87,6 +87,9 @@ def load_gates(path: str = GATES) -> dict:
             "resamples": p.getint("bootstrap_resamples"), "seed": p.getint("bootstrap_seed"),
             "max_zero_main_fraction": p.getfloat("max_zero_main_fraction"),
             "secondary_min_coverage": p.getfloat("secondary_min_coverage", fallback=1.0),
+            "contention": ({k: cp["contention"].getfloat(k) for k in ("busy_threshold", "production_share_max",
+                                                                       "steal_max_fraction")}
+                           if cp.has_section("contention") else None),
             "pilot_blocks": w.getint("pilot_blocks"), "power": w.getfloat("power"),
             "true_ratio": w.getfloat("true_ratio"), "secondary": sec}
 
@@ -332,6 +335,83 @@ def read_campaign(campaign: str) -> Tuple[dict, Dict[Tuple[int, str, int], Trial
                 if t is not None:
                     t.records.append(rec)
     return plan, trials
+
+
+def host_cpu(campaign: str, t: "Trial", host: str, busy_threshold: float = 0.90) -> Optional[dict]:
+    """A trial's host CPU over its window, from the runner's samples
+    (host_cpu): "mean" busy share, "hot" the fraction of sample intervals at
+    or above busy_threshold, "production" production's share of all CPU
+    time, "steal" the share stolen by the hypervisor. None when no two
+    samples fall in the window."""
+    p = os.path.join(campaign, "hostcpu", f"{t.tag}-s{t.slot}-{t.arm}-{host}.tsv")
+    try:
+        lines = open(p).read().split("\n")
+    except OSError:
+        return None
+    rows = []
+    for line in lines:
+        f = line.split()
+        if len(f) != 12:
+            continue
+        try:
+            when = float(f[0]) / (1000.0 if float(f[0]) > 1e11 else 1.0)
+            ticks = [float(x) for x in f[1:9]]
+        except ValueError:
+            continue
+        prod = float(f[10]) if f[10] != "nan" else float("nan")
+        rows.append((when, ticks, prod))
+    rows = [r for r in rows if t.start - 1 <= r[0] <= t.end + 1]
+    if len(rows) < 2:
+        return None
+    intervals, total, prod_ticks, steal = [], 0.0, 0.0, 0.0
+    for (_, a_, pa), (_, b_, pb) in zip(rows, rows[1:]):
+        d = [y - x for x, y in zip(a_, b_)]
+        tot = sum(d)
+        if tot <= 0:
+            continue
+        intervals.append(1.0 - (d[3] + d[4]) / tot)       # all but idle and iowait
+        total += tot
+        steal += d[7]
+        prod_ticks += pb - pa
+    if not intervals:
+        return None
+    return {"mean": sum(intervals) / len(intervals),
+            "hot": sum(1 for x in intervals if x >= busy_threshold) / len(intervals),
+            "production": prod_ticks / total if total else float("nan"),
+            "steal": steal / total if total else float("nan")}
+
+
+def contention_void(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], "Trial"],
+                    bounds: Optional[dict]) -> Tuple[Dict[Tuple[int, str, str], str], Dict[Tuple[str, str], dict]]:
+    """Units (block, path, trial type) void under contention, with why, and
+    each trial's host CPU by (trial key, host). A unit is void when, in any
+    of its trials on any loaded host, production took more than its allowed
+    share of the host's CPU, the hypervisor stole more than its allowed
+    share (a neighbour contending, which hits the arms unpredictably), or
+    the CPU record or production's CPU is missing. A host busy with the test
+    itself is not contention of production: it is reported (an arm may be
+    CPU-bound), not voided."""
+    void: Dict[Tuple[int, str, str], str] = {}
+    cpu: Dict[Tuple[str, str], dict] = {}
+    hosts = (plan.get("hostcpu_hosts") or {})
+    if not plan.get("config", {}).get("host_cpu") or not bounds:
+        return void, cpu
+    for key, t in trials.items():
+        if key[2] >= 100:
+            continue
+        for host in hosts.get(t.path, []):
+            c = host_cpu(campaign, t, host, bounds["busy_threshold"])
+            cpu[(t.tag + f"-s{t.slot}", host)] = c
+            if c is None:
+                void.setdefault(t.unit, f"no CPU record of {host} in slot {t.slot}")
+                continue
+            if not c["production"] == c["production"]:
+                void.setdefault(t.unit, f"production CPU on {host} unreadable in slot {t.slot}")
+            elif c["production"] > bounds["production_share_max"]:
+                void.setdefault(t.unit, f"production took {c['production']:.0%} of {host}'s CPU in slot {t.slot}")
+            if c["steal"] > bounds["steal_max_fraction"]:
+                void.setdefault(t.unit, f"{c['steal']:.0%} of {host}'s CPU stolen by the hypervisor in slot {t.slot}")
+    return void, cpu
 
 
 def fetch_failed(campaign: str) -> List[str]:
@@ -717,6 +797,12 @@ def report(campaign: str, gates: dict, interim: bool = False,
     EFFECTIVE.clear()
     sq = sequential_of(plan)
     problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run, failures=failures)
+    # Contention: units void under host CPU contention are not evidence (they
+    # still counted toward the cap when they ran).
+    void_units, cpu_of = contention_void(campaign, plan, trials, gates.get("contention"))
+    all_trials = dict(trials)
+    if void_units:
+        trials = {k: t for k, t in trials.items() if t.unit not in void_units}
     frozen = plan.get("gates_sha256")
     if frozen and gates.get("sha256") and frozen != gates["sha256"]:
         # The rules (and the stopping looks) the campaign ran under are not
@@ -800,6 +886,10 @@ def report(campaign: str, gates: dict, interim: bool = False,
     if problems:
         out += ["", "**No verdict: the campaign is incomplete.** " + "; ".join(problems) + ". "
                 "The numbers below are for diagnosis only."]
+    if void_units:
+        out += ["", f"**{len(void_units)} block(s) void under contention** (not evidence; they counted toward the "
+                "cap): " + "; ".join(f"block {b} on {p}{' ' + ty if ty else ''}: {why}"
+                                     for (b, p, ty), why in sorted(void_units.items()))]
     if EFFECTIVE:
         out.append("")
         out.append("Effective configuration, from each endpoint's runtime configuration record:")
@@ -834,8 +924,35 @@ def report(campaign: str, gates: dict, interim: bool = False,
         pooled = {a: [x for t in pts[a] for x in t.m.get("_transit", [])] for a in arms}
         row("flow-ACK transit p50 / p90, s (pooled)", [f"{fmt(st.quantile(pooled[a], .5), '.3f')} / {fmt(st.quantile(pooled[a], .9), '.3f')}" for a in arms])
         row("client CPU p90, cores (median)", [fmt(med(a, "cpu_p90"), ".2f") for a in arms])
+        # Host CPU per arm over all its trials, void ones included, so an
+        # arm that burns more CPU shows.
+        cpu_bound: List[str] = []
+        for host in (plan.get("hostcpu_hosts") or {}).get(path, []):
+            def host_stat(arm_, k, host=host):
+                xs = [cpu_of.get((t.tag + f"-s{t.slot}", host)) for t in all_trials.values()
+                      if t.path == path and t.arm == arm_]
+                xs = [x[k] for x in xs if x and x[k] == x[k]]
+                return st.mean(xs)
+            label = "gateway" if host == plan.get("gateway_host") else "client"
+            thr = (gates.get("contention") or {}).get("busy_threshold", 0.90)
+            row(f"{label} host CPU busy, mean", [fmt(host_stat(a, "mean"), ".0%") for a in arms])
+            row(f"{label} host share of the window at or above {thr:.0%} CPU, mean",
+                [fmt(host_stat(a, "hot"), ".0%") for a in arms])
+            row(f"{label} host production CPU share, mean", [fmt(host_stat(a, "production"), ".1%") for a in arms])
+            row(f"{label} host CPU stolen, mean", [fmt(host_stat(a, "steal"), ".1%") for a in arms])
+            for a_ in arms:
+                ts_ = [cpu_of.get((t.tag + f"-s{t.slot}", host)) for t in all_trials.values()
+                       if t.path == path and t.arm == a_]
+                ts_ = [x for x in ts_ if x]
+                bound = sum(1 for x in ts_ if x["hot"] > 0.5)
+                if ts_ and bound > len(ts_) / 2:
+                    cpu_bound.append(f"`{a_}` on the {label} host ({bound} of {len(ts_)} trials at or above "
+                                     f"{thr:.0%} CPU for most of their window)")
         if any(t.m.get("interactive_p99_s") == t.m.get("interactive_p99_s") for a in arms for t in pts[a]):
             row("interactive p99, s (median)", [fmt(med(a, "interactive_p99_s"), ".3f") for a in arms])
+        if cpu_bound:
+            out += ["", "**CPU-bound:** " + "; ".join(cpu_bound) + ". Its bulk numbers may be limited by the "
+                    "host's CPU rather than by the network."]
 
         judged: Dict[str, int] = {}
         if wl.primary:
