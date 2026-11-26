@@ -167,6 +167,12 @@ type Config struct {
 	// sending bulk may still code a sparse write, so the lane's answer for it
 	// can differ. Nil uses Reliable.
 	ReliableSparse func(laneID uint64) bool
+	// ReadDone, when set, is told of each completed read from the source --
+	// a staged read together with its fill -- and whether it filled what it
+	// was offered, which is the evidence that the source had more. A fill the
+	// source cannot do leaves the staging read standing as full. It is
+	// called from the producer without the scheduler's lock.
+	ReadDone func(full bool)
 	// ForceReliable pins selected byte ranges to a reliable carrier even when
 	// the lane normally uses datagrams. The decision is snapshotted at dispatch
 	// just like Reliable, so an in-flight recovery cannot change substrates
@@ -511,6 +517,8 @@ func (s *Scheduler) produce() {
 			buf      []byte
 			n        int
 			reserved int
+			// reported says readStaged already told ReadDone.
+			reported bool
 			// drained says the read returned less than it had room for,
 			// which is the evidence that the source had nothing more: a
 			// read that filled its buffer was limited by the scheduler, not
@@ -529,10 +537,16 @@ func (s *Scheduler) produce() {
 			drained = n < len(buf)
 		} else {
 			var ok bool
-			buf, n, reserved, drained, ok, err = s.readStaged(staging[:min(len(staging), allowance)], allowance)
+			buf, n, reserved, drained, reported, ok, err = s.readStaged(staging[:min(len(staging), allowance)], allowance)
 			if !ok {
 				return
 			}
+		}
+		if n > 0 && s.cfg.ReadDone != nil && !reported {
+			// The logical read is complete -- a staged read with its fill,
+			// however many source reads that took -- and only now is it
+			// known whether it filled what it was offered.
+			s.cfg.ReadDone(!drained)
 		}
 		if !s.publish(buf, n, reserved, drained, err) {
 			return
@@ -597,10 +611,10 @@ func (s *Scheduler) waitForRoom() (int, bool) {
 // readStaged blocks on the application holding no shared memory, then
 // reserves exactly the allocation the bytes in hand need. ok is false when
 // the scheduler closed while it waited for memory.
-func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, drained, ok bool, err error) {
+func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, drained, reported, ok bool, err error) {
 	n, err = s.src.Read(staging)
 	if n <= 0 {
-		return nil, 0, 0, false, true, err
+		return nil, 0, 0, false, false, true, err
 	}
 	drained = n < len(staging)
 	size := n
@@ -612,6 +626,13 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 	// for room they may not need.
 	fill := canFill && err == nil && n == len(staging) && allowance > n &&
 		s.cfg.Memory.TryAcquire(allowance)
+	if !fill && s.cfg.ReadDone != nil {
+		// No fill: the staging read is the whole read, and it is complete
+		// now -- before waiting for memory, which says nothing about the
+		// source and must not make a prompt read look late.
+		s.cfg.ReadDone(!drained)
+		reported = true
+	}
 	if fill {
 		size = allowance
 	} else if acquireErr := s.cfg.Memory.Acquire(s.producerCtx, size); acquireErr != nil {
@@ -622,7 +643,7 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 			s.ready.Broadcast()
 		}
 		s.mu.Unlock()
-		return nil, 0, 0, false, false, nil
+		return nil, 0, 0, false, reported, false, nil
 	}
 	buf = make([]byte, size)
 	copy(buf, staging[:n])
@@ -651,7 +672,7 @@ func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, re
 			buf, reserved = short, n
 		}
 	}
-	return buf, n, reserved, drained, true, err
+	return buf, n, reserved, drained, reported, true, err
 }
 
 // publish files what one read produced. It reports false when the producer

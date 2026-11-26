@@ -463,14 +463,24 @@ type multipathFlow struct {
 	// pending since drainPendingAt becomes a drain unless a read of at least
 	// fullReadBytes follows within refillWindow, and lastReadFull says whether
 	// the latest read filled its buffer. All under ackMu.
-	refillMode    bool
-	fullReadBytes int
-	// refillThreshold is the classifier's threshold in refill mode, the
-	// backlog reported while a full-read stretch is unbroken.
+	//
+	// refillTracking is set for every phased flow once its threshold is
+	// fitted: a drain is then always held pending for refillWindow, because
+	// one coalesced acknowledgement can release a whole flight whatever the
+	// threshold. refillThreshold is the fitted threshold; continuing says a
+	// prompt full refill has taken the room the last drain opened, so the
+	// stretch goes on even if what is outstanding is below the threshold.
+	refillTracking  bool
+	refillMode      bool
+	fullReadBytes   int
 	refillThreshold uint64
 	drainPending    bool
 	drainPendingAt  time.Time
 	lastReadFull    bool
+	continuing      bool
+	// readInProgress says source bytes were counted for a logical read the
+	// scheduler has not yet reported complete.
+	readInProgress bool
 	// ackSampleHook and afterAckSampleHook, when set by a test, run just
 	// before and just after an observation samples the acknowledgement state.
 	ackSampleHook, afterAckSampleHook func()
@@ -3615,7 +3625,7 @@ func (f *multipathFlow) observeLocked(n int, up, publish bool, bufLen int) bool 
 	if f.ackSampleHook != nil {
 		f.ackSampleHook()
 	}
-	upBytes, downBytes, sendBacklog, backlogDrained := f.countAndSample(now, n, up, publish, bufLen)
+	upBytes, downBytes, sendBacklog, backlogDrained, backlogProvisional := f.countAndSample(now, n, up, publish, bufLen)
 	if f.afterAckSampleHook != nil {
 		f.afterAckSampleHook()
 	}
@@ -3653,10 +3663,11 @@ func (f *multipathFlow) observeLocked(n int, up, publish bool, bufLen int) bool 
 		SmallBidirectionalBursts: recentUp <= smallExchangeBytes && recentDown <= smallExchangeBytes,
 		// What this endpoint has read from its application and the peer has
 		// not acknowledged. Only the phased classifier reads it.
-		SendBacklog:    sendBacklog,
-		BacklogDrained: backlogDrained,
-		SmoothedRTT:    time.Duration(f.currentRTTNS.Load()),
-		CarriedPayload: n > 0,
+		SendBacklog:        sendBacklog,
+		BacklogDrained:     backlogDrained,
+		BacklogProvisional: backlogProvisional,
+		SmoothedRTT:        time.Duration(f.currentRTTNS.Load()),
+		CarriedPayload:     n > 0,
 	}
 	oldClass := classifier.Class(f.class.Load())
 	newClass := f.classifier.Observe(obs)
