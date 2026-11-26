@@ -874,9 +874,16 @@ func runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T, limits *Mem
 	// QUIC lane. That asked whether the rescue happens to sort first, not
 	// whether it happened, and it is why this test failed roughly half the
 	// time on the CI runner while passing everywhere else.
+	//
+	// The QUIC connection itself stays healthy: only the flow's stream is
+	// closed. Under carrier recovery (design §10.3) that is a lost binding on
+	// a live carrier, so the flow is rebound by one JOIN on the same carrier;
+	// a TCP handoff is the carrier manager's answer only when no carrier is
+	// usable. Either replacement keeps the flow, and the payload below must
+	// arrive whole across it, replay included.
 	deadline := time.Now().Add(20 * time.Second)
-	closedQUIC := false
-	rescuedTCP := false
+	var closed *mpLane
+	replaced := false
 	for time.Now().Before(deadline) {
 		server.sessionsMu.RLock()
 		var sessionFlow *serverFlow
@@ -884,36 +891,36 @@ func runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T, limits *Mem
 			sessionFlow = candidate
 			break
 		}
-		var quicLane *mpLane
-		haveTCP := false
+		var quicLane, replacement *mpLane
 		if sessionFlow != nil {
 			for _, lane := range sessionFlow.flow.healthyLanes() {
-				switch lane.kind {
-				case TransportQUIC:
-					if quicLane == nil {
-						quicLane = lane
-					}
-				case TransportTCP:
-					haveTCP = true
+				if lane == closed {
+					continue
+				}
+				if closed != nil {
+					replacement = lane
+				} else if lane.kind == TransportQUIC && quicLane == nil {
+					quicLane = lane
 				}
 			}
 		}
 		server.sessionsMu.RUnlock()
-		if quicLane != nil && !closedQUIC {
+		if quicLane != nil && closed == nil {
 			_ = quicLane.fc.Close()
-			closedQUIC = true
+			closed = quicLane
 		}
-		if closedQUIC && haveTCP {
-			rescuedTCP = true
+		if closed != nil && replacement != nil {
+			t.Logf("the flow's replacement lane is %s", replacement.kind)
+			replaced = true
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !closedQUIC {
+	if closed == nil {
 		t.Fatal("initial QUIC lane was not established")
 	}
-	if !rescuedTCP {
-		t.Fatal("TCP rescue lane was not established")
+	if !replaced {
+		t.Fatal("the flow got no replacement lane after its QUIC lane failed")
 	}
 
 	if err := <-writeErr; err != nil {
