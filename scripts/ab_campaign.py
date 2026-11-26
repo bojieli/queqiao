@@ -271,6 +271,8 @@ class Config:
     host_cpu: bool = False
     # A relay hop in front of the gateway ([relay]); None: clients dial it.
     relay: Optional[Relay] = None
+    # Network impairment on the path's client host ([impair], ab_impair).
+    impair: Any = None
 
     @property
     def work_dir(self) -> str:
@@ -357,6 +359,14 @@ def _relay(cp: configparser.ConfigParser) -> Optional["Relay"]:
         if f.lstrip("-").split("=", 1)[0] in ("listen", "upstream"):
             raise ConfigError("[relay] flags: the runner sets --listen and --upstream")
     return Relay(host=r["host"], address=r["address"], platform=r.get("platform", "linux/amd64"), flags=flags)
+
+
+def _impair(cp: configparser.ConfigParser) -> Any:
+    import ab_impair
+    try:
+        return ab_impair.parse(cp)
+    except ValueError as e:
+        raise ConfigError(str(e))
 
 
 def _sequential(c) -> Any:
@@ -462,10 +472,16 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  probe_bytes=c.getint("probe_bytes", 1024), probe_interval=c.getfloat("probe_interval", 0.5),
                  snapshot_every=c.getint("snapshot_every", 4), lane_trace=_bool(c.get("lane_trace", "true")),
                  sequential=_sequential(c), host_cpu=_bool(c.get("host_cpu", "false")),
-                 relay=_relay(cp),
+                 relay=_relay(cp), impair=_impair(cp),
                  log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=3")),
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
+    if wl.impairs and not cfg.impair:
+        raise ConfigError(f"workload {cfg.workload} runs under network impairment: it needs an [impair] section")
+    if cfg.impair and not wl.impairs:
+        raise ConfigError(f"[impair]: workload {cfg.workload} has no impairment scenarios")
+    if cfg.impair and cfg.impair.host not in cfg.hosts():
+        raise ConfigError(f"[impair] host {cfg.impair.host} is not a host of the campaign")
     if cfg.sequential and (wl.analyzer != "ab_analyze" or wl.primary or wl.sample_based):
         # The stopping looks decide [workload:...] rules; a workload judged by
         # the primary gate with its [secondary] bounds, by samples, or by
@@ -1129,6 +1145,9 @@ class Campaign:
         # Failed jobs that are the arm's evidence (a timeout, a job lost or
         # silent on a reachable host), for the report.
         self.workload_failures: List[dict] = []
+        # The network impairment ([impair]), if any.
+        import ab_impair
+        self.impair = ab_impair.Impairer(self, cfg.impair) if cfg.impair else None
         self.stopped = ""
         self.stopped_types: Dict[str, str] = {}
         self.beside_threads: List[threading.Thread] = []
@@ -1207,9 +1226,23 @@ class Campaign:
                   f"a process under ~/{self.cfg.work_dir}/ is already running:", file=self.stream)
             for host, ports in self.cfg.planned_ports().items():
                 print(f"    {host}: " + ", ".join(f"{p} ({w})" for p, w in ports), file=self.stream)
+            if self.impair:
+                print(f"[preflight] impairment on {self.impair.icfg.host}: would refuse unless it is root, the route to "
+                      f"{self.impair.remote} leaves by the impaired interface, that interface has no clsact or ingress "
+                      f"qdisc, no {'/'.join(self.impair.ifb('b') + self.impair.ifb('w'))} device exists, and no filter "
+                      "port is declared production or inside either end's ephemeral range; then snapshot every "
+                      "interface's tc state", file=self.stream)
+                for r in self.impair.config_reasons():
+                    print(f"    REFUSE {r}", file=self.stream)
+                for s, ports in self.impair.ports.items():
+                    if ports:
+                        print(f"    filter set {s}: IPv4 to/from {self.impair.remote}, UDP and TCP, remote port "
+                              f"{ports[0]}-{ports[-1]}", file=self.stream)
             self.reserve()
             return
         reasons = refusal_reasons(self.cfg, self.before) + self.canonical_path_reasons()
+        if self.impair:
+            reasons += self.impair.preflight_reasons()
         if reasons:
             raise Refused("\n".join(reasons))
         self.reserve()
@@ -1741,6 +1774,8 @@ rm -f "$f"''', what=f"stop {tag}")
         t0, t1, rc, out = result
         if rc == 0 and not out.strip() and not self.dry:
             rc = JOB_NO_RECORD       # ran, but left no record at all
+        if rc != 0 and getattr(gen, "harness", False):
+            rc = JOB_KILLED_BY_RUNNER     # the harness's own job (the impairment's outages) failed
         if rc in CONTROL_PLANE:
             # The runner lost the job: its host unreachable through every ssh
             # retry, or the runner itself killed it tearing down. Harness
@@ -1789,6 +1824,9 @@ rm -f "$f"''', what=f"stop {tag}")
         self.beside_results: Dict[Tuple[str, str], Tuple[float, float, int, str]] = {}
         self.beside_slots: List[Tuple[Slot, Arm, Any]] = []
         self.log(f"{beside.name}: starting its sessions beside the blocks")
+        if beside.impair and self.impair:
+            # Its own ports, for the whole session (its set-up included).
+            self.impair.apply("w", beside.impair, beside.phase.duration + beside.ready_seconds + 240)
         for arm in cfg.beside_arms():
             self.start_gateway(arm, f"server-{beside.name}")
         ready: List[Tuple[Host, str]] = []
@@ -1842,6 +1880,9 @@ rm -f "$f"''', what=f"stop {tag}")
         cfg = self.cfg
         for th in self.beside_threads:
             th.join(timeout=beside.phase.duration + 240)
+        if beside.impair and self.impair and self.impair.remove("w"):
+            self.beside_impair_fired = True
+            self.log(f"{beside.name}: the impairment watchdog fired before the session ended")
         clients = [cfg.clients[p] for p in cfg.paths()]
         for c in clients:
             for arm in cfg.beside_arms():
@@ -1864,6 +1905,10 @@ rm -f "$f"''', what=f"stop {tag}")
                 res = self.beside_results.get((slot.path, real.name), (time.time(), time.time(), -1, ""))
                 self.record_job(slot, real, beside.phase, 0, job, gen, res, writer,
                                 os.path.join(sub, "measures.jsonl"), beside.phase.duration)
+            if getattr(self, "beside_impair_fired", False):
+                self.job_failures.append({"failure": "control-plane", "block": 1, "path": cfg.paths()[0], "trial": "",
+                                          "slot": 1, "arm": cfg.main.name, "phase": beside.phase.name,
+                                          "client": cfg.paths()[0], "kind": "impairment", "exit": JOB_KILLED_BY_RUNNER})
             self.beside_failures = self.job_failures[failures_before:]
             # Its failures are its own; the blocks' verdicts do not depend on them.
             del self.job_failures[failures_before:]
@@ -1903,9 +1948,24 @@ rm -f "$f"''', what=f"stop {tag}")
             parallel(lambda: self.scrape(arm, name + "-pre"), *[(lambda c=c: self.scrape_client(c, arm, name + "-pre"))
                                                                  for c in clients])
             samplers = self.start_host_cpu(name, path) if cfg.host_cpu else None
+            phases = cfg.wl.type_phases(cfg, path, trial)
+            scenario = cfg.wl.impairment(cfg, trial) if self.impair else ""
             try:
-                for phase in cfg.wl.type_phases(cfg, path, trial):
-                    self.run_phase(s, arm, phase, writer)
+                if scenario:
+                    # Just before the trial, on every block arm's port alike.
+                    self.impair.apply("b", scenario, sum(p.duration for p in phases) + 120 + BARRIER_LEAD)
+                try:
+                    for phase in phases:
+                        self.run_phase(s, arm, phase, writer)
+                finally:
+                    if scenario and self.impair.remove("b"):
+                        # Its watchdog removed the impairment before the trial
+                        # ended: the harness's failure, not the arm's.
+                        self.job_failures.append({"failure": "control-plane", "block": s.block, "path": s.path,
+                                                  "trial": s.trial, "slot": s.slot, "arm": arm.name,
+                                                  "phase": trial, "client": path, "kind": "impairment",
+                                                  "exit": JOB_KILLED_BY_RUNNER})
+                        self.log(f"impairment watchdog fired during {name}: its block is void")
             finally:
                 if samplers is not None:
                     self.stop_host_cpu(name, samplers)
@@ -2054,6 +2114,16 @@ rm -f "$f"''', what=f"stop {tag}")
     def teardown(self) -> None:
         self.log("teardown")
         self.tearing_down = True
+        if self.impair:
+            # Before any process is stopped (the watchdogs among them): every
+            # set removed and the tc state compared with the snapshot.
+            try:
+                left = self.impair.teardown()
+            except Exception as e:
+                left = [f"impairment: teardown failed: {type(e).__name__}: {e}"]
+                self.impair.leftovers = left
+            self.log("impairment: " + ("NOT RESTORED: " + "; ".join(left) if left else
+                                       "removed; the tc state matches the snapshot"))
         # Only directories this invocation reserved, and only while it still
         # owns them: never another campaign's processes.
         for host in self.reserved:
@@ -2172,6 +2242,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                     # Hosts whose CPU each path's trials record (host_cpu).
                     "hostcpu_hosts": {p: self.host_cpu_hosts(p) for p in cfg.paths()} if cfg.host_cpu else None,
                     "gateway_host": cfg.gateway.host,
+                    # The impairment's filters and frozen scenarios.
+                    "impair": self.impair.describe() if self.impair else None,
                     # The gates in force, frozen before the first block: the
                     # analyzer refuses a verdict under other ones.
                     "gates_sha256": gates_digest(),
@@ -2182,6 +2254,9 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             if not self.dry:
                 with open(os.path.join(self.out, "plan.json"), "w") as f:
                     json.dump(plan, f, indent=2, default=str)
+                if self.impair:
+                    with open(os.path.join(self.out, "impair-before.txt"), "w") as f:
+                        f.write(self.impair.before)
         except BaseException:
             # Nothing was started; give back whatever was reserved so a
             # corrected rerun is not refused.
@@ -2305,6 +2380,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                            "production": production, "teardown_leftovers": leftovers, "cleanup_failures": clean_failures,
                            "fetch_failures": self.fetch_failures, "job_failures": self.job_failures,
                            "workload_failures": self.workload_failures,
+                           "impairment": (None if not self.impair else
+                                          "not restored" if self.impair.leftovers else "restored"),
                            "blocks_run": self.blocks_run, "units_run": self.units_run, "stopped": self.stopped,
                            "stopped_types": self.stopped_types,
                            "wall_seconds": round(time.time() - self.t_start, 1),
@@ -2326,7 +2403,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             self.snapshot_all("teardown")
             return []
         snaps = self.snapshot_all("teardown")
-        out = []
+        out = list(self.impair.leftovers) if self.impair else []
         for host, ports in self.cfg.planned_ports().items():
             snap = snaps.get(host, {})
             if not snap.get("listen_ok"):

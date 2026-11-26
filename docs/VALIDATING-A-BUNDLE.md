@@ -792,6 +792,77 @@ not a gate:
 `ab_analyze.py --flip --profile full` judges the full matrix instead of
 the minimal one.
 
+## Impaired networks
+
+`workload = impaired` (`scripts/workloads/impaired.py`, `scripts/ab_impair.py`,
+`validation/impaired-campaign.example.ini`) measures reliability rather than
+throughput: the mixed foreground under slow, lossy and broken networks, with
+the impairment applied by tc/netem on the path's client host (`[impair]`,
+which needs root there). One path per campaign; any number of arms; one trial
+per arm per block, the arms in random order.
+
+**Scenarios** (frozen in `ab_impair.SCENARIOS` and recorded in `plan.json`;
+round-trip delay, split evenly between the directions; loss and rate per
+direction):
+
+| trial type | scenario | trial |
+|---|---|---:|
+| `slow-lossy` | 5 Mbit/s, +250 ms, 20 ms jitter, Gilbert-Elliott bursty loss (p 1 %, r 30 %: 3.2 % average) | 90 s |
+| `blackhole` | 20 Mbit/s, +150 ms; 100 % drop for 8 s at 30 s and for 25 s at 70 s | 120 s |
+| `policed` | a 4 Mbit/s token-bucket policer with a 12 KB bucket, +150 ms | 90 s |
+| D, `idle-wake-lossy` | 2 % random loss, +200 ms, on D's own ports for its whole session | about 17 min, beside the blocks |
+
+Every trial runs the W5 LLM loop (5 turns), W6 keystrokes and one download
+of 4 MiB objects for the whole window; `blackhole` adds a long upload, and
+probes every 0.25 s (each its own process) that time the recovery.
+
+**Gates** (`gates.ini [workload:impaired]` and the `[secondary]` bounds, each
+one-sided against main): flow completion, stalls per trial, LLM call
+failures, TTFT p99, keystroke echo p99, silent deaths (an LLM call or
+keystroke session that ends in the client's own timeout: none, in every
+block), and for `blackhole` the recovery time (end of each outage to the
+first probe completed after it, the worse of the two). D is judged as its own
+campaign in `<campaign>/idle-wake` by `[workload:idle-wake]`. Goodput is
+reported only.
+
+**How the impairment is applied.**
+
+- A `clsact` qdisc on the interface that carries the route to the address
+  clients dial adds classification hooks; the interface's root qdisc is never
+  replaced, so production traffic keeps its queueing.
+- Flower filters match only IPv4 to (egress) or from (ingress) that address,
+  UDP and TCP, with the remote port in the campaign's arm ports (D's own
+  ports for D). They redirect to the campaign's own IFB devices
+  (`qqimp-<set><u|d>`), each with the direction's netem; a policer is an
+  action on the same filters.
+- The blocks' set is applied just before each trial and removed right after
+  it, on every exit; a `blackhole` trial's outages are a harness job on the
+  client host that changes only those IFB devices' netem, with a trap that
+  restores the base on any exit, and prints when each outage began and ended
+  (the probes' clock). A failure of that job is the control plane's.
+
+**Safety.**
+
+- Preflight refuses when a filter could match production: a filter port
+  declared production on any host, a filter port inside either end's
+  ephemeral port range, or a remote address that is not an IPv4 literal. It
+  also refuses when the interface already has a clsact or ingress qdisc, a
+  device with the campaign's IFB names exists, the route to the remote leaves
+  by another interface, or the host is not root. Each apply checks the
+  production ports again.
+- Before the first trial it snapshots every interface's qdiscs, classes and
+  filters and the interface list (`impair-before.txt`). After every removal
+  that leaves no set applied, and at teardown, the state must equal the
+  snapshot: a difference fails the campaign loudly (a teardown leftover;
+  `status.json` `impairment: not restored`).
+- Each applied set has a watchdog on the host that removes it after its
+  deadline (the trial's cap plus `watchdog_slack`, 300 s) even if the runner
+  or its connection dies. A trial whose watchdog fired is void (control
+  plane). A failed apply removes whatever it had applied.
+- Teardown removes every set before stopping any process. The one host-wide
+  effect is loading the `ifb` module (with no default devices), which is
+  left loaded.
+
 ## Scenario workloads
 
 The workload model groups applications by the network behaviour that
