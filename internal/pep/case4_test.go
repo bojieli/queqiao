@@ -127,15 +127,17 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 	}
 	// The two amplifiers, recorded separately because they need separate fixes.
 	//
-	// The bandwidth estimate reads well above the path's sustained rate: a
-	// token bucket passes a burst at line rate, and a max filter reports that
-	// burst as the path's bandwidth. Bounding the filter's memory in time did
-	// not help here, because the bursts recur every refill period, so there is
-	// always a recent high sample. The statistic is the problem, not its age.
-	if float64(peakBandwidth) < shaped*1.4 {
-		t.Errorf("the bandwidth estimate is no longer reporting the burst rate (%d against a "+
-			"%d path); falsification case 4 may be resolved -- update the design document",
-			peakBandwidth, shaped)
+	// The bandwidth estimate used to read well above the path's sustained
+	// rate: a token bucket passes a burst at line rate, and the per-connection
+	// controller's max filter reported that burst as the path's bandwidth
+	// (1.4x and more). Under the path controller (stage 6, kept alone at stage
+	// 11) the delivery sampler retires each packet's state by its own fate and
+	// rates delivery over the packet's own flight, and the estimate tracks the
+	// policed rate (measured 1.0x). That half of case 4 is resolved; this
+	// keeps it resolved.
+	if float64(peakBandwidth) >= shaped*1.4 {
+		t.Errorf("the bandwidth estimate reports the burst rate again (%d against a %d path); "+
+			"the path controller's sampler regressed", peakBandwidth, shaped)
 	}
 	// And nothing brakes what that estimate then paces.
 	//
@@ -154,12 +156,13 @@ func TestCase4APolicedPathIsStillUnbraked(t *testing.T) {
 			policerQueueBound, queuedSamples, validQueueSamples, maxQueue, brakes.braked, brakes.readings, maxBrake)
 	}
 	// The overdrive this case records, after the compensation was bounded and a
-	// stale peak stopped being re-seeded: 42x became 7.3x became 2.4x. It is
-	// still an overdrive and the path is still unbraked, so this still asserts
-	// the defect -- but it asserts the current one.
-	if float64(peakPacing) < shaped*1.8 {
-		t.Errorf("peak pacing %d is only %.1fx a %d path; the overdrive this case records has "+
-			"been reduced again -- re-measure and update the design document",
-			peakPacing, float64(peakPacing)/shaped, shaped)
+	// stale peak stopped being re-seeded: 42x became 7.3x became 2.4x, and
+	// under the path controller about 1.9x, now that the estimate is right and
+	// only the erasure compensation runs ahead of an unbraked policer. It is
+	// still an overdrive and the path is still unbraked (the check above);
+	// this guards that it does not get worse again.
+	if float64(peakPacing) > shaped*2.4 {
+		t.Errorf("peak pacing %d is %.1fx a %d path, above the 2.4x this case last recorded; "+
+			"the overdrive got worse", peakPacing, float64(peakPacing)/shaped, shaped)
 	}
 }

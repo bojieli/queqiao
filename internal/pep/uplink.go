@@ -350,15 +350,17 @@ func (c *Client) probePath(lane *authenticatedLane) {
 	// accepts the probe and does not reflect it is not an older build to be
 	// tolerated -- it is a peer whose behaviour this client cannot account for,
 	// on a connection it was about to hand real traffic to.
+	echoed := false
 	if closer, ok := lane.outer.(interface{ CloseWrite() error }); ok && sent > 0 {
 		if err := closer.CloseWrite(); err == nil {
 			if err := c.readPathProbeEchoes(lane, sent); err != nil {
 				c.rejectProbePeer(lane, err)
 				return
 			}
+			echoed = true
 		}
 	}
-	c.awaitMeasurement(lane, deadline)
+	c.awaitMeasurement(lane, deadline, echoed)
 }
 
 // probeEchoViolation is a gateway that did not reflect the probe sequence
@@ -433,17 +435,36 @@ func (c *Client) rejectProbePeer(lane *authenticatedLane, err error) {
 // them -- so a prewarm that sent and returned would leave exactly the
 // ignorance it was opened to remove, and the first flow would still be the one
 // discovering the path.
-func (c *Client) awaitMeasurement(lane *authenticatedLane, deadline time.Time) {
+func (c *Client) awaitMeasurement(lane *authenticatedLane, deadline time.Time, echoed bool) {
 	keyed, ok := lane.outer.(interface{ pathModel() pathmodel.Model })
 	if !ok {
 		return
 	}
-	// The connection's own reference, so a cc-api v2 rekey moves the poll to
-	// the new path with the controller.
+	// The connection's own reference, so a rekey moves the poll to the new
+	// path with the controller.
 	model := keyed.pathModel()
-	for time.Now().Before(deadline) {
-		if model.Current().ObservedSamples >= pathProbePackets {
+	// A hundred frames are not a hundred samples. The path controller counts
+	// the decided fates of the eliciting packets that carried them, which are
+	// fewer once the frames share full-size packets (about 65 for the probe
+	// at a discovered MTU), and no longer counts acknowledgement-only
+	// packets. So once the whole echo has come back -- every probe packet
+	// has reached the gateway -- the measurement is complete when the count
+	// stops moving for a quarter of a round trip, rather than when it reaches
+	// a number the probe cannot produce; waiting for that held the first flow
+	// for the whole prewarm budget.
+	var last float64
+	var stableSince time.Time
+	for now := time.Now(); now.Before(deadline); now = time.Now() {
+		st := model.Current()
+		if st.ObservedSamples >= pathProbePackets {
 			return
+		}
+		if echoed && st.ObservedSamples > 0 {
+			if st.ObservedSamples != last {
+				last, stableSince = st.ObservedSamples, now
+			} else if now.Sub(stableSince) >= max(st.RoundTrip/4, 2*measurementPoll) {
+				return
+			}
 		}
 		time.Sleep(measurementPoll)
 	}

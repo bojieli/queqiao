@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/pathsim"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
@@ -230,11 +229,9 @@ func TestThePrewarmLeavesTheUplinkMeasured(t *testing.T) {
 		OneWayDelay: 150 * time.Millisecond, RateBytesPerSec: uint64(25e6 / 8),
 		PolicerRefillPeriod: 8 * time.Millisecond, LossRate: 0.42, Seed: 53,
 	}
-	loopback := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
-	key := pathKey(loopback, loopback)
-
-	// Start from nothing known about this uplink.
-	before := pathmodel.Shared(key).Current().Erasure
+	// Start from nothing known about this uplink (codedPairWith resets the
+	// path models).
+	before := 0.0
 
 	// ServeListener starts the production uplink watcher, which performs one
 	// automatic prewarm. Calling prewarmPath here as well used to race a
@@ -242,11 +239,23 @@ func TestThePrewarmLeavesTheUplinkMeasured(t *testing.T) {
 	// deployed behavior, the two probes could each consume the other's pooled
 	// connection budget and made this assertion intermittently observe neither
 	// completed measurement.
-	_, _ = clientServerAcross(t, &path)
+	client, _ := clientServerAcross(t, &path)
+	// What the first flow's code is sized from: the model the pooled
+	// connection's readers read, which is the path authority's (keyed by the
+	// principal's path, not by the bare endpoint pair).
+	measured := func() float64 {
+		client.quicMu.Lock()
+		g := client.quicGeneration
+		client.quicMu.Unlock()
+		if g == nil {
+			return 0
+		}
+		return pathModelOf(g.conn).Current().Erasure
+	}
 	deadline := time.Now().Add(prewarmTimeout + 5*time.Second)
 	var after float64
 	for time.Now().Before(deadline) {
-		after = pathmodel.Shared(key).Current().Erasure
+		after = measured()
 		if after > 0 {
 			break
 		}

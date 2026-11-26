@@ -157,46 +157,43 @@ func TestCodedRecoveryEndsAtTheStalledByteFrontier(t *testing.T) {
 	if sched.ReissueExpired() != 1 {
 		t.Fatal("the coded attempt was not retired at its deadline")
 	}
-	for round := 1; round <= 2; round++ {
-		retry, err := sched.Next(ctx, 0, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if retry.Offset != stalled.Offset || !retry.Reliable {
-			t.Fatalf("attempt %d of the stalled chunk: offset %d reliable %v, want offset %d on the stream", round, retry.Offset, retry.Reliable, stalled.Offset)
-		}
-		if err := flow.sendChunk(ctx, lane, retry, true); err != nil {
-			t.Fatal(err)
-		}
-		sent := <-lane.writeQ
-		if !sent.forceReliable {
-			t.Fatalf("attempt %d of the stalled chunk was not pinned to the stream", round)
-		}
-		sent.onWritten(true)
-		// The stream attempt is lost too: the chunk stays on the stream.
-		now = now.Add(time.Second)
-		if sched.ReissueExpired() != 1 {
-			t.Fatalf("attempt %d was not reissued", round)
-		}
-	}
-	// Bytes after the stalled chunk are a fresh exchange and go coded.
+	// The retry is on the stream: the sticky reliable bit.
 	retry, err := sched.Next(ctx, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if retry.Offset == stalled.Offset {
-		// The stalled chunk was offered again before the fresh one; take it
-		// off and look at the next.
-		if !retry.Reliable {
-			t.Fatal("the sticky bit was lost")
-		}
-		retry, err = sched.Next(ctx, 0, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
+	if retry.Offset != stalled.Offset || !retry.Reliable {
+		t.Fatalf("the stalled chunk's retry: offset %d reliable %v, want offset %d on the stream", retry.Offset, retry.Reliable, stalled.Offset)
 	}
-	if retry.Offset != stalled.End() || retry.Reliable {
-		t.Fatalf("fresh chunk at %d reliable %v, want offset %d coded", retry.Offset, retry.Reliable, stalled.End())
+	if err := flow.sendChunk(ctx, lane, retry, true); err != nil {
+		t.Fatal(err)
+	}
+	sent := <-lane.writeQ
+	if !sent.forceReliable {
+		t.Fatal("the stalled chunk's retry was not pinned to the stream")
+	}
+	sent.onWritten(true)
+	// The stream attempt outlives its timer: the reliable stream delivers the
+	// chunk or the lane dies, so the same lane is not given a second copy.
+	now = now.Add(time.Second)
+	sched.ReissueExpired()
+	// What the lane is offered next is the fresh exchange behind the stalled
+	// chunk, and it goes coded: the escape covered the stalled bytes only.
+	fresh, err := sched.Next(ctx, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Offset != stalled.End() || fresh.Reliable {
+		t.Fatalf("next chunk at %d reliable %v, want the fresh one at %d coded", fresh.Offset, fresh.Reliable, stalled.End())
+	}
+	// And should the stalled chunk be offered again, it stays on the stream.
+	sched.Complete(0, fresh)
+	now = now.Add(time.Second)
+	sched.ReissueExpired()
+	nextCtx, nextCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer nextCancel()
+	if again, err := sched.Next(nextCtx, 0, 0); err == nil && again != nil && again.Offset == stalled.Offset && !again.Reliable {
+		t.Fatal("the sticky bit was lost")
 	}
 }
 
