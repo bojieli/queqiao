@@ -1264,16 +1264,21 @@ func (p *Path) params() fec.Params {
 
 // rate is the sending rate the window is sized against.
 func (p *Path) rate() float64 {
+	prior := float64(p.symbolBytes()) * 64 / p.roundTrip().Seconds()
 	if p.cfg.SourceRate {
-		rtt := p.roundTrip()
-		if r, ok := p.source.rate(time.Now(), rtt); ok {
-			// A measured sparse lane keeps a sparse window; at least one
-			// symbol a round trip.
-			return max(r, float64(p.symbolBytes())/rtt.Seconds())
+		// A lane busier than the prior sizes from its own source rate. A
+		// sparse lane keeps the prior: the rate also prices what an
+		// unrepaired loss costs (fec.Params.reissueCost), and a sparse rate
+		// prices it at about one symbol, so a small exchange on a lossy path
+		// was coded too weakly to be repaired and waited for a probe timeout
+		// instead (TestSmallExchangesAreRepairedOnceThePathIsKnown, 1.5 s
+		// against 0.3 s at a 300 ms round trip). The prior is the window a
+		// lane with no measurement uses, so it is never a bulk flow's rate.
+		if r, ok := p.source.rate(time.Now(), p.roundTrip()); ok {
+			return max(r, prior)
 		}
-		return float64(p.symbolBytes()) * 64 / p.roundTrip().Seconds()
 	}
-	return float64(p.symbolBytes()) * 64 / p.roundTrip().Seconds()
+	return prior
 }
 
 // roundTrip is the path's own, where it has been measured, and the

@@ -8,8 +8,10 @@ import (
 )
 
 // Under congestion=path a coded window is sized from the encoder's own
-// source bytes per round trip (§9): a sparse coded lane beside a busy bulk
-// connection must not size its window from the bulk's throughput. Until a round trip has been measured the cold-start prior
+// source bytes per round trip (§9), never from another flow's throughput, and
+// never below the cold-start prior: a sparse coded lane keeps the prior, since
+// the rate also prices what an unrepaired loss costs and a sparse rate would
+// price it at one symbol. Until a round trip has been measured the prior
 // stands, and repairs do not count.
 func TestASparseCodedLaneSizesItsWindowFromItsOwnSourceRate(t *testing.T) {
 	model := pathmodel.NewPathModel()
@@ -32,8 +34,8 @@ func TestASparseCodedLaneSizesItsWindowFromItsOwnSourceRate(t *testing.T) {
 		if sourceRate {
 			got := p.rate()
 			t.Logf("sparse lane sizes from %.0f B/s; the cold-start prior is %.0f B/s", got, prior)
-			if got <= 0 || got > prior/10 {
-				t.Fatalf("a sparse coded lane sizes its window from %.0f B/s against a cold-start prior of %.0f", got, prior)
+			if got != prior {
+				t.Fatalf("a sparse coded lane sizes its window from %.0f B/s, want the cold-start prior %.0f", got, prior)
 			}
 		}
 		p.Close()
