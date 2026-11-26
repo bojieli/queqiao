@@ -446,9 +446,9 @@ stage 9 data exists.
 ### The workload
 
 A leaf is an endpoint pair, and the gateway is the sender for downloads, so
-each client host is one leaf under the gateway's shared egress. Under the
-candidate the gateway's authorities sit in its tree as knowledge only. The
-legacy gateway has no tree at all: its per-peer controllers are independent,
+each client host is one leaf under the gateway's shared egress. Neither arm
+has a tree on the gateway: the candidate's gateway authorities take no tree
+view, and the legacy gateway's per-peer controllers are independent,
 and the legacy tree's joint limit couples only clients in one process. So the
 download phases compare one authority per leaf with independent legacy
 controllers. The joint limit itself is exercised by the upload phase below,
