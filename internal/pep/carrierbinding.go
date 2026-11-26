@@ -110,6 +110,7 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		tcpNow     bool
 		tcpNextAt  time.Time
 		tcpBackoff time.Duration
+		gate       tcpHandoffGate
 	)
 	// wake fires at the next time this loop must act on its own: the latest
 	// handoff start, the binding deadline, or the end of a backoff. The
@@ -156,6 +157,7 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		setUnbound(len(healthy) == 0 && !m.now().Before(nextAttempt) && attempts < maxLaneRecoveryAttempts)
 		if len(healthy) > 0 && !superseded {
 			observed, tcpTried, tcpNextAt, tcpBackoff, wake = time.Time{}, false, time.Time{}, 0, nil
+			gate = tcpHandoffGate{}
 			// The per-flow budget resets only after a sustained healthy
 			// dwell, as today's does: a stream that fails again just after
 			// each JOIN cannot JOIN without bound.
@@ -194,9 +196,24 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			// start; when there is no QUIC carrier to JOIN at all it starts
 			// once the fallback grace has passed, as today's rescue does.
 			due := tcpNow || !now.Before(latest) || (target == nil && now.Sub(observed) >= c.fallbackGrace())
+			held := false
 			if due && !now.Before(tcpNextAt) {
+				// A handoff that timed out found TCP down as well: the path
+				// was away, not UDP. When it returns, this retry and the
+				// QUIC replacement race, and a TCP JOIN that lands first
+				// commits the flow to TCP for good (tcpHandoffGate).
+				var until time.Time
+				held, until = gate.hold(now, latest, tcpNow || !now.Before(latest), target == nil && m.quicComing(), c.quicHandshakeWait())
+				if held {
+					wake = nextWake(now, latest, deadline, nextAttempt, until)
+				}
+			}
+			if due && !held && !now.Before(tcpNextAt) {
 				tcpNow = false
 				herr := c.carrierTCPHandoff(manageCtx, flow, sessionID, flowID, healthy, superseded, deadline)
+				if herr != nil && isTimeoutError(herr) {
+					gate.timedOut = true
+				}
 				switch {
 				case herr == nil:
 					// The gateway has committed the flow to TCP: the TCP
@@ -390,6 +407,83 @@ func flowGenerationID(flow *multipathFlow) uint64 {
 		return g.id
 	}
 	return 0
+}
+
+// tcpHandoffGate holds a flow's TCP handoff back for a QUIC replacement that
+// is on its way, within one binding episode.
+//
+// AUTO hands a flow with no QUIC carrier off to TCP once the fallback grace
+// has passed, and retries on a backoff. That is right when UDP is blocked:
+// the first attempt succeeds and the flow moves at once. In an outage the
+// attempts time out, because TCP is down too. When the path returns, the
+// next retry and the carrier manager's QUIC replacement come up within the
+// same second or two, and a TCP JOIN the gateway accepts commits the flow to
+// TCP for the rest of its life. On a live path dropped for 25 s, every flow
+// in flight went to TCP 1.2 to 2.1 s after the restore, a long download
+// among them, and it then moved 14 s after the restore, on one TCP lane.
+//
+// So once a handoff attempt of this episode has timed out, a retry that is
+// due waits for a QUIC replacement that is being dialled: for about one
+// handshake, and never past the latest handoff start. If QUIC comes up, the
+// flow JOINs it; if not, the retry goes ahead.
+type tcpHandoffGate struct {
+	// timedOut says a handoff attempt of this episode failed by timing out:
+	// both transports were down.
+	timedOut bool
+	// waitUntil is when the retry now held goes ahead; zero while none is.
+	waitUntil time.Time
+}
+
+// hold reports whether a TCP handoff due at now must wait, and until when.
+// forced is a handoff nothing may delay: the latest handoff start has come,
+// or the gateway has already committed the flow to TCP. quicComing says a
+// QUIC replacement is being dialled or verified.
+func (g *tcpHandoffGate) hold(now, latest time.Time, forced, quicComing bool, handshake time.Duration) (bool, time.Time) {
+	if forced || !g.timedOut || !quicComing {
+		g.waitUntil = time.Time{}
+		return false, time.Time{}
+	}
+	if g.waitUntil.IsZero() {
+		g.waitUntil = now.Add(handshake)
+		if g.waitUntil.After(latest) {
+			g.waitUntil = latest
+		}
+	}
+	if now.Before(g.waitUntil) {
+		return true, g.waitUntil
+	}
+	// Waited out: this retry goes ahead, and the next one waits afresh.
+	g.waitUntil = time.Time{}
+	return false, time.Time{}
+}
+
+const (
+	// quicHandshakeRTTs is a QUIC replacement's handshake and the probe that
+	// verifies it, in round trips; quicHandshakeWaitMin and Max bound the
+	// wait a TCP handoff gives it.
+	quicHandshakeRTTs    = 4
+	quicHandshakeWaitMin = time.Second
+	quicHandshakeWaitMax = 3 * time.Second
+)
+
+// quicHandshakeWait is about how long a QUIC replacement takes to become a
+// carrier on this path once the path carries packets.
+func (c *Client) quicHandshakeWait() time.Duration {
+	return quicHandshakeWaitFor(time.Duration(c.observedRTT.Load()))
+}
+
+func quicHandshakeWaitFor(rtt time.Duration) time.Duration {
+	return min(max(quicHandshakeRTTs*rtt, quicHandshakeWaitMin), quicHandshakeWaitMax)
+}
+
+// isTimeoutError reports whether err is an attempt that ran out of time, as
+// opposed to one the peer or the network refused.
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
 // carrierTCPHandoff starts AUTO's TCP handoff for a flow that no QUIC JOIN
