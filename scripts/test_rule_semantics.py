@@ -47,10 +47,11 @@ def frozen_rules():
 
 # Six blocks of main's values per measure, and which way is better.
 MAIN = {
-    "call_failures": ([0.2, 0.0, 0.2, 0.4, 0.2, 0.0], "lower"),
     "ttft_net_p99_s": ([5.0, 6.1, 4.8, 5.5, 7.0, 5.2], "lower"),
     "echo_p99_s": ([12.0, 9.5, 14.2, 11.1, 10.0, 13.3], "lower"),
     "recover_s": ([6.0, 7.5, 5.2, 8.1, 6.6, 7.0], "lower"),
+    "reopen_ttfb_s": ([4.0, 5.5, 3.2, 6.1, 4.6, 5.0], "lower"),
+    "inflight_ttfb_s": ([5.0, 6.5, 4.2, 7.1, 5.6, 6.0], "lower"),
     "stalls_per_trial": ([36, 28, 40, 31, 25, 33], "lower"),
     "completion": ([0.5, 0.75, 0.5, 0.25, 0.5, 0.75], "higher"),
 }
@@ -98,7 +99,7 @@ class ImpairedMeasures(unittest.TestCase):
 
     def test_every_measure_points_the_right_way(self):
         rules = frozen_rules()
-        self.assertEqual(set(MAIN), set(rules) - {"silent_deaths"} if "silent_deaths" in rules else set(MAIN))
+        self.assertEqual(set(MAIN), set(rules))
         for name, (main, better) in MAIN.items():
             kind, values = rules[name]
             for how, want in (("better", "pass"), ("equal", "pass"), ("worse", "fail")):
@@ -106,6 +107,41 @@ class ImpairedMeasures(unittest.TestCase):
                     d, ok, seq = judge(kind, values, candidate(main, better, how), main)
                     self.assertEqual(seq, want, (name, how, kind, values, d))
                     self.assertEqual(ok, want == "pass", (name, how, d))
+
+    def test_event_rates(self):
+        cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+        cp.read(os.path.join(HERE, "validation", "gates.ini"))
+        for name in ("call_failures", "silent_rate"):
+            kind, v, n = cp["workload:impaired"][f"*.{name}"].split()
+            self.assertEqual(kind, "events")
+            v, n = float(v), int(n)
+            # n is the fewest at which a zero-event candidate passes a
+            # zero-event main: (1 - v)^n <= alpha.
+            self.assertLessEqual((1 - v) ** n, ALPHA)
+            self.assertGreater((1 - v) ** (n - 2), ALPHA)
+            per = n // 4 + 1                       # opportunities per block, 4 blocks
+            def blocks(ec, em):
+                return [((ec[b], per), (em[b], per)) for b in range(4)]
+            fin = lambda bl: st.events_decision(bl, v, n, ALPHA, final=True)[0]
+            with self.subTest(measure=name):
+                self.assertEqual(fin(blocks([0, 0, 0, 0], [1, 2, 0, 3])), "pass")     # better
+                self.assertEqual(fin(blocks([0, 0, 0, 0], [0, 0, 0, 0])), "pass")     # equal, none
+                self.assertEqual(fin(blocks([1, 0, 1, 0], [1, 0, 1, 0])), "fail")     # equal, some: undecided at the end
+                self.assertEqual(fin(blocks([9, 8, 10, 7], [0, 1, 0, 0])), "fail")    # worse
+                self.assertEqual(st.events_decision(blocks([1, 0, 1, 0], [1, 0, 1, 0]), v, n, ALPHA, final=False)[0],
+                                 "continue")
+                # Too few opportunities: unmeasured at the end, undecided before.
+                few = [((0, 10), (0, 10))] * 4
+                self.assertEqual(st.events_decision(few, v, n, ALPHA, final=True)[0], "n/a")
+                self.assertEqual(st.events_decision(few, v, n, ALPHA, final=False)[0], "continue")
+
+    def test_exact_and_permutation_pieces(self):
+        self.assertAlmostEqual(st.binom_cdf(0, 150, 0.02), 0.98 ** 150)
+        self.assertAlmostEqual(st.binom_cdf(3, 10, 0.5) + st.binom_sf(4, 10, 0.5), 1.0)
+        # One block, the candidate worse: half the assignments are as bad.
+        self.assertEqual(st.block_permutation_worse([((5, 10), (0, 10))]), 0.5)
+        # Every block worse: only the observed assignment is as bad.
+        self.assertEqual(st.block_permutation_worse([((5, 10), (0, 10))] * 6), 1 / 64)
 
     def test_silent_deaths_is_a_hard_ceiling_on_the_candidate(self):
         self.assertTrue(an.HARD["ceiling"](0, (0,)))
