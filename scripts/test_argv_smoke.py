@@ -64,8 +64,9 @@ def free_port(n=1):
 
 
 def free_pair():
-    """A port p with p and p + 1 free (one per arm)."""
-    return free_port(2)
+    """A port p with p .. p + 7 free: one per arm and per D copy of an arm
+    (three arms and D take six), so no two port bases' runs overlap."""
+    return free_port(8)
 
 
 def go_platform():
