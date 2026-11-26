@@ -131,9 +131,22 @@ built to refuse rather than to trust:
   teardown is reported as unverified, for manual cleanup. A record whose
   fields do not each check out is left alone; a `run/` directory that
   cannot be read and searched, or a failed check, is unverified, never
-  clean. A job that does not run to its end (ssh dropped, timed out, the
-  generator crashed) is a harness failure, not the arm's, and its block gets
-  no verdict.
+  clean.
+- **Jobs are detached, and survive ssh drops.** A job is started under
+  `setsid nohup`, keeps its output and exit status in `run/job-N.out` and
+  `run/job-N.rc`, and the runner polls for them and fetches them over fresh
+  ssh sessions (`ServerAliveInterval=10`), retrying a dropped session with
+  backoff (5 tries). A dropped session costs nothing.
+- **Control-plane failures void the block; workload failures are evidence.**
+  When the runner loses a job -- its host unreachable through every retry,
+  the job outliving its window or killed, or leaving no record at all -- that
+  is the harness, not the arm: the whole block is void for both arms (not
+  evidence; it still counts toward the cap), and a trial type with more than
+  `control_plane_void_max` (2) such blocks in a campaign has no verdict
+  (`gates.ini [harness]`). Failures a job itself records -- a transfer cut or
+  reset inside the tunnel (curl exit 18, 56, ...), a timeout, a failed
+  session -- are the arm's and stay evidence, in flow completion and the
+  workload measures. The report lists both kinds per block.
 - **A relay hop is declared, and temporary.** Where production clients
   reach their gateway through a relay, a `[relay]` section (`host`,
   `address`, optional `platform` and `flags`) puts the same hop in the

@@ -551,10 +551,11 @@ class Runner(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("# sequential: looks after blocks 6..12, one-sided alpha 0.05 spent by the Pocock-type function", text)
         self.assertIn("6: 0.0310", text)
-        # Section 15.4's budget: one block each of A, B, C and DC is about 26 min.
-        self.assertIn("bulk 5 min, mixed-67 7 min, mixed-all 9 min", text)
-        self.assertIn("one block each of A, B, C and DC is about 26 min a path", text)
-        self.assertIn("2.6 h at 6 blocks", text)
+        # As measured on the first live campaign: about 230 s of restarts
+        # and job handling per block of a type.
+        self.assertIn("bulk 8 min, mixed-67 10 min, mixed-all 12 min", text)
+        self.assertIn("one block each of A, B, C and DC is about 37 min a path (as measured", text)
+        self.assertIn("3.7 h at 6 blocks", text)
         self.assertRegex(text, r"# estimated wall time on path-a: \d+ min \(stopping at the first look\) to \d+ min \(cap\)")
         for cell in ("bulk: bulk x4", "mixed-67: wl-llm x1", "mixed-67: wl-term x1", "mixed-67: wl-bgdown x2",
                      "mixed-all: wl-call x1", "mixed-all: wl-browse x1", "mixed-all: wl-bgup x1"):
@@ -570,7 +571,9 @@ class Runner(unittest.TestCase):
         camp = ab.Campaign(ab.load_config(str(MINIMAL)), "<o>", ".", dry=True, stream=io.StringIO())
         lo, hi = camp.estimate()["path-a"]
         self.assertLess(lo, hi)
-        self.assertLess(lo, 3 * 3600)     # inside the profile's budget when it stops at the first look
+        # A, B and C together stopping at the first look: about 3 h as measured
+        # (the design budgets 2.5-3 h with DC; see the plan note).
+        self.assertLess(lo, 3.2 * 3600)
 
     def test_the_trial_settings_are_the_models(self):
         cfg = parse(BASE)
@@ -1576,9 +1579,9 @@ class DCAtMinimalSize(unittest.TestCase):
         self.assertIn("--count 10 --spacing 2 ", script)
         self.assertIn("--asr-up 355000 --asr-down 200 --tts-up 300 --tts-down 300000", script)
         self.assertEqual([e.tag for e in cfg.wl.endpoints(cfg)], ["wlserver"])
-        # One block of four 60 s trials and the restarts: about 5 minutes.
+        # One block of four 60 s trials and the restarts: about 8 minutes.
         camp = ab.Campaign(cfg, "<o>", ".", dry=True, stream=io.StringIO())
-        self.assertAlmostEqual(camp.block_seconds("dc") / 60, 5, delta=0.5)
+        self.assertAlmostEqual(camp.block_seconds("dc") / 60, 8, delta=0.5)
 
     def test_calibration_runs_in_the_first_block_only(self):
         cfg = self.cfg()

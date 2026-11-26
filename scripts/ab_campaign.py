@@ -88,11 +88,13 @@ CANON_SH = r'''canon() {
 }
 '''
 # Wall-time estimates: seconds the runner adds per block of one trial type
-# (endpoint restarts, client starts and stops, scrapes, log collection:
-# design section 15.4's "about 26 min" for one block each of A, B, C and DC
-# is four trials of 60, 90, 120 and 60 s plus this per block) and once
-# (builds, copies, enrollment). Rough.
-BLOCK_OVERHEAD = 60
+# (endpoint restarts, client starts and stops, scrapes, host CPU samplers,
+# job launch and polling, log collection) and once (builds, copies,
+# enrollment). Measured on the first stage 6/7 campaign through a relay hop:
+# a block of A took about 7.7 min (4 x 60 s of trials) and one of B about
+# 10 min (4 x 90 s), so about 230 s per block, and a round of A and B about
+# 17 min.
+BLOCK_OVERHEAD = 230
 SETUP_SECONDS = 240
 # Seconds between dispatching a DC phase's jobs and their shared start.
 BARRIER_LEAD = 5
@@ -461,7 +463,7 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  snapshot_every=c.getint("snapshot_every", 4), lane_trace=_bool(c.get("lane_trace", "true")),
                  sequential=_sequential(c), host_cpu=_bool(c.get("host_cpu", "false")),
                  relay=_relay(cp),
-                 log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=15")),
+                 log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=3")),
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
     if cfg.sequential and (wl.analyzer != "ab_analyze" or wl.primary or wl.sample_based):
@@ -1486,30 +1488,95 @@ rm -f "$f"''', what=f"stop {tag}")
     def stop_file(self, client: Client, arm: Arm) -> str:
         return f"{self.w(client.host)}/run/stop-probe-{client.name}-{arm.name}"
 
-    def as_job(self, host: str, script: str) -> str:
-        """Run a job so that teardown can stop it and everything it started,
-        even when the runner was interrupted while the job's ssh was in
-        flight: the job is a file run as `env QQ_AB_TOKEN=<token> bash
-        <file>`, so its shell and every descendant carry the token from exec
-        on (JOB_OWN_SH). The descriptor run/job-N.pgid holds "<pid> <token>";
-        it is removed when the job ends with none of its processes left, and
-        kept (for teardown, or manual cleanup) otherwise."""
+    def as_job(self, host: str, script: str) -> Tuple[str, Dict[str, str]]:
+        """A detached job: the shell that launches it, and its files. The job
+        is a file run by a wrapper as `env QQ_AB_TOKEN=<token> bash <wrapper>`
+        under setsid and nohup, so it survives the ssh session that started
+        it, and its shell and every descendant carry the token from exec on
+        (JOB_OWN_SH; teardown finds them by it). The wrapper keeps the job's
+        output and exit status in run/job-N.out and run/job-N.rc, which the
+        runner fetches over fresh ssh sessions (run_job). The descriptor
+        run/job-N.pgid holds "<pid> <token>"; the wrapper removes it once the
+        job has ended with none of its processes left."""
         W = self.w(host)
         self.job_seq += 1
-        f = f"{W}/run/job-{self.job_seq}.pgid"
-        body = f"{W}/run/job-{self.job_seq}.sh"
+        n = self.job_seq
+        files = {k: f"{W}/run/job-{n}.{k}" for k in ("pgid", "sh", "wrap", "out", "rc")}
         # A fixed-length random token per job: no job's token is a prefix of
         # another's, and none appears in any argument.
         tok = secrets.token_hex(16)
-        return (f"{JOB_OWN_SH}\n"
-                f"cat > {body} <<'QQ_AB_JOB_EOF'\n{script}\nQQ_AB_JOB_EOF\n"
-                f"env QQ_AB_TOKEN={tok} bash {body} &\nj=$!\n"
-                f"echo \"$j {tok}\" > {f}\n"
-                f"wait $j\nrc=$?\n"
-                f"m=$(own_mode)\n"
+        wrap = (f"bash {files['sh']} > {files['out']} 2>&1\n"
+                f"echo $? > {files['rc']}.tmp && mv {files['rc']}.tmp {files['rc']}\n"
+                f"{JOB_OWN_SH}\n"
+                "m=$(own_mode)\n"
                 # Only a verified absence (exit 1) retires the descriptor.
-                f"if [ \"$m\" != none ]; then members {tok} $m $j >/dev/null; [ $? -eq 1 ] && rm -f {f} {body}; fi\n"
-                f"exit $rc")
+                f"if [ \"$m\" != none ]; then members {tok} $m $$ >/dev/null; [ $? -eq 1 ] && rm -f {files['pgid']}; fi\n")
+        launch = (f"cat > {files['sh']} <<'QQ_AB_JOB_EOF'\n{script}\nQQ_AB_JOB_EOF\n"
+                  f"cat > {files['wrap']} <<'QQ_AB_WRAP_EOF'\n{wrap}QQ_AB_WRAP_EOF\n"
+                  f"rm -f {files['out']} {files['rc']}\n"
+                  f"( if command -v setsid >/dev/null; then exec setsid nohup env QQ_AB_TOKEN={tok} bash {files['wrap']}; "
+                  f"else exec nohup env QQ_AB_TOKEN={tok} bash {files['wrap']}; fi ) > /dev/null 2>&1 < /dev/null &\n"
+                  f"echo \"$! {tok}\" > {files['pgid']}\necho QQ_AB_LAUNCHED")
+        return launch, files
+
+    # Polling a detached job: the interval, and how many ssh sessions in a row
+    # may fail (with backoff) before its host counts as unreachable.
+    JOB_POLL = 5.0
+    JOB_SSH_TRIES = 5
+
+    def run_job(self, host: str, script: str, timeout: float, what: str) -> Tuple[int, str]:
+        """Run a job detached on host and return (exit status, output). An ssh
+        session that drops costs nothing: the job goes on, and the runner
+        polls and fetches its output over fresh sessions, retrying with
+        backoff. Only a host unreachable through JOB_SSH_TRIES sessions in a
+        row (255), or a job that outlives `timeout` (-1), is a failed job --
+        a control-plane failure, which voids its block (gates.ini [harness])."""
+        h = self.hosts[host]
+        launch, files = self.as_job(host, script)
+
+        def session(cmd: str, what_: str) -> Tuple[int, str]:
+            """One ssh session, retried with backoff while it fails to connect."""
+            for k in range(self.JOB_SSH_TRIES):
+                try:
+                    rc, out = h.run(cmd, timeout=120, what=what_)
+                except Exception as e:  # a hung ssh is a dropped session
+                    rc, out = 255, f"{type(e).__name__}: {e}"
+                if rc != 255:
+                    return rc, out
+                self.log(f"{host}: ssh session failed ({what_}); retry {k + 1} of {self.JOB_SSH_TRIES - 1}")
+                if not self.dry:
+                    time.sleep(min(30.0, 2.0 * 2 ** k))
+            return 255, out
+        rc, out = session(launch, what)
+        if self.dry:
+            return 0, ""
+        if rc != 0 or "QQ_AB_LAUNCHED" not in out:
+            return (255 if rc == 255 else rc or 1), ""
+        deadline = time.time() + timeout
+        # Done (its status is there), lost (its wrapper is gone without one:
+        # killed), or still running.
+        poll = (f"if [ -f {files['rc']} ]; then echo \"QQ_AB_RC $(cat {files['rc']})\"; cat {files['out']}; "
+                f"elif [ -f {files['pgid']} ] && read -r p t < {files['pgid']} && ! kill -0 \"$p\" 2>/dev/null "
+                f"&& [ ! -f {files['rc']} ]; then echo QQ_AB_LOST; else echo QQ_AB_RUNNING; fi")
+        while True:
+            rc, out = session(poll, f"{what}: poll")
+            if rc == 255:
+                return 255, ""
+            first, _, rest = out.partition("\n")
+            if first.strip() == "QQ_AB_LOST":
+                self.log(f"{host}: {what} ended without an exit status (killed)")
+                return -3, ""
+            if first.startswith("QQ_AB_RC "):
+                try:
+                    job_rc = int(first.split()[1])
+                except (IndexError, ValueError):
+                    job_rc = 1
+                session(f"rm -f {files['out']} {files['rc']} {files['sh']} {files['wrap']}", f"{what}: clean up")
+                return job_rc, rest
+            if time.time() > deadline:
+                self.log(f"{host}: {what} still running after {timeout:.0f} s; left for teardown")
+                return -1, ""
+            time.sleep(self.JOB_POLL)
 
     def interim(self, path: str, trial: str = "") -> Tuple[bool, str]:
         """(stop?, summary) for one path x trial type's sequential gate on
@@ -1542,9 +1609,9 @@ rm -f "$f"''', what=f"stop {tag}")
         def go(i, job, gen):
             t0 = time.time()
             try:
-                rc, out = self.hosts[job.client.host].run(self.as_job(job.client.host, gen.script(self, job, arm, duration, start_at)),
-                                                          timeout=duration + 120 + BARRIER_LEAD,
-                                                          what=f"{phase.name}: {job.kind} x{job.n} via {job.client.name}/{arm.name}")
+                rc, out = self.run_job(job.client.host, gen.script(self, job, arm, duration, start_at),
+                                       timeout=duration + 120 + BARRIER_LEAD,
+                                       what=f"{phase.name}: {job.kind} x{job.n} via {job.client.name}/{arm.name}")
             except Exception as e:  # a hung ssh is a failed job, not a dead campaign
                 rc, out = -1, ""
                 self.log(f"job {job.kind} on {job.client.name} failed: {e}")
@@ -1581,11 +1648,18 @@ rm -f "$f"''', what=f"stop {tag}")
                    result: Tuple[float, float, int, str], writer, measures_path: Optional[str], duration: float) -> None:
         """A finished job's rows (trials.tsv) and raw records (measures.jsonl)."""
         t0, t1, rc, out = result
+        if rc == 0 and not out.strip() and not self.dry:
+            rc = -2           # ran, but left no record at all: not evidence either way
         if rc != 0:
             # The generator did not run to its end (ssh dropped, timed out,
             # crashed): a harness failure, not the arm's. Its block gets no
             # verdict; its rows are still written for diagnosis.
-            self.job_failures.append({"block": slot.block, "path": slot.path, "trial": slot.trial, "slot": slot.slot,
+            # A job that did not run to its end -- its host unreachable through
+            # every retry (255), outliving its window (-1), or its generator
+            # failing -- is the harness's, not the arm's: a control-plane
+            # failure, which voids the block for both arms.
+            self.job_failures.append({"failure": "control-plane", "block": slot.block, "path": slot.path,
+                                      "trial": slot.trial, "slot": slot.slot,
                                       "arm": arm.name, "phase": phase.name, "client": job.client.name,
                                       "kind": job.kind, "exit": rc})
             self.log(f"job {job.kind} on {job.client.name} ({phase.name}) exited {rc}: its block will have no verdict")
@@ -1633,12 +1707,12 @@ rm -f "$f"''', what=f"stop {tag}")
                 n += 1
                 slot = Slot(1, path, n, real.name, 1, True, "")
                 self.beside_slots.append((slot, real, job))
-                script = self.as_job(client.host, gen.script(self, job, arm, beside.phase.duration))
+                script = gen.script(self, job, arm, beside.phase.duration)
 
-                def go(key=(path, real.name), host=ch, script=script, what=f"{beside.name} on {client.name}/{arm.name}"):
+                def go(key=(path, real.name), host=client.host, script=script, what=f"{beside.name} on {client.name}/{arm.name}"):
                     t0 = time.time()
                     try:
-                        rc, out = host.run(script, timeout=beside.phase.duration + 180, what=what)
+                        rc, out = self.run_job(host, script, timeout=beside.phase.duration + 180, what=what)
                     except Exception as e:
                         rc, out = -1, ""
                         self.log(f"{what} failed: {e}")
@@ -1786,12 +1860,12 @@ rm -f "$f"''', what=f"stop {tag}")
             stop = f"{self.w(host)}/run/stop-hostcpu"
             h.run(f"rm -f {stop}", what=f"clear the host CPU sampler's stop file on {host}")
             units = [u for p in self.cfg.production if p.host == host for u in p.units]
-            script = self.as_job(host, host_cpu_sampler(stop, units))
+            script = host_cpu_sampler(stop, units)
             res: Dict[str, Any] = {}
 
             def go(h=h, script=script, res=res, host=host):
                 try:
-                    res["rc"], res["out"] = h.run(script, timeout=6 * 3600, what=f"host CPU sampler on {host} ({name})")
+                    res["rc"], res["out"] = self.run_job(host, script, timeout=6 * 3600, what=f"host CPU sampler on {host} ({name})")
                 except Exception as e:  # recorded as missing evidence, not a dead campaign
                     res["rc"], res["out"] = -1, ""
                     self.log(f"host CPU sampler on {host} failed: {e}")
