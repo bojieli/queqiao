@@ -914,8 +914,8 @@ direction):
 | D, `idle-wake-lossy` | 2 % random loss, +200 ms, on D's own ports for its whole session | about 17 min, beside the blocks |
 
 Every trial runs an LLM swarm (4 concurrent loops of 10 turns with short
-responses: 40 calls), W6 keystrokes, and 25 short downloads of 1 MiB one after
-the other across the window (one started every window/25, or when the one
+responses: 40 calls), W6 keystrokes, and 30 short downloads of 1 MiB one after
+the other across the window (one started every window/30, or when the one
 before ends; each allowed 30 s). `blackhole` adds a long download and a long
 upload with progress timelines (flows in flight across the outages), and
 probes every 0.25 s, each its own connection.
@@ -938,8 +938,9 @@ probes every 0.25 s, each its own connection.
   `events 0.02 149` rate (v3, adopted after imp4; imp3 and imp4 were
   judged by the per-block `higher 0.02` rule and are not re-judged).
   Completion itself is reported. 149 attempts is the fewest at which two
-  arms that never fail can be shown equal at this margin; a trial makes 25
-  downloads of 1 MiB, so 6 blocks give about 150.
+  arms that never fail can be shown equal at this margin; a trial makes 30
+  downloads of 1 MiB, so 6 blocks give about 180 (a void block or a few
+  cut-off downloads still leave 149).
 - *Stalls per trial* (`[secondary]`), *TTFT p99*, *keystroke echo p99*.
 - *Per blackhole*, from the path's restore, the worse of a trial's two
   outages: the first completed probe (`recover_s`), the first byte of a

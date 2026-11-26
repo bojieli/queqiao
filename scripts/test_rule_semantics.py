@@ -171,7 +171,7 @@ if __name__ == "__main__":
 
 class PooledCompletion(unittest.TestCase):
     """Flow completion as a pooled event rate (v3): failed over attempted
-    short downloads, `events 0.02 149`: 25 a trial, so 6 blocks give 150."""
+    short downloads, `events 0.02 149`: 30 a trial, so 6 blocks give 180."""
 
     def rule(self):
         cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
@@ -185,26 +185,31 @@ class PooledCompletion(unittest.TestCase):
         v, n = self.rule()
         # imp4 slow-lossy's shape: the candidate completed all 8 every block,
         # main about 7 of 8.
-        blocks = [((0, 25), (m, 25)) for m in (3, 4, 2, 1, 3, 2)]
+        blocks = [((0, 30), (m, 30)) for m in (3, 4, 2, 1, 3, 2)]
         self.assertEqual(st.events_decision(blocks, v, n, ALPHA, final=True)[0], "pass")
 
     def test_clearly_worse_fails_and_too_few_attempts_is_unmeasured(self):
         v, n = self.rule()
-        self.assertEqual(st.events_decision([((3, 25), (0, 25))] * 6, v, n, ALPHA, final=True)[0], "fail")
-        self.assertEqual(st.events_decision([((0, 25), (1, 25))] * 4, v, n, ALPHA, final=True)[0], "n/a")
+        self.assertEqual(st.events_decision([((3, 30), (0, 30))] * 6, v, n, ALPHA, final=True)[0], "fail")
+        self.assertEqual(st.events_decision([((0, 30), (1, 30))] * 4, v, n, ALPHA, final=True)[0], "n/a")
 
     def test_two_perfect_arms_pass_in_six_blocks(self):
         v, n = self.rule()
         self.assertLessEqual((1 - v) ** n, ALPHA)
-        self.assertEqual(st.events_decision([((0, 25), (0, 25))] * 6, v, n, ALPHA, final=True)[0], "pass")
-        # One block void: too few attempts, unmeasured rather than passed.
-        self.assertEqual(st.events_decision([((0, 25), (0, 25))] * 5, v, n, ALPHA, final=True)[0], "n/a")
+        self.assertEqual(st.events_decision([((0, 30), (0, 30))] * 6, v, n, ALPHA, final=True)[0], "pass")
+        # Slack: one block void, or a few downloads cut at the window's end,
+        # still leaves 149 attempts.
+        self.assertEqual(st.events_decision([((0, 30), (0, 30))] * 5, v, n, ALPHA, final=True)[0], "pass")
+        cut = [((0, 29), (0, 28))] + [((0, 30), (0, 30))] * 4
+        self.assertEqual(st.events_decision(cut, v, n, ALPHA, final=True)[0], "n/a")    # 149 / 148: main short
+        cut6 = [((0, 27), (0, 28))] + [((0, 30), (0, 30))] * 5
+        self.assertEqual(st.events_decision(cut6, v, n, ALPHA, final=True)[0], "pass")   # 177 / 178
 
-    def test_a_trial_has_25_downloads_of_1_mib(self):
+    def test_a_trial_has_30_downloads_of_1_mib(self):
         import ab_workloads as w
         w.load_plugins()
         imp = sys.modules["ab_workload_impaired"]
-        self.assertEqual((imp.FETCHES, imp.BULK_OBJECT), (25, 1 << 20))
+        self.assertEqual((imp.FETCHES, imp.BULK_OBJECT), (30, 1 << 20))
 
     def test_attempts_leave_out_the_windows_cut(self):
         import types
