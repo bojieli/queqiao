@@ -207,6 +207,26 @@ class Client:
     metrics_port_base: int
     flags: List[str]
     cpu_sample: bool
+    # A multi-provider client (`queqiaod client --providers`): one process,
+    # one Client per provider, each reaching the gateway through its own
+    # relay host, so each is its own leaf under this host's uplink. Entries
+    # are (leaf name, relay address, relay port base, listener port base):
+    # the leaf's relay listens on relay base + the arm's index, and its
+    # listener here on listener base + the arm's index. Set by a workload
+    # (the DC gate's upload phase); empty for an ordinary client.
+    providers: List[Tuple[str, str, int, int]] = field(default_factory=list)
+
+
+@dataclass
+class AuxRelay:
+    """A relay hop a workload adds (the DC gate's upload leaves): per arm a
+    temporary `queqiaod relay` on `host`, listening on port_base + the arm's
+    index and forwarding to that arm's gateway port."""
+    name: str
+    host: str
+    address: str
+    platform: str
+    port_base: int
 
 
 @dataclass
@@ -273,6 +293,8 @@ class Config:
     relay: Optional[Relay] = None
     # Network impairment on the path's client host ([impair], ab_impair).
     impair: Any = None
+    # Relay hops a workload adds (AuxRelay), each on its own host.
+    aux_relays: List[Any] = field(default_factory=list)
 
     @property
     def work_dir(self) -> str:
@@ -284,7 +306,8 @@ class Config:
 
     def hosts(self) -> List[str]:
         seen: List[str] = []
-        for h in [self.gateway.host] + [c.host for c in self.clients.values()] + ([self.relay.host] if self.relay else []):
+        for h in [self.gateway.host] + [c.host for c in self.clients.values()] + ([self.relay.host] if self.relay else []) \
+                + [r.host for r in self.aux_relays]:
             if h not in seen:
                 seen.append(h)
         return seen
@@ -296,6 +319,9 @@ class Config:
                 out.append(c.platform)
         if self.relay and self.relay.platform not in out:
             out.append(self.relay.platform)
+        for r in self.aux_relays:
+            if r.platform not in out:
+                out.append(r.platform)
         return out
 
     @property
@@ -332,9 +358,16 @@ class Config:
         if self.relay:
             for a in self.arms + self.beside_arms():
                 out.setdefault(self.relay.host, []).append((g.port_base + a.index, f"relay {a.name}"))
+        for r in self.aux_relays:
+            for a in self.arms:
+                out.setdefault(r.host, []).append((r.port_base + a.index, f"relay {r.name} {a.name}"))
         for c in self.clients.values():
             for a in self.arms + (self.beside_arms() if c.name in self.paths() else []):
-                out.setdefault(c.host, []).append((c.socks_port_base + a.index, f"client {c.name} socks {a.name}"))
+                if c.providers:
+                    for leaf, _, _, base in c.providers:
+                        out.setdefault(c.host, []).append((base + a.index, f"client {c.name} provider {leaf} {a.name}"))
+                else:
+                    out.setdefault(c.host, []).append((c.socks_port_base + a.index, f"client {c.name} socks {a.name}"))
                 out.setdefault(c.host, []).append((c.metrics_port_base + a.index, f"client {c.name} metrics {a.name}"))
         return out
 
@@ -1448,6 +1481,8 @@ class Campaign:
                       f"temporary provider state for {arm.name}")
         if cfg.relay:
             self.start_relays()
+        if cfg.aux_relays:
+            self.start_aux_relays()
         # Enrollment needs a running gateway; start each, enroll every client, stop.
         for arm in cfg.arms + cfg.beside_arms():
             self.start_gateway(arm, "enroll", enroll=True)
@@ -1456,6 +1491,9 @@ class Campaign:
             self.stop(gh, f"gw-{arm.name}")
 
     def enroll(self, client: Client, arm: Arm) -> None:
+        if client.providers:
+            self.enroll_providers(client, arm)
+            return
         gh, ch = self.hosts[self.cfg.gateway.host], self.hosts[client.host]
         d = self.cl_dir(client, arm)
         out = self.must(gh, f"cd {self.gw_dir(arm)} && ./queqiaod provider invite --state ./state --user ab --expires-in 1h",
@@ -1472,6 +1510,56 @@ class Campaign:
         self.must(ch, f"chmod +x {d}/queqiaod\ncd {d} && rm -f {d}/profile.json && ./queqiaod enroll --invite {_q(invite)} "
                   f"--profile {d}/profile.json --device-name {self.cfg.work_dir}-{client.name} {local} >/dev/null && "
                   f"test -s {d}/profile.json", f"enroll {client.name} with {arm.name}")
+
+    def enroll_providers(self, client: Client, arm: Arm) -> None:
+        """A multi-provider client: one enrollment per provider, each invited
+        on its relay's route (`provider invite --path`, which keeps the
+        provider's pinned root and gateway and changes only where the client
+        dials), and a manifest naming each provider's profile and listener."""
+        gh, ch = self.hosts[self.cfg.gateway.host], self.hosts[client.host]
+        d = self.cl_dir(client, arm)
+        self.must(ch, f"mkdir -p {d}/logs", f"client directory {client.name}/{arm.name}")
+        ch.put(self.binary(arm, client.platform, "client"), f"{d}/queqiaod", if_changed=True)
+        local = " ".join(_q(x) for x in local_address_args(self.client_flags(client, arm)))
+        entries = []
+        for leaf, address, relay_base, base in client.providers:
+            route = f"{leaf}={address}:{relay_base + arm.index}"
+            out = self.must(gh, f"cd {self.gw_dir(arm)} && ./queqiaod provider invite --state ./state --user ab "
+                                f"--expires-in 1h --path {_q(route)}",
+                            f"invitation for {client.name}/{leaf}/{arm.name}")
+            m = re.search(r"queqiao://\S+", out)
+            invite = m.group(0) if m else "<invite>"
+            if not self.dry and not m:
+                raise RuntimeError(f"no invitation from gateway {arm.name}: {out.strip()[:300]}")
+            prof = f"{d}/profile-{leaf}.json"
+            self.must(ch, f"chmod +x {d}/queqiaod\ncd {d} && rm -f {prof} && ./queqiaod enroll --invite {_q(invite)} "
+                      f"--profile {prof} --device-name {self.cfg.work_dir}-{client.name}-{leaf} {local} >/dev/null && "
+                      f"test -s {prof}", f"enroll {client.name}/{leaf} with {arm.name}")
+            entries.append({"name": leaf, "profile": prof, "listen": f"127.0.0.1:{base + arm.index}"})
+        manifest = json.dumps({"version": 1, "providers": entries})
+        self.must(ch, f"printf %s {_q(manifest)} > {d}/providers.json", f"provider manifest {client.name}/{arm.name}")
+
+    def aux_relay_cmd(self, r: Any, arm: Arm) -> str:
+        """An added relay's command line for one arm (on its host)."""
+        g = self.cfg.gateway
+        args = [f"{self.w(r.host)}/relay/queqiaod", "relay", "run", "--listen", f":{r.port_base + arm.index}",
+                "--upstream", f"{g.address}:{g.port_base + arm.index}"]
+        return " ".join(_q(a) for a in args)
+
+    def start_aux_relays(self) -> None:
+        """The workload's relay hops, per arm, for the whole campaign, from
+        the main arm's build so the hop is the same for every arm (as
+        start_relays)."""
+        cfg = self.cfg
+        for r in cfg.aux_relays:
+            h, W = self.hosts[r.host], self.w(r.host)
+            self.must(h, f"mkdir -p {W}/relay {W}/run", f"relay directory for {r.name}")
+            h.put(self.binary(cfg.main, r.platform, "gateway"), f"{W}/relay/queqiaod", if_changed=True)
+            self.must(h, f"chmod +x {W}/relay/queqiaod", f"relay binary for {r.name}")
+            for arm in cfg.arms:
+                tag = f"relay-{r.name}-{arm.name}"
+                self.spawn(h, tag, f"{W}/relay", self.aux_relay_cmd(r, arm))
+                self.wait_port(h, r.port_base + arm.index, f"relay {r.name} {arm.name}", tag)
 
     # -- processes
     def spawn(self, host: Host, tag: str, cwd: str, cmd: str, env: str = "") -> None:
@@ -1538,8 +1626,9 @@ rm -f "$f"''', what=f"stop {tag}")
 
     def cl_cmd(self, client: Client, arm: Arm, logname: str) -> str:
         d = self.cl_dir(client, arm)
-        args = [f"{d}/queqiaod", "client", "--profile", f"{d}/profile.json",
-                "--listen", f"127.0.0.1:{client.socks_port_base + arm.index}",
+        where = (["--providers", f"{d}/providers.json"] if client.providers else
+                 ["--profile", f"{d}/profile.json", "--listen", f"127.0.0.1:{client.socks_port_base + arm.index}"])
+        args = [f"{d}/queqiaod", "client", *where,
                 "--metrics-listen", f"127.0.0.1:{client.metrics_port_base + arm.index}",
                 "--log-file", f"{d}/logs/{logname}.jsonl", "--log-max-size-mib", str(min(self.cfg.log_max_mib, 256)),
                 "--log-stderr=false", *self.client_flags(client, arm)]

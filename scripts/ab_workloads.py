@@ -459,6 +459,20 @@ class DCParams:
     rpc_requests: int = 10
     rpc_spacing: float = 2.0
     rpc_port: int = 23485
+    # The upload phase (design section 11.3; #235): the tree's joint limit
+    # exists only inside one client process, so this phase has one
+    # multi-provider client on the `uploader` host, each provider reaching
+    # the gateway through its own relay host ([upleaf:...]). Every provider
+    # is then its own leaf (endpoint pair) under the uploader's uplink, the
+    # common ancestor. `upload_leaves` upload backlogged objects at once;
+    # `upload_control` is the light sibling, one 355 KB upload request every
+    # control_interval. Empty upload_leaves: no upload phase.
+    uploader: str = ""
+    upload_leaves: List[str] = field(default_factory=list)
+    upload_control: str = ""
+    upload_flows_per_leaf: int = 2
+    upload_object_bytes: int = 4 << 20
+    upload_port_base: int = 23700
 
 
 def _calibrate(v: str) -> str:
@@ -503,6 +517,57 @@ def _rpc_rows(out: str, job: Job, duration: float) -> List[Tuple[str, ...]]:
 generator("dc-rpc", Generator(rpc_script, _rpc_rows, lambda job: 0))
 
 
+def upload_script(campaign: Any, job: Job, arm: Any, duration: float, start_at: int = 0) -> str:
+    """One upload leaf's backlogged uploads through its provider's listener
+    on the uploader: wlclient bgup, object after object to wlserver's sink,
+    a cut object counted by what the sink received."""
+    W = campaign.w(job.client.host)
+    return (_barrier(start_at) + f"python3 {W}/wlclient.py bgup --socks 127.0.0.1:{job.client.socks_port_base + arm.index} "
+            f"--target 127.0.0.1:{campaign.cfg.dc.rpc_port} --flows {job.n} "
+            f"--object-bytes {job.params['object_bytes']} --duration {int(duration)}")
+
+
+def upload_probe_script(campaign: Any, job: Job, arm: Any, duration: float, start_at: int = 0) -> str:
+    """The upload phase's light sibling: one ASR-shaped request (355 KB up,
+    200 B back) every interval, through its own provider (wlclient rpc with
+    both alternating shapes set to ASR)."""
+    dc = campaign.cfg.dc
+    W = campaign.w(job.client.host)
+    at = f"--start-at {start_at} " if start_at else ""
+    count = max(1, int(duration / dc.control_interval))
+    return (f"python3 {W}/wlclient.py rpc {at}--socks 127.0.0.1:{job.client.socks_port_base + arm.index} "
+            f"--target 127.0.0.1:{dc.rpc_port} --count {count} --spacing {dc.control_interval:g} "
+            f"--timeout {dc.request_timeout} --asr-up {ASR_UP} --asr-down {ASR_DOWN} --tts-up {ASR_UP} "
+            f"--tts-down {ASR_DOWN}")
+
+
+def _upload_rows(out: str, job: Job, duration: float) -> List[Tuple[str, ...]]:
+    rows = []
+    for line in out.splitlines():
+        p = line.split("\t")
+        if len(p) == 7 and p[0] != "J":
+            t0, t1, flow, code, size, secs, ex = p
+            rows.append((flow, code, size, secs, ex, t0, t1))
+    for i in range(1, job.n + 1):
+        # A flow that printed nothing still counts against the arm.
+        if not any(r[0].split("o", 1)[0] == f"u{i}" for r in rows):
+            rows.append((f"u{i}o1", "000", "0", f"{duration:.3f}", "-1", "", ""))
+    return rows
+
+
+generator("dc-upload", Generator(upload_script, _upload_rows, lambda job: int(job.params["object_bytes"])))
+generator("dc-upprobe", Generator(upload_probe_script, _rpc_rows, lambda job: 0))
+
+
+def upload_leaf_client(cfg: Any, leaf: str) -> Any:
+    """The uploader as seen by one upload leaf's jobs: its host, that
+    provider's listener, and the leaf's name in the rows."""
+    import dataclasses
+    uploader = cfg.clients[cfg.dc.uploader]
+    base = next(b for name, _, _, b in uploader.providers if name == leaf)
+    return dataclasses.replace(uploader, name=leaf, socks_port_base=base, providers=[])
+
+
 @register
 class DC(Workload):
     """The stage 9 gate (section 11.3): loaded leaves and an uncongested
@@ -521,7 +586,11 @@ class DC(Workload):
                       request_timeout=d.getint("request_timeout", 30), control_interval=d.getfloat("control_interval", 1.0),
                       calibrate=_calibrate(d.get("calibrate", "true")), request_mode=d.get("request_mode", "waves"),
                       rpc_requests=d.getint("rpc_requests", 10), rpc_spacing=d.getfloat("rpc_spacing", 2.0),
-                      rpc_port=d.getint("rpc_port", 23485))
+                      rpc_port=d.getint("rpc_port", 23485), uploader=d.get("uploader", ""),
+                      upload_leaves=ab._words(d.get("upload_leaves", "")), upload_control=d.get("upload_control", ""),
+                      upload_flows_per_leaf=d.getint("upload_flows_per_leaf", 2),
+                      upload_object_bytes=d.getint("upload_object_bytes", 4 << 20),
+                      upload_port_base=d.getint("upload_port_base", 23700))
         if dc.request_mode not in ("waves", "rpc"):
             raise ab.ConfigError("[dc] request_mode must be waves or rpc")
         if len(dc.loaded) < 2:
@@ -538,10 +607,61 @@ class DC(Workload):
             # clients on one host at once.
             raise ab.ConfigError("[dc] every leaf must be on its own host")
         cfg.dc = dc
+        self.configure_uploads(cfg, cp)
+
+    def configure_uploads(self, cfg: Any, cp: configparser.ConfigParser) -> None:
+        dc = cfg.dc
+        if not (dc.upload_leaves or dc.upload_control or dc.uploader):
+            if any(sec.startswith("upleaf:") for sec in cp.sections()):
+                raise ab.ConfigError("[upleaf:...] sections need [dc] upload_leaves")
+            return
+        if len(dc.upload_leaves) < 2 or not dc.upload_control or not dc.uploader:
+            raise ab.ConfigError("[dc] the upload phase needs uploader, at least two upload_leaves and upload_control")
+        if dc.uploader not in cfg.clients:
+            raise ab.ConfigError(f"[dc] uploader {dc.uploader!r} is not a [client:...] section")
+        if dc.uploader in dc.loaded + [dc.control]:
+            raise ab.ConfigError("[dc] the uploader must not be a download leaf")
+        uploader = cfg.clients[dc.uploader]
+        if uploader.host in [cfg.clients[x].host for x in dc.loaded + [dc.control]] or uploader.host == cfg.gateway.host:
+            # Its uplink is the upload phase's common ancestor: nothing else
+            # of the campaign may load it, and the gateway's is another link.
+            raise ab.ConfigError("[dc] the uploader needs a host of its own")
+        names = dc.upload_leaves + [dc.upload_control]
+        if len(set(names)) != len(names):
+            raise ab.ConfigError("[dc] upload_leaves and upload_control must be distinct")
+        relays = []
+        # Listeners on the uploader at base + 10 k, relays at base + 10 (n + k):
+        # never the same port, should a host carry both.
+        n = len(names)
+        for k, name in enumerate(names):
+            sec = f"upleaf:{name}"
+            if not cp.has_section(sec) or not cp[sec].get("host") or not cp[sec].get("address"):
+                raise ab.ConfigError(f"[dc] upload leaf {name!r} needs an [{sec}] section with host and address")
+            u = cp[sec]
+            relays.append(ab.AuxRelay(name=name, host=u["host"], address=u["address"],
+                                      platform=u.get("platform", "linux/amd64"), port_base=dc.upload_port_base + 10 * (n + k)))
+        extra = [s for s in cp.sections() if s.startswith("upleaf:") and s.split(":", 1)[1] not in names]
+        if extra:
+            raise ab.ConfigError(f"[{extra[0]}] is not one of [dc] upload_leaves or upload_control")
+        hosts = [r.host for r in relays]
+        addrs = [r.address for r in relays]
+        if len(set(hosts)) != len(hosts) or len(set(addrs)) != len(addrs):
+            # A leaf is an endpoint pair: the remote host is the relay's, so
+            # two leaves behind one relay host would be one leaf.
+            raise ab.ConfigError("[dc] every upload leaf needs a relay host and address of its own")
+        if uploader.host in hosts or cfg.gateway.host in hosts or cfg.gateway.address in addrs:
+            raise ab.ConfigError("[dc] an upload leaf's relay must be on neither the uploader's nor the gateway's host")
+        if len(cfg.arms) > 10:
+            raise ab.ConfigError("[dc] the upload phase supports at most 10 arms (ports are base + 10 k + arm)")
+        cfg.aux_relays = relays
+        uploader.providers = [(r.name, r.address, r.port_base, dc.upload_port_base + 10 * k) for k, r in enumerate(relays)]
+        uploader.socks_port_base = uploader.providers[0][3]
 
     def positive(self, cfg: Any) -> List[Tuple[str, float]]:
         dc = cfg.dc
-        return [("object_bytes", cfg.object_bytes), ("[dc] request_timeout", dc.request_timeout), ("[dc] waves", dc.waves),
+        up = ([("[dc] upload_flows_per_leaf", dc.upload_flows_per_leaf), ("[dc] upload_object_bytes", dc.upload_object_bytes)]
+              if dc.upload_leaves else [])
+        return up + [("object_bytes", cfg.object_bytes), ("[dc] request_timeout", dc.request_timeout), ("[dc] waves", dc.waves),
                 ("[dc] requests_per_leaf", dc.requests_per_leaf), ("[dc] bulk_flows_per_leaf", dc.bulk_flows_per_leaf),
                 ("[dc] request_bytes", dc.request_bytes), ("[dc] control_interval", dc.control_interval)]
 
@@ -558,22 +678,39 @@ class DC(Workload):
         return ["dc"]      # every leaf runs at once: a single path
 
     def clients_for(self, cfg: Any, path: str) -> List[Any]:
-        return [cfg.clients[x] for x in cfg.dc.loaded + [cfg.dc.control]]
+        return [cfg.clients[x] for x in cfg.dc.loaded + [cfg.dc.control] + ([cfg.dc.uploader] if cfg.dc.uploader else [])]
 
     def objects(self, cfg: Any) -> List[Tuple[str, int]]:
         return [(f"obj-{cfg.object_bytes}", cfg.object_bytes), (f"obj-{cfg.dc.request_bytes}", cfg.dc.request_bytes)]
 
     def endpoints(self, cfg: Any) -> List[Endpoint]:
-        if cfg.dc.request_mode != "rpc":
+        # wlserver serves W4 (rpc) and the upload phase's sink.
+        if cfg.dc.request_mode != "rpc" and not cfg.dc.upload_leaves:
             return []
         p = cfg.dc.rpc_port
         return [Endpoint("wlserver", f"python3 {{W}}/wlserver.py --http {p} --term {p + 1} --dir {{W}}",
                          tcp_ports=[(p, "rpc http"), (p + 1, "terminal")], files=[SERVER_PY])]
 
     def client_files(self, cfg: Any) -> List[str]:
-        return [CLIENT_PY] if cfg.dc.request_mode == "rpc" else []
+        return [CLIENT_PY] if cfg.dc.request_mode == "rpc" or cfg.dc.upload_leaves else []
 
     def phases(self, cfg: Any, path: str) -> List[Phase]:
+        return self.download_phases(cfg, path) + self.upload_phases(cfg)
+
+    def upload_phases(self, cfg: Any) -> List[Phase]:
+        """The upload phase: every upload leaf's backlogged uploads at once
+        through the one uploader process, and the light sibling's requests
+        under them."""
+        dc = cfg.dc
+        if not dc.upload_leaves:
+            return []
+        params = {"object_bytes": dc.upload_object_bytes}
+        return [Phase("uploads", cfg.duration,
+                      [Job(upload_leaf_client(cfg, x), "dc-upload", dc.upload_flows_per_leaf, params=params)
+                       for x in dc.upload_leaves]
+                      + [Job(upload_leaf_client(cfg, dc.upload_control), "dc-upprobe", 1, load=False)], barrier=True)]
+
+    def download_phases(self, cfg: Any, path: str) -> List[Phase]:
         dc = cfg.dc
         loaded = [cfg.clients[x] for x in dc.loaded]
         control = cfg.clients[dc.control]
@@ -600,11 +737,14 @@ class DC(Workload):
                       [Job(c, "requests", dc.requests_per_leaf, params=req) for c in loaded]
                       + [Job(control, "probe", 1, load=False, params=probe)], barrier=True)]
 
+    def calibrations(self, cfg: Any) -> int:
+        return len(cfg.dc.loaded) + len(cfg.dc.upload_leaves)
+
     def extra_block_seconds(self, cfg: Any, path: str) -> float:
-        return float(len(cfg.dc.loaded) * (cfg.duration + 15)) if cfg.dc.calibrate == "every" else 0.0
+        return float(self.calibrations(cfg) * (cfg.duration + 15)) if cfg.dc.calibrate == "every" else 0.0
 
     def extra_once_seconds(self, cfg: Any, path: str) -> float:
-        return float(len(cfg.dc.loaded) * (cfg.duration + 15)) if cfg.dc.calibrate == "first" else 0.0
+        return float(self.calibrations(cfg) * (cfg.duration + 15)) if cfg.dc.calibrate == "first" else 0.0
 
     def after_block(self, campaign: Any, block: int, path: str, tagp: str, writer: Any) -> None:
         """Each loaded leaf alone on the main arm: the common ancestor binds
@@ -628,4 +768,23 @@ class DC(Workload):
             campaign.scrape_client(leaf, arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
             if leaf.small:
                 campaign.stop_client(leaf, arm)
+            campaign.pause(cfg.gap)
+        # The upload leaves alone, one at a time, through the uploader (slots
+        # after the download leaves'): whether the uploader's uplink binds.
+        if not cfg.dc.upload_leaves:
+            return
+        uploader = cfg.clients[cfg.dc.uploader]
+        for i, name in enumerate(cfg.dc.upload_leaves):
+            slot = ab.Slot(block, path, 100 + len(cfg.dc.loaded) + i, arm.name, 0, False)
+            if uploader.small:
+                campaign.start_client(uploader, arm, f"client-{tagp}-s{slot.slot}")
+            campaign.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
+            campaign.scrape_client(uploader, arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
+            campaign.run_phase(slot, arm, Phase("upsolo", cfg.duration,
+                                                [Job(upload_leaf_client(cfg, name), "dc-upload", cfg.dc.upload_flows_per_leaf,
+                                                     params={"object_bytes": cfg.dc.upload_object_bytes})]), writer)
+            campaign.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
+            campaign.scrape_client(uploader, arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
+            if uploader.small:
+                campaign.stop_client(uploader, arm)
             campaign.pause(cfg.gap)
