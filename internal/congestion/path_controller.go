@@ -1051,6 +1051,7 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 			return false, &quiccongestion.Permit{}
 		}
 	} else if c.flight+maxBytes > window {
+		c.law.inner.noteWindowLimited()
 		if c.flight+maxBytes > window+debt {
 			c.markWindow(a, true)
 			c.stats.refusedWindow.Add(1)
