@@ -551,10 +551,11 @@ class Runner(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("# sequential: looks after blocks 6..12, one-sided alpha 0.05 spent by the Pocock-type function", text)
         self.assertIn("6: 0.0310", text)
-        # Section 15.4's budget: one block each of A, B, C and DC is about 26 min.
-        self.assertIn("bulk 5 min, mixed-67 7 min, mixed-all 9 min", text)
-        self.assertIn("one block each of A, B, C and DC is about 26 min a path", text)
-        self.assertIn("2.6 h at 6 blocks", text)
+        # As measured on the first live campaign: about 230 s of restarts
+        # and job handling per block of a type.
+        self.assertIn("bulk 8 min, mixed-67 10 min, mixed-all 12 min", text)
+        self.assertIn("one block each of A, B, C and DC is about 37 min a path (as measured", text)
+        self.assertIn("3.7 h at 6 blocks", text)
         self.assertRegex(text, r"# estimated wall time on path-a: \d+ min \(stopping at the first look\) to \d+ min \(cap\)")
         for cell in ("bulk: bulk x4", "mixed-67: wl-llm x1", "mixed-67: wl-term x1", "mixed-67: wl-bgdown x2",
                      "mixed-all: wl-call x1", "mixed-all: wl-browse x1", "mixed-all: wl-bgup x1"):
@@ -570,7 +571,9 @@ class Runner(unittest.TestCase):
         camp = ab.Campaign(ab.load_config(str(MINIMAL)), "<o>", ".", dry=True, stream=io.StringIO())
         lo, hi = camp.estimate()["path-a"]
         self.assertLess(lo, hi)
-        self.assertLess(lo, 3 * 3600)     # inside the profile's budget when it stops at the first look
+        # A, B and C together stopping at the first look: about 3 h as measured
+        # (the design budgets 2.5-3 h with DC; see the plan note).
+        self.assertLess(lo, 3.2 * 3600)
 
     def test_the_trial_settings_are_the_models(self):
         cfg = parse(BASE)
@@ -1061,6 +1064,21 @@ class RoundThreeFixes(unittest.TestCase):
         self.assertGreaterEqual(req.duration, cfg.dc.rpc_requests * cfg.dc.request_timeout)
         self.assertLess(req.expected, 30)              # the estimate stays the usual time
 
+    def test_the_rpc_job_waits_for_the_barrier_itself(self):
+        # The shell must not hold the interpreter back until the barrier:
+        # the client gets the barrier's absolute time and waits after
+        # initialising, so every leaf's waves start from the same instant.
+        cfg = ab.load_config(str(HERE / "validation" / "dc-minimal.example.ini"))
+        req = cfg.wl.phases(cfg, "dc")[0]
+        job = next(j for j in req.jobs if j.kind == "dc-rpc")
+        camp = mock.Mock(cfg=cfg)
+        camp.w.return_value = "/w"
+        arm = mock.Mock(index=0)
+        script = wl.rpc_script(camp, job, arm, req.duration, start_at=1_700_000_000)
+        self.assertTrue(script.startswith("python3 /w/wlclient.py rpc --start-at 1700000000 "), script)
+        self.assertNotIn("date +%s", script)
+        self.assertNotIn("--start-at", wl.rpc_script(camp, job, arm, req.duration))
+
     def test_wake_instances_cannot_collide_with_an_arm(self):
         text = BASE.replace("[arm:cand]", "[arm:main-wake]")
         cfg = parse(text)
@@ -1186,7 +1204,7 @@ class RoundFourFixes(unittest.TestCase):
             g["resamples"] = 500
             dec = an.interim_decisions(root, g, [list(u) for u in units])
             self.assertIn("pass", dec[("a", "bulk")])
-            failed = {"job_failures": [{"block": 6, "path": "a", "trial": "bulk"}], "fetch_failures": []}
+            failed = {"job_failures": [{"block": 6, "path": "a", "trial": "bulk", "exit": 255}], "fetch_failures": []}
             dec = an.interim_decisions(root, g, [list(u) for u in units], failed)
             self.assertNotIn("pass", dec[("a", "bulk")])
             dec = an.interim_decisions(root, g, [list(u) for u in units], {"fetch_failures": ["x"], "job_failures": []})
@@ -1568,7 +1586,7 @@ class DCAtMinimalSize(unittest.TestCase):
     def test_w4_first_then_the_sustained_phase(self):
         cfg = self.cfg()
         ph = cfg.wl.phases(cfg, "dc")
-        self.assertEqual([p.name for p in ph], ["requests", "sustained"])
+        self.assertEqual([p.name for p in ph], ["requests", "sustained", "uploads"])
         self.assertEqual({j.kind for j in ph[0].jobs}, {"dc-rpc", "probe"})
         self.assertEqual(cfg.dc.rpc_requests, 10)
         script = wl.GENERATORS["dc-rpc"].script(ab.Campaign(cfg, "<o>", ".", dry=True, stream=io.StringIO()),
@@ -1576,9 +1594,10 @@ class DCAtMinimalSize(unittest.TestCase):
         self.assertIn("--count 10 --spacing 2 ", script)
         self.assertIn("--asr-up 355000 --asr-down 200 --tts-up 300 --tts-down 300000", script)
         self.assertEqual([e.tag for e in cfg.wl.endpoints(cfg)], ["wlserver"])
-        # One block of four 60 s trials and the restarts: about 5 minutes.
+        # One block of four trials (requests, sustained and the 40 s upload
+        # phase) and the restarts: about 10.5 minutes.
         camp = ab.Campaign(cfg, "<o>", ".", dry=True, stream=io.StringIO())
-        self.assertAlmostEqual(camp.block_seconds("dc") / 60, 5, delta=0.5)
+        self.assertAlmostEqual(camp.block_seconds("dc") / 60, 10.5, delta=0.5)
 
     def test_calibration_runs_in_the_first_block_only(self):
         cfg = self.cfg()
@@ -1587,7 +1606,81 @@ class DCAtMinimalSize(unittest.TestCase):
         for b in (1, 2, 3):
             cfg.wl.after_block(camp, b, "dc", f"b{b:03d}-dc", None)
         self.assertEqual({c.args[0].block for c in camp.run_phase.call_args_list}, {1})
-        self.assertEqual(camp.run_phase.call_count, 3)          # one solo run per loaded leaf
+        # One solo run per loaded leaf, then one per upload leaf.
+        self.assertEqual(camp.run_phase.call_count, 6)
+        self.assertEqual([c.args[2].name for c in camp.run_phase.call_args_list], ["solo"] * 3 + ["upsolo"] * 3)
+
+    # --- the upload phase (#235)
+
+    def test_the_upload_phase_runs_every_upload_leaf_through_one_process(self):
+        cfg = self.cfg()
+        up = cfg.wl.phases(cfg, "dc")[-1]
+        self.assertEqual(up.name, "uploads")
+        self.assertTrue(up.barrier)
+        uploader = cfg.clients["uploader"]
+        # Every job runs on the uploader's host, through its own provider's
+        # listener, and is recorded under its leaf's name.
+        self.assertEqual({j.client.host for j in up.jobs}, {uploader.host})
+        self.assertEqual([(j.client.name, j.kind) for j in up.jobs],
+                         [("up-a", "dc-upload"), ("up-b", "dc-upload"), ("up-c", "dc-upload"), ("up-ctl", "dc-upprobe")])
+        self.assertEqual(len({j.client.socks_port_base for j in up.jobs}), 4)
+        camp = ab.Campaign(cfg, "<o>", ".", dry=True, stream=io.StringIO())
+        arm = cfg.arms[1]
+        upload = wl.GENERATORS["dc-upload"].script(camp, up.jobs[1], arm, 40)
+        self.assertIn(f"bgup --socks 127.0.0.1:{up.jobs[1].client.socks_port_base + arm.index} ", upload)
+        self.assertIn("--flows 2 --object-bytes 4194304 --duration 40", upload)
+        probe = wl.GENERATORS["dc-upprobe"].script(camp, up.jobs[3], arm, 40)
+        # The sibling's requests are all ASR-shaped (355 KB up).
+        self.assertIn("--asr-up 355000 --asr-down 200 --tts-up 355000 --tts-down 200", probe)
+        # One client process with a manifest, not one per provider.
+        cmd = camp.cl_cmd(uploader, arm, "x")
+        self.assertIn(f"--providers '{camp.cl_dir(uploader, arm)}/providers.json'", cmd)
+        self.assertNotIn("--profile", cmd)
+        self.assertNotIn("--listen", cmd)
+        self.assertIn("--path-profile dc-long-haul", cmd)
+        self.assertIn("--recovery=carrier", cmd)
+        # Each relay forwards to the arm's gateway port, on its own port.
+        relay = camp.aux_relay_cmd(cfg.aux_relays[0], arm)
+        self.assertIn(f"--listen :{cfg.aux_relays[0].port_base + arm.index} --upstream 198.51.100.20:"
+                      f"{cfg.gateway.port_base + arm.index}", relay)
+        ports = cfg.planned_ports()
+        self.assertEqual(sorted(p for p, _ in ports["dc-client-e"] if "provider" in _),
+                         sorted(b + a.index for _, _, _, b in uploader.providers for a in cfg.arms))
+        self.assertIn((cfg.aux_relays[0].port_base, "relay up-a legacy"), ports["dc-client-a"])
+
+    def test_the_uploader_enrolls_each_provider_on_its_relays_route(self):
+        cfg = self.cfg()
+        out = io.StringIO()
+        camp = ab.Campaign(cfg, "<o>", ".", dry=True, stream=out)
+        camp.enroll(cfg.clients["uploader"], cfg.arms[0])
+        text = out.getvalue()
+        for name, address, relay_base, base in cfg.clients["uploader"].providers:
+            self.assertIn(f"--path {name}={address}:{relay_base}", text)
+            self.assertIn(f'"listen": "127.0.0.1:{base}"', text)
+            self.assertIn(f"profile-{name}.json", text)
+
+    def test_upload_phase_configuration_is_checked(self):
+        bad = {
+            "upload leaf without a section": "\n[dc]\n",
+            "one relay host for two leaves": "\n[upleaf:up-b]\nhost = dc-client-a\naddress = 198.51.100.32\n",
+            "a relay on the uploader": "\n[upleaf:up-b]\nhost = dc-client-e\naddress = 198.51.100.32\n",
+            "the uploader on a download leaf's host": "\n[client:uploader]\nhost = dc-client-a\nsmall = true\n",
+        }
+        import configparser
+        for what, extra in bad.items():
+            text = (HERE / "validation" / "dc-minimal.example.ini").read_text()
+            cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"), strict=False)
+            cp.read_string(text)
+            if what == "upload leaf without a section":
+                cp.remove_section("upleaf:up-c")
+            else:
+                over = configparser.ConfigParser(interpolation=None, strict=False)
+                over.read_string(extra)
+                for sec in over.sections():
+                    for k, v in over[sec].items():
+                        cp[sec][k] = v
+            with self.assertRaises(ab.ConfigError, msg=what):
+                ab.parse_config(cp)
 
 
 class BesideSession(unittest.TestCase):
@@ -1626,11 +1719,12 @@ class BesideSession(unittest.TestCase):
 class Socks5UDP(threading.Thread):
     """SOCKS5 relay for the tests: CONNECT and UDP ASSOCIATE, on loopback.
     With drop_every n it drops every n-th uplink datagram; with burst s it
-    holds the uplink and releases it in bursts every s seconds."""
+    holds the uplink and releases it in bursts every s seconds; with
+    connect_delay s every CONNECT takes s seconds to open (a slow path)."""
 
-    def __init__(self, drop_every=0, burst=0.0):
+    def __init__(self, drop_every=0, burst=0.0, connect_delay=0.0):
         super().__init__(daemon=True)
-        self.drop_every, self.burst = drop_every, burst
+        self.drop_every, self.burst, self.connect_delay = drop_every, burst, connect_delay
         self.srv = socket.socket()
         self.srv.bind(("127.0.0.1", 0))
         self.srv.listen(64)
@@ -1657,6 +1751,7 @@ class Socks5UDP(threading.Thread):
             if head[1] == 3:
                 self.associate(c)
                 return
+            time.sleep(self.connect_delay)
             u = socket.create_connection((host, port))
             c.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
         except OSError:
@@ -1782,6 +1877,26 @@ class EndToEnd(unittest.TestCase):
                            "--report-target", f"127.0.0.1:{free_port()}")
         self.assertIn("no reflector report", recs[0]["fail"])
 
+    def test_the_calls_window_ends_with_its_media_not_its_report(self):
+        # The report is fetched over the same SOCKS path, here a slow one
+        # (each CONNECT takes 1.5 s, and there are at least two fetches):
+        # the call's end, which C's background window is built from, is
+        # the media's, not the report's.
+        slow = Socks5UDP(connect_delay=1.5)
+        slow.start()
+        try:
+            p = subprocess.run([sys.executable, str(CLIENT), "call", "--socks", f"127.0.0.1:{slow.port}", "--no-tls",
+                                "--target", f"127.0.0.1:{self.udp}", "--duration", "2",
+                                "--report-target", f"127.0.0.1:{self.http}"], capture_output=True, text=True, timeout=60)
+        finally:
+            slow.srv.close()
+        c = [json.loads(l[2:]) for l in p.stdout.splitlines() if l.startswith("J\t")][0]
+        self.assertEqual(c["fail"], "")
+        lo, hi = mn.pa.fg_span([c])
+        self.assertGreaterEqual(hi - lo, 1.9)                       # the media is all inside
+        self.assertLess(hi - lo, 2 + 0.8)                           # and nothing of the report
+        self.assertGreaterEqual(c["reported"] - c["t0"], 2 + 3.0)   # though the fetches did take their time
+
     def test_the_downlink_keeps_its_own_clock_under_a_lossy_bursty_uplink(self):
         # The uplink loses every other packet and arrives in 300 ms bursts;
         # the downlink must still be the full open-loop stream, on time.
@@ -1824,6 +1939,22 @@ class EndToEnd(unittest.TestCase):
         # ASR and TTS alternate: 200 bytes back, then 300 KB.
         self.assertEqual([r[4] for r in rows], ["200", "300000", "200", "300000"])
         self.assertEqual({r[6] for r in rows}, {"0"})
+
+    def test_request_waves_start_at_the_shared_barrier(self):
+        # The barrier is 3 s ahead: the client starts now, initialises, and
+        # waits for it; each wave is due at barrier + i x spacing on the
+        # shared clock, not at its interpreter's start plus that.
+        at = time.time() + 3.0
+        p = subprocess.run([sys.executable, str(CLIENT), "rpc", "--socks", f"127.0.0.1:{self.socks.port}", "--no-tls",
+                            "--target", f"127.0.0.1:{self.http}", "--count", "3", "--spacing", "0.5",
+                            "--start-at", f"{at:.3f}"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = [l.split("\t") for l in p.stdout.splitlines()]
+        self.assertEqual([r[2] for r in rows], ["w1r1", "w2r1", "w3r1"])
+        starts = [float(r[0]) for r in rows]
+        for i, t in enumerate(starts):
+            self.assertGreaterEqual(t, at + 0.5 * i - 0.01)
+            self.assertLess(t, at + 0.5 * i + 0.25)
 
     def test_idle_connections_wake(self):
         ready = os.path.join(self.tmp.name, "ready")

@@ -192,6 +192,13 @@ type Config struct {
 	// Together these give each chunk one repair owner at a time: the code
 	// until its deadline, then the stream. ForceReliable still applies.
 	CodedRetry bool
+	// GapReissued, when set, is told of every chunk receiver gap evidence
+	// returned to the ready set: by ReissueUnacknowledgedBelow, or, under
+	// CodedRetry, by the write or registration report that arrived after the
+	// evidence and completed the proof. Each such retry is reported once,
+	// whichever order the evidence and the report arrived in. It is called
+	// with the scheduler's lock held and must not call back into it.
+	GapReissued func(n uint64)
 	// Windows supplies admission limits. When nil, only LaneWindow and
 	// MaxOutstanding apply, which is the behaviour of a flow with no
 	// congestion coupling.
@@ -418,7 +425,10 @@ type Stats struct {
 	PeakOutstanding  int
 	// CodedAbandoned counts unreliable attempts the coded path abandoned,
 	// under CodedRetry.
-	CodedAbandoned    uint64
+	CodedAbandoned uint64
+	// GapReissued counts chunks receiver gap evidence returned to the ready
+	// set; see Config.GapReissued.
+	GapReissued       uint64
 	CompletedByLaneID map[uint64]uint64
 }
 
@@ -474,13 +484,18 @@ type Scheduler struct {
 type autotuneState struct {
 	bound      int
 	roundStart time.Time
-	covered    bool // newly validated unique coverage arrived this round
-	blocked    bool // the producer waited on the bound this round
-	room       bool // ...while a lane had room to take more
-	waiting    bool // the producer is waiting on the bound now
-	roundMaxU  uint64
-	history    [autotuneHistory]uint64
-	rounds     int
+	// roundLen is the length of the current credit round, sampled from
+	// Autotune.Round once when the round starts. Round can be costly (the
+	// flow layer walks its lanes under their locks) and autotuneLocked runs
+	// at every read admission, dispatch and completion, under s.mu.
+	roundLen  time.Duration
+	covered   bool // newly validated unique coverage arrived this round
+	blocked   bool // the producer waited on the bound this round
+	room      bool // ...while a lane had room to take more
+	waiting   bool // the producer is waiting on the bound now
+	roundMaxU uint64
+	history   [autotuneHistory]uint64
+	rounds    int
 	// reading is when the producer began its current read of the source,
 	// holding nothing back; zero while it is not reading.
 	reading time.Time
@@ -511,6 +526,7 @@ func New(src io.Reader, cfg Config) *Scheduler {
 	if cfg.Autotune != nil {
 		s.tune.bound = s.autotuneStartup()
 		s.tune.roundStart = cfg.Now()
+		s.tune.roundLen = s.autotuneRound()
 	}
 	go s.produce()
 	return s
@@ -826,7 +842,10 @@ func (s *Scheduler) autotuneLocked(now time.Time) {
 	if s.cfg.Autotune == nil {
 		return
 	}
-	round := s.autotuneRound()
+	round := s.tune.roundLen
+	if now.Sub(s.tune.roundStart) < round {
+		return
+	}
 	for i := 0; now.Sub(s.tune.roundStart) >= round; i++ {
 		if i >= autotuneMaxCatchUp {
 			// Every further empty round is the same as the last, and by
@@ -856,6 +875,9 @@ func (s *Scheduler) autotuneLocked(now time.Time) {
 		s.closeRoundLocked()
 		s.tune.roundStart = s.tune.roundStart.Add(round)
 	}
+	// The next round's length is sampled once, now that it has started:
+	// an RTT that changed mid-round takes effect a round later.
+	s.tune.roundLen = s.autotuneRound()
 }
 
 // sourceReturned ends an application-idle stretch when the source read
@@ -1069,10 +1091,6 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 			s.stats.ChunksRetransmit++
 			s.stats.BytesRetransmit += uint64(len(chunk.Data))
 		}
-		var deadline time.Time
-		if after := s.retransmitAfter(); after > 0 {
-			deadline = s.cfg.Now().Add(after)
-		}
 		s.nextAttempt++
 		if s.nextAttempt == 0 {
 			// Zero belongs to source chunks which have not been dispatched. A
@@ -1085,16 +1103,20 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		if s.cfg.ForceReliable != nil && s.cfg.ForceReliable(chunk.Offset) {
 			reliable = true
 		}
-		if s.cfg.CodedRetry {
-			if exists {
-				// The sticky reliable bit: a chunk dispatched before had its
-				// one coded attempt, and every later one is on the stream.
-				reliable = true
-			}
-			if !reliable {
-				// The deadline starts at registration, not here: from now
-				// until then the bytes wait in queues they cannot be lost in.
-				deadline = time.Time{}
+		if s.cfg.CodedRetry && exists {
+			// The sticky reliable bit: a chunk dispatched before had its
+			// one coded attempt, and every later one is on the stream.
+			reliable = true
+		}
+		// Under CodedRetry an attempt on the code has no deadline yet: it
+		// starts at registration, not here, because from now until then the
+		// bytes wait in queues they cannot be lost in. The substrate is
+		// decided first so such a dispatch does not ask for a deadline it
+		// would discard (RetransmitAfter walks the lanes).
+		var deadline time.Time
+		if !s.cfg.CodedRetry || reliable {
+			if after := s.retransmitAfter(); after > 0 {
+				deadline = s.cfg.Now().Add(after)
 			}
 		}
 		out.attempts = append(out.attempts, attempt{
@@ -1444,17 +1466,31 @@ func (s *Scheduler) requeueLocked(chunk *Chunk) {
 // acknowledgement, and therefore the sender's entire clock -- for five
 // seconds, on a transfer that took nine.
 func (s *Scheduler) ReissueUnacknowledgedBelow(offset uint64) int {
+	return s.ReissueUnacknowledgedBelowAt(offset, time.Time{})
+}
+
+// ReissueUnacknowledgedBelowAt is ReissueUnacknowledgedBelow for evidence
+// observed at seen: when the acknowledgement that advanced the frontier
+// arrived, not when this scan runs. Under CodedRetry that instant places the
+// evidence among registrations, so an acknowledgement that arrived before an
+// attempt's packet left cannot show the attempt lost. A zero seen means now.
+func (s *Scheduler) ReissueUnacknowledgedBelowAt(offset uint64, seen time.Time) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gapNow = offset
 	defer func() {
 		if offset > s.gapHigh && s.cfg.CodedRetry {
-			s.gapSeen[s.gapNext%gapHistory] = gapAdvance{at: s.cfg.Now(), offset: offset}
+			at := seen
+			if at.IsZero() {
+				at = s.cfg.Now()
+			}
+			s.gapSeen[s.gapNext%gapHistory] = gapAdvance{at: at, offset: offset}
 			s.gapNext++
 		}
 		s.gapHigh = max(s.gapHigh, offset)
 	}()
 	reissued := 0
+	var requeued uint64 // reissued, for the unsigned accounting
 	for _, out := range s.live {
 		if out.chunk.End() > offset || len(out.attempts) == 0 {
 			continue
@@ -1485,11 +1521,23 @@ func (s *Scheduler) ReissueUnacknowledgedBelow(offset uint64) int {
 		}
 		s.requeueLocked(out.chunk)
 		reissued++
+		requeued++
 	}
 	if reissued > 0 {
+		s.noteGapReissuedLocked(requeued)
 		s.ready.Broadcast()
 	}
 	return reissued
+}
+
+// noteGapReissuedLocked accounts chunks receiver gap evidence returned to the
+// ready set. Every gap-driven retry goes through here, whichever of the
+// evidence and the attempt's own reports arrived last.
+func (s *Scheduler) noteGapReissuedLocked(n uint64) {
+	s.stats.GapReissued += n
+	if s.cfg.GapReissued != nil {
+		s.cfg.GapReissued(n)
+	}
 }
 
 // ReissueExpired advances attempts according to their transport semantics.
@@ -1729,7 +1777,9 @@ func (s *Scheduler) wrote(laneID uint64, chunk *Chunk, reliable *bool) {
 			// reported, and they went nowhere else.
 			s.retireAttemptLocked(out, a.id, true)
 		} else if s.cfg.CodedRetry && s.provenLostLocked(out, a) {
-			s.retireAttemptLocked(out, a.id, false)
+			if s.retireAttemptLocked(out, a.id, false) {
+				s.noteGapReissuedLocked(1)
+			}
 		}
 		s.ready.Broadcast()
 		return
@@ -1790,7 +1840,9 @@ func (s *Scheduler) RegisteredAgo(laneID uint64, chunk *Chunk, age time.Duration
 	// report did, was skipped while the attempt looked unregistered. It
 	// shows the attempt lost now.
 	if s.provenLostLocked(out, a) {
-		s.retireAttemptLocked(out, a.id, false)
+		if s.retireAttemptLocked(out, a.id, false) {
+			s.noteGapReissuedLocked(1)
+		}
 		s.ready.Broadcast()
 	}
 }
@@ -1864,8 +1916,8 @@ func (s *Scheduler) attemptLocked(laneID uint64, chunk *Chunk) (*outstanding, *a
 }
 
 // retireAttemptLocked ends one unreliable attempt and, if it was the chunk's
-// last, returns the chunk to the ready set.
-func (s *Scheduler) retireAttemptLocked(out *outstanding, id uint64, abandoned bool) {
+// last, returns the chunk to the ready set; it reports whether it did.
+func (s *Scheduler) retireAttemptLocked(out *outstanding, id uint64, abandoned bool) bool {
 	for i, a := range out.attempts {
 		if a.id != id {
 			continue
@@ -1877,9 +1929,11 @@ func (s *Scheduler) retireAttemptLocked(out *outstanding, id uint64, abandoned b
 		}
 		break
 	}
-	if len(out.attempts) == 0 {
+	if len(out.attempts) == 0 && !s.pendingHas(out.chunk.Offset) {
 		s.requeueLocked(out.chunk)
+		return true
 	}
+	return false
 }
 
 // LaneOutstanding reports what one lane is holding: chunks handed to it and

@@ -88,11 +88,13 @@ CANON_SH = r'''canon() {
 }
 '''
 # Wall-time estimates: seconds the runner adds per block of one trial type
-# (endpoint restarts, client starts and stops, scrapes, log collection:
-# design section 15.4's "about 26 min" for one block each of A, B, C and DC
-# is four trials of 60, 90, 120 and 60 s plus this per block) and once
-# (builds, copies, enrollment). Rough.
-BLOCK_OVERHEAD = 60
+# (endpoint restarts, client starts and stops, scrapes, host CPU samplers,
+# job launch and polling, log collection) and once (builds, copies,
+# enrollment). Measured on the first stage 6/7 campaign through a relay hop:
+# a block of A took about 7.7 min (4 x 60 s of trials) and one of B about
+# 10 min (4 x 90 s), so about 230 s per block, and a round of A and B about
+# 17 min.
+BLOCK_OVERHEAD = 230
 SETUP_SECONDS = 240
 # Seconds between dispatching a DC phase's jobs and their shared start.
 BARRIER_LEAD = 5
@@ -205,6 +207,39 @@ class Client:
     metrics_port_base: int
     flags: List[str]
     cpu_sample: bool
+    # A multi-provider client (`queqiaod client --providers`): one process,
+    # one Client per provider, each reaching the gateway through its own
+    # relay host, so each is its own leaf under this host's uplink. Entries
+    # are (leaf name, relay address, relay port base, listener port base):
+    # the leaf's relay listens on relay base + the arm's index, and its
+    # listener here on listener base + the arm's index. Set by a workload
+    # (the DC gate's upload phase); empty for an ordinary client.
+    providers: List[Tuple[str, str, int, int]] = field(default_factory=list)
+
+
+@dataclass
+class AuxRelay:
+    """A relay hop a workload adds (the DC gate's upload leaves): per arm a
+    temporary `queqiaod relay` on `host`, listening on port_base + the arm's
+    index and forwarding to that arm's gateway port."""
+    name: str
+    host: str
+    address: str
+    platform: str
+    port_base: int
+
+
+@dataclass
+class Relay:
+    """A fixed relay hop in front of the gateway ([relay]), as production
+    clients reach their gateway through one: per arm a temporary
+    `queqiaod relay` on `host` listening on that arm's gateway port and
+    forwarding TCP and UDP to the gateway. Clients enroll with, and dial,
+    `address` (the relay's) instead of the gateway's."""
+    host: str
+    address: str
+    platform: str
+    flags: List[str]
 
 
 @dataclass
@@ -254,6 +289,14 @@ class Config:
     # Sample every host's CPU (and production's) through each trial, for the
     # contention void rule (gates.ini [contention]).
     host_cpu: bool = False
+    # A relay hop in front of the gateway ([relay]); None: clients dial it.
+    relay: Optional[Relay] = None
+    # Network impairment on the path's client host ([impair], ab_impair).
+    impair: Any = None
+    # Relay hops a workload adds (AuxRelay), each on its own host.
+    aux_relays: List[Any] = field(default_factory=list)
+    # Fetch logs through this ssh host instead of directly ("" for direct).
+    fetch_via: str = ""
 
     @property
     def work_dir(self) -> str:
@@ -265,7 +308,8 @@ class Config:
 
     def hosts(self) -> List[str]:
         seen: List[str] = []
-        for h in [self.gateway.host] + [c.host for c in self.clients.values()]:
+        for h in [self.gateway.host] + [c.host for c in self.clients.values()] + ([self.relay.host] if self.relay else []) \
+                + [r.host for r in self.aux_relays]:
             if h not in seen:
                 seen.append(h)
         return seen
@@ -275,7 +319,17 @@ class Config:
         for c in self.clients.values():
             if c.platform not in out:
                 out.append(c.platform)
+        if self.relay and self.relay.platform not in out:
+            out.append(self.relay.platform)
+        for r in self.aux_relays:
+            if r.platform not in out:
+                out.append(r.platform)
         return out
+
+    @property
+    def endpoint_address(self) -> str:
+        """What clients dial: the relay's address when there is one."""
+        return self.relay.address if self.relay else self.gateway.address
 
     def paths(self) -> List[str]:
         """Clients that are measured paths. The DC workload runs every leaf at
@@ -303,9 +357,19 @@ class Config:
         for ep in (self.wl.endpoints(self) if self.wl else []):
             for port, what in ep.tcp_ports + ep.udp_ports:
                 out.setdefault(g.host, []).append((port, f"{ep.tag} {what}"))
+        if self.relay:
+            for a in self.arms + self.beside_arms():
+                out.setdefault(self.relay.host, []).append((g.port_base + a.index, f"relay {a.name}"))
+        for r in self.aux_relays:
+            for a in self.arms:
+                out.setdefault(r.host, []).append((r.port_base + a.index, f"relay {r.name} {a.name}"))
         for c in self.clients.values():
             for a in self.arms + (self.beside_arms() if c.name in self.paths() else []):
-                out.setdefault(c.host, []).append((c.socks_port_base + a.index, f"client {c.name} socks {a.name}"))
+                if c.providers:
+                    for leaf, _, _, base in c.providers:
+                        out.setdefault(c.host, []).append((base + a.index, f"client {c.name} provider {leaf} {a.name}"))
+                else:
+                    out.setdefault(c.host, []).append((c.socks_port_base + a.index, f"client {c.name} socks {a.name}"))
                 out.setdefault(c.host, []).append((c.metrics_port_base + a.index, f"client {c.name} metrics {a.name}"))
         return out
 
@@ -315,6 +379,29 @@ def load_config(path: str) -> Config:
     if not cp.read(path):
         raise ConfigError(f"cannot read {path}")
     return parse_config(cp)
+
+
+def _relay(cp: configparser.ConfigParser) -> Optional["Relay"]:
+    if not cp.has_section("relay"):
+        return None
+    r = cp["relay"]
+    for k in ("host", "address"):
+        if not r.get(k):
+            raise ConfigError(f"[relay] {k} is required")
+    flags = _words(r.get("flags", "--dial-timeout 3s --idle-timeout 15m --max-connections 8192"))
+    _check_flags("[relay] flags", flags)
+    for f in flags:
+        if f.lstrip("-").split("=", 1)[0] in ("listen", "upstream"):
+            raise ConfigError("[relay] flags: the runner sets --listen and --upstream")
+    return Relay(host=r["host"], address=r["address"], platform=r.get("platform", "linux/amd64"), flags=flags)
+
+
+def _impair(cp: configparser.ConfigParser) -> Any:
+    import ab_impair
+    try:
+        return ab_impair.parse(cp)
+    except ValueError as e:
+        raise ConfigError(str(e))
 
 
 def _sequential(c) -> Any:
@@ -420,9 +507,16 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  probe_bytes=c.getint("probe_bytes", 1024), probe_interval=c.getfloat("probe_interval", 0.5),
                  snapshot_every=c.getint("snapshot_every", 4), lane_trace=_bool(c.get("lane_trace", "true")),
                  sequential=_sequential(c), host_cpu=_bool(c.get("host_cpu", "false")),
-                 log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=15")),
+                 relay=_relay(cp), impair=_impair(cp), fetch_via=c.get("fetch_via", "").strip(),
+                 log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=3")),
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
+    if wl.impairs and not cfg.impair:
+        raise ConfigError(f"workload {cfg.workload} runs under network impairment: it needs an [impair] section")
+    if cfg.impair and not wl.impairs:
+        raise ConfigError(f"[impair]: workload {cfg.workload} has no impairment scenarios")
+    if cfg.impair and cfg.impair.host not in cfg.hosts():
+        raise ConfigError(f"[impair] host {cfg.impair.host} is not a host of the campaign")
     if cfg.sequential and (wl.analyzer != "ab_analyze" or wl.primary or wl.sample_based):
         # The stopping looks decide [workload:...] rules; a workload judged by
         # the primary gate with its [secondary] bounds, by samples, or by
@@ -561,13 +655,30 @@ def unit_tag(block: int, path: str, trial: str = "") -> str:
 class Host:
     """Runs shell on one host: locally when dest is "local", else over ssh."""
 
-    def __init__(self, dest: str, ssh_options: Sequence[str], dry: bool, out=None):
+    def __init__(self, dest: str, ssh_options: Sequence[str], dry: bool, out=None, control_dir: str = ""):
         self.dest = dest
-        self.ssh_options = list(ssh_options)
+        # One ssh connection per host, reused by every session (ControlMaster):
+        # a session then costs a round trip, not a handshake. Its socket lives
+        # in the campaign's own directory; close() ends it.
+        self.control = (["-o", "ControlMaster=auto", "-o", f"ControlPath={control_dir}/%C", "-o", "ControlPersist=300"]
+                        if control_dir and dest != "local" else [])
+        self.base_options = list(ssh_options)
+        self.ssh_options = list(ssh_options) + self.control
+        # Logs are fetched through this host ([campaign] fetch_via) when the
+        # direct link is slow; "" fetches directly.
+        self.fetch_via = ""
         self.dry = dry
         self.out = out or sys.stdout
         self.home = "~" if dry else ""
         self.lock = threading.Lock()
+        # Every session's wall time, for the overhead profile (timing.tsv):
+        # set by the campaign once its directory exists.
+        self.timing_path = ""
+
+    def _time(self, what: str, t0: float) -> None:
+        if self.timing_path:
+            with self.lock, open(self.timing_path, "a") as f:
+                f.write(f"{t0:.3f}\t{self.dest}\t{time.time() - t0:.3f}\t{what.replace(chr(9), ' ')}\n")
 
     def _argv(self) -> List[str]:
         if self.dest == "local":
@@ -581,18 +692,35 @@ class Host:
                 for line in script.strip().splitlines():
                     print(f"    {line}", file=self.out)
             return 0, ""
-        p = subprocess.run(self._argv(), input="set -uo pipefail\n" + script, capture_output=True, text=True,
-                           timeout=timeout)
+        t0 = time.time()
+        try:
+            p = subprocess.run(self._argv(), input="set -uo pipefail\n" + script, capture_output=True, text=True,
+                               timeout=timeout)
+        finally:
+            self._time(what or "run", t0)
         return p.returncode, p.stdout + (("\n" + p.stderr) if p.returncode and p.stderr else "")
 
-    def put(self, local: str, remote: str) -> None:
+    def put(self, local: str, remote: str, if_changed: bool = False) -> None:
+        """Copy a file to the host. if_changed: skip the copy when the host
+        already has a file with the same SHA-256 there (a binary from an
+        earlier campaign or arm), checked on the host, not assumed."""
         if self.dry:
             print(f"[{self.dest}] copy {local} -> {remote}", file=self.out)
             return
+        t0 = time.time()
+        if if_changed:
+            with open(local, "rb") as f:
+                want = hashlib.sha256(f.read()).hexdigest()
+            rc, out = self.run(f"sha256sum {_q(remote)} 2>/dev/null || shasum -a 256 {_q(remote)} 2>/dev/null; true",
+                               what=f"hash {os.path.basename(remote)}")
+            if rc == 0 and out.split()[:1] == [want]:
+                self._time(f"copy {os.path.basename(local)} (unchanged)", t0)
+                return
         if self.dest == "local":
             subprocess.run(["cp", local, remote], check=True)
         else:
             subprocess.run(["scp", "-q", *self.ssh_options, local, f"{self.dest}:{remote}"], check=True)
+        self._time(f"copy {os.path.basename(local)}", t0)
 
     def get(self, remote: str, local: str) -> bool:
         if self.dry:
@@ -601,7 +729,17 @@ class Host:
         os.makedirs(os.path.dirname(local), exist_ok=True)
         if self.dest == "local":
             return subprocess.run(["cp", remote, local]).returncode == 0
+        if self.fetch_via and self.fetch_via != self.dest:
+            # Its own connection through the jump host: a shared connection
+            # would carry it over the direct link.
+            return subprocess.run(["scp", "-q", *self.base_options, "-o", f"ProxyJump={self.fetch_via}",
+                                   f"{self.dest}:{remote}", local]).returncode == 0
         return subprocess.run(["scp", "-q", *self.ssh_options, f"{self.dest}:{remote}", local]).returncode == 0
+
+    def close(self) -> None:
+        """End the shared ssh connection, if one was opened."""
+        if self.control and not self.dry:
+            subprocess.run(["ssh", *self.ssh_options, "-O", "exit", self.dest], capture_output=True, timeout=30)
 
 
 # Snapshot of what production looks like on one host. Read-only: systemctl
@@ -961,6 +1099,15 @@ def cpu_sampler(pid_file: str, out_file: str) -> str:
 
 
 HOST_CPU_EVERY = 2   # seconds between host CPU samples
+# run_job's outcomes besides a job's own exit status. Only a host unreachable
+# through every retry, or a job the runner itself killed tearing down, is the
+# control plane (the block is void); the others are the arm's failures.
+JOB_UNREACHABLE = 255
+JOB_KILLED_BY_RUNNER = -4
+JOB_TIMEOUT = -1
+JOB_NO_RECORD = -2
+JOB_LOST = -3
+CONTROL_PLANE = (JOB_UNREACHABLE, JOB_KILLED_BY_RUNNER)
 
 
 def host_cpu_sampler(stop_file: str, units: Sequence[str]) -> str:
@@ -983,6 +1130,35 @@ def host_cpu_sampler(stop_file: str, units: Sequence[str]) -> str:
             "done\nrm -f \"$stop\"")
 
 
+def ssh_control_dir(out: str) -> str:
+    """Where the campaign's shared ssh sockets live: run/ssh under its own
+    directory, or a private directory under /tmp when that path would be too
+    long for a Unix socket (a %C socket name is 40 characters)."""
+    d = os.path.join(os.path.abspath(out), "ssh")
+    if len(d) + 42 > 100:
+        import tempfile
+        return tempfile.mkdtemp(prefix="qqab-ssh-", dir="/tmp")
+    return d          # created with the campaign directory (run)
+
+
+def parallel(*calls) -> None:
+    """Run the calls at once (threads); re-raise the first error."""
+    errs: List[BaseException] = []
+
+    def go(f):
+        try:
+            f()
+        except BaseException as e:   # surfaced below
+            errs.append(e)
+    ths = [threading.Thread(target=go, args=(f,), daemon=True) for f in calls]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    if errs:
+        raise errs[0]
+
+
 def utc(t: float) -> str:
     return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
@@ -996,8 +1172,11 @@ class Campaign:
         self.repo = repo
         self.dry = dry
         self.stream = stream
-        self.hosts: Dict[str, Host] = {h: Host(h, cfg.ssh_options, dry, stream)
+        self.ssh_dir = "" if dry else ssh_control_dir(self.out)
+        self.hosts: Dict[str, Host] = {h: Host(h, cfg.ssh_options, dry, stream, self.ssh_dir)
                                       for h in cfg.hosts() + [p.host for p in cfg.production]}
+        for h in self.hosts.values():
+            h.fetch_via = cfg.fetch_via
         self.before: Dict[str, dict] = {}
         self.active_small: Dict[str, str] = {}   # host -> running temporary client tag
         self.fetch_failures: List[str] = []
@@ -1008,6 +1187,13 @@ class Campaign:
         self.blocks_run = 0
         self.units_run: List[List[Any]] = []
         self.teardown_notes: List[str] = []
+        self.tearing_down = False
+        # Failed jobs that are the arm's evidence (a timeout, a job lost or
+        # silent on a reachable host), for the report.
+        self.workload_failures: List[dict] = []
+        # The network impairment ([impair]), if any.
+        import ab_impair
+        self.impair = ab_impair.Impairer(self, cfg.impair) if cfg.impair else None
         self.stopped = ""
         self.stopped_types: Dict[str, str] = {}
         self.beside_threads: List[threading.Thread] = []
@@ -1086,9 +1272,23 @@ class Campaign:
                   f"a process under ~/{self.cfg.work_dir}/ is already running:", file=self.stream)
             for host, ports in self.cfg.planned_ports().items():
                 print(f"    {host}: " + ", ".join(f"{p} ({w})" for p, w in ports), file=self.stream)
+            if self.impair:
+                print(f"[preflight] impairment on {self.impair.icfg.host}: would refuse unless it is root, the route to "
+                      f"{self.impair.remote} leaves by the impaired interface, that interface has no clsact or ingress "
+                      f"qdisc, no {'/'.join(self.impair.ifb('b') + self.impair.ifb('w'))} device exists, and no filter "
+                      "port is declared production or inside either end's ephemeral range; then snapshot every "
+                      "interface's tc state", file=self.stream)
+                for r in self.impair.config_reasons():
+                    print(f"    REFUSE {r}", file=self.stream)
+                for s, ports in self.impair.ports.items():
+                    if ports:
+                        print(f"    filter set {s}: IPv4 to/from {self.impair.remote}, UDP and TCP, remote port "
+                              f"{ports[0]}-{ports[-1]}", file=self.stream)
             self.reserve()
             return
         reasons = refusal_reasons(self.cfg, self.before) + self.canonical_path_reasons()
+        if self.impair:
+            reasons += self.impair.preflight_reasons()
         if reasons:
             raise Refused("\n".join(reasons))
         self.reserve()
@@ -1282,16 +1482,20 @@ class Campaign:
         for arm in cfg.arms + cfg.beside_arms():
             d = self.gw_dir(arm)
             self.must(gh, f"mkdir -p {d}/logs", f"gateway directory for {arm.name}")
-            gh.put(self.binary(arm, g.platform, "gateway"), f"{d}/queqiaod")
+            gh.put(self.binary(arm, g.platform, "gateway"), f"{d}/queqiaod", if_changed=True)
             # Fresh provider state every campaign: a kept work directory from
             # an earlier run must not supply this one's identity or users. The
             # account has no device or flow limit of its own (0: every device,
             # the gateway's --max-sessions), so a campaign measures the path,
             # not account admission.
             self.must(gh, f"chmod +x {d}/queqiaod\ncd {d} && rm -rf ./state && ./queqiaod provider init --state ./state "
-                      f"--name {cfg.work_dir}-{arm.name} --endpoint {g.address}:{g.port_base + arm.index} >/dev/null && "
+                      f"--name {cfg.work_dir}-{arm.name} --endpoint {cfg.endpoint_address}:{g.port_base + arm.index} >/dev/null && "
                       f"./queqiaod provider add-user --state ./state --name ab --max-flows 0 --max-clients 0 >/dev/null",
                       f"temporary provider state for {arm.name}")
+        if cfg.relay:
+            self.start_relays()
+        if cfg.aux_relays:
+            self.start_aux_relays()
         # Enrollment needs a running gateway; start each, enroll every client, stop.
         for arm in cfg.arms + cfg.beside_arms():
             self.start_gateway(arm, "enroll", enroll=True)
@@ -1300,6 +1504,9 @@ class Campaign:
             self.stop(gh, f"gw-{arm.name}")
 
     def enroll(self, client: Client, arm: Arm) -> None:
+        if client.providers:
+            self.enroll_providers(client, arm)
+            return
         gh, ch = self.hosts[self.cfg.gateway.host], self.hosts[client.host]
         d = self.cl_dir(client, arm)
         out = self.must(gh, f"cd {self.gw_dir(arm)} && ./queqiaod provider invite --state ./state --user ab --expires-in 1h",
@@ -1309,13 +1516,63 @@ class Campaign:
         if not self.dry and not m:
             raise RuntimeError(f"no invitation from gateway {arm.name}: {out.strip()[:300]}")
         self.must(ch, f"mkdir -p {d}/logs", f"client directory {client.name}/{arm.name}")
-        ch.put(self.binary(arm, client.platform, "client"), f"{d}/queqiaod")
+        ch.put(self.binary(arm, client.platform, "client"), f"{d}/queqiaod", if_changed=True)
         local = " ".join(_q(x) for x in local_address_args(self.client_flags(client, arm)))
         # A profile left by an earlier run would point at another gateway:
         # remove it, enroll, and fail the campaign if enrollment fails.
         self.must(ch, f"chmod +x {d}/queqiaod\ncd {d} && rm -f {d}/profile.json && ./queqiaod enroll --invite {_q(invite)} "
                   f"--profile {d}/profile.json --device-name {self.cfg.work_dir}-{client.name} {local} >/dev/null && "
                   f"test -s {d}/profile.json", f"enroll {client.name} with {arm.name}")
+
+    def enroll_providers(self, client: Client, arm: Arm) -> None:
+        """A multi-provider client: one enrollment per provider, each invited
+        on its relay's route (`provider invite --path`, which keeps the
+        provider's pinned root and gateway and changes only where the client
+        dials), and a manifest naming each provider's profile and listener."""
+        gh, ch = self.hosts[self.cfg.gateway.host], self.hosts[client.host]
+        d = self.cl_dir(client, arm)
+        self.must(ch, f"mkdir -p {d}/logs", f"client directory {client.name}/{arm.name}")
+        ch.put(self.binary(arm, client.platform, "client"), f"{d}/queqiaod", if_changed=True)
+        local = " ".join(_q(x) for x in local_address_args(self.client_flags(client, arm)))
+        entries = []
+        for leaf, address, relay_base, base in client.providers:
+            route = f"{leaf}={address}:{relay_base + arm.index}"
+            out = self.must(gh, f"cd {self.gw_dir(arm)} && ./queqiaod provider invite --state ./state --user ab "
+                                f"--expires-in 1h --path {_q(route)}",
+                            f"invitation for {client.name}/{leaf}/{arm.name}")
+            m = re.search(r"queqiao://\S+", out)
+            invite = m.group(0) if m else "<invite>"
+            if not self.dry and not m:
+                raise RuntimeError(f"no invitation from gateway {arm.name}: {out.strip()[:300]}")
+            prof = f"{d}/profile-{leaf}.json"
+            self.must(ch, f"chmod +x {d}/queqiaod\ncd {d} && rm -f {prof} && ./queqiaod enroll --invite {_q(invite)} "
+                      f"--profile {prof} --device-name {self.cfg.work_dir}-{client.name}-{leaf} {local} >/dev/null && "
+                      f"test -s {prof}", f"enroll {client.name}/{leaf} with {arm.name}")
+            entries.append({"name": leaf, "profile": prof, "listen": f"127.0.0.1:{base + arm.index}"})
+        manifest = json.dumps({"version": 1, "providers": entries})
+        self.must(ch, f"printf %s {_q(manifest)} > {d}/providers.json", f"provider manifest {client.name}/{arm.name}")
+
+    def aux_relay_cmd(self, r: Any, arm: Arm) -> str:
+        """An added relay's command line for one arm (on its host)."""
+        g = self.cfg.gateway
+        args = [f"{self.w(r.host)}/relay/queqiaod", "relay", "run", "--listen", f":{r.port_base + arm.index}",
+                "--upstream", f"{g.address}:{g.port_base + arm.index}"]
+        return " ".join(_q(a) for a in args)
+
+    def start_aux_relays(self) -> None:
+        """The workload's relay hops, per arm, for the whole campaign, from
+        the main arm's build so the hop is the same for every arm (as
+        start_relays)."""
+        cfg = self.cfg
+        for r in cfg.aux_relays:
+            h, W = self.hosts[r.host], self.w(r.host)
+            self.must(h, f"mkdir -p {W}/relay {W}/run", f"relay directory for {r.name}")
+            h.put(self.binary(cfg.main, r.platform, "gateway"), f"{W}/relay/queqiaod", if_changed=True)
+            self.must(h, f"chmod +x {W}/relay/queqiaod", f"relay binary for {r.name}")
+            for arm in cfg.arms:
+                tag = f"relay-{r.name}-{arm.name}"
+                self.spawn(h, tag, f"{W}/relay", self.aux_relay_cmd(r, arm))
+                self.wait_port(h, r.port_base + arm.index, f"relay {r.name} {arm.name}", tag)
 
     # -- processes
     def spawn(self, host: Host, tag: str, cwd: str, cmd: str, env: str = "") -> None:
@@ -1382,8 +1639,9 @@ rm -f "$f"''', what=f"stop {tag}")
 
     def cl_cmd(self, client: Client, arm: Arm, logname: str) -> str:
         d = self.cl_dir(client, arm)
-        args = [f"{d}/queqiaod", "client", "--profile", f"{d}/profile.json",
-                "--listen", f"127.0.0.1:{client.socks_port_base + arm.index}",
+        where = (["--providers", f"{d}/providers.json"] if client.providers else
+                 ["--profile", f"{d}/profile.json", "--listen", f"127.0.0.1:{client.socks_port_base + arm.index}"])
+        args = [f"{d}/queqiaod", "client", *where,
                 "--metrics-listen", f"127.0.0.1:{client.metrics_port_base + arm.index}",
                 "--log-file", f"{d}/logs/{logname}.jsonl", "--log-max-size-mib", str(min(self.cfg.log_max_mib, 256)),
                 "--log-stderr=false", *self.client_flags(client, arm)]
@@ -1443,30 +1701,132 @@ rm -f "$f"''', what=f"stop {tag}")
     def stop_file(self, client: Client, arm: Arm) -> str:
         return f"{self.w(client.host)}/run/stop-probe-{client.name}-{arm.name}"
 
-    def as_job(self, host: str, script: str) -> str:
-        """Run a job so that teardown can stop it and everything it started,
-        even when the runner was interrupted while the job's ssh was in
-        flight: the job is a file run as `env QQ_AB_TOKEN=<token> bash
-        <file>`, so its shell and every descendant carry the token from exec
-        on (JOB_OWN_SH). The descriptor run/job-N.pgid holds "<pid> <token>";
-        it is removed when the job ends with none of its processes left, and
-        kept (for teardown, or manual cleanup) otherwise."""
+    def as_job(self, host: str, script: str) -> Tuple[str, Dict[str, str]]:
+        """A detached job: the shell that launches it, and its files. The job
+        is a file run by a wrapper as `env QQ_AB_TOKEN=<token> bash <wrapper>`
+        under setsid and nohup, so it survives the ssh session that started
+        it, and its shell and every descendant carry the token from exec on
+        (JOB_OWN_SH; teardown finds them by it). The wrapper keeps the job's
+        output and exit status in run/job-N.out and run/job-N.rc, which the
+        runner fetches over fresh ssh sessions (run_job). The descriptor
+        run/job-N.pgid holds "<pid> <token>"; the wrapper removes it once the
+        job has ended with none of its processes left."""
         W = self.w(host)
         self.job_seq += 1
-        f = f"{W}/run/job-{self.job_seq}.pgid"
-        body = f"{W}/run/job-{self.job_seq}.sh"
+        n = self.job_seq
+        files = {k: f"{W}/run/job-{n}.{k}" for k in ("pgid", "sh", "wrap", "out", "rc")}
         # A fixed-length random token per job: no job's token is a prefix of
         # another's, and none appears in any argument.
         tok = secrets.token_hex(16)
-        return (f"{JOB_OWN_SH}\n"
-                f"cat > {body} <<'QQ_AB_JOB_EOF'\n{script}\nQQ_AB_JOB_EOF\n"
-                f"env QQ_AB_TOKEN={tok} bash {body} &\nj=$!\n"
-                f"echo \"$j {tok}\" > {f}\n"
-                f"wait $j\nrc=$?\n"
-                f"m=$(own_mode)\n"
+        wrap = (f"bash {files['sh']} > {files['out']} 2>&1\n"
+                f"echo $? > {files['rc']}.tmp && mv {files['rc']}.tmp {files['rc']}\n"
+                f"{JOB_OWN_SH}\n"
+                "m=$(own_mode)\n"
                 # Only a verified absence (exit 1) retires the descriptor.
-                f"if [ \"$m\" != none ]; then members {tok} $m $j >/dev/null; [ $? -eq 1 ] && rm -f {f} {body}; fi\n"
-                f"exit $rc")
+                f"if [ \"$m\" != none ]; then members {tok} $m $$ >/dev/null; [ $? -eq 1 ] && rm -f {files['pgid']}; fi\n")
+        launch = (f"cat > {files['sh']} <<'QQ_AB_JOB_EOF'\n{script}\nQQ_AB_JOB_EOF\n"
+                  f"cat > {files['wrap']} <<'QQ_AB_WRAP_EOF'\n{wrap}QQ_AB_WRAP_EOF\n"
+                  f"rm -f {files['out']} {files['rc']}\n"
+                  f"( if command -v setsid >/dev/null; then exec setsid nohup env QQ_AB_TOKEN={tok} bash {files['wrap']}; "
+                  f"else exec nohup env QQ_AB_TOKEN={tok} bash {files['wrap']}; fi ) > /dev/null 2>&1 < /dev/null &\n"
+                  f"echo \"$! {tok}\" > {files['pgid']}\necho QQ_AB_LAUNCHED")
+        return launch, files
+
+    # Polling a detached job: the interval, and how many ssh sessions in a row
+    # may fail (with backoff) before its host counts as unreachable.
+    JOB_POLL = 1.0
+    JOB_SSH_TRIES = 5
+    # The CPU sampler's launch, stop and fetch: 9 sessions, about three and a
+    # half minutes of backoff, since its record decides whether a block counts.
+    SAMPLER_SSH_TRIES = 9
+
+    def run_job(self, host: str, script: str, timeout: float, what: str) -> Tuple[int, str]:
+        """Run a job detached on host and return (exit status, output). An ssh
+        session that drops costs nothing: the job goes on, and the runner
+        polls and fetches its output over fresh sessions, retrying with
+        backoff. Only a host unreachable through JOB_SSH_TRIES sessions in a
+        row (255), or a job that outlives `timeout` (-1), is a failed job --
+        a control-plane failure, which voids its block (gates.ini [harness])."""
+        files, rc = self.start_job(host, script, what)
+        if self.dry:
+            return 0, ""
+        if files is None:
+            return rc, ""
+        return self.wait_job(host, files, timeout, what)
+
+    def session(self, host: str, cmd: str, what_: str, tries: int = 0) -> Tuple[int, str]:
+        """One ssh session, retried with backoff (2, 4, ... 30 s) while it
+        fails to connect, up to `tries` sessions (JOB_SSH_TRIES by default)."""
+        h = self.hosts[host]
+        tries = tries or self.JOB_SSH_TRIES
+        out = ""
+        for k in range(tries):
+            try:
+                rc, out = h.run(cmd, timeout=120, what=what_)
+            except Exception as e:  # a hung ssh is a dropped session
+                rc, out = 255, f"{type(e).__name__}: {e}"
+            if rc != 255:
+                return rc, out
+            self.log(f"{host}: ssh session failed ({what_}); retry {k + 1} of {tries - 1}")
+            if not self.dry:
+                time.sleep(min(30.0, 2.0 * 2 ** k))
+        return 255, out
+
+    def start_job(self, host: str, script: str, what: str, tries: int = 0) -> Tuple[Optional[Dict[str, str]], int]:
+        """Launch a detached job; (its files, 0), or (None, exit status) when
+        it could not be launched (255: its host unreachable)."""
+        launch, files = self.as_job(host, script)
+        rc, out = self.session(host, launch, what, tries)
+        if self.dry:
+            return files, 0
+        if rc != 0 or "QQ_AB_LAUNCHED" not in out:
+            return None, (255 if rc == 255 else rc or 1)
+        return files, 0
+
+    def wait_job(self, host: str, files: Dict[str, str], timeout: float, what: str,
+                 tries: int = 0) -> Tuple[int, str]:
+        """Follow a launched job to its end (run_job's outcomes)."""
+        if self.dry:
+            return 0, ""
+        session = lambda cmd, what_: self.session(host, cmd, what_, tries)
+        deadline = time.time() + timeout
+        # Done (its status is there), lost (its wrapper is gone without one:
+        # killed), or still running.
+        poll = (f"if [ -f {files['rc']} ]; then echo \"QQ_AB_RC $(cat {files['rc']})\"; cat {files['out']}; "
+                f"elif [ -f {files['pgid']} ] && read -r p t < {files['pgid']} && ! kill -0 \"$p\" 2>/dev/null "
+                f"&& [ ! -f {files['rc']} ]; then echo QQ_AB_LOST; else echo QQ_AB_RUNNING; fi")
+        while True:
+            rc, out = session(poll, f"{what}: poll")
+            if rc == 255:
+                return 255, ""
+            first, _, rest = out.partition("\n")
+            if first.strip() == "QQ_AB_LOST":
+                # Killed by the runner itself (teardown after an abort) is the
+                # harness's; otherwise the job died on a reachable host.
+                self.log(f"{host}: {what} ended without an exit status (killed)")
+                return (JOB_KILLED_BY_RUNNER if self.tearing_down else JOB_LOST), ""
+            if first.startswith("QQ_AB_RC "):
+                try:
+                    job_rc = int(first.split()[1])
+                except (IndexError, ValueError):
+                    job_rc = 1
+                session(f"rm -f {files['out']} {files['rc']} {files['sh']} {files['wrap']}", f"{what}: clean up")
+                return job_rc, rest
+            if time.time() > deadline:
+                # Past its window: the runner ends the job's own processes (not
+                # the wrapper, which then records what it had), and the job is
+                # a timeout -- the arm's failure, evidence, never void.
+                self.log(f"{host}: {what} still running after {timeout:.0f} s; stopping it (a timeout)")
+                session(f"{JOB_OWN_SH}\nm=$(own_mode); [ \"$m\" != none ] && read -r p t < {files['pgid']} && "
+                        f"ps_=$(members \"$t\" \"$m\" \"$p\") && kill -KILL $(echo \"$ps_\" | tr ' ' '\\n' | "
+                        f"grep -v -x \"$p\") 2>/dev/null; true", f"{what}: stop at its deadline")
+                for _ in range(10):
+                    rc, out = session(poll, f"{what}: poll after its deadline")
+                    if out.startswith("QQ_AB_RC "):
+                        return JOB_TIMEOUT, out.partition("\n")[2]
+                    time.sleep(1)
+                return JOB_TIMEOUT, ""
+            time.sleep(self.JOB_POLL)
 
     def interim(self, path: str, trial: str = "") -> Tuple[bool, str]:
         """(stop?, summary) for one path x trial type's sequential gate on
@@ -1492,6 +1852,7 @@ rm -f "$f"''', what=f"stop {tag}")
         of the window, the others (measuring under that load) until the load
         has finished."""
         import ab_workloads
+        phase = self.cfg.wl.per_trial(self.cfg, slot, arm, phase)
         results: Dict[int, Tuple[float, float, int, str]] = {}
         duration = phase.duration
         gens = [ab_workloads.GENERATORS[j.kind] for j in phase.jobs]
@@ -1499,11 +1860,11 @@ rm -f "$f"''', what=f"stop {tag}")
         def go(i, job, gen):
             t0 = time.time()
             try:
-                rc, out = self.hosts[job.client.host].run(self.as_job(job.client.host, gen.script(self, job, arm, duration, start_at)),
-                                                          timeout=duration + 120 + BARRIER_LEAD,
-                                                          what=f"{phase.name}: {job.kind} x{job.n} via {job.client.name}/{arm.name}")
-            except Exception as e:  # a hung ssh is a failed job, not a dead campaign
-                rc, out = -1, ""
+                rc, out = self.run_job(job.client.host, gen.script(self, job, arm, duration, start_at),
+                                       timeout=duration + 120 + BARRIER_LEAD,
+                                       what=f"{phase.name}: {job.kind} x{job.n} via {job.client.name}/{arm.name}")
+            except Exception as e:  # the runner could not reach or follow the job
+                rc, out = JOB_UNREACHABLE, ""
                 self.log(f"job {job.kind} on {job.client.name} failed: {e}")
             results[i] = (t0, time.time(), rc, out)
 
@@ -1538,14 +1899,31 @@ rm -f "$f"''', what=f"stop {tag}")
                    result: Tuple[float, float, int, str], writer, measures_path: Optional[str], duration: float) -> None:
         """A finished job's rows (trials.tsv) and raw records (measures.jsonl)."""
         t0, t1, rc, out = result
-        if rc != 0:
-            # The generator did not run to its end (ssh dropped, timed out,
-            # crashed): a harness failure, not the arm's. Its block gets no
-            # verdict; its rows are still written for diagnosis.
-            self.job_failures.append({"block": slot.block, "path": slot.path, "trial": slot.trial, "slot": slot.slot,
-                                      "arm": arm.name, "phase": phase.name, "client": job.client.name,
-                                      "kind": job.kind, "exit": rc})
-            self.log(f"job {job.kind} on {job.client.name} ({phase.name}) exited {rc}: its block will have no verdict")
+        if rc == 0 and not out.strip() and not self.dry:
+            rc = JOB_NO_RECORD       # ran, but left no record at all
+        if rc != 0 and getattr(gen, "harness", False):
+            rc = JOB_KILLED_BY_RUNNER     # the harness's own job (the impairment's outages) failed
+        if rc in CONTROL_PLANE:
+            # The runner lost the job: its host unreachable through every ssh
+            # retry, or the runner itself killed it tearing down. Harness
+            # infrastructure, not the arm: the block is void for both arms.
+            self.job_failures.append({"failure": "control-plane", "block": slot.block, "path": slot.path,
+                                      "trial": slot.trial, "slot": slot.slot, "arm": arm.name, "phase": phase.name,
+                                      "client": job.client.name, "kind": job.kind, "exit": rc})
+            self.log(f"job {job.kind} on {job.client.name} ({phase.name}) lost to the control plane (exit {rc}): "
+                     "its block is void")
+        elif rc != 0:
+            # Past its window, lost or silent while its host stayed reachable,
+            # or its generator failing: the arm's failure, kept as evidence.
+            reason = {JOB_TIMEOUT: "timeout", JOB_NO_RECORD: "no record", JOB_LOST: "killed"}.get(rc, f"exit {rc}")
+            self.workload_failures.append({"block": slot.block, "path": slot.path, "trial": slot.trial,
+                                           "slot": slot.slot, "arm": arm.name, "phase": phase.name,
+                                           "client": job.client.name, "kind": job.kind, "reason": reason})
+            self.log(f"job {job.kind} on {job.client.name} ({phase.name}, {arm.name}) failed: {reason} (the arm's)")
+            if gen.records and gen.record_kind and not (gen.records(out) if out else []):
+                # A measuring job with no record of its own: a failed session.
+                out = (out + "\n" if out else "") + "J\t" + json.dumps({"kind": gen.record_kind, "fail": reason,
+                                                                       "t0": round(t0, 3), "t1": round(t1, 3)})
         want = gen.expected(job)
         # A generator's raw records ("J<TAB>{json}" lines) go to
         # measures.jsonl, keyed to the trial and phase, for the workload's
@@ -1573,6 +1951,9 @@ rm -f "$f"''', what=f"stop {tag}")
         self.beside_results: Dict[Tuple[str, str], Tuple[float, float, int, str]] = {}
         self.beside_slots: List[Tuple[Slot, Arm, Any]] = []
         self.log(f"{beside.name}: starting its sessions beside the blocks")
+        if beside.impair and self.impair:
+            # Its own ports, for the whole session (its set-up included).
+            self.impair.apply("w", beside.impair, beside.phase.duration + beside.ready_seconds + 240)
         for arm in cfg.beside_arms():
             self.start_gateway(arm, f"server-{beside.name}")
         ready: List[Tuple[Host, str]] = []
@@ -1590,12 +1971,12 @@ rm -f "$f"''', what=f"stop {tag}")
                 n += 1
                 slot = Slot(1, path, n, real.name, 1, True, "")
                 self.beside_slots.append((slot, real, job))
-                script = self.as_job(client.host, gen.script(self, job, arm, beside.phase.duration))
+                script = gen.script(self, job, arm, beside.phase.duration)
 
-                def go(key=(path, real.name), host=ch, script=script, what=f"{beside.name} on {client.name}/{arm.name}"):
+                def go(key=(path, real.name), host=client.host, script=script, what=f"{beside.name} on {client.name}/{arm.name}"):
                     t0 = time.time()
                     try:
-                        rc, out = host.run(script, timeout=beside.phase.duration + 180, what=what)
+                        rc, out = self.run_job(host, script, timeout=beside.phase.duration + 180, what=what)
                     except Exception as e:
                         rc, out = -1, ""
                         self.log(f"{what} failed: {e}")
@@ -1626,6 +2007,16 @@ rm -f "$f"''', what=f"stop {tag}")
         cfg = self.cfg
         for th in self.beside_threads:
             th.join(timeout=beside.phase.duration + 240)
+        if beside.impair and self.impair:
+            fired = self.impair.remove("w")
+            ended = max((r_[1] for r_ in self.beside_results.values()), default=time.time())
+            if fired is not None and fired < ended:
+                # The session ran partly unimpaired: the harness's failure.
+                self.beside_impair_fired = utc(fired)
+                self.log(f"{beside.name}: the impairment watchdog fired at {utc(fired)}, before the session ended")
+            elif fired is not None:
+                self.log(f"{beside.name}: the impairment watchdog removed it at {utc(fired)}, after the session ended "
+                         f"({utc(ended)}): the session ran impaired throughout")
         clients = [cfg.clients[p] for p in cfg.paths()]
         for c in clients:
             for arm in cfg.beside_arms():
@@ -1636,7 +2027,10 @@ rm -f "$f"''', what=f"stop {tag}")
             return
         sub = os.path.join(self.out, beside.name)
         os.makedirs(sub, exist_ok=True)
+        before = len(self.fetch_failures)
         self.collect(beside.name, clients, cfg.beside_arms(), out=sub)
+        # Its logs are its own campaign's evidence, not the blocks'.
+        self.beside_fetch_failures = self.fetch_failures[before:]
         gen = ab_workloads.GENERATORS[beside.phase.jobs[0].kind]
         with open(os.path.join(sub, "trials.tsv"), "w") as tsv:
             tsv.write("\t".join(TRIAL_COLUMNS) + "\n")
@@ -1648,6 +2042,11 @@ rm -f "$f"''', what=f"stop {tag}")
                 res = self.beside_results.get((slot.path, real.name), (time.time(), time.time(), -1, ""))
                 self.record_job(slot, real, beside.phase, 0, job, gen, res, writer,
                                 os.path.join(sub, "measures.jsonl"), beside.phase.duration)
+            if getattr(self, "beside_impair_fired", ""):
+                self.job_failures.append({"failure": "control-plane", "block": 1, "path": cfg.paths()[0], "trial": "",
+                                          "slot": 1, "arm": cfg.main.name, "phase": beside.phase.name,
+                                          "client": cfg.paths()[0], "kind": "impairment", "exit": JOB_KILLED_BY_RUNNER,
+                                          "fired_utc": self.beside_impair_fired})
             self.beside_failures = self.job_failures[failures_before:]
             # Its failures are its own; the blocks' verdicts do not depend on them.
             del self.job_failures[failures_before:]
@@ -1668,10 +2067,10 @@ rm -f "$f"''', what=f"stop {tag}")
         arms = {a.name: a for a in cfg.arms}
         tagp = unit_tag(block, path, trial)
         self.log(f"block {block} path {path}{' ' + trial if trial else ''}: " + " ".join(s.arm for s in slots))
-        # Restart every gateway, so each arm's first trial in this block is cold.
-        for arm in cfg.arms:
-            self.stop(self.hosts[cfg.gateway.host], f"gw-{arm.name}")
-            self.start_gateway(arm, f"server-{tagp}")
+        # Restart every gateway, so each arm's first trial in this block is
+        # cold: the arms' gateways at once.
+        parallel(*[(lambda arm=arm: (self.stop(self.hosts[cfg.gateway.host], f"gw-{arm.name}"),
+                                     self.start_gateway(arm, f"server-{tagp}"))) for arm in cfg.arms])
         clients = self.clients_for(path)
         resident = [c for c in clients if not c.small]
         for c in resident:
@@ -1684,19 +2083,32 @@ rm -f "$f"''', what=f"stop {tag}")
                 if c.small:
                     self.start_client(c, arm, f"client-{tagp}-s{s.slot}")
             name = f"{tagp}-s{s.slot}-{arm.name}"
-            self.scrape(arm, name + "-pre")
-            for c in clients:
-                self.scrape_client(c, arm, name + "-pre")
+            parallel(lambda: self.scrape(arm, name + "-pre"), *[(lambda c=c: self.scrape_client(c, arm, name + "-pre"))
+                                                                 for c in clients])
             samplers = self.start_host_cpu(name, path) if cfg.host_cpu else None
+            phases = cfg.wl.type_phases(cfg, path, trial)
+            scenario = cfg.wl.impairment(cfg, trial) if self.impair else ""
             try:
-                for phase in cfg.wl.type_phases(cfg, path, trial):
-                    self.run_phase(s, arm, phase, writer)
+                if scenario:
+                    # Just before the trial, on every block arm's port alike.
+                    self.impair.apply("b", scenario, sum(p.duration for p in phases) + 120 + BARRIER_LEAD)
+                try:
+                    for phase in phases:
+                        self.run_phase(s, arm, phase, writer)
+                finally:
+                    if scenario and self.impair.remove("b") is not None:
+                        # Its watchdog removed the impairment before the trial
+                        # ended: the harness's failure, not the arm's.
+                        self.job_failures.append({"failure": "control-plane", "block": s.block, "path": s.path,
+                                                  "trial": s.trial, "slot": s.slot, "arm": arm.name,
+                                                  "phase": trial, "client": path, "kind": "impairment",
+                                                  "exit": JOB_KILLED_BY_RUNNER})
+                        self.log(f"impairment watchdog fired during {name}: its block is void")
             finally:
                 if samplers is not None:
                     self.stop_host_cpu(name, samplers)
-            self.scrape(arm, name + "-post")
-            for c in clients:
-                self.scrape_client(c, arm, name + "-post")
+            parallel(lambda: self.scrape(arm, name + "-post"),
+                     *[(lambda c=c: self.scrape_client(c, arm, name + "-post")) for c in clients])
             for c in clients:
                 if c.small:
                     self.stop_client(c, arm)
@@ -1711,43 +2123,81 @@ rm -f "$f"''', what=f"stop {tag}")
         self.collect(tagp, clients)
 
     def host_cpu_hosts(self, path: str) -> List[str]:
-        """The hosts a trial on this path loads: the gateway's and its clients'."""
-        return list(dict.fromkeys([self.cfg.gateway.host] + [c.host for c in self.clients_for(path)]))
+        """The hosts a trial on this path loads: the gateway's, the relay's
+        and its clients'."""
+        relay = [self.cfg.relay.host] if self.cfg.relay else []
+        return list(dict.fromkeys([self.cfg.gateway.host] + relay + [c.host for c in self.clients_for(path)]))
+
+    def relay_cmd(self, arm: Arm) -> str:
+        """The relay's command line for one arm (on the relay host)."""
+        r, g = self.cfg.relay, self.cfg.gateway
+        port = g.port_base + arm.index
+        args = [f"{self.w(r.host)}/relay/queqiaod", "relay", "run", "--listen", f":{port}",
+                "--upstream", f"{g.address}:{port}", *r.flags]
+        return " ".join(_q(a) for a in args)
+
+    def start_relays(self) -> None:
+        """Per arm, a temporary relay on the relay host on that arm's gateway
+        port, forwarding TCP and UDP to the gateway; the main arm's build for
+        every arm, so the hop is the same for both. Started from the work
+        directory with a pid file, so teardown stops it; it stays up for the
+        whole campaign (a relay keeps no path knowledge)."""
+        cfg, r, g = self.cfg, self.cfg.relay, self.cfg.gateway
+        rh = self.hosts[r.host]
+        W = self.w(r.host)
+        self.must(rh, f"mkdir -p {W}/relay {W}/run", "relay directory")
+        rh.put(self.binary(cfg.main, r.platform, "gateway"), f"{W}/relay/queqiaod", if_changed=True)
+        self.must(rh, f"chmod +x {W}/relay/queqiaod", "relay binary")
+        for arm in cfg.arms + cfg.beside_arms():
+            port = g.port_base + arm.index
+            self.spawn(rh, f"relay-{arm.name}", f"{W}/relay", self.relay_cmd(arm))
+            self.wait_port(rh, port, f"relay {arm.name}", f"relay-{arm.name}")
 
     def start_host_cpu(self, name: str, path: str) -> Dict[str, Any]:
         """Start a read-only CPU sampler (a job, so teardown stops it) on every
         host the trial loads; returns what stop_host_cpu needs."""
         out: Dict[str, Any] = {}
-        for host in self.host_cpu_hosts(path):
-            h = self.hosts[host]
+        hosts = self.host_cpu_hosts(path)
+        parallel(*[(lambda host=host: self.hosts[host].run(f"rm -f {self.w(host)}/run/stop-hostcpu",
+                                                            what=f"clear the host CPU sampler's stop file on {host}"))
+                   for host in hosts])
+        def go(host):
+            # Detached, like the jobs, and not followed while it runs: its
+            # samples stay in its output file on the host and are fetched
+            # once it is stopped, so a dropped ssh session mid-trial costs
+            # nothing. Launching is patient (SAMPLER_SSH_TRIES sessions).
             stop = f"{self.w(host)}/run/stop-hostcpu"
-            h.run(f"rm -f {stop}", what=f"clear the host CPU sampler's stop file on {host}")
             units = [u for p in self.cfg.production if p.host == host for u in p.units]
-            script = self.as_job(host, host_cpu_sampler(stop, units))
-            res: Dict[str, Any] = {}
-
-            def go(h=h, script=script, res=res, host=host):
-                try:
-                    res["rc"], res["out"] = h.run(script, timeout=6 * 3600, what=f"host CPU sampler on {host} ({name})")
-                except Exception as e:  # recorded as missing evidence, not a dead campaign
-                    res["rc"], res["out"] = -1, ""
-                    self.log(f"host CPU sampler on {host} failed: {e}")
-            th = threading.Thread(target=go, daemon=True)
-            th.start()
-            out[host] = (th, stop, res)
+            try:
+                files, _ = self.start_job(host, host_cpu_sampler(stop, units), f"host CPU sampler on {host} ({name})",
+                                          self.SAMPLER_SSH_TRIES)
+            except Exception as e:  # recorded as missing evidence, not a dead campaign
+                files = None
+                self.log(f"host CPU sampler on {host} failed to start: {e}")
+            out[host] = (files, stop)
+        parallel(*[(lambda host=host: go(host)) for host in hosts])
         return out
 
     def stop_host_cpu(self, name: str, samplers: Dict[str, Any]) -> None:
-        """Stop the samplers and keep their samples as hostcpu/<name>-<host>.tsv."""
-        for host, (th, stop, res) in samplers.items():
-            self.hosts[host].run(f"touch {stop}", what=f"stop the host CPU sampler on {host}")
-        for host, (th, stop, res) in samplers.items():
-            th.join(timeout=60)
+        """Stop the samplers and keep their samples as hostcpu/<name>-<host>.tsv.
+        Stopping and fetching are patient (SAMPLER_SSH_TRIES sessions, about
+        three minutes of retries): a brief ssh outage delays the fetch rather
+        than losing the trial's CPU record."""
+        def go(host, files, stop):
+            if files is None:
+                return
+            self.session(host, f"touch {stop}", f"stop the host CPU sampler on {host}", self.SAMPLER_SSH_TRIES)
+            rc, text = self.wait_job(host, files, 60, f"host CPU sampler on {host} ({name})", self.SAMPLER_SSH_TRIES)
             if self.dry:
-                continue
+                return
             os.makedirs(os.path.join(self.out, "hostcpu"), exist_ok=True)
+            if rc == 255:
+                self.log(f"host CPU sampler on {host} ({name}): its samples could not be fetched")
+                return
             with open(os.path.join(self.out, "hostcpu", f"{name}-{host}.tsv"), "w") as f:
-                f.write("".join(line[2:] + "\n" for line in (res.get("out") or "").splitlines() if line.startswith("S ")))
+                f.write("".join(line[2:] + "\n" for line in (text or "").splitlines() if line.startswith("S ")))
+        parallel(*[(lambda host=host, files=files, stop=stop: go(host, files, stop))
+                   for host, (files, stop) in samplers.items()])
 
     def collect(self, tagp: str, clients: List[Client], arms: Optional[List[Arm]] = None,
                 out: Optional[str] = None) -> None:
@@ -1808,6 +2258,17 @@ rm -f "$f"''', what=f"stop {tag}")
     # -- teardown
     def teardown(self) -> None:
         self.log("teardown")
+        self.tearing_down = True
+        if self.impair:
+            # Before any process is stopped (the watchdogs among them): every
+            # set removed and the tc state compared with the snapshot.
+            try:
+                left = self.impair.teardown()
+            except Exception as e:
+                left = [f"impairment: teardown failed: {type(e).__name__}: {e}"]
+                self.impair.leftovers = left
+            self.log("impairment: " + ("NOT RESTORED: " + "; ".join(left) if left else
+                                       "removed; the tc state matches the snapshot"))
         # Only directories this invocation reserved, and only while it still
         # owns them: never another campaign's processes.
         for host in self.reserved:
@@ -1900,6 +2361,9 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         slots = schedule(cfg)
         if not self.dry:
             os.makedirs(self.out, exist_ok=False)
+            os.makedirs(self.ssh_dir, exist_ok=True)
+            for h in self.hosts.values():
+                h.timing_path = os.path.join(self.out, "timing.tsv")
         self.print_plan(slots)
         # SIGINT/SIGTERM become KeyboardInterrupt from before the first
         # reservation, so every path out of reserve, build and the plan's
@@ -1923,6 +2387,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                     # Hosts whose CPU each path's trials record (host_cpu).
                     "hostcpu_hosts": {p: self.host_cpu_hosts(p) for p in cfg.paths()} if cfg.host_cpu else None,
                     "gateway_host": cfg.gateway.host,
+                    # The impairment's filters and frozen scenarios.
+                    "impair": self.impair.describe() if self.impair else None,
                     # The gates in force, frozen before the first block: the
                     # analyzer refuses a verdict under other ones.
                     "gates_sha256": gates_digest(),
@@ -1933,6 +2399,9 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             if not self.dry:
                 with open(os.path.join(self.out, "plan.json"), "w") as f:
                     json.dump(plan, f, indent=2, default=str)
+                if self.impair:
+                    with open(os.path.join(self.out, "impair-before.txt"), "w") as f:
+                        f.write(self.impair.before)
         except BaseException:
             # Nothing was started; give back whatever was reserved so a
             # corrected rerun is not refused.
@@ -2043,13 +2512,23 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         if clean_failures:
             self.log("cleanup failed:\n  " + "\n  ".join(clean_failures))
             status = status or 7
+        for h in self.hosts.values():
+            try:
+                h.close()
+            except Exception:   # a connection already gone needs no closing
+                pass
         if not self.dry:
             # The analyzers issue a verdict only for a campaign that finished,
             # cleaned up after itself and left production as it found it.
             with open(os.path.join(self.out, "status.json"), "w") as f:
                 json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
                            "production": production, "teardown_leftovers": leftovers, "cleanup_failures": clean_failures,
-                           "fetch_failures": self.fetch_failures, "job_failures": self.job_failures,
+                           "fetch_failures": [f for f in self.fetch_failures
+                                              if f not in getattr(self, "beside_fetch_failures", [])],
+                           "job_failures": self.job_failures,
+                           "workload_failures": self.workload_failures,
+                           "impairment": (None if not self.impair else
+                                          "not restored" if self.impair.leftovers else "restored"),
                            "blocks_run": self.blocks_run, "units_run": self.units_run, "stopped": self.stopped,
                            "stopped_types": self.stopped_types,
                            "wall_seconds": round(time.time() - self.t_start, 1),
@@ -2059,7 +2538,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 with open(os.path.join(sub, "status.json"), "w") as f:
                     json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
                                "production": production, "teardown_leftovers": leftovers,
-                               "cleanup_failures": clean_failures, "fetch_failures": self.fetch_failures,
+                               "cleanup_failures": clean_failures,
+                               "fetch_failures": getattr(self, "beside_fetch_failures", []),
                                "job_failures": getattr(self, "beside_failures", []), "blocks_run": 1,
                                "finished_utc": utc(time.time())}, f, indent=2)
         return status
@@ -2071,7 +2551,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             self.snapshot_all("teardown")
             return []
         snaps = self.snapshot_all("teardown")
-        out = []
+        out = list(self.impair.leftovers) if self.impair else []
         for host, ports in self.cfg.planned_ports().items():
             snap = snaps.get(host, {})
             if not snap.get("listen_ok"):
@@ -2139,7 +2619,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         for line in cfg.wl.plan_notes(cfg):
             p(f"# {line}")
         p(f"# work directory on every host: ~/{cfg.work_dir}")
-        p(f"# gateway host {cfg.gateway.host} ({cfg.gateway.platform}), clients dial {cfg.gateway.address}")
+        p(f"# gateway host {cfg.gateway.host} ({cfg.gateway.platform}), clients dial {cfg.endpoint_address}"
+          + (f" (relay on {cfg.relay.host}, forwarding each arm's port to {cfg.gateway.address})" if cfg.relay else ""))
         for a in cfg.arms:
             src = (a.ref if a.gateway_ref == a.client_ref else f"gateway {a.gateway_ref}, client {a.client_ref}") \
                 if not a.binaries else ", ".join(f"{k}={v}" for k, v in a.binaries.items())

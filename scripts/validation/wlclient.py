@@ -691,6 +691,7 @@ def cmd_call(args) -> None:
         return
     u.settimeout(0.2)
     c0 = time.monotonic()
+    c0_wall = time.time()     # the same instant on the wall clock the records use
     sent = {}          # (stream, seq) -> [frame, send ms]
     got_down = {}      # (stream, seq) -> (server send ms, client receive ms)
     done = threading.Event()
@@ -730,6 +731,10 @@ def cmd_call(args) -> None:
             u.sendto(header + body, relay)
     except OSError as e:
         rec["fail"] = f"{type(e).__name__}: {e}"[:200]
+    # The uplink's media ends here, before any report is fetched: the
+    # fetches cross the same SOCKS path and must not stretch the window the
+    # background is measured over.
+    up_end_ms = max((t for _, t in sent.values()), default=0.0)
     up, down = {}, []
     if not rec["fail"]:
         try:
@@ -757,7 +762,13 @@ def cmd_call(args) -> None:
         b = got_down.get((stream, sq))
         rec["down_audio" if stream == b"a" else "down_video"].append(
             [frame, round(ts, 1), None, round(b[1] - ts, 1) if b else None])
-    rec["t1"] = round(time.time(), 3)
+    # The call's end is its media's: the uplink's last send or the
+    # downlink's last arrival, whichever is later, read from the media's own
+    # timestamps. The reflector report's fetches come after and are not
+    # part of it; `reported` is when they finished.
+    down_end_ms = max((v[1] for v in list(got_down.values())), default=0.0)
+    rec["t1"] = round(c0_wall + max(up_end_ms, down_end_ms) / 1000.0, 3)
+    rec["reported"] = round(time.time(), 3)
     for s_ in (u, ctl):
         try:
             s_.close()
@@ -1204,9 +1215,20 @@ def cmd_rpc(args) -> None:
     so the whole job ends within count x timeout plus the spacing. A request
     succeeds only with HTTP 200 and exactly the expected answer size. Row
     per request: flow w<i>r1 (request i of every leaf is wave i), the bytes
-    back, its seconds."""
+    back, its seconds.
+
+    With --start-at (the phase's shared barrier, Unix seconds) the waves are
+    scheduled from that instant, not from this interpreter's start: every
+    leaf host starts its interpreter before the barrier and waits for it
+    after initialising, so start-up skew between hosts does not carry into
+    the waves."""
     sock = reader = None
     c0 = time.monotonic()
+    if args.start_at:
+        # The barrier on the monotonic clock: read both clocks together once.
+        c0 += args.start_at - time.time()
+        if c0 > time.monotonic():
+            time.sleep(c0 - time.monotonic())
     for i in range(args.count):
         due = c0 + i * args.spacing
         if due > time.monotonic():
@@ -1287,6 +1309,8 @@ def main(argv=None) -> int:
     # rpc (W4)
     ap.add_argument("--count", type=int, default=10)
     ap.add_argument("--spacing", type=float, default=2.0)
+    ap.add_argument("--start-at", type=float, default=0,
+                    help="the shared barrier (Unix seconds) the request waves are scheduled from")
     ap.add_argument("--asr-up", type=int, default=355_000)
     ap.add_argument("--asr-down", type=int, default=200)
     ap.add_argument("--tts-up", type=int, default=300)

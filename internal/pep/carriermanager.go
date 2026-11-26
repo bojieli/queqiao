@@ -1,0 +1,1336 @@
+package pep
+
+import (
+	"container/heap"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/apernet/quic-go"
+	quiccongestion "github.com/apernet/quic-go/congestion"
+	"github.com/apernet/quic-go/monotime"
+
+	wancongestion "github.com/bojieli/queqiao/internal/congestion"
+	"github.com/bojieli/queqiao/internal/metrics"
+	"github.com/bojieli/queqiao/internal/protocol"
+)
+
+// The carrier manager is stage 8 of the path-authority design
+// (docs/DESIGN-PATH-AUTHORITY.md §10, §14 recovery=carrier). On a client it
+// is the single owner of the pooled QUIC carrier, of which flows are bound to
+// it, and of its replacement:
+//
+//   - A carrier is judged only on its own transport evidence, the fork's
+//     progress export (§10.2): k_s probe timeouts without an acknowledged
+//     eliciting packet make it SUSPECT, which takes no new flows, makes its
+//     attachment PROBING and dials one standby; nothing moves. A verified
+//     standby is promoted once k_p expiries have passed with the progress
+//     epoch unchanged since SUSPECT. Progress first returns the carrier to
+//     ACTIVE; after promotion nothing returns: the old carrier is DRAINING
+//     until no flow is bound to it.
+//   - A flow whose stream failed is unbound, and is rebound by one JOIN on the
+//     eligible carrier, the same one if it is live (§10.3, §10.4). Missing
+//     flow credit on a live stream has no carrier remedy at all.
+//   - Every unbound flow, idle or not, carries a binding deadline derived from
+//     the gateway's grace less the detection skew S, and a latest handoff
+//     start that leaves the handoff budget J for the JOIN to arrive (§10.3
+//     step 4).
+//   - Every dial round is charged to one path-level attempt history whose
+//     cooldown doubles, so a flapping carrier cannot produce a dial storm.
+//   - The adaptive keep-alive schedule (fork change 11) is set on each carrier
+//     while it has open flows.
+//
+// Flows never dial QUIC for themselves under this mode; the per-flow rescue
+// race and the stall watchdog's lane demotion are not reached.
+
+// CarrierRecoveryConfig holds the carrier manager's thresholds. Every value
+// is provisional: the design calibrates k_s, k_p and the keep-alive floor from
+// the carrier-shadow capture (§10.2, §16 Q4) and J from measured handoff
+// times (§10.3 step 4), so each is configurable and zero selects the design's
+// provisional default.
+type CarrierRecoveryConfig struct {
+	// SuspectPTOs is k_s: probe timeouts without transport progress before a
+	// carrier is SUSPECT.
+	SuspectPTOs uint32
+	// ReplacePTOs is k_p: probe timeouts, the progress epoch unchanged since
+	// SUSPECT, before a verified standby is promoted.
+	ReplacePTOs uint32
+	// DetectionSkew is S: how much later than the gateway the client may
+	// observe the loss of a binding (main budgets 15 s of the 45 s grace for
+	// it, mpflow.go laneReplacementWait).
+	DetectionSkew time.Duration
+	// HandoffBudget is J: the whole interval from starting a JOIN, on QUIC or
+	// by TCP handoff, to the gateway parsing it.
+	HandoffBudget time.Duration
+	// Interval is how often each carrier's progress is sampled. Tests shorten
+	// it.
+	Interval time.Duration
+
+	// grace is the gateway's replacement grace G; zero is
+	// laneReplacementWait. Tests shorten it.
+	grace time.Duration
+	// clock reads the time binding deadlines and the attempt history are
+	// judged by; nil is time.Now. Tests inject one.
+	clock func() time.Time
+}
+
+const (
+	// Provisional, as the shadow observer's labels (carriershadow.go) until
+	// the stage-8 calibration capture (#196) sets them.
+	defaultCarrierSuspectPTOs = defaultCarrierShadowSuspectPTOs
+	defaultCarrierReplacePTOs = defaultCarrierShadowReplacePTOs
+	defaultCarrierInterval    = 50 * time.Millisecond
+	// defaultDetectionSkew is main's own split of the grace (§10.3 step 4).
+	defaultDetectionSkew = laneDeadPathDetection
+	// defaultHandoffBudget is a provisional J: a QUIC stream open and JOIN
+	// on a live carrier takes a round trip; a TCP handoff a dial, TCP and
+	// TLS handshakes and the frame's transit. Five seconds covers several
+	// round trips on the slowest measured path.
+	defaultHandoffBudget = 5 * time.Second
+	// standbyWarmFor is how long a standby is kept after its suspect carrier
+	// recovered before promotion (§10.2).
+	standbyWarmFor = 30 * time.Second
+	// keepAliveFloorMin and keepAliveFloorRTTs give the keep-alive floor
+	// max(4×SRTT, 500 ms) while a carrier has open flows (§10.2).
+	keepAliveFloorMin  = 500 * time.Millisecond
+	keepAliveFloorRTTs = 4
+	// carrierRoundCooldownMax caps the attempt history's doubling cooldown,
+	// as today's per-flow recovery backoff is capped.
+	carrierRoundCooldownMax = 15 * time.Second
+	// pathProbeEvery bounds how long a silent path can come back unnoticed.
+	// While a carrier is SUSPECT its own probe timeouts back off
+	// exponentially, and so does a dialling standby's handshake: after an 8 s
+	// outage the next of either can fall several seconds after the path
+	// returned. A PROBE exchange, under a verification grant so the path's
+	// window cannot hold it, is sent at this cadence instead; the first one
+	// that crosses a returned path is acknowledged, which is progress, and
+	// the carrier is ACTIVE again with its losses detected at once.
+	pathProbeEvery = time.Second
+	// pathProbesInFlight caps the probes outstanding on one carrier.
+	pathProbesInFlight = 3
+	// replacementProbeEvery is the same bound when there is no carrier at
+	// all: a fresh replacement handshake starts at this cadence while flows
+	// wait to be rebound, each with its own Initial timer, rather than one
+	// handshake waiting out its retransmission backoff.
+	replacementProbeEvery = 2 * time.Second
+	// joinTarget is T of §10.3 step 3: the time a JOIN queue should drain in.
+	joinTarget = 3 * time.Second
+	// minJoinConcurrency is the floor of §10.3 step 3.
+	minJoinConcurrency = 16
+)
+
+// ValidateCarrierRecovery reports whether a set of carrier-recovery
+// thresholds is usable. Zero selects a default.
+func ValidateCarrierRecovery(cfg CarrierRecoveryConfig) error {
+	return cfg.resolve()
+}
+
+func (c *CarrierRecoveryConfig) resolve() error {
+	if c.SuspectPTOs == 0 {
+		c.SuspectPTOs = defaultCarrierSuspectPTOs
+	}
+	if c.ReplacePTOs == 0 {
+		c.ReplacePTOs = max(defaultCarrierReplacePTOs, c.SuspectPTOs)
+	}
+	if c.SuspectPTOs > maxCarrierShadowPTOs || c.ReplacePTOs > maxCarrierShadowPTOs {
+		return fmt.Errorf("carrier recovery thresholds must be at most %d probe timeouts", maxCarrierShadowPTOs)
+	}
+	if c.ReplacePTOs < c.SuspectPTOs {
+		return fmt.Errorf("carrier recovery k_p (%d) must not be below k_s (%d)", c.ReplacePTOs, c.SuspectPTOs)
+	}
+	if c.DetectionSkew == 0 {
+		c.DetectionSkew = defaultDetectionSkew
+	}
+	if c.HandoffBudget == 0 {
+		c.HandoffBudget = defaultHandoffBudget
+	}
+	if c.Interval <= 0 {
+		c.Interval = defaultCarrierInterval
+	}
+	if c.grace <= 0 {
+		c.grace = laneReplacementWait
+	}
+	if c.DetectionSkew < 0 || c.HandoffBudget < 0 {
+		return errors.New("carrier recovery skew and handoff budget must not be negative")
+	}
+	if c.grace-c.DetectionSkew-c.HandoffBudget <= 0 {
+		return fmt.Errorf("carrier recovery skew (%v) and handoff budget (%v) leave no time inside the gateway's %v grace", c.DetectionSkew, c.HandoffBudget, c.grace)
+	}
+	return nil
+}
+
+func (c *CarrierRecoveryConfig) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now()
+}
+
+// bindingDeadlines gives the two deadlines of a binding whose loss the
+// client observed at observed (§10.3 step 4): the JOIN must reach the gateway
+// by deadline, observed + G − S; a JOIN, on either substrate, must start by
+// latestStart, deadline − J.
+func (c *CarrierRecoveryConfig) bindingDeadlines(observed time.Time) (latestStart, deadline time.Time) {
+	deadline = observed.Add(c.grace - c.DetectionSkew)
+	return deadline.Add(-c.HandoffBudget), deadline
+}
+
+// carrierState is a carrier's state in the client's carrier manager (§10.2).
+type carrierState uint32
+
+const (
+	carrierActive carrierState = iota + 1
+	carrierSuspect
+	// carrierDraining is irreversible: a standby was promoted over it.
+	carrierDraining
+	carrierDead
+	carrierClosed
+)
+
+func (s carrierState) String() string {
+	switch s {
+	case carrierActive:
+		return "active"
+	case carrierSuspect:
+		return "suspect"
+	case carrierDraining:
+		return "draining"
+	case carrierDead:
+		return "dead"
+	case carrierClosed:
+		return "closed"
+	}
+	return "unknown"
+}
+
+func (s carrierState) terminal() bool { return s == carrierDead || s == carrierClosed }
+
+// carrierEvidence is one reading of a carrier's transport.
+type carrierEvidence struct {
+	Epoch uint64
+	PTOs  uint32
+	// Ended is why the connection is gone, nil while it lives.
+	Ended error
+}
+
+// carrierFSM is the §10.2 state machine of one carrier. It is pure: no clock,
+// no I/O, so every transition is tested deterministically.
+type carrierFSM struct {
+	suspectPTOs, replacePTOs uint32
+	state                    carrierState
+	started                  bool
+	epoch                    uint64
+	// suspectEpoch is the progress epoch when the carrier became SUSPECT.
+	suspectEpoch uint64
+}
+
+func newCarrierFSM(ks, kp uint32) carrierFSM {
+	return carrierFSM{suspectPTOs: ks, replacePTOs: kp, state: carrierActive}
+}
+
+// step folds one reading in. promote says a standby, if verified, should be
+// promoted over this carrier now.
+func (f *carrierFSM) step(ev carrierEvidence) (from, to carrierState, promote bool) {
+	from = f.state
+	if f.state.terminal() {
+		return from, f.state, false
+	}
+	if ev.Ended != nil {
+		if carrierEndState(ev.Ended) == metrics.CarrierShadowClosed {
+			f.state = carrierClosed
+		} else {
+			f.state = carrierDead
+		}
+		return from, f.state, false
+	}
+	if !f.started {
+		f.started, f.epoch = true, ev.Epoch
+	}
+	progressed := ev.Epoch > f.epoch
+	if progressed {
+		f.epoch = ev.Epoch
+		if f.state == carrierSuspect {
+			// Progress before promotion: back to ACTIVE.
+			f.state = carrierActive
+		}
+	}
+	if f.state == carrierDraining {
+		// Nothing returns after promotion, and nothing else moves it.
+		return from, f.state, false
+	}
+	wasSuspect := f.state == carrierSuspect
+	if f.state == carrierActive && ev.PTOs >= f.suspectPTOs {
+		f.state, f.suspectEpoch = carrierSuspect, f.epoch
+	}
+	// Promotion needs a carrier that was already SUSPECT before this
+	// reading, with the epoch unchanged since: never in the reading that
+	// made it SUSPECT, nor in one that saw progress.
+	if wasSuspect && !progressed && ev.PTOs >= f.replacePTOs && f.epoch == f.suspectEpoch {
+		promote = true
+	}
+	return from, f.state, promote
+}
+
+// drain marks the carrier DRAINING: a standby was promoted over it.
+func (f *carrierFSM) drain() {
+	if !f.state.terminal() {
+		f.state = carrierDraining
+	}
+}
+
+// attemptHistory is the path-level record every dial round is charged to
+// (§10.2): the cooldown doubles with each charged round, replacement rounds
+// are capped at today's per-flow cap, and only a sustained healthy dwell
+// resets it.
+type attemptHistory struct {
+	mu           sync.Mutex
+	charged      int
+	cooldown     time.Duration
+	next         time.Time
+	healthySince time.Time
+}
+
+// admit charges one round at now if the cooldown has passed and, for a
+// replacement round, the cap is not spent. Otherwise it returns when to ask
+// again; a zero time means not until the history resets.
+func (h *attemptHistory) admit(now time.Time, replacement bool) (bool, time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if replacement && h.charged >= maxLaneRecoveryAttempts {
+		return false, time.Time{}
+	}
+	if now.Before(h.next) {
+		return false, h.next
+	}
+	h.charged++
+	if h.cooldown == 0 {
+		h.cooldown = time.Second
+	} else {
+		h.cooldown = min(2*h.cooldown, carrierRoundCooldownMax)
+	}
+	h.next = now.Add(h.cooldown)
+	h.healthySince = time.Time{}
+	return true, time.Time{}
+}
+
+// observe resets the history after a sustained healthy dwell.
+func (h *attemptHistory) observe(now time.Time, healthy bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !healthy {
+		h.healthySince = time.Time{}
+		return
+	}
+	if h.healthySince.IsZero() {
+		h.healthySince = now
+		return
+	}
+	if h.charged > 0 && now.Sub(h.healthySince) >= laneRecoveryResetAfter {
+		h.charged, h.cooldown, h.next = 0, 0, time.Time{}
+	}
+}
+
+func (h *attemptHistory) reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.charged, h.cooldown, h.next, h.healthySince = 0, 0, time.Time{}, time.Time{}
+}
+
+func (h *attemptHistory) rounds() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.charged
+}
+
+// managedCarrier is one pooled connection as the carrier manager sees it.
+type managedCarrier struct {
+	gen *controlQUICGeneration
+	// state mirrors fsm.state for lock-free readers (the pool's acquire
+	// path holds quicMu, which the manager takes after its own lock).
+	state   atomic.Uint32
+	standby bool
+	// Guarded by carrierManager.mu.
+	fsm       carrierFSM
+	verified  bool
+	warmUntil time.Time
+	// standbyTried says this carrier's current SUSPECT episode has had its
+	// one standby dial round; a new episode gets another (§10.2).
+	standbyTried bool
+	keepAlive    time.Duration
+	// rebinding counts the flows queued for or running a JOIN onto this
+	// carrier: a new OPEN does not take a stream slot one of them needs
+	// (§10.3 step 2).
+	rebinding atomic.Int64
+	// drainUntil bounds how long a DRAINING carrier's flows hold new OPENs
+	// back: their binding deadline from the promotion.
+	drainUntil time.Time
+	// probes counts the path-return probes in flight on this carrier, and
+	// lastProbe is when the last one started (guarded by the manager).
+	probes    atomic.Int32
+	lastProbe time.Time
+	// received and receivedAt are the connection's received-packet count at
+	// the last tick that saw it move, and when; elicitingSince is when a
+	// tick first saw an ack-eliciting packet outstanding with nothing heard
+	// since (guarded by the manager).
+	received       uint64
+	receivedAt     time.Time
+	elicitingSince time.Time
+	// bound counts the managed flows bound to this carrier. A UDP
+	// association's stream is a pooled stream but not a binding this
+	// manager moves, so it is not counted.
+	bound atomic.Int64
+}
+
+func (mc *managedCarrier) current() carrierState { return carrierState(mc.state.Load()) }
+
+// carrierManager is one client's carrier manager. The client has one remote
+// gateway address, so one path, except across an uplink change, which is a
+// new path whose old carriers are DEAD (§10.2).
+type carrierManager struct {
+	c   *Client
+	cfg CarrierRecoveryConfig
+	log *slog.Logger
+
+	mu       sync.Mutex
+	carriers map[*controlQUICGeneration]*managedCarrier
+	standby  *managedCarrier
+	dialing  bool // a standby dial round is running
+	running  bool
+	// generation is the path's generation, incremented by each promotion;
+	// a binding names the carrier it is on, so a late report about a
+	// superseded one changes nothing.
+	generation uint64
+	// wire is the version of the path's carriers, kept while it has flows
+	// (§7 one wire version per path).
+	wire    byte
+	wireSet bool
+	// replacing says a break-before-make dial is running.
+	replacing atomic.Bool
+	// pathEpoch changes at every path reset; a standby dialled for an older
+	// path is discarded, and cancelStandby stops one still dialling.
+	pathEpoch     uint64
+	cancelStandby context.CancelFunc
+	// flows counts the flows whose bindings this manager reconciles; the
+	// path's wire stays pinned while there are any (§7).
+	flows atomic.Int64
+	// displaced is the number of flows still bound to DRAINING carriers, and
+	// unbound the number of flows with no binding at all. While either is
+	// non-zero a new OPEN waits, so it cannot take a stream slot one of them
+	// needs, whichever goroutine wakes first (§10.3 step 2).
+	displaced, unbound atomic.Int64
+
+	history attemptHistory
+	changed atomic.Pointer[chan struct{}]
+	joins   joinQueue
+
+	// Counters, for tests; count also exports each to the client's
+	// metrics registry.
+	suspects, promotions, standbyDials, standbyFailures, replacementDials atomic.Int64
+	sameCarrierJoins, newCarrierJoins, deadlineFailures, tcpHandoffs      atomic.Int64
+	// pathProbes counts path-return probes sent on silent carriers;
+	// replacementProbes the replacement handshakes in flight while there is
+	// no carrier, and lastReplacementProbe when the last began (guarded by
+	// mu).
+	pathProbes           atomic.Int64
+	replacementProbes    atomic.Int32
+	lastReplacementProbe time.Time
+}
+
+// count records one carrier-recovery event in its counter and in the
+// client's metrics.
+func (m *carrierManager) count(counter *atomic.Int64, event metrics.CarrierRecoveryEvent) {
+	counter.Add(1)
+	m.c.metrics.CarrierRecovery(event)
+}
+
+func newCarrierManager(c *Client, cfg CarrierRecoveryConfig) *carrierManager {
+	m := &carrierManager{c: c, cfg: cfg, log: c.cfg.Logger, carriers: make(map[*controlQUICGeneration]*managedCarrier)}
+	ch := make(chan struct{})
+	m.changed.Store(&ch)
+	m.joins.init()
+	return m
+}
+
+func (m *carrierManager) now() time.Time { return m.cfg.now() }
+
+// changes is closed at the next change of any carrier's state.
+func (m *carrierManager) changes() <-chan struct{} { return *m.changed.Load() }
+
+func (m *carrierManager) broadcast() {
+	next := make(chan struct{})
+	old := m.changed.Swap(&next)
+	close(*old)
+}
+
+// prepare gives a freshly dialled generation its managed state, before the
+// generation is visible to any borrower. standby says it is a standby, which
+// carries no flow until it is promoted.
+func (m *carrierManager) prepare(g *controlQUICGeneration, standby bool) {
+	mc := &managedCarrier{gen: g, standby: standby, fsm: newCarrierFSM(m.cfg.SuspectPTOs, m.cfg.ReplacePTOs)}
+	mc.state.Store(uint32(carrierActive))
+	g.managed = mc
+}
+
+// watch starts sampling a prepared generation: a standby as soon as it is
+// dialled, a pooled generation once it is installed.
+func (m *carrierManager) watch(g *controlQUICGeneration) {
+	mc := g.managed
+	m.mu.Lock()
+	m.carriers[g] = mc
+	if !mc.standby {
+		m.noteWireLocked(g)
+	}
+	if !m.running {
+		m.running = true
+		go m.run()
+	}
+	m.mu.Unlock()
+}
+
+// openGated reports whether a new OPEN on g must wait: flows are queued to
+// rebind onto it, flows are still bound to a carrier promoted away from, or
+// flows have no binding at all (§10.3 step 2). It reads no lock.
+func (m *carrierManager) openGated(g *controlQUICGeneration) bool {
+	if mc := g.managed; mc != nil && mc.rebinding.Load() > 0 {
+		return true
+	}
+	return m.displaced.Load() > 0 || m.unbound.Load() > 0
+}
+
+func (m *carrierManager) noteWireLocked(g *controlQUICGeneration) {
+	if wire, ok := protocol.VersionForALPN(g.conn.ConnectionState().TLS.NegotiatedProtocol); ok {
+		m.wire, m.wireSet = wire, true
+	}
+}
+
+// dialWires is the offer for a replacement or standby: while the path has
+// flows, exactly the wire its carriers speak, because a flow can only JOIN
+// on a connection of its own wire (§7). A path without flows adopts the
+// configured offer.
+func (m *carrierManager) dialWires() []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.wireSet && (m.flows.Load() > 0 || m.c.quicPoolActive.Load() > 0) {
+		return []byte{m.wire}
+	}
+	return m.c.cfg.WireVersions
+}
+
+// accepting reports whether a carrier takes new flows: it is ACTIVE. It
+// reads no lock the pool's acquire path holds.
+func (m *carrierManager) accepting(g *controlQUICGeneration) bool {
+	return g.managed == nil || g.managed.current() == carrierActive
+}
+
+// eligible is the carrier a flow should be bound to now: the pooled
+// generation, if it is ACTIVE and alive.
+func (m *carrierManager) eligible() *controlQUICGeneration {
+	c := m.c
+	c.quicMu.Lock()
+	g := c.quicGeneration
+	c.quicMu.Unlock()
+	if g == nil || g.conn.Context().Err() != nil || !m.accepting(g) {
+		return nil
+	}
+	return g
+}
+
+// superseded reports whether a flow on g must move: g was promoted away from
+// or has ended.
+func (m *carrierManager) superseded(g *controlQUICGeneration) bool {
+	if g == nil {
+		return false
+	}
+	if g.conn.Context().Err() != nil {
+		return true
+	}
+	if mc := g.managed; mc != nil {
+		s := mc.current()
+		return s == carrierDraining || s.terminal()
+	}
+	return false
+}
+
+// suspect reports whether the pooled carrier is SUSPECT: a flow that lost
+// its stream waits for it to recover or be replaced.
+func (m *carrierManager) suspect() bool {
+	c := m.c
+	c.quicMu.Lock()
+	g := c.quicGeneration
+	c.quicMu.Unlock()
+	return g != nil && g.managed != nil && g.managed.current() == carrierSuspect && g.conn.Context().Err() == nil
+}
+
+// admitDial is the gate a pooled dial passes before it starts: one dial
+// round charged to the attempt history. A replacement round (a flow is
+// waiting to be rebound) is also capped. It returns how long to wait
+// otherwise, zero meaning until the next change.
+func (m *carrierManager) admitDial(replacement bool) (bool, time.Duration) {
+	now := m.now()
+	ok, next := m.history.admit(now, replacement)
+	if ok {
+		if replacement {
+			m.count(&m.replacementDials, metrics.CarrierReplacementDial)
+		}
+		return true, 0
+	}
+	if next.IsZero() {
+		return false, 0
+	}
+	return false, max(next.Sub(now), time.Millisecond)
+}
+
+// requestCarrier starts a break-before-make dial for flows that have no
+// carrier at all (DEAD with no standby, §10.2). Only one runs at a time; the
+// dial itself is the pool's singleflight, gated by the attempt history.
+func (m *carrierManager) requestCarrier() {
+	if !m.replacing.CompareAndSwap(false, true) {
+		return
+	}
+	serving := m.c.serving.Load()
+	if serving == nil || (*serving).Err() != nil {
+		m.replacing.Store(false)
+		return
+	}
+	go func() {
+		defer m.replacing.Store(false)
+		ctx, cancel := context.WithTimeout(withCarrierRebind(*serving), m.c.cfg.DialTimeout)
+		defer cancel()
+		g, err := m.c.acquireControlQUICGeneration(ctx, m.c.pooledCongestionConfig())
+		if err != nil {
+			m.log.Debug("carrier replacement unavailable", "error", err)
+			return
+		}
+		g.releaseBorrow()
+	}()
+}
+
+// run samples every carrier until none is left.
+func (m *carrierManager) run() {
+	ticker := time.NewTicker(m.cfg.Interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !m.tick() {
+			return
+		}
+	}
+}
+
+// tick samples each carrier once and acts. It reports whether any carrier
+// is left to watch.
+func (m *carrierManager) tick() bool {
+	c := m.c
+	m.mu.Lock()
+	// Read under the manager's lock (manager before pool, never the
+	// reverse): a promotion cannot move the pool between this read and the
+	// loop below.
+	c.quicMu.Lock()
+	pooled := c.quicGeneration
+	c.quicMu.Unlock()
+	changed := false
+	var closeLater []*controlQUICGeneration
+	now := m.now()
+	for g, mc := range m.carriers {
+		st := g.conn.ConnectionStats()
+		ev := carrierEvidence{Epoch: st.ProgressEpoch, PTOs: st.PTOExpiriesSinceProgress}
+		if ctx := g.conn.Context(); ctx.Err() != nil {
+			ev.Ended = context.Cause(ctx)
+			if ev.Ended == nil {
+				ev.Ended = ctx.Err()
+			}
+		}
+		from, to, promote := mc.fsm.step(ev)
+		mc.state.Store(uint32(to))
+		if from != to {
+			changed = true
+			m.log.Info("carrier state", "carrier", g.id, "from", from.String(), "to", to.String(),
+				"pto_since_progress", ev.PTOs, "transport_epoch", ev.Epoch, "standby", mc.standby,
+				"flows", g.flows.Load(), "path_generation", m.generation)
+		}
+		switch {
+		case to.terminal():
+			delete(m.carriers, g)
+			if m.standby == mc {
+				m.standby = nil
+			}
+			// The connection is gone; its packet socket is ours to close.
+			closeLater = append(closeLater, g)
+			if g == pooled && !mc.standby {
+				// DEAD: a verified standby takes over at once (below);
+				// otherwise the flows are unbound and share the path's one
+				// grace.
+				c.retireControlQUICGeneration(g, "queqiao carrier dead")
+				pooled = nil
+			}
+			continue
+		case mc.standby:
+			if !mc.warmUntil.IsZero() && now.After(mc.warmUntil) {
+				// Kept warm after the suspect carrier recovered; nothing
+				// was promoted onto it.
+				delete(m.carriers, g)
+				if m.standby == mc {
+					m.standby = nil
+				}
+				closeLater = append(closeLater, g)
+				changed = true
+			}
+			continue
+		}
+		if to == carrierDraining {
+			continue
+		}
+		if g != pooled {
+			// Retired from the pool by the pool itself (a failed path
+			// probe or a pool reset): it is draining what it carries.
+			mc.fsm.drain()
+			mc.state.Store(uint32(carrierDraining))
+			mc.drainUntil = now.Add(m.cfg.grace - m.cfg.DetectionSkew)
+			go c.drainControlQUICGeneration(g)
+			changed = true
+			continue
+		}
+		m.history.observe(now, to == carrierActive)
+		m.setKeepAliveLocked(mc, st.SmoothedRTT)
+		switch {
+		case from == carrierActive && to == carrierSuspect:
+			// SUSPECT takes no new flows, makes the attachment PROBING
+			// and dials one standby. Nothing moves.
+			m.count(&m.suspects, metrics.CarrierSuspect)
+			if a, ok := g.controller.(*wancongestion.PathAttachment); ok {
+				a.SetProbing(true)
+			}
+			mc.standbyTried = m.dialStandbyLocked()
+		case from == carrierSuspect && to == carrierActive:
+			mc.standbyTried = false
+			if sb := m.standby; sb != nil && sb.warmUntil.IsZero() {
+				sb.warmUntil = now.Add(standbyWarmFor)
+			}
+		case to == carrierSuspect && !mc.standbyTried:
+			// The round could not start (cooldown, connection budget);
+			// one round per episode, when it can.
+			mc.standbyTried = m.dialStandbyLocked()
+		}
+		if st.PacketsReceived != mc.received || mc.receivedAt.IsZero() {
+			mc.received, mc.receivedAt, mc.elicitingSince = st.PacketsReceived, now, time.Time{}
+		}
+		switch {
+		case !st.ElicitingOutstanding:
+			mc.elicitingSince = time.Time{}
+		case mc.elicitingSince.IsZero():
+			mc.elicitingSince = now
+		}
+		// Probe a SUSPECT carrier; and probe one with flows whose
+		// ack-eliciting packet (a keep-alive PING counts) has gone unanswered,
+		// with nothing heard at all, for max(1 s, 4 SRTT).
+		// A carrier carrying mostly downloads has almost nothing of its own
+		// outstanding: its probe timeouts -- the evidence SUSPECT is built on
+		// -- barely accrue during an outage, and the one keep-alive PING it
+		// sent early in it has backed off for seconds by the time the path
+		// returns. The probe is ack-eliciting, so it both notices a returned
+		// path and supplies that evidence on a dead one. It changes no state
+		// by itself. A healthy idle carrier has nothing ack-eliciting
+		// outstanding between keep-alives (an ACK it sends elicits nothing)
+		// and hears each keep-alive acknowledged within a round trip, so it
+		// is never probed.
+		silent := mc.gen.flows.Load() > 0 && !mc.elicitingSince.IsZero() &&
+			now.Sub(mc.elicitingSince) >= max(pathProbeEvery, keepAliveFloorRTTs*st.SmoothedRTT)
+		if to == carrierSuspect || silent {
+			m.probePathLocked(mc, now)
+		}
+		if promote {
+			if sb := m.usableStandbyLocked(); sb != nil && m.promoteLocked(mc, sb, "suspect carrier made no progress") {
+				pooled = sb.gen
+				changed = true
+			}
+		}
+	}
+	if pooled == nil && m.unbound.Load() > 0 {
+		m.probeReplacementLocked(now)
+	}
+	if pooled == nil {
+		// No carrier at all -- it died, or the pool retired it on a
+		// stream's report before this tick saw it: a verified standby
+		// takes over.
+		if sb := m.usableStandbyLocked(); sb != nil && m.installLocked(sb, nil, "carrier gone with a verified standby") {
+			m.count(&m.promotions, metrics.CarrierPromotion)
+			changed = true
+		}
+	}
+	// Flows still bound to DRAINING carriers hold new OPENs back until they
+	// move, or until their binding deadline.
+	displaced := int64(0)
+	for _, mc := range m.carriers {
+		if mc.current() == carrierDraining && now.Before(mc.drainUntil) {
+			displaced += mc.bound.Load()
+		}
+	}
+	if m.displaced.Swap(displaced) != displaced {
+		changed = true
+	}
+	left := len(m.carriers) > 0
+	if !left {
+		m.running = false
+	}
+	m.mu.Unlock()
+	for _, g := range closeLater {
+		g.close("queqiao standby no longer needed")
+	}
+	if changed {
+		m.broadcast()
+	}
+	return left
+}
+
+// setKeepAliveLocked applies the adaptive keep-alive schedule (fork change
+// 11): a floor of max(4×SRTT, 500 ms) while the carrier has open flows; the
+// fixed interval otherwise.
+func (m *carrierManager) setKeepAliveLocked(mc *managedCarrier, srtt time.Duration) {
+	floor := time.Duration(0)
+	if mc.gen.flows.Load() > 0 {
+		floor = keepAliveFloor(srtt)
+	}
+	// Re-applying the floor restarts the schedule at it, so it is set only
+	// when it moved materially.
+	if floor == mc.keepAlive || (floor > 0 && mc.keepAlive > 0 && absDuration(floor-mc.keepAlive) < mc.keepAlive/4) {
+		return
+	}
+	mc.keepAlive = floor
+	mc.gen.conn.SetKeepAliveSchedule(floor)
+}
+
+func keepAliveFloor(srtt time.Duration) time.Duration {
+	return max(keepAliveFloorRTTs*srtt, keepAliveFloorMin)
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
+
+// probePathLocked sends a path-return probe on a SUSPECT carrier, at most
+// every pathProbeEvery and with at most pathProbesInFlight outstanding. It is
+// not a dial, so it is not charged to the attempt history; what it can
+// produce is the carrier's own transport evidence.
+func (m *carrierManager) probePathLocked(mc *managedCarrier, now time.Time) {
+	if now.Sub(mc.lastProbe) < pathProbeEvery || mc.probes.Load() >= pathProbesInFlight {
+		return
+	}
+	mc.lastProbe = now
+	mc.probes.Add(1)
+	m.count(&m.pathProbes, metrics.CarrierPathProbe)
+	g := mc.gen
+	// A probe lives for a few cadences, not a handshake timeout: its own
+	// retransmissions back off like everything else on the carrier, so a
+	// fresh one must keep going out every pathProbeEvery while the path is
+	// silent. Its answer is irrelevant; the acknowledgement of any of its
+	// packets is the carrier's progress.
+	life := pathProbesInFlight * pathProbeEvery
+	go func() {
+		defer mc.probes.Add(-1)
+		ctx, cancel := context.WithTimeout(g.conn.Context(), life)
+		defer cancel()
+		_ = probePooledQUICGranted(ctx, g.conn, life, g, true)
+	}()
+}
+
+// probeReplacementLocked starts a fresh replacement handshake while there is
+// no carrier and flows wait to be rebound (DEAD with no standby), at most
+// every replacementProbeEvery and within the device's connection budget.
+// Each attempt keeps its full dial timeout, so a lossy but working path can
+// still complete a slow handshake; the cadence only bounds how long a path
+// that came back goes unnoticed. The first verified attempt is installed;
+// the rest close. Only the first attempt of an outage is charged to the
+// attempt history: the others are bounded by the flows' binding deadlines,
+// and stop when no flow waits.
+func (m *carrierManager) probeReplacementLocked(now time.Time) {
+	if now.Sub(m.lastReplacementProbe) < replacementProbeEvery {
+		return
+	}
+	if int(m.replacementProbes.Load())+1 > m.connectionBudget() {
+		return
+	}
+	serving := m.c.serving.Load()
+	if serving == nil || (*serving).Err() != nil {
+		return
+	}
+	if m.replacementProbes.Load() == 0 && !m.replacing.Load() {
+		// The outage's first attempt is a charged round (admitDial counts
+		// it).
+		if ok, _ := m.admitDial(true); !ok {
+			return
+		}
+	} else {
+		m.count(&m.replacementDials, metrics.CarrierReplacementDial)
+	}
+	m.lastReplacementProbe = now
+	m.replacementProbes.Add(1)
+	ctx, cancel := context.WithTimeout(*serving, m.c.cfg.DialTimeout)
+	go func(epoch uint64) {
+		defer m.replacementProbes.Add(-1)
+		defer cancel()
+		c := m.c
+		g, err := c.dialControlGeneration(ctx, 0, c.pooledCongestionConfig(), m.dialWires(), true)
+		if err != nil {
+			return
+		}
+		probeCtx, cancelProbe := context.WithTimeout(g.conn.Context(), c.cfg.HandshakeTimeout)
+		probe := probeStandbyGeneration
+		if c.probeControlGenerationForTest != nil {
+			probe = c.probeControlGenerationForTest
+		}
+		err = probe(probeCtx, g, c.cfg.HandshakeTimeout)
+		cancelProbe()
+		m.mu.Lock()
+		mc := g.managed
+		installed := false
+		if err == nil && epoch == m.pathEpoch && m.carriers[g] == mc && g.conn.Context().Err() == nil {
+			mc.verified = true
+			g.probeMu.Lock()
+			g.verified = time.Now()
+			g.probeMu.Unlock()
+			installed = m.installLocked(mc, nil, "replacement probe answered")
+		}
+		m.mu.Unlock()
+		if installed {
+			m.broadcast()
+			return
+		}
+		g.close("queqiao replacement probe not needed")
+	}(m.pathEpoch)
+}
+
+// usableStandbyLocked is the standby, if it is verified and still healthy
+// now: alive and ACTIVE on its own evidence.
+func (m *carrierManager) usableStandbyLocked() *managedCarrier {
+	sb := m.standby
+	if sb == nil || !sb.verified || sb.gen.conn.Context().Err() != nil || sb.current() != carrierActive {
+		return nil
+	}
+	// Its state may be a tick old: read its evidence now, so a standby that
+	// has itself gone quiet is not promoted over the carrier it replaces.
+	if sb.gen.conn.ConnectionStats().PTOExpiriesSinceProgress >= m.cfg.SuspectPTOs {
+		return nil
+	}
+	return sb
+}
+
+// connectionBudget is how many QUIC connections the device may hold to the
+// path at once: the pooled one and the profile's secondary slots (one on
+// iOS, §11.5).
+func (m *carrierManager) connectionBudget() int {
+	return 1 + max(m.c.memoryLimits.maxBulkConnections, 1)
+}
+
+// dialStandbyLocked starts the one standby dial round of a SUSPECT carrier,
+// if the attempt history and the device's connection budget allow it. A
+// DRAINING carrier still holding flows counts against the budget; without
+// room, recovery is break-before-make (§10.2).
+//
+// It reports whether a round is running or was started.
+func (m *carrierManager) dialStandbyLocked() bool {
+	if m.standby != nil {
+		// A warm standby serves this episode: it is no longer due to close.
+		m.standby.warmUntil = time.Time{}
+		return true
+	}
+	if m.dialing {
+		return true
+	}
+	live := 0
+	for g, mc := range m.carriers {
+		if !mc.current().terminal() && g.conn.Context().Err() == nil {
+			live++
+		}
+	}
+	if live >= m.connectionBudget() {
+		return false
+	}
+	serving := m.c.serving.Load()
+	if serving == nil || (*serving).Err() != nil {
+		return false
+	}
+	if ok, _ := m.admitDial(true); !ok {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(*serving, m.c.cfg.DialTimeout)
+	// Each address candidate the dial races is a connection the gateway
+	// counts against the device: race only as many as the budget has room
+	// for, so a named gateway with several addresses cannot take the device
+	// over its limit (#222). With one slot left they are dialled one at a
+	// time.
+	ctx = withAddressRaceLimit(ctx, standbyAddressRace(m.connectionBudget(), live))
+	m.dialing = true
+	m.cancelStandby = cancel
+	m.count(&m.standbyDials, metrics.CarrierStandbyDial)
+	go m.dialStandby(ctx, cancel, m.pathEpoch)
+	return true
+}
+
+// standbyAddressRace is how many of the gateway's addresses a standby dial
+// may handshake at once: the device's free connection slots, at least one,
+// and no more than an ordinary dial races.
+func standbyAddressRace(budget, live int) int {
+	return min(max(budget-live, 1), defaultAddressRace)
+}
+
+func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelFunc, epoch uint64) {
+	defer cancel()
+	c := m.c
+	g, err := c.dialControlGeneration(ctx, 0, c.pooledCongestionConfig(), m.dialWires(), true)
+	if err == nil {
+		probeCtx, cancelProbe := context.WithTimeout(g.conn.Context(), c.cfg.HandshakeTimeout)
+		probe := probeStandbyGeneration
+		if c.probeControlGenerationForTest != nil {
+			probe = c.probeControlGenerationForTest
+		}
+		err = probe(probeCtx, g, c.cfg.HandshakeTimeout)
+		cancelProbe()
+		if err != nil {
+			g.close("queqiao standby failed verification")
+		}
+	}
+	m.mu.Lock()
+	m.dialing = false
+	m.cancelStandby = nil
+	if err == nil && epoch != m.pathEpoch {
+		// Dialled for a path that has since been reset.
+		m.mu.Unlock()
+		g.close("queqiao standby of a previous path")
+		return
+	}
+	if err != nil {
+		m.count(&m.standbyFailures, metrics.CarrierStandbyFailure)
+		m.mu.Unlock()
+		m.log.Info("carrier standby unavailable", "error", err)
+		return
+	}
+	mc := g.managed
+	if m.carriers[g] != mc || g.conn.Context().Err() != nil {
+		// It died between its echo and this commit.
+		m.count(&m.standbyFailures, metrics.CarrierStandbyFailure)
+		m.mu.Unlock()
+		g.close("queqiao standby died before verification")
+		return
+	}
+	mc.verified = true
+	// The echo is fresh proof of the path for the pool's own check, so the
+	// first rebinding JOINs do not wait for a second PROBE.
+	g.probeMu.Lock()
+	g.verified = time.Now()
+	g.probeMu.Unlock()
+	m.standby = mc
+	m.log.Info("carrier standby verified", "carrier", g.id)
+	// Promotion is the next tick's decision: it needs the old carrier's
+	// expiries and unchanged epoch, read fresh.
+	c.quicMu.Lock()
+	pooled := c.quicGeneration
+	c.quicMu.Unlock()
+	if pooled == nil {
+		// The suspect carrier died while this one was dialled: there is
+		// nothing to drain, and the flows are waiting.
+		m.installLocked(mc, nil, "carrier dead before standby verified")
+	} else if pooled.managed != nil && pooled.managed.current() == carrierActive {
+		mc.warmUntil = m.now().Add(standbyWarmFor)
+	}
+	m.mu.Unlock()
+	m.broadcast()
+}
+
+// promoteLocked makes the verified standby sb the path's carrier over old,
+// which becomes DRAINING. It is single-flight: only the tick holding the
+// manager's lock does it, once per standby.
+func (m *carrierManager) promoteLocked(old, sb *managedCarrier, reason string) bool {
+	// The displaced flows are counted before the new carrier is published,
+	// so no new OPEN on it can run ahead of them (§10.3 step 2).
+	displaced := old.bound.Load()
+	m.displaced.Add(displaced)
+	if !m.installLocked(sb, old.gen, reason) {
+		m.displaced.Add(-displaced)
+		return false
+	}
+	if !old.fsm.state.terminal() {
+		old.fsm.drain()
+		old.state.Store(uint32(carrierDraining))
+	}
+	if a, ok := old.gen.controller.(*wancongestion.PathAttachment); ok {
+		// Nothing returns after promotion (§4.4).
+		a.SetDraining()
+	}
+	old.gen.stopBorrowing(errPoolRetired)
+	old.drainUntil = m.now().Add(m.cfg.grace - m.cfg.DetectionSkew)
+	go m.c.drainControlQUICGeneration(old.gen)
+	m.count(&m.promotions, metrics.CarrierPromotion)
+	m.log.Info("carrier promoted", "old", old.gen.id, "new", sb.gen.id, "reason", reason,
+		"path_generation", m.generation, "flows_to_move", displaced)
+	return true
+}
+
+// installLocked makes sb the pooled carrier, if the pool still holds
+// expected (the carrier sb replaces, or nil for an empty pool): the check
+// and the swap are one step under the pool's lock, so a generation a
+// concurrent dial published is never overwritten. It reports whether sb was
+// installed.
+func (m *carrierManager) installLocked(sb *managedCarrier, expected *controlQUICGeneration, reason string) bool {
+	c := m.c
+	c.quicMu.Lock()
+	if c.quicGeneration != expected {
+		c.quicMu.Unlock()
+		return false
+	}
+	if m.standby == sb {
+		m.standby = nil
+	}
+	sb.standby, sb.warmUntil = false, time.Time{}
+	m.generation++
+	m.noteWireLocked(sb.gen)
+	// A break-before-make dial still in flight would install over the
+	// promoted carrier; supersede it, and its waiters retry on this one.
+	dial := c.quicDial
+	if dial != nil {
+		c.quicEpoch++
+		c.quicDial = nil
+	}
+	c.quicGeneration = sb.gen
+	c.quicMu.Unlock()
+	if dial != nil {
+		dial.cancel()
+	}
+	if reason != "" && sb.gen != nil {
+		m.log.Debug("carrier installed", "carrier", sb.gen.id, "reason", reason)
+	}
+	return true
+}
+
+// resetPool ends every carrier of the old path: a new uplink is a new path
+// key, so its carriers are DEAD (§10.2). Detaching the pool and taking the
+// old path's carriers is one transition under the manager's lock, so no
+// standby can be installed, and no carrier of the new path dialled and
+// then closed, in between.
+func (m *carrierManager) resetPool(reason string) {
+	c := m.c
+	m.mu.Lock()
+	gens := make([]*controlQUICGeneration, 0, len(m.carriers))
+	for g := range m.carriers {
+		gens = append(gens, g)
+		delete(m.carriers, g)
+	}
+	m.standby = nil
+	m.pathEpoch++
+	// A new path funds its own recovery: the old one's cooldown and cap
+	// say nothing about it.
+	m.history.reset()
+	if m.cancelStandby != nil {
+		m.cancelStandby()
+	}
+	c.quicMu.Lock()
+	c.quicEpoch++
+	pooled, dial := c.quicGeneration, c.quicDial
+	c.quicGeneration, c.quicDial = nil, nil
+	c.quicMu.Unlock()
+	m.mu.Unlock()
+	m.broadcast()
+	if dial != nil {
+		dial.cancel()
+	}
+	if pooled != nil {
+		pooled.close(reason)
+	}
+	for _, g := range gens {
+		g.close(reason)
+	}
+}
+
+// probeStandbyGeneration verifies a standby by today's bounded PROBE
+// exchange, under a verification grant, so that it completes while the
+// suspect carrier's flight holds the path's window and balance (§4.3,
+// §10.2).
+func probeStandbyGeneration(ctx context.Context, g *controlQUICGeneration, budget time.Duration) error {
+	return probePooledQUICGranted(ctx, g.conn, budget, g, true)
+}
+
+// probeGrantSeq numbers verification grants; the fork requires them nonzero.
+var probeGrantSeq atomic.Uint64
+
+// bindProbeGrant binds a verification grant to the first bytes a PROBE
+// exchange writes on stream: the probe frames, never anything else.
+func bindProbeGrant(conn *quic.Conn, stream quicBidiStream, start int64, budget time.Duration) {
+	qs, ok := stream.(*quic.Stream)
+	if conn == nil || !ok || qs == nil {
+		return
+	}
+	span := quiccongestion.ByteCount(maxPathProbeFrames*protocol.HeaderSize + maxPathProbeBytes)
+	_ = conn.BindVerificationGrant(qs, quiccongestion.VerificationGrant{
+		ID:    probeGrantSeq.Add(1),
+		Start: quiccongestion.ByteCount(start), End: quiccongestion.ByteCount(start) + span,
+		// A few full packets: the frames and their retransmissions.
+		Budget: 8 * 1500,
+		Expiry: monotime.FromTime(time.Now().Add(budget)),
+	})
+}
+
+// runKeepAliveSchedule keeps a gateway connection's adaptive keep-alive
+// floor at max(4×SRTT, 500 ms) while active reports open flows, and the
+// fixed interval otherwise (§10.2, fork change 11), until it closes.
+func runKeepAliveSchedule(conn *quic.Conn, active func() bool, every time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	var set time.Duration
+	for {
+		select {
+		case <-conn.Context().Done():
+			return
+		case <-ticker.C:
+		}
+		floor := time.Duration(0)
+		if active() {
+			floor = keepAliveFloor(conn.ConnectionStats().SmoothedRTT)
+		}
+		if floor == set || (floor > 0 && set > 0 && absDuration(floor-set) < set/4) {
+			continue
+		}
+		set = floor
+		conn.SetKeepAliveSchedule(floor)
+	}
+}
+
+// errCarrierAdmissionWait marks a pooled borrow that ran out of time waiting
+// for the carrier manager's admission -- a SUSPECT carrier, or flows
+// rebinding -- rather than for the network.
+var errCarrierAdmissionWait = errors.New("waiting for carrier admission")
+
+// carrierRebindKey marks a pooled borrow made to rebind an existing flow:
+// it is not held back for flows waiting to rebind, and a dial it needs is a
+// replacement round.
+type carrierRebindKey struct{}
+
+func withCarrierRebind(ctx context.Context) context.Context {
+	return context.WithValue(ctx, carrierRebindKey{}, true)
+}
+
+func isCarrierRebind(ctx context.Context) bool {
+	v, _ := ctx.Value(carrierRebindKey{}).(bool)
+	return v
+}
+
+// joinQueue admits rebinding JOINs earliest-deadline-first within the order
+// of §10.3 step 3 (pending FIN or ACK, then INTERACTIVE, then BULK), at a
+// concurrency of max(16, N×r/T) for N flows to move and JOIN round trip r.
+type joinQueue struct {
+	mu       sync.Mutex
+	inflight int
+	waiters  joinHeap
+	seq      uint64
+	// rtt is the JOIN round trip estimate r, read when a JOIN is admitted.
+	rtt func() time.Duration
+}
+
+type joinWaiter struct {
+	priority int
+	deadline time.Time
+	seq      uint64
+	ready    chan struct{}
+	granted  bool
+	index    int
+}
+
+type joinHeap []*joinWaiter
+
+func (h joinHeap) Len() int { return len(h) }
+func (h joinHeap) Less(i, j int) bool {
+	if h[i].priority != h[j].priority {
+		return h[i].priority < h[j].priority
+	}
+	if !h[i].deadline.Equal(h[j].deadline) {
+		return h[i].deadline.Before(h[j].deadline)
+	}
+	return h[i].seq < h[j].seq
+}
+func (h joinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
+func (h *joinHeap) Push(x any)   { w := x.(*joinWaiter); w.index = len(*h); *h = append(*h, w) }
+func (h *joinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	w := old[n-1]
+	old[n-1] = nil
+	w.index = -1
+	*h = old[:n-1]
+	return w
+}
+
+func (q *joinQueue) init() {}
+
+// limitLocked is the concurrency for the JOINs queued or running now.
+func (q *joinQueue) limitLocked() int {
+	n := q.inflight + len(q.waiters)
+	r := 100 * time.Millisecond
+	if q.rtt != nil {
+		if measured := q.rtt(); measured > 0 {
+			r = measured
+		}
+	}
+	return max(minJoinConcurrency, int((time.Duration(n)*r+joinTarget-1)/joinTarget))
+}
+
+func (q *joinQueue) grantLocked() {
+	for len(q.waiters) > 0 && q.inflight < q.limitLocked() {
+		w := heap.Pop(&q.waiters).(*joinWaiter)
+		w.granted = true
+		q.inflight++
+		close(w.ready)
+	}
+}
+
+// acquire waits for a JOIN slot. The returned release must be called once.
+func (q *joinQueue) acquire(ctx context.Context, priority int, deadline time.Time) (func(), error) {
+	q.mu.Lock()
+	q.seq++
+	w := &joinWaiter{priority: priority, deadline: deadline, seq: q.seq, ready: make(chan struct{})}
+	heap.Push(&q.waiters, w)
+	q.grantLocked()
+	q.mu.Unlock()
+	release := func() {
+		q.mu.Lock()
+		q.inflight--
+		q.grantLocked()
+		q.mu.Unlock()
+	}
+	select {
+	case <-w.ready:
+		return release, nil
+	case <-ctx.Done():
+		q.mu.Lock()
+		if w.granted {
+			q.mu.Unlock()
+			release()
+		} else {
+			heap.Remove(&q.waiters, w.index)
+			q.mu.Unlock()
+		}
+		return nil, ctx.Err()
+	}
+}
+
+// joinPriority is a flow's place in the JOIN order of §10.3 step 3.
+func joinPriority(flow *multipathFlow) int {
+	switch {
+	case flow.finSent.Load() || flow.remoteFinSeen.Load() || flow.ackSequence.Load() > flow.ackWritten.Load() || flow.gapPending.Load():
+		return 0
+	case !flow.carriesBulk():
+		return 1
+	}
+	return 2
+}
+
+// randomJitter spreads a retry by up to a quarter of d.
+func randomJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return d + randomDuration(d/4)
+}

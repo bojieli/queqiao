@@ -91,14 +91,44 @@ func (c *Client) secondConnectionWanted(snapshot flowSnapshot, generation func()
 // is a stream on, or nil.
 func flowGeneration(flow *multipathFlow) *controlQUICGeneration {
 	for _, lane := range flow.healthyLanes() {
-		if !flow.laneIsControl(lane) || lane.fc == nil {
+		if !flow.laneIsControl(lane) {
 			continue
 		}
-		if s, ok := lane.fc.control.(*controlPoolStreamConn); ok {
-			return s.generation
+		if g := laneGeneration(lane); g != nil {
+			return g
 		}
 	}
 	return nil
+}
+
+// laneGeneration is the pooled control generation a lane is a stream on, or
+// nil.
+func laneGeneration(lane *mpLane) *controlQUICGeneration {
+	if lane == nil || lane.fc == nil {
+		return nil
+	}
+	if s, ok := lane.fc.control.(*controlPoolStreamConn); ok {
+		return s.generation
+	}
+	return nil
+}
+
+// controlLaneShared is a flow's per-chunk test for keeping its data off its
+// control lane once it has another lane (multipathFlow.isolateFromControlLane).
+//
+// With an explicit single-topology fan-out it judges sharing on the
+// generation the selected control lane is a stream on, as opening a fan-out
+// lane does (secondConnectionWanted): after a handover, a flow on the
+// replacement does not send a lone bulk flow's chunks back to its fan-out
+// lane because another flow still drains on the old generation. A control
+// lane on no pooled generation shares with nothing. Isolation keeps today's
+// client-wide count.
+func (c *Client) controlLaneShared(control *mpLane) bool {
+	if c.fanOutConnections() > 0 {
+		g := laneGeneration(control)
+		return g != nil && g.flows.Load() > 1
+	}
+	return c.quicPoolActive.Load() > 1
 }
 
 // Receive-window credit for the preferred connection.

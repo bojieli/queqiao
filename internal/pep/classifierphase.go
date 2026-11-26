@@ -55,19 +55,15 @@ func ParseClassifierMode(value string) (ClassifierMode, error) {
 	return "", fmt.Errorf("classifier must be %s or %s, not %q", ClassifierLegacy, ClassifierPhased, value)
 }
 
-// ValidateClassifier reports whether the classifier mode may run with the
-// given profile. The dc-long-haul profile stays on the legacy bundle
-// throughout the migration (design §0 decision 9), and its own classifier
-// thresholds (32 MiB, idle veto) were tuned against the sticky class.
-func ValidateClassifier(mode ClassifierMode, p profile.Profile) error {
-	parsed, err := ParseClassifierMode(string(mode))
-	if err != nil {
-		return err
-	}
-	if parsed == ClassifierPhased && p.Name == dcLongHaulProfile {
-		return fmt.Errorf("classifier=%s is not supported with the %s profile, which stays on the legacy bundle", ClassifierPhased, dcLongHaulProfile)
-	}
-	return nil
+// ValidateClassifier reports whether the classifier mode is spelled
+// correctly. Whether a profile accepts it with the rest of the bundle is
+// ValidateProfileBundle's: the dc-long-haul profile takes classifier=phased
+// only with its new-architecture bundle (design §11.3), since its own
+// classifier thresholds (32 MiB, idle veto) were tuned against the sticky
+// class and its legacy bundle keeps them exactly.
+func ValidateClassifier(mode ClassifierMode, _ profile.Profile) error {
+	_, err := ParseClassifierMode(string(mode))
+	return err
 }
 
 func resolveClassifier(mode *ClassifierMode, p profile.Profile) error {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
 	"strconv"
 	"time"
 )
@@ -175,6 +176,13 @@ func dialDestinationSerial(ctx context.Context, addresses []string, dial func(co
 
 func (p DestinationPolicy) OpenUDPRelay(ctx context.Context) (serverUDPRelay, error) {
 	if p.OutboundSOCKS5 == "" {
+		if runtime.GOOS == "darwin" {
+			// macOS can give a dual-stack socket a port an IPv4 socket
+			// elsewhere already holds: one socket per family there (#197).
+			return openFamilyUDPRelay(nil)
+		}
+		// Linux checks both families when it picks a dual-stack port, so
+		// the gateway keeps its one socket and no per-datagram hand-off.
 		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
 		if err != nil {
 			return nil, err

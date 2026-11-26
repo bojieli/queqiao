@@ -77,7 +77,7 @@ class DryRun(unittest.TestCase):
         self.assertIn("stop every process this campaign started", text)
         self.assertIn("blocks 2-12 repeat", text)
         # The runner owns these; the arm's bundle is appended after them.
-        self.assertIn("--cc-api=v2 --sched=class --congestion=path", text)
+        self.assertIn("--cc-api=v2 --sched=class --congestion-scope=path", text)
         self.assertNotIn("CAMPAIGN-DONE", text)
 
     def test_probe_stops_when_the_load_finishes(self):
@@ -774,10 +774,13 @@ class LocalProcesses(unittest.TestCase):
         path in its command line. Returns (job shell pid, child pid, done)."""
         pidfile = os.path.join(self.home, f"child-{time.monotonic_ns()}.pid")
         prog = self.CHILD if child_ignores_term else "import sys, os, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)"
-        script = self.camp.as_job("local", f"{sys.executable} -c \"{prog}\" {pidfile} &\n"
-                                           f"while :; do sleep 0.2; done")
+        script = f"{sys.executable} -c \"{prog}\" {pidfile} &\nwhile :; do sleep 0.2; done"
         done = threading.Event()
-        threading.Thread(target=lambda: (self.host.run(script, timeout=120), done.set()), daemon=True).start()
+        self.camp.JOB_POLL = 0.2
+        threading.Thread(target=lambda: (self.camp.run_job("local", script, 120, "test job"), done.set()),
+                         daemon=True).start()
+        # Whatever the outcome, nothing of the job outlives the test.
+        self.addCleanup(lambda: subprocess.run(["pkill", "-f", f"{self.W}/run/job-"], capture_output=True))
         for _ in range(200):
             if os.path.exists(pidfile) and pathlib.Path(pidfile).read_text():
                 break
@@ -842,7 +845,7 @@ class LocalProcesses(unittest.TestCase):
         return p.returncode, p.stdout.split()
 
     def test_job_tokens_are_fixed_length_random(self):
-        script = self.camp.as_job("local", "true")
+        script, _ = self.camp.as_job("local", "true")
         toks = set(re.findall(r"env QQ_AB_TOKEN=(\S+) bash", script))
         self.assertEqual(len(toks), 1)
         tok = toks.pop()
@@ -888,8 +891,8 @@ class LocalProcesses(unittest.TestCase):
         failing = ab.JOB_OWN_SH.replace("own_mode() {", "own_mode() { echo proc; return\n", 1) \
                                .replace("members() {", "members() { return 2\n", 1)
         with mock.patch.object(ab, "JOB_OWN_SH", failing):
-            script = self.camp.as_job("local", "true")
-            self.assertEqual(self.host.run(script, timeout=30)[0], 0)
+            self.camp.JOB_POLL = 0.2
+            self.assertEqual(self.camp.run_job("local", "true", 30, "test job")[0], 0)
             desc = list(pathlib.Path(self.W, "run").glob("job-*.pgid"))
             self.assertEqual(len(desc), 1)
             self.camp.teardown()

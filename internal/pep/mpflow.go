@@ -117,6 +117,11 @@ type mpLane struct {
 	// pooled flow, but after a connection-generation reset its replacement has
 	// a non-zero join ID and must inherit the same scheduling protection.
 	control bool
+	// replayGate, set on a lane that rebinds a flow under recovery=carrier,
+	// holds READY data until the first ACK after the rebinding or one SRTT.
+	replayGate *replayGate
+	// acksIn counts flow ACKs that arrived on this lane.
+	acksIn atomic.Uint64
 	// writeHook is an internal deterministic fault-injection point used by
 	// integration tests. Production lanes leave it nil, so the data path has
 	// only one predictable nil check before the real framed write.
@@ -253,6 +258,12 @@ type multipathFlow struct {
 	memOwned bool
 	// codedRetrySticky selects the coded-retry bundle (CodedRetrySticky).
 	codedRetrySticky bool
+	// carrierRecovery is recovery=carrier (§10.4): the stall watchdog only
+	// observes missing credit and enforces the no-progress budget. It
+	// demotes no lane, requests no rescue and pins no coded frontier; coded
+	// attempts move to the stream by their own deadline (coded-retry=sticky),
+	// and a lost binding is the carrier manager's.
+	carrierRecovery bool
 	// carrierShadow is the endpoint's carrier-liveness observer, nil when it
 	// is off. It only records; nothing here reads what it computes.
 	carrierShadow *carrierShadow
@@ -389,6 +400,9 @@ type multipathFlow struct {
 	// reported, refreshed by observeTransport. The stall threshold is three
 	// of these.
 	minRTTNS atomic.Int64
+	// credit is the flow's one outstanding sender-side credit delay sample
+	// (creditdelay.go): passive telemetry, never read by a decision.
+	credit creditSampler
 	// stallSignal advises the lane manager that a stall episode is in
 	// progress. It is buffered at one and sent non-blockingly: the manager
 	// acts on the flow's current state when it wakes, so a coalesced signal
@@ -416,9 +430,10 @@ type multipathFlow struct {
 	stallGrace    time.Duration
 	progressGrace time.Duration // test override; production uses laneReplacementWait
 	// controlLaneShared reports whether another flow is currently using the
-	// pooled control connection. Nil means "no", which is what a flow on a
-	// dedicated connection should answer.
-	controlLaneShared func() bool
+	// pooled control connection that control, the flow's selected control
+	// lane, is on. Nil means "no", which is what a flow on a dedicated
+	// connection should answer.
+	controlLaneShared func(control *mpLane) bool
 	// resetOnFailure makes a failed flow tell its peer before it closes: a
 	// RESET goes out on every lane still open. The gateway sets it. Without
 	// it the peer sees only the streams end, takes that for a path failure,
@@ -508,6 +523,9 @@ type multipathFlow struct {
 	acksIn            atomic.Uint64
 	acksOut           atomic.Uint64
 	acksSched         atomic.Uint64
+	// ackWritten is the cumulative point the ACK loop last wrote: a flow
+	// whose ackSequence is above it owes its peer an ACK.
+	ackWritten        atomic.Uint64
 	ackWriteNS        atomic.Uint64
 	finSequence       atomic.Uint64
 	remoteFinSequence atomic.Uint64
@@ -640,6 +658,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 	f.telemetryID = nextTelemetryID.Add(1)
 	f.class.Store(uint32(protocol.ClassNew))
 	f.ackTrack = newAckTracker()
+	f.credit.carried = newAckTracker()
 	return f
 }
 
@@ -802,6 +821,7 @@ func (f *multipathFlow) writeLane(lane *mpLane) {
 		}
 		if frame.Header.Type == protocol.TypeData {
 			lane.sent.Add(uint64(len(frame.Payload)))
+			f.noteCarrierTook(lane, frame.Header.Sequence, len(frame.Payload), reliable)
 		}
 		// The transport has taken these bytes, which is what frees the lane to
 		// accept more. A QUIC stream write returns only once the packer has
@@ -1693,7 +1713,7 @@ func (f *multipathFlow) isolateFromControlLane(control *mpLane) bool {
 		// is what a flow that has not been told otherwise should do.
 		return true
 	}
-	return f.controlLaneShared()
+	return f.controlLaneShared(control)
 }
 
 // errPeerReset is the peer ending the flow with RESET.
@@ -2264,6 +2284,18 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			continue
 		}
 		newEpisode := !episode
+		// The carrier manager owns QUIC bindings only; a flow on TCP keeps
+		// its bundle's own stall rescue.
+		if f.carrierRecovery && !hasTCPLane(f) {
+			// Unacknowledged bytes on a live stream: QUIC is delivering, the
+			// peer application is slow, or the ACK is in transit. None has a
+			// remedy between waiting and the no-progress budget above.
+			if newEpisode {
+				episode = true
+				f.noteCreditStall(threshold, sendSince)
+			}
+			continue
+		}
 		if newEpisode {
 			episode = true
 			// An application stall is evidence against the current DATA substrate,
@@ -2334,6 +2366,37 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			}
 		}
 	}
+}
+
+// noteCreditStall records, under recovery=carrier, a stall episode the
+// watchdog does nothing about (§10.4): missing credit on a live stream.
+func (f *multipathFlow) noteCreditStall(threshold time.Duration, since time.Time) {
+	if f.metrics != nil {
+		f.metrics.FlowStallDetected()
+	}
+	var lane *mpLane
+	if healthy := f.healthyLanes(); len(healthy) > 0 {
+		if data := f.dataLane(healthy); len(data) > 0 {
+			lane = data[0]
+		}
+	}
+	if f.logger != nil {
+		f.logger.Info("flow credit missing on a live stream; waiting",
+			"flow_id", f.flowID, "threshold", threshold, "lanes", f.laneCount(),
+			"bytes_up", f.bytesUp.Load(), "bytes_down", f.bytesDown.Load())
+	}
+	if f.carrierShadow != nil {
+		f.carrierShadow.noteStall(f, lane, since, threshold, false, false)
+	}
+}
+
+// failBinding ends a flow whose binding could not be restored in time.
+func (f *multipathFlow) failBinding(err error) {
+	select {
+	case f.ackErr <- err:
+	default:
+	}
+	f.failClose(err)
 }
 
 // escapePendingCoding keeps the current stalled bytes on a reliable carrier
@@ -2907,6 +2970,9 @@ func (f *multipathFlow) acknowledgeCoverage(sequence uint64, final bool, ranges 
 	if advanced && f.phased() {
 		f.noteAckedCoverage()
 	}
+	if advanced {
+		f.noteCreditCovered()
+	}
 	if end := f.codingRecoveryEnd.Load(); end != 0 &&
 		(f.acked >= end || f.ackTrack != nil && f.ackTrack.Covered(0, end)) {
 		f.codingRecoveryEnd.Store(0)
@@ -3239,6 +3305,7 @@ func (f *multipathFlow) ackLoop(ctx context.Context) {
 				continue
 			}
 			sent = sequence
+			f.ackWritten.Store(sequence)
 			// If more bytes arrived during the write, immediately emit the
 			// newer cumulative value. Otherwise return to the wake channel.
 			if f.ackSequence.Load() <= sent {
@@ -3290,6 +3357,9 @@ func (f *multipathFlow) receiveACK(event inboundEvent) error {
 		return errors.New("ack belongs to another flow")
 	}
 	f.acksIn.Add(1)
+	if event.lane != nil {
+		event.lane.acksIn.Add(1)
+	}
 	if frame.Header.Flags&f.sendAckFlag == 0 {
 		return errors.New("acknowledgement has wrong direction")
 	}

@@ -84,9 +84,10 @@ type segmentOutcome struct {
 // so whatever else the host is doing slows both alike. The full form is the
 // model's: 15 segments over 60 s on a path with 1 % loss. -short halves the
 // segment and its period, keeping the bitrate and an idle gap of ten credit
-// rounds before each fetch, on the same path without the loss, and fetches
-// 11: the fewest for which p10 is not the single slowest segment, which in
-// either arm is now and then the first, cold one.
+// rounds before each fetch, on the same path without the loss, fetches 11,
+// and holds the median throughput to the 0.90 bound: at that size p10 moves
+// by a tenth with one slow segment in either arm. The full suite applies the
+// model's p10 and rebuffer bounds.
 //
 // This test found that mem=owned's retention bound decayed through every
 // pause to its startup allowance, so each segment began again from it; see
@@ -160,6 +161,18 @@ func TestSegmentFetchOnAnEmulatedPath(t *testing.T) {
 		return
 	}
 	legacy, flip := outcomes[0], outcomes[1]
+	if testing.Short() {
+		// Eleven segments on a lossless path: one or two slow segments in
+		// either arm move the p10 by a tenth from run to run, so -short
+		// holds the median to the 0.90 bound, which still catches a flow
+		// that restarts slowly after every pause, and leaves p10 and the
+		// rebuffer ratio to the full suite's model form.
+		if got, floor := floatQuantile(flip.throughput, 0.50), 0.90*floatQuantile(legacy.throughput, 0.50); got < floor {
+			t.Errorf("median segment throughput %.2f Mbit/s under the flip bundle, below 0.90 × legacy's (%.2f)",
+				got*8/1e6, floor*8/1e6)
+		}
+		return
+	}
 	if got, floor := floatQuantile(flip.throughput, 0.10), 0.90*floatQuantile(legacy.throughput, 0.10); got < floor {
 		t.Errorf("p10 segment throughput %.2f Mbit/s under the flip bundle, below 0.90 × legacy's (%.2f)",
 			got*8/1e6, floor*8/1e6)

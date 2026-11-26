@@ -210,7 +210,21 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
+      # Gradle's dependency and wrapper caches, one entry per job. An entry is
+      # saved only after the job's build has resolved everything it needs, so
+      # a restored entry is complete. setup-java's single "gradle" cache was
+      # shared by both Android jobs, saved by whichever finished first, and so
+      # never held the instrumentation runner's dependencies (#199).
+      - name: restore Gradle dependency cache
+        id: gradle-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper/dists
+          key: gradle-${{ runner.os }}-${{ github.job }}-${{ hashFiles('mobile/android/**/*.gradle', 'mobile/android/gradle.properties', 'mobile/android/gradle/wrapper/gradle-wrapper.properties', 'mobile/android/gradle/verification-metadata.xml', 'mobile/scripts/gradle-with-retries.sh', 'mobile/scripts/prefetch-configurations.init.gradle') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ github.job }}-
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
           cmdline-tools-version: "14742923"
@@ -218,13 +232,20 @@ jobs:
       - name: install pinned Android SDK components
         run: sdkmanager "platforms;android-37.0" "build-tools;36.0.0" "ndk;28.0.12433566"
       - run: mobile/scripts/build-android-core.sh
-      - name: lint, shrink, and package
-        working-directory: mobile/android
+      - name: lint, shrink, and package (retried on dependency fetch errors)
         run: >-
-          ./gradlew --no-daemon --dependency-verification strict
+          mobile/scripts/gradle-with-retries.sh
           lintDebug lintRelease
           assembleDebug assembleDebugAndroidTest
           assembleRelease bundleRelease
+      - name: save Gradle dependency cache
+        if: steps.gradle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper/dists
+          key: ${{ steps.gradle-cache.outputs.cache-primary-key }}
       - name: assert the released manifest declares both modes and nothing more
         run: |
           set -euo pipefail
@@ -298,7 +319,21 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
+      # Gradle's dependency and wrapper caches, one entry per job. An entry is
+      # saved only after the job's build has resolved everything it needs, so
+      # a restored entry is complete. setup-java's single "gradle" cache was
+      # shared by both Android jobs, saved by whichever finished first, and so
+      # never held the instrumentation runner's dependencies (#199).
+      - name: restore Gradle dependency cache
+        id: gradle-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper/dists
+          key: gradle-${{ runner.os }}-${{ github.job }}-${{ hashFiles('mobile/android/**/*.gradle', 'mobile/android/gradle.properties', 'mobile/android/gradle/wrapper/gradle-wrapper.properties', 'mobile/android/gradle/verification-metadata.xml', 'mobile/scripts/gradle-with-retries.sh', 'mobile/scripts/prefetch-configurations.init.gradle') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ github.job }}-
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
           cmdline-tools-version: "14742923"
@@ -314,11 +349,23 @@ jobs:
           "emulator" "platform-tools"
           "system-images;android-${{ matrix.api }};google_apis;x86_64"
       - run: mobile/scripts/build-android-core.sh
-      - name: assemble app and instrumentation APKs
-        working-directory: mobile/android
+      # The instrumentation runner's own dependencies are resolved only once
+      # connectedDebugAndroidTest starts; fetch them here, where a Maven
+      # Central error can be retried, and run the test step offline.
+      - name: assemble APKs and prefetch the test runner (retried on dependency fetch errors)
         run: >-
-          ./gradlew --no-daemon --dependency-verification strict
+          mobile/scripts/gradle-with-retries.sh
+          -Pqueqiao.prefetch=unified-test-platform
           assembleDebug assembleDebugAndroidTest
+          :app:queqiaoPrefetchDependencies
+      - name: save Gradle dependency cache
+        if: steps.gradle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper/dists
+          key: ${{ steps.gradle-cache.outputs.cache-primary-key }}
       - name: remove build-only NDK before emulator
         run: |
           test "$ANDROID_HOME" = /usr/local/lib/android/sdk
@@ -363,7 +410,7 @@ jobs:
       - name: run mobile storage and routing checks
         working-directory: mobile/android
         run: >-
-          ./gradlew --no-daemon --dependency-verification strict
+          ./gradlew --no-daemon --offline --dependency-verification strict
           connectedDebugAndroidTest
 
   ios:
