@@ -107,6 +107,11 @@ type ServerConfig struct {
 	// GatewayAdmission selects what the session limit counts; see
 	// GatewayAdmission. Empty is legacy.
 	GatewayAdmission GatewayAdmission
+	// Recovery selects the recovery bundle; see RecoveryMode. Empty is flow.
+	// On a gateway carrier disables lane demotion, activates the adaptive
+	// keep-alive schedule and grants PROBE replies; it requires
+	// CongestionScope path and CodedRetry sticky.
+	Recovery RecoveryMode
 	// testReleasedAdmission emulates a released gateway's admission exactly:
 	// a stream that finds no session slot is closed before its first frame
 	// is read, and no standby connection is admitted past a full bound. It
@@ -208,6 +213,9 @@ type serverFlow struct {
 type quicAuthState struct {
 	principal identity.Principal
 	flows     atomic.Int64
+	// probeGranted says this connection's one verification grant for a
+	// PROBE reply has been issued (recovery=carrier).
+	probeGranted atomic.Bool
 }
 
 // shared reports whether more than one flow is using this connection.
@@ -486,6 +494,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, err
 	}
 	if err := resolveClassifier(&cfg.Classifier, cfg.Profile); err != nil {
+		return nil, err
+	}
+	if err := validateRecovery(&cfg.Recovery, cfg.CongestionScope, cfg.CodedRetry, "", 0, true); err != nil {
 		return nil, err
 	}
 	if err := cfg.CarrierShadow.resolve(); err != nil {
@@ -984,6 +995,12 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	}
 	s.metrics.DataConnectionAccepted(wire)
 	auth := &quicAuthState{principal: principal}
+	// openStreams counts this connection's stream handlers: under
+	// recovery=carrier the keep-alive floor applies while it has any.
+	var openStreams atomic.Int64
+	if s.cfg.Recovery == RecoveryCarrier {
+		go runKeepAliveSchedule(conn, func() bool { return openStreams.Load() > 0 }, time.Second)
+	}
 	// connFirstFrames and probes are this connection's own bounds (§10.5): the
 	// streams whose first frame is being read or whose JOIN is being
 	// admitted, and the PROBEs that hold no session slot.
@@ -1011,6 +1028,8 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 			wg.Add(1)
 			go func(lane streamConn) {
 				defer wg.Done()
+				openStreams.Add(1)
+				defer openStreams.Add(-1)
 				s.handleSession(ctx, lane, principal, auth, streamAdmission{release: releaseFirstFrame, probes: probes})
 			}(lane)
 			return true
@@ -1020,6 +1039,8 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 			wg.Add(1)
 			go func(lane streamConn) {
 				defer wg.Done()
+				openStreams.Add(1)
+				defer openStreams.Add(-1)
 				defer func() { <-s.semaphore }()
 				s.handleSession(ctx, lane, principal, auth, streamAdmission{charged: true})
 			}(lane)
@@ -1033,6 +1054,8 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 				wg.Add(1)
 				go func(lane streamConn) {
 					defer wg.Done()
+					openStreams.Add(1)
+					defer openStreams.Add(-1)
 					s.handleSession(ctx, lane, principal, auth, streamAdmission{recoveryOnly: true, release: releaseFirstFrame, probes: probes})
 				}(lane)
 				return true
@@ -1117,7 +1140,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 			defer func() { <-admission.probes }()
 			releaseFirstFrame()
 		}
-		s.handlePathProbe(fc, open)
+		s.handlePathProbeFor(fc, open, auth)
 		return
 	}
 	if open.Header.Type == protocol.TypeJoin {
@@ -1241,6 +1264,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow.memOwned = s.cfg.Memory == MemoryOwned
 	flow.codedRetrySticky = s.cfg.CodedRetry == CodedRetrySticky
 	flow.carrierShadow = s.carrierShadow
+	flow.carrierRecovery = s.cfg.Recovery == RecoveryCarrier
 	// Wire version 1 requires range acknowledgements on both endpoints.
 	flow.ackRanges.Store(true)
 	flow.idleTimeout = s.cfg.FlowIdleTimeout
@@ -1354,6 +1378,17 @@ const (
 // source for its sending direction; reverse-direction arrivals cannot reveal
 // which losses the peer caused by its offered rate.
 func (s *Server) handlePathProbe(fc *frameConn, first protocol.Frame) {
+	s.handlePathProbeFor(fc, first, nil)
+}
+
+// handlePathProbeFor is handlePathProbe on a connection. Under
+// recovery=carrier the reply to the first PROBE a connection carries before
+// any flow (its own stream is the one counted) is under a verification
+// grant: that is a client verifying a new
+// standby (§10.2), and the grant lets the reply go out while a silent
+// sibling holds the path's window. Routine probes on a carrier with flows
+// stay under ordinary admission, and a connection gets at most one grant.
+func (s *Server) handlePathProbeFor(fc *frameConn, first protocol.Frame, auth *quicAuthState) {
 	frames, bytes := 0, 0
 	frame := first
 	sessionID := first.Header.SessionID
@@ -1364,6 +1399,13 @@ func (s *Server) handlePathProbe(fc *frameConn, first protocol.Frame) {
 			frame.Header.Class != protocol.ClassNew || len(frame.Payload) == 0 || len(frame.Payload) > protocol.MaxProbePayload ||
 			bytes+len(frame.Payload) > maxPathProbeBytes {
 			return
+		}
+		if frames == 0 && s.cfg.Recovery == RecoveryCarrier && auth != nil && auth.flows.Load() <= 1 && auth.probeGranted.CompareAndSwap(false, true) {
+			// The reply verifies a client's standby in this direction while
+			// a silent sibling holds the path's window (§10.2).
+			if qs, ok := fc.transport().(*quicStreamConn); ok {
+				bindProbeGrant(qs.conn, qs.stream, 0, s.cfg.HandshakeTimeout)
+			}
 		}
 		frames++
 		bytes += len(frame.Payload)
@@ -1636,6 +1678,17 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 	replacement := &mpLane{
 		id: laneID, kind: kind, fc: fc, writeHook: s.cfg.testLaneWriteHook,
 		control: controlReplacement, staged: true,
+	}
+	if s.cfg.Recovery == RecoveryCarrier && kind == TransportQUIC {
+		// Replay towards the client waits for its ACK state on the new
+		// lane, or one SRTT, as the client's own does (§10.3 step 5).
+		srtt := 100 * time.Millisecond
+		if qs, ok := fc.transport().(*quicStreamConn); ok && qs.conn != nil {
+			if measured := qs.conn.ConnectionStats().SmoothedRTT; measured > 0 {
+				srtt = measured
+			}
+		}
+		replacement.replayGate = &replayGate{wait: srtt}
 	}
 	if err := serverSession.addLaneReplacing(replacement, replacedLaneID, replaceLane); err != nil {
 		s.cfg.Logger.Debug("lane join admission refused", "lane", laneID, "error", err)

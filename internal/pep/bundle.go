@@ -175,8 +175,9 @@ func ValidateBundle(ccAPI CCAPIVersion, congestion CongestionControlKind, p prof
 // sched is the class scheduler (stage 2); classifierMode is the
 // flow-classifier bundle; scope is the path controller switch (stage 6);
 // topology is a client's placement of flows on connections (stage 7), and a
-// gateway passes the empty topology.
-func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, admission GatewayAdmission, sched SchedMode, classifierMode ClassifierMode, scope CongestionScope, topology Topology) string {
+// gateway passes the empty topology; recovery is the recovery owner (stage
+// 8).
+func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, admission GatewayAdmission, sched SchedMode, classifierMode ClassifierMode, scope CongestionScope, topology Topology, recovery RecoveryMode) string {
 	var on []string
 	if ccAPI == CCAPIV2 {
 		on = append(on, "cc-api=v2")
@@ -189,6 +190,9 @@ func Bundle(ccAPI CCAPIVersion, memory MemoryMode, codedRetry CodedRetryMode, ad
 	}
 	if topology == TopologySingle {
 		on = append(on, "topology=single")
+	}
+	if recovery == RecoveryCarrier {
+		on = append(on, "recovery=carrier")
 	}
 	if codedRetry == CodedRetrySticky {
 		on = append(on, "coded-retry=sticky")
@@ -274,4 +278,85 @@ func ValidateTopology(topology Topology, scope CongestionScope, fanOut int) erro
 		scope = CongestionScopeConnection
 	}
 	return validateTopology(&topology, scope, fanOut)
+}
+
+// RecoveryMode selects who owns QUIC recovery. It is the switch of the
+// eighth migration bundle (§10, §14 stage 8, recovery=carrier), which
+// requires the seventh and the fourth.
+type RecoveryMode string
+
+const (
+	// RecoveryFlow is today's recovery: every flow's lane manager rescues its
+	// own lanes, with a dial+JOIN race (per-flow QUIC rescue dials) when its
+	// stall watchdog demotes a lane or its last lane fails, and the pooled
+	// connection is superseded on a packet-count silence heuristic.
+	RecoveryFlow RecoveryMode = "flow"
+	// RecoveryCarrier makes the client's carrier manager the single owner of
+	// carrier bindings and QUIC replacement (§10.2-§10.4): a carrier is
+	// replaced only on its own transport evidence (probe timeouts without
+	// progress), by promoting one verified standby; a flow whose stream
+	// failed is rebound by one JOIN on the eligible carrier, the same one if
+	// it is live; missing flow credit on a live stream only moves coded
+	// bytes to the stream. Per-flow QUIC rescue dials and lane demotion are
+	// off, the adaptive keep-alive schedule is on, and every unbound flow
+	// carries a binding deadline derived from the gateway's grace. On a
+	// gateway it disables lane demotion, activates the keep-alive schedule
+	// and binds a verification grant to PROBE replies; the gateway never
+	// dials (§10.1). It requires congestion=path and coded-retry=sticky, and
+	// on a client topology=single.
+	RecoveryCarrier RecoveryMode = "carrier"
+)
+
+// validateRecovery rejects a recovery owner the migration does not support
+// with the rest of the bundle. The empty mode is the default, flow. A gateway
+// passes the empty topology and no fan-out.
+func validateRecovery(recovery *RecoveryMode, scope CongestionScope, codedRetry CodedRetryMode, topology Topology, fanOut int, gateway bool) error {
+	if *recovery == "" {
+		*recovery = RecoveryFlow
+	}
+	switch *recovery {
+	case RecoveryFlow:
+		return nil
+	case RecoveryCarrier:
+	default:
+		return fmt.Errorf("unsupported recovery %q (want %s or %s)", *recovery, RecoveryFlow, RecoveryCarrier)
+	}
+	if scope != CongestionScopePath {
+		// A standby is an attachment to the same path controller, and a
+		// suspect carrier's attachment becomes PROBING there (§4.4).
+		return fmt.Errorf("recovery=%s requires congestion=%s", RecoveryCarrier, CongestionScopePath)
+	}
+	if codedRetry != CodedRetrySticky {
+		// Missing credit on a live stream moves coded bytes to the stream by
+		// the registration deadline and the sticky bit (§8.1, §10.4); the
+		// watchdog no longer rescues them.
+		return fmt.Errorf("recovery=%s requires coded-retry=%s", RecoveryCarrier, CodedRetrySticky)
+	}
+	if gateway {
+		return nil
+	}
+	if topology != TopologySingle {
+		// The carrier manager owns one carrier per path; isolated bulk
+		// connections are per-flow bindings it does not own.
+		return fmt.Errorf("recovery=%s requires topology=%s", RecoveryCarrier, TopologySingle)
+	}
+	if fanOut > 1 {
+		// A fan-out's extra connections come from the bulk pool, outside the
+		// carrier set (§7 leaves fan-out as a later carrier-manager policy).
+		return fmt.Errorf("recovery=%s does not support a topology fan-out", RecoveryCarrier)
+	}
+	return nil
+}
+
+// ValidateRecovery reports whether a recovery owner is supported with the
+// rest of a client's (gateway false) or gateway's (gateway true) bundle.
+// Check the other switches first.
+func ValidateRecovery(recovery RecoveryMode, scope CongestionScope, codedRetry CodedRetryMode, topology Topology, fanOut int, gateway bool) error {
+	if scope == "" {
+		scope = CongestionScopeConnection
+	}
+	if topology == "" && !gateway {
+		topology = TopologyIsolated
+	}
+	return validateRecovery(&recovery, scope, codedRetry, topology, fanOut, gateway)
 }

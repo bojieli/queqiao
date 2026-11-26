@@ -1005,6 +1005,41 @@ func TestProbingFollowsTransportProgress(t *testing.T) {
 	}
 }
 
+// A client's DRAINING carrier never returns (§4.4): once its endpoint
+// promoted a replacement over it, transport progress -- a late
+// acknowledgement on the old connection -- leaves the attachment PROBING,
+// and so does an explicit return to COUNTED.
+func TestADrainedAttachmentNeverReturnsToCounted(t *testing.T) {
+	c := newPCController()
+	now := base()
+	var tp TransportProgress
+	a := &pcConn{t: t, sizes: map[quiccongestion.PacketNumber]quiccongestion.ByteCount{}}
+	a.a = c.Attach(nil, nil)
+	a.a.SetTransportProgress(func() TransportProgress { return tp })
+	a.a.OnAttach(now, 0, 1200, func() {})
+	a.send(now, 1200)
+	if !c.Stats().Counted[a.a.epoch] {
+		t.Fatal("a fresh attachment is not COUNTED")
+	}
+	a.a.SetDraining()
+	if c.Stats().Counted[a.a.epoch] {
+		t.Fatal("a drained attachment is COUNTED")
+	}
+	tp = TransportProgress{Epoch: 7}
+	a.a.Admit(now, 1200)
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	if c.Stats().Counted[a.a.epoch] {
+		t.Fatal("transport progress returned a drained attachment to COUNTED")
+	}
+	a.a.SetProbing(false)
+	if c.Stats().Counted[a.a.epoch] {
+		t.Fatal("SetProbing(false) returned a drained attachment to COUNTED")
+	}
+	if got := c.Stats().Flight; got != 0 {
+		t.Fatalf("a drained attachment's flight is in the path's sum: %d", got)
+	}
+}
+
 // The coded reader's burst statistic is the datagrams' own: here the
 // datagram-bearing packets lose independently while another attachment's
 // stream packets lose in long runs, and only the path-wide figure shows it.

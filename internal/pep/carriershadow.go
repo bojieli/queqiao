@@ -822,7 +822,12 @@ func designLaneFailureRemedyFor(role string, obs carrierObservation) metrics.Car
 // follows is the manager's decision (its backoff, a remaining healthy lane),
 // so the label is the request, and the dials actually made are the join
 // attempts the client logs.
-func (o *carrierShadow) legacyStallRemedy() string {
+func (o *carrierShadow) legacyStallRemedy(f *multipathFlow) string {
+	if f != nil && f.carrierRecovery && !hasTCPLane(f) {
+		// recovery=carrier acts as the design does: no remedy for missing
+		// credit on a live stream (§10.4).
+		return "none"
+	}
 	if o.role == carrierShadowClient {
 		return "demote_and_request_rescue"
 	}
@@ -855,7 +860,7 @@ func (o *carrierShadow) noteStall(f *multipathFlow, lane *mpLane, pendingSince t
 		"observed_unix_ms", observedMillis(obs),
 		"pto_since_progress", obs.progress.PTOExpiries, "since_transport_progress", obs.since,
 		"eliciting_outstanding", obs.progress.ElicitingOutstanding, "srtt", obs.progress.SmoothedRTT,
-		"transport_epoch", obs.epoch, "design_remedy", remedy.String(), "legacy_remedy", o.legacyStallRemedy(),
+		"transport_epoch", obs.epoch, "design_remedy", remedy.String(), "legacy_remedy", o.legacyStallRemedy(f),
 		"escape_coded", coded, "healthy_spare", spare,
 		"stall_pending_for", time.Since(pendingSince), "threshold", threshold)
 	if lane != nil {

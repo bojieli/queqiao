@@ -410,11 +410,13 @@ func (d *direction) dropLocked(cfg Config) bool {
 
 type peer struct {
 	client net.Addr
-	conn   *net.UDPConn
-	last   atomic.Int64
-	// blackholed drops everything to and from this source; see
+	// conn is the relay's socket towards the server for this source. A NAT
+	// rebinding (RebindSources) replaces it.
+	conn atomic.Pointer[net.UDPConn]
+	last atomic.Int64
+	// blackUp and blackDown drop everything from and to this source; see
 	// BlackholeSources.
-	blackholed atomic.Bool
+	blackUp, blackDown atomic.Bool
 	// up and down are this source address's own policer, used only when the
 	// configuration asks for per-flow shaping. They deliberately do not apply
 	// loss: loss stays a property of the shared path so that per-flow shaping
@@ -598,8 +600,61 @@ func (r *Relay) BlackholeSources() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, p := range r.peers {
-		p.blackholed.Store(true)
+		p.blackUp.Store(true)
+		p.blackDown.Store(true)
 	}
+}
+
+// BlackholeSourcesDirection is BlackholeSources for one direction or both:
+// up drops what the sources already seen send, down what is sent to them.
+// It is a one-way failure of the existing connections only.
+func (r *Relay) BlackholeSourcesDirection(up, down bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, p := range r.peers {
+		if up {
+			p.blackUp.Store(true)
+		}
+		if down {
+			p.blackDown.Store(true)
+		}
+	}
+}
+
+// RestoreSources ends every blackhole: an outage that heals.
+func (r *Relay) RestoreSources() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, p := range r.peers {
+		p.blackUp.Store(false)
+		p.blackDown.Store(false)
+	}
+}
+
+// RebindSources moves every source the relay has seen to a new port towards
+// the server, as a NAT that rebinds its mapping does: the server sees the
+// same connections arrive from new addresses, and the client sees nothing.
+func (r *Relay) RebindSources() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return errors.New("relay is closed")
+	}
+	for _, p := range r.peers {
+		conn, err := net.DialUDP("udp", nil, r.target)
+		if err != nil {
+			return err
+		}
+		if err := configureUDPBuffers(conn); err != nil {
+			_ = conn.Close()
+			return err
+		}
+		old := p.conn.Swap(conn)
+		r.wg.Add(1)
+		go r.readServer(p, conn)
+		_ = old.Close()
+	}
+	return nil
 }
 
 // Stats returns the upstream (client to server) and downstream counters.
@@ -635,7 +690,7 @@ func (r *Relay) Close() error {
 	r.mu.Unlock()
 	_ = r.local.Close()
 	for _, p := range peers {
-		_ = p.conn.Close()
+		_ = p.conn.Load().Close()
 	}
 	r.queueMu.Lock()
 	queues := make([]*deliveryQueue, 0, len(r.queues))
@@ -665,13 +720,13 @@ func (r *Relay) readClient() {
 			continue
 		}
 		p, err := r.peerFor(addr)
-		if err != nil || p.blackholed.Load() {
+		if err != nil || p.blackUp.Load() {
 			continue
 		}
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 		r.forward(r.upstream, &p.up, payload, func(b []byte) {
-			_, _ = p.conn.Write(b)
+			_, _ = p.conn.Load().Write(b)
 		})
 	}
 }
@@ -695,13 +750,14 @@ func (r *Relay) peerFor(addr net.Addr) (*peer, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("configure peer buffers: %w", err)
 	}
-	p := &peer{client: addr, conn: conn}
+	p := &peer{client: addr}
+	p.conn.Store(conn)
 	p.up.rng = rand.New(rand.NewSource(r.cfg.Seed))
 	p.down.rng = rand.New(rand.NewSource(r.cfg.Seed))
 	p.last.Store(time.Now().UnixNano())
 	r.peers[key] = p
 	r.wg.Add(1)
-	go r.readServer(p)
+	go r.readServer(p, conn)
 	return p, nil
 }
 
@@ -712,18 +768,18 @@ func configureUDPBuffers(conn *net.UDPConn) error {
 	return conn.SetWriteBuffer(relaySocketBuffer)
 }
 
-func (r *Relay) readServer(p *peer) {
+func (r *Relay) readServer(p *peer, conn *net.UDPConn) {
 	defer r.wg.Done()
 	buf := make([]byte, r.cfg.MTU)
 	for {
-		n, err := p.conn.Read(buf)
+		n, err := conn.Read(buf)
 		if err != nil {
 			if fatalReadError(err) {
 				return
 			}
 			continue
 		}
-		if p.blackholed.Load() {
+		if p.blackDown.Load() {
 			continue
 		}
 		payload := make([]byte, n)
