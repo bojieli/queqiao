@@ -1586,7 +1586,7 @@ class DCAtMinimalSize(unittest.TestCase):
     def test_w4_first_then_the_sustained_phase(self):
         cfg = self.cfg()
         ph = cfg.wl.phases(cfg, "dc")
-        self.assertEqual([p.name for p in ph], ["requests", "sustained"])
+        self.assertEqual([p.name for p in ph], ["requests", "sustained", "uploads"])
         self.assertEqual({j.kind for j in ph[0].jobs}, {"dc-rpc", "probe"})
         self.assertEqual(cfg.dc.rpc_requests, 10)
         script = wl.GENERATORS["dc-rpc"].script(ab.Campaign(cfg, "<o>", ".", dry=True, stream=io.StringIO()),
@@ -1594,9 +1594,10 @@ class DCAtMinimalSize(unittest.TestCase):
         self.assertIn("--count 10 --spacing 2 ", script)
         self.assertIn("--asr-up 355000 --asr-down 200 --tts-up 300 --tts-down 300000", script)
         self.assertEqual([e.tag for e in cfg.wl.endpoints(cfg)], ["wlserver"])
-        # One block of four 60 s trials and the restarts: about 8 minutes.
+        # One block of four trials (requests, sustained and the 40 s upload
+        # phase) and the restarts: about 10.5 minutes.
         camp = ab.Campaign(cfg, "<o>", ".", dry=True, stream=io.StringIO())
-        self.assertAlmostEqual(camp.block_seconds("dc") / 60, 8, delta=0.5)
+        self.assertAlmostEqual(camp.block_seconds("dc") / 60, 10.5, delta=0.5)
 
     def test_calibration_runs_in_the_first_block_only(self):
         cfg = self.cfg()
@@ -1605,7 +1606,115 @@ class DCAtMinimalSize(unittest.TestCase):
         for b in (1, 2, 3):
             cfg.wl.after_block(camp, b, "dc", f"b{b:03d}-dc", None)
         self.assertEqual({c.args[0].block for c in camp.run_phase.call_args_list}, {1})
-        self.assertEqual(camp.run_phase.call_count, 3)          # one solo run per loaded leaf
+        # Three rounds (calibrate_repeats): in each, one solo run per loaded
+        # leaf, then one per upload leaf, all on the main arm.
+        self.assertEqual(camp.run_phase.call_count, 18)
+        self.assertEqual([c.args[2].name for c in camp.run_phase.call_args_list], (["solo"] * 3 + ["upsolo"] * 3) * 3)
+        self.assertEqual({c.args[1].name for c in camp.run_phase.call_args_list}, {cfg.main.name})
+
+    def test_repeated_calibration_on_every_arm(self):
+        text = (HERE / "validation" / "dc-minimal.example.ini").read_text()
+        text = text.replace("calibrate_repeats = 3", "calibrate_repeats = 2").replace("calibrate_arms = main",
+                                                                                      "calibrate_arms = all")
+        import configparser
+        cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+        cp.read_string(text)
+        cfg = ab.parse_config(cp)
+        camp = mock.Mock(cfg=cfg)
+        cfg.wl.after_block(camp, 1, "dc", "b001-dc", None)
+        calls = [(c.args[0].slot, c.args[1].name, c.args[2].name, c.args[2].jobs[0].client.name)
+                 for c in camp.run_phase.call_args_list]
+        # 2 rounds x 2 arms x (3 download + 3 upload leaves), each slot its own.
+        self.assertEqual(len(calls), 24)
+        self.assertEqual([c[0] for c in calls], list(range(100, 124)))
+        # The main arm first in every round, then the candidate; a leaf's
+        # repeats are spread over the calibration, not back to back.
+        self.assertEqual([c[1] for c in calls[::6]], ["legacy", "pathauth", "legacy", "pathauth"])
+        self.assertEqual([c[3] for c in calls[:6]], ["leaf-a", "leaf-b", "leaf-c", "up-a", "up-b", "up-c"])
+        # The estimate counts every solo run.
+        self.assertEqual(cfg.wl.extra_once_seconds(cfg, "dc"), 24 * (cfg.duration + 15))
+
+    def test_calibration_settings_are_checked(self):
+        import configparser
+        text = (HERE / "validation" / "dc-minimal.example.ini").read_text()
+        for bad, why in (("calibrate_repeats = 0", "calibrate_repeats"), ("calibrate_arms = some", "calibrate_arms")):
+            key = bad.split(" = ")[0]
+            cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+            cp.read_string("\n".join(bad if l.startswith(key + " =") else l for l in text.splitlines()))
+            with self.assertRaisesRegex(ab.ConfigError, why):
+                ab.parse_config(cp)
+
+    # --- the upload phase (#235)
+
+    def test_the_upload_phase_runs_every_upload_leaf_through_one_process(self):
+        cfg = self.cfg()
+        up = cfg.wl.phases(cfg, "dc")[-1]
+        self.assertEqual(up.name, "uploads")
+        self.assertTrue(up.barrier)
+        uploader = cfg.clients["uploader"]
+        # Every job runs on the uploader's host, through its own provider's
+        # listener, and is recorded under its leaf's name.
+        self.assertEqual({j.client.host for j in up.jobs}, {uploader.host})
+        self.assertEqual([(j.client.name, j.kind) for j in up.jobs],
+                         [("up-a", "dc-upload"), ("up-b", "dc-upload"), ("up-c", "dc-upload"), ("up-ctl", "dc-upprobe")])
+        self.assertEqual(len({j.client.socks_port_base for j in up.jobs}), 4)
+        camp = ab.Campaign(cfg, "<o>", ".", dry=True, stream=io.StringIO())
+        arm = cfg.arms[1]
+        upload = wl.GENERATORS["dc-upload"].script(camp, up.jobs[1], arm, 40)
+        self.assertIn(f"bgup --socks 127.0.0.1:{up.jobs[1].client.socks_port_base + arm.index} ", upload)
+        self.assertIn("--flows 2 --object-bytes 4194304 --duration 40", upload)
+        probe = wl.GENERATORS["dc-upprobe"].script(camp, up.jobs[3], arm, 40)
+        # The sibling's requests are all ASR-shaped (355 KB up).
+        self.assertIn("--asr-up 355000 --asr-down 200 --tts-up 355000 --tts-down 200", probe)
+        # One client process with a manifest, not one per provider.
+        cmd = camp.cl_cmd(uploader, arm, "x")
+        self.assertIn(f"--providers '{camp.cl_dir(uploader, arm)}/providers.json'", cmd)
+        self.assertNotIn("--profile", cmd)
+        self.assertNotIn("--listen", cmd)
+        self.assertIn("--path-profile dc-long-haul", cmd)
+        self.assertIn("--recovery=carrier", cmd)
+        # Each relay forwards to the arm's gateway port, on its own port.
+        relay = camp.aux_relay_cmd(cfg.aux_relays[0], arm)
+        self.assertIn(f"--listen :{cfg.aux_relays[0].port_base + arm.index} --upstream 198.51.100.20:"
+                      f"{cfg.gateway.port_base + arm.index}", relay)
+        ports = cfg.planned_ports()
+        self.assertEqual(sorted(p for p, _ in ports["dc-client-e"] if "provider" in _),
+                         sorted(b + a.index for _, _, _, b in uploader.providers for a in cfg.arms))
+        self.assertIn((cfg.aux_relays[0].port_base, "relay up-a legacy"), ports["dc-client-a"])
+
+    def test_the_uploader_enrolls_each_provider_on_its_relays_route(self):
+        cfg = self.cfg()
+        out = io.StringIO()
+        camp = ab.Campaign(cfg, "<o>", ".", dry=True, stream=out)
+        camp.enroll(cfg.clients["uploader"], cfg.arms[0])
+        text = out.getvalue()
+        for name, address, relay_base, base in cfg.clients["uploader"].providers:
+            self.assertIn(f"--path {name}={address}:{relay_base}", text)
+            self.assertIn(f'"listen": "127.0.0.1:{base}"', text)
+            self.assertIn(f"profile-{name}.json", text)
+
+    def test_upload_phase_configuration_is_checked(self):
+        bad = {
+            "upload leaf without a section": "\n[dc]\n",
+            "one relay host for two leaves": "\n[upleaf:up-b]\nhost = dc-client-a\naddress = 198.51.100.32\n",
+            "a relay on the uploader": "\n[upleaf:up-b]\nhost = dc-client-e\naddress = 198.51.100.32\n",
+            "the uploader on a download leaf's host": "\n[client:uploader]\nhost = dc-client-a\nsmall = true\n",
+        }
+        import configparser
+        for what, extra in bad.items():
+            text = (HERE / "validation" / "dc-minimal.example.ini").read_text()
+            cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"), strict=False)
+            cp.read_string(text)
+            if what == "upload leaf without a section":
+                cp.remove_section("upleaf:up-c")
+            else:
+                over = configparser.ConfigParser(interpolation=None, strict=False)
+                over.read_string(extra)
+                for sec in over.sections():
+                    for k, v in over[sec].items():
+                        cp[sec][k] = v
+            with self.assertRaises(ab.ConfigError, msg=what):
+                ab.parse_config(cp)
 
 
 class BesideSession(unittest.TestCase):

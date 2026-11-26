@@ -38,7 +38,9 @@ serves wire-1 clients and released clients, so upgrade gateways first.
   is retried on the flow's stream and stays there.
 - Owned memory. The shared send budget is granted to waiting flows in turn,
   a flow's retention follows its own flow credit, and bytes read but not yet
-  sent count as pending work for the no-progress budget.
+  sent count as pending work for the no-progress budget. A flow may have one
+  path window unacknowledged from its first byte and again after an idle gap,
+  and it keeps its bound through a pause of its application.
 - Phased classification. A flow that carried a bulk transfer becomes
   interactive again once it stops: its data class, queue and coding follow
   what it does now, and a small write onto an empty queue is sent interactive

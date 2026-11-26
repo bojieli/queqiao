@@ -580,8 +580,13 @@ type multipathFlow struct {
 	// sparseCurrent and sparsePrior are the same two buckets for the bytes
 	// sent under the phased bundle's sparse-write rule.
 	sparseCurrent, sparsePrior uint64
-	// clock, when set by a test, replaces time.Now for classification.
+	// clock, when set by a test, replaces time.Now for classification and
+	// for the idle limit (watchLimits).
 	clock func() time.Time
+	// limitTicker, when set by a test, replaces watchLimits' ticker: it
+	// returns the ticks, a call to make after each check that did not end
+	// the flow, and a call to make when the watch stops.
+	limitTicker func() (ticks <-chan time.Time, checked, stop func())
 	// classifyMu serialises observe: sampling, classifying and publishing.
 	classifyMu sync.Mutex
 
@@ -1824,7 +1829,26 @@ func (f *multipathFlow) runFlow(ctx context.Context) (FlowStats, error) {
 			if f.metrics != nil {
 				f.metrics.FlowTimeout()
 			}
-			f.resetLanes(err)
+			if errors.Is(err, errFlowIdleTimeout) || errors.Is(err, errFlowLifetime) {
+				// An idle or lifetime limit is this end deciding the flow is
+				// over, not a path failing, so the peer is told whichever end
+				// this is. A client that only closed its streams left the
+				// gateway to take that for a path failure and hold the
+				// destination open for a replacement lane that was never
+				// coming (laneReplacementWait, 45 s): the destination saw
+				// the flow end that long after the application did.
+				f.resetOnce.Do(func() { f.broadcastReset(err) })
+				// The RESET has been handed to the transport, not delivered,
+				// and a dedicated QUIC lane's connection closes with it. The
+				// flow's application I/O stops now; its lanes stay, for a
+				// bounded time, until the peer reads the RESET and closes
+				// them.
+				cancelRun()
+				_ = f.inner.Close()
+				f.awaitPeerTeardown(terminalResetDrain)
+			} else {
+				f.resetLanes(err)
+			}
 			cancelRun()
 			f.closeAll()
 			stats.Ended = time.Now()
@@ -1931,8 +1955,17 @@ func (f *multipathFlow) watchLimits(stop <-chan struct{}, out chan<- error) {
 			interval = 10 * time.Millisecond
 		}
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	var tickC <-chan time.Time
+	var checked func()
+	if f.limitTicker != nil {
+		var stopTicks func()
+		tickC, checked, stopTicks = f.limitTicker()
+		defer stopTicks()
+	} else {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		tickC = ticker.C
+	}
 	var lifetimeTimer *time.Timer
 	var lifetimeC <-chan time.Time
 	if lifetime > 0 {
@@ -1959,16 +1992,19 @@ func (f *multipathFlow) watchLimits(stop <-chan struct{}, out chan<- error) {
 				return
 			}
 
-		case <-ticker.C:
+		case <-tickC:
 			if idle > 0 {
 				last := f.lastActivity.Load()
-				if last == 0 || time.Since(time.Unix(0, last)) >= idle {
+				if last == 0 || f.clockNow().Sub(time.Unix(0, last)) >= idle {
 					select {
 					case out <- errFlowIdleTimeout:
 					case <-stop:
 					}
 					return
 				}
+			}
+			if checked != nil {
+				checked()
 			}
 		case <-lifetimeC:
 			select {
@@ -3818,6 +3854,19 @@ func (f *multipathFlow) dataSubstrates() (coded, stream uint64) {
 // flow that is already failing, so a lane that cannot take it at once is
 // simply closed.
 const terminalResetWait = 250 * time.Millisecond
+
+// terminalResetDrain bounds how long a flow that ended at its own limit keeps
+// its lanes open for the peer to read its RESET and close them.
+const terminalResetDrain = 2 * time.Second
+
+// awaitPeerTeardown waits until every lane has been closed, which the peer
+// does on reading a RESET, or until timeout.
+func (f *multipathFlow) awaitPeerTeardown(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for len(f.healthyLanes()) > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 // failClose ends a flow that failed. On an endpoint with resetOnFailure set it
 // first sends RESET on every lane still open, so the peer learns the session is

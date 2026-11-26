@@ -242,6 +242,14 @@ type Autotune struct {
 	// ReadyLimit bounds READY bytes; nil or a non-positive answer leaves them
 	// bounded only by the retention bound.
 	ReadyLimit func() int
+	// Floor, if set, raises the bound's floor above Startup to its answer
+	// (never past MaxOutstandingBytes): what the flow may always hold
+	// unacknowledged, however long it was idle. The flow layer passes its
+	// path's congestion window, so a flow returning from idle sends a
+	// request of up to one flight without waiting a credit round per
+	// Startup's worth. It reserves nothing: shared memory is taken only for
+	// bytes in hand, under the endpoint's grants.
+	Floor func() int
 }
 
 const (
@@ -257,6 +265,15 @@ const (
 	// round halves the remaining distance, so this reaches the floor from any
 	// int-sized bound.
 	autotuneMaxCatchUp = autotuneHistory + 64
+	// autotuneIdleHold is how long an application-idle flow keeps its bound:
+	// RFC 7661's non-validated period, for the same reason. A flow with
+	// nothing read, nothing in flight and no producer waiting holds no memory
+	// whatever its bound, so its idle rounds say nothing about what it needs
+	// when the application writes again; decaying through them made every
+	// restart after a few seconds' pause start over from the startup
+	// allowance (W10 in docs/WORKLOAD-MODEL.md). Past the hold, the elapsed
+	// rounds decay the bound as before.
+	autotuneIdleHold = 5 * time.Minute
 )
 
 // DefaultConfig returns bounds suitable for a long-haul path.
@@ -477,6 +494,12 @@ type autotuneState struct {
 	roundMaxU uint64
 	history   [autotuneHistory]uint64
 	rounds    int
+	// reading is when the producer began its current read of the source,
+	// holding nothing back; zero while it is not reading.
+	reading time.Time
+	// idleSince is the start of the first application-idle round of the
+	// current idle stretch; zero outside one.
+	idleSince time.Time
 }
 
 // New returns a scheduler that reads src and hands it out in chunks. It starts
@@ -540,6 +563,7 @@ func (s *Scheduler) produce() {
 			// bytes arrived to fill the chunk, which is latency invented by
 			// the scheduler.
 			n, err = s.src.Read(buf)
+			s.sourceReturned()
 			drained = n < len(buf)
 		} else {
 			var ok bool
@@ -610,6 +634,9 @@ func (s *Scheduler) waitForRoom() (int, bool) {
 			continue
 		}
 		s.tune.waiting = false
+		if s.cfg.Autotune != nil {
+			s.tune.reading = s.cfg.Now()
+		}
 		return allowance, true
 	}
 }
@@ -619,6 +646,7 @@ func (s *Scheduler) waitForRoom() (int, bool) {
 // the scheduler closed while it waited for memory.
 func (s *Scheduler) readStaged(staging []byte, allowance int) (buf []byte, n, reserved int, drained, reported, ok bool, err error) {
 	n, err = s.src.Read(staging)
+	s.sourceReturned()
 	if n <= 0 {
 		return nil, 0, 0, false, false, true, err
 	}
@@ -781,6 +809,16 @@ func (s *Scheduler) autotuneStartup() int {
 	return startup
 }
 
+// autotuneFloor is the bound's floor now: Startup, raised to Floor's answer
+// if that is larger, never past MaxOutstandingBytes.
+func (s *Scheduler) autotuneFloor() int {
+	floor := s.autotuneStartup()
+	if f := s.cfg.Autotune.Floor; f != nil {
+		floor = max(floor, min(f(), s.cfg.MaxOutstandingBytes))
+	}
+	return floor
+}
+
 func (s *Scheduler) autotuneRound() time.Duration {
 	if round := s.cfg.Autotune.Round; round != nil {
 		if d := round(); d > 0 {
@@ -805,6 +843,10 @@ func (s *Scheduler) autotuneLocked(now time.Time) {
 	if s.cfg.Autotune == nil {
 		return
 	}
+	// The floor can rise at any time (the path's window grew), and the
+	// bound is never below it. That is a floor, not growth: it needs no
+	// coverage.
+	defer func() { s.tune.bound = max(s.tune.bound, s.autotuneFloor()) }()
 	round := s.tune.roundLen
 	if now.Sub(s.tune.roundStart) < round {
 		return
@@ -816,12 +858,57 @@ func (s *Scheduler) autotuneLocked(now time.Time) {
 			s.tune.roundStart = now
 			break
 		}
+		if !s.applicationIdleLocked(s.tune.roundStart) {
+			s.tune.idleSince = time.Time{}
+		} else {
+			if s.tune.idleSince.IsZero() {
+				s.tune.idleSince = s.tune.roundStart
+			}
+			// Within the hold an idle round neither moves the bound nor
+			// enters the history: skip every whole round that ended by
+			// now and inside the hold, in one step.
+			hold := s.tune.idleSince.Add(autotuneIdleHold)
+			if end := s.tune.roundStart.Add(round); !end.After(hold) {
+				limit := now
+				if hold.Before(limit) {
+					limit = hold
+				}
+				s.tune.roundStart = s.tune.roundStart.Add(max(1, limit.Sub(s.tune.roundStart)/round) * round)
+				continue
+			}
+		}
 		s.closeRoundLocked()
 		s.tune.roundStart = s.tune.roundStart.Add(round)
 	}
 	// The next round's length is sampled once, now that it has started:
 	// an RTT that changed mid-round takes effect a round later.
 	s.tune.roundLen = s.autotuneRound()
+}
+
+// sourceReturned ends an application-idle stretch when the source read
+// returns, before the producer waits for memory: a flow waiting on the
+// shared budget is not waiting on its application. The rounds that ended
+// during the read are closed with the state they had, in which it was.
+func (s *Scheduler) sourceReturned() {
+	if s.cfg.Autotune == nil {
+		return
+	}
+	s.mu.Lock()
+	s.autotuneLocked(s.cfg.Now())
+	s.tune.reading = time.Time{}
+	s.mu.Unlock()
+}
+
+// applicationIdleLocked reports whether the round that started at start has
+// been application-idle throughout: the producer was already waiting on the
+// application before it began, with nothing read and waiting and nothing in
+// flight, and no coverage arrived in it. None of that can change until the
+// application writes, which closes the elapsed rounds before it counts.
+func (s *Scheduler) applicationIdleLocked(start time.Time) bool {
+	t := &s.tune
+	return !t.reading.IsZero() && t.reading.Before(start) &&
+		t.roundMaxU == 0 && s.uniqueBytes == 0 && s.readyBytes == 0 &&
+		!t.waiting && !t.blocked && !t.covered
 }
 
 func (s *Scheduler) closeRoundLocked() {
@@ -833,7 +920,7 @@ func (s *Scheduler) closeRoundLocked() {
 		t.rounds++
 	}
 	ceiling := s.cfg.MaxOutstandingBytes
-	floor := s.autotuneStartup()
+	floor := s.autotuneFloor()
 	if t.covered && t.blocked && t.room {
 		t.bound = min(2*t.bound, ceiling)
 	} else {

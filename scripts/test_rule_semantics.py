@@ -52,6 +52,8 @@ MAIN = {
     "recover_s": ([6.0, 7.5, 5.2, 8.1, 6.6, 7.0], "lower"),
     "reopen_ttfb_s": ([4.0, 5.5, 3.2, 6.1, 4.6, 5.0], "lower"),
     "inflight_ttfb_s": ([5.0, 6.5, 4.2, 7.1, 5.6, 6.0], "lower"),
+    "ttft_clear_p99_s": ([2.0, 2.4, 1.9, 2.6, 2.2, 2.1], "lower"),
+    "ttft_after_restore_s": ([3.0, 4.5, 2.2, 5.1, 3.6, 4.0], "lower"),
     "stalls_per_trial": ([36, 28, 40, 31, 25, 33], "lower"),
     "completion": ([0.5, 0.75, 0.5, 0.25, 0.5, 0.75], "higher"),
 }

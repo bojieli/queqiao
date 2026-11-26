@@ -452,15 +452,14 @@ stage 9 data exists.
 ### The workload
 
 A leaf is an endpoint pair, and the gateway is the sender for downloads, so
-each client host is one leaf under the gateway's shared egress. Under the
-candidate the gateway's authorities sit in its tree as knowledge only. The
-legacy gateway has no tree at all: its per-peer controllers are independent,
-and the legacy tree's joint limit couples only clients in one process. So
-this campaign compares one authority per leaf with independent legacy
-controllers. The joint limit itself is exercised by the deterministic test
-`TestDCMultiLeafFairnessHoldsWithAKnowledgeOnlyTree` (uploads, several
-clients in one process), which computes the same contrasts with the same
-bounds. The DC campaign
+each client host is one leaf under the gateway's shared egress. Neither arm
+has a tree on the gateway: the candidate's gateway authorities take no tree
+view, and the legacy gateway's per-peer controllers are independent,
+and the legacy tree's joint limit couples only clients in one process. So the
+download phases compare one authority per leaf with independent legacy
+controllers. The joint limit itself is exercised by the upload phase below,
+and by the deterministic test `TestDCMultiLeafFairnessHoldsWithAKnowledgeOnlyTree`.
+Both run several leaves in one client process. The DC campaign
 (`scripts/validation/dc-campaign.example.ini`) has these parts:
 
 - One temporary gateway per arm, with `--path-profile dc-long-haul` on both
@@ -481,10 +480,16 @@ bounds. The DC campaign
   (*w* − 1) × `request_timeout` on every leaf. A W4 client (`wlclient rpc`)
   is given the barrier's absolute time, starts at once and waits for the
   barrier after initialising, so the leaf hosts' interpreter start-up times
-  do not shift their waves. The analysis requires every
-  loaded leaf to have been in each wave together for at least 0.1 s, on
-  millisecond times; otherwise latency and spread are unmeasured. This also
-  relies on NTP-synchronised clocks.
+  do not shift their waves. The analysis requires every loaded leaf to have
+  been in each wave together, on millisecond times, for at least half of the
+  shortest leaf's time in that wave, and never less than 20 ms or more than
+  0.1 s. Otherwise latency and spread are unmeasured. The bound scales
+  because on a short path a whole warm request can take less than 0.1 s:
+  across a 53 ms hop a 300 KB request finishes in about 60 ms, and a fixed
+  0.1 s left every wave unmeasured. The control leaf's probes count under
+  the request phase in the same way: each request loses a quarter of its
+  length from each end (at least 20 ms, at most 0.1 s), and a probe counts
+  if it overlaps what remains. This relies on NTP-synchronised clocks.
 - **A shared sustained window:** every loaded leaf must have been
   transferring together for at least 90% of the window. This is measured on
   each leaf's actual transfer intervals, intersected across leaves; a leaf
@@ -500,9 +505,67 @@ bounds. The DC campaign
   a failure would inflate the solo rate. With no usable calibration at all
   (or `calibrate = false`), the binding is not measured, and the verdict is
   INCOMPLETE rather than VOID.
+  - `calibrate_repeats` (1 to 9) runs every leaf's solo that many times,
+    one round of all leaves after another. A leaf's calibrated rate is the
+    median of its usable runs, so one run that collapses or bursts cannot
+    void the binding check or decide it. On a live path a single legacy
+    solo once collapsed to 10 Mbit/s against 356 for its sibling, and that
+    one run voided the campaign. The minimal example uses 3.
+  - `calibrate_arms = all` also runs every candidate arm's solos, after the
+    main arm's in each round. They are not used for binding. The report
+    lists every arm's solo runs per leaf (median and each run): the rate one
+    leaf gets alone on one connection, which is the evidence for or against
+    fan-out (design §11.3, Q3).
 - **The temporary account** has no device or flow limit of its own, so the
   gateway's `--max-sessions` is the only admission limit. A campaign then
   measures the path rather than account admission.
+
+### The upload phase
+
+The download phases cannot see the legacy tree's joint limit. That limit
+lives in a client process and couples only the clients inside it, and the
+download phases run one client process per leaf host, with the gateway
+sending. The upload phase is where the gate sees the tree (design §11.3,
+#235). It is configured in `[dc]` and the `[upleaf:...]` sections:
+
+- **One uploader process.** `uploader` names a `[client:...]` on a host of
+  its own. Per arm it runs one `queqiaod client --providers` process, with
+  one provider per upload leaf. Each provider is enrolled with
+  `provider invite --path NAME=ADDRESS:PORT`, so it dials its leaf's relay,
+  and listens on its own loopback port.
+- **One relay per leaf.** Each `[upleaf:NAME]` (`host`, `address`) runs a
+  `queqiaod relay` per arm that forwards to that arm's gateway. Every upload
+  leaf is then its own remote host, so its own leaf, and the uploader's uplink
+  is the common ancestor. A relay may share a host with a download leaf but
+  not with the uploader or the gateway, and no two relays share a host or an
+  address.
+- **The phase.** `upload_leaves` each run `upload_flows_per_leaf` backlogged
+  uploads of `upload_object_bytes` objects to wlserver's sink, all at once on
+  a barrier. `upload_control` is the light sibling: one ASR-shaped request
+  (355 KB up) every `control_interval`. A cut object counts the bytes the sink
+  received.
+- **Calibration.** Each upload leaf also runs alone, after the download
+  calibration (the same `calibrate`, `calibrate_repeats` and
+  `calibrate_arms` rules). The legacy arm's simultaneous upload rate must be
+  at most `[upload] binding_max` (0.80) of the sum of the solo rates. The
+  report prints this uplink binding beside the ancestor binding. Otherwise
+  the uplink did not bind and the campaign is VOID: pick an uploader with a
+  narrower uplink, or add upload load.
+- **Evidence.** In each upload window the gateway must see only QUIC flows,
+  one leaf key per upload leaf plus one for the sibling (one per solo run),
+  and the uploader must run `dc-long-haul` with the arm's bundle. Leaves
+  behind one relay void the campaign.
+
+The upload criteria are the download criteria with their own frozen bounds,
+in `dc_gate.ini` `[upload]`:
+
+| Criterion | Contrast |
+|---|---|
+| upload goodput (aggregate of upload leaves) | `cand − 0.90 × legacy` |
+| worst upload leaf's bytes | `cand − 0.90 × legacy` |
+| completion spread (slowest leaf's median whole-object time over the fastest's) | `1.25 × legacy − cand`, and `3.5 − cand` |
+| Jain's index over upload leaves | `cand − (legacy − 0.05)` |
+| sibling request p50 | `1.10 × legacy − cand` |
 
 ### The criteria
 
@@ -796,7 +859,8 @@ block per path for all four, 2.6 hours at 6 blocks and 5.2 hours at the
 12-block cap (design section 15.4). D adds no wall time. `--dry-run`
 prints the per-type block time, the campaign's estimate, the look levels,
 and the run order. DC calibrates each loaded leaf alone in its first block
-only (`calibrate = first`), and that block's solo rates stand for every
+only (`calibrate = first`), three times each (`calibrate_repeats = 3`, the
+median taken), and that block's solo rates stand for every
 block's ancestor-binding check and leaf identities; every block's carrier
 and leaf evidence is still checked. With 30 requests per arm in a trial,
 DC's request p99 is pooled over blocks and tested by resampling blocks.
@@ -865,6 +929,17 @@ probes every 0.25 s, each its own connection.
   connection opened after it (`reopen_ttfb_s`), and the first byte again
   of every flow in flight across it (`inflight_ttfb_s`), each `lower 1.0`.
 
+- *Blackhole TTFT*, split: `ttft_clear_p99_s` over the calls clear of
+  the outages (neither starting nor running within one or the 5 s after
+  it), `atmost 1.10 0.200`; and `ttft_after_restore_s`, for the calls
+  caught by an outage, from its restore to their first token (the worse
+  outage), `lower 1.0`. The p99 over all calls is reported only: with fixed
+  timing an LLM turn lined up with the 25 s outage, and that p99 reported
+  which arm had a call in flight.
+- *Offsets*: each trial's LLM start (+0 to 6 s) and outage starts (+0 to
+  10 s and +0 to 5 s) are drawn from the frozen seed, independently per
+  block, slot and arm.
+
 D is judged as its own campaign in `<campaign>/idle-wake` by
 `[workload:idle-wake]`; its trials are not voided for host CPU records,
 which only the blocks take. Goodput is reported only. The first impaired
@@ -875,6 +950,11 @@ while they run: their samples stay on the host and are fetched once the
 trial ends, with about three minutes of ssh retries, so a brief outage of
 the runner's link no longer voids a block. `[campaign] fetch_via = <ssh
 host>` fetches logs through that host, for a slow direct link.
+`ssh_proxy_jump = <ssh host>` in a section naming a host ([gateway],
+[relay], [client:...], [production:...]) reaches that host through the
+other for every session and copy (ssh ProxyJump, this machine's own keys
+end to end). Binaries are uploaded gzipped, unpacked on the host and
+checked against the local SHA-256 before they replace anything.
 
 **Reading a rule's row.** Every rule's per-block contrast is the
 candidate's headroom inside its bound, positive when inside whichever way

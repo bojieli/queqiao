@@ -124,6 +124,28 @@ func (l *mpLane) windowBytes() int {
 	return laneQueueBytes(cwnd)
 }
 
+// pathWindowBytes is the combined congestion window of the flow's lanes,
+// counting once the window of lanes attached to one path controller: what
+// the flow's transports can have in flight at once. Zero without telemetry.
+func (f *multipathFlow) pathWindowBytes() int {
+	total := 0
+	var authorities map[uint64]struct{}
+	for _, lane := range f.healthyLanes() {
+		cwnd, _ := lane.congestionState()
+		if id := lane.authority(); id != 0 {
+			if _, seen := authorities[id]; seen {
+				continue
+			}
+			if authorities == nil {
+				authorities = make(map[uint64]struct{})
+			}
+			authorities[id] = struct{}{}
+		}
+		total += cwnd
+	}
+	return total
+}
+
 // creditRound is one flow-credit round trip: the slowest healthy lane's
 // round trip plus the receiver's ACK coalescing delay (G1). It paces the
 // owned-memory retention autotune; zero before any lane has an RTT sample.
@@ -222,6 +244,17 @@ func (l *mpLane) congestionState() (cwnd, inFlight int) {
 	return l.cwndBytes, l.inFlightBytes
 }
 
+// authority is the path controller the lane's connection is attached to,
+// as of its last congestion sample; zero for a connection-owned controller.
+func (l *mpLane) authority() uint64 {
+	if l == nil {
+		return 0
+	}
+	l.cwndMu.Lock()
+	defer l.cwndMu.Unlock()
+	return l.authorityID
+}
+
 // flowSource adapts the application connection to the scheduler's reader,
 // keeping the classification and half-close handling that used to live in the
 // send loop.
@@ -302,7 +335,12 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 	f.fitBacklogThreshold()
 
 	// Retention follows the flow's own credit-driven bound (design §8.3).
-	autotune := &stripe.Autotune{Round: f.creditRound, ReadyLimit: f.readyLimit}
+	// The floor is one path window: a flow back from idle may have what
+	// its transport can carry in one flight unacknowledged, rather than
+	// waiting a credit round per startup allowance. A request just over
+	// four chunks -- an LLM prompt of 132 KB -- otherwise paid a round
+	// trip on every turn after an idle gap.
+	autotune := &stripe.Autotune{Round: f.creditRound, ReadyLimit: f.readyLimit, Floor: f.pathWindowBytes}
 	sched := stripe.New(&flowSource{flow: f}, stripe.Config{
 		ChunkSize:      f.chunkSize,
 		LaneWindow:     min(maxLaneChunkWindow, f.memoryLimits.maxOutstanding),
