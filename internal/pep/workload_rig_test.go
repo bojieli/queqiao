@@ -34,38 +34,30 @@ type workloadArm struct {
 	server func(*ServerConfig)
 }
 
-// legacyArm is every switch off: today's behaviour and the registered
-// control of the stage-10 gate. Each switch is set explicitly, so the control
-// stays the legacy bundle on a build whose defaults have flipped.
-var legacyArm = workloadArm{
-	name: "legacy",
-	client: func(c *ClientConfig) {
-		c.CCAPI, c.Sched, c.CongestionScope = CCAPIV1, SchedLegacy, CongestionScopeConnection
-		c.Topology, c.Classifier = TopologyIsolated, ClassifierLegacy
-		c.CodedRetry, c.Memory = CodedRetryLegacy, MemoryLegacy
-	},
-	server: func(s *ServerConfig) {
-		s.CCAPI, s.Sched, s.CongestionScope = CCAPIV1, SchedLegacy, CongestionScopeConnection
-		s.Classifier, s.CodedRetry, s.Memory = ClassifierLegacy, CodedRetryLegacy, MemoryLegacy
-		s.GatewayAdmission = GatewayAdmissionLegacy
-	},
-}
+// legacyArm is the legacy bundle: the registered control of the stage-10
+// gate. Each switch is set explicitly (pep.BundleLegacy), so the control
+// stays the legacy bundle now that the defaults have flipped.
+var legacyArm = bundleArm("legacy", BundleLegacy)
 
-// flipArm is every switch of the path-authority migration that is merged,
-// on: what the default flip measures. A stage that adds a switch adds it
-// here.
-var flipArm = workloadArm{
-	name: "flip",
-	client: func(c *ClientConfig) {
-		c.CCAPI, c.Sched, c.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
-		c.Topology, c.Classifier = TopologySingle, ClassifierPhased
-		c.CodedRetry, c.Memory = CodedRetrySticky, MemoryOwned
-	},
-	server: func(s *ServerConfig) {
-		s.CCAPI, s.Sched, s.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
-		s.Classifier, s.CodedRetry, s.Memory = ClassifierPhased, CodedRetrySticky, MemoryOwned
-		s.GatewayAdmission = GatewayAdmissionOwned
-	},
+// flipArm is the path-authority bundle, the default since stage 10: what the
+// default flip ships, recovery=carrier included. It is the named bundle
+// itself, so a switch added to the bundle is measured here without an edit.
+var flipArm = bundleArm("flip", BundlePathAuthority)
+
+// bundleArm is the arm that applies every switch of a named bundle.
+func bundleArm(name string, bundle BundleName) workloadArm {
+	switches := func(gateway bool) BundleSwitches {
+		s, err := SwitchesOf(bundle, gateway)
+		if err != nil {
+			panic(err)
+		}
+		return s
+	}
+	return workloadArm{
+		name:   name,
+		client: func(c *ClientConfig) { switches(false).ApplyToClient(c) },
+		server: func(s *ServerConfig) { switches(true).ApplyToServer(s) },
+	}
 }
 
 // workloadArms are the two arms, control first.
