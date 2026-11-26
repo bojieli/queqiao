@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -62,7 +61,7 @@ func fetchSegment(conn net.Conn, size int) (time.Duration, error) {
 	return time.Since(start), nil
 }
 
-// segmentOutcome is one arm's W10 measures.
+// segmentOutcome is W10's measures.
 type segmentOutcome struct {
 	times      []time.Duration
 	throughput []float64 // bytes per second, as an ABR sees each segment
@@ -78,16 +77,15 @@ type segmentOutcome struct {
 // Measures: each segment's download time d_k, its throughput as the player
 // sees it (size / d_k), and the rebuffer ratio Σ max(0, d_k − period) over
 // the session. Bounds (model W10): p10 throughput ≥ 0.90 × legacy; rebuffer
-// ratio ≤ legacy + 1 pp.
+// ratio ≤ legacy + 1 pp. Legacy's values are frozen below, as measured on
+// this path at stage 10 before the legacy bundle was deleted.
 //
-// The arms run at once, each on its own client, gateway and emulated path,
-// so whatever else the host is doing slows both alike. The full form is the
-// model's: 15 segments over 60 s on a path with 1 % loss. -short halves the
-// segment and its period, keeping the bitrate and an idle gap of ten credit
-// rounds before each fetch, on the same path without the loss, fetches 11,
-// and holds the median throughput to the 0.90 bound: at that size p10 moves
-// by a tenth with one slow segment in either arm. The full suite applies the
-// model's p10 and rebuffer bounds.
+// The full form is the model's: 15 segments over 60 s on a path with 1 %
+// loss. -short halves the segment and its period, keeping the bitrate and an
+// idle gap of ten credit rounds before each fetch, on the same path without
+// the loss, fetches 11, and holds the median throughput to the 0.90 bound:
+// at that size p10 moves by a tenth with one slow segment. The full suite
+// applies the model's p10 and rebuffer bounds.
 //
 // This test found that mem=owned's retention bound decayed through every
 // pause to its startup allowance, so each segment began again from it; see
@@ -104,81 +102,66 @@ func TestSegmentFetchOnAnEmulatedPath(t *testing.T) {
 		path.LossRate = 0
 	}
 
-	arms := workloadArms()
-	outcomes := make([]segmentOutcome, len(arms))
-	rigs := make([]*workloadRig, len(arms))
-	for i, arm := range arms {
-		rigs[i] = newWorkloadRig(t, path, arm, nil)
-	}
-	destination := segmentServer(t)
-	var wg sync.WaitGroup
-	errs := make(chan error, len(arms))
-	for i := range arms {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			conn := rigs[i].dial(destination)
-			_ = conn.SetDeadline(time.Now().Add(time.Duration(segments)*period + time.Minute))
-			// Warm: the player has the manifest before the first segment.
-			if _, err := fetchSegment(conn, 4096); err != nil {
-				errs <- err
-				return
-			}
-			start := time.Now()
-			var stalled time.Duration
-			o := &outcomes[i]
-			for k := range segments {
-				if wait := time.Until(start.Add(time.Duration(k) * period)); wait > 0 {
-					time.Sleep(wait)
-				}
-				d, err := fetchSegment(conn, size)
-				if err != nil {
-					errs <- err
-					return
-				}
-				o.times = append(o.times, d)
-				o.throughput = append(o.throughput, float64(size)/d.Seconds())
-				stalled += max(0, d-period)
-			}
-			o.rebuffer = stalled.Seconds() / (time.Duration(segments) * period).Seconds()
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
+	rig := newWorkloadRig(t, path, pathAuthorityArm, nil)
+	conn := rig.dial(segmentServer(t))
+	_ = conn.SetDeadline(time.Now().Add(time.Duration(segments)*period + time.Minute))
+	// Warm: the player has the manifest before the first segment.
+	if _, err := fetchSegment(conn, 4096); err != nil {
 		t.Fatal(err)
 	}
-	for i, arm := range arms {
-		o := outcomes[i]
-		rounded := make([]time.Duration, len(o.times))
-		for k, d := range o.times {
-			rounded[k] = d.Round(time.Millisecond)
+	start := time.Now()
+	var stalled time.Duration
+	var o segmentOutcome
+	for k := range segments {
+		if wait := time.Until(start.Add(time.Duration(k) * period)); wait > 0 {
+			time.Sleep(wait)
 		}
-		t.Logf("%s: segment times %v; p10 throughput %.2f Mbit/s; rebuffer %.2f %%",
-			arm.name, rounded, floatQuantile(o.throughput, 0.10)*8/1e6, 100*o.rebuffer)
+		d, err := fetchSegment(conn, size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.times = append(o.times, d)
+		o.throughput = append(o.throughput, float64(size)/d.Seconds())
+		stalled += max(0, d-period)
 	}
-	if !judgeComparisons(t) {
+	o.rebuffer = stalled.Seconds() / (time.Duration(segments) * period).Seconds()
+
+	rounded := make([]time.Duration, len(o.times))
+	for k, d := range o.times {
+		rounded[k] = d.Round(time.Millisecond)
+	}
+	t.Logf("segment times %v; median throughput %.2f Mbit/s, p10 %.2f Mbit/s; rebuffer %.2f %%",
+		rounded, floatQuantile(o.throughput, 0.50)*8/1e6, floatQuantile(o.throughput, 0.10)*8/1e6, 100*o.rebuffer)
+	if !judgeBounds(t) {
 		return
 	}
-	legacy, flip := outcomes[0], outcomes[1]
 	if testing.Short() {
-		// Eleven segments on a lossless path: one or two slow segments in
-		// either arm move the p10 by a tenth from run to run, so -short
-		// holds the median to the 0.90 bound, which still catches a flow
-		// that restarts slowly after every pause, and leaves p10 and the
-		// rebuffer ratio to the full suite's model form.
-		if got, floor := floatQuantile(flip.throughput, 0.50), 0.90*floatQuantile(legacy.throughput, 0.50); got < floor {
-			t.Errorf("median segment throughput %.2f Mbit/s under the flip bundle, below 0.90 × legacy's (%.2f)",
-				got*8/1e6, floor*8/1e6)
+		// Eleven segments on a lossless path: one or two slow segments move
+		// the p10 by a tenth from run to run, so -short holds the median to
+		// the 0.90 bound, which still catches a flow that restarts slowly
+		// after every pause, and leaves p10 and the rebuffer ratio to the
+		// full suite's model form.
+		if got, floor := floatQuantile(o.throughput, 0.50)*8/1e6, 0.90*segmentLegacyShortMedianMbps; got < floor {
+			t.Errorf("median segment throughput %.2f Mbit/s, below 0.90 × legacy's %.2f (%.2f)", got, segmentLegacyShortMedianMbps, floor)
 		}
 		return
 	}
-	if got, floor := floatQuantile(flip.throughput, 0.10), 0.90*floatQuantile(legacy.throughput, 0.10); got < floor {
-		t.Errorf("p10 segment throughput %.2f Mbit/s under the flip bundle, below 0.90 × legacy's (%.2f)",
-			got*8/1e6, floor*8/1e6)
+	if got, floor := floatQuantile(o.throughput, 0.10)*8/1e6, 0.90*segmentLegacyP10Mbps; got < floor {
+		t.Errorf("p10 segment throughput %.2f Mbit/s, below 0.90 × legacy's %.2f (%.2f)", got, segmentLegacyP10Mbps, floor)
 	}
-	if flip.rebuffer > legacy.rebuffer+0.01 {
-		t.Errorf("rebuffer ratio %.2f %% under the flip bundle against %.2f %% under legacy; the bound is legacy + 1 pp",
-			100*flip.rebuffer, 100*legacy.rebuffer)
+	if o.rebuffer > segmentLegacyRebuffer+0.01 {
+		t.Errorf("rebuffer ratio %.2f %%; the bound is legacy's %.2f %% + 1 pp", 100*o.rebuffer, 100*segmentLegacyRebuffer)
 	}
 }
+
+// What the legacy bundle measured on W10's paths at stage 10, before it was
+// deleted, on a 32-core Linux host: the median of 16 full runs (p10 from 6.5
+// to 12.0 Mbit/s, three of them under 9; no rebuffering) and of four -short
+// runs (medians of 10.02, 9.63, 9.54 and 9.42 Mbit/s). The path-authority
+// bundle's own figures in the same runs were a p10 of 10.2 to 11.7 and a
+// -short median of 9.7 to 10.2.
+const (
+	segmentLegacyP10Mbps         = 10.65
+	segmentLegacyShortMedianMbps = 9.6
+	segmentLegacyRebuffer        = 0.0
+)

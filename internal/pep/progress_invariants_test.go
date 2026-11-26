@@ -467,8 +467,13 @@ func (b *progressTestLog) Write(p []byte) (int, error) {
 }
 func (b *progressTestLog) String() string { b.mu.Lock(); defer b.mu.Unlock(); return b.buf.String() }
 
+// A TCP flow's stall rescue (the only per-flow rescue left; a QUIC binding
+// is the carrier manager's) does not race an unconfirmed OPEN.
 func TestUnconfirmedOpenDoesNotRaceRescueJoin(t *testing.T) {
 	flow := newGraceTestFlow(t)
+	local, remote := net.Pipe()
+	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
+	flow.lanes[0] = &mpLane{id: 0, kind: TransportTCP, fc: newFrameConn(local)}
 	flow.stallScan = time.Millisecond
 	flow.stallGrace = 2 * time.Millisecond
 	flow.progressGrace = time.Second

@@ -234,7 +234,6 @@ func readUntilData(fc *frameConn, outer streamConn, within time.Duration) (proto
 type admissionCase struct {
 	name    string
 	carrier TransportKind
-	mode    GatewayAdmission
 	wire    byte
 	kind    destinationKind
 	// pooled puts every flow on one QUIC connection, so only the stream
@@ -245,7 +244,7 @@ type admissionCase struct {
 
 func admissionCases() []admissionCase {
 	var cases []admissionCase
-	for _, mode := range []GatewayAdmission{GatewayAdmissionLegacy, GatewayAdmissionOwned} {
+	{
 		for _, carrier := range []TransportKind{TransportQUIC, TransportTCP} {
 			for _, wire := range protocol.SupportedVersions() {
 				for _, kind := range []destinationKind{idleFlows, activeFlows} {
@@ -262,8 +261,8 @@ func admissionCases() []admissionCase {
 							topology = "pooled"
 						}
 						cases = append(cases, admissionCase{
-							name:    fmt.Sprintf("%s/%s/wire%d/%s/%s", mode, carrier, wire, name, topology),
-							carrier: carrier, mode: mode, wire: wire, kind: kind, pooled: pooled,
+							name:    fmt.Sprintf("%s/wire%d/%s/%s", carrier, wire, name, topology),
+							carrier: carrier, wire: wire, kind: kind, pooled: pooled,
 						})
 					}
 				}
@@ -289,7 +288,7 @@ func TestAFullGatewayAdmitsTheJoinAndProbeThatRecoverItsFlows(t *testing.T) {
 			defer cancel()
 			destination := admissionDestination(t, tc.kind)
 			server, remote := admissionGateway(t, ctx, tc.carrier, ServerConfig{
-				Credentials: serverCredentials, MaxSessions: maxSessions, GatewayAdmission: tc.mode,
+				Credentials: serverCredentials, MaxSessions: maxSessions,
 			})
 			checkReset := func(what string, frame protocol.Frame) {
 				t.Helper()
@@ -397,10 +396,10 @@ func TestAFullGatewayAdmitsTheJoinAndProbeThatRecoverItsFlows(t *testing.T) {
 				if refused.Header.Type == protocol.TypeOpenOK {
 					t.Fatal("a new OPEN was admitted past the session limit")
 				}
-				if tc.mode == GatewayAdmissionOwned && (refused.Header.Type != protocol.TypeReset || resetCode(refused.Payload) != session.ResetFlowLimit) {
+				if refused.Header.Type != protocol.TypeReset || resetCode(refused.Payload) != session.ResetFlowLimit {
 					t.Fatalf("owned admission refused the OPEN with %+v %q, want FLOW_LIMIT", refused.Header, refused.Payload)
 				}
-			} else if tc.mode == GatewayAdmissionOwned {
+			} else {
 				t.Fatalf("owned admission closed the OPEN without an answer: %v", err)
 			}
 		})
@@ -500,8 +499,7 @@ func TestOwnedAdmissionCountsFlowsNotStreams(t *testing.T) {
 	defer cancel()
 	destination := admissionDestination(t, idleFlows)
 	_, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{
-		Credentials: serverCredentials, MaxSessions: 2, GatewayAdmission: GatewayAdmissionOwned,
-	})
+		Credentials: serverCredentials, MaxSessions: 2})
 	carrier, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
 	if err != nil {
 		t.Fatal(err)
@@ -539,25 +537,6 @@ func TestOwnedAdmissionCountsFlowsNotStreams(t *testing.T) {
 		t.Fatalf("probe at the session limit answered %+v, %v", echo.Header, err)
 	}
 	_ = lanes
-}
-
-func TestGatewayAdmissionConfiguration(t *testing.T) {
-	credentials, _ := testCertificate(t)
-	for _, value := range []string{"", "legacy", " Owned "} {
-		if _, err := ParseGatewayAdmission(value); err != nil {
-			t.Fatalf("%q refused: %v", value, err)
-		}
-	}
-	server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0", Credentials: credentials})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if server.cfg.GatewayAdmission != GatewayAdmissionLegacy {
-		t.Fatalf("default admission = %q, want legacy", server.cfg.GatewayAdmission)
-	}
-	if _, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0", Credentials: credentials, GatewayAdmission: "shared"}); err == nil {
-		t.Fatal("an unknown gateway admission was accepted")
-	}
 }
 
 // A full connection bound still admits one standby beside a principal's
@@ -729,20 +708,18 @@ func TestALiveUDPRelayIsHandedToItsReplacement(t *testing.T) {
 	defer target.Close()
 	for _, tc := range []struct {
 		name        string
-		mode        GatewayAdmission
 		maxSessions int
 		closeFirst  bool
 		wantResumed bool
 	}{
-		{"owned/close-lost", GatewayAdmissionOwned, 1, false, true},
-		{"owned/close-arrived", GatewayAdmissionOwned, 1, true, true},
-		{"legacy/close-lost", GatewayAdmissionLegacy, 2, false, false},
+		{"owned/close-lost", 1, false, true},
+		{"owned/close-arrived", 1, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			server, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{
-				Credentials: serverCredentials, MaxSessions: tc.maxSessions, GatewayAdmission: tc.mode,
+				Credentials: serverCredentials, MaxSessions: tc.maxSessions,
 			})
 			carrier, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
 			if err != nil {
@@ -777,7 +754,7 @@ func TestALiveUDPRelayIsHandedToItsReplacement(t *testing.T) {
 			if tc.wantResumed && after != before {
 				t.Fatalf("relay source moved from %s to %s", before, after)
 			}
-			if tc.mode == GatewayAdmissionOwned {
+			{
 				// Exactly one session slot is held: the one transferred.
 				if got := len(server.semaphore); got != 1 {
 					t.Fatalf("%d session slots held after the transfer, want 1", got)
@@ -1057,8 +1034,7 @@ func testResumeRetry(t *testing.T, grantRead bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	_, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{
-		Credentials: serverCredentials, MaxSessions: 1, GatewayAdmission: GatewayAdmissionOwned,
-	})
+		Credentials: serverCredentials, MaxSessions: 1})
 	carrier, err := dialRawCarrier(ctx, t, TransportQUIC, remote, clientCredentials, protocol.Version)
 	if err != nil {
 		t.Fatal(err)
@@ -1313,12 +1289,12 @@ func TestAnExpiredParkedRelayReleasesItsLeaseToTheReplacement(t *testing.T) {
 // A completed flow's replay record holds no session slot in owned admission:
 // with MaxSessions=1 the next flow is admitted at once, not after the
 // tombstone's linger. The records have their own bound, past which a
-// completed session is not kept. Legacy admission keeps today's accounting.
+// completed session is not kept.
 func TestCompletedSessionsDoNotBlockOwnedAdmission(t *testing.T) {
 	credentials, _ := testCertificate(t)
-	for _, mode := range []GatewayAdmission{GatewayAdmissionLegacy, GatewayAdmissionOwned} {
-		t.Run(string(mode), func(t *testing.T) {
-			server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0", Credentials: credentials, MaxSessions: 1, GatewayAdmission: mode})
+	{
+		t.Run("owned", func(t *testing.T) {
+			server, err := NewServer(ServerConfig{ListenAddr: "127.0.0.1:0", Credentials: credentials, MaxSessions: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1333,12 +1309,6 @@ func TestCompletedSessionsDoNotBlockOwnedAdmission(t *testing.T) {
 			server.retainCompletedSession(firstID, first)
 			second, secondID := session(2)
 			admitted := server.registerSession(secondID, second)
-			if mode == GatewayAdmissionLegacy {
-				if admitted {
-					t.Fatal("legacy admission changed: a tombstone no longer counts")
-				}
-				return
-			}
 			if !admitted {
 				t.Fatal("a completed flow's tombstone blocked the next flow")
 			}
@@ -1408,16 +1378,6 @@ func TestAFailedRelayIsNotHandedToAWaitingReplacement(t *testing.T) {
 	}
 }
 
-// The effective configuration names the stage 5 switch beside the others.
-func TestBundleNamesGatewayAdmission(t *testing.T) {
-	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedLegacy, ClassifierLegacy, CongestionScopeConnection, "", ""); got != "legacy" {
-		t.Fatalf("all-off bundle = %q", got)
-	}
-	if got := Bundle(CCAPIV2, MemoryOwned, CodedRetrySticky, GatewayAdmissionOwned, SchedLegacy, ClassifierLegacy, CongestionScopeConnection, "", ""); got != "cc-api=v2,coded-retry=sticky,mem=owned,gateway-admission=owned" {
-		t.Fatalf("bundle = %q", got)
-	}
-}
-
 // In owned admission a parked relay keeps its association's slots until its
 // grace ends, and the sweeper reaches it only some time later. An OPEN that
 // finds the limit full takes back the slots of relays already expired rather
@@ -1428,8 +1388,7 @@ func TestAnExpiredParkedRelayDoesNotRefuseANewFlow(t *testing.T) {
 	defer cancel()
 	destination := admissionDestination(t, idleFlows)
 	server, remote := admissionGateway(t, ctx, TransportQUIC, ServerConfig{
-		Credentials: serverCredentials, MaxSessions: 1, GatewayAdmission: GatewayAdmissionOwned,
-	})
+		Credentials: serverCredentials, MaxSessions: 1})
 	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -1484,10 +1443,10 @@ func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
 // timeout before the acknowledgement is on its way.
 func TestAUDPOpenAcknowledgementKeepsItsHandshakeDeadline(t *testing.T) {
 	credentials, _ := testCertificate(t)
-	for _, mode := range []GatewayAdmission{GatewayAdmissionLegacy, GatewayAdmissionOwned} {
-		t.Run(string(mode), func(t *testing.T) {
+	{
+		t.Run("owned", func(t *testing.T) {
 			server, err := NewServer(ServerConfig{
-				ListenAddr: "127.0.0.1:0", Credentials: credentials, GatewayAdmission: mode,
+				ListenAddr: "127.0.0.1:0", Credentials: credentials,
 				DestinationPolicy: DestinationPolicy{AllowPrivate: true},
 				Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 			})
@@ -1534,7 +1493,6 @@ func TestAnExpiredParkedRelayFreesItsAccountCapacity(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server, principals := admissionFixture(t, tc.limits, 2)
-			server.cfg.GatewayAdmission = GatewayAdmissionOwned
 			server.udpRelays = newUDPRelayStore()
 			old, fresh := principals[0], principals[1]
 			if refusal := server.admitAccountFlow(old); refusal != nil {
@@ -1568,11 +1526,11 @@ func TestAnExpiredParkedRelayFreesItsAccountCapacity(t *testing.T) {
 // resumable, instead of holding shutdown until the handshake deadline.
 func TestAStalledUDPOpenAcknowledgementEndsWithItsContext(t *testing.T) {
 	credentials, _ := testCertificate(t)
-	for _, mode := range []GatewayAdmission{GatewayAdmissionLegacy, GatewayAdmissionOwned} {
+	{
 		for _, resumable := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/resumable=%v", mode, resumable), func(t *testing.T) {
+			t.Run(fmt.Sprintf("resumable=%v", resumable), func(t *testing.T) {
 				server, err := NewServer(ServerConfig{
-					ListenAddr: "127.0.0.1:0", Credentials: credentials, GatewayAdmission: mode,
+					ListenAddr: "127.0.0.1:0", Credentials: credentials,
 					DestinationPolicy: DestinationPolicy{AllowPrivate: true},
 					Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 				})

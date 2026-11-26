@@ -99,8 +99,8 @@ func reverseAckPair(t *testing.T, cfg pathsim.Config, upstream pathmodel.Model, 
 		t.Fatal("server did not accept")
 	}
 	t.Cleanup(func() { _ = server.CloseWithError(0, "") })
-	clientSender := NewErasureSenderOn(client.InitialPacketSize(), upstream)
-	serverSender := NewErasureSenderOn(server.InitialPacketSize(), downstream)
+	clientSender := NewErasureSender(client.InitialPacketSize())
+	serverSender := NewErasureSender(server.InitialPacketSize())
 	if v2 {
 		attached := NewErasurePathSender(clientSender, nil)
 		client.SetCongestionControl(attached)
@@ -125,7 +125,9 @@ func TestReverseAckOnlyTrafficOverRealQUIC(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs real QUIC transfers for several seconds")
 	}
-	for _, v2 := range []bool{false, true} {
+	// Only the PathSender arm remains: the per-packet callbacks (cc-api v1)
+	// were deleted with the legacy bundle.
+	for _, v2 := range []bool{true} {
 		name := "v1"
 		if v2 {
 			name = "v2"

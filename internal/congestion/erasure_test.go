@@ -194,67 +194,6 @@ func TestTheCongestionWindowIsCompensated(t *testing.T) {
 	}
 }
 
-// A controller joining a path something else has already measured must start
-// from what is known rather than at the initial window. On a channel that
-// erases 40% of packets the ramp is the expensive part, and a lane opened to
-// replace one that died would otherwise repeat it on a path nothing has
-// forgotten.
-func TestAJoiningSenderStartsFromWhatIsAlreadyKnown(t *testing.T) {
-	model := pathmodel.NewPathModel()
-	const perMember = 2e6
-	model.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: perMember, RoundTrip: 0})
-	model.Report(2, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: perMember, RoundTrip: 0})
-
-	seeded := NewErasureSenderOn(1200, model)
-	if seeded.Share() <= 0 {
-		t.Fatal("a sender joining a measured path was given no share")
-	}
-	fresh := NewErasureSender(1200)
-	if seeded.bandwidth() <= fresh.bandwidth() {
-		t.Fatalf("seeded sender starts at %d, no better than an unseeded %d",
-			seeded.bandwidth(), fresh.bandwidth())
-	}
-}
-
-// And the window has to be seeded too, not only the rate.
-//
-// BBR will not send beyond its congestion window however fast it is paced, so
-// a sender that knows the path's rate and starts at the initial window spends
-// its ramp doubling that window with the pacer idle behind it. Traced live,
-// that was 37 KB against a 60 Mbit/s pacing rate, and eight round trips of
-// doubling on a path already measured at 15 Mbit/s -- about two seconds of a
-// ten-second transfer, paid again by every flow.
-func TestAJoiningSenderStartsWithTheWindowItsRateImplies(t *testing.T) {
-	const rate, roundTrip = 2e6, 250 * time.Millisecond
-	model := pathmodel.NewPathModel()
-	model.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: rate, RoundTrip: roundTrip})
-
-	seeded := NewErasureSenderOn(1200, model)
-	fresh := NewErasureSender(1200)
-	if seeded.GetCongestionWindow() <= fresh.GetCongestionWindow() {
-		t.Fatalf("a sender joining a path measured at %.0f bytes/s and %v starts "+
-			"with a %d-byte window, no better than an unseeded %d",
-			rate, roundTrip, seeded.GetCongestionWindow(), fresh.GetCongestionWindow())
-	}
-	// The window it should hold is a round trip of what it will put on the
-	// wire, which on an erasing path is more than what arrives.
-	want := quiccongestion.ByteCount(rate / (1 - 0.42) * roundTrip.Seconds())
-	if got := seeded.GetCongestionWindow(); got < want/2 || got > want*2 {
-		t.Errorf("window %d against a bandwidth-delay product of %d", got, want)
-	}
-
-	// Without a measured round trip there is no window to compute, and the
-	// sender must still start from the rate rather than refusing to start.
-	blind := NewErasureSenderOn(1200, func() *pathmodel.PathModel {
-		m := pathmodel.NewPathModel()
-		m.Report(1, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: rate, RoundTrip: 0})
-		return m
-	}())
-	if blind.bandwidth() <= NewErasureSender(1200).bandwidth() {
-		t.Error("a sender given a rate but no round trip did not use the rate")
-	}
-}
-
 // A connection whose pipe has emptied must not have to rediscover the path.
 //
 // The bandwidth filter holds ten rounds, so a connection that spends a while
@@ -389,9 +328,9 @@ func TestTheSenderPublishesTheMeasurementItsCodeIsSizedFrom(t *testing.T) {
 	// A model whose floor and measurement disagree the way the live one did.
 	model.Report(2, pathmodel.Observation{
 		Erasure: 0.199, BurstFactor: 1,
-		ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
+		ObservedSamples: 5000, RoundTrip: 200 * time.Millisecond,
 	})
-	e := NewErasureSenderOn(1200, model)
+	e := newPathLaw(1200, model)
 
 	// One congestion event is enough to make this sender a member and pull the
 	// pooled state through.

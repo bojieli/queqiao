@@ -14,11 +14,11 @@ import (
 // 53 ms, 300 Mbit/s leg; three loaded leaves, each its own client, gateway
 // and path authority, each with two backlogged downloads, and a control leaf
 // fetching 300 KB on a fresh flow every half second, as the live gate's
-// probe. On the new architecture each leaf's authority is independent and
-// nothing limits them jointly; on the legacy bundle the path tree caps its
-// members. The control leaf either shares the leaves' bottleneck (the joint
+// probe. Each leaf's authority is independent and nothing limits them
+// jointly. The control leaf either shares the leaves' bottleneck (the joint
 // queue is the question) or has a path of its own (only its own flow's
-// startup is).
+// startup is). Until stage 11 each trial also ran the legacy bundle, whose
+// path tree capped its members; that arm went with the legacy code.
 
 const (
 	dcCtlLoadedLeaves = 3
@@ -103,11 +103,11 @@ func q(d []time.Duration, p float64) time.Duration {
 func TestDCControlLeafBesideLoadedDownloads(t *testing.T) {
 	requireDCBed(t)
 	for _, shared := range []bool{true, false} {
-		where, order := "own path", []dcArm{dcLegacyArm, dcNewArm}
+		where, order := "own path", []dcArm{dcNewArm}
 		if shared {
-			// ABBAAB: on a shared emulated queue the control leaf's latency
-			// moves by a factor of two or three between trials.
-			where, order = "shared bottleneck", []dcArm{dcLegacyArm, dcNewArm, dcNewArm, dcLegacyArm, dcLegacyArm, dcNewArm}
+			// Three trials: on a shared emulated queue the control leaf's
+			// latency moves by a factor of two or three between trials.
+			where, order = "shared bottleneck", []dcArm{dcNewArm, dcNewArm, dcNewArm}
 		}
 		pooled := map[string][]time.Duration{}
 		rates := map[string][]float64{}
@@ -119,7 +119,7 @@ func TestDCControlLeafBesideLoadedDownloads(t *testing.T) {
 			pooled[arm.name] = append(pooled[arm.name], r.loaded...)
 			rates[arm.name] = append(rates[arm.name], r.loadedMbps)
 		}
-		for _, arm := range []dcArm{dcLegacyArm, dcNewArm} {
+		for _, arm := range []dcArm{dcNewArm} {
 			sum := 0.0
 			for _, v := range rates[arm.name] {
 				sum += v

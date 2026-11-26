@@ -1200,8 +1200,8 @@ func TestAChunkProvedMissingIsReissuedWithoutWaiting(t *testing.T) {
 	source := bytes.NewReader(bytes.Repeat([]byte("x"), 8*1024))
 	s := New(source, Config{
 		ChunkSize: 1024, LaneWindow: 64, MaxOutstanding: 64,
-		MaxOutstandingBytes: 1 << 20, Retention: func() int { return 1 << 20 },
-		RetransmitAfter: after(time.Hour), // only the proof may re-offer anything
+		MaxOutstandingBytes: 1 << 20,
+		RetransmitAfter:     after(time.Hour), // only the proof may re-offer anything
 		// An unreliable lane, which is what a coded lane is: what it loses has
 		// no other way back.
 		Reliable: func(uint64) bool { return false },
@@ -1241,8 +1241,8 @@ func TestAChunkProvedMissingIsReissuedWithoutWaiting(t *testing.T) {
 	// cannot help.
 	reliable := New(bytes.NewReader(bytes.Repeat([]byte("y"), 4*1024)), Config{
 		ChunkSize: 1024, LaneWindow: 64, MaxOutstanding: 64,
-		MaxOutstandingBytes: 1 << 20, Retention: func() int { return 1 << 20 },
-		RetransmitAfter: after(time.Hour),
+		MaxOutstandingBytes: 1 << 20,
+		RetransmitAfter:     after(time.Hour),
 	})
 	defer reliable.Close()
 	first, err := reliable.Next(ctx, 1, 1<<20)

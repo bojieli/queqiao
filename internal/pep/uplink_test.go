@@ -70,11 +70,13 @@ func TestInitiallyUnavailableUplinkWarmsWhenItAppears(t *testing.T) {
 
 func TestOnlyConfiguredDynamicBindingMakesAnEmptyProbeDefinitive(t *testing.T) {
 	dynamic := &Client{cfg: ClientConfig{LocalAddress: "if:queqiao-interface-that-does-not-exist"}}
+	attachTestCarriers(dynamic)
 	if address, unavailable := dynamic.currentUplinkState(); address != "" || !unavailable {
 		t.Fatalf("missing configured interface = address %q unavailable %v", address, unavailable)
 	}
 
 	inconclusive := &Client{cfg: ClientConfig{RemoteAddr: "127.0.0.1:not-a-port"}}
+	attachTestCarriers(inconclusive)
 	if address, unavailable := inconclusive.currentUplinkState(); address != "" || unavailable {
 		t.Fatalf("failed unbound probe = address %q unavailable %v", address, unavailable)
 	}

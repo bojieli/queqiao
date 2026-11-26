@@ -4,14 +4,9 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -479,7 +474,7 @@ func TestPooledFlowCountTracksOpenAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
-		ListenAddr: "127.0.0.1:0", RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true, Logger: logger, HandshakeTimeout: time.Second,
+		ListenAddr: "127.0.0.1:0", RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, Logger: logger, HandshakeTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -528,100 +523,6 @@ func TestPooledFlowCountTracksOpenAndClose(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server shutdown timeout")
-	}
-}
-
-func TestBulkIsolationCapacityCannotEscapeIntoDedicatedConnections(t *testing.T) {
-	certificate, roots := testCertificate(t)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	server, err := NewServer(ServerConfig{
-		ListenAddr: packetConn.LocalAddr().String(), Credentials: certificate,
-		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true,
-		Logger: logger, HandshakeTimeout: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	serverErr := make(chan error, 1)
-	go func() { serverErr <- server.ServePacketConn(ctx, packetConn) }()
-
-	var sockets atomic.Int64
-	client, err := NewClient(ClientConfig{
-		ListenAddr: "127.0.0.1:0", RemoteAddr: packetConn.LocalAddr().String(),
-		LocalAddress: "127.0.0.1", Credentials: roots,
-		Transport: TransportQUIC, EnableQUICPool: true,
-		DialTimeout: 2 * time.Second, HandshakeTimeout: 2 * time.Second,
-		Logger: logger,
-		SocketControl: func(network, _ string, _ syscall.RawConn) error {
-			if strings.HasPrefix(network, "udp") {
-				sockets.Add(1)
-			}
-			return nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.memoryLimits.maxBulkConnections = 1
-
-	occupied, err := client.reserveBulkConn(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer occupied.close("test complete")
-
-	const waiters = 16
-	var wg sync.WaitGroup
-	errs := make(chan error, waiters)
-	for i := 0; i < waiters; i++ {
-		wg.Add(1)
-		go func(laneID uint64) {
-			defer wg.Done()
-			_, laneErr := client.openJoinLane(ctx, TransportQUIC, [16]byte{1}, 1, laneID)
-			errs <- laneErr
-		}(uint64(i + 1))
-	}
-	wg.Wait()
-	close(errs)
-	for laneErr := range errs {
-		if !errors.Is(laneErr, errBulkConnectionLimit) {
-			t.Fatalf("over-budget lane = %v, want capacity decision", laneErr)
-		}
-	}
-	if got := sockets.Load(); got != 1 {
-		t.Fatalf("over-budget isolation opened %d UDP sockets, want the one admitted connection", got)
-	}
-
-	client.closeQUICPool()
-	cancel()
-	select {
-	case serveErr := <-serverErr:
-		if serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
-			t.Fatalf("server shutdown: %v", serveErr)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("server shutdown timeout")
-	}
-}
-
-func TestDedicatedBulkFallbackIsReservedForRecoverablePoolFailures(t *testing.T) {
-	if dedicatedBulkFallbackAllowed(errBulkConnectionLimit) {
-		t.Fatal("capacity decision was treated as a pool failure")
-	}
-	if dedicatedBulkFallbackAllowed(fmt.Errorf("wrapped: %w", errBulkConnectionLimit)) {
-		t.Fatal("wrapped capacity decision was treated as a pool failure")
-	}
-	if dedicatedBulkFallbackAllowed(context.Canceled) || dedicatedBulkFallbackAllowed(context.DeadlineExceeded) {
-		t.Fatal("expired caller started a dedicated fallback")
-	}
-	if !dedicatedBulkFallbackAllowed(errors.New("pooled stream unavailable")) {
-		t.Fatal("recoverable pool failure did not retain dedicated fallback")
 	}
 }
 

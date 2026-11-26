@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/pathsim"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
@@ -92,23 +91,9 @@ func TestFlowInitiationCostsNoRoundTripsWhenTheConnectionIsWarm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("brings up QUIC across an emulated 300 ms path")
 	}
-	testFlowInitiation(t, "")
-}
-
-// The same on the default bundle (stage 10): the path controller counts
-// packet outcomes rather than probe frames, and the prewarm must still end
-// once its echo is back rather than run out its budget.
-func TestFlowInitiationOnTheDefaultBundle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("brings up QUIC across an emulated 300 ms path")
-	}
-	testFlowInitiation(t, DefaultBundle)
-}
-
-func testFlowInitiation(t *testing.T, bundle BundleName) {
 	const oneWay = 150 * time.Millisecond
 	path := pathsim.Config{OneWayDelay: oneWay, Seed: 31}
-	socks, destination := codedPairOnBundle(t, bundle, true, &path, echoDestination)
+	socks, destination := codedPairWith(t, true, &path, echoDestination)
 
 	measure := func() time.Duration {
 		start := time.Now()
@@ -193,6 +178,7 @@ func TestTheUplinkIsWhicheverAddressReachesTheServer(t *testing.T) {
 	}
 	defer listener.Close()
 	client := &Client{cfg: ClientConfig{RemoteAddr: listener.LocalAddr().String()}}
+	attachTestCarriers(client)
 
 	uplink := client.currentUplink()
 	if uplink != "127.0.0.1" {
@@ -210,6 +196,7 @@ func TestTheUplinkIsWhicheverAddressReachesTheServer(t *testing.T) {
 	// because a resolver that answers everything -- this machine's does, with
 	// a fake address in 198.18.0.0/15 -- would otherwise give it an uplink.
 	unreachable := &Client{cfg: ClientConfig{RemoteAddr: "127.0.0.1:not-a-port"}}
+	attachTestCarriers(unreachable)
 	if got := unreachable.currentUplink(); got != "" {
 		t.Fatalf("unreachable server reported uplink %q", got)
 	}
@@ -224,6 +211,7 @@ func TestTheConfiguredUplinkMatchesTheBoundOuterAddress(t *testing.T) {
 		RemoteAddr:   "127.0.0.1:not-a-port",
 		LocalAddress: "192.0.2.10",
 	}}
+	attachTestCarriers(client)
 	if got := client.currentUplink(); got != "192.0.2.10" {
 		t.Fatalf("configured uplink = %q, want 192.0.2.10", got)
 	}
@@ -244,11 +232,9 @@ func TestThePrewarmLeavesTheUplinkMeasured(t *testing.T) {
 		OneWayDelay: 150 * time.Millisecond, RateBytesPerSec: uint64(25e6 / 8),
 		PolicerRefillPeriod: 8 * time.Millisecond, LossRate: 0.42, Seed: 53,
 	}
-	loopback := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
-	key := pathKey(loopback, loopback)
-
-	// Start from nothing known about this uplink.
-	before := pathmodel.Shared(key).Current().Erasure
+	// Start from nothing known about this uplink (codedPairWith resets the
+	// path models).
+	before := 0.0
 
 	// ServeListener starts the production uplink watcher, which performs one
 	// automatic prewarm. Calling prewarmPath here as well used to race a
@@ -256,11 +242,23 @@ func TestThePrewarmLeavesTheUplinkMeasured(t *testing.T) {
 	// deployed behavior, the two probes could each consume the other's pooled
 	// connection budget and made this assertion intermittently observe neither
 	// completed measurement.
-	_, _ = clientServerAcross(t, &path)
+	client, _ := clientServerAcross(t, &path)
+	// What the first flow's code is sized from: the model the pooled
+	// connection's readers read, which is the path authority's (keyed by the
+	// principal's path, not by the bare endpoint pair).
+	measured := func() float64 {
+		client.quicMu.Lock()
+		g := client.quicGeneration
+		client.quicMu.Unlock()
+		if g == nil {
+			return 0
+		}
+		return pathModelOf(g.conn).Current().Erasure
+	}
 	deadline := time.Now().Add(prewarmTimeout + 5*time.Second)
 	var after float64
 	for time.Now().Before(deadline) {
-		after = pathmodel.Shared(key).Current().Erasure
+		after = measured()
 		if after > 0 {
 			break
 		}
@@ -372,6 +370,7 @@ func TestPathProbeEchoFailuresAreDistinguishedFromASlowPath(t *testing.T) {
 			}()
 
 			client := &Client{}
+			attachTestCarriers(client)
 			lane := &authenticatedLane{fc: clientFrames, sessionID: sessionID}
 			err := client.readPathProbeEchoes(lane, 3)
 			var violation probeEchoViolation
@@ -396,6 +395,7 @@ func TestPathProbeEchoFailuresAreDistinguishedFromASlowPath(t *testing.T) {
 			t.Fatal(err)
 		}
 		client := &Client{}
+		attachTestCarriers(client)
 		lane := &authenticatedLane{fc: clientFrames, sessionID: sessionID}
 		if err := client.readPathProbeEchoes(lane, 3); err != nil {
 			t.Fatalf("expired probe budget reported as a peer violation: %v", err)

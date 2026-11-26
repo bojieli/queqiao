@@ -1696,9 +1696,6 @@ func TestAPathControllerKeepsNoShareHistory(t *testing.T) {
 		a.send(now, 1200)
 	}
 	a.event(now.Add(100*time.Millisecond), numbers(0, 20), nil)
-	if share := model.Current().Share; share != 0 {
-		t.Fatalf("the path controller's reports built a bandwidth share of %.0f", share)
-	}
 	if model.Current().ObservedSamples == 0 {
 		t.Fatal("the path controller reported no measurement at all")
 	}

@@ -29,13 +29,6 @@ func codedPair(t *testing.T, pooled bool, path *pathsim.Config) (socks string, d
 // codedPairWith lets a test choose what the destination does with the bytes.
 func codedPairWith(t *testing.T, pooled bool, path *pathsim.Config, serve func(net.Listener)) (socks string, destination net.Listener) {
 	t.Helper()
-	return codedPairOnBundle(t, "", pooled, path, serve)
-}
-
-// codedPairOnBundle is codedPairWith with both endpoints on a named bundle;
-// the empty name keeps the library's zero values (the legacy bundle).
-func codedPairOnBundle(t *testing.T, bundle BundleName, pooled bool, path *pathsim.Config, serve func(net.Listener)) (socks string, destination net.Listener) {
-	t.Helper()
 	// Every endpoint in this process is loopback, so every test shares one
 	// path model and would otherwise size its code from what the test before
 	// it measured on a different channel.
@@ -57,22 +50,14 @@ func codedPairOnBundle(t *testing.T, bundle BundleName, pooled bool, path *paths
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverCfg := ServerConfig{
+	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
 		Metrics: metrics.New(),
 		// The first connection to an erasing path spends about five seconds
 		// on the QUIC handshake alone, so a bound of five is a coin flip.
 		HandshakeTimeout: 30 * time.Second,
-	}
-	if bundle != "" {
-		s, err := SwitchesOf(bundle, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s.ApplyToServer(&serverCfg)
-	}
-	server, err := NewServer(serverCfg)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,18 +79,10 @@ func codedPairOnBundle(t *testing.T, bundle BundleName, pooled bool, path *paths
 	}
 	clientMetrics := metrics.New()
 	lastClientMetrics = clientMetrics
-	clientCfg := ClientConfig{
+	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: remote, Credentials: roots, Transport: TransportQUIC,
-		EnableQUICPool: pooled, Logger: logger, Metrics: clientMetrics,
-	}
-	if bundle != "" {
-		s, err := SwitchesOf(bundle, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s.ApplyToClient(&clientCfg)
-	}
-	client, err := NewClient(clientCfg)
+		Logger: logger, Metrics: clientMetrics,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,21 +299,6 @@ func TestOneBuildServesACleanPathAndAnErasureChannel(t *testing.T) {
 			t.Logf("%s: %d bytes echoed in %v", test.name, len(payload),
 				time.Since(start).Round(time.Millisecond))
 		})
-	}
-}
-
-// The default controller decides whether the target path is reachable at all,
-// so it is not a matter of taste.
-//
-// Measured live on the China-US link, one lane, three interleaved rounds:
-// reno 0.11, 0.10, 0.08 Mbit/s against erasure's 10.31, 11.63, 10.90 -- a
-// factor of a hundred, and erasure was the only one that never collapsed. On a
-// clean path the erasure controller reduces to BBR, because the floor it
-// measures is zero and the correction it applies is one, so defaulting to it
-// costs nothing where it is not needed.
-func TestTheDefaultControllerIsTheOneThatReachesThePath(t *testing.T) {
-	if got := defaultCongestion(); got != CongestionErasure {
-		t.Fatalf("default congestion controller is %q, want %q", got, CongestionErasure)
 	}
 }
 

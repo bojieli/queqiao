@@ -110,24 +110,6 @@ func TestOnlyTheDatacenterProfileUsesTheHierarchy(t *testing.T) {
 	}
 }
 
-// Discovering the grouping needs a hierarchy to rearrange, so a profile that
-// asks for one without the other is a configuration that cannot do what it
-// says.
-func TestGroupingDiscoveryRequiresAHierarchy(t *testing.T) {
-	for _, name := range Names() {
-		p, err := ByName(name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if p.DiscoverGrouping && !p.HierarchicalPath {
-			t.Errorf("%s discovers grouping without a hierarchy to apply it to", name)
-		}
-	}
-	if Default().DiscoverGrouping {
-		t.Error("the default profile rearranges its own tree")
-	}
-}
-
 // The command-line form has to survive the match containing an "=", which the
 // common case does: "path=/app/voice" is an identity fragment, not a
 // key-value pair this parser should split on.

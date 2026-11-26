@@ -23,32 +23,17 @@ func quietObservation(age time.Duration) Observation {
 	}
 }
 
-func TestLegacyCurrentIsTheStickyClass(t *testing.T) {
-	c := New(DefaultConfig())
-	c.Observe(bulkObservation(2 * time.Second))
-	for i := 0; i < 20; i++ {
-		if got := c.Observe(quietObservation(3*time.Second + time.Duration(i)*time.Second)); got != ClassBulk {
-			t.Fatalf("legacy current class left BULK: %v", got)
-		}
-	}
-	if c.Current() != c.Class() {
-		t.Fatalf("legacy current %v differs from class %v", c.Current(), c.Class())
-	}
-}
-
 func phasedConfig() Config {
-	cfg := DefaultConfig()
-	cfg.Phased = true
-	return cfg
+	return DefaultConfig()
 }
 
-// The first entry into BULK is the legacy test, at the same instant.
+// The first entry into BULK is the sticky class's test, at the same instant.
 func TestPhasedEntersBulkWhenLegacyDoes(t *testing.T) {
-	legacy, phased := New(DefaultConfig()), New(phasedConfig())
+	phased := New(phasedConfig())
 	for age := 100 * time.Millisecond; age < 3*time.Second; age += 100 * time.Millisecond {
 		o := bulkObservation(age)
-		if legacy.Observe(o) != phased.Observe(o) {
-			t.Fatalf("at age %v legacy %v and phased %v disagree", age, legacy.Current(), phased.Current())
+		if got := phased.Observe(o); got != phased.Class() {
+			t.Fatalf("at age %v current %v and sticky class %v disagree", age, got, phased.Class())
 		}
 	}
 	if phased.Current() != ClassBulk {

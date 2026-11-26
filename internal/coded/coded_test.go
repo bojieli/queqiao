@@ -111,7 +111,7 @@ func (p *lossyPipe) stats() (sent, lost int) {
 // connection.
 func measuredPath(floor float64) *pathmodel.PathModel {
 	m := pathmodel.NewPathModel()
-	m.Report(1, pathmodel.Observation{Erasure: floor, BurstFactor: 1, ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 0})
+	m.Report(1, pathmodel.Observation{Erasure: floor, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
 	return m
 }
 
@@ -463,7 +463,7 @@ func TestTheCodeIsSizedFromTheMeasurementNotTheFloor(t *testing.T) {
 	m := pathmodel.NewPathModel()
 	m.Report(1, pathmodel.Observation{
 		Erasure: measured, BurstFactor: 1,
-		ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 250 * time.Millisecond,
+		ObservedSamples: 5000, RoundTrip: 250 * time.Millisecond,
 	})
 
 	pa, _ := newPipes(1, measured)
@@ -580,7 +580,7 @@ func TestParityCostsACodeRateAndNotAByteRate(t *testing.T) {
 		m := pathmodel.NewPathModel()
 		m.Report(1, pathmodel.Observation{
 			Erasure: erasure, BurstFactor: 1,
-			ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
+			ObservedSamples: 5000, RoundTrip: 200 * time.Millisecond,
 		})
 		pa, _ := newBudgetedPipes(budget)
 		p := New(pa, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Path: m})
@@ -640,7 +640,7 @@ func TestTailProtectionCostsOneBurstNotOnePerWrite(t *testing.T) {
 		m := pathmodel.NewPathModel()
 		m.Report(1, pathmodel.Observation{
 			Erasure: 0.14, BurstFactor: 1,
-			ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
+			ObservedSamples: 5000, RoundTrip: 200 * time.Millisecond,
 		})
 		pa, _ := newPipes(1, 0)
 		p := New(pa, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Path: m, tailDefer: testTailDefer})
@@ -702,7 +702,7 @@ func TestAShortExchangeIsStillProtectedPromptly(t *testing.T) {
 	m := pathmodel.NewPathModel()
 	m.Report(1, pathmodel.Observation{
 		Erasure: 0.14, BurstFactor: 1,
-		ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
+		ObservedSamples: 5000, RoundTrip: 200 * time.Millisecond,
 	})
 	pa, _ := newPipes(1, 0)
 	p := New(pa, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Path: m})

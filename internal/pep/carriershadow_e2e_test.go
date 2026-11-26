@@ -82,7 +82,7 @@ func shadowPair(t *testing.T, path *pathsim.Config, serve func(net.Listener), ga
 	}
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: remote, Credentials: roots, Transport: TransportQUIC,
-		EnableQUICPool: true, Metrics: e.clientMetrics,
+		Metrics:       e.clientMetrics,
 		Logger:        slog.New(slog.NewJSONHandler(e.clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		CarrierShadow: shadow,
 	})
@@ -149,8 +149,8 @@ func boundCarriers(t *testing.T, logs string) map[float64]bool {
 // labels it REPLACE and finally DEAD on QUIC's idle timeout. The watchdog's
 // stall on it is recorded with the carrier, so the comparison can measure
 // how much later than the 3xminRTT flow timer the design would have acted.
-// Today's recovery runs as without the observer and rescues the flow over a
-// fresh source port.
+// The carrier manager runs as without the observer and replaces the carrier
+// over a fresh source port.
 func TestCarrierShadowLabelsABlackholedConnectionDead(t *testing.T) {
 	if testing.Short() {
 		t.Skip("waits out a QUIC idle timeout")
@@ -193,8 +193,8 @@ func TestCarrierShadowLabelsABlackholedConnectionDead(t *testing.T) {
 		t.Fatalf("the client never suspected the blackholed carrier:\n%s", e.clientLogs.String())
 	}
 	// Past SUSPECT the client's old carrier is either labelled for
-	// replacement or retired first by today's pool liveness check, which
-	// closes it locally: that ends its episode censored, not dead.
+	// replacement or retired first by the carrier manager, which closes it
+	// locally: that ends its episode censored, not dead.
 	next := waitForRecord(t, e.clientLogs, "carrier shadow state", 10*time.Second, func(r map[string]any) bool {
 		return onOld(r) && (r["to"] == "replace" || r["to"] == "closed")
 	})
@@ -202,15 +202,15 @@ func TestCarrierShadowLabelsABlackholedConnectionDead(t *testing.T) {
 		t.Fatalf("the client's blackholed carrier stayed SUSPECT:\n%s", e.clientLogs.String())
 	}
 	t.Logf("client's blackholed carrier went %v -> %v at %v PTOs, %v after the blackhole", next["from"], next["to"], next["pto_since_progress"], time.Since(blackholed).Round(time.Millisecond))
-	// Today's watchdog declares the stall after three minimum RTTs, before
-	// k_s probe timeouts have accrued: at that instant the design has no
-	// carrier evidence yet and would still be waiting. The record carries
-	// the carrier so the comparison can follow it to REPLACE.
+	// The watchdog declares the stall after three minimum RTTs, before k_s
+	// probe timeouts have accrued: at that instant there is no carrier
+	// evidence yet and the endpoint waits. The record carries the carrier so
+	// the comparison can follow it to REPLACE.
 	stall := waitForRecord(t, e.clientLogs, "carrier shadow stall", 10*time.Second, onOld)
 	if stall == nil {
 		t.Fatalf("no client stall was recorded on the blackholed carrier:\n%s", e.clientLogs.String())
 	}
-	if stall["legacy_remedy"] != "demote_and_request_rescue" {
+	if stall["legacy_remedy"] != "none" {
 		t.Fatalf("stall record = %v", stall)
 	}
 	t.Logf("stall on the blackholed carrier: state %v, design remedy %v, %v PTOs", stall["carrier_state"], stall["design_remedy"], stall["pto_since_progress"])
@@ -227,7 +227,7 @@ func TestCarrierShadowLabelsABlackholedConnectionDead(t *testing.T) {
 	}
 	t.Logf("gateway labelled the blackholed carrier dead (%v) %v after the blackhole", dead["reason"], time.Since(blackholed).Round(time.Millisecond))
 	// The client's old carrier ends too, dead on its idle timeout or closed
-	// by today's pool retirement; either way never active again.
+	// by the carrier manager; either way never active again.
 	for _, record := range logRecords(t, e.clientLogs.String(), "carrier shadow state") {
 		if onOld(record) && record["to"] == "active" && record["reason"] == "progress" {
 			t.Fatalf("a blackholed carrier made progress: %v", record)
@@ -248,10 +248,10 @@ func TestCarrierShadowLabelsABlackholedConnectionDead(t *testing.T) {
 
 // A flow stalled on a healthy carrier: the receiving application stops
 // reading, so flow credit stops while QUIC has nothing unacknowledged. The
-// watchdog declares stalls and today's client dials rescues; the observer
-// labels the carrier ACTIVE, records that the transport was acknowledging,
-// and says the design would have waited. This is the shadow form of §15.1
-// test 8 ("no remedy on a live stream").
+// watchdog declares stalls and the client waits; the observer labels the
+// carrier ACTIVE, records that the transport was acknowledging, and agrees
+// with the waiting. This is the shadow form of §15.1 test 8 ("no remedy on a
+// live stream").
 func TestCarrierShadowLabelsAStalledFlowOnAHealthyCarrierLive(t *testing.T) {
 	if testing.Short() {
 		t.Skip("brings up QUIC")
@@ -307,8 +307,8 @@ func TestCarrierShadowLabelsAStalledFlowOnAHealthyCarrierLive(t *testing.T) {
 	if remedy := stall["design_remedy"]; remedy != "wait" && remedy != "wait_move_coded" {
 		t.Fatalf("design remedy on a live carrier = %v", remedy)
 	}
-	if stall["legacy_remedy"] != "demote_and_request_rescue" {
-		t.Fatalf("legacy remedy = %v", stall["legacy_remedy"])
+	if stall["legacy_remedy"] != "none" {
+		t.Fatalf("endpoint remedy = %v", stall["legacy_remedy"])
 	}
 	got := e.clientMetrics.Snapshot().CarrierShadow
 	if got.Stalls[metrics.CarrierShadowReplaceCarrier] != 0 || got.Transitions[metrics.CarrierShadowSuspect] != 0 {
@@ -317,30 +317,11 @@ func TestCarrierShadowLabelsAStalledFlowOnAHealthyCarrierLive(t *testing.T) {
 	if got.StallsTransportAcked == 0 {
 		t.Fatalf("no stall recorded the transport as acknowledged: %+v", got)
 	}
-	// Today's recovery still acted on the stall; the observer did not stop it.
+	// The watchdog still counted the stall, and nothing was dialled for it.
 	if e.clientMetrics.Snapshot().FlowStallsDetected == 0 {
-		t.Fatal("today's watchdog did not count the stall")
+		t.Fatal("the watchdog did not count the stall")
 	}
-	if waitForRecord(t, e.clientLogs, "carrier shadow rescue started", 5*time.Second, func(map[string]any) bool { return true }) == nil {
-		t.Fatalf("today's client did not start its stall rescue:\n%s", e.clientLogs.String())
-	}
-	// The rescue's JOIN attempts pair with the gateway's arrivals by lane:
-	// the per-attempt transit the recovery-deadline report uses for J.
-	paired := false
-	deadline := time.Now().Add(10 * time.Second)
-	for !paired && time.Now().Before(deadline) {
-		attempts := map[float64]bool{}
-		for _, r := range logRecords(t, e.clientLogs.String(), "carrier shadow join attempt") {
-			attempts[r["lane_id"].(float64)] = r["flow_id"] == stall["flow_id"]
-		}
-		for _, r := range logRecords(t, e.gatewayLogs.String(), "carrier shadow join arrived") {
-			if attempts[r["lane_id"].(float64)] && r["flow_id"] == stall["flow_id"] {
-				paired = true
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !paired {
-		t.Fatalf("no JOIN attempt paired with a gateway arrival:\nclient:\n%s\ngateway:\n%s", e.clientLogs.String(), e.gatewayLogs.String())
+	if n := e.clientMetrics.Snapshot().LaneRescueAttempts; n != 0 {
+		t.Fatalf("%d rescue dials for a stall on a live stream", n)
 	}
 }

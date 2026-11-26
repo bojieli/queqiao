@@ -72,6 +72,7 @@ func TestRound2HandshakeCancellation(t *testing.T) {
 			received := make(chan struct{})
 			go func() { _, _ = newFrameConn(peer).Read(); close(received) }()
 			client := &Client{cfg: ClientConfig{Transport: TransportTCP, HandshakeTimeout: time.Second}}
+			attachTestCarriers(client)
 			lane := &authenticatedLane{fc: newFrameConn(local), outer: local, kind: TransportTCP, sessionID: [16]byte{1}, laneID: 1}
 			client.dialAuthenticatedLaneForTest = func(context.Context, TransportKind) (*authenticatedLane, error) { return lane, nil }
 			done := make(chan error, 1)
@@ -231,7 +232,7 @@ func TestRound2PooledPathProbePreservesSibling(t *testing.T) {
 	defer rig.client.closeQUICPool()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	sibling, err := rig.client.dialPooledQUICLane(ctx, congestionConfig{kind: defaultCongestion()})
+	sibling, err := rig.client.dialPooledQUICLane(ctx, congestionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +257,7 @@ func TestRound2PooledPathProbePreservesSibling(t *testing.T) {
 
 func TestRound2QueuedReliableChunkCannotTurnIntoDatagram(t *testing.T) {
 	model := pathmodel.NewPathModel()
-	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000, Delivered: 2e6})
+	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000})
 	path := coded.New(newPipeCarrier(), coded.Config{Path: model})
 	defer path.Close()
 	capture := newAckCaptureConn(0, nil)

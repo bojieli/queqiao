@@ -53,7 +53,7 @@ func TestClientProbeAuthenticatesProviderWithoutOpeningFlow(t *testing.T) {
 			client, err := NewClient(ClientConfig{
 				ListenAddr: "127.0.0.1:0", RemoteAddr: endpoint,
 				Credentials: clientCredentials, Transport: transport,
-				EnableQUICPool: false, Logger: logger,
+				Logger: logger,
 			})
 			if err != nil {
 				t.Fatal(err)

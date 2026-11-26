@@ -225,6 +225,7 @@ func TestADeclaredClassIsCounted(t *testing.T) {
 			5555: {"PID": 1, "Path": "/app/voice", "Workload": map[string]any{"kind": "unknown"}},
 		}),
 	}, metrics: reg}
+	attachTestCarriers(c)
 	c.flowMeta = flowmeta.New(c.cfg.FlowMetadataSocket, time.Second)
 
 	inner, peer := net.Pipe()
@@ -255,6 +256,7 @@ func TestAnUnmatchedIdentityCountsNothing(t *testing.T) {
 			5555: {"PID": 1, "Path": "/usr/bin/curl", "Workload": map[string]any{"kind": "unknown"}},
 		}),
 	}, metrics: reg}
+	attachTestCarriers(c)
 	c.flowMeta = flowmeta.New(c.cfg.FlowMetadataSocket, time.Second)
 
 	inner, peer := net.Pipe()

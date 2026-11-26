@@ -69,9 +69,6 @@ type Session struct {
 	runErr    error
 	resources mobileResourceLimits
 	mode      string
-	// memoryMode is the memory-ownership bundle the next run starts with
-	// (SetMemoryBundle). Empty is legacy.
-	memoryMode atomic.Value
 	// Copied into the maintenance goroutine when a run starts. Tests shorten
 	// these on their own Session; keeping them per-session prevents one test
 	// from changing the clock under a still-stopping session.
@@ -255,61 +252,23 @@ func (s *Session) SetRoutingRules(text string) string {
 	return string(encoded)
 }
 
-// SetMemoryBundle selects the memory-ownership bundle the next Start uses:
-// "owned" (the default since stage 10, part of the path-authority bundle the
-// tunnel runs) or "legacy". Owned grants the shared send budget to
-// waiting flows in turn and tunes each flow's retention
-// from its own flow credit. Any other value is refused and changes nothing.
-// A running tunnel keeps the bundle it started with.
-func (s *Session) SetMemoryBundle(mode string) error {
-	parsed, err := pep.ParseMemoryMode(mode)
-	if err != nil {
-		return err
-	}
-	s.memoryMode.Store(parsed)
-	return nil
-}
-
-func (s *Session) memoryBundle() pep.MemoryMode {
-	if mode, ok := s.memoryMode.Load().(pep.MemoryMode); ok {
-		return mode
-	}
-	return mobileBundle().Memory
-}
-
 // tunnelClientConfig is the tunnel's client configuration for a resource
 // profile, without the parts that come from the running session (listener,
 // endpoint, socket protection, credentials, metrics and logger).
-func tunnelClientConfig(limits mobileResourceLimits, memory pep.MemoryMode) pep.ClientConfig {
+func tunnelClientConfig(limits mobileResourceLimits) pep.ClientConfig {
 	cfg := pep.ClientConfig{
 		ChunkSize:   limits.chunkSize,
 		DialTimeout: 10 * time.Second, HandshakeTimeout: 30 * time.Second,
 		FlowIdleTimeout: 10 * time.Minute, FlowMaxLifetime: 6 * time.Hour,
 		MaxSessions: limits.maxSessions, MaxPendingOpens: limits.maxPendingOpens, Transport: pep.TransportAuto,
-		TCPFallbackLanes: 0, EnableQUICPool: true, WaitForOpenAcknowledgement: false,
-		UDPOnStream: false, Congestion: pep.CongestionErasure,
-		AdaptiveMinBytesSec: 64 * 1024, AdaptiveMaxBytesSec: 200 * 1024 * 1024,
+		TCPFallbackLanes: 0, WaitForOpenAcknowledgement: false, UDPOnStream: false,
 		FallbackDelay: 300 * time.Millisecond, FallbackGrace: 2 * time.Second,
 		UDPFailureThreshold: 3, UDPCooldown: 30 * time.Second,
 		StreamReceiveWindow: limits.streamWindow, ConnectionReceiveWindow: limits.connectionWindow,
 		MaxStreamReceiveWindow: limits.streamWindow, MaxConnectionReceiveWindow: limits.connectionWindow,
 		MaxIncomingStreams: limits.maxIncomingStreams, MemoryLimits: &limits.memory,
 	}
-	mobileBundle().ApplyToClient(&cfg)
-	cfg.Memory = memory
 	return cfg
-}
-
-// mobileBundle is the migration bundle a tunnel runs: the default
-// path-authority bundle since stage 10 (design §14), with the one pooled
-// connection per path that topology=single and recovery=carrier need, and
-// the profile's windows grown by the single topology's credit (§11.5).
-func mobileBundle() pep.BundleSwitches {
-	s, err := pep.SwitchesOf(pep.DefaultBundle, false)
-	if err != nil {
-		panic(err) // the default bundle is always defined
-	}
-	return s
 }
 
 // SetCountrySet hands the core a packed country set for GEOIP rules to consult.
@@ -439,7 +398,7 @@ func (s *Session) start(opts sessionOptions) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	registry := metrics.New()
 	logger := slog.New(newObserverHandler(s.observer, slog.LevelInfo))
-	clientConfig := tunnelClientConfig(limits, s.memoryBundle())
+	clientConfig := tunnelClientConfig(limits)
 	// Leave source-address selection to the platform. Android's socket
 	// protector must run before bind/connect; resolving and binding an
 	// "auto" interface here would bypass that contract and can select the
@@ -891,7 +850,6 @@ func ProbeProfileJSON(profileJSON string, timeoutMillis int64) (string, error) {
 		Credentials: credentials, Transport: pep.TransportAuto,
 		DialTimeout: timeout, HandshakeTimeout: timeout,
 		FallbackDelay: 300 * time.Millisecond, FallbackGrace: 2 * time.Second,
-		EnableQUICPool: false, Congestion: pep.CongestionErasure,
 		Logger: logger,
 	})
 	if err != nil {

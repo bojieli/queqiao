@@ -160,9 +160,7 @@ func (c *idleCell) survives(idleTimeout time.Duration) bool {
 // documented outcome is that the tunnel ends the flow at the timeout, and
 // then both applications must see EOF or RST within 5 s of the flow ending:
 // a flow the tunnel ends silently, leaving an application holding a socket
-// that will never deliver again, is the failure this exists to catch. The
-// legacy bundle and the flip bundle must both give exactly these outcomes,
-// so the flip delivers at least what legacy does in every cell.
+// that will never deliver again, is the failure this exists to catch.
 //
 // The clock drives the flow idle limit and classification on both ends. The
 // path's own timers (QUIC idle and keepalive, carrier liveness) run on real
@@ -179,8 +177,7 @@ func TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock(t *testing.T) {
 	// the bound.
 	const propagation = 5 * time.Second
 
-	delivered := map[string]map[string]bool{}
-	for _, arm := range workloadArms() {
+	for _, arm := range []workloadArm{pathAuthorityArm} {
 		t.Run(arm.name, func(t *testing.T) {
 			var offset atomic.Int64
 			clock := func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
@@ -370,20 +367,9 @@ func TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock(t *testing.T) {
 						cell, propagation, clientEnded, client.err, farEnded, far.err)
 				}
 			}
-			delivered[t.Name()] = arm
 			t.Logf("%d cells: %d below the flow idle timeout delivered, %d ended at it",
 				len(cells), countTrue(arm), len(cells)-len(arm))
 		})
-	}
-	legacy, legacyRan := delivered[t.Name()+"/"+legacyArm.name]
-	flip, flipRan := delivered[t.Name()+"/"+flipArm.name]
-	if !legacyRan || !flipRan {
-		return // one arm selected with -run: its own assertions have run
-	}
-	for cell, ok := range legacy {
-		if ok && !flip[cell] {
-			t.Errorf("%s: delivered under the legacy bundle, not under the flip bundle", cell)
-		}
 	}
 }
 
@@ -562,23 +548,14 @@ func checkIdleEnds(t *testing.T, cells []*idleCell, idleTimeout time.Duration, c
 // shorter than the gateway's the destination always waited. This pins the
 // second case, on real time.
 func TestAClientIdleTimeoutReachesTheDestinationWithinFiveSeconds(t *testing.T) {
-	// Pooled, the lane is a stream on a connection that outlives the flow;
-	// dedicated, closing the lane closes the connection, so the RESET must
-	// be delivered before it is.
-	for _, pooled := range []bool{true, false} {
-		name := "pooled"
-		if !pooled {
-			name = "dedicated"
-		}
-		t.Run(name, func(t *testing.T) { clientIdleTimeoutReachesTheDestination(t, pooled) })
-	}
-}
-
-func clientIdleTimeoutReachesTheDestination(t *testing.T, pooled bool) {
+	// The lane is a stream on a connection that outlives the flow. (Until
+	// stage 11 this also ran an unpooled client, whose dedicated lane's
+	// connection closes with the flow; that client went with the legacy
+	// code.)
 	const idleTimeout = 2 * time.Second
 	arm := workloadArm{
 		name:   "client idle timeout",
-		client: func(c *ClientConfig) { c.FlowIdleTimeout, c.EnableQUICPool = idleTimeout, pooled },
+		client: func(c *ClientConfig) { c.FlowIdleTimeout = idleTimeout },
 		server: func(*ServerConfig) {},
 	}
 	rig := newWorkloadRig(t, pathsim.Config{OneWayDelay: 10 * time.Millisecond, Seed: 3}, arm, nil)

@@ -29,17 +29,13 @@ func TestResumeReplacesPoolsBeforeConcurrentBorrowersReuseThem(t *testing.T) {
 	client.resumeState = suspendWatchState{known: true}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ccfg := congestionConfig{kind: defaultCongestion()}
+	ccfg := congestionConfig{}
 	first, err := client.dialPooledQUICLane(ctx, ccfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
 	old := first.(*controlPoolStreamConn).generation
-	bulk, err := client.reserveBulkConn(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
 	suspended.Store(int64(laneDeadPathDetection + time.Second))
 	const borrowers = 8
 	results := make(chan streamConn, borrowers)
@@ -70,8 +66,8 @@ func TestResumeReplacesPoolsBeforeConcurrentBorrowersReuseThem(t *testing.T) {
 		}
 		replacement = generation
 	}
-	if old.conn.Context().Err() == nil || bulk.conn.Context().Err() == nil {
-		t.Fatal("resume left a pre-sleep control or bulk connection open")
+	if old.conn.Context().Err() == nil {
+		t.Fatal("resume left a pre-sleep control connection open")
 	}
 	if client.checkSystemResume() {
 		t.Fatal("watcher consumed the same resume again after borrowers handled it")
@@ -120,7 +116,7 @@ func TestPooledFlowsRecoverThroughOneReplacementGeneration(t *testing.T) {
 			client, err := NewClient(ClientConfig{
 				ListenAddr: clientListener.Addr().String(), RemoteAddr: serverListener.Addr().String(),
 				LocalAddress: "127.0.0.1", Credentials: roots, Transport: transport,
-				EnableQUICPool: true, FallbackDelay: 100 * time.Millisecond,
+				FallbackDelay: 100 * time.Millisecond,
 				FallbackGrace: 2 * time.Second, HandshakeTimeout: 3 * time.Second,
 				Logger: logger,
 				SocketControl: func(network, _ string, _ syscall.RawConn) error {
@@ -204,14 +200,13 @@ func TestPooledFlowsRecoverThroughOneReplacementGeneration(t *testing.T) {
 			}
 			if got := udpSockets.Load(); got < baselineSockets+1 {
 				t.Fatalf("generation recovery opened %d new UDP sockets, want at least one", got-baselineSockets)
-			} else if want := baselineSockets + 1 + 2*flowCount; got > want {
-				// The replacement generation dial is still singleflight --
-				// one new socket however many flows wait on it, which is what
-				// the old exact assertion pinned. Each flow's rescue round
-				// now also runs two independent sprayed QUIC dials beside it
-				// (first JOIN wins, the losers are cancelled), so the ceiling
-				// is one coalesced generation dial plus two racers per flow.
-				t.Fatalf("generation recovery opened %d new UDP sockets, want the coalesced dial plus at most two racers per flow (%d)", got-baselineSockets, want-baselineSockets)
+			} else if want := baselineSockets + 2; got > want {
+				// The replacement generation dial is singleflight -- one new
+				// socket however many flows wait on it -- and the carrier
+				// manager rebinds every flow onto it with a JOIN; there are
+				// no per-flow dials. The one allowance is a standby the
+				// manager may dial meanwhile.
+				t.Fatalf("generation recovery opened %d new UDP sockets, want the coalesced dial and at most one standby (%d)", got-baselineSockets, want-baselineSockets)
 			}
 			snapshot := client.Metrics().Snapshot()
 			if snapshot.LaneReplacements != flowCount {
@@ -274,8 +269,7 @@ func TestPooledAutoFlowCommitsToTCPWhenQUICGenerationCannotRecover(t *testing.T)
 	defer clientListener.Close()
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: serverListener.Addr().String(),
-		Credentials: roots, Transport: TransportAuto, EnableQUICPool: true,
-		FallbackDelay: 100 * time.Millisecond, FallbackGrace: 200 * time.Millisecond,
+		Credentials: roots, Transport: TransportAuto, FallbackDelay: 100 * time.Millisecond, FallbackGrace: 200 * time.Millisecond,
 		DialTimeout: 400 * time.Millisecond, HandshakeTimeout: 3 * time.Second,
 		Logger: logger,
 	})
@@ -368,8 +362,7 @@ func TestControlPoolDialOwnershipAndGenerationGuards(t *testing.T) {
 			client, err := NewClient(ClientConfig{
 				ListenAddr: "127.0.0.1:0", RemoteAddr: packetConn.LocalAddr().String(),
 				LocalAddress: "127.0.0.1", Credentials: roots,
-				Transport: TransportQUIC, EnableQUICPool: true,
-				DialTimeout: 2 * time.Second, HandshakeTimeout: 2 * time.Second,
+				Transport: TransportQUIC, DialTimeout: 2 * time.Second, HandshakeTimeout: 2 * time.Second,
 				Logger: logger,
 				SocketControl: func(_, _ string, _ syscall.RawConn) error {
 					sockets.Add(1)
@@ -391,7 +384,7 @@ func TestControlPoolDialOwnershipAndGenerationGuards(t *testing.T) {
 			defer cancelFirst()
 			first := make(chan laneResult, 1)
 			go func() {
-				lane, dialErr := client.dialPooledQUICLane(firstCtx, congestionConfig{kind: defaultCongestion()})
+				lane, dialErr := client.dialPooledQUICLane(firstCtx, congestionConfig{})
 				first <- laneResult{lane: lane, err: dialErr}
 			}()
 			select {
@@ -407,7 +400,7 @@ func TestControlPoolDialOwnershipAndGenerationGuards(t *testing.T) {
 			}
 			second := make(chan laneResult, 1)
 			go func() {
-				lane, dialErr := client.dialPooledQUICLane(ctx, congestionConfig{kind: defaultCongestion()})
+				lane, dialErr := client.dialPooledQUICLane(ctx, congestionConfig{})
 				second <- laneResult{lane: lane, err: dialErr}
 			}()
 			if test.resetPool {
@@ -475,8 +468,7 @@ func TestTimedOutControlStreamPreservesItsQUICGeneration(t *testing.T) {
 	client, err := NewClient(ClientConfig{
 		ListenAddr: "127.0.0.1:0", RemoteAddr: packetConn.LocalAddr().String(),
 		LocalAddress: "127.0.0.1", Credentials: roots,
-		Transport: TransportQUIC, EnableQUICPool: true,
-		DialTimeout: 2 * time.Second, HandshakeTimeout: 2 * time.Second,
+		Transport: TransportQUIC, DialTimeout: 2 * time.Second, HandshakeTimeout: 2 * time.Second,
 		Logger: logger,
 		SocketControl: func(network, _ string, _ syscall.RawConn) error {
 			if strings.HasPrefix(network, "udp") {
@@ -489,7 +481,7 @@ func TestTimedOutControlStreamPreservesItsQUICGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := client.dialPooledQUICLane(ctx, congestionConfig{kind: defaultCongestion()})
+	first, err := client.dialPooledQUICLane(ctx, congestionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +507,7 @@ func TestTimedOutControlStreamPreservesItsQUICGeneration(t *testing.T) {
 	}
 	_ = first.Close()
 
-	second, err := client.dialPooledQUICLane(ctx, congestionConfig{kind: defaultCongestion()})
+	second, err := client.dialPooledQUICLane(ctx, congestionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,8 +541,7 @@ func TestCancelledWaiterDoesNotStartAControlPoolDial(t *testing.T) {
 	client, err := NewClient(ClientConfig{
 		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:9",
 		LocalAddress: "127.0.0.1", Credentials: roots,
-		Transport: TransportQUIC, EnableQUICPool: true,
-		SocketControl: func(_, _ string, _ syscall.RawConn) error {
+		Transport: TransportQUIC, SocketControl: func(_, _ string, _ syscall.RawConn) error {
 			sockets.Add(1)
 			return nil
 		},
@@ -560,7 +551,7 @@ func TestCancelledWaiterDoesNotStartAControlPoolDial(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := client.dialPooledQUICLane(ctx, congestionConfig{kind: defaultCongestion()}); !errors.Is(err, context.Canceled) {
+	if _, err := client.dialPooledQUICLane(ctx, congestionConfig{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled pool dial = %v, want context cancellation", err)
 	}
 	if got := sockets.Load(); got != 0 {
@@ -580,37 +571,4 @@ func assertEchoRoundTrip(t *testing.T, conn net.Conn, payload string) {
 	if string(got) != payload {
 		t.Fatalf("echo = %q, want %q", got, payload)
 	}
-}
-
-// Sleep may happen during the handshake, after the initial resume check.
-// Do not publish that pre-sleep bulk connection into the post-wake pool.
-func TestBulkDialRechecksResumeBeforePublishing(t *testing.T) {
-	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
-	client := rig.client
-	t.Cleanup(client.closeQUICPool)
-	var reads atomic.Int64
-	client.resumeState = suspendWatchState{known: true}
-	client.readSuspendTime = func() (time.Duration, error) {
-		if reads.Add(1) == 1 {
-			return 0, nil
-		}
-		return laneDeadPathDetection + time.Second, nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	entry, err := client.reserveBulkConn(ctx)
-	if entry != nil {
-		client.releaseBulkConn(entry, true)
-	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("pre-sleep bulk dial published: %v", err)
-	}
-	if got := client.bulkConnCount(); got != 0 {
-		t.Fatalf("obsolete bulk connections: %d", got)
-	}
-	fresh, err := client.reserveBulkConn(ctx)
-	if err != nil {
-		t.Fatalf("fresh bulk dial after resume: %v", err)
-	}
-	client.releaseBulkConn(fresh, true)
 }

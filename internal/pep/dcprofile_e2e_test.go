@@ -21,57 +21,28 @@ import (
 	"github.com/bojieli/queqiao/internal/profile"
 )
 
-// Stage 9: dc-long-haul on the new architecture (docs/DESIGN-PATH-AUTHORITY.md
-// §11.3), against the legacy bundle it ran until now, on real fork send loops
-// over emulated paths. The legacy arm is the profile as it was: per-connection
-// erasure senders reporting to the path tree's chain, whose shared nodes cap
-// every member (the hierarchy's joint limit). The candidate arm is the whole
-// stage 1-8 bundle with classifier=phased: one path authority per leaf, the
-// tree used only as knowledge.
-//
-// The acceptance bounds are the stage-9 gate's own, frozen in
-// scripts/validation/dc_gate.ini before any stage-9 data existed; the live gate
-// judges the same quantities against the same legacy arm.
+// dc-long-haul on the path-authority architecture (docs/DESIGN-PATH-AUTHORITY.md
+// §11.3), on real fork send loops over emulated paths: one path authority per
+// leaf, the tree used only as knowledge. Until stage 11 each trial also ran
+// the legacy bundle the profile had run before (per-connection erasure
+// senders under the tree's joint limit), and the stage-9 gate's contrasts
+// were computed against it here and live (scripts/dc_gate.py). The legacy
+// arm went with the legacy code once the gate passed; what is left are the
+// absolute guarantees: requests complete, traffic is sustained, and the
+// completion spread across loaded leaves stays out of the independent-relay
+// regime.
 const (
-	// dcGoodputRatio: sustained goodput, d = cand - 0.90 x legacy.
-	dcGoodputRatio = 0.90
-	// dcLatencyMaxRatio: request latency at the median and p99, d = 1.10 x
-	// legacy - cand.
-	dcLatencyMaxRatio = 1.10
-	// dcWorstLeafRatio: the least-served loaded leaf's sustained bytes, d =
-	// cand - 0.90 x legacy.
-	dcWorstLeafRatio = 0.90
-	// dcSpreadMaxRatio and dcSpreadCeiling: the slowest loaded leaf's median
-	// request completion over the fastest's, at most 1.25 x legacy's and
-	// never into the independent-relay regime (3.5).
-	dcSpreadMaxRatio = 1.25
-	dcSpreadCeiling  = 3.5
-	// dcJainMargin: Jain's index over the loaded leaves' sustained bytes, d =
-	// cand - (legacy - 0.05).
-	dcJainMargin = 0.05
-	// dcControlMaxRatio: the uncongested sibling's request p50 under the
-	// others' load, d = 1.10 x legacy - cand.
-	dcControlMaxRatio = 1.10
+	// dcSpreadCeiling: the slowest loaded leaf's median request completion
+	// over the fastest's never reaches the independent-relay regime.
+	dcSpreadCeiling = 3.5
 )
 
-// dcLatencySlack is the one allowance the deterministic version adds to a
-// latency ratio: the emulator's own scheduling noise, a small fraction of the
-// 200 ms round trip, so that a ratio is not failed by a few milliseconds of
-// timer jitter on a loaded test host. It is not a performance allowance.
-const dcLatencySlack = 15 * time.Millisecond
-
-// dcArm is one bundle under the dc-long-haul profile.
+// dcArm names the bundle a bed runs under the dc-long-haul profile.
 type dcArm struct {
-	name   string
-	legacy bool
-	// congestion, if set, overrides a legacy arm's controller on both ends.
-	congestion CongestionControlKind
+	name string
 }
 
-var (
-	dcLegacyArm = dcArm{name: "legacy", legacy: true}
-	dcNewArm    = dcArm{name: "path-authority"}
-)
+var dcNewArm = dcArm{name: "path-authority"}
 
 // dcRPC is the destination's protocol: an eight-byte header, the bytes the
 // client sends and the bytes it wants back, then the request. An upload of
@@ -191,21 +162,15 @@ func dcHost(t *testing.T, base, i int) string {
 // leaf starts leaf i. relay builds its emulated path from the relay's listen
 // address to the gateway's.
 func (b *dcBed) leaf(i int, relay func(listen, target string) (*pathsim.Relay, error)) *dcLeaf {
-	return b.leafAs(i, b.arm, relay)
-}
-
-// leafAs is leaf with an arm of its own, for beds where different bundles
-// share one bottleneck.
-func (b *dcBed) leafAs(i int, arm dcArm, relay func(listen, target string) (*pathsim.Relay, error)) *dcLeaf {
 	t := b.t
 	t.Helper()
-	dc, err := profile.ByName(dcLongHaulProfile)
+	dc, err := profile.ByName("dc-long-haul")
 	if err != nil {
 		t.Fatal(err)
 	}
 	certificate, roots := testCertificate(t)
 	// The gateway listens on a loopback address of its own too, so that each
-	// gateway's legacy per-peer model is its own, as on separate hosts.
+	// gateway's per-peer model is its own, as on separate hosts.
 	gatewayConn, err := net.ListenPacket("udp", dcHost(t, 40, i)+":0")
 	if err != nil {
 		t.Fatal(err)
@@ -215,12 +180,6 @@ func (b *dcBed) leafAs(i int, arm dcArm, relay func(listen, target string) (*pat
 		ListenAddr: "127.0.0.1:0", Credentials: certificate, Profile: dc,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true,
 		Logger: discard, Metrics: metrics.New(), HandshakeTimeout: 30 * time.Second,
-	}
-	scfg.Congestion = arm.congestion
-	if !arm.legacy {
-		scfg.CCAPI, scfg.Sched, scfg.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
-		scfg.CodedRetry, scfg.Memory, scfg.Classifier = CodedRetrySticky, MemoryOwned, ClassifierPhased
-		scfg.GatewayAdmission, scfg.Recovery = GatewayAdmissionOwned, RecoveryCarrier
 	}
 	server, err := NewServer(scfg)
 	if err != nil {
@@ -237,13 +196,7 @@ func (b *dcBed) leafAs(i int, arm dcArm, relay func(listen, target string) (*pat
 	}
 	ccfg := ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: r.LocalAddr(), Credentials: roots,
-		Transport: TransportQUIC, EnableQUICPool: true, Profile: dc, Metrics: metrics.New(), Logger: discard,
-	}
-	ccfg.Congestion = arm.congestion
-	if !arm.legacy {
-		ccfg.CCAPI, ccfg.Sched, ccfg.CongestionScope, ccfg.Topology = CCAPIV2, SchedClass, CongestionScopePath, TopologySingle
-		ccfg.CodedRetry, ccfg.Memory, ccfg.Classifier = CodedRetrySticky, MemoryOwned, ClassifierPhased
-		ccfg.Recovery = RecoveryCarrier
+		Transport: TransportQUIC, Profile: dc, Metrics: metrics.New(), Logger: discard,
 	}
 	client, err := NewClient(ccfg)
 	if err != nil {
@@ -434,11 +387,6 @@ const (
 	dcControlBytes     = 300 << 10
 	dcControlEvery     = time.Second
 	dcAncestorRateByte = 1_500_000 // 12 Mbit/s, shared by the loaded leaves
-	// dcBindingMax is the harness's validity bound (dc_gate.ini [validity]
-	// binding_max): the legacy arm's simultaneous aggregate over the sum of
-	// the loaded leaves' solo rates. Above it the ancestor did not bind and
-	// the comparison is not the one §11.3 asks for.
-	dcBindingMax = 0.80
 )
 
 // dcASRorTTS is request i of the W4 alternation: ASR (355 KB up, 200 B back)
@@ -603,105 +551,33 @@ func mbits(bytes []float64, seconds float64) []string {
 	return out
 }
 
-func meanOf(xs []float64) float64 {
-	var s float64
-	for _, x := range xs {
-		s += x
-	}
-	return s / float64(len(xs))
-}
-
-// TestDCMultiLeafFairnessHoldsWithAKnowledgeOnlyTree is §11.3's fairness
-// criterion, deterministic: a binding common ancestor and an uncongested
-// sibling, the worst leaf's service and the spread of completion times
-// compared with the legacy bundle's in the same run, two trials of each arm
-// in ABBA order, with the live gate's frozen bounds. A knowledge-only tree
-// that fails it fails the gate.
+// TestDCMultiLeafFairnessHoldsWithAKnowledgeOnlyTree runs §11.3's fairness
+// workload, deterministic: a binding common ancestor and an uncongested
+// sibling, three trials. No request fails, every loaded leaf is served, and
+// the completion spread stays below the independent-relay ceiling; the
+// gate's contrasts against the legacy bundle were decided at stage 9.
 func TestDCMultiLeafFairnessHoldsWithAKnowledgeOnlyTree(t *testing.T) {
 	requireDCBed(t)
-	// Calibration, as the live gate's: one loaded leaf alone on the
-	// ancestor, on the legacy arm.
-	solo := runDCFairness(t, dcLegacyArm, true).aggregate()
-	results := map[string][]dcFairness{}
-	// Three trials per arm, ABBAAB: the leaves' shares on an emulated
-	// shared queue move by tens of percent between trials.
-	for _, arm := range []dcArm{dcLegacyArm, dcNewArm, dcNewArm, dcLegacyArm, dcLegacyArm, dcNewArm} {
-		results[arm.name] = append(results[arm.name], runDCFairness(t, arm, false))
+	var results []dcFairness
+	for range 3 {
+		results = append(results, runDCFairness(t, dcNewArm, false))
 	}
-	summarise := func(rs []dcFairness) (worst, aggregate, jain, spread float64, p50, p99, control time.Duration, failed int) {
-		var ws, as, js, ss []float64
-		var requests, controls []time.Duration
-		for _, r := range rs {
-			ws, as, js, ss = append(ws, r.worst()), append(as, r.aggregate()), append(js, jainIndex(r.leafBytes)), append(ss, r.spread())
-			requests, controls = append(requests, r.requests...), append(controls, r.control...)
-			failed += r.failed
-		}
-		return meanOf(ws), meanOf(as), meanOf(js), meanOf(ss), dcMedian(requests), quantileOf(requests, 0.99), dcMedian(controls), failed
-	}
-	lw, la, lj, ls, lp50, lp99, lc, lf := summarise(results[dcLegacyArm.name])
-	cw, ca, cj, cs, cp50, cp99, cc, cf := summarise(results[dcNewArm.name])
 	window := dcSustainedWindow.Seconds()
-	t.Logf("legacy: worst %.2f Mbit/s, aggregate %.2f, jain %.3f, spread %.2f, request p50 %v p99 %v, control p50 %v, failed %d",
-		lw*8/window/1e6, la*8/window/1e6, lj, ls, lp50, lp99, lc, lf)
-	t.Logf("new:    worst %.2f Mbit/s, aggregate %.2f, jain %.3f, spread %.2f, request p50 %v p99 %v, control p50 %v, failed %d",
-		cw*8/window/1e6, ca*8/window/1e6, cj, cs, cp50, cp99, cc, cf)
-	if binding := la / (dcLoadedLeaves * solo); binding > dcBindingMax {
-		t.Fatalf("the common ancestor did not bind: the legacy aggregate is %.2f of the loaded leaves' solo rates (bound %.2f)", binding, dcBindingMax)
-	} else {
-		t.Logf("ancestor binding: legacy aggregate / sum of solo rates = %.2f", binding)
+	for _, r := range results {
+		if r.failed > 0 {
+			t.Errorf("%d requests failed", r.failed)
+		}
+		if r.worst() <= 0 {
+			t.Errorf("a loaded leaf was not served: %v", mbits(r.leafBytes, window))
+		}
+		if spread := r.spread(); spread > dcSpreadCeiling {
+			t.Errorf("completion spread %.2f reaches the independent-relay regime (ceiling %.1f)", spread, dcSpreadCeiling)
+		}
+		t.Logf("worst %.2f Mbit/s, aggregate %.2f, jain %.3f, spread %.2f, request p50 %v p99 %v, control p50 %v",
+			r.worst()*8/window/1e6, r.aggregate()*8/window/1e6, jainIndex(r.leafBytes), r.spread(),
+			dcMedian(r.requests), quantileOf(r.requests, 0.99), dcMedian(r.control))
 	}
-	// Hard: what a knowledge-only tree must guarantee whatever the gate's
-	// verdict. Requests complete as often as on the legacy bundle, and the
-	// uncongested sibling is not throttled by what the tree knows about its
-	// congested siblings (knowledge is a prior, never a limit).
-	if cf > lf {
-		t.Errorf("the new architecture failed %d requests, the legacy bundle %d", cf, lf)
-	}
-	if limit := scaleDuration(lc, dcControlMaxRatio) + dcLatencySlack; cc > limit {
-		t.Errorf("the uncongested sibling's request p50 %v > %.2f x legacy's %v: tree knowledge throttled it", cc, dcControlMaxRatio, lc)
-	}
-	// The §11.3 fairness criterion with the gate's frozen bounds, reported as
-	// a verdict rather than asserted: it is the measurement the stage-9
-	// decision rests on, and a FAIL is a legitimate outcome of the design
-	// (the legacy bundle then stays for this profile and joint limiting
-	// waits for the tree arbiter, Q2), not a defect in this change. The live
-	// gate (scripts/dc_gate.py) decides; this is its deterministic twin.
-	verdict := dcVerdict{t: t}
-	verdict.check("worst leaf's service", cw >= dcWorstLeafRatio*lw, "%.0f B vs %.2f x legacy's %.0f B", cw, dcWorstLeafRatio, lw)
-	verdict.check("completion spread", cs <= dcSpreadMaxRatio*ls && cs <= dcSpreadCeiling, "%.2f vs %.2f x legacy's %.2f, ceiling %.1f", cs, dcSpreadMaxRatio, ls, dcSpreadCeiling)
-	verdict.check("cross-leaf fairness (Jain)", cj >= lj-dcJainMargin, "%.3f vs legacy's %.3f - %.2f", cj, lj, dcJainMargin)
-	verdict.check("sustained goodput", ca >= dcGoodputRatio*la, "%.0f B vs %.2f x legacy's %.0f B", ca, dcGoodputRatio, la)
-	verdict.check("loaded request p50", cp50 <= scaleDuration(lp50, dcLatencyMaxRatio)+dcLatencySlack, "%v vs %.2f x legacy's %v", cp50, dcLatencyMaxRatio, lp50)
-	verdict.check("loaded request p99", cp99 <= scaleDuration(lp99, dcLatencyMaxRatio)+dcLatencySlack, "%v vs %.2f x legacy's %v", cp99, dcLatencyMaxRatio, lp99)
-	verdict.report("§11.3 multi-leaf fairness")
 }
-
-// dcVerdict collects a gate's criteria and logs one verdict line.
-type dcVerdict struct {
-	t      *testing.T
-	failed []string
-}
-
-func (v *dcVerdict) check(name string, ok bool, format string, args ...any) {
-	v.t.Helper()
-	state := "pass"
-	if !ok {
-		state = "FAIL"
-		v.failed = append(v.failed, name)
-	}
-	v.t.Logf("  %-28s %s: %s", name, state, fmt.Sprintf(format, args...))
-}
-
-func (v *dcVerdict) report(gate string) {
-	v.t.Helper()
-	if len(v.failed) == 0 {
-		v.t.Logf("%s verdict: PASS", gate)
-		return
-	}
-	v.t.Logf("%s verdict: FAIL on %v (design §11.3: the legacy bundle stays for dc-long-haul)", gate, v.failed)
-}
-
-func scaleDuration(d time.Duration, f float64) time.Duration { return time.Duration(float64(d) * f) }
 
 // dcShape is one arm's result on the single-leaf request and sustained
 // workload.
@@ -774,39 +650,17 @@ func runDCShape(t *testing.T, arm dcArm) dcShape {
 }
 
 // TestDCRequestLatencyAndSustainedGoodputShape is the DC trial's request and
-// sustained shape on the emulated characterised path, ABBA: request latency
-// at the median and p99 within 10% of the legacy bundle's, and sustained
-// goodput at least 0.90 of it (§11.3, §15.4).
+// sustained shape on the emulated characterised path, twice: every request
+// completes (a failure is fatal in runDCShape) and traffic is sustained. The
+// gate's latency and goodput contrasts against the legacy bundle were
+// decided at stage 9.
 func TestDCRequestLatencyAndSustainedGoodputShape(t *testing.T) {
 	requireDCBed(t)
-	results := map[string][]dcShape{}
-	for _, arm := range []dcArm{dcLegacyArm, dcNewArm, dcNewArm, dcLegacyArm} {
-		results[arm.name] = append(results[arm.name], runDCShape(t, arm))
-	}
-	pool := func(rs []dcShape) (p50, p99 time.Duration, sustained float64) {
-		var all []time.Duration
-		var s []float64
-		for _, r := range rs {
-			all = append(all, r.requests...)
-			s = append(s, r.sustained)
+	for range 2 {
+		if r := runDCShape(t, dcNewArm); r.sustained <= 0 {
+			t.Fatalf("no sustained goodput: %.0f B/s", r.sustained)
 		}
-		return dcMedian(all), quantileOf(all, 0.99), meanOf(s)
 	}
-	lp50, lp99, ls := pool(results[dcLegacyArm.name])
-	cp50, cp99, cs := pool(results[dcNewArm.name])
-	t.Logf("legacy: request p50 %v p99 %v, sustained %.1f Mbit/s", lp50, lp99, ls*8/1e6)
-	t.Logf("new:    request p50 %v p99 %v, sustained %.1f Mbit/s", cp50, cp99, cs*8/1e6)
-	// Every request completed (a failure is fatal above) and both arms
-	// sustained traffic; the gate's latency and goodput contrasts are the
-	// verdict, as in the fairness test.
-	if cs <= 0 || ls <= 0 {
-		t.Fatalf("no sustained goodput: new %.0f, legacy %.0f B/s", cs, ls)
-	}
-	verdict := dcVerdict{t: t}
-	verdict.check("request p50", cp50 <= scaleDuration(lp50, dcLatencyMaxRatio)+dcLatencySlack, "%v vs %.2f x legacy's %v", cp50, dcLatencyMaxRatio, lp50)
-	verdict.check("request p99", cp99 <= scaleDuration(lp99, dcLatencyMaxRatio)+dcLatencySlack, "%v vs %.2f x legacy's %v", cp99, dcLatencyMaxRatio, lp99)
-	verdict.check("sustained goodput", cs >= dcGoodputRatio*ls, "%.1f Mbit/s vs %.2f x legacy's %.1f", cs*8/1e6, dcGoodputRatio, ls*8/1e6)
-	verdict.report("DC request and sustained shape")
 }
 
 // Under dc-long-haul the new architecture's authority reports through the
@@ -859,9 +713,6 @@ func TestDCProfileRunsOnThePathAuthorityWithTheTreeAsKnowledge(t *testing.T) {
 	for _, n := range []*pathmodel.NodeReport{egress, endpoint} {
 		if n.State.ObservedSamples == 0 {
 			t.Errorf("node %s heard nothing: %+v", n.Key, n.State)
-		}
-		if n.State.Share != 0 || n.State.Seed != 0 {
-			t.Errorf("node %s computed a share %v or seed %v from an authority", n.Key, n.State.Share, n.State.Seed)
 		}
 	}
 }

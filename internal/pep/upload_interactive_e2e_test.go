@@ -26,18 +26,9 @@ import (
 // persistent connection that uploads a ~100-130 KB prompt per turn and then
 // receives a stream of small deltas. R is what the campaign's workload server
 // measures: the time from the first to the last byte of a prompt at the
-// destination.
-
-type uploadArm string
-
-const (
-	armMain uploadArm = "main" // classifier=phased only, as the campaign's control
-	armS7   uploadArm = "s7"   // the stage 1-7 bundle
-	armS8   uploadArm = "s8"   // s7 plus recovery=carrier
-	// armS7MemLegacy is s7 without mem=owned: separates the memory bundle
-	// from the path controller and topology.
-	armS7MemLegacy uploadArm = "s7-mem-legacy"
-)
+// destination. Until stage 11 the loop also ran on the campaign's control
+// bundle and on partial bundles, for the log only; those arms went with the
+// switches.
 
 type uploadPair struct {
 	socks       string
@@ -47,7 +38,7 @@ type uploadPair struct {
 	clientLogs  *lockedBuffer
 }
 
-func newUploadPair(t *testing.T, arm uploadArm, path pathsim.Config, serve func(net.Listener)) *uploadPair {
+func newUploadPair(t *testing.T, path pathsim.Config, serve func(net.Listener)) *uploadPair {
 	t.Helper()
 	pathmodel.Reset()
 	t.Cleanup(pathmodel.Reset)
@@ -68,24 +59,10 @@ func newUploadPair(t *testing.T, arm uploadArm, path pathsim.Config, serve func(
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true,
 		Logger: slog.New(slog.DiscardHandler), Metrics: metrics.New(), HandshakeTimeout: 30 * time.Second,
-		Classifier: ClassifierPhased,
 	}
 	ccfg := ClientConfig{
-		Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true, Metrics: metrics.New(),
-		Logger:     slog.New(slog.NewJSONHandler(p.clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		Classifier: ClassifierPhased,
-	}
-	if arm != armMain {
-		scfg.CCAPI, scfg.Sched, scfg.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
-		scfg.CodedRetry, scfg.Memory, scfg.GatewayAdmission = CodedRetrySticky, MemoryOwned, GatewayAdmissionOwned
-		ccfg.CCAPI, ccfg.Sched, ccfg.CongestionScope, ccfg.Topology = CCAPIV2, SchedClass, CongestionScopePath, TopologySingle
-		ccfg.CodedRetry, ccfg.Memory = CodedRetrySticky, MemoryOwned
-	}
-	if arm == armS7MemLegacy {
-		scfg.Memory, ccfg.Memory = MemoryLegacy, MemoryLegacy
-	}
-	if arm == armS8 {
-		scfg.Recovery, ccfg.Recovery = RecoveryCarrier, RecoveryCarrier
+		Credentials: roots, Transport: TransportQUIC, Metrics: metrics.New(),
+		Logger: slog.New(slog.NewJSONHandler(p.clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	server, err := NewServer(scfg)
 	if err != nil {
@@ -183,8 +160,7 @@ func (d *promptDestination) serve(l net.Listener) {
 }
 
 type promptRun struct {
-	arm uploadArm
-	rs  []time.Duration
+	rs []time.Duration
 	// classes and coded record, per prompt, the LLM flow's DATA class when
 	// the prompt was written and how many of its bytes went coded.
 	classes    []string
@@ -196,7 +172,7 @@ type promptRun struct {
 func (r promptRun) String() string {
 	rs := append([]time.Duration(nil), r.rs...)
 	sort.Slice(rs, func(i, j int) bool { return rs[i] < rs[j] })
-	s := fmt.Sprintf("%-4s upload=%-5v R per prompt:", r.arm, r.withUpload)
+	s := fmt.Sprintf("upload=%-5v R per prompt:", r.withUpload)
 	for i, d := range r.rs {
 		s += fmt.Sprintf(" %.3fs", d.Seconds())
 		if i < len(r.classes) {
@@ -206,14 +182,14 @@ func (r promptRun) String() string {
 	return s + fmt.Sprintf(" | median %.3fs max %.3fs | bulk upload %.2f Mbit/s", rs[len(rs)/2].Seconds(), rs[len(rs)-1].Seconds(), r.bulkMbps)
 }
 
-// runPromptLoop runs one arm: optionally a bulk upload, then an agent loop of
+// runPromptLoop runs one trial: optionally a bulk upload, then an agent loop of
 // turns prompts.
-func runPromptLoop(t *testing.T, arm uploadArm, withUpload bool, turns int) promptRun {
+func runPromptLoop(t *testing.T, withUpload bool, turns int) promptRun {
 	t.Helper()
 	d := &promptDestination{deltas: 40, cadence: 25 * time.Millisecond, thinking: 500 * time.Millisecond}
 	path := pathsim.Config{OneWayDelay: 75 * time.Millisecond, RateBytesPerSec: 20_000_000 / 8, QueueBytes: 512 << 10, Seed: 61}
 	var flows flowTracker
-	p := newUploadPair(t, arm, path, d.serve)
+	p := newUploadPair(t, path, d.serve)
 	p.client.flowStartedForTest = flows.add
 	open := func() net.Conn {
 		conn, err := trySocksDial(p.socks, p.destination, 30*time.Second)
@@ -255,23 +231,23 @@ func runPromptLoop(t *testing.T, arm uploadArm, withUpload bool, turns int) prom
 		_ = llm.SetDeadline(time.Now().Add(60 * time.Second))
 		codedBefore, _ := flow.dataSubstrates()
 		if _, err := llm.Write(prompt); err != nil {
-			t.Fatalf("%s: prompt %d: %v", arm, turn, err)
+			t.Fatalf("prompt %d: %v", turn, err)
 		}
 		if _, err := io.ReadFull(llm, reply[:1]); err != nil {
-			t.Fatalf("%s: reply %d: %v", arm, turn, err)
+			t.Fatalf("reply %d: %v", turn, err)
 		}
 		codedAfter, _ := flow.dataSubstrates()
 		classes = append(classes, fmt.Sprint(f2class(flow)))
 		codedBytes = append(codedBytes, codedAfter-codedBefore)
 		if _, err := io.ReadFull(llm, reply[1:]); err != nil {
-			t.Fatalf("%s: reply %d: %v", arm, turn, err)
+			t.Fatalf("reply %d: %v", turn, err)
 		}
 		time.Sleep(time.Second) // tool execution between turns
 	}
 	elapsed := time.Since(start)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return promptRun{arm: arm, withUpload: withUpload, rs: append([]time.Duration(nil), d.rs...), classes: classes, coded: codedBytes,
+	return promptRun{withUpload: withUpload, rs: append([]time.Duration(nil), d.rs...), classes: classes, coded: codedBytes,
 		bulkMbps: float64(d.bulkIn.Load()-bulkStart) * 8 / elapsed.Seconds() / 1e6}
 }
 
@@ -279,25 +255,23 @@ func TestPromptUploadBesideABulkUpload(t *testing.T) {
 	if testing.Short() {
 		t.Skip("wall-clock emulated path")
 	}
-	for _, arm := range []uploadArm{armMain, armS7, armS7MemLegacy, armS8} {
-		for _, withUpload := range []bool{false, true} {
-			r := runPromptLoop(t, arm, withUpload, 6)
-			t.Log(r)
-			if withUpload || arm == armMain {
+	for _, withUpload := range []bool{false, true} {
+		r := runPromptLoop(t, withUpload, 6)
+		t.Log(r)
+		if withUpload {
+			continue
+		}
+		// Alone on the path, a prompt over the four-chunk startup
+		// allowance (turns 4 and 5: 132 and 140 KB) must not wait a
+		// credit round for its last bytes: the path's round trip is
+		// 150 ms. (A single early prompt occasionally takes about one
+		// round trip; that is not this bound.)
+		for turn, d := range r.rs {
+			if size := 100_000 + 8_000*turn; size <= stripe.DefaultAutotuneStartupChunks*32<<10 {
 				continue
 			}
-			// Alone on the path, a prompt over the four-chunk startup
-			// allowance (turns 4 and 5: 132 and 140 KB) must not wait a
-			// credit round for its last bytes: the path's round trip is
-			// 150 ms. (A single early prompt occasionally takes about one
-			// round trip with or without mem=owned; that is not this bound.)
-			for turn, d := range r.rs {
-				if size := 100_000 + 8_000*turn; size <= stripe.DefaultAutotuneStartupChunks*32<<10 {
-					continue
-				}
-				if d > 100*time.Millisecond {
-					t.Errorf("%s: prompt %d (%d bytes) took R = %v alone on the path; a credit round trip was paid", arm, turn, 100_000+8_000*turn, d)
-				}
+			if d > 100*time.Millisecond {
+				t.Errorf("prompt %d (%d bytes) took R = %v alone on the path; a credit round trip was paid", turn, 100_000+8_000*turn, d)
 			}
 		}
 	}

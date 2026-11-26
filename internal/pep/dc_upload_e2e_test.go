@@ -19,16 +19,11 @@ import (
 )
 
 // The live DC gate's upload and light-request workloads on a 53 ms,
-// 300 Mbit/s emulated leg, with the dc-long-haul profile: the legacy bundle
-// against the full stage 1-8 bundle with classifier=phased. Each upload is a
-// 4 MiB object on a fresh flow, as the gate's upload jobs send them.
-
-type gateArm string
-
-const (
-	gateLegacy   gateArm = "legacy"
-	gatePathAuth gateArm = "pathauth"
-)
+// 300 Mbit/s emulated leg, with the dc-long-haul profile. Each upload is a
+// 4 MiB object on a fresh flow, as the gate's upload jobs send them. Until
+// stage 11 each test also ran the legacy bundle and the upload rate was held
+// to 0.9 of legacy's; that arm went with the legacy code, and the rate now
+// has an absolute floor.
 
 // gateDestination serves objects framed as a 4-byte length and that many
 // bytes, answering each with a 4-byte reply length and that many bytes.
@@ -71,7 +66,7 @@ type gatePair struct {
 	client      *Client
 }
 
-func newGatePair(t *testing.T, arm gateArm, path pathsim.Config) *gatePair {
+func newGatePair(t *testing.T, path pathsim.Config) *gatePair {
 	t.Helper()
 	pathmodel.Reset()
 	t.Cleanup(pathmodel.Reset)
@@ -97,15 +92,8 @@ func newGatePair(t *testing.T, arm gateArm, path pathsim.Config) *gatePair {
 		Profile: dc,
 	}
 	ccfg := ClientConfig{
-		Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true, Metrics: metrics.New(),
+		Credentials: roots, Transport: TransportQUIC, Metrics: metrics.New(),
 		Logger: slog.New(slog.DiscardHandler), Profile: dc,
-	}
-	if arm == gatePathAuth {
-		scfg.CCAPI, scfg.Sched, scfg.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
-		scfg.CodedRetry, scfg.Memory, scfg.GatewayAdmission = CodedRetrySticky, MemoryOwned, GatewayAdmissionOwned
-		scfg.Classifier, scfg.Recovery = ClassifierPhased, RecoveryCarrier
-		ccfg.CCAPI, ccfg.Sched, ccfg.CongestionScope, ccfg.Topology = CCAPIV2, SchedClass, CongestionScopePath, TopologySingle
-		ccfg.CodedRetry, ccfg.Memory, ccfg.Classifier, ccfg.Recovery = CodedRetrySticky, MemoryOwned, ClassifierPhased, RecoveryCarrier
 	}
 	server, err := NewServer(scfg)
 	if err != nil {
@@ -161,6 +149,13 @@ func gateLeg(seed int64) pathsim.Config {
 	return pathsim.Config{OneWayDelay: 26500 * time.Microsecond, RateBytesPerSec: 300_000_000 / 8, QueueBytes: 2 << 20, Seed: seed}
 }
 
+// dcUploadFloorMbps is the least a warm client uploads 4 MiB objects at on
+// the gate's leg. At stage 10 the legacy bundle ran them at 120 to 158 Mbit/s
+// on a 32-core Linux host, depending on its load, and the path-authority
+// bundle at 124 to 157 in the same runs; before the retention floor the
+// latter ran at 75. The floor separates the two.
+const dcUploadFloorMbps = 100
+
 func gateMbps(bytes int, d time.Duration) float64 { return float64(bytes) * 8 / d.Seconds() / 1e6 }
 
 // A cold client uploads 4 MiB objects one after another, each on a fresh
@@ -172,19 +167,14 @@ func TestDCUploadObjectsOnFreshFlows(t *testing.T) {
 		t.Skip("wall-clock emulated path")
 	}
 	const object = 4 << 20
-	results := map[gateArm][]float64{}
-	for _, arm := range []gateArm{gateLegacy, gatePathAuth} {
-		p := newGatePair(t, arm, gateLeg(71))
-		for range 8 {
-			results[arm] = append(results[arm], gateMbps(object, p.exchange(t, object, 1)))
-		}
-		r := results[arm]
-		sorted := append([]float64(nil), r...)
-		sort.Float64s(sorted)
-		t.Logf("%-8s 4 MiB uploads, Mbit/s in order: %s | first %.0f, median of the rest %.0f", arm, fmtGateRates(r), r[0], medianOf(r[1:]))
+	p := newGatePair(t, gateLeg(71))
+	var r []float64
+	for range 8 {
+		r = append(r, gateMbps(object, p.exchange(t, object, 1)))
 	}
-	if legacy, cand := medianOf(results[gateLegacy][1:]), medianOf(results[gatePathAuth][1:]); cand < 0.9*legacy {
-		t.Errorf("pathauth uploads 4 MiB objects at %.0f Mbit/s against legacy's %.0f", cand, legacy)
+	t.Logf("4 MiB uploads, Mbit/s in order: %s | first %.0f, median of the rest %.0f", fmtGateRates(r), r[0], medianOf(r[1:]))
+	if got := medianOf(r[1:]); got < dcUploadFloorMbps {
+		t.Errorf("4 MiB objects upload at %.0f Mbit/s, under the floor of %.0f", got, float64(dcUploadFloorMbps))
 	}
 }
 
@@ -200,8 +190,8 @@ func TestDCLightRequestBesideLoad(t *testing.T) {
 		t.Skip("wall-clock emulated path")
 	}
 	for _, load := range []string{"download", "upload"} {
-		for _, arm := range []gateArm{gateLegacy, gatePathAuth} {
-			p := newGatePair(t, arm, gateLeg(72))
+		{
+			p := newGatePair(t, gateLeg(72))
 			ctx, cancel := context.WithCancel(context.Background())
 			var wg sync.WaitGroup
 			for range 2 {
@@ -254,13 +244,13 @@ func TestDCLightRequestBesideLoad(t *testing.T) {
 			cancel()
 			wg.Wait()
 			sort.Float64s(lat)
-			t.Logf("beside a loaded %-8s %-8s light request: p50 %.3fs p90 %.3fs max %.3fs", load, arm, lat[len(lat)/2], lat[len(lat)*9/10], lat[len(lat)-1])
+			t.Logf("beside a loaded %-8s light request: p50 %.3fs p90 %.3fs max %.3fs", load, lat[len(lat)/2], lat[len(lat)*9/10], lat[len(lat)-1])
 			// A request of a few hundred kilobytes on this leg is one round
 			// trip (53 ms), the request's own serialization and the loaded
 			// queue's delay. More than that plus two rounds is a request
 			// waiting on its own flow's credit.
-			if arm == gatePathAuth && lat[len(lat)/2] > 0.25 {
-				t.Errorf("pathauth: a light request beside a loaded %s took p50 %.3fs", load, lat[len(lat)/2])
+			if lat[len(lat)/2] > 0.25 {
+				t.Errorf("a light request beside a loaded %s took p50 %.3fs", load, lat[len(lat)/2])
 			}
 		}
 	}

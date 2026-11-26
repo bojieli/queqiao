@@ -72,23 +72,6 @@ func TestAbandonedReplacementDoesNotFailAFlowWithALane(t *testing.T) {
 	}
 }
 
-// The wait is a client-side conclusion drawn from the client's own behaviour.
-// A server flow never draws it: the rescue is still somebody's to send, and
-// its grace is what gives the peer time to send it.
-func TestTheLaneManagerIsWhatAbandonsReplacement(t *testing.T) {
-	flow := newGraceTestFlow(t)
-	if flow.replacementAbandoned.Load() {
-		t.Fatal("a fresh flow starts with its replacement grace already spent")
-	}
-	client := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewTextHandler(discardWriter{}, nil))}}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	client.manageQUICLanes(ctx, flow, flow.sessionID, flow.flowID)
-	if !flow.replacementAbandoned.Load() {
-		t.Fatal("the lane manager returned without ending the flow's replacement grace")
-	}
-}
-
 type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
@@ -334,8 +317,10 @@ func TestAFlowRecordsWhetherAReplacementWasEvenAttempted(t *testing.T) {
 	}
 }
 
+// A TCP flow's bundle manager replaces its last lane itself. (A QUIC flow is
+// rebound by the carrier manager, whose refusals have their own tests.)
 func TestZeroLaneRecoveryLogsReturnedRefusal(t *testing.T) {
-	for _, transport := range []TransportKind{TransportQUIC, TransportTCP} {
+	for _, transport := range []TransportKind{TransportTCP} {
 		t.Run(string(transport), func(t *testing.T) {
 			rig := newJoinTestRig(t, transport, transport, 1)
 			// The client is not serving yet, so nothing else reads its
@@ -542,6 +527,7 @@ func (r *lockedRecords) records(t *testing.T, msg string) []map[string]any {
 func TestLaneRecoveryFailureLogLevels(t *testing.T) {
 	records := &lockedRecords{}
 	client := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewJSONHandler(records, &slog.HandlerOptions{Level: slog.LevelDebug}))}}
+	attachTestCarriers(client)
 	live := context.Background()
 	ended, cancel := context.WithCancel(context.Background())
 	cancel()

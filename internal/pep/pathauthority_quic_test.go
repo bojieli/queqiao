@@ -18,7 +18,7 @@ import (
 	"github.com/bojieli/queqiao/internal/pathsim"
 )
 
-var pathScopeConfig = congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2, sched: SchedClass, scope: CongestionScopePath}
+var pathScopeConfig = congestionConfig{}
 
 // pathBed is a gateway-side listener behind one emulated bottleneck, which
 // any number of client connections can be dialled through: they share the
@@ -383,7 +383,6 @@ func TestAGatewayAttachesEveryDataConnectionOfADeviceToOneController(t *testing.
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true},
-		CCAPI:             CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -503,7 +502,6 @@ func TestAnUplinkChangeWithTheSameAddressStartsANewController(t *testing.T) {
 	_, credentials := testCertificate(t)
 	client, err := NewClient(ClientConfig{
 		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
-		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -573,7 +571,6 @@ func TestAGatewayClosesADataConnectionItCannotAttach(t *testing.T) {
 	}
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true,
-		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -605,7 +602,6 @@ func TestAResumeWithAnUplinkChangeStartsANewGeneration(t *testing.T) {
 	_, credentials := testCertificate(t)
 	client, err := NewClient(ClientConfig{
 		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
-		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -631,7 +627,6 @@ func TestASurvivingConnectionFollowsTheUplinkGeneration(t *testing.T) {
 	_, credentials := testCertificate(t)
 	client, err := NewClient(ClientConfig{
 		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
-		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
 	})
 	if err != nil {
 		t.Fatal(err)

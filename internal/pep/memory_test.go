@@ -38,7 +38,7 @@ func TestMemoryLimitsRejectDeadlockingOrMultiplicativeSettings(t *testing.T) {
 		"no receive budget":       func(l *MemoryLimits) { l.ReceiveBudgetBytes = 0 },
 		"control consumes queue":  func(l *MemoryLimits) { l.LaneInteractiveReserve = 2 },
 		"oversized event queue":   func(l *MemoryLimits) { l.EventQueueFrames = maxLaneEvents + 1 },
-		"oversized bulk pool":     func(l *MemoryLimits) { l.MaxBulkConnections = isolatedBulkConns + 1 },
+		"oversized window credit": func(l *MemoryLimits) { l.MaxBulkConnections = maxWindowCreditConnections + 1 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			limits := valid

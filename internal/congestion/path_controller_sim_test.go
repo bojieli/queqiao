@@ -136,7 +136,7 @@ type pcSimConn struct {
 	lastReq  time.Duration
 
 	att    *PathAttachment // congestion=path
-	legacy *ErasureSender  // per-connection, pooled
+	legacy *ErasureSender  // per-connection, on its own
 }
 
 func (c *pcSimConn) admit(at monotime.Time, class quiccongestion.SendClass) bool {
@@ -197,7 +197,7 @@ func (c *pcSimConn) event(at monotime.Time, prior quiccongestion.ByteCount, acke
 }
 
 // runPCSim runs lanes on path for duration, through one PathController when
-// authority is set and through pooled per-connection senders otherwise.
+// authority is set and through one sender per connection otherwise.
 func runPCSim(path pcSimPath, lanes []pcSimLane, duration, measureFrom time.Duration, authority bool) (pcSimResult, *PathController) {
 	base := monotime.Now()
 	var now time.Duration
@@ -228,7 +228,7 @@ func runPCSim(path pcSimPath, lanes []pcSimLane, duration, measureFrom time.Dura
 					c.att.OnAttach(at, 0, pcSimPacketSize, func() {})
 					c.att.SetRTTStatsProvider(&c.rtt)
 				} else {
-					c.legacy = NewErasureSenderOn(pcSimPacketSize, model)
+					c.legacy = NewErasureSender(pcSimPacketSize)
 					c.legacy.inner.randomState = uint64(i+1) * 0x9e3779b97f4a7c15
 					c.legacy.SetRTTStatsProvider(&c.rtt)
 				}

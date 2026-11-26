@@ -36,9 +36,9 @@ limitations](KNOWN-LIMITATIONS.md) before deploying it.
 | Area | Current capability |
 | --- | --- |
 | Data plane | SOCKS5 TCP CONNECT and UDP ASSOCIATE; pooled QUIC streams and datagrams; authenticated TLS/TCP fallback; optional gateway chaining through a loopback SOCKS5 upstream |
-| WAN policy | one erasure-aware congestion controller per path that every connection attaches to (the path-authority bundle, the default; `--bundle=legacy` restores the shared path model of per-connection controllers for one release), aggregate pacing, and interactive reserve |
+| WAN policy | one erasure-aware congestion controller per path that every connection attaches to (the path-authority architecture), aggregate pacing, and interactive reserve |
 | Recovery | byte-offset reassembly, range acknowledgements, bounded replay, sliding-window coding, carrier replacement on transport evidence with flows rebound by JOIN, and UDP relay reclamation |
-| Contention | phased flow classification, class scheduling of CONTROL, INTERACTIVE and BULK inside one QUIC connection per path, and bounded opt-in TCP fallback striping; the legacy bundle keeps reactive bulk isolation |
+| Contention | phased flow classification, class scheduling of CONTROL, INTERACTIVE and BULK inside one QUIC connection per path, and bounded opt-in TCP fallback striping |
 | Identity | one-time invitations, provider-pinned gateway identity, per-device mutual TLS, renewal, revocation, and per-user limits |
 | Operations | bounded JSON logs, metrics, local visualizer, service examples, release packaging, SBOMs, and rollback procedure |
 | Clients | one process per provider or one process serving several providers on separate loopback SOCKS5 listeners; macOS/Linux desktop and gateway binaries published with every release; Windows targets built but under testing; Android SOCKS export and iOS packet-tunnel clients under testing, all using the protocol-2 core |

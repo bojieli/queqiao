@@ -124,26 +124,6 @@ func (l *mpLane) windowBytes() int {
 	return laneQueueBytes(cwnd)
 }
 
-// retentionBytes is how much this flow may hold unacknowledged: the lanes'
-// combined congestion windows, doubled to cover the acknowledgement coming back
-// while the next window's worth is already in flight.
-//
-// This has to follow the path rather than be chosen. A chunk is retained from
-// the moment it is read until the peer acknowledges it, so the quantity is
-// whatever the lanes can have outstanding at once -- which is what a congestion
-// window means. Fixed at 16 MiB it was the binding limit on a fast path and
-// four times more than a slow one will ever use.
-func (f *multipathFlow) retentionBytes() int {
-	total := f.pathWindowBytes()
-	if total <= 0 {
-		return minFlowRetentionBytes
-	}
-	if want := 2 * total; want > minFlowRetentionBytes {
-		return want
-	}
-	return minFlowRetentionBytes
-}
-
 // pathWindowBytes is the combined congestion window of the flow's lanes,
 // counting once the window of lanes attached to one path controller: what
 // the flow's transports can have in flight at once. Zero without telemetry.
@@ -354,19 +334,13 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 	defer close(f.sendDone)
 	f.fitBacklogThreshold()
 
-	retention := f.retentionBytes
-	var autotune *stripe.Autotune
-	if f.memOwned {
-		// The owned-memory bundle replaces the summed congestion windows with
-		// the flow's own credit-driven bound (design §8.3).
-		retention = nil
-		// The floor is one path window: a flow back from idle may have what
-		// its transport can carry in one flight unacknowledged, rather than
-		// waiting a credit round per startup allowance. A request just over
-		// four chunks -- an LLM prompt of 132 KB -- otherwise paid a round
-		// trip on every turn after an idle gap.
-		autotune = &stripe.Autotune{Round: f.creditRound, ReadyLimit: f.readyLimit, Floor: f.pathWindowBytes}
-	}
+	// Retention follows the flow's own credit-driven bound (design §8.3).
+	// The floor is one path window: a flow back from idle may have what
+	// its transport can carry in one flight unacknowledged, rather than
+	// waiting a credit round per startup allowance. A request just over
+	// four chunks -- an LLM prompt of 132 KB -- otherwise paid a round
+	// trip on every turn after an idle gap.
+	autotune := &stripe.Autotune{Round: f.creditRound, ReadyLimit: f.readyLimit, Floor: f.pathWindowBytes}
 	sched := stripe.New(&flowSource{flow: f}, stripe.Config{
 		ChunkSize:      f.chunkSize,
 		LaneWindow:     min(maxLaneChunkWindow, f.memoryLimits.maxOutstanding),
@@ -379,16 +353,14 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		MaxOutstandingBytes:  f.memoryLimits.maxSendBytes,
 		Memory:               f.sendMemory,
 		StagingBytes:         stagingBytes,
-		Retention:            retention,
 		Autotune:             autotune,
 		RetransmitAfter:      f.reissueDelay,
 		ReliableReissueBurst: f.reliableReissueBurst(),
 		// A lane carrying its data over coded datagrams does not retransmit
 		// for itself: the code repairs most loss and not all, and what it
 		// cannot repair has no other way back on a single-lane flow.
-		Reliable:      f.laneRetransmits,
-		GapReissued:   f.noteGapReissued,
-		ForceReliable: f.recoverChunkReliably,
+		Reliable:    f.laneRetransmits,
+		GapReissued: f.noteGapReissued,
 		// The phased classifier's sparse-write rule (R1a): a small write onto
 		// an empty send queue is INTERACTIVE and coded whatever the flow's
 		// class, within the sparse allowance.
@@ -396,10 +368,10 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		SparseBytes:    f.sparseBytes(),
 		Sparse:         f.admitSparse,
 		ReliableSparse: f.laneRetransmitsSparse,
-		// The coded-retry bundle (design §8.1): a coded attempt's deadline
-		// starts when its datagrams are registered, and its retry, like every
-		// later attempt of the chunk, is on the stream.
-		CodedRetry: f.codedRetrySticky,
+		// Coded retry (design §8.1): a coded attempt's deadline starts when
+		// its datagrams are registered, and its retry, like every later
+		// attempt of the chunk, is on the stream.
+		CodedRetry: true,
 		Windows:    &laneAdmission{flow: f},
 	})
 	defer sched.Close()
@@ -659,28 +631,25 @@ func (f *multipathFlow) laneCarriesData(lane *mpLane, bulk bool) bool {
 
 // sendChunk writes one chunk on one lane. The chunk's offset is its sequence
 // number, so the receiver can place it without knowing which lane it came from
-// or what order the lanes ran in.
-func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stripe.Chunk, bulk bool) error {
+// or what order the lanes ran in. The lane's bulk queue choice is not taken
+// from the caller: it follows the class the frame is stamped with.
+func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stripe.Chunk, _ bool) error {
 	if len(chunk.Data) == 0 {
 		// An empty final chunk carries no bytes; the FIN that follows the
 		// stream is what ends it.
 		return nil
 	}
-	if f.phased() {
-		// The phased class moves with the backlog, which acknowledgements
-		// change without any application read; re-examine before stamping,
-		// whether or not this lane asked a coding question at dispatch.
-		f.refreshClass()
-	}
+	// The phased class moves with the backlog, which acknowledgements change
+	// without any application read; re-examine before stamping, whether or
+	// not this lane asked a coding question at dispatch.
+	f.refreshClass()
 	frame := protocol.Frame{Header: protocol.Header{
 		Version: protocol.Version, Type: protocol.TypeData, SessionID: f.sessionID, FlowID: f.flowID,
 		Sequence: chunk.Offset, Class: f.sendClass(chunk.Sparse),
 	}, Payload: chunk.Data}
-	if f.phased() {
-		// The lane was chosen by the sticky class; the queue within it and
-		// the aggregate budget's interactive flag follow what this frame is.
-		bulk = frame.Header.Class == protocol.ClassBulk
-	}
+	// The lane was chosen by the sticky class; the queue within it and the
+	// aggregate budget's interactive flag follow what this frame is.
+	bulk := frame.Header.Class == protocol.ClassBulk
 	// Deliberately not retained here: the scheduler is holding this chunk until
 	// it is acknowledged, and is the thing that will re-issue it if this lane
 	// stops. Recording it again would put the same bytes under two limits.
@@ -688,7 +657,7 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 	queued := laneFrame{frame: frame, forceReliable: chunk.Reliable}
 	if sched := f.scheduler.Load(); sched != nil {
 		queued.onWritten = func(reliable bool) { sched.WroteAs(lane.id, chunk, reliable) }
-		if f.codedRetrySticky && !chunk.Reliable {
+		if !chunk.Reliable {
 			// The outcome can arrive after the chunk was acknowledged and its
 			// memory released, so the callback holds its identity, not its
 			// bytes.

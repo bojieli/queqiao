@@ -3,89 +3,29 @@ package pep
 import (
 	"context"
 	"sync"
-
-	"github.com/bojieli/queqiao/internal/classifier"
 )
 
-// Topology (design docs/DESIGN-PATH-AUTHORITY.md §7, §14 stage 7).
+// Topology (design docs/DESIGN-PATH-AUTHORITY.md §7).
 //
-// Under topology=single a client keeps every flow a stream on one preferred
-// QUIC connection per path: the pooled control generation. It never isolates
-// a bulk flow reactively, because the path controller's class arbitration
-// (§4.3), executed by the packet builder, already keeps bulk bytes from
-// trapping control and interactive work, which is what isolation bought with
-// a second connection and controller. Connections beyond the preferred one
-// exist only
-//
-//   - during a handover: a replacement control generation
-//     (supersedeSilentGeneration) beside the one it replaces;
-//   - for per-flow rescue, which still dials (stage 8 moves it to the carrier
-//     manager); and
-//   - for an explicit fan-out (ClientConfig.TopologyFanOut).
-//
-// Under congestion=path, which topology=single requires, every one of them
-// is an attachment to the same PathController, so none of them adds a
-// congestion controller or claims capacity.
+// A client keeps every flow a stream on one preferred QUIC connection per
+// path: the pooled control generation. It never isolates a bulk flow,
+// because the path controller's class arbitration (§4.3), executed by the
+// packet builder, keeps bulk bytes from trapping control and interactive
+// work, which is what isolation bought with a second connection and
+// controller. Connections beyond the preferred one exist only during a
+// handover, as the carrier manager's verified standby beside the carrier it
+// replaces, and each is an attachment to the same PathController, so none
+// adds a congestion controller or claims capacity. A fan-out across several
+// connections is not built: it would be a carrier-manager policy, triggered
+// by a measured single-connection ceiling (§16 Q3).
 //
 // An old client that isolates is the gateway's concern and needs nothing
 // here: the gateway attaches all of a device's data connections to one
-// controller (stage 6).
+// controller.
 
-// singleTopology reports whether this client keeps its flows on one
-// connection per path.
-func (c *Client) singleTopology() bool { return c.cfg.Topology == TopologySingle }
-
-// fanOutConnections is the number of connections an explicit fan-out may add
-// beside the preferred one: zero unless one was configured.
-func (c *Client) fanOutConnections() int {
-	if !c.singleTopology() || c.cfg.TopologyFanOut <= 1 {
-		return 0
-	}
-	return c.cfg.TopologyFanOut - 1
-}
-
-// secondConnectionWanted decides whether a flow's data should move from the
-// pooled connection to a secondary one, once the manager's own pacing (the
-// decision interval, the attempt budget and back-off) allows asking.
-//
-// Under topology=isolated this is today's reactive isolation: a BULK flow, or
-// one prewarmed as bulk, that shares the pooled connection with another flow.
-// Isolating a lone flow buys nothing and was measured to cost about 8 %.
-//
-// Under topology=single it is the fan-out hook and nothing else. The design
-// keeps fan-out as a carrier-manager policy that stays off until the
-// single-connection ceiling (one connection plateaued at 292 Mbit/s against
-// 536 for four on an unconstrained 200 ms path) is attributed, and leaves its
-// automatic trigger open (§16 Q3). So the only trigger built is the explicit
-// one: with a fan-out configured, a bulk flow that shares the generation of
-// the pooled connection it is on with another flow, within the fan-out's
-// connection budget (maxBulkConns). An automatic trigger belongs here, as a
-// further condition on a measured ceiling.
-//
-// Sharing is judged on the flow's own generation (generation reports it, nil
-// when the flow is not on a pooled stream; it is consulted only when a
-// fan-out is configured): after a handover a flow still draining on
-// the old generation does not share the replacement with a lone bulk flow,
-// and moving that flow would spend a handshake and the fan-out slot for
-// nothing. Isolation keeps today's client-wide count.
-func (c *Client) secondConnectionWanted(snapshot flowSnapshot, generation func() *controlQUICGeneration) bool {
-	if c.singleTopology() {
-		if c.fanOutConnections() == 0 {
-			return false
-		}
-		if g := generation(); g == nil || g.flows.Load() <= 1 {
-			return false
-		}
-	} else if c.quicPoolActive.Load() <= 1 {
-		// Isolation earns its cost only while another flow shares the
-		// control connection. A bulk transfer alone on it has nothing to
-		// protect, and moving it would spend a handshake and a fresh
-		// congestion window for no benefit: measured on an otherwise idle
-		// path that costs about 8% of bulk goodput.
-		return false
-	}
-	return snapshot.Class == classifier.ClassBulk || shouldPrewarmBulkLane(snapshot)
-}
+// maxWindowCreditConnections bounds MemoryLimits.MaxBulkConnections, the
+// preferred connection's receive-window credit in stream windows.
+const maxWindowCreditConnections = 8
 
 // flowGeneration is the pooled control generation the flow's control lane
 // is a stream on, or nil.
@@ -114,20 +54,10 @@ func laneGeneration(lane *mpLane) *controlQUICGeneration {
 }
 
 // controlLaneShared is a flow's per-chunk test for keeping its data off its
-// control lane once it has another lane (multipathFlow.isolateFromControlLane).
-//
-// With an explicit single-topology fan-out it judges sharing on the
-// generation the selected control lane is a stream on, as opening a fan-out
-// lane does (secondConnectionWanted): after a handover, a flow on the
-// replacement does not send a lone bulk flow's chunks back to its fan-out
-// lane because another flow still drains on the old generation. A control
-// lane on no pooled generation shares with nothing. Isolation keeps today's
-// client-wide count.
-func (c *Client) controlLaneShared(control *mpLane) bool {
-	if c.fanOutConnections() > 0 {
-		g := laneGeneration(control)
-		return g != nil && g.flows.Load() > 1
-	}
+// control lane once it has another lane (multipathFlow.isolateFromControlLane),
+// which on a client happens only for a flow handed to a TCP bundle: another
+// flow shares the pooled connection.
+func (c *Client) controlLaneShared(*mpLane) bool {
 	return c.quicPoolActive.Load() > 1
 }
 
@@ -219,12 +149,11 @@ func (h *creditHold) release() {
 // reservePreferredWindows returns the receive windows for a new preferred
 // (pooled control) connection, grown by the credit it was granted, and the
 // hold on that credit, which the caller binds to the connection once dialled
-// or releases if the dial fails. Without topology=single it is the configured
-// windows and a nil hold.
+// or releases if the dial fails.
 func (c *Client) reservePreferredWindows() (flowWindows, *creditHold) {
 	w := c.windows()
-	unopened := c.memoryLimits.maxBulkConnections - c.fanOutConnections()
-	if !c.singleTopology() || unopened <= 0 {
+	unopened := c.memoryLimits.maxBulkConnections
+	if unopened <= 0 {
 		return w, nil
 	}
 	_, _, streamMax, connectionMax, _ := w.resolved()

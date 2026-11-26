@@ -27,6 +27,7 @@ func TestTheFallbackGraceScalesTheMeasuredRoundTrip(t *testing.T) {
 	c := &Client{cfg: ClientConfig{
 		FallbackGrace: 2 * time.Second, FallbackGraceRTTFactor: 16, FallbackGraceMax: 30 * time.Second,
 	}}
+	attachTestCarriers(c)
 	c.observeLaneRTT(&measuredLane{rtt: 200 * time.Millisecond})
 	if got := c.fallbackGrace(); got != 3200*time.Millisecond {
 		t.Fatalf("a 200ms path got a %v grace, want 16 round trips (3.2s)", got)

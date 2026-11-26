@@ -254,16 +254,6 @@ type multipathFlow struct {
 	memoryLimits  flowMemoryLimits
 	sendMemory    *memlimit.Budget
 	receiveMemory *memlimit.Budget
-	// memOwned selects the owned-memory bundle (MemoryOwned).
-	memOwned bool
-	// codedRetrySticky selects the coded-retry bundle (CodedRetrySticky).
-	codedRetrySticky bool
-	// carrierRecovery is recovery=carrier (§10.4): the stall watchdog only
-	// observes missing credit and enforces the no-progress budget. It
-	// demotes no lane, requests no rescue and pins no coded frontier; coded
-	// attempts move to the stream by their own deadline (coded-retry=sticky),
-	// and a lost binding is the carrier manager's.
-	carrierRecovery bool
 	// carrierShadow is the endpoint's carrier-liveness observer, nil when it
 	// is off. It only records; nothing here reads what it computes.
 	carrierShadow *carrierShadow
@@ -331,12 +321,6 @@ type multipathFlow struct {
 	peerSampledWall  atomic.Int64 // wall-clock nanoseconds at that sample
 	// suspendClock reads the cumulative suspend time; nil reads the system's.
 	suspendClock func() (time.Duration, error)
-	// capacityRefusals counts consecutive rescue rounds the peer answered
-	// with its lane-admission ceiling. One answer is the ordinary loser of a
-	// rescue race; several in a row with no successful round between them are
-	// the signature of a wedged admission slot the peer cannot see, which is
-	// when the answer stops being treated as transient.
-	capacityRefusals atomic.Int64
 	// replacementAbandoned records that whatever opens replacement lanes for
 	// this flow has stopped: its attempt budget is spent, or its manager has
 	// returned. The grace exists to cover the time a replacement needs to
@@ -505,11 +489,6 @@ type multipathFlow struct {
 	// classBytes counts DATA payload this endpoint sent, by class byte (new,
 	// interactive, bulk) and substrate (stream, coded).
 	classBytes [3][2]atomic.Uint64
-	// codingRecoveryEnd bounds a stalled coded send's stream escape. Once the
-	// peer has acknowledged the bytes pending at detection, their recovery is
-	// complete. Newer exchanges remain eligible for coding while feedback is
-	// delayed, and each retry pins its own reliability at dispatch.
-	codingRecoveryEnd atomic.Uint64
 	// ackTrack answers "has this range arrived?", which is what clocks every
 	// lane. scheduler and sendCtx let a lane joined mid-flow start carrying
 	// data as soon as it is admitted.
@@ -768,9 +747,7 @@ func (f *multipathFlow) startLane(lane *mpLane) {
 	// asking for it.
 	lane.fc.setCodingPolicy(f.prefersCodingOverRetransmission)
 	lane.fc.setDataObserver(f.noteDataFrame)
-	if f.phased() {
-		lane.fc.setFrameCodingPolicy(f.frameCoding)
-	}
+	lane.fc.setFrameCodingPolicy(f.frameCoding)
 	if f.openConfirmationRequired.Load() {
 		lane.fc.setOpenSafetyPolicy(func() bool { return f.openConfirmationRequired.Load() })
 	}
@@ -1073,15 +1050,6 @@ func (f *multipathFlow) observeTransport(lanes []*mpLane) {
 		f.metrics.ObserveQUIC(f.telemetryID, observation)
 	}
 }
-
-// noteLaneCapacityRefusal records a rescue round the peer answered with its
-// lane-admission ceiling; resetLaneCapacityRefusals clears the streak on any
-// other round outcome, since only consecutive answers mark the desync.
-func (f *multipathFlow) noteLaneCapacityRefusal() { f.capacityRefusals.Add(1) }
-
-func (f *multipathFlow) resetLaneCapacityRefusals() { f.capacityRefusals.Store(0) }
-
-func (f *multipathFlow) laneCapacityRefusals() int64 { return f.capacityRefusals.Load() }
 
 func (f *multipathFlow) laneCount() int {
 	f.lanesMu.RLock()
@@ -2169,14 +2137,11 @@ func (f *multipathFlow) pendingOutbound() bool {
 	if pending {
 		return true
 	}
-	if f.memOwned {
-		// READY bytes hold a shared reservation and are owed dispatch. On
-		// main this predicate looks only at sent offsets and tracked chunks,
-		// so bytes read while no binding exists were waiting without a
-		// deadline (design §8.3).
-		if sched := f.scheduler.Load(); sched != nil && sched.HasReadyWork() {
-			return true
-		}
+	// READY bytes hold a shared reservation and are owed dispatch: bytes read
+	// while no binding exists wait under the no-progress deadline too (design
+	// §8.3).
+	if sched := f.scheduler.Load(); sched != nil && sched.HasReadyWork() {
+		return true
 	}
 	return false
 }
@@ -2208,12 +2173,15 @@ func scanStall(pending bool, progressNS int64, now time.Time, threshold time.Dur
 // failLane: failLane learns a lane is dead from an I/O error, which on a path
 // erasing one direction takes the transport's whole idle timeout of receive
 // silence. This watchdog instead measures forward progress -- the
-// acknowledged send offset moving -- and, finding none for three round trips
-// while work is pending, demotes the current data lane and
-// asks the lane manager for a rescue. It never fails a lane and never closes
-// anything: the suspected lane keeps receiving and is used again the moment
-// nothing healthier exists, and an acknowledgement arriving on it clears the
-// suspicion outright.
+// acknowledged send offset moving -- and enforces the flow's no-progress
+// budget. On a QUIC binding missing credit has no remedy here: a live stream
+// is delivering, and a lost binding or a dead carrier is the carrier
+// manager's (design §10.4). A flow on a TCP bundle keeps that bundle's own
+// stall rescue: finding no progress for three round trips while work is
+// pending, it demotes the current data lane and asks the bundle manager for a
+// rescue. It never fails a lane and never closes anything: the suspected lane
+// keeps receiving and is used again the moment nothing healthier exists, and
+// an acknowledgement arriving on it clears the suspicion outright.
 // An acknowledged request waiting for application data is not transport work:
 // long polling, server processing and one-way traffic may all stay quiet for
 // longer than three RTTs. Receive-only outages remain the transport's job to
@@ -2290,10 +2258,11 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		newEpisode := !episode
 		// The carrier manager owns QUIC bindings only; a flow on TCP keeps
 		// its bundle's own stall rescue.
-		if f.carrierRecovery && !hasTCPLane(f) {
+		if !hasTCPLane(f) {
 			// Unacknowledged bytes on a live stream: QUIC is delivering, the
 			// peer application is slow, or the ACK is in transit. None has a
-			// remedy between waiting and the no-progress budget above.
+			// remedy between waiting and the no-progress budget above; coded
+			// bytes move to the stream by their own registration deadline.
 			if newEpisode {
 				episode = true
 				f.noteCreditStall(threshold, sendSince)
@@ -2302,33 +2271,6 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 		}
 		if newEpisode {
 			episode = true
-			// An application stall is evidence against the current DATA substrate,
-			// even when QUIC itself keeps acknowledging packets. The server cannot
-			// dial a replacement lane, so merely queuing stallSignal leaves its
-			// response retrying on datagrams indefinitely. Existing outstanding
-			// unreliable attempts expire normally; their next dispatch is pinned
-			// to the authenticated stream by the scheduler's reliability snapshot.
-			// This escape lasts only until the bytes pending now are acknowledged:
-			// loss of feedback alone is not evidence against future coded DATA.
-			// Only those byte offsets escape; later exchanges remain coded.
-			if f.phased() {
-				// Under the phased classifier what the flow prefers now says
-				// nothing about what is pending: a BULK flow codes its sparse
-				// writes, and a flow that left BULK may have only stream data
-				// outstanding. The scheduler knows which chunks went coded.
-				if f.codedDataOutstanding() {
-					f.escapePendingCoding()
-				}
-			} else {
-				for _, lane := range f.healthyLanes() {
-					if lane.fc.codesData() {
-						f.escapePendingCoding()
-						break
-					}
-				}
-			}
-			// Coded bytes are pending only if the escape latched a frontier.
-			escapedCoding := f.codingRecoveryEnd.Load() != 0
 			// The shadow observer looks at the lane the watchdog demotes.
 			spare, shadowLane := f.suspectDataLanes()
 			if f.metrics != nil {
@@ -2345,7 +2287,7 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 					"bytes_up", f.bytesUp.Load(), "bytes_down", f.bytesDown.Load())
 			}
 			if f.carrierShadow != nil {
-				f.carrierShadow.noteStall(f, shadowLane, sendSince, threshold, escapedCoding, spare)
+				f.carrierShadow.noteStall(f, shadowLane, sendSince, threshold, false, spare)
 			}
 		}
 		// The manager's own backoff paces the dials; this pacing only keeps a
@@ -2401,31 +2343,6 @@ func (f *multipathFlow) failBinding(err error) {
 	default:
 	}
 	f.failClose(err)
-}
-
-// escapePendingCoding keeps the current stalled bytes on a reliable carrier
-// until the peer confirms their delivery. Capture under the ACK lock so an ACK
-// arriving between the watchdog's scan and this decision cannot leave an
-// already-completed recovery latched. Do not move an active recovery's frontier
-// forward with new data: the stall says nothing about that later traffic.
-func (f *multipathFlow) escapePendingCoding() {
-	f.replayMu.Lock()
-	defer f.replayMu.Unlock()
-	if f.codingRecoveryEnd.Load() != 0 || f.highestSent <= f.acked {
-		return
-	}
-	if f.ackTrack != nil && f.ackTrack.Covered(0, f.highestSent) {
-		return
-	}
-	f.codingRecoveryEnd.Store(f.highestSent)
-}
-
-// recoverChunkReliably is the byte-scoped part of the substrate decision.
-// Delayed ACKs for old data cannot put fresh exchanges behind a stream's head
-// of line. The scheduler snapshots this before queueing the write, preserving
-// reliable retries even when their acknowledgement races the writer.
-func (f *multipathFlow) recoverChunkReliably(offset uint64) bool {
-	return offset < f.codingRecoveryEnd.Load()
 }
 
 // suspectDataLanes marks the lanes currently carrying the flow's data as
@@ -2971,15 +2888,11 @@ func (f *multipathFlow) acknowledgeCoverage(sequence uint64, final bool, ranges 
 		f.ackTrack.Advance(sequence)
 		advanced = f.ackTrack.Add(ranges) || advanced
 	}
-	if advanced && f.phased() {
+	if advanced {
 		f.noteAckedCoverage()
 	}
 	if advanced {
 		f.noteCreditCovered()
-	}
-	if end := f.codingRecoveryEnd.Load(); end != 0 &&
-		(f.acked >= end || f.ackTrack != nil && f.ackTrack.Covered(0, end)) {
-		f.codingRecoveryEnd.Store(0)
 	}
 	if final && f.closeFrame != nil && f.closeFrame.Header.Sequence <= sequence {
 		f.closeFrame = nil
@@ -3814,12 +3727,8 @@ func (f *multipathFlow) observeLocked(n int, up, publish bool, bufLen int) bool 
 			// trial's class timeline can be rebuilt per flow and endpoint.
 			fields := []any{"session_id", fmt.Sprintf("%x", f.sessionID), "flow_id", f.flowID,
 				"from", oldClass, "to", newClass, "ever_bulk", f.everBulk.Load(), "age", age,
-				"recent_up", recentUp, "recent_down", recentDown, "phased", f.phased()}
-			if f.phased() {
-				// Acknowledged coverage is tracked only under the phased
-				// bundle, so the backlog means nothing on a legacy flow.
-				fields = append(fields, "send_backlog", obs.SendBacklog)
-			}
+				"recent_up", recentUp, "recent_down", recentDown, "phased", true,
+				"send_backlog", obs.SendBacklog}
 			f.logger.Debug("flow class changed", fields...)
 		}
 	}

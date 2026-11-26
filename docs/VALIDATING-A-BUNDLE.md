@@ -218,13 +218,11 @@ wins, as the client itself sees it, so enrollment uses the same interface.
 Arm flags are the section 14 switch names. Check `queqiaod client -h` on the
 candidate build.
 
-Since stage 10 both roles default to the path-authority bundle, so a build
-from after the flip with no switch flags runs the whole new architecture. An
-arm that means a stage's partial bundle, or the legacy bundle, starts from
-`--bundle=legacy` and adds the stage's switches, as the example campaigns
-do; it then means the same on a build from before or after the flip that
-knows `--bundle`. A build from before the flip does not know `--bundle`: give
-its arms the switches alone.
+Since stage 11 a build from `origin/main` has one architecture and no
+switches: the example campaigns compare the previous release (the legacy
+bundle) with it. Comparing the migration's partial bundles needs builds from
+before stage 11 with their switches; a build from stage 10 also takes
+`--bundle=legacy`.
 
 | Stage | Reference arm (`role = main`) | Candidate arm | Note |
 |---|---|---|---|
@@ -667,7 +665,8 @@ one release. Its gate is Gate 1 run on the release candidate:
   rollout takes.
 - **Legacy bundle.** The legacy bundle must still start and pass. Keep an arm
   on the candidate build with `--bundle=legacy`, so the rollback path is
-  measured in the same campaign.
+  measured in the same campaign. (This gate runs on the stage-10 build,
+  before stage 11 deletes the legacy bundle.)
 - **DC profile.** Because of the gate's outcome, `dc-long-haul` either moved
   at stage 9 or still runs the legacy bundle. Run its campaign again on the
   candidate either way.

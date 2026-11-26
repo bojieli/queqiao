@@ -30,8 +30,7 @@ func TestTheListenerDoesNotWaitOutASlowPrewarm(t *testing.T) {
 	}
 	client, err := NewClient(ClientConfig{
 		ListenAddr: listener.Addr().String(), RemoteAddr: silent.LocalAddr().String(),
-		Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: metrics.New(),
+		Credentials: roots, Transport: TransportQUIC, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: metrics.New(),
 	})
 	if err != nil {
 		t.Fatal(err)

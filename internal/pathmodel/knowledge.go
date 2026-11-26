@@ -4,7 +4,7 @@ package pathmodel
 // model as the leaf, with the tree's nodes above it supplying priors and
 // nothing else (docs/DESIGN-PATH-AUTHORITY.md §11.3).
 //
-// A Chain, which the legacy bundle uses, combines its nodes into a limit: the
+// The legacy bundle's chain combined its nodes into a limit: the
 // tightest node's share caps every member below it, and the largest erasure
 // anywhere on the chain sizes compensation and coding for as long as the flow
 // lives. Under the path authority neither is allowed. One authority per leaf
@@ -40,9 +40,6 @@ var _ Model = (*Knowledge)(nil)
 func SharedKnowledge(k Key, leaf *PathModel) *Knowledge {
 	if leaf == nil {
 		return nil
-	}
-	if k.Group != "" {
-		k.Group = GroupOf(k.Group)
 	}
 	keys := k.chainKeys()
 	kn := &Knowledge{leaf: leaf, ancestors: make([]*PathModel, 0, len(keys)), keys: keys}
@@ -103,10 +100,8 @@ func (k *Knowledge) Current() State {
 
 // prior is the leaf's state, with the confident ancestors' erasure, burst
 // factor and round trip standing in while the leaf is not itself confident.
-// Share and Seed are dropped in every case.
 func prior(leaf State, ancestors []State) State {
 	out := leaf
-	out.Share, out.Seed = 0, 0
 	if leaf.ObservedSamples >= confidentSamples {
 		return out
 	}

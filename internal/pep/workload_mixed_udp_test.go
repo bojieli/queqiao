@@ -186,7 +186,7 @@ type m5Direction struct {
 	lateness []time.Duration
 }
 
-// m5Outcome is one arm's M5 measures.
+// m5Outcome is one block's M5 measures.
 type m5Outcome struct {
 	audio        [2]m5Direction // uplink, downlink
 	keystrokes   []time.Duration
@@ -217,16 +217,19 @@ type m5Outcome struct {
 // bottleneck's own drops and the heavy flow's goodput are reported in their
 // place.
 //
-// Both arms run at once, each on its own client, gateway and emulated path:
-// 120 ms round trip, 20 Mbit/s behind a drop-tail queue, for 30 s. That is a
-// block. The measures follow the inner controller's sawtooth, so one block's
-// tail moves by a third from run to run in either arm and either direction,
-// as the design expects of a tail (§15.4 judges tails over blocks). The full
-// suite runs §15.4's sequential gate on each measure's per-block contrast:
-// 6 blocks, then one at a time to 12, passing when every lower bound clears
-// zero, failing when any upper bound falls below it, and failing as
-// inconclusive at the cap. -short runs one 8 s block as a smoke test: every keystroke echoed,
-// audio measured both ways, the heavy flow moving.
+// A block is one client, gateway and emulated path: 120 ms round trip,
+// 20 Mbit/s behind a drop-tail queue, for 30 s. The measures follow the inner
+// controller's sawtooth, so one block's tail moves by a third from run to
+// run in either direction, as the design expects of a tail (§15.4 judges
+// tails over blocks). The full suite runs §15.4's sequential gate on each
+// measure's per-block contrast: 6 blocks, then one at a time to 12, passing
+// when every lower bound clears zero, failing when any upper bound falls
+// below it, and failing as inconclusive at the cap. Until stage 11 each block
+// also ran the legacy bundle and the contrast was paired with it; the
+// contrast is now against legacy's mean over the blocks measured at stage 10,
+// before the legacy bundle was deleted (m5Check.legacy). -short runs one 8 s
+// block as a smoke test: every keystroke echoed, audio measured both ways,
+// the heavy flow moving.
 func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 	requireStableImpairmentClock(t)
 	const playout = 150 * time.Millisecond
@@ -241,57 +244,48 @@ func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 	t.Cleanup(func() { _ = echoListener.Close() })
 	go echoDestination(echoListener)
 
-	arms := workloadArms()
-	checks := []m5Check{
-		{"uplink audio late loss (%)", 0, 1, 0.005, 100},
-		{"downlink audio late loss (%)", 1, 1, 0.005, 100},
-		{"uplink audio lateness p99 (ms)", 2, 1.10, 0.010, 1000},
-		{"downlink audio lateness p99 (ms)", 3, 1.10, 0.010, 1000},
-		{"keystroke echo p99 (ms)", 4, 1.10, 0.020, 1000},
-	}
-	// measures[arm] holds, per block: late fraction up, late fraction down,
+	checks := m5Checks
+	// measures holds, per block: late fraction up, late fraction down,
 	// lateness p99 up, lateness p99 down, keystroke echo p99.
-	measures := make([][5][]float64, len(arms))
+	var measures [5][]float64
 	for block := range maxBlocks {
 		// A subtest per block, so each block's clients, gateways and paths
 		// are torn down before the next starts.
-		var outcomes []m5Outcome
+		var outcome *m5Outcome
 		if !t.Run(fmt.Sprintf("block%d", block), func(t *testing.T) {
-			outcomes = runM5Block(t, echoListener.Addr().String(), measure, playout)
+			outcome = runM5Block(t, echoListener.Addr().String(), measure, playout)
 		}) {
 			t.FailNow()
 		}
-		if outcomes == nil {
+		if outcome == nil {
 			continue // not selected by -run
 		}
-		for i, arm := range arms {
-			o := outcomes[i]
-			for d, name := range []string{"uplink", "downlink"} {
-				a := o.audio[d]
-				t.Logf("block %d, %s %s audio: %d of %d late or lost, lateness p99 %v", block, arm.name, name, a.late, a.sent,
-					durationQuantile(a.lateness, 0.99).Round(time.Millisecond))
-				if len(a.lateness) == 0 {
-					t.Fatalf("%s: no %s audio arrived", arm.name, name)
-				}
-				measures[i][d] = append(measures[i][d], float64(a.late)/float64(a.sent))
-				measures[i][2+d] = append(measures[i][2+d], durationQuantile(a.lateness, 0.99).Seconds())
+		o := outcome
+		for d, name := range []string{"uplink", "downlink"} {
+			a := o.audio[d]
+			t.Logf("block %d, %s audio: %d of %d late or lost, lateness p99 %v", block, name, a.late, a.sent,
+				durationQuantile(a.lateness, 0.99).Round(time.Millisecond))
+			if len(a.lateness) == 0 {
+				t.Fatalf("no %s audio arrived", name)
 			}
-			t.Logf("block %d, %s: keystroke echo p99 %v over %d; heavy goodput %.2f Mbit/s; bottleneck drops %d",
-				block, arm.name, durationQuantile(o.keystrokes, 0.99).Round(time.Millisecond), len(o.keystrokes),
-				o.heavyGoodput*8/1e6, o.pathDrops)
-			measures[i][4] = append(measures[i][4], durationQuantile(o.keystrokes, 0.99).Seconds())
-			// A heavy flow that stalled would leave the thin flows nothing
-			// to compete with: the measurement would not be M5.
-			if o.heavyGoodput < 1e6/8 || o.heavyGap > 2*time.Second {
-				t.Fatalf("%s: the heavy download moved %.2f Mbit/s during the measurements and stopped for up to %v",
-					arm.name, o.heavyGoodput*8/1e6, o.heavyGap.Round(time.Millisecond))
-			}
+			measures[d] = append(measures[d], float64(a.late)/float64(a.sent))
+			measures[2+d] = append(measures[2+d], durationQuantile(a.lateness, 0.99).Seconds())
 		}
-		n := len(measures[0][0])
+		t.Logf("block %d: keystroke echo p99 %v over %d; heavy goodput %.2f Mbit/s; bottleneck drops %d",
+			block, durationQuantile(o.keystrokes, 0.99).Round(time.Millisecond), len(o.keystrokes),
+			o.heavyGoodput*8/1e6, o.pathDrops)
+		measures[4] = append(measures[4], durationQuantile(o.keystrokes, 0.99).Seconds())
+		// A heavy flow that stalled would leave the thin flows nothing to
+		// compete with: the measurement would not be M5.
+		if o.heavyGoodput < 1e6/8 || o.heavyGap > 2*time.Second {
+			t.Fatalf("the heavy download moved %.2f Mbit/s during the measurements and stopped for up to %v",
+				o.heavyGoodput*8/1e6, o.heavyGap.Round(time.Millisecond))
+		}
+		n := len(measures[0])
 		if testing.Short() || n < minBlocks || n != block+1 {
 			continue // too few blocks to look, or -run selected some only
 		}
-		if !judgeComparisons(t) {
+		if !judgeBounds(t) {
 			return
 		}
 		// Design §15.4's sequential gate, at its frozen look levels: pass
@@ -305,17 +299,33 @@ func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 			return
 		}
 	}
-	if n := len(measures[0][0]); !testing.Short() && n > 0 && n < minBlocks {
+	if n := len(measures[0]); !testing.Short() && n > 0 && n < minBlocks {
 		t.Logf("%d of %d blocks selected by -run: not judged", n, minBlocks)
 	}
 }
 
-// m5Check is one M5 measure and its bound: flip ≤ m × legacy + a.
+// m5Check is one M5 measure and its bound: at most m × legacy + a, where
+// legacy is the legacy bundle's mean over the blocks measured at stage 10.
 type m5Check struct {
 	name    string
 	measure int
 	m, a    float64
 	unit    float64 // for the message: 100 for %, 1000 for ms
+	legacy  float64
+}
+
+// m5Checks are the model's bounds (W7, W6) against legacy's means over 21
+// blocks measured at stage 10, on a 32-core Linux host: 2.19 % and 2.60 % of
+// audio late or lost, lateness p99 of 224 ms and 289 ms, keystroke echo p99
+// of 341 ms. Paired with those blocks, the path-authority bundle was not
+// decided either way at the cap on the audio measures: its uplink lateness
+// p99 ran at 223 to 249 ms, beside a bound of 257.
+var m5Checks = []m5Check{
+	{"uplink audio late loss (%)", 0, 1, 0.005, 100, 0.0219},
+	{"downlink audio late loss (%)", 1, 1, 0.005, 100, 0.0260},
+	{"uplink audio lateness p99 (ms)", 2, 1.10, 0.010, 1000, 0.2242},
+	{"downlink audio lateness p99 (ms)", 3, 1.10, 0.010, 1000, 0.2892},
+	{"keystroke echo p99 (ms)", 4, 1.10, 0.020, 1000, 0.3406},
 }
 
 type m5Verdict int
@@ -331,31 +341,31 @@ const (
 // 0.0162; scripts/ab_stats.py spending_levels) at n − 1 degrees of freedom.
 var m5LookT = map[int]float64{6: 2.395, 7: 2.669, 8: 2.637, 9: 2.581, 10: 2.526, 11: 2.478, 12: 2.433}
 
-// judgeM5 applies the per-block contrast d = (m × legacy + a) − flip of
+// judgeM5 applies the per-block contrast d = (m × legacy + a) − measured of
 // each check at the look after n blocks.
-func judgeM5(t testing.TB, checks []m5Check, measures [][5][]float64, n int, last bool) m5Verdict {
+func judgeM5(t testing.TB, checks []m5Check, measures [5][]float64, n int, last bool) m5Verdict {
 	t.Helper()
 	tq := m5LookT[n]
 	allPass, anyFail := true, false
 	for _, c := range checks {
 		d := make([]float64, n)
 		for b := range n {
-			d[b] = c.m*measures[0][c.measure][b] + c.a - measures[1][c.measure][b]
+			d[b] = c.m*c.legacy + c.a - measures[c.measure][b]
 		}
 		mean, se := meanAndSE(d)
 		lower, upper := mean-tq*se, mean+tq*se
-		t.Logf("look %d, %s: legacy %v, flip %v; contrast mean %.3g, bounds [%.3g, %.3g]",
-			n, c.name, scaled(measures[0][c.measure], c.unit), scaled(measures[1][c.measure], c.unit),
+		t.Logf("look %d, %s: legacy %.1f, measured %v; contrast mean %.3g, bounds [%.3g, %.3g]",
+			n, c.name, c.legacy*c.unit, scaled(measures[c.measure], c.unit),
 			mean*c.unit, lower*c.unit, upper*c.unit)
 		if upper < 0 {
 			anyFail = true
-			t.Errorf("%s: the flip bundle exceeds legacy × %.2f + %.3g (contrast upper bound %.3g after %d blocks)",
+			t.Errorf("%s: exceeds legacy × %.2f + %.3g (contrast upper bound %.3g after %d blocks)",
 				c.name, c.m, c.a*c.unit, upper*c.unit, n)
 		}
 		if lower <= 0 {
 			allPass = false
 			if last && upper >= 0 {
-				t.Errorf("%s: no evidence after %d blocks that the flip bundle is within legacy × %.2f + %.3g (contrast lower bound %.3g)",
+				t.Errorf("%s: no evidence after %d blocks that it is within legacy × %.2f + %.3g (contrast lower bound %.3g)",
 					c.name, n, c.m, c.a*c.unit, lower*c.unit)
 			}
 		}
@@ -396,41 +406,22 @@ func scaled(values []float64, unit float64) []float64 {
 	return out
 }
 
-// runM5Block runs one M5 block: both arms at once, each on a fresh client,
-// gateway, emulated path and far ends.
-func runM5Block(t *testing.T, echo string, measure, playout time.Duration) []m5Outcome {
+// runM5Block runs one M5 block on a fresh client, gateway, emulated path
+// and far ends.
+func runM5Block(t *testing.T, echo string, measure, playout time.Duration) *m5Outcome {
 	t.Helper()
 	path := pathsim.Config{OneWayDelay: 60 * time.Millisecond, Seed: 5, RateBytesPerSec: 20e6 / 8}
-	arms := workloadArms()
-	rigs := make([]*workloadRig, len(arms))
-	servers := make([]*innerQUICServer, len(arms))
-	fars := make([]*audioFarEnd, len(arms))
-	for i, arm := range arms {
-		rigs[i] = newWorkloadRig(t, path, arm, nil)
-		servers[i] = newInnerQUICServer(t)
-		fars[i] = newAudioFarEnd(t, int(measure/audioInterval))
-	}
-	outcomes := make([]m5Outcome, len(arms))
-	errs := make(chan error, len(arms))
-	var wg sync.WaitGroup
-	for i, arm := range arms {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := runM5Arm(t, rigs[i], servers[i], fars[i], echo, measure, playout, &outcomes[i]); err != nil {
-				errs <- fmt.Errorf("%s: %w", arm.name, err)
-			}
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
+	rig := newWorkloadRig(t, path, pathAuthorityArm, nil)
+	server := newInnerQUICServer(t)
+	far := newAudioFarEnd(t, int(measure/audioInterval))
+	var o m5Outcome
+	if err := runM5Arm(t, rig, server, far, echo, measure, playout, &o); err != nil {
 		t.Fatal(err)
 	}
-	return outcomes
+	return &o
 }
 
-// runM5Arm runs one arm's M5: the thin endpoints are set up first, then the
+// runM5Arm runs one block's M5: the thin endpoints are set up first, then the
 // heavy download starts and fills the path, then the call and the keystrokes
 // run while the download's progress is counted. Every worker it starts has
 // ended when it returns.
@@ -579,34 +570,33 @@ func runKeystrokes(conn net.Conn, d time.Duration) ([]time.Duration, error) {
 // noise that never settles (which fails at the cap) all come out as §15.4
 // says.
 func TestM5SequentialGateNeedsEvidenceToPass(t *testing.T) {
-	checks := []m5Check{{"lateness (ms)", 0, 1.10, 0.010, 1000}}
-	series := func(legacy, flip []float64) [][5][]float64 {
-		m := make([][5][]float64, 2)
-		m[0][0], m[1][0] = legacy, flip
+	checks := []m5Check{{"lateness (ms)", 0, 1.10, 0.010, 1000, 0.200}}
+	series := func(measured []float64) (m [5][]float64) {
+		m[0] = measured
 		return m
 	}
 	same := []float64{0.200, 0.210, 0.190, 0.205, 0.195, 0.200}
 	better := []float64{0.150, 0.160, 0.155, 0.150, 0.158, 0.152}
 	worse := []float64{0.300, 0.310, 0.290, 0.305, 0.295, 0.300}
-	// Equal arms clear the 10 % + 10 ms margin.
-	if v := judgeM5(t, checks, series(same, same), 6, false); v != m5Pass {
-		t.Errorf("equal arms: verdict %d, want pass", v)
+	// Legacy's own level clears the 10 % + 10 ms margin.
+	if v := judgeM5(t, checks, series(same), 6, false); v != m5Pass {
+		t.Errorf("at legacy's level: verdict %d, want pass", v)
 	}
-	if v := judgeM5(t, checks, series(same, better), 6, false); v != m5Pass {
-		t.Errorf("a better flip arm: verdict %d, want pass", v)
+	if v := judgeM5(t, checks, series(better), 6, false); v != m5Pass {
+		t.Errorf("better than legacy: verdict %d, want pass", v)
 	}
 	inner := &quietTB{TB: t}
-	if v := judgeM5(inner, checks, series(same, worse), 6, false); v != m5Fail {
-		t.Errorf("a clearly worse flip arm: verdict %d, want fail", v)
+	if v := judgeM5(inner, checks, series(worse), 6, false); v != m5Fail {
+		t.Errorf("clearly worse than legacy: verdict %d, want fail", v)
 	}
-	// A flip arm right at the bound with block-to-block noise is
-	// undecided before the cap and fails at it.
+	// Right at the bound with block-to-block noise is undecided before the
+	// cap and fails at it.
 	edge := []float64{0.260, 0.180, 0.290, 0.170, 0.250, 0.200}
-	if v := judgeM5(inner, checks, series(same, edge), 6, false); v != m5Undecided {
-		t.Errorf("a noisy flip arm at the bound: verdict %d, want undecided", v)
+	if v := judgeM5(inner, checks, series(edge), 6, false); v != m5Undecided {
+		t.Errorf("noisy at the bound: verdict %d, want undecided", v)
 	}
-	if v := judgeM5(inner, checks, series(same, edge), 6, true); v != m5Fail {
-		t.Errorf("a noisy flip arm at the cap: verdict %d, want fail", v)
+	if v := judgeM5(inner, checks, series(edge), 6, true); v != m5Fail {
+		t.Errorf("noisy at the cap: verdict %d, want fail", v)
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +35,7 @@ func TestCompletedLaneJoinCarriesReplacementHint(t *testing.T) {
 	}()
 	ctx := context.WithValue(context.Background(), laneReplacementContextKey{}, laneReplacementHint{id: 0})
 	client := &Client{cfg: ClientConfig{HandshakeTimeout: time.Second}}
+	attachTestCarriers(client)
 	if _, err := client.completeLaneJoin(ctx, &authenticatedLane{
 		fc: newFrameConn(local), outer: local, sessionID: [16]byte{1}, kind: TransportQUIC, laneID: 9,
 	}, 7, 0); err != nil {
@@ -81,6 +81,7 @@ func TestCompleteLaneJoinMapsResetCodesToRetryPolicy(t *testing.T) {
 				}, Payload: session.ResetPayload(test.code, "refused")})
 			}()
 			client := &Client{cfg: ClientConfig{Logger: logger, HandshakeTimeout: 2 * time.Second}}
+			attachTestCarriers(client)
 			_, err := client.completeLaneJoin(context.Background(), &authenticatedLane{
 				fc: newFrameConn(local), outer: local, sessionID: [16]byte{1}, kind: TransportQUIC, laneID: 1,
 			}, 7, 0)
@@ -135,8 +136,7 @@ func newJoinTestRig(t *testing.T, clientTransport, initialKind TransportKind, tc
 
 	client, err := NewClient(ClientConfig{
 		ListenAddr: "127.0.0.1:0", RemoteAddr: serverListener.Addr().String(),
-		Credentials: roots, Transport: clientTransport, EnableQUICPool: true,
-		FallbackDelay: 100 * time.Millisecond, FallbackGrace: 2 * time.Second,
+		Credentials: roots, Transport: clientTransport, FallbackDelay: 100 * time.Millisecond, FallbackGrace: 2 * time.Second,
 		DialTimeout: 2 * time.Second, HandshakeTimeout: 2 * time.Second, Logger: logger,
 	})
 	if err != nil {
@@ -163,218 +163,4 @@ func newJoinTestRig(t *testing.T, clientTransport, initialKind TransportKind, tc
 		_ = packetConn.Close()
 	})
 	return rig
-}
-
-// A peer that answers a rescue JOIN with "flow switched to TCP fallback" is
-// stating a permanent fact about the flow. An AUTO client must take it at its
-// word and commit to TCP at once, not spend the replacement grace on QUIC
-// retries the peer has already ruled out.
-func TestAutoRecoveryCommitsToTCPWhenPeerSaysFlowIsOnTCP(t *testing.T) {
-	rig := newJoinTestRig(t, TransportAuto, TransportTCP, 1)
-	flow := newGraceTestFlow(t)
-	flow.reserveControlLane = true
-	if err := flow.addLane(isolationLane(t, 0)); err != nil {
-		t.Fatal(err)
-	}
-	lane, err := rig.client.openRescueLane(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lane.kind != TransportTCP {
-		t.Fatalf("recovery lane transport = %s, want TCP", lane.kind)
-	}
-}
-
-// Once the QUIC race has exhausted its candidates, AUTO can hand off to TCP
-// immediately; repeating the same capacity refusal adds no useful evidence.
-func TestCapacityAnswerLetsAutoCommitToTCPImmediately(t *testing.T) {
-	rig := newJoinTestRig(t, TransportAuto, TransportQUIC, 4)
-	// Fill the ceiling with lanes too young to evict, so every JOIN is
-	// answered with the transient capacity refusal. The ids stay clear of the
-	// ones the client flow allocates for its JOINs.
-	control := isolationLane(t, 7)
-	control.control = true
-	if err := rig.serverSess.addLane(control); err != nil {
-		t.Fatal(err)
-	}
-	if err := rig.serverSess.addLane(isolationLane(t, 8)); err != nil {
-		t.Fatal(err)
-	}
-	flow := newGraceTestFlow(t)
-	flow.reserveControlLane = true
-	if err := flow.addLane(isolationLane(t, 0)); err != nil {
-		t.Fatal(err)
-	}
-	lane, err := rig.client.openRescueLane(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lane.kind != TransportTCP {
-		t.Fatalf("recovery lane transport = %s, want immediate TCP handoff", lane.kind)
-	}
-	if !rig.serverSess.tcpMode {
-		t.Fatal("server flow did not commit to TCP")
-	}
-}
-
-// A successful round is what makes the capacity answer believable again:
-// whatever the streak was before, it restarts from zero.
-func TestSuccessfulRescueRoundResetsTheCapacityStreak(t *testing.T) {
-	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
-	flow := newGraceTestFlow(t)
-	flow.reserveControlLane = true
-	if err := flow.addLane(isolationLane(t, 0)); err != nil {
-		t.Fatal(err)
-	}
-	flow.noteLaneCapacityRefusal()
-	if err := rig.client.runRescueRound(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID); err != nil {
-		t.Fatal(err)
-	}
-	if got := flow.laneCapacityRefusals(); got != 0 {
-		t.Fatalf("capacity streak after a successful round = %d, want 0", got)
-	}
-}
-
-// The stall-rescue loop believes the transient capacity answer only so many
-// consecutive times: at the recovery-attempt cap with no successful round
-// between, the flow is marked unresumable and the manager stops, so the
-// application reconnects on a fresh flow instead of retrying for the flow's
-// life.
-func TestStallRescueGivesUpAfterConsecutiveCapacityRefusals(t *testing.T) {
-	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
-	control := isolationLane(t, 7)
-	control.control = true
-	if err := rig.serverSess.addLane(control); err != nil {
-		t.Fatal(err)
-	}
-	if err := rig.serverSess.addLane(isolationLane(t, 8)); err != nil {
-		t.Fatal(err)
-	}
-	flow := newGraceTestFlow(t)
-	flow.reserveControlLane = true
-	if err := flow.addLane(isolationLane(t, 0)); err != nil {
-		t.Fatal(err)
-	}
-	for range maxLaneRecoveryAttempts - 1 {
-		flow.noteLaneCapacityRefusal()
-	}
-	done := make(chan struct{})
-	go func() {
-		rig.client.manageQUICLanes(context.Background(), flow, rig.serverFlow.sessionID, rig.serverFlow.flowID)
-		close(done)
-	}()
-	flow.stallSignal <- struct{}{}
-	select {
-	case <-done:
-	case <-time.After(15 * time.Second):
-		t.Fatal("lane manager kept rescuing after the capacity answer persisted")
-	}
-	if !flow.resumeRefused.Load() {
-		t.Fatal("consecutive capacity refusals did not mark the flow unresumable")
-	}
-	if !flow.doneChanClosed() {
-		t.Fatal("exhausted stall rescue left the application connection open")
-	}
-}
-
-func TestStallRescueRejectionClosesApplicationConnection(t *testing.T) {
-	rig := newJoinTestRig(t, TransportQUIC, TransportQUIC, 1)
-	inner, application := net.Pipe()
-	t.Cleanup(func() { _ = inner.Close(); _ = application.Close() })
-	// The transport still looks alive locally, but the gateway has forgotten
-	// this session. The application must not wait for the transport timeout.
-	flow := newMultipathFlow(context.Background(), inner, [16]byte{99}, 7,
-		defaultChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, nil, nil)
-	t.Cleanup(flow.closeAll)
-	flow.reserveControlLane = true
-	if err := flow.addLane(isolationLane(t, 0)); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	runDone := make(chan struct{})
-	go func() {
-		_, _ = flow.run(ctx)
-		close(runDone)
-	}()
-	done := make(chan struct{})
-	go func() {
-		rig.client.manageQUICLanes(ctx, flow, flow.sessionID, flow.flowID)
-		close(done)
-	}()
-	flow.stallSignal <- struct{}{}
-	select {
-	case <-done:
-	case <-ctx.Done():
-		t.Fatal("rejected rescue did not return")
-	}
-	if !flow.resumeRefused.Load() {
-		t.Fatal("peer did not reject the missing session")
-	}
-	_ = application.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-	if _, err := application.Read(make([]byte, 1)); err != io.EOF {
-		t.Fatalf("application read = %v, want immediate EOF after terminal rescue refusal", err)
-	}
-	select {
-	case <-runDone:
-	case <-ctx.Done():
-		t.Fatal("terminal rescue refusal left the flow workers running")
-	}
-}
-
-// A QUIC manager with a lost unpooled lane first makes a real TCP handoff.
-// Its TCP stream remains open while the flow has unacknowledged bytes.
-// The actual watchdog and manager must negotiate a fresh stream at both ends.
-func TestSingleTCPStallAfterQUICHandoff(t *testing.T) {
-	rig := newJoinTestRig(t, TransportAuto, TransportQUIC, 1)
-	log := &progressTestLog{}
-	rig.client.cfg.Logger = slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	flow := newGraceTestFlow(t)
-	flow.stallScan = 5 * time.Millisecond
-	flow.stallGrace = 100 * time.Millisecond
-	original := isolationLane(t, 0)
-	if err := flow.addLane(original); err != nil {
-		t.Fatal(err)
-	}
-	if err := rig.serverSess.addLane(isolationLane(t, 0)); err != nil {
-		t.Fatal(err)
-	}
-	flow.closeFailedLane(original)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		rig.client.manageQUICLanes(ctx, flow, rig.serverFlow.sessionID, rig.serverFlow.flowID)
-	}()
-	defer func() { cancel(); <-done; flow.closeAll() }()
-	waitTCP := func(previous *mpLane) *mpLane {
-		t.Helper()
-		deadline := time.Now().Add(8 * time.Second)
-		for time.Now().Before(deadline) {
-			lanes := flow.healthyLanes()
-			if len(lanes) == 1 && lanes[0].kind == TransportTCP && lanes[0] != previous {
-				return lanes[0]
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		t.Fatalf("single TCP lane did not become available: %s", log.String())
-		return nil
-	}
-	first := waitTCP(nil)
-	deadline := time.Now().Add(4 * time.Second)
-	for !strings.Contains(log.String(), "flow handed off to TCP fallback") {
-		if time.Now().After(deadline) {
-			t.Fatal("manager did not hand off the flow to TCP")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	flow.noteSent(0, 64)
-	stopWatch := make(chan struct{})
-	defer close(stopWatch)
-	go flow.stallWatchdog(stopWatch)
-	next := waitTCP(first)
-	peer := rig.serverFlow.healthyLanes()
-	if !first.closed.Load() || len(peer) != 1 || peer[0].id != next.id {
-		t.Fatalf("replacement mismatch: old closed=%v client=%d peer=%v", first.closed.Load(), next.id, peer)
-	}
 }

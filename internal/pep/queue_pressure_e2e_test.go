@@ -19,12 +19,9 @@ import (
 // through one 300 Mbit/s, 53 ms link with a buffer of one bandwidth-delay
 // product. Competing traffic on a real path includes other users' flows, so a
 // sender may take its share of the link but must not hold the shared queue
-// full, nor leave a legacy or a loss-based (NewReno) competitor less than
-// today's legacy sender leaves it.
-
-// dcRenoArm is the legacy bundle on the QUIC implementation's stock
-// controller, NewReno with a 0.7 backoff: the loss-based competitor.
-var dcRenoArm = dcArm{name: "reno", legacy: true, congestion: CongestionReno}
+// full. Until stage 11 this also reported a path authority beside a legacy
+// sender and beside a loss-based (NewReno) one; an endpoint can no longer be
+// configured as either.
 
 const (
 	qpFlowsPerSender = 2
@@ -47,14 +44,15 @@ type qpResult struct {
 
 func (r qpResult) share(i int) float64 { return r.mbps[i] / (r.mbps[0] + r.mbps[1]) }
 
-func runQueuePressure(t *testing.T, a, b dcArm) qpResult {
+func runQueuePressure(t *testing.T) qpResult {
 	t.Helper()
+	a, b := dcNewArm, dcNewArm
 	bed := newDCBed(t, a)
 	defer bed.close()
 	leg := qpLeg()
 	link := pathsim.NewBottleneck(leg)
 	attach := func(listen, target string) (*pathsim.Relay, error) { return link.Attach(listen, target, leg) }
-	leaves := [2]*dcLeaf{bed.leafAs(1, a, attach), bed.leafAs(2, b, attach)}
+	leaves := [2]*dcLeaf{bed.leaf(1, attach), bed.leaf(2, attach)}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	var got [2]atomic.Int64
@@ -173,46 +171,29 @@ func (r qpResult) String() string {
 // 24% there; with it, 0.1 to 0.3%.
 const qpSelfDropMax = 0.05
 
-// TestSharedBottleneckQueuePressure reports, for each pairing, the standing
-// queue the two senders hold at a shared link and the share each takes, and
-// fails if two path authorities overflow the queue they share.
+// TestSharedBottleneckQueuePressure reports the standing queue two path
+// authorities hold at a shared link and the share each takes, and fails if
+// they overflow the queue they share.
 //
-// QQ_QP_ALL=1 adds the pairings without a path authority, for reference;
-// QQ_QP_PAIR=a/b runs one pairing, QQ_QP_REPEAT=n repeats each,
-// QQ_QP_WINDOW sets the measured window (NewReno adds a packet a round trip,
-// so it needs minutes to find its share at this bandwidth-delay product) and QQ_QP_TELEMETRY how often
-// the controllers' state is sampled for go test -v.
+// QQ_QP_REPEAT=n repeats the run, QQ_QP_WINDOW sets the measured window and
+// QQ_QP_TELEMETRY how often the controllers' state is sampled for go test -v.
 func TestSharedBottleneckQueuePressure(t *testing.T) {
 	requireDCBed(t)
-	pairs := [][2]dcArm{
-		{dcNewArm, dcNewArm},
-		{dcNewArm, dcLegacyArm},
-		{dcNewArm, dcRenoArm},
-	}
-	if os.Getenv("QQ_QP_ALL") != "" {
-		pairs = append(pairs, [2]dcArm{dcLegacyArm, dcLegacyArm}, [2]dcArm{dcLegacyArm, dcRenoArm})
-	}
-	only := os.Getenv("QQ_QP_PAIR")
 	repeat := 1
 	if n, err := strconv.Atoi(os.Getenv("QQ_QP_REPEAT")); err == nil && n > 1 {
 		repeat = n
 	}
-	for _, p := range pairs {
-		if only != "" && only != p[0].name+"/"+p[1].name {
-			continue
+	for range repeat {
+		r := runQueuePressure(t)
+		t.Logf("PAIR %s", r)
+		if testing.Verbose() {
+			for _, line := range r.telemetry {
+				t.Log("  " + line)
+			}
 		}
-		for range repeat {
-			r := runQueuePressure(t, p[0], p[1])
-			t.Logf("PAIR %s", r)
-			if testing.Verbose() {
-				for _, line := range r.telemetry {
-					t.Log("  " + line)
-				}
-			}
-			if p[0] == dcNewArm && p[1] == dcNewArm && r.dropRate() > qpSelfDropMax {
-				t.Errorf("two path authorities lost %.1f%% of their packets to the queue they share (bound %.0f%%)",
-					100*r.dropRate(), 100*qpSelfDropMax)
-			}
+		if r.dropRate() > qpSelfDropMax {
+			t.Errorf("two path authorities lost %.1f%% of their packets to the queue they share (bound %.0f%%)",
+				100*r.dropRate(), 100*qpSelfDropMax)
 		}
 	}
 }

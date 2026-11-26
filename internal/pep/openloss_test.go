@@ -32,6 +32,7 @@ func TestPoolRotationGraceEndsOnProofCloseOrDeadline(t *testing.T) {
 	deadline := time.Unix(100, 0)
 	g := &controlQUICGeneration{borrowers: 2, pendingOpens: make(map[*controlPoolStreamConn]pendingOpen)}
 	c := &Client{}
+	attachTestCarriers(c)
 	stream := &proofReadQUICStream{read: func(buf []byte) (int, error) { return copy(buf, "x"), nil }}
 	proved := &controlPoolStreamConn{owner: c, generation: g, quicStreamConn: &quicStreamConn{stream: stream}}
 	closing := &controlPoolStreamConn{owner: c, generation: g, quicStreamConn: &quicStreamConn{stream: &closeTrackingQUICStream{}}}

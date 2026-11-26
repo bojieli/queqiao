@@ -288,7 +288,7 @@ func udpAssociationOver(t *testing.T, path pathsim.Config, onStream bool) (*net.
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: relay.LocalAddr(),
 		Credentials: roots, Transport: TransportQUIC,
-		EnableQUICPool: true, Logger: logger,
+		Logger:  logger,
 		Metrics: metrics.New(), UDPOnStream: onStream,
 	})
 	if err != nil {

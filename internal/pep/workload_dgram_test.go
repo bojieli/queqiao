@@ -57,17 +57,20 @@ func oneShotAnswer(request []byte) []byte {
 // and reused associations separately.
 //
 // Bound (model W11): fraction over 1 s ≤ legacy + 0.5 pp, per kind, as a
-// count. One query there is several points at -short's size, so -short
-// is a smoke test that each kind is answered.
+// count. Legacy answered every query of each kind within 1 s on this path
+// (0 of 100, measured at stage 10 before the legacy bundle was deleted), and
+// 0.5 pp of 100 queries is less than one query, so the frozen bound is
+// oneShotOverLimit: one query of a hundred, the smallest allowance a count
+// can express above none. One query is several points at -short's size, so
+// -short is a smoke test that each kind is answered.
 //
 // The path is a long-haul shape at a modest size: 120 ms round trip, 10 %
 // random loss each way, a policed 20 Mbit/s. Queries run one at a time, the
 // next starting when the last is answered or reaches the 1 s retry: fresh
 // and reused associations share the tunnel's coded symbol stream, so a later
 // query in flight could reveal a lost tail that the tunnel must repair on its
-// own. Queries are one a second, the model's cadence, and both arms run at
-// once on their own paths. The full suite sends 200; -short sends 16 and
-// reports.
+// own. Queries are one a second, the model's cadence. The full suite sends
+// 200; -short sends 16 and reports.
 func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 	requireStableImpairmentClock(t)
 	queries := 200
@@ -79,56 +82,40 @@ func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 		RateBytesPerSec: 20e6 / 8, PolicerRefillPeriod: 8 * time.Millisecond,
 	}
 
-	arms := workloadArms()
-	rigs := make([]*workloadRig, len(arms))
-	reflectors := make([]*net.UDPAddr, len(arms))
-	for i, arm := range arms {
-		rigs[i] = newWorkloadRig(t, path, arm, nil)
-		reflectors[i] = udpReflector(t, oneShotAnswer)
+	rig := newWorkloadRig(t, path, pathAuthorityArm, nil)
+	r := runOneShotArm(rig, udpReflector(t, oneShotAnswer), queries)
+	if r.err != nil {
+		t.Fatal(r.err)
 	}
-	results := make([]oneShotArm, len(arms))
-	var wg sync.WaitGroup
-	for i := range arms {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i] = runOneShotArm(rigs[i], reflectors[i], queries)
-		}()
-	}
-	wg.Wait()
-	for i, arm := range arms {
-		r := results[i]
-		if r.err != nil {
-			t.Fatalf("%s: %v", arm.name, r.err)
-		}
-		for kind, name := range []string{"reused", "fresh"} {
-			t.Logf("%s, %s: %d of %d over %v; answered p50 %v, p99 %v", arm.name, name, r.over[kind], queries/2, oneShotRetry,
-				durationQuantile(r.answered[kind], 0.50).Round(time.Millisecond),
-				durationQuantile(r.answered[kind], 0.99).Round(time.Millisecond))
-			if len(r.answered[kind]) == 0 {
-				t.Fatalf("%s: no query on a %s association was answered", arm.name, name)
-			}
+	for kind, name := range []string{"reused", "fresh"} {
+		t.Logf("%s: %d of %d over %v; answered p50 %v, p99 %v", name, r.over[kind], queries/2, oneShotRetry,
+			durationQuantile(r.answered[kind], 0.50).Round(time.Millisecond),
+			durationQuantile(r.answered[kind], 0.99).Round(time.Millisecond))
+		if len(r.answered[kind]) == 0 {
+			t.Fatalf("no query on a %s association was answered", name)
 		}
 	}
-	if testing.Short() || !judgeComparisons(t) {
-		// At 8 queries a kind one query is several points; the model's
-		// 0.5 pp needs the full suite's count to mean anything.
+	if testing.Short() || !judgeBounds(t) {
+		// At 8 queries a kind one query is several points; the bound needs
+		// the full suite's count to mean anything.
 		return
 	}
-	legacy, flip := results[0].over, results[1].over
 	for kind, name := range []string{"reused", "fresh"} {
-		if limit := oneShotLimit(legacy[kind], queries/2); flip[kind] > limit {
-			t.Errorf("%s associations: %d of %d queries over %v under the flip bundle against %d under legacy; "+
-				"the bound (legacy + 0.5 pp) allows %d",
-				name, flip[kind], queries/2, oneShotRetry, legacy[kind], limit)
+		if limit := queries / 2 * oneShotOverLimit / 100; r.over[kind] > limit {
+			t.Errorf("%s associations: %d of %d queries over %v; the bound allows %d",
+				name, r.over[kind], queries/2, oneShotRetry, limit)
 		}
 	}
 }
 
+// oneShotOverLimit is W11's frozen bound: the queries in a hundred, of each
+// kind, that may take longer than the retry or go unanswered.
+const oneShotOverLimit = 1
+
 // oneShotRetry is a stub resolver's first retry.
 const oneShotRetry = time.Second
 
-// oneShotArm is one arm's W11 outcome, by kind: reused, fresh.
+// oneShotArm is W11's outcome, by kind: reused, fresh.
 type oneShotArm struct {
 	over     [2]int
 	answered [2][]time.Duration
@@ -235,10 +222,4 @@ func runOneShotArm(rig *workloadRig, reflector *net.UDPAddr, queries int) (out o
 		}
 	}
 	return out
-}
-
-// oneShotLimit is W11's bound as a count: legacy's count plus 0.5 pp of the
-// queries, in whole queries.
-func oneShotLimit(legacy, queries int) int {
-	return legacy + queries*5/1000
 }

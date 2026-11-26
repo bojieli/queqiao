@@ -22,46 +22,28 @@ import (
 // The deterministic workload tests of docs/WORKLOAD-MODEL.md ("Minimal live
 // plan": W8, W9b, W10, W11 and M5) replace live runs. Each runs a workload
 // end to end, through a real client and gateway, across a seeded
-// internal/pathsim path, once per arm: the legacy bundle, which is the
-// control, and the bundle the default flip ships (design §15.3, §15.4). The
-// arms differ only in their switches.
+// internal/pathsim path. Until stage 11 each ran once per arm, the legacy
+// bundle as the control beside the bundle the default flip shipped (design
+// §15.3, §15.4), and each bound was the model's contrast against legacy. The
+// control went with the legacy code. Each bound is now the model's own bound
+// applied to what legacy measured on the same seeded path before it was
+// deleted (the frozen constants beside each test), so a regression of the
+// one architecture against the bar it was admitted under still fails.
 
-// workloadArm is one arm of a workload test: a set of switches applied to an
-// otherwise identical client and gateway.
+// workloadArm is the configuration a workload test adds to an otherwise
+// default client and gateway.
 type workloadArm struct {
 	name   string
 	client func(*ClientConfig)
 	server func(*ServerConfig)
 }
 
-// legacyArm is the legacy bundle: the registered control of the stage-10
-// gate. Each switch is set explicitly (pep.BundleLegacy), so the control
-// stays the legacy bundle now that the defaults have flipped.
-var legacyArm = bundleArm("legacy", BundleLegacy)
-
-// flipArm is the path-authority bundle, the default since stage 10: what the
-// default flip ships, recovery=carrier included. It is the named bundle
-// itself, so a switch added to the bundle is measured here without an edit.
-var flipArm = bundleArm("flip", BundlePathAuthority)
-
-// bundleArm is the arm that applies every switch of a named bundle.
-func bundleArm(name string, bundle BundleName) workloadArm {
-	switches := func(gateway bool) BundleSwitches {
-		s, err := SwitchesOf(bundle, gateway)
-		if err != nil {
-			panic(err)
-		}
-		return s
-	}
-	return workloadArm{
-		name:   name,
-		client: func(c *ClientConfig) { switches(false).ApplyToClient(c) },
-		server: func(s *ServerConfig) { switches(true).ApplyToServer(s) },
-	}
+// pathAuthorityArm is the one architecture: a default client and gateway.
+var pathAuthorityArm = workloadArm{
+	name:   "path-authority",
+	client: func(*ClientConfig) {},
+	server: func(*ServerConfig) {},
 }
-
-// workloadArms are the two arms, control first.
-func workloadArms() []workloadArm { return []workloadArm{legacyArm, flipArm} }
 
 // workloadRig is a client and a gateway with an emulated path between them.
 type workloadRig struct {
@@ -100,9 +82,9 @@ func newWorkloadRig(t *testing.T, path pathsim.Config, arm workloadArm, setup fu
 	}
 	// The client reaches the relay over IPv6 loopback and the gateway is
 	// reached over IPv4, so the two ends' path keys differ ("::1->::1" and
-	// "127.0.0.1->127.0.0.1"), as two hosts' would: on one loopback the
-	// legacy bundle's two controllers would share one path model and each
-	// would learn from the other direction's traffic.
+	// "127.0.0.1->127.0.0.1"), as two hosts' would: on one loopback the two
+	// ends would share one path model and each would learn from the other
+	// direction's traffic.
 	relay, err := pathsim.New("[::1]:0", packetConn.LocalAddr().String(), path)
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +97,7 @@ func newWorkloadRig(t *testing.T, path pathsim.Config, arm workloadArm, setup fu
 	}
 	clientCfg := ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: relay.LocalAddr(),
-		Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true,
+		Credentials: roots, Transport: TransportQUIC,
 		Logger: logger, Metrics: clientMetrics,
 	}
 	arm.client(&clientCfg)
@@ -306,20 +288,19 @@ func (c *socksPacketConn) SetWriteDeadline(t time.Time) error {
 	return c.association.local.SetWriteDeadline(t)
 }
 
-// judgeComparisons reports whether a workload test should apply its bounds
-// against legacy: not under the race detector, which slows the endpoints
-// several-fold and unequally, and for now on Linux only: on a loaded
-// macOS-intel runner the flip arm's controller runs away behind a policer
-// and loses packets the legacy arm does not (issue #238). Hard assertions
-// apply everywhere.
-func judgeComparisons(t *testing.T) bool {
+// judgeBounds reports whether a workload test should apply its performance
+// bounds: not under the race detector, which slows the endpoints
+// several-fold, and for now on Linux only: on a loaded macOS-intel runner
+// the controller runs away behind a policer and loses packets (issue #238).
+// Hard assertions apply everywhere.
+func judgeBounds(t *testing.T) bool {
 	t.Helper()
 	if workloadRaceEnabled {
-		t.Log("race detector on: comparative bounds are reported, not judged")
+		t.Log("race detector on: performance bounds are reported, not judged")
 		return false
 	}
 	if runtime.GOOS != "linux" {
-		t.Log("not Linux: comparative bounds are reported, not judged (issue #238)")
+		t.Log("not Linux: performance bounds are reported, not judged (issue #238)")
 		return false
 	}
 	return true

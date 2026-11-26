@@ -11,9 +11,11 @@ import (
 )
 
 // A JOIN can finish after its manager has returned. The late transport must
-// be closed, not stranded in a result queue with no remaining reader.
+// be closed, not stranded in a result queue with no remaining reader. Only a
+// TCP bundle's manager dials JOINs per flow; a QUIC flow's rebinding is the
+// carrier manager's.
 func TestLaneManagerClosesJoinCompletedAfterExit(t *testing.T) {
-	for _, kind := range []TransportKind{TransportQUIC, TransportTCP} {
+	for _, kind := range []TransportKind{TransportTCP} {
 		t.Run(string(kind), func(t *testing.T) {
 			for i := 0; i < 12; i++ {
 				flow := newIsolationTestFlow(t, kind == TransportQUIC)
@@ -23,6 +25,7 @@ func TestLaneManagerClosesJoinCompletedAfterExit(t *testing.T) {
 					flow.lanes[0] = isolationLaneKind(t, 0, kind)
 				}
 				c := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, metrics: metrics.New()}
+				attachTestCarriers(c)
 				c.quicPoolActive.Store(2)
 				local, peer := net.Pipe()
 				started := make(chan struct{})

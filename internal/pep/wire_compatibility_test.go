@@ -56,7 +56,7 @@ func dialWireLane(ctx context.Context, carrier TransportKind, remote string, cre
 	if carrier == TransportTCP {
 		return dialTCP(ctx, remote, credentials, offer, 2*time.Second, "", nil)
 	}
-	return dialQUIC(ctx, remote, credentials, offer, 2*time.Second, "", nil, nil, congestionConfig{kind: CongestionReno}, flowWindows{}, hopDialConfig{})
+	return dialQUIC(ctx, remote, credentials, offer, 2*time.Second, "", nil, nil, congestionConfig{}, flowWindows{}, hopDialConfig{})
 }
 
 // TestNegotiatedWireVersionMatrix is the version negotiation as deployed: a

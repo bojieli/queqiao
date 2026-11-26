@@ -2,9 +2,6 @@ package pep
 
 import (
 	"context"
-	"errors"
-	"io"
-	"log/slog"
 	"net"
 	"testing"
 	"time"
@@ -90,6 +87,11 @@ func TestScanStallGating(t *testing.T) {
 // A one-way message or a slow origin must not trigger lane churn.
 func TestAcknowledgedApplicationMessageDoesNotTriggerRescue(t *testing.T) {
 	flow := newStallTestFlow(t, metrics.New())
+	// A TCP bundle is the only binding the watchdog still asks to rescue.
+	lane, _ := rescueTestLane(t, 0)
+	if err := flow.addLane(lane); err != nil {
+		t.Fatal(err)
+	}
 	flow.stallScan = time.Millisecond
 	flow.stallGrace = 20 * time.Millisecond
 	flow.observe(512, true)
@@ -111,7 +113,8 @@ func TestAcknowledgedApplicationMessageDoesNotTriggerRescue(t *testing.T) {
 	}
 }
 
-// Demotion is not death: a suspected lane is passed over for new writes while
+// Demotion, which only a TCP bundle still uses (a QUIC binding is the carrier
+// manager's), is not death: a suspected lane is passed over for new writes while
 // a healthier lane exists, keeps its place in the healthy set, and is fully
 // eligible again the moment it is the only thing left.
 func TestSuspectedLaneIsDemotedNotKilled(t *testing.T) {
@@ -125,8 +128,8 @@ func TestSuspectedLaneIsDemotedNotKilled(t *testing.T) {
 		_ = dataLocal.Close()
 		_ = dataRemote.Close()
 	})
-	control := &mpLane{id: 0, kind: TransportQUIC, fc: newFrameConn(controlLocal), control: true}
-	data := &mpLane{id: 1, kind: TransportQUIC, fc: newFrameConn(dataLocal)}
+	control := &mpLane{id: 0, kind: TransportTCP, fc: newFrameConn(controlLocal), control: true}
+	data := &mpLane{id: 1, kind: TransportTCP, fc: newFrameConn(dataLocal)}
 	if err := flow.addLane(control); err != nil {
 		t.Fatal(err)
 	}
@@ -166,11 +169,16 @@ func TestSuspectedLaneIsDemotedNotKilled(t *testing.T) {
 	control.suspected.Store(false)
 }
 
-// The watchdog fires once per episode, demotes the data lane, and asks the
-// lane manager for a rescue; an idle flow with the same timing never fires.
+// On a TCP bundle the watchdog fires once per episode, demotes the data lane,
+// and asks the bundle manager for a rescue; an idle flow with the same timing
+// never fires.
 func TestStallWatchdogDetectsPendingWorkWithoutProgress(t *testing.T) {
 	registry := metrics.New()
 	flow := newStallTestFlow(t, registry)
+	lane, _ := rescueTestLane(t, 0)
+	if err := flow.addLane(lane); err != nil {
+		t.Fatal(err)
+	}
 	flow.stallScan = 5 * time.Millisecond
 	flow.stallGrace = 20 * time.Millisecond
 	stop := make(chan struct{})
@@ -219,10 +227,10 @@ func TestStallWatchdogCountsTheWarmSpare(t *testing.T) {
 		_ = dataLocal.Close()
 		_ = dataRemote.Close()
 	})
-	if err := flow.addLane(&mpLane{id: 0, kind: TransportQUIC, fc: newFrameConn(controlLocal), control: true}); err != nil {
+	if err := flow.addLane(&mpLane{id: 0, kind: TransportTCP, fc: newFrameConn(controlLocal), control: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := flow.addLane(&mpLane{id: 1, kind: TransportQUIC, fc: newFrameConn(dataLocal)}); err != nil {
+	if err := flow.addLane(&mpLane{id: 1, kind: TransportTCP, fc: newFrameConn(dataLocal)}); err != nil {
 		t.Fatal(err)
 	}
 	flow.noteSent(0, 512)
@@ -246,113 +254,7 @@ func rescueTestLane(t *testing.T, id uint64) (*mpLane, net.Conn) {
 	t.Helper()
 	local, remote := net.Pipe()
 	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
-	return &mpLane{id: id, kind: TransportQUIC, fc: newFrameConn(local)}, remote
-}
-
-// The first completed JOIN wins; every losing attempt is cancelled, and a
-// loser that finishes anyway has its lane closed rather than installed. The
-// attempts here share nothing -- the analogue of several dials on the same
-// single port, where independence is the whole value.
-func TestParallelRescueFirstWinsAndLosersAreCancelled(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	registry := metrics.New()
-	client := &Client{cfg: ClientConfig{Logger: logger}, metrics: registry}
-	flow := newGraceTestFlow(t)
-
-	loserStarted := make(chan struct{})
-	loserLane, loserRemote := rescueTestLane(t, 1)
-	winnerLane, _ := rescueTestLane(t, 2)
-	attempts := []rescueAttempt{
-		func(ctx context.Context) (*mpLane, error) {
-			close(loserStarted)
-			<-ctx.Done()
-			// A dial cancelled mid-handshake returns its context's error.
-			return nil, ctx.Err()
-		},
-		func(ctx context.Context) (*mpLane, error) {
-			<-loserStarted
-			return winnerLane, nil
-		},
-		func(ctx context.Context) (*mpLane, error) {
-			// A loser that completes its JOIN before the cancellation
-			// reaches it must have its lane closed, not leaked.
-			<-loserStarted
-			time.Sleep(20 * time.Millisecond)
-			return loserLane, nil
-		},
-	}
-	lane, winner, err := client.raceRescueAttempts(context.Background(), flow, attempts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if winner != 1 || lane != winnerLane {
-		t.Fatalf("winner = %d (%v), want attempt 1", winner, lane)
-	}
-	snapshot := registry.Snapshot()
-	if snapshot.LaneRescueAttempts != 3 {
-		t.Fatalf("rescue attempts = %d, want 3", snapshot.LaneRescueAttempts)
-	}
-	if snapshot.LaneRescueWins[1] != 1 || snapshot.LaneRescueWins[0] != 0 || snapshot.LaneRescueWins[2] != 0 {
-		t.Fatalf("rescue wins = %v, want attempt 1 only", snapshot.LaneRescueWins)
-	}
-	// The late loser's lane is closed once its attempt unwinds.
-	if err := loserRemote.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loserRemote.Read(make([]byte, 1)); err == nil {
-		t.Fatal("the losing lane's connection stayed open")
-	}
-}
-
-// A refusal is the peer's permanent answer about the session: it ends the
-// round immediately rather than being outvoted by slower attempts.
-func TestParallelRescueRefusalEndsTheRound(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	client := &Client{cfg: ClientConfig{Logger: logger}, metrics: metrics.New()}
-	flow := newGraceTestFlow(t)
-	slow := make(chan struct{})
-	t.Cleanup(func() { close(slow) })
-	attempts := []rescueAttempt{
-		func(ctx context.Context) (*mpLane, error) { return nil, errLaneJoinRejected },
-		func(ctx context.Context) (*mpLane, error) {
-			select {
-			case <-slow:
-				lane, _ := rescueTestLane(t, 9)
-				return lane, nil
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		},
-	}
-	start := time.Now()
-	if _, _, err := client.raceRescueAttempts(context.Background(), flow, attempts); !errors.Is(err, errLaneJoinRejected) {
-		t.Fatalf("err = %v, want %v", err, errLaneJoinRejected)
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("the round waited %s for attempts a refusal already answered", elapsed)
-	}
-}
-
-// When every attempt fails, the round reports the first failure rather than
-// installing anything.
-func TestParallelRescueAllAttemptsFail(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	client := &Client{cfg: ClientConfig{Logger: logger}, metrics: metrics.New()}
-	flow := newGraceTestFlow(t)
-	first := errors.New("dial refused")
-	attempts := []rescueAttempt{
-		func(ctx context.Context) (*mpLane, error) { return nil, first },
-		func(ctx context.Context) (*mpLane, error) {
-			time.Sleep(50 * time.Millisecond)
-			return nil, errors.New("dial timeout")
-		},
-	}
-	if _, _, err := client.raceRescueAttempts(context.Background(), flow, attempts); !errors.Is(err, first) {
-		t.Fatalf("err = %v, want the first failure", err)
-	}
-	if got := client.metrics.Snapshot().LaneRescueAttempts; got != 2 {
-		t.Fatalf("rescue attempts = %d, want 2", got)
-	}
+	return &mpLane{id: id, kind: TransportTCP, fc: newFrameConn(local)}, remote
 }
 
 // A JOIN can succeed without restoring data delivery. The next request in

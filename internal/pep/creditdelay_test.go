@@ -138,14 +138,6 @@ func TestCreditDelayIsTimedFromTheCarriersTakeToTheCoveringACK(t *testing.T) {
 // client and a download by the gateway, each on its own clock, and both
 // export the histogram.
 func TestBothEndpointsExportCreditDelay(t *testing.T) {
-	// Under every controller: Reno installs none of its own telemetry, so
-	// the baseline must come from the transport.
-	for _, congestion := range []CongestionControlKind{CongestionErasure, CongestionReno} {
-		t.Run(string(congestion), func(t *testing.T) { exportsCreditDelay(t, congestion) })
-	}
-}
-
-func exportsCreditDelay(t *testing.T, congestion CongestionControlKind) {
 	destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +155,7 @@ func exportsCreditDelay(t *testing.T, congestion CongestionControlKind) {
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
-		Metrics: serverMetrics, Congestion: congestion,
+		Metrics: serverMetrics,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +166,7 @@ func exportsCreditDelay(t *testing.T, congestion CongestionControlKind) {
 	}
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots,
-		Transport: TransportQUIC, Logger: logger, Metrics: clientMetrics, Congestion: congestion,
+		Transport: TransportQUIC, Logger: logger, Metrics: clientMetrics,
 	})
 	if err != nil {
 		t.Fatal(err)

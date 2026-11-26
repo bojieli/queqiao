@@ -56,22 +56,9 @@ func TestARequestAfterThePooledConnectionDiesDoesNotWaitForTheIdleTimeout(t *tes
 	if testing.Short() {
 		t.Skip("brings up QUIC across an emulated path")
 	}
-	testRequestAfterPoolDies(t, "")
-}
-
-// The same gate on the default bundle (stage 10), where the carrier manager,
-// not the pool's silence heuristic, replaces the dead connection.
-func TestARequestAfterThePooledConnectionDiesOnTheDefaultBundle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("brings up QUIC across an emulated path")
-	}
-	testRequestAfterPoolDies(t, DefaultBundle)
-}
-
-func testRequestAfterPoolDies(t *testing.T, bundle BundleName) {
 	requireStableImpairmentClock(t)
 	path := pathsim.Config{OneWayDelay: 25 * time.Millisecond, Seed: 3}
-	socks, destination := codedPairOnBundle(t, bundle, true, &path, responseDestination)
+	socks, destination := codedPairWith(t, true, &path, responseDestination)
 	if err := tryFetch(socks, destination, 20_000, 20*time.Second); err != nil {
 		t.Fatalf("the healthy pool did not carry a request: %v", err)
 	}

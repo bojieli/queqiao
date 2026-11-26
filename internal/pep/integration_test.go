@@ -271,7 +271,7 @@ func runUDPAssociateSOCKSEndToEnd(t *testing.T, transport TransportKind, shadow 
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
-		ListenAddr: clientListener.Addr().String(), RemoteAddr: serverAddr, Credentials: roots, Transport: transport, EnableQUICPool: transport == TransportQUIC, Logger: logger,
+		ListenAddr: clientListener.Addr().String(), RemoteAddr: serverAddr, Credentials: roots, Transport: transport, Logger: logger,
 		CarrierShadow: shadowCfg,
 	})
 	if err != nil {
@@ -446,44 +446,11 @@ func portBelowTheDynamicRange(t *testing.T) int {
 	return low + int(binary.BigEndian.Uint16(pick[:]))%span
 }
 
+// A pooled QUIC flow transfers correctly end to end, both ends class
+// schedule the live connection, and each end's connection is an attachment
+// of its path's controller.
 func TestQUICOneLaneSOCKSEndToEnd(t *testing.T) {
-	testQUICOneLaneSOCKSEndToEnd(t, "", "")
-}
-
-// The cc-api=v2 bundle starts, both ends, and carries the same flows.
-func TestQUICOneLaneSOCKSEndToEndUnderCCAPIV2(t *testing.T) {
-	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, "")
-}
-
-// The sched=class bundle (cc-api=v2 with the class scheduler) starts, both
-// ends, and carries the same flows.
-func TestQUICOneLaneSOCKSEndToEndUnderSchedClass(t *testing.T) {
-	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, SchedClass)
-}
-
-// The coded-retry bundle starts, both ends, on top of cc-api=v2, and carries
-// the same flows.
-func TestQUICOneLaneSOCKSEndToEndUnderCodedRetry(t *testing.T) {
-	testQUICOneLaneSOCKSEndToEnd(t, CCAPIV2, "", CodedRetrySticky)
-}
-
-// The congestion=path bundle (cc-api=v2, sched=class and one controller per
-// path) starts, both ends, and carries the same flows: the client's
-// connection and the gateway's are attachments of their paths' controllers.
-func TestQUICOneLaneSOCKSEndToEndUnderCongestionPath(t *testing.T) {
 	pathAuthorities.forget()
-	testQUICOneLaneSOCKSEndToEndScoped(t, CCAPIV2, SchedClass, CongestionScopePath)
-}
-
-func testQUICOneLaneSOCKSEndToEnd(t *testing.T, ccAPI CCAPIVersion, sched SchedMode, codedRetry ...CodedRetryMode) {
-	testQUICOneLaneSOCKSEndToEndScoped(t, ccAPI, sched, CongestionScopeConnection, codedRetry...)
-}
-
-func testQUICOneLaneSOCKSEndToEndScoped(t *testing.T, ccAPI CCAPIVersion, sched SchedMode, scope CongestionScope, codedRetry ...CodedRetryMode) {
-	var retry CodedRetryMode
-	if len(codedRetry) > 0 {
-		retry = codedRetry[0]
-	}
 	destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -500,7 +467,7 @@ func testQUICOneLaneSOCKSEndToEndScoped(t *testing.T, ccAPI CCAPIVersion, sched 
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
-		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond, CCAPI: ccAPI, Sched: sched, CongestionScope: scope, CodedRetry: retry,
+		Metrics: metrics.New(), HandshakeTimeout: 300 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -510,8 +477,8 @@ func testQUICOneLaneSOCKSEndToEndScoped(t *testing.T, ccAPI CCAPIVersion, sched 
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
-		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true, Logger: logger,
-		Metrics: metrics.New(), CCAPI: ccAPI, Sched: sched, CongestionScope: scope, CodedRetry: retry,
+		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, Logger: logger,
+		Metrics: metrics.New(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -618,7 +585,7 @@ func testQUICOneLaneSOCKSEndToEndScoped(t *testing.T, ccAPI CCAPIVersion, sched 
 	if got := client.Metrics().Snapshot(); got.ActiveFlows != 0 || got.FlowsCompleted != 2 {
 		t.Fatalf("client flow lifecycle leaked: active=%d started=%d completed=%d failed=%d", got.ActiveFlows, got.FlowsStarted, got.FlowsCompleted, got.FlowsFailed)
 	}
-	if sched == SchedClass {
+	{
 		// Both ends of this test's live connection schedule classes: the
 		// client's dials the gateway's address, the gateway's is bound to
 		// it.
@@ -637,7 +604,7 @@ func testQUICOneLaneSOCKSEndToEndScoped(t *testing.T, ccAPI CCAPIVersion, sched 
 			t.Fatalf("sched=class installed on the client: %v, on the gateway: %v", clientSide, gatewaySide)
 		}
 	}
-	if scope == CongestionScopePath {
+	{
 		// The client's path and the gateway's -- keyed by the client's
 		// principal -- each have a controller with the live connection
 		// attached.
@@ -665,12 +632,12 @@ func testQUICOneLaneSOCKSEndToEndScoped(t *testing.T, ccAPI CCAPIVersion, sched 
 }
 
 func TestQUICFlowSurvivesOneLaneFailure(t *testing.T) {
-	runQUICFlowSurvivesOneLaneFailure(t, MemoryLegacy, nil)
+	runQUICFlowSurvivesOneLaneFailure(t, nil)
 }
 
-// runQUICFlowSurvivesOneLaneFailure runs with the given memory bundle and limits, so the owned-memory
-// bundle is held to the same replay guarantee.
-func runQUICFlowSurvivesOneLaneFailure(t *testing.T, mode MemoryMode, limits *MemoryLimits) {
+// runQUICFlowSurvivesOneLaneFailure runs with the given memory limits, so a
+// shared send budget is held to the same replay guarantee.
+func runQUICFlowSurvivesOneLaneFailure(t *testing.T, limits *MemoryLimits) {
 	destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -686,7 +653,7 @@ func runQUICFlowSurvivesOneLaneFailure(t *testing.T, mode MemoryMode, limits *Me
 	}
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
-		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, ChunkSize: 4 * 1024, Logger: logger, Memory: mode,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, ChunkSize: 4 * 1024, Logger: logger,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -696,7 +663,7 @@ func runQUICFlowSurvivesOneLaneFailure(t *testing.T, mode MemoryMode, limits *Me
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
-		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, ChunkSize: 4 * 1024, Logger: logger, Memory: mode, MemoryLimits: limits,
+		ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots, Transport: TransportQUIC, ChunkSize: 4 * 1024, Logger: logger, MemoryLimits: limits,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -832,12 +799,12 @@ func TestAutoTransportFallsBackToTCPWhenUDPUnavailable(t *testing.T) {
 }
 
 func TestAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T) {
-	runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t, MemoryLegacy, nil)
+	runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t, nil)
 }
 
-// runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail runs with the given memory bundle and limits, so the owned-memory
-// bundle is held to the same replay guarantee.
-func runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T, mode MemoryMode, limits *MemoryLimits) {
+// runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail runs with the given memory
+// limits, so a shared send budget is held to the same replay guarantee.
+func runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T, limits *MemoryLimits) {
 	destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -850,7 +817,7 @@ func runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T, mode Memory
 	serverListener, packetConn := listenTCPAndUDPOnOnePort(t)
 	server, err := NewServer(ServerConfig{
 		ListenAddr: serverListener.Addr().String(), Credentials: certificate,
-		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableTCP: true, EnableQUIC: true, ChunkSize: 4 * 1024, Logger: logger, Memory: mode,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableTCP: true, EnableQUIC: true, ChunkSize: 4 * 1024, Logger: logger,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -860,7 +827,7 @@ func runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T, mode Memory
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
-		ListenAddr: clientListener.Addr().String(), RemoteAddr: serverListener.Addr().String(), Credentials: roots, Transport: TransportAuto, FallbackDelay: 300 * time.Millisecond, ChunkSize: 4 * 1024, Logger: logger, Memory: mode, MemoryLimits: limits,
+		ListenAddr: clientListener.Addr().String(), RemoteAddr: serverListener.Addr().String(), Credentials: roots, Transport: TransportAuto, FallbackDelay: 300 * time.Millisecond, ChunkSize: 4 * 1024, Logger: logger, MemoryLimits: limits,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -907,9 +874,16 @@ func runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T, mode Memory
 	// QUIC lane. That asked whether the rescue happens to sort first, not
 	// whether it happened, and it is why this test failed roughly half the
 	// time on the CI runner while passing everywhere else.
+	//
+	// The QUIC connection itself stays healthy: only the flow's stream is
+	// closed. Under carrier recovery (design §10.3) that is a lost binding on
+	// a live carrier, so the flow is rebound by one JOIN on the same carrier;
+	// a TCP handoff is the carrier manager's answer only when no carrier is
+	// usable. Either replacement keeps the flow, and the payload below must
+	// arrive whole across it, replay included.
 	deadline := time.Now().Add(20 * time.Second)
-	closedQUIC := false
-	rescuedTCP := false
+	var closed *mpLane
+	replaced := false
 	for time.Now().Before(deadline) {
 		server.sessionsMu.RLock()
 		var sessionFlow *serverFlow
@@ -917,36 +891,36 @@ func runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t *testing.T, mode Memory
 			sessionFlow = candidate
 			break
 		}
-		var quicLane *mpLane
-		haveTCP := false
+		var quicLane, replacement *mpLane
 		if sessionFlow != nil {
 			for _, lane := range sessionFlow.flow.healthyLanes() {
-				switch lane.kind {
-				case TransportQUIC:
-					if quicLane == nil {
-						quicLane = lane
-					}
-				case TransportTCP:
-					haveTCP = true
+				if lane == closed {
+					continue
+				}
+				if closed != nil {
+					replacement = lane
+				} else if lane.kind == TransportQUIC && quicLane == nil {
+					quicLane = lane
 				}
 			}
 		}
 		server.sessionsMu.RUnlock()
-		if quicLane != nil && !closedQUIC {
+		if quicLane != nil && closed == nil {
 			_ = quicLane.fc.Close()
-			closedQUIC = true
+			closed = quicLane
 		}
-		if closedQUIC && haveTCP {
-			rescuedTCP = true
+		if closed != nil && replacement != nil {
+			t.Logf("the flow's replacement lane is %s", replacement.kind)
+			replaced = true
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !closedQUIC {
+	if closed == nil {
 		t.Fatal("initial QUIC lane was not established")
 	}
-	if !rescuedTCP {
-		t.Fatal("TCP rescue lane was not established")
+	if !replaced {
+		t.Fatal("the flow got no replacement lane after its QUIC lane failed")
 	}
 
 	if err := <-writeErr; err != nil {

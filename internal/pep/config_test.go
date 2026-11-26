@@ -24,7 +24,6 @@ func TestClientRejectsUnserviceableConfiguration(t *testing.T) {
 		"invalid local address":  func(c *ClientConfig) { c.LocalAddress = "not-an-address" },
 		"empty local interface":  func(c *ClientConfig) { c.LocalAddress = "if:" },
 		"too many TCP lanes":     func(c *ClientConfig) { c.TCPFallbackLanes = maxTCPFallbackLanes + 1 },
-		"adaptive bounds":        func(c *ClientConfig) { c.AdaptiveMinBytesSec = 2; c.AdaptiveMaxBytesSec = 1 },
 		"reserve without budget": func(c *ClientConfig) {
 			c.InteractiveReserveBytesPerSec = 1
 		},
@@ -346,23 +345,11 @@ func TestZeroAccountLimitsAdmitEverything(t *testing.T) {
 	}
 }
 
-func TestTUICAlignedCongestionConfigurationIsAccepted(t *testing.T) {
-	_, credentials := testCertificate(t)
-	base := ClientConfig{
-		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1",
-		Credentials: credentials, Congestion: CongestionBBRTUIC,
-	}
-	if _, err := NewClient(base); err != nil {
-		t.Fatalf("bbr-tuic configuration rejected: %v", err)
-	}
-}
-
 func TestServerRejectsUnserviceableConfiguration(t *testing.T) {
 	credentials, _ := testCertificate(t)
 	base := ServerConfig{ListenAddr: "127.0.0.1:0", Credentials: credentials}
 	for name, mutate := range map[string]func(*ServerConfig){
 		"too many sessions": func(c *ServerConfig) { c.MaxSessions = maxConfiguredSessions + 1 },
-		"adaptive bounds":   func(c *ServerConfig) { c.AdaptiveMinBytesSec = 2; c.AdaptiveMaxBytesSec = 1 },
 		"too many TCP lanes": func(c *ServerConfig) {
 			c.TCPFallbackLanes = maxTCPFallbackLanes + 1
 		},

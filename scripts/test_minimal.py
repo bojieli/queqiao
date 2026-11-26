@@ -1672,7 +1672,8 @@ class DCAtMinimalSize(unittest.TestCase):
         self.assertNotIn("--profile", cmd)
         self.assertNotIn("--listen", cmd)
         self.assertIn("--path-profile dc-long-haul", cmd)
-        self.assertIn("--recovery=carrier", cmd)
+        # The arm's own flags reach the uploader (no switches since stage 11).
+        self.assertIn("--carrier-shadow", cmd)
         # Each relay forwards to the arm's gateway port, on its own port.
         relay = camp.aux_relay_cmd(cfg.aux_relays[0], arm)
         self.assertIn(f"--listen :{cfg.aux_relays[0].port_base + arm.index} --upstream 198.51.100.20:"

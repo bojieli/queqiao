@@ -97,12 +97,17 @@ type codedRetryFixture struct {
 	lane    *mpLane
 }
 
+// newCodedRetryFixture builds the fixture. sticky must be true: the
+// dispatch-time deadline it once selected against was deleted with the legacy
+// bundle (design §14 stage 11); the parameter is kept for existing callers.
 func newCodedRetryFixture(t *testing.T, sticky, hold bool) *codedRetryFixture {
 	t.Helper()
+	if !sticky {
+		t.Fatal("the legacy coded retry no longer exists")
+	}
 	flow := newStallTestFlow(t, nil)
-	flow.codedRetrySticky = sticky
 	model := pathmodel.NewPathModel()
-	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000, Delivered: 2e6})
+	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000})
 	carrier := newErasingCarrier(hold)
 	path := coded.New(carrier, coded.Config{Path: model})
 	t.Cleanup(func() { _ = path.Close() })
@@ -120,9 +125,8 @@ func (x *codedRetryFixture) scheduler(t *testing.T, now func() time.Time) *strip
 	t.Helper()
 	sched := stripe.New(bytes.NewReader([]byte("response")), stripe.Config{
 		Reliable:        func(uint64) bool { return !x.fc.codesData() },
-		ForceReliable:   x.flow.recoverChunkReliably,
 		RetransmitAfter: x.flow.reissueDelay,
-		CodedRetry:      x.flow.codedRetrySticky,
+		CodedRetry:      true,
 		Now:             now,
 	})
 	t.Cleanup(sched.Close)
@@ -178,8 +182,8 @@ func (x *codedRetryFixture) streamDelivers(t *testing.T) {
 // The P0 lesson, made structural (design §8.1, §10.6 "Coded tail"): a coded
 // tail lost on a healthy connection, with no later chunk to expose it, is
 // retried on the existing stream once its registration deadline passes. The
-// stall watchdog is not running: nothing here depends on it, on the frontier
-// it pins, or on the lane manager it signals.
+// stall watchdog is not running: nothing here depends on it or on the lane
+// manager it signals.
 func TestCodedTailLostAloneIsRecoveredWithoutTheWatchdog(t *testing.T) {
 	x := newCodedRetryFixture(t, true, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -212,9 +216,6 @@ func TestCodedTailLostAloneIsRecoveredWithoutTheWatchdog(t *testing.T) {
 	}
 	if tagged, _, _ := x.carrier.counts(); tagged == 0 {
 		t.Fatal("the first attempt never went to the code")
-	}
-	if x.flow.codingRecoveryEnd.Load() != 0 {
-		t.Fatal("recovery leaned on the watchdog's frontier")
 	}
 	select {
 	case <-x.flow.stallSignals():
@@ -356,95 +357,6 @@ func TestDiscardedCodedDatagramGoesToTheStream(t *testing.T) {
 	x.streamDelivers(t)
 	if got := sched.Stats().CodedAbandoned; got != 1 {
 		t.Fatalf("CodedAbandoned = %d, want 1", got)
-	}
-}
-
-// With the switch off nothing is observed or tagged, the deadline counts from
-// dispatch and a retry stays on the code: today's behaviour, which the
-// watchdog's frontier then rescues (TestCodedSendStallRecoversOnExistingStream).
-func TestCodedRetryOffIsTodaysBehaviour(t *testing.T) {
-	x := newCodedRetryFixture(t, false, true)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	now := time.Unix(1000, 0)
-	sched := x.scheduler(t, func() time.Time { return now })
-	first, err := sched.Next(ctx, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := x.flow.sendChunk(ctx, x.lane, first, true); err != nil {
-		t.Fatal(err)
-	}
-	if queued := x.write(t, ctx); queued.onCoded != nil {
-		t.Fatal("the legacy bundle observes coded frames")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, untagged, _ := x.carrier.counts(); untagged > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the coded path sent nothing")
-		}
-		time.Sleep(100 * time.Microsecond)
-	}
-	if tagged, _, _ := x.carrier.counts(); tagged != 0 {
-		t.Fatal("the legacy bundle tagged a datagram")
-	}
-	now = now.Add(x.flow.reissueDelay())
-	if n := sched.ReissueExpired(); n != 1 {
-		t.Fatalf("legacy ReissueExpired = %d at the dispatch deadline, want 1", n)
-	}
-	retry, err := sched.Next(ctx, 0, 0)
-	if err != nil || retry.Reliable {
-		t.Fatalf("legacy retry = %+v, %v; want the code again", retry, err)
-	}
-}
-
-// coded-retry=sticky needs the datagram outcomes of the cc-api=v2 fork API
-// (design §14): the validator refuses it on v1, at both roles' constructors.
-func TestCodedRetryRequiresCCAPIV2(t *testing.T) {
-	for _, test := range []struct {
-		mode CodedRetryMode
-		api  CCAPIVersion
-		ok   bool
-	}{
-		{"", "", true},
-		{CodedRetryLegacy, CCAPIV1, true},
-		{CodedRetryLegacy, CCAPIV2, true},
-		{CodedRetrySticky, CCAPIV2, true},
-		{CodedRetrySticky, CCAPIV1, false},
-		{CodedRetrySticky, "", false},
-		{"eager", CCAPIV2, false},
-	} {
-		if err := ValidateCodedRetry(test.mode, test.api); (err == nil) != test.ok {
-			t.Errorf("ValidateCodedRetry(%q, %q) = %v, want ok=%v", test.mode, test.api, err, test.ok)
-		}
-	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetrySticky, GatewayAdmissionLegacy, SchedLegacy, ClassifierLegacy, CongestionScopeConnection, "", ""); got != "cc-api=v2,coded-retry=sticky" {
-		t.Fatalf("Bundle = %q", got)
-	}
-	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedLegacy, ClassifierLegacy, CongestionScopeConnection, "", ""); got != "legacy" {
-		t.Fatalf("Bundle = %q", got)
-	}
-	certificate, credentials := testCertificate(t)
-	if _, err := NewClient(ClientConfig{
-		ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: credentials,
-		CodedRetry: CodedRetrySticky,
-	}); err == nil {
-		t.Error("client accepted coded-retry=sticky on cc-api=v1")
-	}
-	if _, err := NewServer(ServerConfig{
-		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true,
-		CodedRetry: CodedRetrySticky,
-	}); err == nil {
-		t.Error("server accepted coded-retry=sticky on cc-api=v1")
-	}
-	if _, err := NewServer(ServerConfig{
-		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true,
-		CCAPI: CCAPIV2, CodedRetry: CodedRetrySticky,
-	}); err != nil {
-		t.Errorf("server rejected coded-retry=sticky on cc-api=v2: %v", err)
 	}
 }
 

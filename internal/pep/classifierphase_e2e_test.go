@@ -15,12 +15,11 @@ import (
 // An SSH-shaped session end to end, through a real client and gateway: one
 // SOCKS connection to an echo destination, keystrokes for over a second, a
 // 1 MB burst, then keystrokes again. The gateway's per-class byte telemetry
-// says how it sent the echoes after the burst: BULK under the legacy bundle,
-// which is the latch, and INTERACTIVE under the phased one. Every byte is
-// echoed intact in both.
+// says how it sent the echoes after the burst: INTERACTIVE, not the BULK
+// latch of the old sticky classifier. Every byte is echoed intact.
 func TestEchoesAfterABurstEndToEnd(t *testing.T) {
-	for _, mode := range []ClassifierMode{ClassifierLegacy, ClassifierPhased} {
-		t.Run(string(mode), func(t *testing.T) {
+	{
+		t.Run("phased", func(t *testing.T) {
 			destinationListener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -36,7 +35,7 @@ func TestEchoesAfterABurstEndToEnd(t *testing.T) {
 			}
 			serverMetrics := metrics.New()
 			server, err := NewServer(ServerConfig{
-				ListenAddr: "127.0.0.1:0", Credentials: certificate, Classifier: mode,
+				ListenAddr: "127.0.0.1:0", Credentials: certificate,
 				DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
 				Metrics: serverMetrics,
 			})
@@ -49,7 +48,7 @@ func TestEchoesAfterABurstEndToEnd(t *testing.T) {
 			}
 			client, err := NewClient(ClientConfig{
 				ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots,
-				Transport: TransportQUIC, Logger: logger, Metrics: metrics.New(), Classifier: mode,
+				Transport: TransportQUIC, Logger: logger, Metrics: metrics.New(),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -101,12 +100,6 @@ func TestEchoesAfterABurstEndToEnd(t *testing.T) {
 			echoed := uint64(keys * len(key))
 			if total := delta(0) + delta(1) + delta(2); total != echoed {
 				t.Fatalf("the gateway counted %d DATA bytes for %d echoed", total, echoed)
-			}
-			if mode == ClassifierLegacy {
-				if delta(2) == 0 {
-					t.Fatal("legacy echoes after the burst were not BULK; the latch no longer reproduces end to end")
-				}
-				return
 			}
 			if delta(2) != 0 {
 				t.Fatalf("%d of %d echo bytes after the burst were sent BULK", delta(2), echoed)

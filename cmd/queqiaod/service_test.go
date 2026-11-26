@@ -224,32 +224,3 @@ func TestServiceResolveAcceptsAKnownPathProfile(t *testing.T) {
 		t.Fatalf("a known profile was rejected: %v", err)
 	}
 }
-
-// The soak release's rollback can be installed as a service: --bundle is
-// passed through when given, validated at install, and absent otherwise so
-// the service runs the default bundle.
-func TestServiceBundleIsPassedThroughOnlyWhenGiven(t *testing.T) {
-	config := testServiceConfig()
-	if args := strings.Join(config.arguments(), " "); strings.Contains(args, "--bundle") {
-		t.Fatalf("default service names a bundle: %s", args)
-	}
-	config.providers = filepath.Join(t.TempDir(), "providers.json")
-	if err := os.WriteFile(config.providers, []byte("{}"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	config.bundle = "Legacy"
-	if err := config.resolve(); err != nil {
-		t.Fatal(err)
-	}
-	if args := strings.Join(config.arguments(), " "); !strings.Contains(args, "--bundle legacy") {
-		t.Fatalf("legacy service arguments: %s", args)
-	}
-	config.bundle = "v1"
-	if err := config.resolve(); err == nil {
-		t.Fatal("an unknown bundle was installed")
-	}
-	// What the service passes, the client accepts.
-	if _, err := parseRuntimeArgs(true, "--bundle", "legacy"); err != nil {
-		t.Fatal(err)
-	}
-}

@@ -121,26 +121,16 @@ queqiaod client --profile ~/.config/queqiao/*.json \
 
 Applications reach it at `127.0.0.1:12080` over SOCKS5.
 
-### The bundle it runs
+### The architecture it runs
 
-Since the path-authority bundle became the default
-([DESIGN-PATH-AUTHORITY.md](DESIGN-PATH-AUTHORITY.md) §11.3, §14 stage 10),
-the profile runs on it with no extra flags: each endpoint pair has one rate
+The profile runs the path-authority architecture
+([DESIGN-PATH-AUTHORITY.md](DESIGN-PATH-AUTHORITY.md) §11.3), as the default
+profile does, with no extra flags: each endpoint pair has one rate
 controller, and the path tree only supplies starting estimates of erasure and
-round trip for a destination that has not been measured yet. It no longer
-caps destinations jointly. The flip waited for the profile's own live gate.
-
-The profile runs exactly two bundles, and start-up refuses anything in
-between. To return to the bundle it ran before (per-connection controllers
-under the path tree's chain, and the sticky classifier its thresholds were
-tuned against), add the same flag on both ends:
-
-```sh
---bundle=legacy
-```
-
-That rollback is available while the new defaults soak; deleting the legacy
-code (stage 11) removes it.
+round trip for a destination that has not been measured yet. It does not cap
+destinations jointly. Releases before v0.15 ran the profile on per-connection
+controllers under the path tree's chain; going back to that means installing
+the previous release on both ends.
 
 That is the foreground form. To install it as a service, pass the same profile
 to the installer, which threads it into the LaunchAgent or systemd user unit:

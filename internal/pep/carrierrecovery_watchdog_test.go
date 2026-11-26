@@ -10,12 +10,13 @@ import (
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
-// Behaviour-equivalent replacements, under recovery=carrier, for the tests of
-// the mechanisms stage 8 disables (§15.1): TestStallWatchdogCountsTheWarmSpare
-// and TestSuspectedLaneIsDemotedNotKilled (lane demotion),
-// TestStallWatchdogDetectsPendingWorkWithoutProgress (the rescue request) and
-// TestCodedSendStallRecoversOnExistingStream (the watchdog's coded
-// frontier). The originals keep running against the legacy bundle.
+// Behaviour-equivalent replacements, on a QUIC binding, for the tests of the
+// mechanisms carrier recovery removed (§15.1): lane demotion and the rescue
+// request (TestStallWatchdogCountsTheWarmSpare,
+// TestSuspectedLaneIsDemotedNotKilled and
+// TestStallWatchdogDetectsPendingWorkWithoutProgress, which now run on the
+// TCP bundle that keeps them) and the watchdog's coded frontier, deleted at
+// stage 11.
 
 // The watchdog still sees a stall, counts it and keeps the no-progress
 // budget, but demotes no lane, sets no replacement identity, asks for no
@@ -23,8 +24,6 @@ import (
 func TestCarrierRecoveryWatchdogObservesAStallAndDoesNothingElse(t *testing.T) {
 	registry := metrics.New()
 	flow := newStallTestFlow(t, registry)
-	flow.carrierRecovery = true
-	flow.codedRetrySticky = true
 	flow.reserveControlLane = true
 	controlLocal, controlRemote := net.Pipe()
 	dataLocal, dataRemote := net.Pipe()
@@ -72,9 +71,6 @@ func TestCarrierRecoveryWatchdogObservesAStallAndDoesNothingElse(t *testing.T) {
 	if _, ok := flow.rescueReplacement(); ok {
 		t.Fatal("a replacement identity was set for a live stream")
 	}
-	if flow.codingRecoveryEnd.Load() != 0 {
-		t.Fatal("the watchdog pinned a coded frontier under recovery=carrier")
-	}
 	candidates, err := flow.laneCandidates(true)
 	if err != nil || len(candidates) != 1 || candidates[0] != data {
 		t.Fatalf("data candidates after the stall = %v, %v, want the data lane unchanged", candidates, err)
@@ -91,11 +87,9 @@ func TestCarrierRecoveryWatchdogObservesAStallAndDoesNothingElse(t *testing.T) {
 // registration deadline (coded-retry=sticky), with the watchdog running
 // under recovery=carrier beside it: the bytes are retried on the existing
 // stream, nothing is demoted, nothing is requested, and fresh exchanges stay
-// coded. This is what TestCodedSendStallRecoversOnExistingStream checks for
-// the legacy watchdog's frontier.
+// coded.
 func TestCarrierRecoveryCodedTailMovesToTheExistingStream(t *testing.T) {
 	x := newCodedRetryFixture(t, true, false)
-	x.flow.carrierRecovery = true
 	x.flow.stallScan = time.Millisecond
 	x.flow.stallGrace = 10 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -126,9 +120,6 @@ func TestCarrierRecoveryCodedTailMovesToTheExistingStream(t *testing.T) {
 	if tagged, _, _ := x.carrier.counts(); tagged == 0 {
 		t.Fatal("the first attempt never went to the code")
 	}
-	if x.flow.codingRecoveryEnd.Load() != 0 {
-		t.Fatal("recovery leaned on the watchdog's frontier")
-	}
 	if x.lane.suspected.Load() {
 		t.Fatal("the lane was demoted")
 	}
@@ -147,7 +138,6 @@ func TestCarrierRecoveryCodedTailMovesToTheExistingStream(t *testing.T) {
 // recovery=carrier.
 func TestCarrierRecoveryLeavesTCPStallRescueAlone(t *testing.T) {
 	flow := newStallTestFlow(t, nil)
-	flow.carrierRecovery = true
 	local, remote := net.Pipe()
 	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
 	if err := flow.addLane(&mpLane{id: 0, kind: TransportTCP, fc: newFrameConn(local)}); err != nil {
