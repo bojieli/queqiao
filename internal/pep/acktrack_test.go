@@ -135,3 +135,25 @@ func TestAckTrackerIgnoresStaleAcknowledgements(t *testing.T) {
 		t.Fatal("a stale acknowledgement moved the cumulative point backwards")
 	}
 }
+
+// The snapshot dates the highest acknowledged offset by the acknowledgement
+// that raised it, so gap evidence is placed by when it arrived rather than
+// when the watcher's pass ran (#178).
+func TestAckSnapshotDatesTheHighestOffset(t *testing.T) {
+	now := time.Unix(1000, 0)
+	tracker := newAckTracker()
+	tracker.now = func() time.Time { return now }
+	tracker.Add([][2]uint64{{100, 200}})
+	raised := now
+	now = now.Add(time.Second)
+	// Filling a hole below does not move the highest offset.
+	tracker.Add([][2]uint64{{50, 80}})
+	tracker.Advance(40)
+	if got := tracker.Snapshot(); got.highest() != 200 || !got.highestAt.Equal(raised) {
+		t.Fatalf("snapshot highest %d at %v; want 200 at %v", got.highest(), got.highestAt, raised)
+	}
+	tracker.Advance(300)
+	if got := tracker.Snapshot(); got.highest() != 300 || !got.highestAt.Equal(now) {
+		t.Fatalf("snapshot highest %d at %v; want 300 at %v", got.highest(), got.highestAt, now)
+	}
+}
