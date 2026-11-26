@@ -954,6 +954,20 @@ probes every 0.25 s, each its own connection.
   outage), `lower 1.0`. The p99 over all calls is reported only: with fixed
   timing an LLM turn lined up with the 25 s outage, and that p99 reported
   which arm had a call in flight.
+- *Blackhole backgrounds* (v4, adopted after imp5; imp5 is not
+  re-judged): a download of 4 MiB objects and an upload of 2 MiB objects,
+  one after the other, a failed object followed by the next, with a socket
+  timeout of 60 s (above the longest outage), so each arm has a transfer in
+  flight at each outage and a transfer fails only when the tunnel does not
+  resume. `resume_download_s` and `resume_upload_s` time each kind from the
+  outage's end to its next byte (the worse outage), compared only in the
+  blocks where that flow was alive at the outage's start in both arms
+  (`Workload.paired_only`: two such blocks suffice); one that never resumed
+  is censored at the next outage or the trial's end and also counts as a
+  failure. `bg_transfer_failures` (`events 0.02 149`) pools failed over
+  attempted background objects; a flow that died before an outage counts
+  against its own arm. The worst over all flows (`inflight_ttfb_s`) is
+  reported.
 - *Keystroke echo* counts a broken session: a keystroke the session did
   not echo is censored at the trial window's end (its echo time is from
   when it was sent to then), so a session that broke during an outage is

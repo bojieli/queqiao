@@ -71,6 +71,14 @@ OUTAGE_JITTER = (10.0, 5.0)
 # A call is clear of the outages when it neither starts nor runs within an
 # outage or the CLEAR_AFTER seconds after it ends.
 CLEAR_AFTER = 5.0
+# Background transfers in flight across the outages (blackhole): a download
+# and an upload, each object after object, a failed object followed by the
+# next one (each failure recorded), with a socket timeout per scenario well
+# above its longest scripted outage (25 s), so a transfer fails only when
+# the tunnel does not resume, not because the outage outlasted the client.
+BG_DOWN_OBJECT = 4 << 20
+BG_UP_OBJECT = 2 << 20
+BG_IO_TIMEOUT = {"blackhole": 60.0}
 AGENTS = 4
 TURNS = 10
 DELTAS = 100
@@ -282,6 +290,59 @@ def echo_samples(trial, ph) -> List[float]:
     return out
 
 
+def resume_by_kind(outages, recs, end, direction) -> List[Optional[float]]:
+    """Per outage: seconds from its end until the background flow of this
+    direction ("down", "up") moved a byte again, if that flow was alive when
+    the outage began (its timeline started before it and had not ended);
+    None when it was not. One that never moved again before the next outage
+    or the trial's end is censored there."""
+    flows = [[(float(a), float(b)) for a, b in r["samples"]] for r in recs
+             if r.get("kind") == "bgprog" and r.get("dir") == direction and r.get("samples")]
+    out: List[Optional[float]] = []
+    for k, (s, e) in enumerate(outages):
+        nxt = outages[k + 1][0] if k + 1 < len(outages) else end
+        worst: Optional[float] = None
+        for smp in flows:
+            if smp[0][0] > s or smp[-1][0] < s:
+                continue                         # not alive when the outage began
+            at_end = max((b for a, b in smp if a <= e), default=0.0)
+            moved = next((a for a, b in smp if a > e and b > at_end), None)
+            x = (min(moved, nxt) if moved is not None else nxt) - e
+            worst = x if worst is None else max(worst, x)
+        out.append(worst)
+    return out
+
+
+def never_resumed(outages, recs, end) -> int:
+    """Background flows alive at an outage's start that never moved a byte
+    again before the next outage or the trial's end (each a failure)."""
+    n = 0
+    for direction in ("down", "up"):
+        for k, x in enumerate(resume_by_kind(outages, recs, end, direction)):
+            nxt = outages[k + 1][0] if k + 1 < len(outages) else end
+            if x is not None and x >= nxt - outages[k][1] - 1e-9:
+                n += 1
+    return n
+
+
+def bg_transfers(trial, ph) -> Tuple[int, int]:
+    """(failed, attempted) background transfers in a trial: every object a
+    background download or upload attempted, the one the window's end cut
+    left out; a failure is a send or receive error or socket timeout, or a
+    non-200 answer. Each flow that never resumed after an outage adds a
+    failure (and an attempt)."""
+    rows = [r for r in trial.rows if r["phase"] == ph and r["kind"] in ("wl-bgdown", "wl-bgup")]
+    tried = [r for r in rows if r.get("curl_exit") != "28"]
+    failed = sum(1 for r in tried if r.get("curl_exit") != "0" or r.get("http") != "200")
+    ev = next((r for r in getattr(trial, "records", []) if r.get("_phase") == ph and r.get("kind") == "impair"
+               and not r.get("fail")), None)
+    stuck = 0
+    if ev and ev.get("outages"):
+        trecs = [r for r in getattr(trial, "records", []) if r.get("_phase") == ph]
+        stuck = never_resumed(ev["outages"], trecs, trial_end(ev["outages"], trecs))
+    return failed + stuck, len(tried) + stuck
+
+
 def fetch_attempts(trials, ph) -> Tuple[int, int]:
     """(failed, attempted) short downloads over the trials, pooled: a download
     the window's end cut was not a fair attempt and is left out."""
@@ -334,7 +395,12 @@ class Impaired(mn.Minimal):
     # downloads), not the generic single-flow one.
     generic = {t: ("stalls_per_trial",) for t in TRIAL_TYPES}
     report_only = ("completion", "goodput_bps", "ttft_net_p50_s", "ttft_all_p99_s", "echo_p50_s", "recover_8s_s", "recover_25s_s",
-                   "reopen_ttfb_8s_s", "reopen_ttfb_25s_s", "inflight_ttfb_8s_s", "inflight_ttfb_25s_s")
+                   "reopen_ttfb_8s_s", "reopen_ttfb_25s_s", "inflight_ttfb_8s_s", "inflight_ttfb_25s_s",
+                   "inflight_ttfb_s")
+    # Measures compared only in the blocks where both arms have them (a flow
+    # kind alive at an outage's start in both): the coverage rule asks for
+    # two such blocks, not every block.
+    paired_only = ("resume_download_s", "resume_upload_s")
 
     def generics(self, plan):
         """At stage 10 (`[workload:impaired] stage = 10`) sender-side credit
@@ -405,7 +471,7 @@ class Impaired(mn.Minimal):
 
     def objects(self, cfg):
         return [(f"obj-{BULK_OBJECT}", BULK_OBJECT), (f"obj-{PROBE_BYTES}", PROBE_BYTES),
-                (f"obj-{cfg.object_bytes}", cfg.object_bytes)]
+                (f"obj-{BG_DOWN_OBJECT}", BG_DOWN_OBJECT), (f"obj-{cfg.object_bytes}", cfg.object_bytes)]
 
     def llm_swarm(self) -> dict:
         # W5's call shape with short responses (100 deltas, 25 ms apart):
@@ -426,8 +492,9 @@ class Impaired(mn.Minimal):
                 # Flows in flight across the outages (a download and a long
                 # upload, each with a progress timeline), probes for the
                 # recovery and for new connections, and the outages.
-                jobs += [w.Job(c, "wl-bgdown", 1, load=False),
-                         w.Job(c, "wl-bgup", 1, load=False, params={"object_bytes": cfg.scenario_upload_object}),
+                bg = {"io_timeout": BG_IO_TIMEOUT[t], "continue_after_failure": True}
+                jobs += [w.Job(c, "wl-bgdown", 1, load=False, params=dict(bg, object_bytes=BG_DOWN_OBJECT)),
+                         w.Job(c, "wl-bgup", 1, load=False, params=dict(bg, object_bytes=BG_UP_OBJECT)),
                          w.Job(c, "imp-probe", 1, load=False),
                          w.Job(c, "impair-outages", 1, params={"scenario": t})]
             out.append(w.Phase(t, secs, jobs))
@@ -496,6 +563,9 @@ class Impaired(mn.Minimal):
             out[f"{ph}.call_failures"] = (sum(1 for r in llm if r.get("fail")), len(llm))
             out[f"{ph}.silent_rate"] = (silent_deaths(recs), len(sessions))
             out[f"{ph}.fetch_failures"] = fetch_attempts(pt, ph)
+            if ph == "blackhole":
+                bg = [bg_transfers(t, ph) for t in pt]
+                out[f"{ph}.bg_transfer_failures"] = (sum(f for f, _ in bg), sum(n for _, n in bg))
         return out
 
     def phase_measures(self, ph, recs, rows, trials):
@@ -569,4 +639,20 @@ class Impaired(mn.Minimal):
                 for k, label in ((0, "8s"), (1, "25s")):
                     xs = [x[k] for x in per if len(x) > k]
                     m[f"{name}_{label}_s"] = sum(xs) / len(xs) if xs else nan
+            # Resume per flow kind, the worse outage: a block's value only
+            # when that flow was alive at an outage's start (the analyzer
+            # compares a kind only in blocks where both arms have it).
+            for direction, key in (("down", "resume_download_s"), ("up", "resume_upload_s")):
+                per_k = []
+                for t in trials:
+                    ev = next((r for r in getattr(t, "records", []) if r.get("_phase") == ph and
+                               r.get("kind") == "impair" and not r.get("fail")), None)
+                    trecs = [r for r in getattr(t, "records", []) if r.get("_phase") == ph]
+                    xs = ([x for x in resume_by_kind(ev["outages"], trecs, trial_end(ev["outages"], trecs), direction)
+                           if x is not None] if ev and ev.get("outages") else [])
+                    per_k.append(max(xs) if xs else nan)
+                m[key] = sum(per_k) / len(per_k) if per_k and all(x == x for x in per_k) else nan
+            bg = [bg_transfers(t, ph) for t in trials]
+            m["bg_transfer_failures"] = (sum(f for f, _ in bg) / sum(n for _, n in bg)
+                                         if sum(n for _, n in bg) else nan)
         return m

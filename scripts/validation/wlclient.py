@@ -459,8 +459,8 @@ def cmd_bgdown(args) -> None:
             k += 1
             t0, got, code, err = time.time(), 0, 0, 0
             try:
-                s = socks_connect(args.socks, args.target, 10)
-                s.settimeout(5)
+                s = socks_connect(args.socks, args.target, args.io_timeout or 10)
+                s.settimeout(args.io_timeout or 5)
                 s.sendall(f"GET {args.path} HTTP/1.0\r\nHost: origin\r\n\r\n".encode())
                 head = b""
                 while b"\r\n\r\n" not in head:
@@ -491,7 +491,9 @@ def cmd_bgdown(args) -> None:
             t1 = time.time()
             row(t0, t1, f"b{i}o{k}", code, got, t1 - t0, err)
             if err not in (0,) or code != 200:
-                break
+                if err == 28 or not args.continue_after_failure:
+                    break
+                time.sleep(0.5)          # the next object, after a failed one
         prog.close(time.time())
 
     sampler = Sampler(progs)
@@ -557,8 +559,8 @@ def cmd_bgup(args) -> None:
             t0, sent, code, err = time.time(), 0, 0, 0
             tag = f"{run}-{i}-{k}"
             try:
-                s = open_conn(args, 10)
-                s.settimeout(10)
+                s = open_conn(args, args.io_timeout or 10)
+                s.settimeout(args.io_timeout or 10)
                 s.sendall(f"POST /sink HTTP/1.1\r\nHost: wlserver\r\nContent-Length: {args.object_bytes}\r\n"
                           f"X-QQ-Tag: {tag}\r\n\r\n".encode())
                 while sent < args.object_bytes:
@@ -576,7 +578,7 @@ def cmd_bgup(args) -> None:
             except (OSError, EOFError, ValueError, ssl.SSLError):
                 err = 7
             t1 = time.time()
-            if err:
+            if err and (err == 28 or not args.continue_after_failure):
                 # The flow's transfer ends here: freeze its timeline before
                 # any receipt is fetched.
                 prog.close(t1)
@@ -591,7 +593,9 @@ def cmd_bgup(args) -> None:
             else:
                 row(t0, t1, f"u{i}o{k}", code, sent, t1 - t0, err)
             if err:
-                break
+                if err == 28 or not args.continue_after_failure:
+                    break
+                time.sleep(0.5)          # the next object, after a failed one
         prog.close(time.time())
 
     sampler = Sampler(progs)
@@ -1294,6 +1298,11 @@ def main(argv=None) -> int:
     ap.add_argument("--target", required=True)
     ap.add_argument("--no-tls", action="store_true")
     ap.add_argument("--stop-file", default="")
+    # Background transfers (bgdown, bgup): the socket timeout, and whether a
+    # failed object is followed by the next one (so the flow stays in flight,
+    # each failure recorded) instead of ending the flow.
+    ap.add_argument("--io-timeout", type=float, default=0.0)
+    ap.add_argument("--continue-after-failure", action="store_true")
     ap.add_argument("--duration", type=float, default=120)
     ap.add_argument("--delay", type=float, default=0, help="seconds to wait first (backgrounds start before)")
     ap.add_argument("--timeout", type=float, default=30, help="no bytes for this long fails a call")
