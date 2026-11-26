@@ -1848,8 +1848,11 @@ func (f *multipathFlow) runFlow(ctx context.Context) (FlowStats, error) {
 				f.resetOnce.Do(func() { f.broadcastReset(err) })
 				// The RESET has been handed to the transport, not delivered,
 				// and a dedicated QUIC lane's connection closes with it. The
-				// peer closes its lanes when it reads the RESET; until then,
-				// for a bounded time, keep them.
+				// flow's application I/O stops now; its lanes stay, for a
+				// bounded time, until the peer reads the RESET and closes
+				// them.
+				cancelRun()
+				_ = f.inner.Close()
 				f.awaitPeerTeardown(terminalResetDrain)
 			} else {
 				f.resetLanes(err)

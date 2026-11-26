@@ -185,11 +185,15 @@ func TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock(t *testing.T) {
 			var offset atomic.Int64
 			clock := func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
 			ticker := newLimitTicker()
-			advance := func(to time.Duration) {
+			// advance returns when it moved the clock: the moment a flow
+			// past its timeout became due to end.
+			advance := func(to time.Duration) time.Time {
 				offset.Store(int64(to))
+				moved := time.Now()
 				if err := ticker.tick(5 * time.Second); err != nil {
 					t.Fatal(err)
 				}
+				return moved
 			}
 
 			rig := newWorkloadRig(t, pathsim.Config{OneWayDelay: 10 * time.Millisecond, Seed: 9}, arm,
@@ -292,10 +296,10 @@ func TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock(t *testing.T) {
 			crossed := false
 			last := targets[len(targets)-1] * time.Minute
 			for now := time.Minute; now <= last; now += time.Minute {
-				advance(now)
+				moved := advance(now)
 				if !crossed && now >= idleTimeout {
 					crossed = true
-					checkIdleEnds(t, cells, idleTimeout, time.Now(), propagation)
+					checkIdleEnds(t, cells, idleTimeout, moved, propagation)
 				}
 				if !crossed && now+time.Minute >= idleTimeout {
 					// The last minute before the timeout: every flow is

@@ -242,10 +242,9 @@ func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 	go echoDestination(echoListener)
 
 	arms := workloadArms()
-	packets := float64(measure / audioInterval)
 	checks := []m5Check{
-		{"uplink audio late loss (%)", 0, 1, 0.005 + 1/packets, 100},
-		{"downlink audio late loss (%)", 1, 1, 0.005 + 1/packets, 100},
+		{"uplink audio late loss (%)", 0, 1, 0.005, 100},
+		{"downlink audio late loss (%)", 1, 1, 0.005, 100},
 		{"uplink audio lateness p99 (ms)", 2, 1.10, 0.010, 1000},
 		{"downlink audio lateness p99 (ms)", 3, 1.10, 0.010, 1000},
 		{"keystroke echo p99 (ms)", 4, 1.10, 0.020, 1000},
