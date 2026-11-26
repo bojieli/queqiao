@@ -378,6 +378,14 @@ class Minimal(pa._Scenario):
             return dict(self.generic)
         return {ph: ks + STAGE10_GENERIC for ph, ks in self.generic.items()}
 
+    def report_only_for(self, plan) -> Tuple[str, ...]:
+        """The measures shown without a rule. Stage 10's generic
+        secondaries are report-only below stage 10 only: at stage 10 one
+        without a rule in gates.ini leaves the cell INCOMPLETE."""
+        if campaign_stage(plan) < 10:
+            return self.report_only
+        return tuple(k for k in self.report_only if k not in STAGE10_GENERIC)
+
     def reported(self, plan) -> Dict[str, Tuple[str, ...]]:
         """The generic secondaries each trial type reports without gating."""
         if campaign_stage(plan) < 10:

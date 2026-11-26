@@ -24,6 +24,9 @@ CREDIT_BUCKET = re.compile(r'^queqiao_credit_delay_seconds_bucket\{le="([^"]+)"\
 EPISODES = 'queqiao_carrier_shadow_pto_episodes_total{reached="%s"}'
 RECOVERED = 'queqiao_carrier_shadow_pto_recovered_total{reached="%s"}'
 SHADOW_BUCKETS = 16                      # metrics.CarrierShadowPTOBuckets
+# metrics.CreditDelayBounds, seconds; a scrape must carry every one and +Inf.
+CREDIT_BOUNDS = (0.001, 0.002, 0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5,
+                 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0)
 DEFAULT_KS, DEFAULT_KP = 2, 4            # pep's defaults, for a flag left at 0
 
 Histogram = List[Tuple[float, float]]    # (upper bound s, cumulative count), in bound order
@@ -46,7 +49,8 @@ def histogram_movement(pre: Scrape, post: Scrape) -> Optional[Histogram]:
     (a restart) and the cumulative counts do not decrease (a truncated or
     mixed scrape)."""
     a, b = _buckets(pre), _buckets(post)
-    if not b or set(a) != set(b) or math.inf not in b:
+    schema = set(CREDIT_BOUNDS) | {math.inf}
+    if set(a) != schema or set(b) != schema:
         return None
     out: Histogram = []
     last = 0.0

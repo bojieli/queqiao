@@ -244,7 +244,8 @@ def calibration(endpoint: Endpoint) -> dict[str, Any]:
         "carriers_ended": len(summarized), "open_carrier_episodes": open_episodes,
         "open_episodes_censored": open_censored, "rows": rows,
         "transitions": dict(transitions), "false_replacements": false_replacements,
-        **promotion_rate(endpoint, rows, thresholds, bool(open_carrier_records(endpoint, summarized))),
+        **promotion_rate(endpoint, rows, thresholds, bool(open_carrier_records(endpoint, summarized)) or any(
+            carrier_key(r) not in summarized for r in endpoint.of(BOUND) if r.get("carrier_id") not in (None, 0))),
         "thresholds": [{"k_s": k[0], "k_p": k[1], "records": n} for k, n in thresholds.items()],
     }
 

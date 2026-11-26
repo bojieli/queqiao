@@ -611,6 +611,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 	f.telemetryID = nextTelemetryID.Add(1)
 	f.class.Store(uint32(protocol.ClassNew))
 	f.ackTrack = newAckTracker()
+	f.credit.carried = newAckTracker()
 	return f
 }
 

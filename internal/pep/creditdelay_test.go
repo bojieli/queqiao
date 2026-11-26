@@ -29,10 +29,10 @@ func TestCreditDelayIsTimedFromTheCarriersTakeToTheCoveringACK(t *testing.T) {
 	// The controller reports a much larger (smoothed or fallback) figure,
 	// and Reno none at all: the baseline is the transport's own minimum.
 	quic := &mpLane{id: 0, kind: TransportQUIC, fc: newFrameConn(&statsConn{
-		stats: laneTransportStats{minRTT: minRTT, controller: wancongestion.ControllerTelemetry{MinRTT: 200 * time.Millisecond}},
+		stats: laneTransportStats{minRTT: minRTT, latestRTT: minRTT, controller: wancongestion.ControllerTelemetry{MinRTT: 200 * time.Millisecond}},
 	})}
 	tcp := &mpLane{id: 1, kind: TransportTCP, fc: newFrameConn(&statsConn{
-		stats: laneTransportStats{minRTT: minRTT},
+		stats: laneTransportStats{minRTT: minRTT, latestRTT: minRTT},
 	})}
 
 	flow.noteSent(0, 8000)
@@ -91,14 +91,46 @@ func TestCreditDelayIsTimedFromTheCarriersTakeToTheCoveringACK(t *testing.T) {
 	if flow.credit.pending.Load() {
 		t.Fatal("a chunk already covered armed a sample")
 	}
-	// A re-issue may complete a sample armed by the original.
-	flow.noteCarrierTook(quic, 7000, 1000, true)
-	flow.noteCarrierTook(quic, 7000, 1000, true)
-	if _, err := flow.acknowledgeCoverage(8000, false, nil); err != nil {
+	// Lanes finish out of order: an earlier original written after a later
+	// one is still an original.
+	flow.noteSent(0, 14000)
+	flow.noteCarrierTook(tcp, 9000, 1000, true)
+	flow.noteCarrierTook(quic, 8000, 1000, true)
+	if !flow.credit.pending.Load() {
+		t.Fatal("an original written after a later offset was taken for a re-issue")
+	}
+	if _, err := flow.acknowledgeCoverage(9000, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if n := registry.Snapshot().CreditDelay.Count(); n != 3 {
-		t.Fatalf("the original's sample was not completed (%d samples, want 3)", n)
+		t.Fatalf("%d samples, want 3", n)
+	}
+	// A re-issue may complete a sample armed by the original.
+	flow.noteCarrierTook(quic, 10000, 1000, true)
+	flow.noteCarrierTook(quic, 10000, 1000, true)
+	if _, err := flow.acknowledgeCoverage(11000, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := registry.Snapshot().CreditDelay.Count(); n != 4 {
+		t.Fatalf("the original's sample was not completed (%d samples, want 4)", n)
+	}
+	// A path with no round-trip sample yet: its minimum is the transport's
+	// placeholder, not a measurement, so no sample starts.
+	fresh := &mpLane{id: 2, kind: TransportQUIC, fc: newFrameConn(&statsConn{
+		stats: laneTransportStats{minRTT: 100 * time.Millisecond},
+	})}
+	flow.noteCarrierTook(fresh, 11000, 1000, true)
+	if flow.credit.pending.Load() {
+		t.Fatal("the placeholder minimum of an unmeasured path started a sample")
+	}
+	// Before OPEN_OK a coded frame's stream safety copy is not a first take.
+	unconfirmed := &mpLane{id: 3, kind: TransportQUIC, fc: newFrameConn(&statsConn{
+		stats: laneTransportStats{minRTT: minRTT, latestRTT: minRTT},
+	})}
+	unconfirmed.fc.openUnconfirmed = func() bool { return true }
+	flow.noteCarrierTook(unconfirmed, 12000, 1000, true)
+	if flow.credit.pending.Load() {
+		t.Fatal("a write before OPEN_OK started a sample")
 	}
 }
 

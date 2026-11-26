@@ -26,31 +26,29 @@ import (
 // may still complete a sample already armed).
 type creditSampler struct {
 	pending atomic.Bool
-	// takenEnd is the highest offset any carrier has taken, on any lane and
-	// substrate: a write that does not start at or above it re-issues bytes
-	// a carrier already had, and must not start a sample, which would time
-	// the repair and not the delay that caused it.
-	takenEnd atomic.Uint64
-	mu       sync.Mutex
-	start    uint64
-	end      uint64
-	taken    time.Time
-	minRTT   time.Duration
+	// carried holds every byte range a carrier has taken, on any lane and
+	// substrate. A write of a range it already holds re-issues bytes a
+	// carrier already had, and must not start a sample, which would time
+	// the repair and not the delay that caused it. Ranges, not a high-water
+	// mark: lanes finish their writes out of order, and an earlier original
+	// written after a later one is still an original.
+	carried *ackTracker
+	mu      sync.Mutex
+	start   uint64
+	end     uint64
+	taken   time.Time
+	minRTT  time.Duration
 }
 
-// noteTaken advances takenEnd to end and reports whether [sequence, end)
-// lies wholly above what any carrier had taken before: an original
-// transmission.
+// noteTaken records [sequence, end) as carried and reports whether no
+// carrier had taken it before: an original transmission.
 func (c *creditSampler) noteTaken(sequence, end uint64) bool {
-	for {
-		high := c.takenEnd.Load()
-		if end <= high {
-			return false
-		}
-		if c.takenEnd.CompareAndSwap(high, end) {
-			return sequence >= high
-		}
+	if c.carried == nil {
+		return false
 	}
+	// Add reports whether the range was not already wholly held. A
+	// re-issue carries a chunk's own range again, so it is held.
+	return c.carried.Add([][2]uint64{{sequence, end}})
 }
 
 // noteCarrierTook is called when a lane's carrier has taken a DATA frame;
@@ -64,6 +62,11 @@ func (f *multipathFlow) noteCarrierTook(lane *mpLane, sequence uint64, n int, re
 	if !original || !reliable || lane.kind != TransportQUIC || f.credit.pending.Load() {
 		return
 	}
+	if lane.fc.openUnconfirmed != nil && lane.fc.openUnconfirmed() {
+		// Before OPEN_OK a coded frame also goes as a stream safety copy,
+		// written after the code took it: its write is not the first take.
+		return
+	}
 	taken := time.Now()
 	// The baseline is the path's own minimum round trip, as the transport
 	// measures it, whatever controller runs: Reno installs none, and
@@ -71,10 +74,15 @@ func (f *multipathFlow) noteCarrierTook(lane *mpLane, sequence uint64, n int, re
 	// would subtract the very queueing this measures.
 	var minRTT time.Duration
 	if provider, ok := lane.fc.transport().(laneStatsProvider); ok {
-		minRTT = provider.transportStats().minRTT
+		// The transport starts its minimum at a placeholder (the initial
+		// RTT) and restores it on a path migration; it is a measurement
+		// only once the path has a round-trip sample.
+		if stats := provider.transportStats(); stats.latestRTT > 0 {
+			minRTT = stats.minRTT
+		}
 	}
 	if minRTT <= 0 {
-		// No round trip measured yet: nothing to subtract, so no sample.
+		// No round trip measured on this path yet: nothing to subtract.
 		return
 	}
 	// Armed under replayMu, the lock acknowledgements are applied under,

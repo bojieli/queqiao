@@ -345,9 +345,13 @@ Sender-side credit delay p95 comes from every endpoint's
 trial. Each endpoint times what it sends over a QUIC stream: from a chunk's
 last byte being taken by the carrier to the flow acknowledgement that covers
 it, minus the path's minimum round trip as the QUIC transport measures it
-(whatever congestion controller runs), one chunk per flow at a time. Only an
-original transmission starts a sample; a re-issue can complete one but never
-starts one, so a repair is timed from the first take. An
+(whatever congestion controller runs, and only once the path has a
+round-trip sample), one chunk per flow at a time. Only an original
+transmission starts a sample, judged by the byte ranges carriers have
+already taken rather than by order, since lanes finish out of order; a
+re-issue can complete a sample but never starts one, so a repair is timed
+from the first take. Writes before OPEN_OK are not timed. A scrape must carry
+every exported bucket. An
 arm's block p95 is taken over the histograms of its trials, gateway and
 client, pooled, never as a mean of per-trial percentiles; a block with fewer
 than 20 samples per arm is pooled over blocks like any sparse tail. A build

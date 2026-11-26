@@ -998,7 +998,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
             rule = rules.get(k.lower()) or rules.get(f"*.{metric.lower()}")
             if rule:
                 judged_rules[k] = rule
-            elif metric not in wl.report_only:
+            elif metric not in (wl.report_only_for(plan) if hasattr(wl, "report_only_for") else wl.report_only):
                 unruled.append(k)
         # And every configured rule must find its measure: in each phase that
         # ran on this path for a wildcard, by name otherwise. A measure the

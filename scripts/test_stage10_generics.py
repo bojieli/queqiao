@@ -461,5 +461,50 @@ class LeadReview(unittest.TestCase):
             self.assertIn("open", cal["incomplete"])
 
 
+class LastRound(unittest.TestCase):
+    def test_a_stage_10_rule_missing_from_gates_leaves_the_cell_incomplete(self):
+        g = gates()
+        g["secondary"] = {k: v for k, v in g["secondary"].items() if k != "credit_delay_p95_s"}
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "c")
+            campaign(root, stage=10, cand_false=(0, 2), main_false=(0, 2))
+            text, v = an.report(root, g)
+        self.assertEqual(v[("a", "cand", "rule:bulk.credit_delay_p95_s")], "n/a", text)
+        self.assertIn("(**no rule**)", text)
+        self.assertEqual(an.cell_verdicts(v, "a", "cand")["bulk"], "INCOMPLETE")
+
+    def test_scrapes_missing_the_same_buckets_are_not_a_histogram(self):
+        pre, post = histogram([]), histogram([0.004] * 9)
+        only_inf = lambda h: {k: v for k, v in h.items() if "+Inf" in k}
+        self.assertIsNone(gm.histogram_movement(only_inf(pre), only_inf(post)))
+        # The analyzer's schema is the one the product exports.
+        src = (HERE.parent / "internal" / "metrics" / "creditdelay.go").read_text()
+        block = src[src.index("var CreditDelayBounds"):src.index("}", src.index("var CreditDelayBounds"))]
+        bounds = []
+        for term in block.split("{", 1)[1].replace("\n", " ").split(","):
+            term = term.strip()
+            if not term:
+                continue
+            num, _, unit = term.partition("*")
+            num, unit = (num.strip(), unit.strip()) if unit else ("1", num.strip())
+            scale = {"time.Millisecond": 1e-3, "time.Second": 1.0}[unit]
+            bounds.append(float(num) * scale)
+        self.assertEqual(tuple(round(b, 6) for b in bounds), gm.CREDIT_BOUNDS)
+
+    def test_k_p_1_with_a_bound_only_carrier_is_unmeasured(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "c.jsonl")
+            with open(log, "w") as f:
+                f.write(json.dumps({"time": "2026-06-01T00:00:00Z", "msg": "runtime configuration",
+                                    "carrier_shadow": True, "carrier_shadow_ks": 1, "carrier_shadow_kp": 1}) + "\n")
+                f.write(json.dumps({"time": "2026-06-01T00:00:05Z", "msg": shadow.ENDED, "carrier_id": 1,
+                                    "pto_reached": [4] + [0] * 15, "pto_recovered": [1] + [0] * 15,
+                                    "pto_dead": [3] + [0] * 15}) + "\n")
+                f.write(json.dumps({"time": "2026-06-01T00:00:06Z", "msg": shadow.BOUND, "carrier_id": 2}) + "\n")
+            ep = shadow.Endpoint("client")
+            ep.load([log])
+            self.assertIsNone(shadow.calibration(ep)["false_promotion_rate"])
+
+
 if __name__ == "__main__":
     unittest.main()
