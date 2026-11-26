@@ -39,7 +39,7 @@ def frozen_rules():
         parts = v.split()
         if parts[0] in an.RULES:
             out[k.split(".", 1)[1]] = (parts[0], tuple(float(x) for x in parts[1:]))
-    for k in ("completion", "stalls_per_trial"):
+    for k in ("stalls_per_trial",):
         better, margin = cp["secondary"][k].split()
         out[k] = (better, (float(margin),))
     return out
@@ -55,7 +55,6 @@ MAIN = {
     "ttft_clear_p99_s": ([2.0, 2.4, 1.9, 2.6, 2.2, 2.1], "lower"),
     "ttft_after_restore_s": ([3.0, 4.5, 2.2, 5.1, 3.6, 4.0], "lower"),
     "stalls_per_trial": ([36, 28, 40, 31, 25, 33], "lower"),
-    "completion": ([0.5, 0.75, 0.5, 0.25, 0.5, 0.75], "higher"),
 }
 
 
@@ -168,3 +167,45 @@ class Rendering(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PooledCompletion(unittest.TestCase):
+    """Flow completion as a pooled event rate (v3): failed over attempted
+    short downloads, `events 0.02 40`."""
+
+    def rule(self):
+        cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+        cp.read(os.path.join(HERE, "validation", "gates.ini"))
+        kind, v, n = cp["workload:impaired"]["*.fetch_failures"].split()
+        self.assertEqual(kind, "events")
+        self.assertNotIn("*.completion", cp["workload:impaired"])
+        return float(v), int(n)
+
+    def test_every_block_favouring_the_candidate_passes(self):
+        v, n = self.rule()
+        # imp4 slow-lossy's shape: the candidate completed all 8 every block,
+        # main about 7 of 8.
+        blocks = [((0, 8), (m, 8)) for m in (1, 2, 1, 0, 1, 1)]
+        self.assertEqual(st.events_decision(blocks, v, n, ALPHA, final=True)[0], "pass")
+
+    def test_clearly_worse_fails_and_too_few_attempts_is_unmeasured(self):
+        v, n = self.rule()
+        self.assertEqual(st.events_decision([((3, 8), (0, 8))] * 6, v, n, ALPHA, final=True)[0], "fail")
+        self.assertEqual(st.events_decision([((0, 8), (1, 8))] * 4, v, n, ALPHA, final=True)[0], "n/a")
+
+    def test_two_perfect_arms_are_undecided_at_this_size(self):
+        # (1 - 0.02)^48 > 0.05: equality cannot be shown in 48 attempts.
+        v, n = self.rule()
+        self.assertEqual(st.events_decision([((0, 8), (0, 8))] * 6, v, n, ALPHA, final=False)[0], "continue")
+
+    def test_attempts_leave_out_the_windows_cut(self):
+        import types
+        import ab_workloads as w
+        w.load_plugins()
+        imp = sys.modules["ab_workload_impaired"]
+        rows = [{"phase": "policed", "kind": "imp-fetch", "flow": f"w1r{k}", "complete": c, "curl_exit": e}
+                for k, c, e in ((1, "1", "0"), (2, "1", "0"), (3, "0", "56"), (4, "0", "28"))]
+        recs = [{"_phase": "policed", "kind": "fetch", "k": 4, "window_cut": 1}]
+        t_ = types.SimpleNamespace(rows=rows, records=recs, trial="policed")
+        self.assertEqual(imp.fetch_attempts([t_], "policed"), (1, 3))
+        self.assertEqual(imp.Impaired().block_events([t_], {})["policed.fetch_failures"], (1, 3))

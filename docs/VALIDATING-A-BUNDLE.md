@@ -933,8 +933,12 @@ probes every 0.25 s, each its own connection.
   fewest at which a candidate with no event can pass a main with none,
   (1 - v)^n <= alpha, 150 for v = 0.02.
 - *Silent deaths*: none, in every block (hard), beside the pooled rate.
-- *Flow completion*: completed over attempted short downloads per trial
-  (one the window's end cut is not an attempt), `higher 0.02`.
+- *Flow completion*: failed over attempted short downloads (one the
+  window's end cut is not an attempt), pooled over all blocks, as an
+  `events 0.02 40` rate (v3, adopted after imp4; imp3 and imp4 were judged
+  by the per-block `higher 0.02` rule and are not re-judged). Completion
+  itself is reported. Two arms that never fail cannot be shown equal in
+  under 149 attempts at this margin: they end undecided.
 - *Stalls per trial* (`[secondary]`), *TTFT p99*, *keystroke echo p99*.
 - *Per blackhole*, from the path's restore, the worse of a trial's two
   outages: the first completed probe (`recover_s`), the first byte of a
