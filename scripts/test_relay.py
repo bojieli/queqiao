@@ -47,7 +47,7 @@ class RelayHop(unittest.TestCase):
         # One relay per arm, on that arm's port, to the gateway's same port;
         # both up before any client enrolls.
         for port in (23471, 23472):
-            self.assertIn(f"relay --listen :{port} --upstream 192.0.2.1:{port} --dial-timeout 3s --idle-timeout 15m "
+            self.assertIn(f"relay run --listen :{port} --upstream 192.0.2.1:{port} --dial-timeout 3s --idle-timeout 15m "
                           "--max-connections 8192", text)
         self.assertLess(text.index("[rl] start relay-cand"), text.index("enroll a with main"))
         self.assertIn("clients dial 198.51.100.7 (relay on rl", text)
