@@ -75,6 +75,9 @@ built to refuse rather than to trust:
 - **Preflight is read-only, and it refuses.** Before anything is copied or
   started, the runner snapshots each host:
   - each unit's state, MainPID, NRestarts, start time and executable SHA-256.
+    With `snapshot_sudo = true` in a `[production:...]` section, this
+    observation of that section's units (and nothing else the campaign does)
+    runs through `sudo -n`; a sudo that fails is an observation error.
     A running unit whose executable cannot be read or hashed is not
     observed: the preflight refuses, and during the run it is a change;
   - each launchd job;
@@ -660,6 +663,17 @@ show the bounds at that look's level. Sequential mode is only for workloads
 judged entirely by their own rules, such as `minimal`; the primary gate
 with its `[secondary]` bounds (`bulk`, `single`, `interactive`), D and the
 DC gate keep a fixed number of blocks.
+
+**Contention** (`[campaign] host_cpu = true`). Through every trial a
+read-only sampler (a job, torn down with the rest) records each loaded host's
+CPU from `/proc/stat`, its load, and production's own CPU (its units'
+processes, from `/proc/<pid>/stat`) every 2 s. A block is void when, in any
+of its trials, a host was at or above 90 % CPU for more than 10 % of the
+window, production took more than 20 % of the host's CPU, or a host's CPU
+record is missing (`gates.ini [contention]`, frozen with the gates). A void
+block counted toward the cap but is not evidence; the report lists each void
+block with its reason, and shows each arm's mean host CPU and production
+share, void blocks included, so an arm that burns more CPU shows.
 
 **Cost.** One block is four trials plus about a minute of restarts, so a
 block of A takes about 5 minutes, B 7, C 9 and DC 5: about 26 minutes per
