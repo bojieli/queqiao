@@ -290,8 +290,12 @@ func TestCarrierRecoveryRebindsEveryFlowAfterAnUplinkChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p.client.onUplinkTick(ctx, false, true, "uplink-a", "uplink-b")
-	for _, e := range streams {
-		e.waitEchoed(t, e.echoed.Load()+16<<10, 30*time.Second)
+	marks := make([]int64, len(streams))
+	for i, e := range streams {
+		marks[i] = e.echoed.Load()
+	}
+	for i, e := range streams {
+		e.waitEchoed(t, marks[i]+16<<10, 30*time.Second)
 	}
 	m := p.client.carriers
 	if got := m.newCarrierJoins.Load(); got != flows {
@@ -427,8 +431,12 @@ func TestCarrierRecoveryRebindsManyFlowsAfterOnePromotion(t *testing.T) {
 	}
 	p.relay.BlackholeSources()
 	blackholed := time.Now()
-	for _, e := range streams {
-		e.waitEchoed(t, e.echoed.Load()+4<<10, 45*time.Second)
+	marks := make([]int64, len(streams))
+	for i, e := range streams {
+		marks[i] = e.echoed.Load()
+	}
+	for i, e := range streams {
+		e.waitEchoed(t, marks[i]+4<<10, 45*time.Second)
 	}
 	t.Logf("%d flows resumed %v after the blackhole", flows, time.Since(blackholed))
 	m := p.client.carriers
