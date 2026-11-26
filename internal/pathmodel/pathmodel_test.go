@@ -14,10 +14,10 @@ func TestTheFloorIsPooledAcrossLanes(t *testing.T) {
 	m := NewPathModel()
 	// Three lanes with plenty of samples agree on 0.42; a fourth has just
 	// started and has seen almost nothing.
-	m.Report(1, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 0})
-	m.Report(2, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 0})
-	m.Report(3, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 0})
-	erasure := m.Report(4, Observation{Erasure: 0.05, BurstFactor: 1, ObservedSamples: 20, Delivered: 1e6}).Erasure
+	m.Report(1, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
+	m.Report(2, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
+	m.Report(3, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
+	erasure := m.Report(4, Observation{Erasure: 0.05, BurstFactor: 1, ObservedSamples: 20}).Erasure
 
 	if math.Abs(erasure-0.42) > 0.01 {
 		t.Fatalf("pooled erasure %.3f, want the weight of the measured lanes at about 0.42", erasure)
@@ -29,46 +29,10 @@ func TestTheFloorIsPooledAcrossLanes(t *testing.T) {
 	}
 }
 
-// The share is what stops lanes compounding: each is capped at the endpoint
-// pair's bottleneck divided by the number of lanes, so the aggregate on the
-// wire is what one sender would have put there.
-func TestTheShareDividesTheBottleneck(t *testing.T) {
-	m := NewPathModel()
-	const perLane = 1e6 // bytes per second
-	m.Report(1, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: perLane, RoundTrip: 0})
-	m.Report(2, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: perLane, RoundTrip: 0})
-	m.Report(3, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: perLane, RoundTrip: 0})
-	share := m.Report(4, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: perLane, RoundTrip: 0}).Share
-
-	if m.Members() != 4 {
-		t.Fatalf("model counts %d lanes, want 4", m.Members())
-	}
-	// The aggregate is 4 MB/s over four lanes, and each share carries the
-	// probe gain, because a cap with no headroom is a cap computed from its
-	// own effect.
-	want := shareProbeGain * perLane
-	if math.Abs(share-want) > want*0.05 {
-		t.Fatalf("share %.0f of a 4 MB/s aggregate over 4 lanes, want about %.0f", share, want)
-	}
-	// Four lanes each capped at their share put on the wire what one BBR
-	// sender probing on its own would have.
-	if total := share * 4; math.Abs(total-shareProbeGain*4*perLane) > perLane*0.2 {
-		t.Fatalf("four shares total %.0f, want %.0f", total, shareProbeGain*4*perLane)
-	}
-}
-
-// A lane on its own must not be capped by a bottleneck nobody has measured.
-func TestAnUnknownBottleneckDoesNotCap(t *testing.T) {
-	m := NewPathModel()
-	if share := m.Report(1, Observation{Erasure: 0, BurstFactor: 1, ObservedSamples: 0, Delivered: 0, RoundTrip: 0}).Share; share != 0 {
-		t.Fatalf("share %.0f before any delivered rate was reported, want 0 for no cap", share)
-	}
-}
-
 func TestObservationProgressDoesNotWeightAnUntrustedFloor(t *testing.T) {
 	m := NewPathModel()
-	m.Report(1, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 0})
-	state := m.Report(2, Observation{Erasure: 0, BurstFactor: 1, ObservedSamples: 120, Delivered: 0, RoundTrip: 0})
+	m.Report(1, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
+	state := m.Report(2, Observation{Erasure: 0, BurstFactor: 1, ObservedSamples: 120, RoundTrip: 0})
 	if state.ObservedSamples != 5120 {
 		t.Fatalf("observed samples = %.0f, want 5120", state.ObservedSamples)
 	}
@@ -79,7 +43,7 @@ func TestObservationProgressDoesNotWeightAnUntrustedFloor(t *testing.T) {
 
 func TestPathKnowledgeOutlivesTheConnectionThatMeasuredIt(t *testing.T) {
 	m := NewPathModel()
-	m.Report(1, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 240 * time.Millisecond})
+	m.Report(1, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 240 * time.Millisecond})
 
 	// Membership governs only concurrent bandwidth sharing. Simulate a lane
 	// going idle without making a five-second unit test: the measurement must
@@ -104,7 +68,7 @@ func TestPathKnowledgeOutlivesTheConnectionThatMeasuredIt(t *testing.T) {
 
 	// Retained knowledge is a handoff, not a permanent verdict. Once a new
 	// connection supplies trusted evidence, it becomes the path's knowledge.
-	changed := m.Report(2, Observation{Erasure: 0.55, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 300 * time.Millisecond})
+	changed := m.Report(2, Observation{Erasure: 0.55, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 300 * time.Millisecond})
 	if changed.Erasure != 0.55 {
 		t.Fatalf("new generation erasure = %.3f, want 0.550", changed.Erasure)
 	}
@@ -115,8 +79,8 @@ func TestPathKnowledgeOutlivesTheConnectionThatMeasuredIt(t *testing.T) {
 // controller, so membership has to expire.
 func TestAnIdleLaneStopsCounting(t *testing.T) {
 	m := NewPathModel()
-	m.Report(1, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 0})
-	m.Report(2, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 0})
+	m.Report(1, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
+	m.Report(2, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
 	if m.Members() != 2 {
 		t.Fatalf("members = %d, want 2", m.Members())
 	}
@@ -125,17 +89,9 @@ func TestAnIdleLaneStopsCounting(t *testing.T) {
 	m.members[1].at = time.Now().Add(-2 * memberIdle)
 	m.mu.Unlock()
 
-	state := m.Report(2, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 0})
+	m.Report(2, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
 	if m.Members() != 1 {
 		t.Fatalf("members = %d after one went idle, want 1", m.Members())
-	}
-	// The remaining lane has the whole bottleneck rather than half, and being
-	// alone it is no longer capped at all.
-	if state.Seed < 1.5e6 {
-		t.Fatalf("seed %.0f for the only live lane, want the whole aggregate", state.Seed)
-	}
-	if state.Share != 0 {
-		t.Fatalf("share %.0f for a lane that is now alone, want no cap", state.Share)
 	}
 }
 
@@ -151,79 +107,6 @@ func TestSharedPathIsPerPeer(t *testing.T) {
 	}
 }
 
-// A shared controller must still work when it is the only lane, because that
-// is the common case and the one measured fastest live.
-func TestASingleSharedLaneIsNotPenalised(t *testing.T) {
-	m := NewPathModel()
-	const rate = 2e6
-	state := m.Report(1, Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: rate, RoundTrip: 0})
-	// Not capped at its own rate: not capped at all. A lone lane has nothing
-	// to compound with, and a ceiling equal to what it has already delivered
-	// is one it can never probe past.
-	if state.Share != 0 {
-		t.Fatalf("a lone lane was capped at %.0f, want no cap", state.Share)
-	}
-	// It still learns the path, so a lane replacing it can start from what it
-	// measured rather than from the initial window.
-	if state.Seed < rate*0.95 {
-		t.Fatalf("seed %.0f from a lane delivering %.0f, want about the same", state.Seed, rate)
-	}
-}
-
-// The share is measured from what the members deliver, and the members deliver
-// what the share allows. Without headroom that is a loop whose only stable
-// point is the rate it started at, and whose every disturbance moves it down:
-// one application-limited interval lowers the windowed maximum, which lowers
-// the share, which lowers what can be delivered, and nothing ever measures the
-// path upward again.
-//
-// Live, that was a transport that ran at 143 Mbit/s for six 20-second windows
-// and then moved no bytes at all until its process was restarted
-// (docs/archive/2026-08-development/MEASUREMENTS-20260816.md). On the emulator it is one trial at 37
-// Mbit/s followed by four at 0.8.
-func TestTheShareDoesNotRatchetDown(t *testing.T) {
-	const capacity = 8e6 // what the path would actually carry, bytes/second
-	for _, lanes := range []int{1, 2, 4} {
-		t.Run("", func(t *testing.T) {
-			m := NewPathModel()
-			// Each lane delivers what its own cap allows, which is the loop
-			// the real controller runs: bandwidth() takes the smaller of its
-			// estimate and its share.
-			delivered := make([]float64, lanes)
-			for i := range delivered {
-				delivered[i] = capacity / float64(lanes)
-			}
-			// One application-limited interval: every lane briefly delivers a
-			// tenth of what it could. This is a gap between requests, not a
-			// property of the path.
-			for i := range delivered {
-				delivered[i] /= 10
-			}
-			var share float64
-			for round := 0; round < 40; round++ {
-				for i := 0; i < lanes; i++ {
-					share = m.Report(Member(i+1), Observation{Erasure: 0.1, BurstFactor: 1, ObservedSamples: 5000, Delivered: delivered[i], RoundTrip: 0}).Share
-					// The next round delivers what this one is allowed to,
-					// bounded by the path itself.
-					next := capacity / float64(lanes)
-					if share > 0 && share < next {
-						next = share
-					}
-					delivered[i] = next
-				}
-			}
-			total := 0.0
-			for _, d := range delivered {
-				total += d
-			}
-			if total < capacity*0.9 {
-				t.Fatalf("%d lane(s) settled at %.0f B/s after one idle interval, want the path's %.0f",
-					lanes, total, capacity)
-			}
-		})
-	}
-}
-
 // What a path measured outlives the connection that measured it, but not for
 // ever. A gateway keys these by client address for the life of its process, so
 // a client back hours later was seeded with the erasure and the minimum round
@@ -232,7 +115,7 @@ func TestPathKnowledgeExpiresWhenNothingHasReportedForLong(t *testing.T) {
 	now := time.Now()
 	m := NewPathModel()
 	m.now = func() time.Time { return now }
-	m.Report(1, Observation{Erasure: 0.3, BurstFactor: 1, ObservedSamples: 5000, Delivered: 1e6, RoundTrip: 40 * time.Millisecond})
+	m.Report(1, Observation{Erasure: 0.3, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 40 * time.Millisecond})
 
 	// A minute later the member has gone idle, but the path is remembered.
 	now = now.Add(time.Minute)
@@ -245,7 +128,7 @@ func TestPathKnowledgeExpiresWhenNothingHasReportedForLong(t *testing.T) {
 		t.Fatalf("a path nothing has reported on for %v still answers %+v", knowledgeLifetime, got)
 	}
 	// And a new report starts from what it measures, not from the old floor.
-	got := m.Report(2, Observation{Erasure: 0.05, BurstFactor: 1, ObservedSamples: 200, Delivered: 1e6, RoundTrip: 210 * time.Millisecond})
+	got := m.Report(2, Observation{Erasure: 0.05, BurstFactor: 1, ObservedSamples: 200, RoundTrip: 210 * time.Millisecond})
 	if got.RoundTrip != 210*time.Millisecond {
 		t.Fatalf("a fresh report on an expired path got round trip %v, want its own 210ms", got.RoundTrip)
 	}

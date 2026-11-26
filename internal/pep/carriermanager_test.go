@@ -354,90 +354,24 @@ func TestReplayGateOpensOnTheFirstACKOrAfterOneSRTT(t *testing.T) {
 	}
 }
 
-// Bundles (test 18): recovery=carrier needs the path controller and the
-// sticky coded retry on both ends, and on a client the single topology
-// without a fan-out; anything else is rejected at start-up.
-func TestRecoveryBundleIsValidated(t *testing.T) {
-	cases := []struct {
-		recovery RecoveryMode
-		scope    CongestionScope
-		coded    CodedRetryMode
-		topology Topology
-		fanOut   int
-		gateway  bool
+// Every client builds a carrier manager, and both constructors validate its
+// thresholds.
+func TestClientAndServerValidateTheRecoveryBundle(t *testing.T) {
+	_, roots := testCertificate(t)
+	for _, tc := range []struct {
+		name     string
+		recovery CarrierRecoveryConfig
 		ok       bool
 	}{
-		{"", "", "", "", 0, false, true},
-		{RecoveryFlow, CongestionScopeConnection, CodedRetryLegacy, TopologyIsolated, 0, false, true},
-		{RecoveryCarrier, CongestionScopePath, CodedRetrySticky, TopologySingle, 0, false, true},
-		{RecoveryCarrier, CongestionScopePath, CodedRetrySticky, "", 0, true, true},
-		{RecoveryCarrier, CongestionScopePath, CodedRetrySticky, TopologyIsolated, 0, false, false},
-		{RecoveryCarrier, CongestionScopePath, CodedRetrySticky, TopologySingle, 2, false, false},
-		{RecoveryCarrier, CongestionScopePath, CodedRetryLegacy, TopologySingle, 0, false, false},
-		{RecoveryCarrier, CongestionScopeConnection, CodedRetrySticky, TopologySingle, 0, false, false},
-		{RecoveryCarrier, CongestionScopeConnection, CodedRetrySticky, "", 0, true, false},
-		{RecoveryCarrier, CongestionScopePath, CodedRetryLegacy, "", 0, true, false},
-		{"bogus", CongestionScopePath, CodedRetrySticky, TopologySingle, 0, false, false},
-	}
-	for _, tc := range cases {
-		err := ValidateRecovery(tc.recovery, tc.scope, tc.coded, tc.topology, tc.fanOut, tc.gateway)
-		if (err == nil) != tc.ok {
-			t.Errorf("%+v: %v, want ok=%v", tc, err, tc.ok)
-		}
-	}
-	got := Bundle(CCAPIV2, MemoryOwned, CodedRetrySticky, GatewayAdmissionLegacy, SchedClass, ClassifierPhased, CongestionScopePath, TopologySingle, RecoveryCarrier)
-	if want := "cc-api=v2,sched=class,congestion=path,topology=single,recovery=carrier,coded-retry=sticky,mem=owned,classifier=phased"; got != want {
-		t.Fatalf("bundle %q, want %q", got, want)
-	}
-}
-
-// Both constructors apply the validator; the full stage 1-7 bundle with
-// classifier=phased composes with recovery=carrier.
-func TestClientAndServerValidateTheRecoveryBundle(t *testing.T) {
-	certificate, roots := testCertificate(t)
-	full := func(cfg *ClientConfig) {
-		cfg.CCAPI, cfg.Sched, cfg.CongestionScope, cfg.Topology = CCAPIV2, SchedClass, CongestionScopePath, TopologySingle
-		cfg.CodedRetry, cfg.Memory, cfg.Classifier, cfg.EnableQUICPool = CodedRetrySticky, MemoryOwned, ClassifierPhased, true
-	}
-	for _, tc := range []struct {
-		name   string
-		mutate func(*ClientConfig)
-		ok     bool
-	}{
-		{"full bundle", func(c *ClientConfig) { full(c); c.Recovery = RecoveryCarrier }, true},
-		{"without topology=single", func(c *ClientConfig) { full(c); c.Topology = TopologyIsolated; c.Recovery = RecoveryCarrier }, false},
-		{"without coded-retry", func(c *ClientConfig) { full(c); c.CodedRetry = CodedRetryLegacy; c.Recovery = RecoveryCarrier }, false},
-		{"bad thresholds", func(c *ClientConfig) {
-			full(c)
-			c.Recovery = RecoveryCarrier
-			c.CarrierRecovery = CarrierRecoveryConfig{SuspectPTOs: 5, ReplacePTOs: 2}
-		}, false},
+		{"defaults", CarrierRecoveryConfig{}, true},
+		{"bad thresholds", CarrierRecoveryConfig{SuspectPTOs: 5, ReplacePTOs: 2}, false},
 	} {
-		cfg := ClientConfig{ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: roots}
-		tc.mutate(&cfg)
-		client, err := NewClient(cfg)
+		client, err := NewClient(ClientConfig{ListenAddr: "127.0.0.1:0", RemoteAddr: "127.0.0.1:1", Credentials: roots, CarrierRecovery: tc.recovery})
 		if (err == nil) != tc.ok {
 			t.Errorf("client %s: %v, want ok=%v", tc.name, err, tc.ok)
 		}
-		if err == nil && (client.carriers == nil) != (cfg.Recovery != RecoveryCarrier) {
-			t.Errorf("client %s: carrier manager present=%v", tc.name, client.carriers != nil)
-		}
-	}
-	for _, tc := range []struct {
-		scope CongestionScope
-		coded CodedRetryMode
-		ok    bool
-	}{
-		{CongestionScopePath, CodedRetrySticky, true},
-		{CongestionScopeConnection, CodedRetrySticky, false},
-		{CongestionScopePath, CodedRetryLegacy, false},
-	} {
-		_, err := NewServer(ServerConfig{
-			ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true,
-			CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: tc.scope, CodedRetry: tc.coded, Recovery: RecoveryCarrier,
-		})
-		if (err == nil) != tc.ok {
-			t.Errorf("server %s/%s: %v, want ok=%v", tc.scope, tc.coded, err, tc.ok)
+		if err == nil && client.carriers == nil {
+			t.Errorf("client %s: no carrier manager", tc.name)
 		}
 	}
 }

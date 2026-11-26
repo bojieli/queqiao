@@ -151,7 +151,6 @@ func TestWire1ClientAgainstTheDualGateway(t *testing.T) {
 		{"tombstone-replay", TestCompletedFlowTombstoneReplaysFinalAck},
 		{"provider-probe", TestClientProbeAuthenticatesProviderWithoutOpeningFlow},
 		{"pool-recovery", TestPooledFlowsRecoverThroughOneReplacementGeneration},
-		{"bulk-pool-probe", TestBulkExpiredProofUsesRealProbeAndHotReuseSkipsProbe},
 		{"gateway-reset-163", TestFailingGatewayFlowResetsEveryOpenLane},
 		{"client-ends-on-reset-163", TestClientEndsFlowOnGatewayResetWithoutLaneFailure},
 		{"staged-lane-reset-163", TestStagedLaneGetsAPermanentReset},
@@ -427,7 +426,7 @@ func TestStallRescueAcrossWireVersions(t *testing.T) {
 				// striped bundle frozen whole is a lane-failure case instead.
 				client, err := NewClient(ClientConfig{
 					ListenAddr: clientListener.Addr().String(), RemoteAddr: remote, Credentials: clientCredentials,
-					Transport: carrier, EnableQUICPool: carrier == TransportQUIC, WireVersions: []byte{wire},
+					Transport: carrier, WireVersions: []byte{wire},
 					TCPFallbackLanes: 1, Logger: logger, Metrics: clientMetrics,
 				})
 				if err != nil {
@@ -438,9 +437,10 @@ func TestStallRescueAcrossWireVersions(t *testing.T) {
 
 				// A stall is rescued by the side with work it cannot send, and
 				// only the client opens lanes: the client must be the sender
-				// for its watchdog to fire. A QUIC download is rescued as
-				// well, by the pooled connection's liveness check; a TCP lane
-				// has no such check, so its scenario is an upload.
+				// for its watchdog to fire. A QUIC download is recovered as
+				// well, by the carrier manager replacing the frozen carrier
+				// and rebinding the flow; a TCP lane has no carrier manager,
+				// so its scenario is an upload.
 				if carrier == TransportQUIC {
 					conn := dialTestSOCKS(t, clientListener.Addr().String(), streamDestination(t, size))
 					defer conn.Close()
@@ -559,7 +559,7 @@ func TestAJoinOfTheOtherVersionIsRefusedAndTheFlowSurvives(t *testing.T) {
 			}
 			client, err := NewClient(ClientConfig{
 				ListenAddr: clientListener.Addr().String(), RemoteAddr: gateway.LocalAddr().String(), Credentials: clientCredentials,
-				Transport: TransportQUIC, EnableQUICPool: true, WireVersions: []byte{flowWire}, Logger: logger,
+				Transport: TransportQUIC, WireVersions: []byte{flowWire}, Logger: logger,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -649,8 +649,7 @@ func TestPinnedFlowDialsOnlyItsVersion(t *testing.T) {
 	remote := wireGateway(t, ctx, TransportQUIC, nil, serverCredentials, metrics.New())
 	client, err := NewClient(ClientConfig{
 		ListenAddr: "127.0.0.1:0", RemoteAddr: remote, Credentials: clientCredentials,
-		Transport: TransportQUIC, EnableQUICPool: true,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Transport: TransportQUIC, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -678,35 +677,6 @@ func TestPinnedFlowDialsOnlyItsVersion(t *testing.T) {
 	if _, err := client.dialLaneMode(pinned, TransportQUIC, [16]byte{3}, 4, true); err == nil || !strings.Contains(err.Error(), errPinnedWireMismatch.Error()) {
 		t.Fatalf("a version-1 flow borrowed a version-2 pooled lane: %v", err)
 	}
-
-	// The bulk pool lends a connection only to flows of its version, and a
-	// pinned flow's dial stays inside the pool's budget: with the one slot
-	// held by an idle connection of the other version, that connection is
-	// retired to make room rather than the budget being exceeded.
-	client.memoryLimits.maxBulkConnections = 1
-	v2, err := client.reserveBulkConn(withPinnedWire(ctx, 2))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v2.wire() != 2 {
-		t.Fatalf("a bulk connection for a version-2 flow speaks %d", v2.wire())
-	}
-	client.releaseBulkConn(v2, false)
-	v1, err := client.reserveBulkConn(pinned)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v1 == v2 || v1.wire() != 1 {
-		t.Fatalf("a version-1 flow got bulk connection %p speaking %d (the version-2 one is %p)", v1, v1.wire(), v2)
-	}
-	if n := client.bulkConnCount(); n != 1 {
-		t.Fatalf("bulk pool holds %d connections with a budget of 1", n)
-	}
-	if v2.conn.Context().Err() == nil {
-		t.Fatal("the idle version-2 bulk connection was not retired to make room")
-	}
-	client.releaseBulkConn(v1, false)
-	client.closeBulkQUICPool("test done")
 }
 
 // TestAJoinOfTheOtherVersionCannotClaimAPendingOpen covers the window before

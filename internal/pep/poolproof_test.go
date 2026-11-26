@@ -25,7 +25,7 @@ func TestNewPooledStreamResponseRenewsPathProof(t *testing.T) {
 	t.Cleanup(c.closeQUICPool)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cc := congestionConfig{kind: defaultCongestion()}
+	cc := congestionConfig{}
 	outer, err := c.dialPooledQUICLane(ctx, cc)
 	if err != nil {
 		t.Fatal(err)
@@ -212,7 +212,7 @@ func TestPooledStreamFailurePathProof(t *testing.T) {
 			t.Cleanup(c.closeQUICPool)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			cc := congestionConfig{kind: defaultCongestion()}
+			cc := congestionConfig{}
 			old, err := c.dialPooledQUICLane(ctx, cc)
 			if err != nil {
 				t.Fatal(err)
@@ -332,7 +332,7 @@ func TestPooledConnectionFailureRetiresEvenAfterStreamEOF(t *testing.T) {
 	t.Cleanup(c.closeQUICPool)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cc := congestionConfig{kind: defaultCongestion()}
+	cc := congestionConfig{}
 	outer, err := c.dialPooledQUICLane(ctx, cc)
 	if err != nil {
 		t.Fatal(err)
@@ -376,7 +376,7 @@ func TestLatePathProofReborrowsBeforeSendingOPEN(t *testing.T) {
 	t.Cleanup(c.closeQUICPool)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cfg := congestionConfig{kind: defaultCongestion()}
+	cfg := congestionConfig{}
 	held, err := c.dialPooledQUICLane(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -408,7 +408,7 @@ func TestLatePathProofReborrowsBeforeSendingOPEN(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	c.supersedeSilentGeneration(old, nil)
+	retirePooledGenerationForTest(c, old)
 	defer close(release)
 	select {
 	case o := <-result:
@@ -454,7 +454,7 @@ func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
 			}()
 		}
 	}()
-	c, err := NewClient(ClientConfig{ListenAddr: "127.0.0.1:0", RemoteAddr: listener.Addr().String(), Credentials: clientCred, Transport: TransportQUIC, EnableQUICPool: true, DialTimeout: time.Second, HandshakeTimeout: time.Second, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	c, err := NewClient(ClientConfig{ListenAddr: "127.0.0.1:0", RemoteAddr: listener.Addr().String(), Credentials: clientCred, Transport: TransportQUIC, DialTimeout: time.Second, HandshakeTimeout: time.Second, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
 	// to spend most of a bound that was meant for the borrows below.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cfg := congestionConfig{kind: defaultCongestion()}
+	cfg := congestionConfig{}
 	held, err := c.dialPooledQUICLane(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -507,7 +507,7 @@ func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
 		t.Fatalf("borrow should be blocked: %v", o.err)
 	case <-time.After(40 * time.Millisecond):
 	}
-	c.supersedeSilentGeneration(old, nil)
+	retirePooledGenerationForTest(c, old)
 	// Deliberately withhold all old stream credit. Retirement itself must
 	// release the wait, while the already admitted sibling stays usable.
 	select {
@@ -522,4 +522,17 @@ func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
+}
+
+// retirePooledGenerationForTest retires the pooled generation g the way a
+// carrier promotion does: no new borrower is lent g, a borrower still waiting
+// for proof or stream credit on it is released, and g drains.
+func retirePooledGenerationForTest(c *Client, g *controlQUICGeneration) {
+	c.quicMu.Lock()
+	if c.quicGeneration == g {
+		c.quicGeneration = nil
+	}
+	c.quicMu.Unlock()
+	g.stopBorrowing(errPoolRetired)
+	c.drainControlQUICGeneration(g)
 }

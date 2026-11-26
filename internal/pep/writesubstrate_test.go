@@ -24,8 +24,7 @@ func (*bufferConn) Close() error { return nil }
 func TestAWriteReportsTheSubstrateItActuallyUsed(t *testing.T) {
 	model := pathmodel.NewPathModel()
 	model.Report(1, pathmodel.Observation{
-		Erasure: 0.14, BurstFactor: 1, ObservedSamples: 5000,
-		Delivered: 1 << 20, RoundTrip: 200 * time.Millisecond,
+		Erasure: 0.14, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 200 * time.Millisecond,
 	})
 	path := coded.New(newPipeCarrier(), coded.Config{Path: model})
 	defer path.Close()
@@ -72,8 +71,7 @@ func TestAWriteReportsTheSubstrateItActuallyUsed(t *testing.T) {
 func TestClassTelemetryCountsBothCopiesOfAnOpenSafetyFrame(t *testing.T) {
 	model := pathmodel.NewPathModel()
 	model.Report(1, pathmodel.Observation{
-		Erasure: 0.14, BurstFactor: 1, ObservedSamples: 5000,
-		Delivered: 1 << 20, RoundTrip: 200 * time.Millisecond,
+		Erasure: 0.14, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 200 * time.Millisecond,
 	})
 	path := coded.New(newPipeCarrier(), coded.Config{Path: model})
 	defer path.Close()

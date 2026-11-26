@@ -61,7 +61,6 @@ type options struct {
 	congestion   string
 	brutalMbits  float64
 	chunkSize    int
-	quicPool     bool
 	timeout      time.Duration
 	cpuProfile   string
 	verbose      bool
@@ -101,10 +100,9 @@ func run(args []string) error {
 	fs.Int64Var(&opts.bytes, "bytes", 10<<20, "object size per flow in bytes")
 	fs.IntVar(&opts.trials, "trials", 3, "trials per stack")
 	fs.StringVar(&opts.flows, "flows", "1", "comma-separated concurrent flow counts")
-	fs.StringVar(&opts.congestion, "congestion", "bbr-tuic", "congestion controller for both stacks")
-	fs.Float64Var(&opts.brutalMbits, "brutal-rate", 0, "queqiao fixed send rate in Mbit/s when --congestion=brutal")
+	fs.StringVar(&opts.congestion, "congestion", "bbr-tuic", "congestion controller for the baseline and external stacks; queqiao always runs its path controller (the erasure law)")
+	fs.Float64Var(&opts.brutalMbits, "brutal-rate", 0, "baseline fixed send rate in Mbit/s when --congestion=brutal")
 	fs.IntVar(&opts.chunkSize, "chunk", 0, "queqiao data frame size in bytes (0 selects the default)")
-	fs.BoolVar(&opts.quicPool, "quic-pool", true, "enable the queqiao pooled QUIC connection")
 	fs.DurationVar(&opts.timeout, "timeout", 120*time.Second, "per-trial timeout")
 	fs.StringVar(&opts.cpuProfile, "cpuprofile", "", "write a CPU profile to this path")
 	fs.BoolVar(&opts.verbose, "verbose", false, "log transport diagnostics")
@@ -564,7 +562,6 @@ func startStackOn(ctx context.Context, stack string, opts options, pathCfg paths
 		server, err := pep.NewServer(pep.ServerConfig{
 			ListenAddr: serverPacket.LocalAddr().String(), Credentials: serverIdentity,
 			DestinationPolicy: pep.DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, ChunkSize: opts.chunkSize,
-			Congestion: pep.CongestionControlKind(opts.congestion), BrutalBytesPerSec: uint64(opts.brutalMbits * 1e6 / 8),
 			Logger: logger,
 		})
 		if err != nil {
@@ -574,10 +571,7 @@ func startStackOn(ctx context.Context, stack string, opts options, pathCfg paths
 		client, err := pep.NewClient(pep.ClientConfig{
 			ListenAddr: h.socks, RemoteAddr: relay.LocalAddr(), Credentials: clientIdentity,
 			Transport: pep.TransportQUIC, ChunkSize: opts.chunkSize,
-			EnableQUICPool:    opts.quicPool,
-			Congestion:        pep.CongestionControlKind(opts.congestion),
-			BrutalBytesPerSec: uint64(opts.brutalMbits * 1e6 / 8),
-			Logger:            logger,
+			Logger: logger,
 		})
 		if err != nil {
 			h.Close()

@@ -117,22 +117,6 @@ type ClientConfig struct {
 	// TCPFallbackLanes is the number of independent TLS/TCP connections used
 	// for a classified bulk flow. Values above one never affect QUIC.
 	TCPFallbackLanes int
-	// EnableQUICPool keeps one persistent QUIC connection for initial and
-	// control streams, and is what makes opening a flow cost nothing.
-	//
-	// Without it every flow dials its own connection, and so pays a handshake
-	// and a congestion ramp from the initial window before it carries a byte.
-	// Measured live on a 38% erasure path, a small flow cost 0.64 s, 1.11 s and
-	// 14.77 s on three attempts unpooled -- the last being a handshake that
-	// lost packets -- against 0.302, 0.292 and 0.300 pooled, which is one round
-	// trip and nothing else.
-	//
-	// It was opt-in because bulk on a pooled connection to a Reno peer measured
-	// worse than an independent lane. That reason has gone: the peer runs the
-	// erasure controller, the scheduler already moves classified bulk off the
-	// pooled connection onto lanes of its own, and bulk measured the same
-	// either way (0.85-1.15 MB/s pooled against 0.86-1.02 unpooled).
-	EnableQUICPool bool
 	// WaitForOpenAcknowledgement makes a flow wait for OPEN_OK before telling
 	// the application its connection is up. It is off by default, so a flow on
 	// a connection that is already established costs no round trips at all.
@@ -162,24 +146,7 @@ type ClientConfig struct {
 	// gateway of either generation; a single version pins every connection to
 	// it. Whatever a flow's first lane negotiates, every lane that later joins
 	// the flow speaks too.
-	WireVersions []byte
-	Congestion   CongestionControlKind
-	// CCAPI selects how QUIC congestion controllers are driven; see
-	// CCAPIVersion. Empty is v1.
-	CCAPI CCAPIVersion
-	// Sched selects how a QUIC connection orders the classes of work it
-	// sends; see SchedMode. Empty is legacy. Class requires CCAPI v2.
-	Sched SchedMode
-	// CongestionScope selects what one congestion controller governs; see
-	// CongestionScope. Empty is connection. Path requires CCAPI v2 and
-	// Sched class.
-	CongestionScope CongestionScope
-	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
-	// is legacy.
-	CodedRetry                    CodedRetryMode
-	BrutalBytesPerSec             uint64
-	AdaptiveMinBytesSec           uint64
-	AdaptiveMaxBytesSec           uint64
+	WireVersions                  []byte
 	AggregateBytesPerSec          uint64
 	InteractiveReserveBytesPerSec uint64
 	// StreamReceiveWindow and ConnectionReceiveWindow override the QUIC
@@ -195,28 +162,8 @@ type ClientConfig struct {
 	// MemoryLimits is required by resource-constrained clients. Nil retains
 	// the throughput-oriented defaults used by servers and desktop clients.
 	MemoryLimits *MemoryLimits
-	// Memory selects the memory-ownership bundle; empty is legacy.
-	Memory MemoryMode
-	// Classifier selects the flow-classifier bundle; see ClassifierMode.
-	// Empty is legacy.
-	Classifier ClassifierMode
-	// Topology selects how flows are placed on QUIC connections; see
-	// Topology. Empty is isolated. Single requires CongestionScope path and
-	// EnableQUICPool.
-	Topology Topology
-	// TopologyFanOut, above one and only under TopologySingle, is an
-	// explicit fan-out: at most this many QUIC connections per path, the
-	// extra ones carrying bulk flows that would otherwise share the preferred
-	// connection with another flow (§7; see Client.fanOutWanted). Zero or one
-	// is off, the default. It is bounded by the profile's bulk pool.
-	TopologyFanOut int
-	// Recovery selects who owns QUIC recovery; see RecoveryMode. Empty is
-	// flow (today's per-flow rescue). Carrier requires Topology single and
-	// CodedRetry sticky.
-	Recovery RecoveryMode
-	// CarrierRecovery holds the carrier manager's thresholds under
-	// Recovery carrier; zero values select the design's provisional
-	// defaults.
+	// CarrierRecovery holds the carrier manager's thresholds; zero values
+	// select the design's provisional defaults.
 	CarrierRecovery CarrierRecoveryConfig
 	Metrics         *metrics.Registry
 	// FallbackDelay is when AUTO starts connecting its warm-standby TCP
@@ -315,15 +262,11 @@ type Client struct {
 	// can be tested without a network that loses things on demand.
 	openFlowForTest               func() (*openedFlow, error)
 	probeControlGenerationForTest func(context.Context, *controlQUICGeneration, time.Duration) error
-	probeBulkConnectionForTest    func(context.Context, *bulkConn, time.Duration) error
 	// openJoinLaneForTest controls handshake completion during manager shutdown.
 	openJoinLaneForTest func(context.Context, TransportKind, uint64) (*mpLane, error)
 	// flowOpenRetryDelayForTest makes retry timing deterministic without
 	// weakening the production jitter shared by concurrent callers.
 	flowOpenRetryDelayForTest func(failedAttempt int) time.Duration
-	// dialPipelinedFlowForTest isolates the cold-flow transport race from the
-	// network in state-machine tests.
-	dialPipelinedFlowForTest func(context.Context, TransportKind, []byte) (*openedFlow, error)
 	// dialAuthenticatedLaneForTest isolates the pooled transport race. The
 	// production path still goes through dialAuthenticatedLane; tests can make
 	// TCP ready before QUIC without relying on scheduler timing or live loss.
@@ -340,22 +283,6 @@ type Client struct {
 	// connection. A bulk flow only needs to move off it when another flow
 	// would otherwise queue behind its congestion window.
 	quicPoolActive atomic.Int64
-	// bulkMu protects a bounded set of pre-authenticated secondary QUIC
-	// connections used only for fast lane joins. Keeping them separate from
-	// the control pool preserves the control lane's congestion state while
-	// avoiding a fresh QUIC handshake at the bulk-promotion boundary.
-	//
-	// Each connection carries at most one lane at a time. Multiplexing several
-	// lanes of one flow onto a single connection would give them one 4-tuple
-	// and one congestion controller, which is what a single TUIC connection
-	// already provides: measured on a path that polices per source address,
-	// striping over a shared connection produced no gain at all. A connection
-	// is retained after its lane is released so a later flow still skips the
-	// handshake.
-	bulkMu    sync.Mutex
-	bulkConns []*bulkConn
-	bulkEpoch uint64
-	bulkDials map[*byte]context.CancelFunc
 
 	// pendingOpens admits only bounded remote setup work. It is deliberately
 	// non-blocking: callers beyond the bound are rejected promptly, release
@@ -453,33 +380,7 @@ func (l *SessionLimit) acquire() (sessionSlot, bool) {
 	}
 }
 
-// bulkConn is one pre-authenticated secondary QUIC connection reserved for
-// bulk lane joins.
-type bulkConn struct {
-	conn       *quic.Conn
-	packet     net.PacketConn
-	controller wancongestion.TelemetryProvider
-	busy       bool
-	idleTimer  *time.Timer // guarded by Client.bulkMu
-	idleEpoch  uint64      // guarded by Client.bulkMu
-	verified   time.Time   // guarded by Client.bulkMu; handshake or authenticated probe
-	closeOnce  sync.Once
-}
-
 var errPoolRetired = errors.New("pooled connection retired before OPEN")
-
-// wire is the version the bulk connection negotiated.
-func (b *bulkConn) wire() byte {
-	wire, _ := protocol.VersionForALPN(b.conn.ConnectionState().TLS.NegotiatedProtocol)
-	return wire
-}
-
-// bulkConnFits reports whether a bulk connection can carry a lane for the
-// flow ctx dials for: one pinned to a version takes only a connection of it.
-func bulkConnFits(ctx context.Context, entry *bulkConn) bool {
-	wire, pinned := pinnedWire(ctx)
-	return !pinned || entry.wire() == wire
-}
 
 // controlQUICGeneration owns exactly one shared connection and the packet
 // socket beneath it. Keeping ownership in one object makes generation checks
@@ -505,9 +406,6 @@ type controlQUICGeneration struct {
 	packet       net.PacketConn
 	controller   wancongestion.TelemetryProvider
 	closeOnce    sync.Once
-	// liveness watches for a connection that sends and hears nothing back,
-	// so new flows stop being opened on it long before QUIC's idle timeout.
-	liveness poolLiveness
 	// Silent retirement wakes borrowers still waiting for proof or stream credit.
 	borrowing     context.Context
 	stopBorrowing context.CancelCauseFunc
@@ -515,42 +413,6 @@ type controlQUICGeneration struct {
 	// recovery=carrier, set before the generation is published; nil
 	// otherwise.
 	managed *managedCarrier
-}
-
-// watchLiveness samples the connection's packet counters until it closes.
-//
-// Silence is acted on here, not when the next flow asks for the pool. The
-// flows opened in the first second after a path dies are the ones a page load
-// is waiting on, and waiting for the next one to notice would leave them on the
-// dead connection until QUIC's idle timeout. So: once silent, the generation
-// stops taking new flows and a replacement is dialed at once. A longer
-// silence closes the old connection once any protected OPEN has drained.
-func (g *controlQUICGeneration) watchLiveness(onSilent func(*controlQUICGeneration)) {
-	ticker := time.NewTicker(poolLivenessInterval)
-	defer ticker.Stop()
-	reported := false
-	for {
-		select {
-		case <-g.conn.Context().Done():
-			return
-		case now := <-ticker.C:
-			stats := g.conn.ConnectionStats()
-			g.liveness.observe(now, stats.PacketsSent, stats.PacketsReceived, stats.SmoothedRTT)
-			// Detach before considering a hard close. Admission and detach are
-			// serialized by the pool lock, so a previously admitted lossy OPEN
-			// has published its drain deadline before we inspect it here.
-			if !reported && g.liveness.silent(now) {
-				reported = true
-				if onSilent != nil {
-					onSilent(g)
-				}
-			}
-			if g.liveness.dead(now) && !g.awaitingOpen(now) {
-				g.close("queqiao pooled connection stopped answering")
-				return
-			}
-		}
-	}
 }
 
 func (g *controlQUICGeneration) close(reason string) {
@@ -579,27 +441,6 @@ type controlQUICDial struct {
 	generation *controlQUICGeneration
 	err        error
 	superseded bool
-}
-
-// stopIdleLocked invalidates even a callback that Timer.Stop cannot cancel.
-// The owning client's bulkMu must be held for all timer/epoch operations.
-func (b *bulkConn) stopIdleLocked() {
-	b.idleEpoch++
-	if b.idleTimer != nil {
-		b.idleTimer.Stop()
-		b.idleTimer = nil
-	}
-}
-
-func (b *bulkConn) close(reason string) {
-	b.closeOnce.Do(func() {
-		if b.conn != nil {
-			_ = b.conn.CloseWithError(0, reason)
-		}
-		if b.packet != nil {
-			_ = b.packet.Close()
-		}
-	})
 }
 
 const bulkPoolIdleTimeout = 30 * time.Second
@@ -696,60 +537,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.TCPFallbackLanes < 1 || cfg.TCPFallbackLanes > maxTCPFallbackLanes {
 		return nil, fmt.Errorf("TCP fallback lanes must be between 1 and %d", maxTCPFallbackLanes)
 	}
-	if cfg.Congestion == "" {
-		cfg.Congestion = defaultCongestion()
-	}
-	if cfg.Congestion != CongestionReno && cfg.Congestion != CongestionBBR && cfg.Congestion != CongestionBBRTUIC && cfg.Congestion != CongestionErasure && cfg.Congestion != CongestionAdaptive && cfg.Congestion != CongestionBrutal {
-		return nil, fmt.Errorf("unsupported QUIC congestion controller %q", cfg.Congestion)
-	}
-	if cfg.Congestion == CongestionBrutal && cfg.BrutalBytesPerSec == 0 {
-		return nil, errors.New("brutal congestion requires a positive per-lane byte rate")
-	}
-	if err := validateBundle(&cfg.CCAPI, cfg.Congestion, cfg.Profile); err != nil {
-		return nil, err
-	}
-	if err := validateSched(&cfg.Sched, cfg.CCAPI); err != nil {
-		return nil, err
-	}
-	if err := validateCongestionScope(&cfg.CongestionScope, cfg.CCAPI, cfg.Sched); err != nil {
-		return nil, err
-	}
-	if err := validateTopology(&cfg.Topology, cfg.CongestionScope, cfg.TopologyFanOut); err != nil {
-		return nil, err
-	}
-	if cfg.Topology == TopologySingle && !cfg.EnableQUICPool {
-		// Without the pool every flow dials a connection of its own, which is
-		// the opposite of one connection per path.
-		return nil, fmt.Errorf("topology=%s requires the pooled QUIC connection", TopologySingle)
-	}
-	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
-		return nil, err
-	}
-	if err := resolveClassifier(&cfg.Classifier, cfg.Profile); err != nil {
-		return nil, err
-	}
 	if err := cfg.CarrierShadow.resolve(); err != nil {
 		return nil, err
 	}
-	if err := validateRecovery(&cfg.Recovery, cfg.CongestionScope, cfg.CodedRetry, cfg.Topology, cfg.TopologyFanOut, false); err != nil {
+	if err := cfg.CarrierRecovery.resolve(); err != nil {
 		return nil, err
-	}
-	if err := validateProfileBundle(cfg.Profile, cfg.CCAPI, cfg.Sched, cfg.CongestionScope, cfg.CodedRetry, cfg.Topology, cfg.Recovery, cfg.Classifier, false); err != nil {
-		return nil, err
-	}
-	if cfg.Recovery == RecoveryCarrier {
-		if err := cfg.CarrierRecovery.resolve(); err != nil {
-			return nil, err
-		}
-	}
-	if cfg.AdaptiveMinBytesSec == 0 {
-		cfg.AdaptiveMinBytesSec = defaultAdaptiveMinBytesPerSec
-	}
-	if cfg.AdaptiveMaxBytesSec == 0 {
-		cfg.AdaptiveMaxBytesSec = defaultAdaptiveMaxBytesPerSec
-	}
-	if cfg.AdaptiveMaxBytesSec < cfg.AdaptiveMinBytesSec {
-		return nil, errors.New("adaptive maximum byte rate cannot be below its minimum")
 	}
 	if cfg.AggregateBytesPerSec == 0 && cfg.InteractiveReserveBytesPerSec != 0 {
 		return nil, errors.New("interactive reserve requires an aggregate byte budget")
@@ -787,19 +579,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}).validate(); err != nil {
 		return nil, err
 	}
-	memoryMode, err := ParseMemoryMode(string(cfg.Memory))
+	memoryLimits, sendMemory, receiveMemory, err := resolveMemoryLimits(cfg.MemoryLimits, cfg.ChunkSize)
 	if err != nil {
 		return nil, err
-	}
-	cfg.Memory = memoryMode
-	memoryLimits, sendMemory, receiveMemory, err := resolveMemoryLimits(cfg.MemoryLimits, cfg.ChunkSize, memoryMode)
-	if err != nil {
-		return nil, err
-	}
-	if cfg.TopologyFanOut > 1 && cfg.TopologyFanOut-1 > memoryLimits.maxBulkConnections {
-		// The extra connections come from the bulk pool, whose size is the
-		// profile's connection budget (one on iOS).
-		return nil, fmt.Errorf("topology fan-out of %d connections exceeds the profile's %d secondary connections", cfg.TopologyFanOut, memoryLimits.maxBulkConnections)
 	}
 	// A misspelled class name fails here rather than matching nothing at
 	// runtime, where it would be indistinguishable from a rule whose workload
@@ -816,10 +598,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		sendMemory: sendMemory, receiveMemory: receiveMemory, memoryLimits: memoryLimits,
 	}
 	client.carrierShadow = newCarrierShadow(cfg.CarrierShadow, carrierShadowClient, cfg.Logger, cfg.Metrics)
-	if cfg.Recovery == RecoveryCarrier {
-		client.carriers = newCarrierManager(client, cfg.CarrierRecovery)
-		client.carriers.joins.rtt = client.carrierRTT
-	}
+	client.carriers = newCarrierManager(client, cfg.CarrierRecovery)
+	client.carriers.joins.rtt = client.carrierRTT
 	client.checkSystemResume()
 	return client, nil
 }
@@ -1069,43 +849,10 @@ func (c *Client) ServeListener(ctx context.Context, listener net.Listener) error
 // than once and closes the packet socket owned by a locally-bound QUIC dial.
 func (c *Client) closeQUICPool() {
 	c.closeControlQUICPool("queqiao client pool reset")
-	c.closeBulkQUICPool("queqiao bulk pool stopped")
 }
 
 func (c *Client) closeControlQUICPool(reason string) {
-	if c.carriers != nil {
-		c.carriers.resetPool(reason)
-		return
-	}
-	c.quicMu.Lock()
-	c.quicEpoch++
-	generation, dial := c.quicGeneration, c.quicDial
-	c.quicGeneration, c.quicDial = nil, nil
-	c.quicMu.Unlock()
-	if dial != nil {
-		dial.cancel()
-	}
-	if generation != nil {
-		generation.close(reason)
-	}
-}
-
-func (c *Client) closeBulkQUICPool(reason string) {
-	c.bulkMu.Lock()
-	bulkConns := c.bulkConns
-	for _, entry := range bulkConns {
-		entry.stopIdleLocked()
-	}
-	c.bulkConns = nil
-	c.bulkEpoch++
-	for _, cancel := range c.bulkDials {
-		cancel()
-	}
-	c.bulkDials = nil
-	c.bulkMu.Unlock()
-	for _, entry := range bulkConns {
-		entry.close(reason)
-	}
+	c.carriers.resetPool(reason)
 }
 
 func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
@@ -1149,10 +896,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	c.cfg.Logger.Debug("local flow opened", "transport", flow.kind, "duration", time.Since(flowOpenStarted))
 	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
 	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
-	flowSession.memOwned = c.cfg.Memory == MemoryOwned
-	flowSession.codedRetrySticky = c.cfg.CodedRetry == CodedRetrySticky
 	flowSession.carrierShadow = c.carrierShadow
-	flowSession.carrierRecovery = c.carriers != nil
 	flowSession.wire = flow.fc.wire
 	if c.flowStartedForTest != nil {
 		c.flowStartedForTest(flowSession)
@@ -1239,221 +983,7 @@ type authenticatedLane struct {
 func (c *Client) openFlow(ctx context.Context, destination string) (*openedFlow, error) {
 	// TLS has already authenticated the device when the first application frame
 	// is sent, so OPEN never waits on a second security handshake.
-	if !c.cfg.EnableQUICPool {
-		return c.openInitialFlow(ctx, destination)
-	}
 	return c.openFlowMode(ctx, destination, false)
-}
-
-// openInitialFlow establishes a dedicated mutually authenticated connection
-// and sends OPEN as its first application frame. AUTO preserves the normal UDP
-// preference and prepares a delayed TCP standby behind the QUIC candidate.
-func (c *Client) openInitialFlow(ctx context.Context, destination string) (*openedFlow, error) {
-	payload, err := session.EncodeDestination(destination)
-	if err != nil {
-		return nil, err
-	}
-	if c.cfg.Transport == TransportTCP {
-		return c.dialPipelinedCandidate(ctx, TransportTCP, payload)
-	}
-	if c.cfg.Transport == TransportQUIC {
-		return c.dialPipelinedCandidate(ctx, TransportQUIC, payload)
-	}
-	if c.cfg.Transport != TransportAuto {
-		return nil, fmt.Errorf("unsupported transport %q", c.cfg.Transport)
-	}
-	if !c.udpHealth.allow(time.Now()) {
-		c.metrics.Fallback()
-		return c.dialPipelinedCandidate(ctx, TransportTCP, payload)
-	}
-	return c.racePipelinedFlow(ctx, payload)
-}
-
-func (c *Client) dialPipelinedCandidate(ctx context.Context, kind TransportKind, payload []byte) (*openedFlow, error) {
-	if c.dialPipelinedFlowForTest != nil {
-		return c.dialPipelinedFlowForTest(ctx, kind, payload)
-	}
-	return c.dialPipelinedFlow(ctx, kind, payload)
-}
-
-func (c *Client) dialPipelinedFlow(ctx context.Context, kind TransportKind, payload []byte) (*openedFlow, error) {
-	sessionID, err := session.NewSessionID()
-	if err != nil {
-		return nil, err
-	}
-	flowID, err := randomFlowID()
-	if err != nil {
-		return nil, err
-	}
-	lane, err := c.dialLaneMode(ctx, kind, sessionID, 0, false)
-	if err != nil {
-		return nil, err
-	}
-	fail := func(err error) (*openedFlow, error) {
-		_ = lane.fc.Close()
-		return nil, err
-	}
-	openDeadline, finishHandshake := bindHandshake(ctx, lane.outer, handshakeBound(lane.outer, c.cfg.HandshakeTimeout))
-	defer finishHandshake()
-	if err := lane.fc.Write(protocol.Frame{
-		Header:  protocol.Header{Version: protocol.Version, Type: protocol.TypeOpen, SessionID: sessionID, FlowID: flowID, Class: protocol.ClassNew},
-		Payload: payload,
-	}); err != nil {
-		return fail(fmt.Errorf("send pipelined flow open: %w", err))
-	}
-	if !c.cfg.WaitForOpenAcknowledgement {
-		if err := finishHandshake(); err != nil {
-			_ = lane.fc.Close()
-			return nil, err
-		}
-		return &openedFlow{
-			fc: lane.fc, outer: lane.outer, sessionID: sessionID, flowID: flowID,
-			laneID: lane.laneID, kind: lane.kind, openPending: true, openDeadline: openDeadline,
-			tcpStriping: kind == TransportTCP && c.cfg.TCPFallbackLanes > 1,
-		}, nil
-	}
-	openAck, err := lane.fc.Read()
-	if err != nil {
-		return fail(fmt.Errorf("read pipelined flow acknowledgement: %w", err))
-	}
-	if openAck.Header.SessionID != sessionID || openAck.Header.FlowID != flowID {
-		return fail(peerResponse(errors.New("pipelined flow acknowledgement identity mismatch")))
-	}
-	if openAck.Header.Type == protocol.TypeReset {
-		return fail(peerResponse(errDestinationUnavailable))
-	}
-	if openAck.Header.Type != protocol.TypeOpenOK || len(openAck.Payload) != 0 {
-		return fail(peerResponse(errors.New("invalid pipelined flow acknowledgement")))
-	}
-	if err := finishHandshake(); err != nil {
-		_ = lane.fc.Close()
-		return nil, err
-	}
-	return &openedFlow{
-		fc: lane.fc, outer: lane.outer, sessionID: sessionID, flowID: flowID,
-		laneID: lane.laneID, kind: lane.kind,
-		tcpStriping: kind == TransportTCP && c.cfg.TCPFallbackLanes > 1,
-	}, nil
-}
-
-func (c *Client) racePipelinedFlow(ctx context.Context, payload []byte) (*openedFlow, error) {
-	raceCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	quicResult := make(chan openedFlowResult, 1)
-	go func() {
-		flow, err := c.dialPipelinedCandidate(raceCtx, TransportQUIC, payload)
-		quicResult <- openedFlowResult{flow: flow, err: err}
-	}()
-	timer := time.NewTimer(c.cfg.FallbackDelay)
-	defer timer.Stop()
-	select {
-	case result := <-quicResult:
-		quicEvidence := classifyQUICPathEvidence(result.err)
-		if quicEvidence == quicPathAvailable {
-			// A peer response proves the QUIC path worked even when the
-			// destination or protocol operation itself was refused.
-			c.udpHealth.observe(quicEvidence, time.Now())
-			return result.flow, result.err
-		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		tcpFlow, tcpErr := c.dialPipelinedCandidate(ctx, TransportTCP, payload)
-		tcpEvidence := classifyQUICPathEvidence(tcpErr)
-		c.observeUDPPath(differentialQUICPathEvidence(quicEvidence, tcpEvidence), result.err)
-		c.metrics.Fallback()
-		if tcpEvidence != quicPathAvailable {
-			c.reportEndpointTransportRaceFailure(result.err, tcpErr)
-		}
-		return tcpFlow, tcpErr
-	case <-timer.C:
-	case <-ctx.Done():
-		closeLateFlow(quicResult)
-		return nil, ctx.Err()
-	}
-	tcpResult := make(chan openedFlowResult, 1)
-	go func() {
-		flow, err := c.dialPipelinedCandidate(raceCtx, TransportTCP, payload)
-		tcpResult <- openedFlowResult{flow: flow, err: err}
-	}()
-	var quicErr, tcpErr error
-	var tcpReady *openedFlow
-	var standbyTimer *time.Timer
-	var standbyC <-chan time.Time
-	defer func() {
-		if standbyTimer != nil {
-			standbyTimer.Stop()
-		}
-	}()
-	quicEvidence := quicPathNeutral
-	for quicResult != nil || tcpResult != nil {
-		select {
-		case result := <-quicResult:
-			quicResult = nil
-			quicEvidence = classifyQUICPathEvidence(result.err)
-			if quicEvidence == quicPathAvailable {
-				c.udpHealth.observe(quicEvidence, time.Now())
-				cancel()
-				closeOpenedFlow(tcpReady)
-				closeLateFlow(tcpResult)
-				return result.flow, result.err
-			}
-			quicErr = result.err
-			if tcpReady != nil {
-				c.observeUDPPath(differentialQUICPathEvidence(quicEvidence, quicPathAvailable), quicErr)
-				c.metrics.Fallback()
-				cancel()
-				return tcpReady, nil
-			}
-		case result := <-tcpResult:
-			tcpResult = nil
-			tcpEvidence := classifyQUICPathEvidence(result.err)
-			if tcpEvidence == quicPathAvailable {
-				// TCP is a warm standby, not an equal race winner. A
-				// still-pending QUIC handshake has said nothing about UDP
-				// reachability, and on the target path TCP can authenticate
-				// first yet carry bulk data a thousand times more slowly.
-				// Keep the ready TCP flow bounded by the QUIC dial's own
-				// timeout and commit it only after QUIC explicitly fails.
-				if result.err == nil && quicResult != nil {
-					tcpReady = result.flow
-					standbyTimer = time.NewTimer(c.fallbackGrace())
-					standbyC = standbyTimer.C
-					continue
-				}
-				c.observeUDPPath(differentialQUICPathEvidence(quicEvidence, tcpEvidence), quicErr)
-				c.metrics.Fallback()
-				cancel()
-				closeLateFlow(quicResult)
-				return result.flow, result.err
-			}
-			tcpErr = result.err
-		case <-standbyC:
-			// The preference window is an application-latency bound, not
-			// evidence that UDP is blocked. This cold, unpooled flow cannot
-			// reuse a late connection, so retire its QUIC candidate without
-			// changing endpoint health.
-			standbyC = nil
-			c.metrics.Fallback()
-			c.cfg.Logger.Info("QUIC preference window elapsed; using TCP without penalizing UDP health",
-				"endpoint", c.cfg.RemoteAddr, "grace", c.fallbackGrace())
-			cancel()
-			closeLateFlow(quicResult)
-			return tcpReady, nil
-		case <-ctx.Done():
-			closeOpenedFlow(tcpReady)
-			closeLateFlow(quicResult)
-			closeLateFlow(tcpResult)
-			return nil, ctx.Err()
-		}
-	}
-	c.reportEndpointTransportRaceFailure(quicErr, tcpErr)
-	return nil, fmt.Errorf("QUIC failed (%v); TCP fallback failed (%v)", quicErr, tcpErr)
-}
-
-type openedFlowResult struct {
-	flow *openedFlow
-	err  error
 }
 
 // observeUDPPath keeps the existing health state and makes its operational
@@ -1539,22 +1069,6 @@ func (c *Client) reportEndpointTransportRaceFailure(quicErr, tcpErr error) {
 			"quic_error", quicErr,
 			"tcp_error", tcpErr,
 		)
-	}
-}
-
-func closeLateFlow(ch <-chan openedFlowResult) {
-	if ch == nil {
-		return
-	}
-	go func() {
-		result := <-ch
-		closeOpenedFlow(result.flow)
-	}()
-}
-
-func closeOpenedFlow(flow *openedFlow) {
-	if flow != nil && flow.fc != nil {
-		_ = flow.fc.Close()
 	}
 }
 
@@ -1666,10 +1180,10 @@ func (c *Client) openFlowMode(ctx context.Context, destination string, _ bool) (
 			break
 		}
 		_ = finishHandshake()
-		if c.carriers == nil || ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return fail(errPoolRetired)
 		}
-		// recovery=carrier: the carrier became SUSPECT, or a sibling
+		// The carrier became SUSPECT, or a sibling
 		// started rebinding onto it, after the borrow. Nothing was sent on
 		// the stream; give it back and wait for admission again, within
 		// the request's own deadline.
@@ -1801,7 +1315,7 @@ func (c *Client) dialJoinLane(ctx context.Context, kind TransportKind, sessionID
 }
 
 func (c *Client) dialLane(ctx context.Context, kind TransportKind, sessionID [16]byte, laneID uint64) (*authenticatedLane, error) {
-	return c.dialLaneMode(ctx, kind, sessionID, laneID, c.cfg.EnableQUICPool)
+	return c.dialLaneMode(ctx, kind, sessionID, laneID, true)
 }
 
 // dialLaneMode uses the shared QUIC stream pool only for a flow's initial
@@ -1855,9 +1369,6 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 // flows may be waiting to rebind onto it, while the borrow waited for proof
 // or stream credit. Nothing has been written to the stream yet.
 func (c *Client) carrierAdmits(ctx context.Context, g *controlQUICGeneration) bool {
-	if c.carriers == nil {
-		return true
-	}
 	return c.carriers.accepting(g) && (isCarrierRebind(ctx) || !c.carriers.openGated(g))
 }
 
@@ -1866,10 +1377,7 @@ func (c *Client) carrierAdmits(ctx context.Context, g *controlQUICGeneration) bo
 func (c *Client) pooledCongestionConfig() congestionConfig {
 	return congestionConfig{
 		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
-		discoverGrouping: c.cfg.Profile.DiscoverGrouping,
-		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
-		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipalNow, generation: c.uplinkGeneration.Load,
+		principal:        c.pathPrincipalNow, generation: c.uplinkGeneration.Load,
 	}
 }
 
@@ -1979,8 +1487,8 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 		}
 		c.checkSystemResume()
 		c.quicMu.Lock()
-		if generation := c.quicGeneration; generation != nil && generation.conn.Context().Err() == nil && c.carriers != nil {
-			// Under recovery=carrier the carrier manager judges the carrier
+		if generation := c.quicGeneration; generation != nil && generation.conn.Context().Err() == nil {
+			// The carrier manager judges the carrier
 			// on its transport evidence (§10.2), not on packet counts. A
 			// SUSPECT carrier takes no new flows, and while flows wait to be
 			// rebound onto a carrier a new OPEN does not take a stream slot
@@ -2004,24 +1512,9 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 			}
 			continue
 		}
-		if generation := c.quicGeneration; generation != nil && generation.conn.Context().Err() == nil {
-			if !generation.liveness.silent(time.Now()) {
-				generation.borrowMu.Lock()
-				generation.borrowers++
-				generation.borrowMu.Unlock()
-				c.quicMu.Unlock()
-				return generation, nil
-			}
-			// Sending and hearing nothing for several round trips: open this
-			// flow, and every one after it, on a fresh connection instead of
-			// waiting out QUIC's idle timeout on one the path has abandoned.
-			c.quicMu.Unlock()
-			c.supersedeSilentGeneration(generation, nil)
-			continue
-		}
 		stale := c.quicGeneration
 		attempt := c.quicDial
-		if attempt == nil && c.carriers != nil {
+		if attempt == nil {
 			// Every dial round is charged to the path's attempt history; a
 			// round for flows waiting to be rebound is also capped (§10.2).
 			if ok, retry := c.carriers.admitDial(isCarrierRebind(ctx)); !ok {
@@ -2070,10 +1563,9 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 	}
 }
 
-// dialControlGeneration dials one pooled connection offering wires. Under
-// recovery=carrier a standby is handed to the carrier manager at once; a
-// pooled generation is handed to it when it is installed. Otherwise the
-// generation watches its own liveness.
+// dialControlGeneration dials one pooled connection offering wires. A
+// standby is handed to the carrier manager at once; a pooled generation is
+// handed to it when it is installed.
 func (c *Client) dialControlGeneration(ctx context.Context, id uint64, ccfg congestionConfig, wires []byte, standby bool) (*controlQUICGeneration, error) {
 	windows, credit := c.reservePreferredWindows()
 	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), wires, c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, windows, c.hopDialConfig())
@@ -2093,17 +1585,11 @@ func (c *Client) dialControlGeneration(ctx context.Context, id uint64, ccfg cong
 		controller: configureQUICController(conn, ccfg),
 		lossPath:   pathModelOf(conn),
 	}
-	switch {
-	case c.carriers != nil:
-		// Managed state exists before any borrower can see the generation;
-		// a standby is sampled from now, a pooled generation once it is
-		// installed.
-		c.carriers.prepare(generation, standby)
-		if standby {
-			c.carriers.watch(generation)
-		}
-	default:
-		go generation.watchLiveness(func(g *controlQUICGeneration) { c.supersedeSilentGeneration(g, &ccfg) })
+	// Managed state exists before any borrower can see the generation; a
+	// standby is sampled from now, a pooled generation once it is installed.
+	c.carriers.prepare(generation, standby)
+	if standby {
+		c.carriers.watch(generation)
 	}
 	return generation, nil
 }
@@ -2115,10 +1601,7 @@ var carrierIDs atomic.Uint64
 const standbyCarrierIDBit = 1 << 62
 
 func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDial, ccfg congestionConfig) {
-	wires := c.cfg.WireVersions
-	if c.carriers != nil {
-		wires = c.carriers.dialWires()
-	}
+	wires := c.carriers.dialWires()
 	generation, err := c.dialControlGeneration(ctx, attempt.epoch, ccfg, wires, false)
 
 	c.quicMu.Lock()
@@ -2133,7 +1616,7 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 		}
 	}
 	c.quicMu.Unlock()
-	if current && generation != nil && c.carriers != nil {
+	if current && generation != nil {
 		c.carriers.watch(generation)
 	}
 	if !current && generation != nil {
@@ -2143,36 +1626,6 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 		attempt.superseded = true
 	}
 	close(attempt.done)
-}
-
-// supersedeSilentGeneration stops opening flows on a pooled connection that has
-// stopped answering. With a congestion configuration it also dials the
-// replacement immediately, so the next flow finds one ready rather than paying
-// a handshake on top of the outage.
-func (c *Client) supersedeSilentGeneration(generation *controlQUICGeneration, ccfg *congestionConfig) {
-	c.quicMu.Lock()
-	current := c.quicGeneration == generation
-	if current {
-		c.quicGeneration = nil
-	}
-	c.quicMu.Unlock()
-	if !current {
-		return
-	}
-	c.cfg.Logger.Warn("pooled QUIC connection stopped answering; dialing a fresh one",
-		"generation", generation.id)
-	generation.stopBorrowing(errPoolRetired)
-	c.drainControlQUICGeneration(generation)
-	serving := c.serving.Load()
-	if ccfg != nil && serving != nil && (*serving).Err() == nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(*serving, c.cfg.DialTimeout)
-			defer cancel()
-			if fresh, err := c.acquireControlQUICGeneration(ctx, *ccfg); err == nil {
-				fresh.releaseBorrow()
-			}
-		}()
-	}
 }
 
 func (c *Client) retireControlQUICGeneration(generation *controlQUICGeneration, reason string) {
@@ -2231,40 +1684,17 @@ var errLaneJoinCapacity = errors.New("lane join refused by peer lane capacity")
 // replacement grace on QUIC retries the peer has already ruled out.
 var errLaneJoinTCPMode = fmt.Errorf("%w: flow switched to TCP fallback", errLaneJoinRejected)
 
-// errBulkConnectionLimit is a scheduling answer, not a transport failure.
-// The caller keeps the flow on its pooled control connection when every
-// isolation slot is occupied. Falling back to a dedicated connection here
-// would silently bypass the descriptor and handshake budget this limit exists
-// to enforce.
-var errBulkConnectionLimit = errors.New("bulk lane connection limit reached")
-
-func dedicatedBulkFallbackAllowed(err error) bool {
-	return err != nil &&
-		!errors.Is(err, errBulkConnectionLimit) &&
-		!errors.Is(err, context.Canceled) &&
-		!errors.Is(err, context.DeadlineExceeded)
-}
-
 func (c *Client) openJoinLane(ctx context.Context, kind TransportKind, sessionID [16]byte, flowID, laneID uint64) (*mpLane, error) {
 	if c.openJoinLaneForTest != nil {
 		return c.openJoinLaneForTest(ctx, kind, laneID)
 	}
-	if kind != TransportQUIC && kind != TransportTCP {
+	if kind != TransportTCP {
+		// A QUIC flow is rebound by the carrier manager on the pooled
+		// connection (openControlPoolJoinLane); only a TCP lane is dialled
+		// for one flow.
 		return nil, fmt.Errorf("unsupported join transport %q", kind)
 	}
 	c.carrierShadow.noteJoinAttempt(ctx, sessionID, flowID, laneID, kind)
-	if kind == TransportQUIC && c.cfg.EnableQUICPool {
-		if lane, poolErr := c.openPooledJoinLane(ctx, sessionID, flowID, laneID); poolErr == nil {
-			return lane, nil
-		} else if !dedicatedBulkFallbackAllowed(poolErr) || c.singleTopology() {
-			// Under topology=single the only secondary connections are the
-			// fan-out's, and a dedicated dial would escape its budget; the
-			// flow stays on the preferred connection.
-			return nil, poolErr
-		} else {
-			c.cfg.Logger.Debug("pooled lane join unavailable; using dedicated lane", "error", poolErr)
-		}
-	}
 	lane, err := c.dialJoinLane(ctx, kind, sessionID, laneID)
 	if err != nil {
 		return nil, err
@@ -2362,198 +1792,6 @@ func (c *Client) completeLaneJoin(ctx context.Context, lane *authenticatedLane, 
 	}, nil
 }
 
-// openPooledJoinLane uses a bounded, separately authenticated QUIC connection
-// for bulk streams. Mutual TLS authenticates the connection; the JOIN frame
-// only identifies the existing flow and lane and cannot change its principal.
-func (c *Client) openPooledJoinLane(ctx context.Context, sessionID [16]byte, flowID, laneID uint64) (*mpLane, error) {
-	started := time.Now()
-	outer, err := c.openBulkPoolStream(ctx)
-	if err != nil {
-		return nil, err
-	}
-	fc := newFrameConnLimited(outer, c.memoryLimits.frameReadBuffer, c.memoryLimits.eventQueue)
-	fc.setPacketsOnStream(c.cfg.UDPOnStream)
-	if err := checkPinnedWire(ctx, fc); err != nil {
-		// The caller falls back to a dedicated lane offering only the
-		// flow's version.
-		_ = fc.Close()
-		return nil, err
-	}
-	lane, err := c.completeLaneJoin(ctx, &authenticatedLane{
-		fc: fc, outer: outer, sessionID: sessionID, kind: TransportQUIC, laneID: laneID,
-	}, flowID, 0)
-	if err != nil {
-		return nil, err
-	}
-	c.cfg.Logger.Debug("bulk lane joined", "lane", laneID, "duration", time.Since(started))
-	return lane, nil
-}
-
-// openBulkPoolStream reserves one secondary connection and opens its lane
-// stream. Connections are created lazily, so one-shot and interactive-only
-// clients pay no extra QUIC handshake, and each is reserved exclusively for
-// the lane it carries so concurrent lanes keep independent 4-tuples and
-// congestion state.
-func (c *Client) openBulkPoolStream(ctx context.Context) (streamConn, error) {
-	started := time.Now()
-	dialCtx := ctx
-	var cancel context.CancelFunc
-	if c.cfg.DialTimeout > 0 {
-		dialCtx, cancel = context.WithTimeout(ctx, c.cfg.DialTimeout)
-		defer cancel()
-	}
-	entry, err := c.reserveBulkConn(dialCtx)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.verifyBulkPath(dialCtx, entry); err != nil {
-		c.releaseBulkConn(entry, true)
-		return nil, err
-	}
-	stream, err := entry.conn.OpenStreamSync(dialCtx)
-	if err != nil {
-		c.releaseBulkConn(entry, entry.conn.Context().Err() != nil)
-		return nil, err
-	}
-	c.cfg.Logger.Debug("bulk pool stream opened", "duration", time.Since(started), "connections", c.bulkConnCount())
-	return &bulkPoolStreamConn{
-		quicStreamConn: &quicStreamConn{stream: stream, conn: entry.conn, controller: entry.controller, closeConn: false, bulk: connBulkPath(entry.conn, c.memoryLimits.eventQueue)},
-		owner:          c, entry: entry,
-	}, nil
-}
-
-// reserveBulkConn returns an idle authenticated connection, or establishes a
-// new one when every existing connection is already carrying a lane.
-func (c *Client) reserveBulkConn(ctx context.Context) (*bulkConn, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	c.checkSystemResume()
-	c.bulkMu.Lock()
-	live := c.bulkConns[:0]
-	for _, entry := range c.bulkConns {
-		if entry.conn.Context().Err() != nil && !entry.busy {
-			entry.stopIdleLocked()
-			entry.close("queqiao stale bulk pool")
-			continue
-		}
-		live = append(live, entry)
-	}
-	c.bulkConns = live
-	for _, entry := range c.bulkConns {
-		if !entry.busy && entry.conn.Context().Err() == nil && bulkConnFits(ctx, entry) {
-			entry.busy = true
-			entry.stopIdleLocked()
-			c.bulkMu.Unlock()
-			return entry, nil
-		}
-	}
-	var retired *bulkConn
-	if len(c.bulkConns)+len(c.bulkDials) >= c.maxBulkConns() {
-		// An idle connection of another wire version is the one slot that
-		// can be given back: closing it keeps the budget a budget, where
-		// leaving it would send this flow to a dedicated dial outside it.
-		evicted := -1
-		for i, entry := range c.bulkConns {
-			if !entry.busy && !bulkConnFits(ctx, entry) {
-				evicted = i
-				break
-			}
-		}
-		if evicted < 0 {
-			c.bulkMu.Unlock()
-			return nil, errBulkConnectionLimit
-		}
-		retired = c.bulkConns[evicted]
-		retired.stopIdleLocked()
-		c.bulkConns = append(c.bulkConns[:evicted:evicted], c.bulkConns[evicted+1:]...)
-	}
-	epoch := c.bulkEpoch
-	dialCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	if c.bulkDials == nil {
-		c.bulkDials = make(map[*byte]context.CancelFunc)
-	}
-	token := new(byte)
-	c.bulkDials[token] = cancel
-	c.bulkMu.Unlock()
-	if retired != nil {
-		retired.close("queqiao bulk pool wire version")
-	}
-
-	entry, err := c.dialBulkConn(dialCtx)
-	// A successful handshake can span system sleep. Expire its old epoch
-	// before publishing it, just as control-pool borrowers do after dialing.
-	c.checkSystemResume()
-	c.bulkMu.Lock()
-	if epoch == c.bulkEpoch {
-		delete(c.bulkDials, token)
-	}
-	if err != nil || epoch != c.bulkEpoch || dialCtx.Err() != nil {
-		c.bulkMu.Unlock()
-		if entry != nil {
-			entry.close("queqiao obsolete bulk dial")
-		}
-		if err != nil {
-			return nil, err
-		}
-		return nil, context.Canceled
-	}
-	entry.busy = true
-	c.bulkConns = append(c.bulkConns, entry)
-	c.bulkMu.Unlock()
-	return entry, nil
-}
-
-// isolatedBulkConns bounds the secondary connections one client may hold.
-//
-// It is a count of concurrently isolated bulk flows, not of lanes. A flow's
-// data lives on one lane, so a flow needs at most one of these -- but several
-// bulk flows can be in flight at once, and each has to have its own or
-// isolation is a queue rather than a policy. Capping this at one during the
-// striping excision would have let exactly one bulk flow at a time leave the
-// shared connection, which is the case the eight-flow live measurement is
-// about.
-//
-// Eight is what the lane ceiling used to permit and is a bound on descriptors
-// and handshakes rather than a tuning choice; a ninth concurrent bulk flow
-// stays on the pooled connection, which is where it started.
-const isolatedBulkConns = 8
-
-// maxBulkConns is the bulk pool's connection budget: the profile's under
-// isolation, and the explicit fan-out's (zero when off) under topology=single.
-func (c *Client) maxBulkConns() int {
-	if c.singleTopology() {
-		return min(c.fanOutConnections(), c.memoryLimits.maxBulkConnections)
-	}
-	return c.memoryLimits.maxBulkConnections
-}
-
-func (c *Client) bulkConnCount() int {
-	c.bulkMu.Lock()
-	defer c.bulkMu.Unlock()
-	return len(c.bulkConns)
-}
-
-func (c *Client) dialBulkConn(ctx context.Context) (*bulkConn, error) {
-	started := time.Now()
-	// A bulk connection is dialed for one flow's lane, so it offers that
-	// flow's version; it is reused only by flows of the same version.
-	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.dialWires(ctx), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, c.windows(), c.hopDialConfig())
-	if err != nil {
-		return nil, err
-	}
-	entry := &bulkConn{conn: conn, packet: packet, verified: time.Now()}
-	entry.controller = configureQUICController(conn, congestionConfig{
-		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
-		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
-		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipalNow, generation: c.uplinkGeneration.Load,
-	})
-	c.cfg.Logger.Debug("bulk QUIC pool authenticated", "duration", time.Since(started))
-	return entry, nil
-}
-
 // controlPoolStreamConn keeps the count of flows sharing the pooled control
 // connection accurate, which is what decides whether a bulk flow should move
 // off it.
@@ -2630,78 +1868,6 @@ func (s *controlPoolStreamConn) Close() error {
 	return err
 }
 
-type bulkPoolStreamConn struct {
-	*quicStreamConn
-	owner *Client
-	entry *bulkConn
-	once  sync.Once
-}
-
-func (s *bulkPoolStreamConn) Close() error {
-	err := s.quicStreamConn.Close()
-	s.once.Do(func() { s.owner.releaseBulkConn(s.entry, s.entry.conn.Context().Err() != nil) })
-	return err
-}
-
-// releaseBulkConn returns a connection to the idle set, or discards it when
-// its transport is already dead. An idle connection is retained briefly so a
-// following flow can skip the handshake, then closed.
-func (c *Client) releaseBulkConn(entry *bulkConn, dead bool) {
-	c.bulkMu.Lock()
-	found := false
-	for _, existing := range c.bulkConns {
-		if existing == entry {
-			found = true
-			break
-		}
-	}
-	entry.stopIdleLocked()
-	entry.busy = false
-	if !found {
-		c.bulkMu.Unlock()
-		entry.close("queqiao detached bulk pool release")
-		return
-	}
-	if dead {
-		remaining := c.bulkConns[:0]
-		for _, existing := range c.bulkConns {
-			if existing != entry {
-				remaining = append(remaining, existing)
-			}
-		}
-		c.bulkConns = remaining
-		c.bulkMu.Unlock()
-		entry.close("queqiao bulk pool failed")
-		return
-	}
-	epoch := entry.idleEpoch
-	entry.idleTimer = time.AfterFunc(bulkPoolIdleTimeout, func() { c.expireBulkConn(entry, epoch) })
-	c.bulkMu.Unlock()
-}
-
-func (c *Client) expireBulkConn(entry *bulkConn, epoch uint64) {
-	c.bulkMu.Lock()
-	if entry.busy || entry.idleEpoch != epoch {
-		c.bulkMu.Unlock()
-		return
-	}
-	remaining := c.bulkConns[:0]
-	found := false
-	for _, existing := range c.bulkConns {
-		if existing == entry {
-			found = true
-			entry.stopIdleLocked()
-			continue
-		}
-		remaining = append(remaining, existing)
-	}
-	c.bulkConns = remaining
-	c.bulkMu.Unlock()
-	if found {
-		entry.close("queqiao bulk pool idle")
-	}
-}
-
 func bulkLaneBudget(reserveControl bool) (bulk, controlReserve int) {
 	if reserveControl {
 		return 1, 1
@@ -2720,298 +1886,7 @@ func (c *Client) manageLanes(ctx context.Context, flow *multipathFlow, sessionID
 	if initialKind != TransportQUIC {
 		return
 	}
-	if c.carriers != nil {
-		c.manageCarrierBoundLanes(ctx, flow, sessionID, flowID)
-		return
-	}
-	c.manageQUICLanes(ctx, flow, sessionID, flowID)
-}
-
-func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) {
-	_, controlReserve := bulkLaneBudget(flow.reserveControlLane)
-	manageCtx, manageCancel := context.WithCancel(ctx)
-	defer manageCancel()
-	// This goroutine is the only thing that opens a replacement lane for this
-	// flow. When it returns -- budget spent, context gone, or handed off to the
-	// bundle manager below, which marks the flow again when it returns in turn
-	// -- the flow's replacement grace is waiting for something nobody will
-	// send, and it should stop rather than leave the application in silence.
-	defer flow.noteReplacementAbandoned()
-	go func() {
-		select {
-		case <-flow.doneChan():
-			manageCancel()
-		case <-manageCtx.Done():
-		}
-	}()
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	// Ownership transfers only when the manager receives the lane. A buffered
-	// result can outlive this manager and leak its transport on cancellation.
-	joins := make(chan laneJoinResult)
-	joinPending := false
-	isolated := false
-	var lastDecision time.Time
-	var recoveryBackoff time.Duration
-	var nextRecovery time.Time
-	recoveryAttempts := 0
-	var lastRecoveryAttempt time.Time
-	var isolationBlockedUntil time.Time
-	var isolationBackoff time.Duration
-	isolationAttempts := 0
-	var nextStallRescue time.Time
-	for {
-		select {
-		case <-flow.doneChan():
-			return
-		case <-manageCtx.Done():
-			return
-		case <-flow.stallSignals():
-			// The watchdog suspects the lane, not declares it dead: the flow
-			// still has one, so this is a rescue beside the existing lane,
-			// not a replacement for a lost one. A flow with no lane at all is
-			// the outage path below, which owns that case.
-			if flow.doneChanClosed() {
-				return
-			}
-			if len(flow.healthyLanes()) == 0 {
-				continue
-			}
-			if flow.openConfirmationRequired.Load() {
-				// A JOIN on another stream can overtake the optimistic OPEN
-				// and get an "unknown session" refusal for a flow still being
-				// established. Keep the original reliable stream and bounded
-				// OPEN deadline in charge until OPEN_OK arrives. Actual lane
-				// loss still takes the replacement path below.
-				continue
-			}
-			now := time.Now()
-			if now.Before(nextStallRescue) {
-				continue
-			}
-			if err := c.runRescueRound(withShadowRescueTrigger(manageCtx, shadowRescueStall), flow, sessionID, flowID); err != nil {
-				if manageCtx.Err() != nil || flow.doneChanClosed() {
-					return
-				}
-				if errors.Is(err, errLaneJoinRejected) {
-					// The suspect lane still counts as healthy locally, so no
-					// replacement waiter will observe this flag. Close the flow
-					// to release the application on this terminal peer answer.
-					flow.noteRefusalCause(err)
-					flow.resumeRefused.Store(true)
-					c.cfg.Logger.Debug("peer cannot resume this association", "flow_id", flowID, "error", err)
-					flow.closeAll()
-					return
-				}
-				if errors.Is(err, errLaneJoinCapacity) && flow.laneCapacityRefusals() >= maxLaneRecoveryAttempts {
-					// The ceiling answer is transient only while lanes
-					// genuinely come and go. This many consecutive refusals
-					// without one successful round is a wedged admission slot
-					// the peer cannot see, so the flow fails fast here exactly
-					// as it does for a permanent refusal, and the application
-					// reconnects on a fresh flow.
-					flow.resumeRefused.Store(true)
-					c.cfg.Logger.Debug("peer lane capacity answer persisted; giving up on this association", "flow_id", flowID, "refusals", flow.laneCapacityRefusals())
-					flow.closeAll()
-					return
-				}
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					c.cfg.Logger.Warn("stall rescue unavailable", "flow_id", flowID, "error", err)
-				}
-			}
-			// The watchdog already paces pending-work rescue by measured RTT.
-			// Do not stack exponential sleeps on top of handshake timeouts.
-			nextStallRescue = time.Now().Add(flow.stallThreshold())
-		case <-ticker.C:
-			// The remote completion watcher can close its lanes just before
-			// this scheduler tick. Both FIN directions are already known at
-			// that point, so joining a tombstoned/unknown session would only
-			// create noisy warnings and transient UDP-health penalties.
-			if flow.finSent.Load() && flow.remoteFinSeen.Load() {
-				flow.closeAll()
-				return
-			}
-			for draining := true; draining; {
-				select {
-				case result := <-joins:
-					joinPending = false
-					switch {
-					case result.err != nil:
-						if manageCtx.Err() != nil || flow.doneChanClosed() {
-							return
-						}
-						if errors.Is(result.err, errLaneJoinRejected) || errors.Is(result.err, errLaneJoinCapacity) {
-							// The peer's ceiling, not a broken path. Keep the
-							// flow where it is.
-							isolated = true
-							c.cfg.Logger.Debug("peer refused lane join; flow stays on the shared connection", "lane", result.id, "error", result.err)
-							break
-						}
-						if errors.Is(result.err, errBulkConnectionLimit) {
-							c.cfg.Logger.Debug("bulk isolation capacity occupied; flow stays on the shared connection", "lane", result.id)
-						} else {
-							c.cfg.Logger.Warn("bulk isolation lane unavailable", "lane", result.id, "error", result.err)
-						}
-						if isolationBackoff == 0 {
-							isolationBackoff = minLaneProbeBackoff
-						} else if isolationBackoff < maxLaneProbeBackoff {
-							isolationBackoff *= 2
-							if isolationBackoff > maxLaneProbeBackoff {
-								isolationBackoff = maxLaneProbeBackoff
-							}
-						}
-						isolationBlockedUntil = time.Now().Add(isolationBackoff)
-					default:
-						if err := flow.addLane(result.lane); err != nil {
-							_ = result.lane.fc.Close()
-							break
-						}
-						flow.confirmOpenByJoin()
-						isolated = true
-						if controlReserve > 0 && flow.laneCount() == controlReserve+1 {
-							// The flow's first bulk lane is what moves it off
-							// the shared control connection, which is what
-							// keeps interactive traffic out of a bulk
-							// congestion window. Count it so an operator can
-							// see the policy act.
-							c.metrics.BulkIsolated()
-						}
-					}
-				default:
-					draining = false
-				}
-			}
-			snapshot := flow.snapshot()
-			now := time.Now()
-			if snapshot.HealthyLanes == 0 {
-				if flow.doneChanClosed() {
-					return
-				}
-				if recoveryAttempts >= maxLaneRecoveryAttempts {
-					// Say so once, at the level a failing flow is reported at:
-					// from here the flow fails immediately rather than waiting
-					// out a grace nothing will arrive during.
-					c.cfg.Logger.Info("lane recovery abandoned", "attempts", recoveryAttempts, "flow_id", flowID)
-					return
-				}
-				if !nextRecovery.IsZero() && now.Before(nextRecovery) {
-					continue
-				}
-				recoveryAttempts++
-				lastRecoveryAttempt = now
-				attempt := flow.noteReplacementAttempt()
-				if err := c.runRescueRound(withShadowRescueTrigger(manageCtx, shadowRescueOutage), flow, sessionID, flowID); err != nil {
-					err = classifyUnconfirmedRefusal(flow, err)
-					flow.noteReplacementFailure(err)
-					// The flow this belongs to is the whole point of the
-					// line: a gateway record saying a flow failed with no
-					// replacement cannot be told from one where none was
-					// tried unless the attempts can be found by flow.
-					// `attempt` is the flow's replacement ordinal, so the
-					// last line logged for a flow matches the
-					// lane_replacement_attempts on its completion record.
-					// It is written for every counted failure, before the
-					// refusal below can end the manager.
-					c.logLaneRecoveryFailure(manageCtx, flowID, attempt, err)
-					if errors.Is(err, errLaneJoinRejected) {
-						// The peer answered, and its answer was that it does
-						// not hold this session. That does not change: a
-						// session identifier is random and is never reissued.
-						// Retrying it spends the flow's whole replacement
-						// grace learning the same thing, so record the refusal
-						// and let the flow fail now.
-						flow.noteRefusalCause(err)
-						flow.resumeRefused.Store(true)
-						c.cfg.Logger.Debug("peer cannot resume this association", "flow_id", flowID, "error", err)
-						return
-					}
-					if recoveryBackoff == 0 {
-						recoveryBackoff = time.Second
-					} else if recoveryBackoff < 15*time.Second {
-						recoveryBackoff *= 2
-						if recoveryBackoff > 15*time.Second {
-							recoveryBackoff = 15 * time.Second
-						}
-					}
-					nextRecovery = now.Add(recoveryBackoff)
-				} else {
-					// A replacement that succeeds its handshake can still fail
-					// immediately. Keep a bounded exponential delay between all
-					// attempts, not only failed handshakes.
-					if recoveryBackoff == 0 {
-						recoveryBackoff = time.Second
-					}
-					nextRecovery = now.Add(recoveryBackoff)
-					if recoveryBackoff < 15*time.Second {
-						recoveryBackoff *= 2
-						if recoveryBackoff > 15*time.Second {
-							recoveryBackoff = 15 * time.Second
-						}
-					}
-				}
-				continue
-			}
-			// A replacement that survives one 500-ms scheduler tick is not yet
-			// stable. Reset the lifetime budget only after a sustained healthy
-			// dwell; otherwise accept-then-close peers can bypass the cap by
-			// keeping each replacement alive very briefly.
-			if recoveryAttempts > 0 && !lastRecoveryAttempt.IsZero() && time.Since(lastRecoveryAttempt) >= laneRecoveryResetAfter {
-				recoveryAttempts = 0
-				recoveryBackoff = 0
-				nextRecovery = time.Time{}
-				lastRecoveryAttempt = time.Time{}
-			}
-			// Once a TCP rescue lane is installed, keep the session on it.
-			if hasTCPLane(flow) {
-				retired := flow.retireLanesExcept(TransportTCP)
-				c.cfg.Logger.Info("flow handed off to TCP fallback", "retired_quic_lanes", retired, "tcp_lanes", flow.laneCount())
-				c.manageTCPBundle(manageCtx, flow, sessionID, flowID)
-				return
-			}
-			// Everything below is isolation, and it is over once it has
-			// happened: a QUIC flow's data lives on one lane, so there is never
-			// a second QUIC data lane to open.
-			if isolated || controlReserve == 0 || joinPending {
-				continue
-			}
-			// Reactive isolation, or under topology=single only an explicit
-			// fan-out (§7).
-			if !c.secondConnectionWanted(snapshot, func() *controlQUICGeneration { return flowGeneration(flow) }) {
-				continue
-			}
-			// Do not consume the decision interval while the flow is still NEW
-			// or INTERACTIVE. The classifier may cross its bulk byte/age
-			// boundary just after such a tick.
-			if !lastDecision.IsZero() && now.Sub(lastDecision) < laneDecisionInterval {
-				continue
-			}
-			lastDecision = now
-			if isolationAttempts >= maxLaneProbeAttempts || flow.doneChanClosed() ||
-				now.Before(isolationBlockedUntil) {
-				continue
-			}
-			laneID, err := flow.allocateJoinID()
-			if err != nil {
-				return
-			}
-			isolationAttempts++
-			joinPending = true
-			// Open the lane off the decision loop. On a saturated path the
-			// join's own handshake queues behind the flow's data and has been
-			// measured taking several seconds; doing it inline would leave the
-			// flow blind to a lane failure meanwhile.
-			go func() {
-				lane, err := c.openJoinLane(manageCtx, TransportQUIC, sessionID, flowID, laneID)
-				select {
-				case joins <- laneJoinResult{lane: lane, id: laneID, err: err}:
-				case <-manageCtx.Done():
-					if lane != nil {
-						_ = lane.fc.Close()
-					}
-				}
-			}()
-		}
-	}
+	c.manageCarrierBoundLanes(ctx, flow, sessionID, flowID)
 }
 
 // manageTCPBundle maintains a bounded group of independent reliable paths for
@@ -3328,48 +2203,6 @@ func shouldPrewarmBulkLane(snapshot flowSnapshot) bool {
 	return larger/smaller >= bulkLaneAsymmetry
 }
 
-// rescueAttempt is one dial+JOIN strategy in a parallel rescue round.
-type rescueAttempt func(ctx context.Context) (*mpLane, error)
-
-// runRescueRound executes one parallel rescue round under the flow's
-// in-flight guard: the stall watchdog stays silent for the round, and any
-// request it managed to queue just before the guard engaged is dropped
-// afterwards, because the round has just changed the state that request
-// described.
-func (c *Client) runRescueRound(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) error {
-	hint := flow.rescueHint.Load()
-	if hint != nil {
-		ctx = context.WithValue(ctx, laneReplacementContextKey{}, *hint)
-	}
-	flow.rescueInFlight.Store(true)
-	ctx = flow.carrierShadow.noteRescue(ctx, flow)
-	err := c.openParallelRescue(ctx, flow, sessionID, flowID)
-	flow.rescueInFlight.Store(false)
-	// The capacity streak is kept per round rather than per attempt: a round
-	// is the unit the peer's ceiling answer is believed or doubted on, and
-	// the attempts inside one round race exactly because only one of them is
-	// supposed to win.
-	if errors.Is(err, errLaneJoinCapacity) {
-		flow.noteLaneCapacityRefusal()
-	} else {
-		flow.resetLaneCapacityRefusals()
-	}
-	if err == nil {
-		if hint != nil {
-			// The peer retired this lane before acknowledging the JOIN. Mirror
-			// that transition locally instead of waiting for its old reader to
-			// time out and overwrite the next round's replacement identity.
-			flow.retireLaneByID(hint.id)
-			flow.clearRescueReplacementSnapshot(hint)
-		}
-	}
-	select {
-	case <-flow.stallSignals():
-	default:
-	}
-	return err
-}
-
 // logLaneRecoveryFailure writes the per-attempt record for a zero-lane QUIC
 // recovery round that returned an error.
 //
@@ -3450,207 +2283,6 @@ func (c *Client) logTCPJoinFailure(manageCtx context.Context, flowID uint64, res
 type laneReplacementHint struct{ id uint64 }
 
 type laneReplacementContextKey struct{}
-
-// openParallelRescue installs a QUIC race winner, or a sequential TCP
-// handoff after that race fails. A TCP JOIN mutates the server before its
-// response arrives, so it must never compete with a possible QUIC winner.
-func (c *Client) openParallelRescue(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) error {
-	lane, err := c.openRescueLane(ctx, flow, sessionID, flowID)
-	if err != nil {
-		return err
-	}
-	if err := c.installRecoveryLane(flow, lane); err != nil {
-		return err
-	}
-	c.cfg.Logger.Info("lane rescue joined", "flow", flowID, "lane", lane.id, "transport", lane.kind)
-	return nil
-}
-
-func (c *Client) openRescueLane(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) (*mpLane, error) {
-	if flow.finSent.Load() && flow.remoteFinSeen.Load() {
-		return nil, context.Canceled
-	}
-	attempts := []rescueAttempt{func(ctx context.Context) (*mpLane, error) {
-		return c.openQUICRecoveryLane(ctx, flow, sessionID, flowID)
-	}}
-	for len(attempts) < metrics.RescueAttemptSlots {
-		attempts = append(attempts, func(ctx context.Context) (*mpLane, error) {
-			return c.openSprayedQUICRescueJoin(ctx, flow, sessionID, flowID)
-		})
-	}
-	if c.cfg.Transport == TransportAuto && (!flow.reserveControlLane || !c.cfg.EnableQUICPool) {
-		// Preserve the unpooled AUTO policy: recover directly on TCP. There
-		// is no shared generation to rebuild, and no QUIC racers may run
-		// beside this irreversible handoff.
-		attempts = nil
-	}
-	return c.raceRescueWithFallback(ctx, flow, attempts, func(ctx context.Context) (*mpLane, error) {
-		laneID, err := flow.allocateJoinID()
-		if err != nil {
-			return nil, err
-		}
-		return c.openJoinLane(ctx, TransportTCP, sessionID, flowID, laneID)
-	})
-}
-
-// raceRescueWithFallback makes the irreversible TCP handoff only after there
-// can no longer be a client-selected QUIC winner. Late cancelled QUIC JOINs
-// cannot undo TCP mode on the server. Capacity refusals can immediately
-// hand off to TCP once the QUIC race ends. Permanent session refusals never
-// trigger another JOIN.
-func (c *Client) raceRescueWithFallback(ctx context.Context, flow *multipathFlow, attempts []rescueAttempt, tcp rescueAttempt) (*mpLane, error) {
-	recoveryCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		select {
-		case <-flow.doneChan():
-			cancel()
-		case <-recoveryCtx.Done():
-		}
-	}()
-	quicCtx := recoveryCtx
-	quicCancel := func() {}
-	if c.cfg.Transport == TransportAuto {
-		quicCtx, quicCancel = context.WithTimeout(recoveryCtx, c.fallbackGrace())
-	}
-	lane, _, err := c.raceRescueAttempts(quicCtx, flow, attempts)
-	quicCancel()
-	if err == nil {
-		return lane, nil
-	}
-	if recoveryCtx.Err() != nil {
-		return nil, recoveryCtx.Err()
-	}
-	if c.cfg.Transport != TransportAuto {
-		return nil, err
-	}
-	if errors.Is(err, errLaneJoinRejected) && !errors.Is(err, errLaneJoinTCPMode) {
-		return nil, err
-	}
-	c.metrics.LaneRescueAttempt()
-	lane, err = tcp(recoveryCtx)
-	if err == nil {
-		c.metrics.LaneRescueWin(0)
-	}
-	return lane, err
-}
-
-// openSprayedQUICRescueJoin is one independent QUIC dial+JOIN for the
-// parallel rescue: its own connection, its own handshake retransmission
-// schedule, and -- through the shared hop walk -- the next port in a shuffled
-// permutation of the hop pool, which makes concurrent attempts uniform over
-// the available ports without repeating one.
-func (c *Client) openSprayedQUICRescueJoin(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) (*mpLane, error) {
-	laneID, err := flow.allocateJoinID()
-	if err != nil {
-		return nil, err
-	}
-	c.carrierShadow.noteJoinAttempt(ctx, sessionID, flowID, laneID, TransportQUIC)
-	lane, err := c.dialJoinLane(ctx, TransportQUIC, sessionID, laneID)
-	if err != nil {
-		return nil, err
-	}
-	return c.completeLaneJoin(ctx, lane, flowID, 0)
-}
-
-// raceRescueAttempts runs a rescue round: every attempt starts together, the
-// first successful JOIN wins, and the losers' contexts are cancelled at once.
-// Losing lanes are closed wherever they surface -- an attempt finishing after
-// the race was decided closes its own lane, and the drain collects any that
-// completed in the window before the cancellation reached them.
-//
-// The race is deliberately not transactional with the server, which admits
-// JOINs in arrival order while the winner here is the first finisher. What
-// keeps a late losing JOIN from evicting the winner's server side at the
-// lane ceiling is the server: a lane is unevictable while its JOIN handshake
-// is in flight and for one path-detection budget afterwards, so the loser is
-// refused by capacity instead (see retireOldestLane), and a capacity refusal
-// is exactly the per-attempt failure errLaneJoinCapacity carries back here.
-// Past that window no role or seniority shields a lane from a newer rescue.
-func (c *Client) raceRescueAttempts(ctx context.Context, flow *multipathFlow, attempts []rescueAttempt) (*mpLane, int, error) {
-	raceCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	// A rescue handshake must not outlive its flow.
-	go func() {
-		select {
-		case <-flow.doneChan():
-			cancel()
-		case <-raceCtx.Done():
-		}
-	}()
-	type result struct {
-		lane    *mpLane
-		attempt int
-		err     error
-	}
-	results := make(chan result, len(attempts))
-	for i, attempt := range attempts {
-		c.metrics.LaneRescueAttempt()
-		go func(i int, attempt rescueAttempt) {
-			lane, err := attempt(raceCtx)
-			if err == nil && lane != nil && raceCtx.Err() != nil {
-				// Finished after the race was decided: close it here rather
-				// than trusting the drain to see it.
-				_ = lane.fc.Close()
-				lane = nil
-				err = context.Canceled
-			}
-			results <- result{lane: lane, attempt: i, err: err}
-		}(i, attempt)
-	}
-	drain := func(pending int) {
-		for ; pending > 0; pending-- {
-			if loser := <-results; loser.lane != nil {
-				_ = loser.lane.fc.Close()
-			}
-		}
-	}
-	pending := len(attempts)
-	var firstErr error
-	for pending > 0 {
-		var r result
-		select {
-		case r = <-results:
-		case <-raceCtx.Done():
-			go drain(pending)
-			return nil, -1, raceCtx.Err()
-		}
-		pending--
-		if r.err == nil && r.lane != nil {
-			cancel()
-			go drain(pending)
-			c.metrics.LaneRescueWin(r.attempt)
-			return r.lane, r.attempt, nil
-		}
-		if errors.Is(r.err, errLaneJoinRejected) {
-			// Permanent session state is shared by all QUIC attempts. TCP
-			// mode is handled by the sequential fallback phase above.
-			cancel()
-			go drain(pending)
-			return nil, -1, r.err
-		}
-		if firstErr == nil {
-			firstErr = r.err
-		}
-	}
-	if firstErr == nil {
-		firstErr = errors.New("lane rescue ran no attempts")
-	}
-	return nil, -1, firstErr
-}
-
-// openQUICRecoveryLane never commits TCP. Pooled flows first reuse the
-// shared generation; the other racers supply independent QUIC connections.
-func (c *Client) openQUICRecoveryLane(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64) (*mpLane, error) {
-	if flow.reserveControlLane && c.cfg.EnableQUICPool {
-		laneID, err := flow.allocateJoinID()
-		if err != nil {
-			return nil, err
-		}
-		return c.openControlPoolJoinLane(ctx, sessionID, flowID, laneID)
-	}
-	return c.openSprayedQUICRescueJoin(ctx, flow, sessionID, flowID)
-}
 
 func (c *Client) installRecoveryLane(flow *multipathFlow, lane *mpLane) error {
 	if err := flow.addLane(lane); err != nil {
@@ -3794,17 +2426,12 @@ func (c *Client) raceUDPAndTCP(ctx context.Context) (*authenticatedLane, error) 
 			c.metrics.Fallback()
 			c.cfg.Logger.Info("QUIC preference window elapsed; using TCP without penalizing UDP health",
 				"endpoint", c.cfg.RemoteAddr, "grace", c.fallbackGrace())
-			if c.cfg.EnableQUICPool {
-				// The current request has its bounded answer, while the one
-				// coalesced pool dial keeps running. Its eventual success
-				// restores QUIC for later flows; an explicit failure is the
-				// conservative evidence the cooldown requires.
-				keepQUICAttempt = true
-				c.finishLatePooledQUIC(quicResult, cancel)
-			} else {
-				cancel()
-				closeLateLane(quicResult)
-			}
+			// The current request has its bounded answer, while the one
+			// coalesced pool dial keeps running. Its eventual success
+			// restores QUIC for later flows; an explicit failure is the
+			// conservative evidence the cooldown requires.
+			keepQUICAttempt = true
+			c.finishLatePooledQUIC(quicResult, cancel)
 			return tcpReady, nil
 		case <-ctx.Done():
 			closeAuthenticatedLane(tcpReady)
@@ -3858,7 +2485,7 @@ func (c *Client) classifierConfig() classifier.Config {
 	if cfg.BulkBytes == 0 {
 		cfg = profile.Default().Classifier
 	}
-	return phasedClassifierConfig(cfg, c.cfg.Classifier)
+	return cfg
 }
 
 // declareClass asks the local capture agent what opened this connection, and

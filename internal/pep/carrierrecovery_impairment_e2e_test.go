@@ -10,14 +10,13 @@ import (
 	"github.com/bojieli/queqiao/internal/pathsim"
 )
 
-// Stage 8 under the impairments of the next live campaign's netem arm, on
-// pathsim, each against legacy recovery (recovery=flow) with everything else
-// equal: the full stage 1-7 bundle and classifier=phased on both ends. The
-// workload is one bulk download beside one interactive echo flow. Hard
-// assertions: no flow dies silently (each either keeps making progress or
-// ends with an error the application sees) and, under the carrier manager,
-// no false replacement of a carrier that is only slow or lossy. Comparative
-// bounds are loose: these gate regressions against legacy, not tuning.
+// Carrier recovery under the impairments of the live campaign's netem arm,
+// on pathsim. The workload is one bulk download beside one interactive echo
+// flow. Hard assertions: no flow dies silently (each either keeps making
+// progress or ends with an error the application sees) and no false
+// replacement of a carrier that is only slow or lossy. Until stage 11 each ran
+// against legacy recovery too; that arm went with the legacy code, so what is
+// left are the absolute assertions.
 
 // downloadMarker opens a download on muxDestination instead of an echo.
 const downloadMarker = 0xFF
@@ -112,7 +111,6 @@ func (d *downloadStream) waitReceived(want int64, budget time.Duration) bool {
 
 // impairmentRun is one arm's outcome.
 type impairmentRun struct {
-	mode RecoveryMode
 	// downloaded is the bulk bytes delivered over the measured window.
 	downloaded int64
 	// echoed is the interactive bytes echoed over it.
@@ -132,28 +130,23 @@ func (r *impairmentRun) checkNotSilent(name string, lastProgress time.Time, fail
 	}
 }
 
-func impairmentPair(t *testing.T, mode RecoveryMode, path pathsim.Config, recovery CarrierRecoveryConfig) *carrierPair {
-	return newCarrierPair(t, carrierPairOptions{
-		path: path, serve: muxDestination, clientRecovery: mode, gatewayRecovery: mode, recovery: recovery,
-	})
+func impairmentPair(t *testing.T, path pathsim.Config, recovery CarrierRecoveryConfig) *carrierPair {
+	return newCarrierPair(t, carrierPairOptions{path: path, serve: muxDestination, recovery: recovery})
 }
 
 func (r impairmentRun) promotionsOf(p *carrierPair) int64 {
-	if p.client.carriers == nil {
-		return 0
-	}
 	return p.client.carriers.promotions.Load()
 }
 
 // measureSteady runs the workload over a steady impairment for window.
-func measureSteady(t *testing.T, mode RecoveryMode, path pathsim.Config, window time.Duration) impairmentRun {
+func measureSteady(t *testing.T, path pathsim.Config, window time.Duration) impairmentRun {
 	t.Helper()
-	p := impairmentPair(t, mode, path, CarrierRecoveryConfig{})
-	run := impairmentRun{mode: mode}
+	p := impairmentPair(t, path, CarrierRecoveryConfig{})
+	run := impairmentRun{}
 	d := startDownload(t, p)
 	e := startEchoStream(t, p, 64, 50*time.Millisecond)
 	if !d.waitReceived(64<<10, 60*time.Second) {
-		t.Fatalf("%s: the download never started: %v", mode, d.failure())
+		t.Fatalf("the download never started: %v", d.failure())
 	}
 	d0, e0 := d.received.Load(), e.echoed.Load()
 	time.Sleep(window)
@@ -166,56 +159,52 @@ func measureSteady(t *testing.T, mode RecoveryMode, path pathsim.Config, window 
 	return run
 }
 
-// compareSteady runs both arms and applies the common assertions.
-func compareSteady(t *testing.T, path pathsim.Config, window time.Duration, minRatio float64) {
+// checkSteady runs the workload and applies the common assertions.
+func checkSteady(t *testing.T, path pathsim.Config, window time.Duration) {
 	if testing.Short() {
 		t.Skip("wall-clock impairment campaign")
 	}
-	legacy := measureSteady(t, RecoveryFlow, path, window)
-	carrier := measureSteady(t, RecoveryCarrier, path, window)
-	t.Logf("legacy: %d bytes down, %d echoed; carrier: %d bytes down, %d echoed, %d promotions",
-		legacy.downloaded, legacy.echoed, carrier.downloaded, carrier.echoed, carrier.promotions)
-	for _, r := range []impairmentRun{legacy, carrier} {
-		if len(r.silent) > 0 {
-			t.Fatalf("%s: flows died silently: %v", r.mode, r.silent)
-		}
+	run := measureSteady(t, path, window)
+	t.Logf("%d bytes down, %d echoed, %d promotions", run.downloaded, run.echoed, run.promotions)
+	if len(run.silent) > 0 {
+		t.Fatalf("flows died silently: %v", run.silent)
 	}
-	if carrier.promotions != 0 {
-		t.Fatalf("the carrier manager replaced a carrier that was only impaired (%d promotions)", carrier.promotions)
+	if run.promotions != 0 {
+		t.Fatalf("the carrier manager replaced a carrier that was only impaired (%d promotions)", run.promotions)
 	}
-	if float64(carrier.downloaded) < minRatio*float64(legacy.downloaded) {
-		t.Fatalf("carrier recovery delivered %d bytes against legacy's %d (below %.2fx)", carrier.downloaded, legacy.downloaded, minRatio)
+	if run.downloaded == 0 {
+		t.Fatal("the download made no progress over the window")
 	}
 }
 
 // 3 % bursty loss at 5 Mbit/s with +250 ms of round trip: a slow, lossy
-// path is waited out, never replaced, and delivers as legacy does.
-func TestCarrierRecoveryOnASlowLossyPathMatchesLegacy(t *testing.T) {
-	compareSteady(t, pathsim.Config{
+// path is waited out and never replaced.
+func TestCarrierRecoveryOnASlowLossyPath(t *testing.T) {
+	checkSteady(t, pathsim.Config{
 		OneWayDelay: 125 * time.Millisecond, RateBytesPerSec: 5_000_000 / 8,
 		LossRate: 0.03, LossBurstPackets: 3, QueueBytes: 256 << 10, Seed: 31,
-	}, 15*time.Second, 0.8)
+	}, 15*time.Second)
 }
 
 // A 4 Mbit/s policer: drops at the bucket are loss on a live carrier, which
 // is no evidence against it.
-func TestCarrierRecoveryUnderA4MbitPolicerMatchesLegacy(t *testing.T) {
-	compareSteady(t, pathsim.Config{
+func TestCarrierRecoveryUnderA4MbitPolicer(t *testing.T) {
+	checkSteady(t, pathsim.Config{
 		OneWayDelay: 30 * time.Millisecond, RateBytesPerSec: 4_000_000 / 8,
 		PolicerRefillPeriod: 8 * time.Millisecond, Seed: 32,
-	}, 15*time.Second, 0.8)
+	}, 15*time.Second)
 }
 
 // measureBlackhole drops everything, from every source, for outage, then
 // restores the path, and reports how soon both flows deliver again.
-func measureBlackhole(t *testing.T, mode RecoveryMode, outage time.Duration) impairmentRun {
+func measureBlackhole(t *testing.T, outage time.Duration) impairmentRun {
 	t.Helper()
-	p := impairmentPair(t, mode, pathsim.Config{OneWayDelay: 40 * time.Millisecond, RateBytesPerSec: 10_000_000 / 8, QueueBytes: 256 << 10, Seed: 33}, CarrierRecoveryConfig{})
-	run := impairmentRun{mode: mode, resumed: -1}
+	p := impairmentPair(t, pathsim.Config{OneWayDelay: 40 * time.Millisecond, RateBytesPerSec: 10_000_000 / 8, QueueBytes: 256 << 10, Seed: 33}, CarrierRecoveryConfig{})
+	run := impairmentRun{resumed: -1}
 	d := startDownload(t, p)
 	e := startEchoStream(t, p, 64, 50*time.Millisecond)
 	if !d.waitReceived(64<<10, 30*time.Second) {
-		t.Fatalf("%s: the download never started", mode)
+		t.Fatal("the download never started")
 	}
 	e.waitEchoed(t, 1024, 20*time.Second)
 	p.relay.SetLossRate(1, 1)
@@ -247,29 +236,20 @@ func measureBlackhole(t *testing.T, mode RecoveryMode, outage time.Duration) imp
 
 // A whole-path blackhole of 8 s (inside QUIC's idle timeout, so the carrier
 // survives it) and of 25 s (past it, so the carrier dies and the flows are
-// rebound onto a new one inside the gateway's grace). Both arms must resume
-// or fail visibly; the carrier manager resumes, no later than legacy plus a
-// few seconds.
-func TestCarrierRecoveryAcrossBlackholesAgainstLegacy(t *testing.T) {
+// rebound onto a new one inside the gateway's grace). The flows resume.
+func TestCarrierRecoveryAcrossBlackholes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("wall-clock impairment campaign")
 	}
 	for _, outage := range []time.Duration{8 * time.Second, 25 * time.Second} {
 		t.Run(outage.String(), func(t *testing.T) {
-			legacy := measureBlackhole(t, RecoveryFlow, outage)
-			carrier := measureBlackhole(t, RecoveryCarrier, outage)
-			t.Logf("%v blackhole: legacy resumed %v after the restore, carrier %v (%d promotions)",
-				outage, legacy.resumed, carrier.resumed, carrier.promotions)
-			for _, r := range []impairmentRun{legacy, carrier} {
-				if len(r.silent) > 0 {
-					t.Fatalf("%s: flows died silently: %v", r.mode, r.silent)
-				}
+			carrier := measureBlackhole(t, outage)
+			t.Logf("%v blackhole: resumed %v after the restore (%d promotions)", outage, carrier.resumed, carrier.promotions)
+			if len(carrier.silent) > 0 {
+				t.Fatalf("flows died silently: %v", carrier.silent)
 			}
 			if carrier.resumed < 0 {
 				t.Fatal("the carrier manager did not resume the flows after the path came back")
-			}
-			if legacy.resumed >= 0 && carrier.resumed > legacy.resumed+5*time.Second {
-				t.Fatalf("carrier recovery resumed %v after the restore, legacy %v", carrier.resumed, legacy.resumed)
 			}
 			if outage < laneDeadPathDetection && carrier.promotions != 0 {
 				// A path that comes back inside the idle timeout returns the
@@ -286,41 +266,35 @@ func TestCarrierRecoveryAcrossBlackholesAgainstLegacy(t *testing.T) {
 // the keep-alive bridges; the carrier manager's clock is moved to 1, 5 and
 // 16 minutes of idle before each wake (crossing the 15-minute boundary),
 // which a real campaign covers in wall time. Every wake is delivered within
-// 5 s in both arms, and nothing is replaced in the carrier arm.
-func TestCarrierRecoveryIdleWakeUnderLossAgainstLegacy(t *testing.T) {
+// 5 s, and nothing is replaced.
+func TestCarrierRecoveryIdleWakeUnderLoss(t *testing.T) {
 	if testing.Short() {
 		t.Skip("wall-clock impairment campaign")
 	}
 	path := pathsim.Config{OneWayDelay: 125 * time.Millisecond, RateBytesPerSec: 5_000_000 / 8, LossRate: 0.03, LossBurstPackets: 3, Seed: 34}
 	wakes := []time.Duration{time.Minute, 5 * time.Minute, 16 * time.Minute}
-	for _, mode := range []RecoveryMode{RecoveryFlow, RecoveryCarrier} {
-		t.Run(string(mode), func(t *testing.T) {
-			var skew atomic.Int64
-			cfg := CarrierRecoveryConfig{clock: func() time.Time { return time.Now().Add(time.Duration(skew.Load())) }}
-			p := impairmentPair(t, mode, path, cfg)
-			var flows []*echoStream
-			for range wakes {
-				e := startEchoStream(t, p, 200, 20*time.Millisecond)
-				e.waitEchoed(t, 2<<10, 60*time.Second)
-				e.pause.Store(true)
-				flows = append(flows, e)
-			}
-			time.Sleep(laneDeadPathDetection + 3*time.Second)
-			for i, idle := range wakes {
-				skew.Store(int64(idle))
-				e := flows[i]
-				before := e.echoed.Load()
-				e.pause.Store(false)
-				took := e.waitEchoed(t, before+200, 5*time.Second)
-				e.pause.Store(true)
-				t.Logf("%s: wake after %v idle delivered in %v", mode, idle, took)
-			}
-			if p.client.carriers != nil {
-				m := p.client.carriers
-				if got := m.promotions.Load() + m.deadlineFailures.Load(); got != 0 {
-					t.Fatalf("idle flows on a lossy path were replaced or failed (%d):\n%s", got, p.clientLogs.String())
-				}
-			}
-		})
+	var skew atomic.Int64
+	cfg := CarrierRecoveryConfig{clock: func() time.Time { return time.Now().Add(time.Duration(skew.Load())) }}
+	p := impairmentPair(t, path, cfg)
+	var flows []*echoStream
+	for range wakes {
+		e := startEchoStream(t, p, 200, 20*time.Millisecond)
+		e.waitEchoed(t, 2<<10, 60*time.Second)
+		e.pause.Store(true)
+		flows = append(flows, e)
+	}
+	time.Sleep(laneDeadPathDetection + 3*time.Second)
+	for i, idle := range wakes {
+		skew.Store(int64(idle))
+		e := flows[i]
+		before := e.echoed.Load()
+		e.pause.Store(false)
+		took := e.waitEchoed(t, before+200, 5*time.Second)
+		e.pause.Store(true)
+		t.Logf("wake after %v idle delivered in %v", idle, took)
+	}
+	m := p.client.carriers
+	if got := m.promotions.Load() + m.deadlineFailures.Load(); got != 0 {
+		t.Fatalf("idle flows on a lossy path were replaced or failed (%d):\n%s", got, p.clientLogs.String())
 	}
 }

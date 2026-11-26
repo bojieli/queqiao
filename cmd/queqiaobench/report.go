@@ -149,7 +149,9 @@ func describePath(opts options, cfg pathsim.Config) PathReport {
 		RateMbits: opts.rateMbits, PerFlowMbits: opts.perFlowMbits,
 		QueueBytes: cfg.QueueBytes, Seed: opts.seed, ObjectBytes: opts.bytes,
 		Congestion: opts.congestion,
-		ChunkSize:  opts.chunkSize, QUICPool: opts.quicPool,
+		// queqiao always pools its QUIC connection; the field stays so
+		// reports keep one schema.
+		ChunkSize: opts.chunkSize, QUICPool: true,
 	}
 }
 

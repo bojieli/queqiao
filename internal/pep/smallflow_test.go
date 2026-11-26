@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -165,7 +164,7 @@ func TestSmallExchangesAreRepairedOnceThePathIsKnown(t *testing.T) {
 	// learns this from its own traffic or from the prewarm; only the floor is
 	// seeded, because a delivered rate would also claim a share of the
 	// bottleneck and that is a different experiment.
-	pathmodel.Shared(key).Report(99, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, Delivered: 0, RoundTrip: 0})
+	pathmodel.Shared(key).Report(99, pathmodel.Observation{Erasure: 0.42, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
 	knowingSamples := exchange(10, time.Minute)
 	knowing := median(knowingSamples)
 
@@ -301,144 +300,6 @@ func TestFlowOpenRetryBackoffHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestColdQUICDestinationRefusalDoesNotFallBackOrRetry(t *testing.T) {
-	client := &Client{
-		cfg: ClientConfig{
-			Transport: TransportAuto, FallbackDelay: time.Second,
-		},
-		udpHealth: newUDPHealth(1, time.Minute),
-		metrics:   metrics.New(),
-	}
-	var quicCalls, tcpCalls int
-	client.dialPipelinedFlowForTest = func(_ context.Context, kind TransportKind, _ []byte) (*openedFlow, error) {
-		if kind == TransportQUIC {
-			quicCalls++
-			return nil, errDestinationUnavailable
-		}
-		tcpCalls++
-		return nil, errors.New("unexpected TCP fallback")
-	}
-	_, err := client.openInitialFlow(context.Background(), "example.test:443")
-	if !errors.Is(err, errDestinationUnavailable) {
-		t.Fatalf("cold-flow result = %v, want destination unavailable", err)
-	}
-	if quicCalls != 1 || tcpCalls != 0 {
-		t.Fatalf("cold-flow candidates: QUIC=%d TCP=%d, want one QUIC and no TCP", quicCalls, tcpCalls)
-	}
-	if !client.udpHealth.allow(time.Now()) {
-		t.Fatal("the destination response poisoned QUIC health")
-	}
-	if got := client.metrics.Snapshot().Fallbacks; got != 0 {
-		t.Fatalf("destination response recorded %d fallbacks", got)
-	}
-}
-
-func TestServerQUICShutdownDoesNotPoisonGlobalPathHealth(t *testing.T) {
-	client := &Client{
-		cfg:       ClientConfig{Transport: TransportAuto, FallbackDelay: time.Second},
-		udpHealth: newUDPHealth(1, time.Minute), metrics: metrics.New(),
-	}
-	client.dialPipelinedFlowForTest = func(_ context.Context, kind TransportKind, _ []byte) (*openedFlow, error) {
-		if kind == TransportQUIC {
-			return nil, &quic.ApplicationError{Remote: true, ErrorMessage: "server restarting"}
-		}
-		return &openedFlow{kind: TransportTCP}, nil
-	}
-	flow, err := client.openInitialFlow(context.Background(), "example.test:443")
-	if err != nil || flow == nil || flow.kind != TransportTCP {
-		t.Fatalf("fallback flow = %+v, error = %v", flow, err)
-	}
-	if !client.udpHealth.allow(time.Now()) {
-		t.Fatal("a peer-terminated QUIC connection blocked future QUIC attempts")
-	}
-}
-
-func TestQUICReachabilityTimeoutWithWorkingTCPEntersCooldown(t *testing.T) {
-	var logs bytes.Buffer
-	client := &Client{
-		cfg: ClientConfig{
-			RemoteAddr: "egress.example:443", Transport: TransportAuto, FallbackDelay: time.Second,
-			Logger: slog.New(slog.NewTextHandler(&logs, nil)),
-		},
-		udpHealth: newUDPHealth(1, time.Minute), metrics: metrics.New(),
-	}
-	client.dialPipelinedFlowForTest = func(_ context.Context, kind TransportKind, _ []byte) (*openedFlow, error) {
-		if kind == TransportQUIC {
-			return nil, &quic.HandshakeTimeoutError{}
-		}
-		return &openedFlow{kind: TransportTCP}, nil
-	}
-	flow, err := client.openInitialFlow(context.Background(), "example.test:443")
-	if err != nil || flow == nil || flow.kind != TransportTCP {
-		t.Fatalf("fallback flow = %+v, error = %v", flow, err)
-	}
-	if client.udpHealth.allow(time.Now()) {
-		t.Fatal("a QUIC reachability timeout against a working TCP control did not enter cooldown")
-	}
-	got := client.metrics.Snapshot()
-	if got.UDPPathUnavailable != 1 || got.EndpointTransportRaceFailures != 0 {
-		t.Fatalf("unexpected endpoint transport metrics: %+v", got)
-	}
-	for _, want := range []string{
-		"UDP path explicitly failed",
-		"endpoint=egress.example:443",
-		"fallback=tcp",
-		"quic_error",
-	} {
-		if !strings.Contains(logs.String(), want) {
-			t.Fatalf("UDP failure log is missing %q: %s", want, logs.String())
-		}
-	}
-}
-
-func TestReadyTCPDoesNotDisplaceSlowWorkingQUIC(t *testing.T) {
-	client := &Client{
-		cfg: ClientConfig{
-			RemoteAddr: "egress.example:443", Transport: TransportAuto, FallbackDelay: time.Millisecond,
-			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		},
-		udpHealth: newUDPHealth(3, time.Minute), metrics: metrics.New(),
-	}
-	quicRelease := make(chan struct{})
-	tcpReady := make(chan struct{})
-	client.dialPipelinedFlowForTest = func(_ context.Context, kind TransportKind, _ []byte) (*openedFlow, error) {
-		if kind == TransportQUIC {
-			<-quicRelease
-			return &openedFlow{kind: TransportQUIC}, nil
-		}
-		close(tcpReady)
-		return &openedFlow{kind: TransportTCP}, nil
-	}
-
-	result := make(chan openedFlowResult, 1)
-	go func() {
-		flow, err := client.openInitialFlow(context.Background(), "example.test:443")
-		result <- openedFlowResult{flow: flow, err: err}
-	}()
-	select {
-	case <-tcpReady:
-	case <-time.After(time.Second):
-		t.Fatal("TCP standby was not started")
-	}
-	select {
-	case got := <-result:
-		close(quicRelease)
-		t.Fatalf("ready TCP displaced pending QUIC: flow=%+v err=%v", got.flow, got.err)
-	case <-time.After(25 * time.Millisecond):
-	}
-	close(quicRelease)
-	got := <-result
-	if got.err != nil || got.flow == nil || got.flow.kind != TransportQUIC {
-		t.Fatalf("QUIC-preferred result = %+v, error = %v", got.flow, got.err)
-	}
-	if snapshot := client.metrics.Snapshot(); snapshot.Fallbacks != 0 || snapshot.UDPPathUnavailable != 0 {
-		t.Fatalf("a slow working QUIC path was reported as failed: %+v", snapshot)
-	}
-	if !client.udpHealth.allow(time.Now()) {
-		t.Fatal("a slow working QUIC path entered cooldown")
-	}
-}
-
 func TestReadyTCPDoesNotDisplaceSlowWorkingPooledQUIC(t *testing.T) {
 	client := &Client{
 		cfg: ClientConfig{
@@ -484,53 +345,10 @@ func TestReadyTCPDoesNotDisplaceSlowWorkingPooledQUIC(t *testing.T) {
 	}
 }
 
-func TestReadyTCPIsCommittedAfterExplicitQUICFailure(t *testing.T) {
-	client := &Client{
-		cfg: ClientConfig{
-			RemoteAddr: "egress.example:443", Transport: TransportAuto, FallbackDelay: time.Millisecond,
-			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		},
-		udpHealth: newUDPHealth(1, time.Minute), metrics: metrics.New(),
-	}
-	quicRelease := make(chan struct{})
-	tcpReady := make(chan struct{})
-	client.dialPipelinedFlowForTest = func(_ context.Context, kind TransportKind, _ []byte) (*openedFlow, error) {
-		if kind == TransportQUIC {
-			<-quicRelease
-			return nil, &quic.HandshakeTimeoutError{}
-		}
-		close(tcpReady)
-		return &openedFlow{kind: TransportTCP}, nil
-	}
-
-	result := make(chan openedFlowResult, 1)
-	go func() {
-		flow, err := client.openInitialFlow(context.Background(), "example.test:443")
-		result <- openedFlowResult{flow: flow, err: err}
-	}()
-	select {
-	case <-tcpReady:
-	case <-time.After(time.Second):
-		t.Fatal("TCP standby was not started")
-	}
-	close(quicRelease)
-	got := <-result
-	if got.err != nil || got.flow == nil || got.flow.kind != TransportTCP {
-		t.Fatalf("explicit-failure fallback = %+v, error = %v", got.flow, got.err)
-	}
-	if snapshot := client.metrics.Snapshot(); snapshot.Fallbacks != 1 || snapshot.UDPPathUnavailable != 1 {
-		t.Fatalf("explicit differential failure was not recorded: %+v", snapshot)
-	}
-	if client.udpHealth.allow(time.Now()) {
-		t.Fatal("an explicit QUIC failure against working TCP did not enter cooldown")
-	}
-}
-
 func TestPreferenceGraceUsesTCPWithoutPoisoningUDPAndLatePoolRecovers(t *testing.T) {
 	client := &Client{
 		cfg: ClientConfig{
-			RemoteAddr: "egress.example:443", Transport: TransportAuto, EnableQUICPool: true,
-			FallbackDelay: time.Millisecond, FallbackGrace: 20 * time.Millisecond,
+			RemoteAddr: "egress.example:443", Transport: TransportAuto, FallbackDelay: time.Millisecond, FallbackGrace: 20 * time.Millisecond,
 			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		},
 		udpHealth: newUDPHealth(1, time.Minute), metrics: metrics.New(),
@@ -567,8 +385,7 @@ func TestPreferenceGraceUsesTCPWithoutPoisoningUDPAndLatePoolRecovers(t *testing
 func TestLatePooledQUICFailureIsRecordedOnlyWhenItBecomesExplicit(t *testing.T) {
 	client := &Client{
 		cfg: ClientConfig{
-			RemoteAddr: "egress.example:443", Transport: TransportAuto, EnableQUICPool: true,
-			FallbackDelay: time.Millisecond, FallbackGrace: 20 * time.Millisecond,
+			RemoteAddr: "egress.example:443", Transport: TransportAuto, FallbackDelay: time.Millisecond, FallbackGrace: 20 * time.Millisecond,
 			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		},
 		udpHealth: newUDPHealth(1, time.Minute), metrics: metrics.New(),
@@ -602,43 +419,11 @@ func TestLatePooledQUICFailureIsRecordedOnlyWhenItBecomesExplicit(t *testing.T) 
 	}
 }
 
-func TestColdFlowReportsBothEndpointTransportsFailing(t *testing.T) {
-	var logs bytes.Buffer
-	client := &Client{
-		cfg: ClientConfig{
-			RemoteAddr: "egress.example:443", Transport: TransportAuto, FallbackDelay: time.Second,
-			Logger: slog.New(slog.NewTextHandler(&logs, nil)),
-		},
-		udpHealth: newUDPHealth(1, time.Minute), metrics: metrics.New(),
-	}
-	client.dialPipelinedFlowForTest = func(_ context.Context, kind TransportKind, _ []byte) (*openedFlow, error) {
-		return nil, fmt.Errorf("%s path unavailable", kind)
-	}
-
-	if _, err := client.openInitialFlow(context.Background(), "example.test:443"); err == nil {
-		t.Fatal("a cold flow with neither transport was reported as successful")
-	}
-	got := client.metrics.Snapshot()
-	if got.EndpointTransportRaceFailures != 1 || got.UDPPathUnavailable != 0 {
-		t.Fatalf("unexpected endpoint transport metrics: %+v", got)
-	}
-	for _, want := range []string{
-		"configured endpoint failed on both transports",
-		"endpoint=egress.example:443",
-		"quic_error",
-		"tcp_error",
-	} {
-		if !strings.Contains(logs.String(), want) {
-			t.Fatalf("dual-transport failure log is missing %q: %s", want, logs.String())
-		}
-	}
-}
-
 func TestPooledFlowReportsBothEndpointTransportsFailing(t *testing.T) {
 	var logs bytes.Buffer
 	client := &Client{
 		cfg: ClientConfig{
-			RemoteAddr: "127.0.0.1:not-a-port", Transport: TransportAuto, EnableQUICPool: true, FallbackDelay: time.Second,
+			RemoteAddr: "127.0.0.1:not-a-port", Transport: TransportAuto, FallbackDelay: time.Second,
 			Logger: slog.New(slog.NewTextHandler(&logs, nil)),
 		},
 		udpHealth: newUDPHealth(1, time.Minute), metrics: metrics.New(),
@@ -835,7 +620,7 @@ func TestAShortFlowCostsARoundTrip(t *testing.T) {
 	// timing test explicitly so scheduler speed under -race cannot decide how
 	// many of its measured flows run before the asynchronous prewarm finishes.
 	loopback := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
-	pathmodel.Shared(pathKey(loopback, loopback)).Report(99, pathmodel.Observation{Erasure: path.LossRate, BurstFactor: 1, ObservedSamples: 5000, Delivered: 0, RoundTrip: 0})
+	pathmodel.Shared(pathKey(loopback, loopback)).Report(99, pathmodel.Observation{Erasure: path.LossRate, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
 	// Warm the shared transport independently of the path measurement.
 	warm := dialWithRetries(t, socks, destination, 3)
 	request := make([]byte, 16)

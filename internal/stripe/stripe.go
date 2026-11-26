@@ -88,14 +88,8 @@ type Config struct {
 	LaneWindow int
 	// MaxOutstanding bounds chunks held across all lanes.
 	MaxOutstanding int
-	// Retention, when set, reports the current bound instead. It is consulted
-	// rather than fixed because what a flow must retain is a property of the
-	// path: the lanes' combined congestion windows, plus what the peer has not
-	// yet acknowledged. A constant either starves a fast path or lets a slow
-	// one hold memory it will never use.
-	Retention func() int
 	// MaxOutstandingBytes bounds the same set by size, and is the ceiling on
-	// Retention. Counting chunks cannot bound memory when a chunk is whatever one
+	// the Autotune bound. Counting chunks cannot bound memory when a chunk is whatever one
 	// read returned: 2048 chunks is 64 MiB if they are full and a fraction of
 	// that if they are not, so a count generous enough to keep a fast path busy
 	// is also generous enough to let a flow retain tens of megabytes. Measured
@@ -122,8 +116,9 @@ type Config struct {
 	// small: with 1,024 sessions, 1 KiB is 1 MiB in the worst case. Zero
 	// selects DefaultStagingBytes, capped at ChunkSize.
 	StagingBytes int
-	// Autotune, when set, replaces Retention with the flow-layer bound of the
-	// owned-memory bundle; see Autotune.
+	// Autotune, when set, bounds retention by the flow-layer bound of owned
+	// memory (design §8.3); see Autotune. Without it the bound is
+	// MaxOutstandingBytes.
 	Autotune *Autotune
 	// RetransmitAfter is asked how long a chunk may be outstanding before it is
 	// presumed lost and offered again. Re-issuing duplicates bytes the receiver
@@ -173,11 +168,6 @@ type Config struct {
 	// source cannot do leaves the staging read standing as full. It is
 	// called from the producer without the scheduler's lock.
 	ReadDone func(full bool)
-	// ForceReliable pins selected byte ranges to a reliable carrier even when
-	// the lane normally uses datagrams. The decision is snapshotted at dispatch
-	// just like Reliable, so an in-flight recovery cannot change substrates
-	// when the policy later clears. Nil leaves the lane's decision unchanged.
-	ForceReliable func(offset uint64) bool
 	// CodedRetry selects the coded-retry bundle (design §8.1, §14 stage 4):
 	//
 	//   - an attempt the lane carries unreliably has no recovery deadline
@@ -190,7 +180,7 @@ type Config struct {
 	//     been registered, so an attempt still queued below is never copied.
 	//
 	// Together these give each chunk one repair owner at a time: the code
-	// until its deadline, then the stream. ForceReliable still applies.
+	// until its deadline, then the stream.
 	CodedRetry bool
 	// GapReissued, when set, is told of every chunk receiver gap evidence
 	// returned to the ready set: by ReissueUnacknowledgedBelow, or, under
@@ -737,14 +727,7 @@ func (s *Scheduler) readAheadLimit() int {
 	if s.cfg.Autotune != nil {
 		return s.tune.bound
 	}
-	if s.cfg.Retention == nil {
-		return s.cfg.MaxOutstandingBytes
-	}
-	want := s.cfg.Retention()
-	if want <= 0 || want > s.cfg.MaxOutstandingBytes {
-		return s.cfg.MaxOutstandingBytes
-	}
-	return want
+	return s.cfg.MaxOutstandingBytes
 }
 
 // retainedBytes is what the flow is holding: chunks read but not yet
@@ -1035,9 +1018,6 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		}
 		id := s.nextAttempt
 		reliable := s.laneRetransmitsChunk(laneID, chunk)
-		if s.cfg.ForceReliable != nil && s.cfg.ForceReliable(chunk.Offset) {
-			reliable = true
-		}
 		if s.cfg.CodedRetry && exists {
 			// The sticky reliable bit: a chunk dispatched before had its
 			// one coded attempt, and every later one is on the stream.

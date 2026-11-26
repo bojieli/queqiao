@@ -170,32 +170,6 @@ func (g *controlQUICGeneration) releaseBorrow() {
 	}
 }
 
-// Bulk entries are exclusively reserved before validation. A failed check can
-// retire that entry without closing any control-pool sibling. No background
-// keepalive is introduced: idle entries are checked only when borrowed again.
-func (c *Client) verifyBulkPath(ctx context.Context, entry *bulkConn) error {
-	c.bulkMu.Lock()
-	fresh := time.Since(entry.verified) < pooledPathProofMaxAge
-	c.bulkMu.Unlock()
-	if fresh {
-		return nil
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, c.cfg.HandshakeTimeout)
-	defer cancel()
-	var err error
-	if c.probeBulkConnectionForTest != nil {
-		err = c.probeBulkConnectionForTest(probeCtx, entry, c.cfg.HandshakeTimeout)
-	} else {
-		err = probePooledQUIC(probeCtx, entry.conn, c.cfg.HandshakeTimeout, nil)
-	}
-	if err == nil {
-		c.bulkMu.Lock()
-		entry.verified = time.Now()
-		c.bulkMu.Unlock()
-	}
-	return err
-}
-
 func (g *controlQUICGeneration) highErasure() bool {
 	if g == nil || g.lossPath == nil {
 		return false
@@ -254,7 +228,7 @@ func (s *controlPoolStreamConn) trackOpen(deadline time.Time, size int) bool {
 	// borrow owns exactly one OPEN and, on a lossy route, its drain deadline.
 	s.owner.quicMu.Lock()
 	defer s.owner.quicMu.Unlock()
-	if s.owner.quicGeneration != g || g.conn.Context().Err() != nil || g.liveness.silent(time.Now()) {
+	if s.owner.quicGeneration != g || g.conn.Context().Err() != nil {
 		return false
 	}
 	if m := s.owner.carriers; m != nil && (!m.accepting(g) || m.openGated(g)) {
@@ -287,6 +261,8 @@ func (s *controlPoolStreamConn) finishOpen() {
 	}
 }
 
+// awaitingOpen reports whether an OPEN on this generation still waits for
+// its acknowledgement.
 func (g *controlQUICGeneration) awaitingOpen(now time.Time) bool {
 	g.probeMu.Lock()
 	defer g.probeMu.Unlock()

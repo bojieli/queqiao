@@ -3,8 +3,6 @@ package pep
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -12,8 +10,7 @@ import (
 	"github.com/bojieli/queqiao/internal/identity"
 )
 
-// GatewayAdmission selects what a gateway's session limit counts (design
-// §10.5, stage 5 of the path-authority migration).
+// Gateway admission (design §10.5).
 //
 // A gateway used to take one slot of its session semaphore for every stream,
 // before reading the stream's first frame, and to hold it for the stream's
@@ -21,66 +18,39 @@ import (
 // gateway whose slots were all held by established flows refused the PROBE
 // and the JOINs that would have let those very flows recover (issue #170).
 //
-// Two modes exist:
-//
-//   - legacy (the default) keeps that charge for every stream that finds a
-//     free slot. Only a stream that finds none behaves differently: its first
-//     frame is read under a small per-connection bound, and a JOIN or PROBE
-//     for an existing binding is admitted without a slot; anything else is
-//     closed as before. Below saturation nothing changes.
-//   - owned charges the session limit to logical flows at OPEN, on the QUIC
-//     and the TLS/TCP entry points alike. Every stream's first frame is parsed
-//     under a per-connection bound, a JOIN is charged to the flow it joins
-//     (its lane ceiling), a PROBE to a per-connection allowance, and a refused
-//     OPEN is answered with FLOW_LIMIT. A UDP association whose replacement
-//     names its live relay hands the relay, its session slot and its account
-//     slot to the replacement (§11.2).
-//
-// Both modes admit one standby connection beside a principal's existing data
-// connections when the connection bound is full.
-type GatewayAdmission string
-
-const (
-	GatewayAdmissionLegacy GatewayAdmission = "legacy"
-	GatewayAdmissionOwned  GatewayAdmission = "owned"
-)
-
-// ParseGatewayAdmission accepts the names a configuration may use. The empty
-// string is the default, legacy.
-func ParseGatewayAdmission(value string) (GatewayAdmission, error) {
-	switch GatewayAdmission(strings.ToLower(strings.TrimSpace(value))) {
-	case "", GatewayAdmissionLegacy:
-		return GatewayAdmissionLegacy, nil
-	case GatewayAdmissionOwned:
-		return GatewayAdmissionOwned, nil
-	}
-	return "", fmt.Errorf("unsupported gateway admission %q (want %s or %s)", value, GatewayAdmissionLegacy, GatewayAdmissionOwned)
-}
+// The session limit is now charged to logical flows at OPEN, on the QUIC and
+// the TLS/TCP entry points alike. Every stream's first frame is parsed under
+// a per-connection bound, a JOIN is charged to the flow it joins (its lane
+// ceiling), a PROBE to a per-connection allowance, and a refused OPEN is
+// answered with FLOW_LIMIT. A UDP association whose replacement names its
+// live relay hands the relay, its session slot and its account slot to the
+// replacement (§11.2). One standby connection is admitted beside a
+// principal's existing data connections when the connection bound is full.
 
 const (
 	// firstFrameStreams bounds, per QUIC connection, the streams whose first
 	// frame is being read or whose JOIN is being admitted. It is not a limit
-	// on flows: an OPEN leaves it as soon as its frame is read. In owned mode
-	// the accept loop waits for room, so a peer that stalls its own first
-	// frames delays only its own connection; in legacy mode it bounds the
-	// streams read past a full session limit.
+	// on flows: an OPEN leaves it as soon as its frame is read. The accept
+	// loop waits for room, so a peer that stalls its own first frames delays
+	// only its own connection.
 	firstFrameStreams = 32
 	// probeStreams is the per-connection allowance for path PROBEs that do
 	// not hold a session slot. A client verifies one connection with one
 	// probe at a time; the margin covers a probe overlapping its retry. The
 	// work of each is fixed by PROTOCOL.md §14.
 	probeStreams = 4
-	// recoveryReads bounds, gateway-wide in legacy mode, the streams (QUIC)
-	// and connections (TLS/TCP) read past a full session limit so that a JOIN
-	// or PROBE on them can be found. Each is bounded by the handshake
-	// deadline until it is admitted. In owned mode the gateway-wide bounds
-	// are MaxSessions (at least this), the bound every stream used to be
-	// read under.
+	// recoveryReads is the floor of the gateway-wide bounds on streams
+	// (QUIC) and connections (TLS/TCP) whose first frame is being read: they
+	// are MaxSessions, but at least this, so a gateway configured with very
+	// few sessions can still read the JOINs and PROBEs that recover them.
 	recoveryReads = 64
 )
 
+// admissionOwned is true outside tests: only the emulation of a released
+// gateway (ServerConfig.testReleasedAdmission) charges every stream a slot
+// before reading it, as gateways before v0.15 did.
 func (s *Server) admissionOwned() bool {
-	return s.cfg.GatewayAdmission == GatewayAdmissionOwned
+	return !s.cfg.testReleasedAdmission
 }
 
 // streamAdmission says what a stream was charged before its first frame was
@@ -89,9 +59,6 @@ type streamAdmission struct {
 	// charged: the stream already holds a session slot, taken before its
 	// first frame (legacy). Its caller releases it.
 	charged bool
-	// recoveryOnly: the stream found no session slot (legacy). Only a JOIN
-	// or a PROBE may proceed; anything else is closed, as it always was.
-	recoveryOnly bool
 	// release frees the bound the first frame was read under. It is called
 	// once the stream has been admitted or refused, and may be nil.
 	release func()

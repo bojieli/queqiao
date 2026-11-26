@@ -2,90 +2,12 @@ package pep
 
 import (
 	"context"
-	"errors"
 	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/bojieli/queqiao/internal/metrics"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
-
-// A TCP JOIN retires QUIC on the server before returning to the client. Even
-// a delayed QUIC success must exclude that irreversible side effect entirely.
-func TestRecoveryQUICWinnerExcludesTCPHandoff(t *testing.T) {
-	client := &Client{cfg: ClientConfig{Transport: TransportAuto, FallbackGrace: time.Second}, metrics: metrics.New()}
-	flow := newGraceTestFlow(t)
-	server := &serverFlow{flow: newGraceTestFlow(t), maxLanes: 2, tcpMaxLanes: 1}
-	quic, _ := rescueTestLane(t, 1)
-	tcp, _ := rescueTestLane(t, 2)
-	tcp.kind = TransportTCP
-	var committed atomic.Bool
-	lane, err := client.raceRescueWithFallback(context.Background(), flow, []rescueAttempt{
-		func(ctx context.Context) (*mpLane, error) {
-			if err := server.addLane(quic); err != nil {
-				return nil, err
-			}
-			time.Sleep(20 * time.Millisecond) // delayed JOIN acknowledgement
-			return quic, nil
-		},
-		func(ctx context.Context) (*mpLane, error) { <-ctx.Done(); return nil, ctx.Err() },
-	}, func(ctx context.Context) (*mpLane, error) {
-		committed.Store(true)
-		return tcp, server.addLane(tcp)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lane != quic || committed.Load() || quic.closed.Load() || server.tcpMode {
-		t.Fatal("TCP handoff invalidated the QUIC race winner")
-	}
-}
-
-func TestRecoveryTCPFollowsFailedQUICPhase(t *testing.T) {
-	for _, mode := range []string{"failed", "deadline", "peer-tcp", "capacity", "permanent", "cancelled", "quic-only"} {
-		t.Run(mode, func(t *testing.T) {
-			client := &Client{cfg: ClientConfig{Transport: TransportAuto, FallbackGrace: 20 * time.Millisecond}, metrics: metrics.New()}
-			flow := newGraceTestFlow(t)
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			if mode == "quic-only" {
-				client.cfg.Transport = TransportQUIC
-			}
-			if mode == "cancelled" {
-				cancel()
-			}
-			tcp, _ := rescueTestLane(t, 2)
-			tcp.kind = TransportTCP
-			var tcpCalls atomic.Int32
-			attempt := func(ctx context.Context) (*mpLane, error) {
-				switch mode {
-				case "deadline", "cancelled":
-					<-ctx.Done()
-					return nil, ctx.Err()
-				case "peer-tcp":
-					return nil, errLaneJoinTCPMode
-				case "capacity":
-					return nil, errLaneJoinCapacity
-				case "permanent":
-					return nil, errLaneJoinRejected
-				default:
-					return nil, errors.New("QUIC unavailable")
-				}
-			}
-			lane, err := client.raceRescueWithFallback(ctx, flow, []rescueAttempt{attempt, attempt}, func(ctx context.Context) (*mpLane, error) { tcpCalls.Add(1); return tcp, nil })
-			wantTCP := mode == "failed" || mode == "deadline" || mode == "peer-tcp" || mode == "capacity"
-			if wantTCP {
-				if err != nil || lane != tcp || tcpCalls.Load() != 1 {
-					t.Fatalf("lane=%v error=%v TCP calls=%d", lane, err, tcpCalls.Load())
-				}
-			} else if err == nil || tcpCalls.Load() != 0 {
-				t.Fatalf("unexpected fallback: error=%v TCP calls=%d", err, tcpCalls.Load())
-			}
-		})
-	}
-}
 
 // A peer can stop during either half of JOIN. Cancellation must release the
 // stream promptly instead of waiting for the independent handshake timeout.

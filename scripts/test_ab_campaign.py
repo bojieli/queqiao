@@ -76,8 +76,8 @@ class DryRun(unittest.TestCase):
         self.assertIn("main: bulk x4 via path-a/cand", text)
         self.assertIn("stop every process this campaign started", text)
         self.assertIn("blocks 2-12 repeat", text)
-        # The runner owns these; the arm's bundle is appended after them.
-        self.assertIn("--cc-api=v2 --sched=class --congestion-scope=path", text)
+        # The runner owns these; the arm's flags are appended after them.
+        self.assertIn("--carrier-shadow", text)
         self.assertNotIn("CAMPAIGN-DONE", text)
 
     def test_probe_stops_when_the_load_finishes(self):
@@ -259,7 +259,7 @@ class Config(unittest.TestCase):
         self.assertNotEqual(camp.binary(cand, "linux/amd64", "gateway"), camp.binary(main, "linux/amd64", "gateway"))
 
     def test_dc_profile_cannot_be_overridden(self):
-        text = DC_EXAMPLE.read_text().replace("flags = --cc-api=v2 --sched=class", "flags = --path-profile=wan-shared-bottleneck --cc-api=v2 --sched=class")
+        text = DC_EXAMPLE.read_text().replace("flags = --carrier-shadow", "flags = --path-profile=wan-shared-bottleneck --carrier-shadow")
         self.assertRejected(text, "workload dc sets --path-profile on both ends")
 
     def test_prebuilt_binaries_must_cover_every_platform(self):

@@ -1273,11 +1273,6 @@ func (p *Path) rate() float64 {
 		}
 		return float64(p.symbolBytes()) * 64 / p.roundTrip().Seconds()
 	}
-	if p.cfg.Path != nil {
-		if share := p.cfg.Path.Current().Share; share > 0 {
-			return share
-		}
-	}
 	return float64(p.symbolBytes()) * 64 / p.roundTrip().Seconds()
 }
 

@@ -13,12 +13,9 @@ import (
 	"time"
 
 	"github.com/apernet/quic-go"
-	"github.com/bojieli/queqiao/internal/coded"
 	"github.com/bojieli/queqiao/internal/identity"
 	"github.com/bojieli/queqiao/internal/metrics"
-	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/protocol"
-	"github.com/bojieli/queqiao/internal/stripe"
 )
 
 // shadowTrace drives a carrierMachine through synthetic progress samples.
@@ -317,105 +314,6 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
-// The coded tail of TestCodedSendStallRecoversOnExistingStream, observed: a
-// datagram tail is lost on a carrier QUIC keeps acknowledging. The watchdog
-// stalls and today's recovery escapes the bytes to the stream; the observer
-// labels the carrier live, records that the transport was acknowledged during
-// the stall, and says the design would move the coded bytes to the stream and
-// wait -- not replace the carrier. Everything the original test asserts about
-// today's recovery still holds with the observer on.
-func TestCarrierShadowLabelsCodedTailStallALiveCarrier(t *testing.T) {
-	registry := metrics.New()
-	var logs lockedBuffer
-	shadowCfg := CarrierShadowConfig{Enabled: true, Interval: time.Millisecond}
-	if err := shadowCfg.resolve(); err != nil {
-		t.Fatal(err)
-	}
-	flow := newStallTestFlow(t, registry)
-	flow.carrierShadow = newCarrierShadow(shadowCfg, carrierShadowClient, slog.New(slog.NewJSONHandler(&logs, nil)), registry)
-	flow.stallGrace = 10 * time.Millisecond
-	flow.stallScan = time.Millisecond
-	model := pathmodel.NewPathModel()
-	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000, Delivered: 2e6})
-	path := coded.New(newPipeCarrier(), coded.Config{Path: model})
-	defer path.Close()
-	capture := newAckCaptureConn(0, nil)
-	defer capture.Close()
-	carrier := &fakeCarrier{}
-	fc := newSplitFrameConn(&shadowCaptureConn{ackCaptureConn: capture, fakeCarrier: carrier}, path)
-	fc.setCodingPolicy(flow.prefersCodingOverRetransmission)
-	lane := &mpLane{id: 0, kind: TransportQUIC, fc: fc, writeQ: make(chan laneFrame, 2), writeDone: make(chan struct{})}
-	lane.ready.Store(true)
-	flow.lanes[0] = lane
-	flow.carrierShadow.bindLane(flow, lane)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	now := time.Now()
-	sched := stripe.New(bytes.NewReader([]byte("response")), stripe.Config{
-		Reliable:        func(uint64) bool { return !fc.codesData() },
-		ForceReliable:   flow.recoverChunkReliably,
-		RetransmitAfter: func() time.Duration { return time.Millisecond }, Now: func() time.Time { return now },
-	})
-	defer sched.Close()
-	flow.scheduler.Store(sched)
-	first, err := sched.Next(ctx, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.Reliable {
-		t.Fatal("fixture must begin on coded datagrams")
-	}
-	if err = flow.sendChunk(ctx, lane, first, true); err != nil {
-		t.Fatal(err)
-	}
-	sent := <-lane.writeQ
-	sent.onWritten(false)
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() { flow.stallWatchdog(stop); close(done) }()
-	defer func() { close(stop); <-done }()
-	select {
-	case <-flow.stallSignals():
-	case <-ctx.Done():
-		t.Fatal("no stall detected")
-	}
-	// Today's recovery is unchanged: the stalled bytes escape to the stream.
-	now = now.Add(time.Second)
-	if sched.ReissueExpired() != 1 {
-		t.Fatal("lost response was not reissued")
-	}
-	retry, err := sched.Next(ctx, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !retry.Reliable {
-		t.Fatal("stalled response keeps retrying unreliable datagrams; no stream escape")
-	}
-	if !lane.suspected.Load() {
-		t.Fatal("today's watchdog no longer demotes the lane")
-	}
-
-	got := registry.Snapshot().CarrierShadow
-	if got.Stalls[metrics.CarrierShadowWaitMoveCoded] != 1 || got.StallsTransportAcked != 1 {
-		t.Fatalf("shadow stalls = %+v, want one wait_move_coded with the transport acknowledged", got)
-	}
-	if got.Stalls[metrics.CarrierShadowReplaceCarrier] != 0 || got.Transitions[metrics.CarrierShadowSuspect] != 0 {
-		t.Fatalf("a live carrier was suspected: %+v", got)
-	}
-	if request := findLogRecord(t, logs.String(), "carrier shadow rescue requested"); request["flow_id"] != float64(7) {
-		t.Fatalf("rescue request record = %v", request)
-	}
-	record := findLogRecord(t, logs.String(), "carrier shadow stall")
-	for key, want := range map[string]any{
-		"carrier_state": "active", "transport_acked": true, "design_remedy": "wait_move_coded",
-		"legacy_remedy": "demote_and_request_rescue", "escape_coded": true, "flow_id": float64(7),
-	} {
-		if record[key] != want {
-			t.Fatalf("stall record %s = %v, want %v; record %v", key, record[key], want, record)
-		}
-	}
-}
-
 // The same watchdog stall on a carrier that has stopped being acknowledged
 // is carrier evidence: the design would replace the carrier.
 func TestCarrierShadowLabelsStallOnSilentCarrierForReplacement(t *testing.T) {
@@ -441,7 +339,7 @@ func TestCarrierShadowLabelsStallOnSilentCarrierForReplacement(t *testing.T) {
 		t.Fatalf("shadow stalls = %+v, want one replace_carrier without transport progress", got)
 	}
 	record := findLogRecord(t, logs.String(), "carrier shadow stall")
-	if record["carrier_state"] != "replace" || record["legacy_remedy"] != "demote_and_request_rescue" || record["endpoint"] != "client" {
+	if record["carrier_state"] != "replace" || record["legacy_remedy"] != "none" || record["endpoint"] != "client" {
 		t.Fatalf("stall record = %v", record)
 	}
 	// A lane failure on the silent carrier is carrier evidence too; once the

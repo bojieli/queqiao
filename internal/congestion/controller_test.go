@@ -20,49 +20,6 @@ func (f *fakeRTT) UpdateRTT(time.Duration, time.Duration) {}
 func (f *fakeRTT) SetMaxAckDelay(time.Duration)           {}
 func (f *fakeRTT) SetInitialRTT(rtt time.Duration)        { f.smoothed = rtt }
 
-func TestAdaptiveSenderGrowsOnCleanDeliveryAndBacksOffOnLoss(t *testing.T) {
-	sender := NewAdaptiveSender(1200, 64*1024, 8*1024*1024)
-	sender.SetRTTStatsProvider(&fakeRTT{smoothed: 200 * time.Millisecond})
-	initialRate := sender.rateBps
-	start := monotime.Now()
-
-	sender.OnCongestionEventEx(0, start, []quiccongestion.AckedPacketInfo{{BytesAcked: 32 * 1024}}, nil)
-	sender.OnCongestionEventEx(0, start.Add(100*time.Millisecond), []quiccongestion.AckedPacketInfo{{BytesAcked: 64 * 1024}}, nil)
-	if sender.rateBps <= initialRate {
-		t.Fatalf("clean delivery did not grow rate: initial=%v current=%v", initialRate, sender.rateBps)
-	}
-	if sender.GetCongestionWindow() < 4*1200 {
-		t.Fatalf("congestion window below safety floor: %d", sender.GetCongestionWindow())
-	}
-
-	beforeLoss := sender.rateBps
-	sender.OnCongestionEventEx(128*1024, start.Add(200*time.Millisecond), nil, []quiccongestion.LostPacketInfo{{BytesLost: 1200}})
-	if sender.rateBps >= beforeLoss {
-		t.Fatalf("loss did not reduce rate: before=%v after=%v", beforeLoss, sender.rateBps)
-	}
-	if sender.rateBps < sender.minRateBps {
-		t.Fatalf("loss reduced rate below configured floor: %v", sender.rateBps)
-	}
-}
-
-func TestAdaptiveSenderHonorsBounds(t *testing.T) {
-	sender := NewAdaptiveSender(1200, 100_000, 200_000)
-	sender.SetRTTStatsProvider(&fakeRTT{smoothed: 100 * time.Millisecond})
-	start := monotime.Now()
-	for i := 0; i < 20; i++ {
-		sender.OnCongestionEventEx(0, start.Add(time.Duration(i)*100*time.Millisecond), []quiccongestion.AckedPacketInfo{{BytesAcked: 256 * 1024}}, nil)
-	}
-	if sender.rateBps > 200_000 {
-		t.Fatalf("rate exceeded maximum: %v", sender.rateBps)
-	}
-	for i := 0; i < 20; i++ {
-		sender.OnCongestionEventEx(0, start.Add(time.Duration(20+i)*100*time.Millisecond), nil, []quiccongestion.LostPacketInfo{{BytesLost: 1200}})
-	}
-	if sender.rateBps < 100_000 {
-		t.Fatalf("rate fell below minimum: %v", sender.rateBps)
-	}
-}
-
 func TestBrutalSenderCompensatesForModerateLoss(t *testing.T) {
 	sender := NewBrutalSender(1_000_000, false)
 	sender.SetRTTStatsProvider(&fakeRTT{smoothed: 200 * time.Millisecond})
@@ -211,13 +168,11 @@ func TestBBRSenderBoundsPacketSamplerState(t *testing.T) {
 }
 
 func TestRateControllersDoNotSendAtWindowBoundary(t *testing.T) {
-	adaptive := NewAdaptiveSender(1200, 64*1024, 1*1024*1024)
 	brutal := NewBrutalSender(1*1024*1024, false)
 	bbr := NewBBRSender(1200)
 	for name, sender := range map[string]quiccongestion.CongestionControl{
-		"adaptive": adaptive,
-		"brutal":   brutal,
-		"bbr":      bbr,
+		"brutal": brutal,
+		"bbr":    bbr,
 	} {
 		window := sender.GetCongestionWindow()
 		if sender.CanSend(window) {

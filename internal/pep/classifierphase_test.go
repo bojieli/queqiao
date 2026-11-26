@@ -31,13 +31,13 @@ type phaseHarness struct {
 	now time.Time
 }
 
-func newPhaseHarness(t *testing.T, mode ClassifierMode) *phaseHarness {
+func newPhaseHarness(t *testing.T) *phaseHarness {
 	t.Helper()
 	inner, peer := net.Pipe()
 	t.Cleanup(func() { inner.Close(); peer.Close() })
 	f := newMultipathFlow(context.Background(), inner, [16]byte{1}, 1, 64*1024,
 		protocol.FlagAckDown, protocol.FlagAckUp, nil, nil, nil)
-	f.classifier = classifier.New(phasedClassifierConfig(profile.Default().Classifier, mode))
+	f.classifier = classifier.New(profile.Default().Classifier)
 	h := &phaseHarness{t: t, f: f, now: f.started}
 	f.clock = func() time.Time { return h.now }
 	return h
@@ -63,11 +63,7 @@ func (h *phaseHarness) write(n int, queueEmpty bool) (protocol.Class, bool) {
 	class := f.sendClass(sparse)
 	var coded bool
 	f.lastClassified.Store(0)
-	if f.phased() {
-		coded = f.frameCoding(class)
-	} else {
-		coded = f.prefersCodingOverRetransmission()
-	}
+	coded = f.frameCoding(class)
 	f.noteDataBytes(class, coded, n)
 	return class, coded
 }
@@ -133,9 +129,9 @@ func (h *phaseHarness) burst() {
 // once by the sparse-write rule, and the flow's current class within the exit
 // window. The sticky class is unchanged, so the flow keeps its lane.
 func TestKeystrokesAfterABurstAreInteractiveAgain(t *testing.T) {
-	for _, mode := range []ClassifierMode{ClassifierLegacy, ClassifierPhased} {
-		t.Run(string(mode), func(t *testing.T) {
-			h := newPhaseHarness(t, mode)
+	{
+		t.Run("phased", func(t *testing.T) {
+			h := newPhaseHarness(t)
 			if bulk, uncoded := h.keystrokes(10 * time.Second); bulk+uncoded != 0 {
 				t.Fatalf("phase A: %d echoes bulk, %d uncoded before any burst", bulk, uncoded)
 			}
@@ -146,13 +142,6 @@ func TestKeystrokesAfterABurstAreInteractiveAgain(t *testing.T) {
 			bulk, uncoded := h.keystrokes(4 * time.Second)
 			exitedWithin := h.current() != classifier.ClassBulk
 			laterBulk, laterUncoded := h.keystrokes(10 * time.Second)
-			if mode == ClassifierLegacy {
-				// The defect this bundle exists for, reproduced: main's behaviour.
-				if laterBulk == 0 || laterUncoded == 0 || h.current() != classifier.ClassBulk {
-					t.Fatalf("legacy no longer latches (bulk %d uncoded %d class %v); update this test", laterBulk, laterUncoded, h.current())
-				}
-				return
-			}
 			if bulk+uncoded+laterBulk+laterUncoded != 0 {
 				t.Fatalf("phase C echoes: %d bulk and %d uncoded in the first 4 s, %d and %d after", bulk, uncoded, laterBulk, laterUncoded)
 			}
@@ -172,9 +161,9 @@ func TestKeystrokesAfterABurstAreInteractiveAgain(t *testing.T) {
 // counted by the per-flow class telemetry the harness reads, and every delta
 // is coded.
 func TestLLMDeltasOnAReusedConnectionAreInteractive(t *testing.T) {
-	for _, mode := range []ClassifierMode{ClassifierLegacy, ClassifierPhased} {
-		t.Run(string(mode), func(t *testing.T) {
-			h := newPhaseHarness(t, mode)
+	{
+		t.Run("phased", func(t *testing.T) {
+			h := newPhaseHarness(t)
 			uncoded := 0
 			for turn := 0; turn < 5; turn++ {
 				for got, want := 0, 100_000+turn*8_000; got < want; got += 16 << 10 {
@@ -192,12 +181,6 @@ func TestLLMDeltasOnAReusedConnectionAreInteractive(t *testing.T) {
 				h.advance(2 * time.Second)
 			}
 			fraction := h.interactiveFraction()
-			if mode == ClassifierLegacy {
-				if fraction >= 0.99 {
-					t.Fatalf("legacy sent %.3f of deltas interactive; the latch no longer reproduces", fraction)
-				}
-				return
-			}
 			if fraction < 0.99 {
 				t.Fatalf("%.3f of delta bytes interactive, want at least 0.99", fraction)
 			}
@@ -212,9 +195,9 @@ func TestLLMDeltasOnAReusedConnectionAreInteractive(t *testing.T) {
 // push every 30 s with the client's 60-byte acknowledgement. Every push is
 // INTERACTIVE and coded.
 func TestPushesAfterAPhotoAreInteractive(t *testing.T) {
-	for _, mode := range []ClassifierMode{ClassifierLegacy, ClassifierPhased} {
-		t.Run(string(mode), func(t *testing.T) {
-			h := newPhaseHarness(t, mode)
+	{
+		t.Run("phased", func(t *testing.T) {
+			h := newPhaseHarness(t)
 			h.recv(400)
 			h.write(2_000, true) // login
 			h.advance(3 * time.Second)
@@ -241,12 +224,6 @@ func TestPushesAfterAPhotoAreInteractive(t *testing.T) {
 				h.recv(60)
 				h.ack()
 			}
-			if mode == ClassifierLegacy {
-				if bad != 10 {
-					t.Fatalf("legacy sent %d of 10 pushes as bulk or uncoded; the latch no longer reproduces", bad)
-				}
-				return
-			}
 			if bad != 0 {
 				t.Fatalf("%d of 10 pushes after the photo were bulk or uncoded", bad)
 			}
@@ -255,16 +232,15 @@ func TestPushesAfterAPhotoAreInteractive(t *testing.T) {
 }
 
 // W1: a backlogged download stays BULK and uncoded from the moment it is
-// classified to the end -- through a source stall and a slow tail -- and every
-// write gets exactly the class and coding the legacy bundle gives it, so the
-// phased bundle cannot cost a bulk flow throughput.
+// classified to the end -- through a source stall and a slow tail -- so the
+// phased classifier cannot cost a bulk flow throughput.
 func TestABackloggedDownloadStaysBulkThroughout(t *testing.T) {
 	type decision struct {
 		class protocol.Class
 		coded bool
 	}
-	run := func(mode ClassifierMode) ([]decision, *phaseHarness) {
-		h := newPhaseHarness(t, mode)
+	run := func() ([]decision, *phaseHarness) {
+		h := newPhaseHarness(t)
 		var out []decision
 		write := func() {
 			class, coded := h.write(16<<10, false)
@@ -296,13 +272,9 @@ func TestABackloggedDownloadStaysBulkThroughout(t *testing.T) {
 		}
 		return out, h
 	}
-	legacy, _ := run(ClassifierLegacy)
-	phased, h := run(ClassifierPhased)
+	phased, h := run()
 	bulkFrom := -1
 	for i := range phased {
-		if phased[i] != legacy[i] {
-			t.Fatalf("write %d: phased %+v, legacy %+v", i, phased[i], legacy[i])
-		}
 		if bulkFrom < 0 && phased[i].class == protocol.ClassBulk {
 			bulkFrom = i
 		}
@@ -342,12 +314,12 @@ func TestRecentWindowAgesAcrossIdle(t *testing.T) {
 		t.Fatalf("3 s after a burst the window holds %d, want 0", up)
 	}
 
-	// Through observe, on the default (legacy) bundle: 116 KB of exchange,
+	// Through observe: 116 KB of exchange,
 	// 10 s of silence, then a 16 KB response that takes the total over the
 	// 128 KiB floor. The flow is old and over the floor, so only a stale
 	// window -- one still holding the exchange from before the gap -- would
 	// call it a transfer. This is the 120-128 KiB knife edge of F1/F3.
-	h := newPhaseHarness(t, ClassifierLegacy)
+	h := newPhaseHarness(t)
 	h.advance(2 * time.Second)
 	for i := 0; i < 6; i++ {
 		h.recv(16_000)
@@ -365,7 +337,7 @@ func TestRecentWindowAgesAcrossIdle(t *testing.T) {
 
 // The sparse allowance bounds how much a flow can send through the rule.
 func TestSparseAllowanceIsBounded(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	admitted := 0
 	for i := 0; i < 1000; i++ {
 		if h.f.admitSparse(1400) {
@@ -379,37 +351,6 @@ func TestSparseAllowanceIsBounded(t *testing.T) {
 	if !h.f.admitSparse(1400) {
 		t.Fatal("the allowance did not refill after the window passed")
 	}
-	legacy := newPhaseHarness(t, ClassifierLegacy)
-	if legacy.f.sparseBytes() != 0 || legacy.f.admitSparse(10) {
-		t.Fatal("the legacy bundle marks sparse writes")
-	}
-}
-
-func TestClassifierModeValidation(t *testing.T) {
-	if _, err := ParseClassifierMode("v2"); err == nil {
-		t.Fatal("an unknown classifier mode parsed")
-	}
-	if mode, err := ParseClassifierMode(""); err != nil || mode != ClassifierLegacy {
-		t.Fatalf("empty mode parsed as %q, %v", mode, err)
-	}
-	dc, err := profile.ByName(dcLongHaulProfile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Spelling is ValidateClassifier's; the profile's bundle decides whether
-	// phased runs with dc-long-haul (TestDCLongHaulRunsTheLegacyOrTheWholeNewBundle).
-	if err := ValidateClassifier(ClassifierPhased, dc); err != nil {
-		t.Fatal(err)
-	}
-	if err := ValidateProfileBundle(dc, "", "", "", "", "", "", ClassifierPhased, false); err == nil {
-		t.Fatal("classifier=phased accepted with the dc-long-haul profile's legacy bundle")
-	}
-	if err := ValidateClassifier(ClassifierPhased, profile.Default()); err != nil {
-		t.Fatal(err)
-	}
-	if got := Bundle(CCAPIV1, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedLegacy, ClassifierPhased, CongestionScopeConnection, "", ""); got != "classifier=phased" {
-		t.Fatalf("bundle %q", got)
-	}
 }
 
 // The send path end to end below the classifier: with a phased flow that is
@@ -419,7 +360,7 @@ func TestClassifierModeValidation(t *testing.T) {
 // BULK, on the bulk queue, and on the stream. Both use the flow's one data
 // lane, chosen by the sticky class.
 func TestASparseWriteOfABulkFlowIsSentInteractiveAndCoded(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	h.advance(2 * time.Second)
 	h.burst()
 	if h.current() != classifier.ClassBulk {
@@ -427,7 +368,7 @@ func TestASparseWriteOfABulkFlowIsSentInteractiveAndCoded(t *testing.T) {
 	}
 	f := h.f
 	model := pathmodel.NewPathModel()
-	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000, Delivered: 2e6})
+	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000})
 	path := coded.New(newPipeCarrier(), coded.Config{Path: model})
 	defer path.Close()
 	capture := newAckCaptureConn(0, nil)
@@ -523,10 +464,11 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 }
 
 // A sparse write of a BULK flow is coded; if its datagrams stop getting
-// through, the stall watchdog must still send its retry to the stream. It used
-// to ask only whether the flow preferred coding, which a BULK flow does not.
+// through, its retry must still go to the stream. The escape used to ask
+// whether the flow preferred coding, which a BULK flow does not; now it is the
+// coded attempt's own registration deadline and sticky reliable bit.
 func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	h.advance(2 * time.Second)
 	h.burst()
 	f := h.f
@@ -536,7 +478,7 @@ func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
 	f.stallGrace = 10 * time.Millisecond
 	f.stallScan = time.Millisecond
 	model := pathmodel.NewPathModel()
-	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000, Delivered: 2e6})
+	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000})
 	path := coded.New(newPipeCarrier(), coded.Config{Path: model})
 	defer path.Close()
 	capture := newAckCaptureConn(0, nil)
@@ -557,7 +499,7 @@ func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
 	sched := stripe.New(src, stripe.Config{
 		Reliable: f.laneRetransmits, ReliableSparse: f.laneRetransmitsSparse,
 		SparseBytes: f.sparseBytes(), Sparse: f.admitSparse,
-		ForceReliable:   f.recoverChunkReliably,
+		CodedRetry:      true,
 		RetransmitAfter: func() time.Duration { return time.Millisecond }, Now: func() time.Time { return now },
 	})
 	defer sched.Close()
@@ -579,18 +521,16 @@ func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
 		t.Fatalf("the echo was not written coded: reliable=%v err=%v", reliable, err)
 	}
 	sent.onWritten(reliable)
-	if !f.codedDataOutstanding() {
-		t.Fatal("a coded echo was not recorded as outstanding coded DATA")
+	if sent.onCoded == nil {
+		t.Fatal("the coded echo is not observed")
 	}
+	sent.onCoded(coded.Registered, now)
+	// The echo's own registration deadline moves it to the stream; the
+	// watchdog asks a QUIC lane's manager for nothing.
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() { f.stallWatchdog(stop); close(done) }()
 	defer func() { close(stop); <-done }()
-	select {
-	case <-f.stallSignals():
-	case <-ctx.Done():
-		t.Fatal("no stall detected")
-	}
 	now = now.Add(time.Second)
 	if sched.ReissueExpired() != 1 {
 		t.Fatal("the lost echo was not reissued")
@@ -602,13 +542,18 @@ func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
 	if !retry.Reliable {
 		t.Fatal("the stalled sparse write keeps retrying on datagrams; no stream escape")
 	}
+	select {
+	case <-f.stallSignals():
+		t.Fatal("a stall on a QUIC lane signalled the lane manager")
+	default:
+	}
 }
 
 // The send backlog counts what the peer does not hold, including bytes it
 // acknowledged selectively beyond a gap, and an acknowledgement that drains it
 // below the threshold is reported to the next observation.
 func TestSendBacklogCountsSelectiveCoverageAndDips(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.bytesUp.Store(400 << 10)
 	f.replayMu.Lock()
@@ -627,49 +572,6 @@ func TestSendBacklogCountsSelectiveCoverageAndDips(t *testing.T) {
 	}
 }
 
-// A stall on a BULK flow whose outstanding data all went on the stream is not
-// a coded stall, though the lane could code; and a coded chunk the peer has
-// acknowledged, selectively or not, is no longer outstanding.
-func TestCodedDataOutstandingFollowsTheAttempts(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
-	f := h.f
-	src := &chunkReader{writes: make(chan []byte, 2)}
-	defer close(src.writes)
-	coding := false
-	sched := stripe.New(src, stripe.Config{
-		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
-		Reliable: func(uint64) bool { return !coding },
-	})
-	defer sched.Close()
-	f.scheduler.Store(sched)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	next := func(n int) *stripe.Chunk {
-		t.Helper()
-		src.writes <- make([]byte, n)
-		c, err := sched.Next(ctx, 0, 0)
-		if err != nil || c == nil {
-			t.Fatal(err)
-		}
-		return c
-	}
-	stream := next(16 << 10)
-	sched.WroteAs(0, stream, true)
-	if f.codedDataOutstanding() {
-		t.Fatal("a stream-only chunk counted as outstanding coded DATA")
-	}
-	coding = true
-	coded := next(36)
-	sched.WroteAs(0, coded, false)
-	if !f.codedDataOutstanding() {
-		t.Fatal("an unacknowledged coded chunk was not outstanding")
-	}
-	sched.Complete(0, coded) // acknowledged above the stream chunk's gap
-	if f.codedDataOutstanding() {
-		t.Fatal("a coded chunk acknowledged selectively still counted as outstanding")
-	}
-}
-
 // The backlog threshold fits what the flow's scheduler can hold -- its send
 // bytes, its chunk count times what each read can hold, and under mem=owned
 // the autotune floor -- and sits at half of what remains after one read is
@@ -682,7 +584,7 @@ func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
 	twoChunks.maxSendBytes, twoChunks.maxOutstanding = 1<<20, 2
 	eightSlots := defaultFlowMemoryLimits()
 	eightSlots.maxSendBytes, eightSlots.maxOutstanding = 1<<20, 8
-	ios, _, _, err := resolveMemoryLimits(iosMemoryLimits(), iosChunkSize, MemoryOwned)
+	ios, _, _, err := resolveMemoryLimits(iosMemoryLimits(), iosChunkSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -693,28 +595,24 @@ func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
 		base            uint64
 		limits          flowMemoryLimits
 		chunk, readSize int
-		memOwned        bool
 		want            uint64
 		refill          bool
 	}{
-		{"default", base, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 64 << 10, false},
-		{"default, mem=owned at the autotune floor", base, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, true, 16 << 10, false},
-		{"ios, legacy memory", base, ios, iosChunkSize, iosChunkSize, false, 64 << 10, false},
-		{"a profile's lower threshold is kept", 16 << 10, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, false, 16 << 10, false},
+		{"default, at the autotune floor", base, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, 16 << 10, false},
+		{"a profile's lower threshold is kept", 16 << 10, defaultFlowMemoryLimits(), defaultChunkSize, defaultChunkSize, 16 << 10, false},
 		// One coalesced acknowledgement (64 KiB plus a chunk) can empty these,
 		// so bytes outstanding cannot separate a transfer from a
 		// conversation: refill evidence.
-		{"48 KiB send bound, legacy", base, small, defaultChunkSize, defaultChunkSize, false, 1, true},
-		{"48 KiB send bound, mem=owned", base, small, defaultChunkSize, defaultChunkSize, true, 1, true},
-		{"two 16 KiB chunks", base, twoChunks, 16 << 10, 16 << 10, false, 1, true},
-		{"ios, mem=owned at the autotune floor", base, ios, iosChunkSize, iosChunkSize, true, 1, true},
-		{"ios, mem=owned, staged reads", base, ios, iosChunkSize, stagingBytes, true, 1, true},
-		{"eight slots of 1 KiB staged reads", base, eightSlots, 32 << 10, stagingBytes, false, 1, true},
-		{"33 KiB legacy bound: a 32 KiB read and a 1 KiB staged read", base, mixed, 32 << 10, stagingBytes, false, 1, true},
-		{"32 KiB + 1 send bound, legacy", base, flowMemoryLimits{maxSendBytes: 32<<10 + 1, maxOutstanding: 16384}, 32 << 10, 32 << 10, false, 1, true},
-		{"one slot", base, oneSlot, 32 << 10, 32 << 10, false, 1, true},
+		{"48 KiB send bound", base, small, defaultChunkSize, defaultChunkSize, 1, true},
+		{"two 16 KiB chunks", base, twoChunks, 16 << 10, 16 << 10, 1, true},
+		{"ios, at the autotune floor", base, ios, iosChunkSize, iosChunkSize, 1, true},
+		{"ios, staged reads", base, ios, iosChunkSize, stagingBytes, 1, true},
+		{"eight slots of 1 KiB staged reads", base, eightSlots, 32 << 10, stagingBytes, 1, true},
+		{"33 KiB send bound: a 32 KiB read and a 1 KiB staged read", base, mixed, 32 << 10, stagingBytes, 1, true},
+		{"32 KiB + 1 send bound", base, flowMemoryLimits{maxSendBytes: 32<<10 + 1, maxOutstanding: 16384}, 32 << 10, 32 << 10, 1, true},
+		{"one slot", base, oneSlot, 32 << 10, 32 << 10, 1, true},
 	} {
-		got, refill := backlogThresholdFor(c.base, c.limits, c.chunk, c.readSize, c.memOwned)
+		got, refill := backlogThresholdFor(c.base, c.limits, c.chunk, c.readSize)
 		if got != c.want || refill != c.refill {
 			t.Errorf("%s: threshold %d refill %v, want %d and %v", c.name, got, refill, c.want, c.refill)
 		}
@@ -725,7 +623,7 @@ func TestBacklogThresholdFitsTheSchedulerCapacity(t *testing.T) {
 // to the staging buffer for a flow with shared send memory, whose reads are
 // extended only when the shared budget and the connection allow.
 func TestFitBacklogThresholdUsesTheProfileAndTheReadPath(t *testing.T) {
-	cfg := phasedClassifierConfig(profile.Default().Classifier, ClassifierPhased)
+	cfg := profile.Default().Classifier
 	cfg.BulkBacklogBytes = 16 << 10
 	inner, peer := net.Pipe()
 	defer inner.Close()
@@ -741,7 +639,7 @@ func TestFitBacklogThresholdUsesTheProfileAndTheReadPath(t *testing.T) {
 	limits.maxSendBytes, limits.maxOutstanding = 1<<20, 8
 	staged := newMultipathFlowWithMemory(context.Background(), inner, [16]byte{1}, 2, 32<<10,
 		protocol.FlagAckDown, protocol.FlagAckUp, nil, nil, nil, limits, memlimit.New(1<<20), nil,
-		phasedClassifierConfig(profile.Default().Classifier, ClassifierPhased))
+		profile.Default().Classifier)
 	staged.fitBacklogThreshold()
 	if got := staged.classifier.BacklogBytes(); got != 1 || !staged.refillMode || staged.fullReadBytes != stagingBytes {
 		t.Fatalf("eight staged 1 KiB reads: threshold %d refill %v full read %d, want 1, refill evidence, and the staging size", got, staged.refillMode, staged.fullReadBytes)
@@ -754,10 +652,9 @@ func TestFitBacklogThresholdUsesTheProfileAndTheReadPath(t *testing.T) {
 // before the producer refills the room. The dip to 16 KiB is not a drain, so
 // the transfer, having left BULK, goes back into it.
 func TestAnExtendedStagedTransferReentersBulk(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 32 << 10
-	f.memOwned = true
 	f.sendMemory = memlimit.New(1 << 20)
 	f.memoryLimits.maxSendBytes = 48 << 10
 	f.fitBacklogThreshold()
@@ -826,7 +723,7 @@ func (h *phaseHarness) leaveBulk() {
 // at once; then the small one. The dip to 1 KiB is not the transfer
 // draining, so having left BULK it goes back in.
 func TestAMixedReadTransferReentersBulk(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 32 << 10
 	f.sendMemory = memlimit.New(1 << 20)
@@ -859,7 +756,7 @@ func TestAMixedReadTransferReentersBulk(t *testing.T) {
 // whose refills come late.
 func TestASingleSlotFlowUsesRefillEvidence(t *testing.T) {
 	setup := func() *phaseHarness {
-		h := newPhaseHarness(t, ClassifierPhased)
+		h := newPhaseHarness(t)
 		h.f.chunkSize = 32 << 10
 		h.f.memoryLimits.maxSendBytes, h.f.memoryLimits.maxOutstanding = 1<<20, 1
 		h.f.fitBacklogThreshold()
@@ -898,7 +795,7 @@ func TestASingleSlotFlowUsesRefillEvidence(t *testing.T) {
 // two-chunk flow at once. A producer that refills both at once is still a
 // continuously backlogged transfer.
 func TestCoalescedAcksOfAWholeFlightAreNotDrains(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 16 << 10
 	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 2
@@ -919,7 +816,7 @@ func TestCoalescedAcksOfAWholeFlightAreNotDrains(t *testing.T) {
 // Receive-side bytes observed between an acknowledgement and the prompt
 // refill do not end the backlog stretch while the refill is still due.
 func TestAReceiveBetweenAckAndRefillKeepsTheStretch(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 32 << 10
 	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 1
@@ -941,7 +838,7 @@ func TestAReceiveBetweenAckAndRefillKeepsTheStretch(t *testing.T) {
 // A read is full when it fills its buffer, whatever its size: a staged fill
 // reads the rest of the chunk into a smaller remaining slice.
 func TestAReadThatFillsItsBufferIsFull(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 1500
 	f.sendMemory = memlimit.New(1 << 20)
@@ -966,7 +863,7 @@ func TestAReadThatFillsItsBufferIsFull(t *testing.T) {
 // is judged against the refill: with one chunk still outstanding it is not a
 // drain.
 func TestAnAckAfterARefillIsNotADrain(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 16 << 10
 	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 2
@@ -994,7 +891,7 @@ func TestAnAckAfterARefillIsNotADrain(t *testing.T) {
 // through the real acknowledgement path, so every dip is recorded: a dip to
 // one chunk of backlog must not count as the transfer draining.
 func TestACountLimitedTransferReentersBulk(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 16 << 10
 	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 2
@@ -1035,7 +932,7 @@ func TestACountLimitedTransferReentersBulk(t *testing.T) {
 // restart at that moment, and an idle gap followed by the next burst would
 // count as a continuous backlog and re-enter BULK at once.
 func TestADrainDuringAnObservationEndsTheBacklogStretch(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	// A count-limited flow (two 16 KiB chunks), whose threshold is 16 KiB,
 	// so one application read can refill the backlog past it.
@@ -1077,7 +974,7 @@ func TestADrainDuringAnObservationEndsTheBacklogStretch(t *testing.T) {
 
 // observeCarried counts the bytes in the same step as the observation.
 func TestObserveCarriedCountsTheBytes(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	h.f.observeCarried(100, true)
 	h.f.observeCarried(40, false)
 	if h.f.bytesUp.Load() != 100 || h.f.bytesDown.Load() != 40 {
@@ -1137,7 +1034,7 @@ func stagedHarness(t *testing.T, chunk, sendBound int) (*phaseHarness, *scripted
 
 func stagedHarnessSlots(t *testing.T, chunk, sendBound, slots int) (*phaseHarness, *scriptedConn, *flowSource) {
 	t.Helper()
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	conn := &scriptedConn{Conn: f.inner}
 	f.inner = conn
@@ -1179,7 +1076,7 @@ func stagedRead(t *testing.T, src *flowSource, chunk int) int {
 // threshold is 16 KiB, above the refill floor, and every such acknowledgement
 // still empties the flow. A producer that refills at once is backlogged.
 func TestAWholeFlightAckAboveTheRefillFloorIsNotADrain(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 32 << 10
 	f.memoryLimits.maxSendBytes = 128 << 10
@@ -1244,7 +1141,7 @@ func TestAStagedFillThatTimesOutEmptyIsShort(t *testing.T) {
 // read deadlines refills 1 KiB at a time. A prompt full 1 KiB refill after
 // each acknowledgement continues the stretch although 1 KiB is below 4 KiB.
 func TestARefillSmallerThanTheThresholdContinuesTheStretch(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 32 << 10
 	f.sendMemory = memlimit.New(1 << 20)
@@ -1405,7 +1302,7 @@ func TestAReadInProgressIsNotJudgedByThePreviousRead(t *testing.T) {
 // drain.
 func TestAPendingDrainHoldsAboveTheFloor(t *testing.T) {
 	mk := func() *phaseHarness {
-		h := newPhaseHarness(t, ClassifierPhased)
+		h := newPhaseHarness(t)
 		h.f.chunkSize = 32 << 10
 		h.f.memoryLimits.maxSendBytes = 128 << 10
 		h.f.fitBacklogThreshold()
@@ -1447,7 +1344,7 @@ func TestAPendingDrainHoldsAboveTheFloor(t *testing.T) {
 // acknowledgement opened is still being decided -- here receive-side bytes
 // between the acknowledgement and the prompt refill.
 func TestAPendingDrainKeepsAStretchBackedByQueuedBytes(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 32 << 10
 	f.memoryLimits.maxSendBytes = 128 << 10
@@ -1480,7 +1377,7 @@ func TestAPendingDrainKeepsAStretchBackedByQueuedBytes(t *testing.T) {
 // recorded a pending drain -- the acknowledgement landed between the two --
 // did not take the room that acknowledgement freed, and leaves it pending.
 func TestAReadCompletedBeforeAnAckDoesNotSettleIt(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.chunkSize = 32 << 10
 	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 1
@@ -1505,7 +1402,7 @@ func TestAReadCompletedBeforeAnAckDoesNotSettleIt(t *testing.T) {
 // that acknowledgement leaves pending preserves no stretch, so the reply's
 // observation is no backlog evidence.
 func TestAPendingDrainWithoutAStretchIsNoEvidence(t *testing.T) {
-	h := newPhaseHarness(t, ClassifierPhased)
+	h := newPhaseHarness(t)
 	f := h.f
 	f.fitBacklogThreshold()
 	h.advance(2 * time.Second)

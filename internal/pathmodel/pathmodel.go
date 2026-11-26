@@ -62,9 +62,6 @@ type PathModel struct {
 	// quiet path become "unknown" five seconds after its prewarm. Forget is the
 	// lifecycle boundary for this state.
 	knowledge pathKnowledge
-	// aggregate is a windowed maximum of the summed delivered rate, which is
-	// the endpoint pair's bottleneck as measured from this side.
-	aggregate []bandwidthSample
 	// now is the clock, for tests; nil means time.Now.
 	now func() time.Time
 }
@@ -115,7 +112,6 @@ type report struct {
 	erasure   float64
 	burst     float64
 	observed  float64
-	delivered float64
 	roundTrip time.Duration
 	at        time.Time
 }
@@ -141,9 +137,7 @@ type Observation struct {
 	// still unknown, which is what distinguishes a measured clean path from an
 	// unmeasured one.
 	ObservedSamples float64
-	// Delivered is this contributor's delivered rate in bytes per second, and
-	// RoundTrip the smallest round trip it has seen.
-	Delivered float64
+	// RoundTrip is the smallest round trip this contributor has seen.
 	RoundTrip time.Duration
 }
 
@@ -160,58 +154,15 @@ type State struct {
 	// floor. It distinguishes a measured clean path from an unmeasured one
 	// without giving an untrusted zero any weight in Floor.
 	ObservedSamples float64
-	// Share is this contributor's allowance of the bottleneck in bytes per
-	// second. Zero means the contributor must not cap itself -- either because
-	// the bottleneck is not yet known, or because it is the only one here and
-	// so has nothing to compound with.
-	//
-	// A share is deliberately larger than an even split. The bottleneck is
-	// measured from what the contributors deliver, and they deliver what this
-	// number lets them, so a share with no headroom is a cap computed from its
-	// own effect: it can be held, never exceeded, and any dip in delivery
-	// lowers it permanently. See shareProbeGain.
-	Share float64
-	// Seed is the rate a contributor joining now should start from, which is
-	// its expected portion of the bottleneck. Unlike Share it is never a
-	// ceiling -- it exists so a replacement lane does not rediscover a path
-	// its siblings already measured.
-	Seed float64
 	// RoundTrip is the path's minimum round trip, which is the smallest any
 	// lane has seen: a larger one is that lane's queueing, not the path.
 	RoundTrip time.Duration
 }
 
-type bandwidthSample struct {
-	rate float64
-	at   time.Time
-}
-
-const (
-	// memberIdle is how long a contributor may go without reporting before it
-	// stops counting. It is several round trips on a long-haul path, so one
-	// that is merely quiet is not evicted and made to rediscover the path.
-	memberIdle = 5 * time.Second
-	// bottleneckWindow is how long a delivered-rate sample stands. Long enough
-	// to survive a probe cycle, short enough that a path which genuinely
-	// narrowed is believed within a few seconds.
-	bottleneckWindow = 10 * time.Second
-	// shareProbeGain is the headroom a share leaves above an even split.
-	//
-	// It is BBR's own probe gain, and it is here for the same reason BBR has
-	// it: an estimate of a bottleneck can only grow if something is allowed to
-	// send above it. The bottleneck here is measured from what the members
-	// deliver, so without this factor the cap is derived from the traffic the
-	// cap itself limits -- a loop with one stable point and a downward
-	// ratchet. Any interval where a member is application-limited lowers the
-	// windowed maximum, which lowers every share, which lowers what can be
-	// delivered next, and the path is never re-measured upward.
-	//
-	// With the gain, the members together may put 1.25x the measured
-	// bottleneck on the wire, which is what one BBR sender would have done
-	// probing on its own -- which is exactly the property the share exists to
-	// preserve.
-	shareProbeGain = 1.25
-)
+// memberIdle is how long a contributor may go without reporting before it
+// stops counting. It is several round trips on a long-haul path, so one that
+// is merely quiet is not evicted and made to rediscover the path.
+const memberIdle = 5 * time.Second
 
 // NewPathModel returns an empty model. Callers normally want SharedPath.
 func NewPathModel() *PathModel {
@@ -243,22 +194,19 @@ func (m *PathModel) Report(member Member, o Observation) State {
 		m.members[member] = entry
 	}
 	entry.erasure, entry.burst = o.Erasure, o.BurstFactor
-	entry.observed, entry.delivered, entry.at = o.ObservedSamples, o.Delivered, now
+	entry.observed, entry.at = o.ObservedSamples, now
 	if o.RoundTrip > 0 {
 		entry.roundTrip = o.RoundTrip
 	}
 
 	var state State
-	var observed, sum float64
+	var observed float64
 	var erasureWeighted, burstWeighted float64
-	live := 0
 	for key, other := range m.members {
 		if now.Sub(other.at) > memberIdle {
 			delete(m.members, key)
 			continue
 		}
-		live++
-		sum += other.delivered
 		// A lane with few samples should not move the pooled estimate much,
 		// which is also what lets a new lane join without disturbing it.
 		erasureWeighted += other.erasure * other.observed
@@ -291,41 +239,11 @@ func (m *PathModel) Report(member Member, o Observation) State {
 	} else if state.RoundTrip == 0 {
 		state.RoundTrip = m.knowledge.roundTrip
 	}
-
-	if sum > 0 {
-		m.aggregate = append(m.aggregate, bandwidthSample{rate: sum, at: now})
-	}
-	bottleneck := 0.0
-	kept := m.aggregate[:0]
-	for _, sample := range m.aggregate {
-		if now.Sub(sample.at) > bottleneckWindow {
-			continue
-		}
-		kept = append(kept, sample)
-		if sample.rate > bottleneck {
-			bottleneck = sample.rate
-		}
-	}
-	m.aggregate = kept
-
-	if live > 0 && bottleneck > 0 {
-		state.Seed = bottleneck / float64(live)
-		// A lone member has nothing to compound with, so there is nothing for
-		// a cap to protect and everything for it to break: its share would be
-		// the whole bottleneck, the bottleneck is the maximum of what it has
-		// recently delivered, and a sender held at its own recent maximum can
-		// never probe past it. Measured, that is a transport that runs at line
-		// rate and then collapses to a fiftieth of it for the rest of the
-		// process's life.
-		if live > 1 {
-			state.Share = shareProbeGain * state.Seed
-		}
-	}
 	return state
 }
 
 // Current is what the model already knows, without contributing to it: the
-// pooled erasure floor and the share a lane joining now would be given.
+// pooled erasure, burst factor and round trip.
 //
 // A lane that starts from nothing has to rediscover a path its siblings
 // already measured, and on a channel that erases 40% of packets that discovery
@@ -341,15 +259,13 @@ func (m *PathModel) Current() State {
 	now := m.clock()
 	m.expireKnowledgeLocked(now)
 	var state State
-	var observed, bottleneck float64
+	var observed float64
 	var erasureWeighted, burstWeighted float64
-	live := 0
 	for key, entry := range m.members {
 		if now.Sub(entry.at) > memberIdle {
 			delete(m.members, key)
 			continue
 		}
-		live++
 		erasureWeighted += entry.erasure * entry.observed
 		burstWeighted += entry.burst * entry.observed
 		observed += entry.observed
@@ -379,23 +295,6 @@ func (m *PathModel) Current() State {
 		m.knowledge.roundTrip = state.RoundTrip
 	} else if state.RoundTrip == 0 {
 		state.RoundTrip = m.knowledge.roundTrip
-	}
-	for _, sample := range m.aggregate {
-		if now.Sub(sample.at) <= bottleneckWindow && sample.rate > bottleneck {
-			bottleneck = sample.rate
-		}
-	}
-	if bottleneck > 0 {
-		// The joining lane counts too, or the first thing it does is take a
-		// share sized for a path with one fewer lane on it.
-		state.Seed = bottleneck / float64(live+1)
-		// Only a lane that will actually share the path takes a ceiling with
-		// it. A lane joining an empty model is alone, and capping it at what
-		// the last occupant delivered is how a fresh connection inherits a
-		// dead one's collapse.
-		if live > 0 {
-			state.Share = shareProbeGain * state.Seed
-		}
 	}
 	return state
 }

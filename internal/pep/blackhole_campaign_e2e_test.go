@@ -19,13 +19,13 @@ import (
 // 16 s later, for 25 s, from every source. Under it run what the campaign
 // runs: an LLM agent loop on one persistent connection (a ~130 KB prompt,
 // 0.5 s of server think time, then a stream of small deltas), a terminal
-// echo, a bulk upload, and a new connection every 0.5 s. Both arms run the
-// full stage 1-7 bundle with classifier=phased and differ only in
-// recovery=flow (legacy) or recovery=carrier.
+// echo, a bulk upload, and a new connection every 0.5 s. Until stage 11 a
+// second arm ran legacy recovery (recovery=flow) for comparison; it went with
+// the legacy code.
 //
 // Unlike the live loop, whose turns drift by a second or two from trial to
-// trial, every LLM call here starts at a fixed offset from an outage, so both
-// arms are measured on the same calls. QUIC only: the live blackhole drops
+// trial, every LLM call here starts at a fixed offset from an outage, so
+// trials are measured on the same calls. QUIC only: the live blackhole drops
 // TCP too, and pathsim's TCP relay cannot drop.
 
 const (
@@ -97,7 +97,6 @@ type probeResult struct {
 }
 
 type blackholeCampaign struct {
-	mode  RecoveryMode
 	calls []llmCall
 	// echoAfter and probeAfter are how long after each restore the terminal
 	// echoed again and a new connection first completed.
@@ -108,7 +107,7 @@ type blackholeCampaign struct {
 }
 
 func (c blackholeCampaign) String() string {
-	s := fmt.Sprintf("%-7s", c.mode)
+	s := "carrier"
 	for _, call := range c.calls {
 		if call.afterRestore > 0 {
 			s += fmt.Sprintf(" | %s: ttft %.2fs (%.2fs after restore)", call.label, call.ttft.Seconds(), call.afterRestore.Seconds())
@@ -123,13 +122,13 @@ func (c blackholeCampaign) String() string {
 // runBlackholeCampaign runs one trial. lead is how long before each drop the
 // straddling LLM call starts, which also moves the drops relative to every
 // timer the transport has running.
-func runBlackholeCampaign(t *testing.T, mode RecoveryMode, lead time.Duration, seed int64) blackholeCampaign {
+func runBlackholeCampaign(t *testing.T, lead time.Duration, seed int64) blackholeCampaign {
 	t.Helper()
 	p := newCarrierPair(t, carrierPairOptions{
 		path:  pathsim.Config{OneWayDelay: 75 * time.Millisecond, RateBytesPerSec: 20_000_000 / 8, QueueBytes: 512 << 10, Seed: seed},
-		serve: campaignDestination, clientRecovery: mode, gatewayRecovery: mode,
+		serve: campaignDestination,
 	})
-	res := blackholeCampaign{mode: mode}
+	res := blackholeCampaign{}
 	open := func(marker byte) net.Conn {
 		conn, err := trySocksDial(p.socks, p.destination, 30*time.Second)
 		if err != nil {
@@ -273,36 +272,32 @@ func recoveryAfter(trials []blackholeCampaign, drop int) (mean, worst time.Durat
 	return mean / time.Duration(len(trials)), worst
 }
 
-// The live blackhole trial, three times per arm at different phases of the
-// drops against the transport's timers. Hard assertions: no flow fails, and
-// recovery=carrier notices a returned path within its probe cadence: the
+// The live blackhole trial, three times at different phases of the drops
+// against the transport's timers. Hard assertions: no flow fails, and the
+// carrier manager notices a returned path within its probe cadence: the
 // terminal echoes again within 3 s of each restore in every trial.
-func TestBlackholeCampaignAgainstLegacy(t *testing.T) {
+func TestBlackholeCampaign(t *testing.T) {
 	if testing.Short() {
 		t.Skip("wall-clock impairment campaign")
 	}
 	leads := []time.Duration{300 * time.Millisecond, 1100 * time.Millisecond, 1900 * time.Millisecond}
-	arms := map[RecoveryMode][]blackholeCampaign{}
-	for _, mode := range []RecoveryMode{RecoveryFlow, RecoveryCarrier} {
-		for i, lead := range leads {
-			r := runBlackholeCampaign(t, mode, lead, int64(41+i))
-			t.Log(r)
-			if len(r.failures) > 0 {
-				t.Errorf("%s: %v", mode, r.failures)
-			}
-			arms[mode] = append(arms[mode], r)
+	var trials []blackholeCampaign
+	for i, lead := range leads {
+		r := runBlackholeCampaign(t, lead, int64(41+i))
+		t.Log(r)
+		if len(r.failures) > 0 {
+			t.Errorf("%v", r.failures)
 		}
+		trials = append(trials, r)
 	}
-	for _, mode := range []RecoveryMode{RecoveryFlow, RecoveryCarrier} {
-		m8, w8 := recoveryAfter(arms[mode], 0)
-		m25, w25 := recoveryAfter(arms[mode], 1)
-		t.Logf("%-7s recovery after restore: 8 s drop mean %.2fs worst %.2fs; 25 s drop mean %.2fs worst %.2fs",
-			mode, m8.Seconds(), w8.Seconds(), m25.Seconds(), w25.Seconds())
-	}
-	for _, r := range arms[RecoveryCarrier] {
+	m8, w8 := recoveryAfter(trials, 0)
+	m25, w25 := recoveryAfter(trials, 1)
+	t.Logf("recovery after restore: 8 s drop mean %.2fs worst %.2fs; 25 s drop mean %.2fs worst %.2fs",
+		m8.Seconds(), w8.Seconds(), m25.Seconds(), w25.Seconds())
+	for _, r := range trials {
 		for drop, after := range r.echoAfter {
 			if after > 3*time.Second {
-				t.Errorf("recovery=carrier: the terminal echoed %.2fs after restore %d", after.Seconds(), drop+1)
+				t.Errorf("the terminal echoed %.2fs after restore %d", after.Seconds(), drop+1)
 			}
 		}
 	}
@@ -311,46 +306,36 @@ func TestBlackholeCampaignAgainstLegacy(t *testing.T) {
 // A receive-only carrier across an 8 s drop: one bulk download and nothing
 // else, so the client has almost nothing ack-eliciting outstanding and its
 // probe timeouts -- the SUSPECT evidence -- barely accrue, as the live
-// campaign's logs showed for most trials. How long after the restore does
-// the download move again? Under recovery=carrier it waited, before the
-// silence probe, for the keep-alive PING sent early in the outage to come
-// round again on its backed-off probe timer: about 5 s, against legacy's
-// half a second, whose fixed 5 s keep-alive happened to send its PING late.
-func TestBlackholeReceiveOnlyAgainstLegacy(t *testing.T) {
+// campaign's logs showed for most trials. The download moves again within 3 s
+// of the restore: before the silence probe it waited for the keep-alive PING
+// sent early in the outage to come round again on its backed-off probe timer,
+// about 5 s.
+func TestBlackholeReceiveOnly(t *testing.T) {
 	if testing.Short() {
 		t.Skip("wall-clock impairment campaign")
 	}
-	results := map[RecoveryMode][]time.Duration{}
-	for _, mode := range []RecoveryMode{RecoveryFlow, RecoveryCarrier} {
-		for i, lead := range []time.Duration{0, 700 * time.Millisecond, 1400 * time.Millisecond} {
-			p := impairmentPair(t, mode, pathsim.Config{OneWayDelay: 75 * time.Millisecond, RateBytesPerSec: 20_000_000 / 8, QueueBytes: 512 << 10, Seed: int64(51 + i)}, CarrierRecoveryConfig{})
-			d := startDownload(t, p)
-			if !d.waitReceived(1<<20, 30*time.Second) {
-				t.Fatalf("%s: the download never started", mode)
-			}
-			time.Sleep(3*time.Second + lead)
-			p.relay.SetLossRate(1, 1)
-			time.Sleep(8 * time.Second)
-			p.relay.SetLossRate(0, 0)
-			restored := time.Now()
-			mark := d.received.Load()
-			if !d.waitReceived(mark+256<<10, 40*time.Second) {
-				t.Fatalf("%s: the download did not resume: %v", mode, d.failure())
-			}
-			results[mode] = append(results[mode], time.Since(restored))
+	var results []time.Duration
+	for i, lead := range []time.Duration{0, 700 * time.Millisecond, 1400 * time.Millisecond} {
+		p := impairmentPair(t, pathsim.Config{OneWayDelay: 75 * time.Millisecond, RateBytesPerSec: 20_000_000 / 8, QueueBytes: 512 << 10, Seed: int64(51 + i)}, CarrierRecoveryConfig{})
+		d := startDownload(t, p)
+		if !d.waitReceived(1<<20, 30*time.Second) {
+			t.Fatal("the download never started")
 		}
-	}
-	for mode, rs := range results {
-		var mean, worst time.Duration
-		for _, r := range rs {
-			mean += r
-			worst = max(worst, r)
+		time.Sleep(3*time.Second + lead)
+		p.relay.SetLossRate(1, 1)
+		time.Sleep(8 * time.Second)
+		p.relay.SetLossRate(0, 0)
+		restored := time.Now()
+		mark := d.received.Load()
+		if !d.waitReceived(mark+256<<10, 40*time.Second) {
+			t.Fatalf("the download did not resume: %v", d.failure())
 		}
-		t.Logf("%-7s download resumed after restore: %v (mean %.2fs, worst %.2fs)", mode, rs, (mean / time.Duration(len(rs))).Seconds(), worst.Seconds())
+		results = append(results, time.Since(restored))
 	}
-	for _, r := range results[RecoveryCarrier] {
+	t.Logf("download resumed after restore: %v", results)
+	for _, r := range results {
 		if r > 3*time.Second {
-			t.Errorf("recovery=carrier: a receive-only download resumed %.2fs after the restore", r.Seconds())
+			t.Errorf("a receive-only download resumed %.2fs after the restore", r.Seconds())
 		}
 	}
 }

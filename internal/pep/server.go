@@ -51,32 +51,7 @@ type ServerConfig struct {
 	TCPFallbackLanes int
 	// TCPCongestion selects the Linux kernel congestion controller inherited by
 	// accepted fallback sockets. "system" leaves the host default untouched.
-	TCPCongestion string
-	// Memory selects the memory-ownership bundle; empty is legacy. A gateway
-	// has no shared send budget, so only the retention autotune and the
-	// no-progress accounting of READY bytes apply to it.
-	Memory     MemoryMode
-	Congestion CongestionControlKind
-	// CCAPI selects how QUIC congestion controllers are driven; see
-	// CCAPIVersion. Empty is v1.
-	CCAPI CCAPIVersion
-	// Sched selects how a QUIC connection orders the classes of work it
-	// sends; see SchedMode. Empty is legacy. Class requires CCAPI v2.
-	Sched SchedMode
-	// CongestionScope selects what one congestion controller governs; see
-	// CongestionScope. Empty is connection. Path requires CCAPI v2 and
-	// Sched class.
-	CongestionScope CongestionScope
-	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
-	// is legacy.
-	CodedRetry CodedRetryMode
-	// Classifier selects the flow-classifier bundle; see ClassifierMode.
-	// Empty is legacy. The gateway classifies the direction it sends, so
-	// downstream DATA follows this setting, not the client's.
-	Classifier                    ClassifierMode
-	BrutalBytesPerSec             uint64
-	AdaptiveMinBytesSec           uint64
-	AdaptiveMaxBytesSec           uint64
+	TCPCongestion                 string
 	AggregateBytesPerSec          uint64
 	InteractiveReserveBytesPerSec uint64
 	// StreamReceiveWindow and ConnectionReceiveWindow override the QUIC
@@ -104,14 +79,6 @@ type ServerConfig struct {
 	// single version emulates a gateway that speaks only that one, and is how
 	// a deployment retires a version once its clients have moved.
 	AcceptWire []byte
-	// GatewayAdmission selects what the session limit counts; see
-	// GatewayAdmission. Empty is legacy.
-	GatewayAdmission GatewayAdmission
-	// Recovery selects the recovery bundle; see RecoveryMode. Empty is flow.
-	// On a gateway carrier disables lane demotion, activates the adaptive
-	// keep-alive schedule and grants PROBE replies; it requires
-	// CongestionScope path and CodedRetry sticky.
-	Recovery RecoveryMode
 	// testReleasedAdmission emulates a released gateway's admission exactly:
 	// a stream that finds no session slot is closed before its first frame
 	// is read, and no standby connection is admitted past a full bound. It
@@ -423,11 +390,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	// carries. It is not a receive limit -- protocol.MaxPayload is, and it is
 	// fixed by the wire version -- so an out-of-range value is corrected to the
 	// default rather than allowed to produce frames the peer must reject.
-	memoryMode, err := ParseMemoryMode(string(cfg.Memory))
-	if err != nil {
-		return nil, err
-	}
-	cfg.Memory = memoryMode
 	if cfg.ChunkSize <= 0 || cfg.ChunkSize > protocol.MaxPayload {
 		cfg.ChunkSize = defaultChunkSize
 	}
@@ -449,11 +411,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.MaxSessions > maxConfiguredSessions {
 		return nil, fmt.Errorf("maximum sessions must not exceed %d", maxConfiguredSessions)
 	}
-	admission, err := ParseGatewayAdmission(string(cfg.GatewayAdmission))
-	if err != nil {
-		return nil, err
-	}
-	cfg.GatewayAdmission = admission
 	acceptWire, err := resolveWireVersions(cfg.AcceptWire)
 	if err != nil {
 		return nil, fmt.Errorf("accepted wire versions: %w", err)
@@ -472,47 +429,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Congestion == "" {
-		cfg.Congestion = defaultCongestion()
-	}
-	if cfg.Congestion != CongestionReno && cfg.Congestion != CongestionBBR && cfg.Congestion != CongestionBBRTUIC && cfg.Congestion != CongestionErasure && cfg.Congestion != CongestionAdaptive && cfg.Congestion != CongestionBrutal {
-		return nil, fmt.Errorf("unsupported QUIC congestion controller %q", cfg.Congestion)
-	}
-	if cfg.Congestion == CongestionBrutal && cfg.BrutalBytesPerSec == 0 {
-		return nil, errors.New("brutal congestion requires a positive per-lane byte rate")
-	}
-	if err := validateBundle(&cfg.CCAPI, cfg.Congestion, cfg.Profile); err != nil {
-		return nil, err
-	}
-	if err := validateSched(&cfg.Sched, cfg.CCAPI); err != nil {
-		return nil, err
-	}
-	if err := validateCongestionScope(&cfg.CongestionScope, cfg.CCAPI, cfg.Sched); err != nil {
-		return nil, err
-	}
-	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
-		return nil, err
-	}
-	if err := resolveClassifier(&cfg.Classifier, cfg.Profile); err != nil {
-		return nil, err
-	}
-	if err := validateRecovery(&cfg.Recovery, cfg.CongestionScope, cfg.CodedRetry, "", 0, true); err != nil {
-		return nil, err
-	}
-	if err := validateProfileBundle(cfg.Profile, cfg.CCAPI, cfg.Sched, cfg.CongestionScope, cfg.CodedRetry, "", cfg.Recovery, cfg.Classifier, true); err != nil {
-		return nil, err
-	}
 	if err := cfg.CarrierShadow.resolve(); err != nil {
 		return nil, err
-	}
-	if cfg.AdaptiveMinBytesSec == 0 {
-		cfg.AdaptiveMinBytesSec = defaultAdaptiveMinBytesPerSec
-	}
-	if cfg.AdaptiveMaxBytesSec == 0 {
-		cfg.AdaptiveMaxBytesSec = defaultAdaptiveMaxBytesPerSec
-	}
-	if cfg.AdaptiveMaxBytesSec < cfg.AdaptiveMinBytesSec {
-		return nil, errors.New("adaptive maximum byte rate cannot be below its minimum")
 	}
 	if cfg.AggregateBytesPerSec == 0 && cfg.InteractiveReserveBytesPerSec != 0 {
 		return nil, errors.New("interactive reserve requires an aggregate byte budget")
@@ -535,10 +453,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	budget := limiter.New(limiter.Config{TotalBytesPerSec: cfg.AggregateBytesPerSec, ReserveBytesPerSec: cfg.InteractiveReserveBytesPerSec})
 	cfg.ChunkSize = chunkSizeForBudget(cfg.ChunkSize, budget)
-	handshakes := recoveryReads
-	if cfg.GatewayAdmission == GatewayAdmissionOwned {
-		handshakes = max(cfg.MaxSessions, recoveryReads)
-	}
+	handshakes := max(cfg.MaxSessions, recoveryReads)
 	server := &Server{
 		cfg:          cfg,
 		semaphore:    make(chan struct{}, cfg.MaxSessions),
@@ -721,17 +636,6 @@ func (s *Server) ServeListener(ctx context.Context, listener net.Listener) error
 				s.handleTCP(ctx, tls.Server(raw, tlsConfig), streamAdmission{charged: true})
 			}()
 		default:
-			// Every slot is held. The JOIN that would recover one of those
-			// flows, or a PROBE, needs none, so the connection is read under a
-			// small separate bound before anything else is refused (#170).
-			if !s.cfg.testReleasedAdmission && tryAcquire(s.handshakes) {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					s.handleTCP(ctx, tls.Server(raw, tlsConfig), streamAdmission{recoveryOnly: true, release: func() { <-s.handshakes }})
-				}()
-				continue
-			}
 			_ = raw.Close()
 			s.cfg.Logger.Warn("remote session limit reached")
 		}
@@ -751,10 +655,6 @@ func (s *Server) handleTCP(ctx context.Context, conn *tls.Conn, admission stream
 		return
 	}
 	state := conn.ConnectionState()
-	if admission.recoveryOnly && (state.NegotiatedProtocol == identity.EnrollmentALPN || state.NegotiatedProtocol == identity.RenewalALPN) {
-		// Read past a full session limit only to find a JOIN or a PROBE.
-		return
-	}
 	if state.NegotiatedProtocol == identity.EnrollmentALPN {
 		if s.cfg.Enrollment != nil {
 			if !s.admitEnrollment() {
@@ -925,9 +825,6 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	defer wg.Wait()
 	defer conn.CloseWithError(0, "queqiao session complete")
 	controller := configureQUICController(conn, congestionConfig{
-		kind: s.cfg.Congestion, brutalBytesPerSecond: s.cfg.BrutalBytesPerSec,
-		adaptiveMinBytesPerSec: s.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: s.cfg.AdaptiveMaxBytesSec,
-		ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched, scope: s.cfg.CongestionScope,
 		// The ALPN and the principal are checked below: only an authorised
 		// data connection attaches to its path's controller.
 		provisional: true,
@@ -981,49 +878,32 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 	if err != nil {
 		return
 	}
-	if s.cfg.CCAPI == CCAPIV2 && s.cfg.Congestion == CongestionErasure && s.cfg.CongestionScope == CongestionScopePath {
-		// An authorised data connection leaves its provisional controller
-		// for the authority of its path: the principal's, over this uplink,
-		// to this remote host (§4.1). Every connection of one device -- an
-		// old client's isolated and rescue lanes too -- attaches to the same
-		// one.
-		if err := authorizePathPrincipal(s.cfg.Credentials.Store, principal, time.Now()); err != nil {
-			// Not authorised now: the connection carries no data, rather
-			// than carrying it later outside the device's path budget.
-			return
-		}
-		controller = attachPathController(conn, congestionConfig{
-			kind: s.cfg.Congestion, ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched, scope: s.cfg.CongestionScope,
-			// Under a hierarchical profile the gateway's authorities sit in
-			// its own tree (its uplink, then each client endpoint pair) as
-			// knowledge only (§11.3). The legacy gateway had no tree.
-			hierarchicalPath: s.cfg.Profile.HierarchicalPath,
-		}, func() string { return gatewayPathPrincipal(principal) })
+	// An authorised data connection leaves its provisional controller for the
+	// authority of its path: the principal's, over this uplink, to this
+	// remote host (§4.1). Every connection of one device -- an old client's
+	// isolated and rescue lanes too -- attaches to the same one.
+	if err := authorizePathPrincipal(s.cfg.Credentials.Store, principal, time.Now()); err != nil {
+		// Not authorised now: the connection carries no data, rather than
+		// carrying it later outside the device's path budget.
+		return
 	}
+	controller = attachPathController(conn, congestionConfig{
+		// Under a hierarchical profile the gateway's authorities sit in its
+		// own tree (its uplink, then each client endpoint pair) as knowledge
+		// only (§11.3).
+		hierarchicalPath: s.cfg.Profile.HierarchicalPath,
+	}, func() string { return gatewayPathPrincipal(principal) })
 	s.metrics.DataConnectionAccepted(wire)
 	auth := &quicAuthState{principal: principal}
-	// openStreams counts this connection's stream handlers: under
-	// recovery=carrier the keep-alive floor applies while it has any.
+	// openStreams counts this connection's stream handlers: the keep-alive
+	// floor applies while it has any.
 	var openStreams atomic.Int64
-	if s.cfg.Recovery == RecoveryCarrier {
-		go runKeepAliveSchedule(conn, func() bool { return openStreams.Load() > 0 }, time.Second)
-	}
+	go runKeepAliveSchedule(conn, func() bool { return openStreams.Load() > 0 }, time.Second)
 	// connFirstFrames and probes are this connection's own bounds (§10.5): the
 	// streams whose first frame is being read or whose JOIN is being
 	// admitted, and the PROBEs that hold no session slot.
 	connFirstFrames := make(chan struct{}, firstFrameStreams)
 	releaseFirstFrame := func() { <-s.firstFrames; <-connFirstFrames }
-	// tryFirstFrame takes a slot of both first-frame bounds, or neither.
-	tryFirstFrame := func() bool {
-		if !tryAcquire(connFirstFrames) {
-			return false
-		}
-		if !tryAcquire(s.firstFrames) {
-			<-connFirstFrames
-			return false
-		}
-		return true
-	}
 	probes := make(chan struct{}, probeStreams)
 	owned := s.admissionOwned()
 	// Mutual TLS authenticates the whole QUIC connection before any stream is
@@ -1053,20 +933,6 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 			}(lane)
 			return true
 		default:
-			// Every slot is held, typically by the flows this stream may be
-			// trying to recover. A JOIN or a PROBE needs no slot, so the first
-			// frame is read under the connection's own bound before anything
-			// is refused (#170).
-			if !s.cfg.testReleasedAdmission && tryFirstFrame() {
-				wg.Add(1)
-				go func(lane streamConn) {
-					defer wg.Done()
-					openStreams.Add(1)
-					defer openStreams.Add(-1)
-					s.handleSession(ctx, lane, principal, auth, streamAdmission{recoveryOnly: true, release: releaseFirstFrame, probes: probes})
-				}(lane)
-				return true
-			}
 			_ = lane.Close()
 			s.cfg.Logger.Warn("remote session limit reached")
 			return false
@@ -1178,12 +1044,6 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 		s.admitLaneJoin(ctx, conn, fc, principal, open.Header.SessionID, laneID, replacedLaneID, replaceLane, open, releaseFirstFrame)
 		return
 	}
-	if admission.recoveryOnly {
-		// Read past a full session limit only to find a JOIN or a PROBE. An
-		// OPEN is refused exactly as it was before it was read.
-		s.cfg.Logger.Warn("remote session limit reached")
-		return
-	}
 	sessionID := open.Header.SessionID
 	laneID := uint64(0)
 	if open.Header.Type != protocol.TypeOpen || session.IsZeroSessionID(sessionID) || open.Header.FlowID == 0 || open.Header.Sequence != 0 {
@@ -1268,10 +1128,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	defer destinationConn.Close()
 	flow := newMultipathFlow(ctx, destinationConn, sessionID, open.Header.FlowID, s.cfg.ChunkSize, protocol.FlagAckDown, protocol.FlagAckUp, s.budget, s.metrics, s.cfg.Logger)
 	flow.classifier = classifier.New(s.classifierConfig())
-	flow.memOwned = s.cfg.Memory == MemoryOwned
-	flow.codedRetrySticky = s.cfg.CodedRetry == CodedRetrySticky
 	flow.carrierShadow = s.carrierShadow
-	flow.carrierRecovery = s.cfg.Recovery == RecoveryCarrier
 	// Wire version 1 requires range acknowledgements on both endpoints.
 	flow.ackRanges.Store(true)
 	flow.idleTimeout = s.cfg.FlowIdleTimeout
@@ -1407,7 +1264,7 @@ func (s *Server) handlePathProbeFor(fc *frameConn, first protocol.Frame, auth *q
 			bytes+len(frame.Payload) > maxPathProbeBytes {
 			return
 		}
-		if frames == 0 && s.cfg.Recovery == RecoveryCarrier && auth != nil && auth.flows.Load() <= 1 && auth.probeGranted.CompareAndSwap(false, true) {
+		if frames == 0 && auth != nil && auth.flows.Load() <= 1 && auth.probeGranted.CompareAndSwap(false, true) {
 			// The reply verifies a client's standby in this direction while
 			// a silent sibling holds the path's window (§10.2).
 			if qs, ok := fc.transport().(*quicStreamConn); ok {
@@ -1686,7 +1543,7 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 		id: laneID, kind: kind, fc: fc, writeHook: s.cfg.testLaneWriteHook,
 		control: controlReplacement, staged: true,
 	}
-	if s.cfg.Recovery == RecoveryCarrier && kind == TransportQUIC {
+	if kind == TransportQUIC {
 		// Replay towards the client waits for its ACK state on the new
 		// lane, or one SRTT, as the client's own does (§10.3 step 5).
 		srtt := 100 * time.Millisecond
@@ -2150,5 +2007,5 @@ func (s *Server) classifierConfig() classifier.Config {
 	if cfg.BulkBytes == 0 {
 		cfg = profile.Default().Classifier
 	}
-	return phasedClassifierConfig(cfg, s.cfg.Classifier)
+	return cfg
 }

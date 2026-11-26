@@ -13,7 +13,7 @@ func TestFailedPoolProbeRebuildsWithoutClosingSibling(t *testing.T) {
 	t.Cleanup(c.closeQUICPool)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cc := congestionConfig{kind: defaultCongestion()}
+	cc := congestionConfig{}
 	first, err := c.dialPooledQUICLane(ctx, cc)
 	if err != nil {
 		t.Fatal(err)

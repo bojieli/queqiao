@@ -81,7 +81,7 @@ func codedPairWith(t *testing.T, pooled bool, path *pathsim.Config, serve func(n
 	lastClientMetrics = clientMetrics
 	client, err := NewClient(ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: remote, Credentials: roots, Transport: TransportQUIC,
-		EnableQUICPool: pooled, Logger: logger, Metrics: clientMetrics,
+		Logger: logger, Metrics: clientMetrics,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -299,21 +299,6 @@ func TestOneBuildServesACleanPathAndAnErasureChannel(t *testing.T) {
 			t.Logf("%s: %d bytes echoed in %v", test.name, len(payload),
 				time.Since(start).Round(time.Millisecond))
 		})
-	}
-}
-
-// The default controller decides whether the target path is reachable at all,
-// so it is not a matter of taste.
-//
-// Measured live on the China-US link, one lane, three interleaved rounds:
-// reno 0.11, 0.10, 0.08 Mbit/s against erasure's 10.31, 11.63, 10.90 -- a
-// factor of a hundred, and erasure was the only one that never collapsed. On a
-// clean path the erasure controller reduces to BBR, because the floor it
-// measures is zero and the correction it applies is one, so defaulting to it
-// costs nothing where it is not needed.
-func TestTheDefaultControllerIsTheOneThatReachesThePath(t *testing.T) {
-	if got := defaultCongestion(); got != CongestionErasure {
-		t.Fatalf("default congestion controller is %q, want %q", got, CongestionErasure)
 	}
 }
 

@@ -201,11 +201,11 @@ func TestClassArbiterIndivisibleDatagramsStayWithinOnePacketPerRound(t *testing.
 // permitted admission with the arbiter's turn; pacing and the window still
 // decide whether a packet goes at all.
 func TestErasurePathSenderClassScheduling(t *testing.T) {
-	plain := NewErasurePathSender(NewErasureSenderOn(1252, nil), nil)
+	plain := NewErasurePathSender(NewErasureSender(1252), nil)
 	if plain.SchedulesClasses() {
 		t.Fatal("class scheduling is on by default")
 	}
-	p := NewErasurePathSender(NewErasureSenderOn(1252, nil), nil)
+	p := NewErasurePathSender(NewErasureSender(1252), nil)
 	p.EnableClassScheduling(DefaultClassWeights)
 	if !p.SchedulesClasses() {
 		t.Fatal("class scheduling did not turn on")

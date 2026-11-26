@@ -15,15 +15,15 @@ import (
 
 	wancongestion "github.com/bojieli/queqiao/internal/congestion"
 	"github.com/bojieli/queqiao/internal/identity"
-	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/pathsim"
 	"github.com/bojieli/queqiao/internal/protocol"
 )
 
 // schedPair is one connection across an emulated bottleneck. The client's
-// controller is the cc-api=v2 erasure sender, with the given scheduler; the
-// client is the sender in these tests.
-func schedPair(t *testing.T, sched SchedMode, cfg pathsim.Config, windows ...flowWindows) (client, server *quic.Conn, controller *wancongestion.ErasurePathSender) {
+// controller is its own PathController (a principal of its own, so no other
+// test shares it), which arbitrates the classes; the client is the sender in
+// these tests.
+func schedPair(t *testing.T, cfg pathsim.Config, windows ...flowWindows) (client, server *quic.Conn, controller *wancongestion.PathAttachment) {
 	t.Helper()
 	serverCredentials, clientCredentials := testCertificate(t)
 	serverTLS, err := identity.ServerTLSConfig(serverCredentials, defaultALPN, false)
@@ -67,14 +67,14 @@ func schedPair(t *testing.T, sched SchedMode, cfg pathsim.Config, windows ...flo
 		t.Fatal("not accepted")
 	}
 	t.Cleanup(func() { _ = server.CloseWithError(0, "") })
-	pathmodel.Forget(peerKey(client))
-	c := configureQUICController(client, congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2, sched: sched})
-	controller, ok := c.(*wancongestion.ErasurePathSender)
+	principal := "sched-test|" + t.Name()
+	c := attachPathController(client, congestionConfig{}, func() string { return principal })
+	controller, ok := c.(*wancongestion.PathAttachment)
 	if !ok {
 		t.Fatalf("installed %T", c)
 	}
-	if controller.SchedulesClasses() != (sched == SchedClass) {
-		t.Fatalf("sched %q: SchedulesClasses() = %v", sched, controller.SchedulesClasses())
+	if !controller.SchedulesClasses() {
+		t.Fatal("the path controller does not schedule classes")
 	}
 	return client, server, controller
 }
@@ -194,9 +194,10 @@ func percentile(d []time.Duration, p float64) time.Duration {
 // write. Under sched=class the waiting ACK boosts that flow's stream to
 // CONTROL, so the bytes ahead of it are served ahead of the queued BULK of
 // the other seven flows and the ACK goes out within about one chunk at the
-// path rate; under the legacy builder the same chunk drains at an eighth of
-// it. BULK is not starved for it: every bulk flow keeps moving and BULK is
-// served at least its weight.
+// path rate (22 ms for a 32 KiB chunk at 1.5 MB/s), where the round-robin
+// builder that preceded class scheduling drained the same chunk at an eighth
+// of it (about 175 ms). BULK is not starved for it: every bulk flow keeps
+// moving and BULK is served at least its weight.
 func TestControlFeedbackIsServedAheadOfQueuedBulkWhilePaced(t *testing.T) {
 	if testing.Short() {
 		t.Skip("emulated-path timing test")
@@ -204,25 +205,18 @@ func TestControlFeedbackIsServedAheadOfQueuedBulkWhilePaced(t *testing.T) {
 	path := pathsim.Config{OneWayDelay: 10 * time.Millisecond, RateBytesPerSec: 1_500_000, Seed: 7}
 	w := schedWorkload{flows: 8, ackFlows: 1, ackEvery: 25 * time.Millisecond, duration: 5 * time.Second}
 
-	results := map[SchedMode]schedOutcome{}
-	var stats wancongestion.ClassArbiterStats
-	for _, sched := range []SchedMode{SchedLegacy, SchedClass} {
-		client, server, controller := schedPair(t, sched, path)
-		results[sched] = w.run(t, client, server)
-		if sched == SchedClass {
-			stats, _ = controller.ClassStats()
-		}
+	client, server, controller := schedPair(t, path)
+	class := w.run(t, client, server)
+	stats, _ := controller.ClassStats()
+	if len(class.ackDelays) < 50 {
+		t.Fatalf("too few ACKs delivered: %d", len(class.ackDelays))
 	}
-	legacy, class := results[SchedLegacy], results[SchedClass]
-	if len(class.ackDelays) < 50 || len(legacy.ackDelays) < 10 {
-		t.Fatalf("too few ACKs delivered: legacy %d, class %d", len(legacy.ackDelays), len(class.ackDelays))
-	}
-	lp50, lp90 := percentile(legacy.ackDelays, 0.5), percentile(legacy.ackDelays, 0.9)
 	cp50, cp90 := percentile(class.ackDelays, 0.5), percentile(class.ackDelays, 0.9)
-	t.Logf("ACK delay p50/p90: legacy %v/%v (%d ACKs), class %v/%v (%d ACKs)", lp50, lp90, len(legacy.ackDelays), cp50, cp90, len(class.ackDelays))
+	t.Logf("ACK delay p50/p90: %v/%v (%d ACKs)", cp50, cp90, len(class.ackDelays))
 	t.Logf("class arbiter: served %v turns %v", stats.Served, stats.Turns)
-	if cp50*2 > lp50 || cp90*2 > lp90 {
-		t.Fatalf("CONTROL feedback was not served ahead of queued BULK: class p50/p90 %v/%v against legacy %v/%v", cp50, cp90, lp50, lp90)
+	// Half of what the round-robin builder took, at each percentile.
+	if cp50 > 90*time.Millisecond || cp90 > 175*time.Millisecond {
+		t.Fatalf("CONTROL feedback was not served ahead of queued BULK: p50/p90 %v/%v", cp50, cp90)
 	}
 	if stats.Served[quiccongestion.ClassControl] == 0 {
 		t.Fatal("nothing was served at CONTROL")
@@ -251,7 +245,7 @@ func TestManyBoostedFlowsStayWithinControlsShare(t *testing.T) {
 		t.Skip("emulated-path timing test")
 	}
 	path := pathsim.Config{OneWayDelay: 10 * time.Millisecond, RateBytesPerSec: 1_500_000, Seed: 11}
-	client, server, controller := schedPair(t, SchedClass, path)
+	client, server, controller := schedPair(t, path)
 	w := schedWorkload{flows: 7, ackFlows: 6, ackEvery: 2 * time.Millisecond, duration: 5 * time.Second}
 	out := w.run(t, client, server)
 	stats, _ := controller.ClassStats()
@@ -282,7 +276,7 @@ func TestDueWindowUpdatesAreServedAgainstBusyBulk(t *testing.T) {
 		t.Skip("emulated-path timing test")
 	}
 	path := pathsim.Config{OneWayDelay: 10 * time.Millisecond, RateBytesPerSec: 1_500_000, Seed: 13}
-	client, server, controller := schedPair(t, SchedClass, path, flowWindows{stream: 64 << 10, connection: 128 << 10, maxStream: 64 << 10, maxConnection: 128 << 10})
+	client, server, controller := schedPair(t, path, flowWindows{stream: 64 << 10, connection: 128 << 10, maxStream: 64 << 10, maxConnection: 128 << 10})
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 

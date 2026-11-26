@@ -78,9 +78,9 @@ type Config struct {
 	// second one.
 	BulkIdleGapVetoEpisodes int
 
-	// Phased splits the class into two (the classifier=phased bundle).
+	// The class is split in two (the phased classifier, workload model R1).
 	//
-	// Class keeps today's meaning: a sticky fact about the flow, "this flow
+	// Class keeps its original meaning: a sticky fact about the flow, "this flow
 	// has been a bulk transfer". Lane choice, bulk isolation and pre-warm read
 	// it, because re-isolating a flow back and forth costs a lane each way.
 	//
@@ -90,9 +90,6 @@ type Config struct {
 	// round trips, whichever is longer). The frame's class byte, the lane
 	// queue, the aggregate budget's interactive flag and the coding choice
 	// read it.
-	//
-	// Without Phased, Current is Class, which is the legacy bundle.
-	Phased bool
 	// BulkExitWindow and BulkExitWindows set how a flow that is currently
 	// BULK leaves it: after BulkExitWindows distinct windows of BulkExitWindow
 	// in which it carried payload and showed no bulk evidence. Evidence is a
@@ -201,8 +198,7 @@ type Classifier struct {
 	mu           sync.Mutex
 	class        Class
 
-	// current is the phased classifier's present-tense class; without Phased
-	// it is always class. quietWindows counts the distinct exit windows that
+	// current is the present-tense class. quietWindows counts the distinct exit windows that
 	// carried payload since bulk evidence was last seen, firstQuietAge is the
 	// age of the first of them, and lastQuietWindow the index of the latest. backlogSince
 	// is the age at which the present unbroken send backlog began, and
@@ -245,9 +241,7 @@ func (c *Classifier) Declare(class Class) {
 func New(cfg Config) *Classifier {
 	if cfg.NewBytes == 0 || cfg.NewAge <= 0 || cfg.BulkBytes == 0 ||
 		cfg.BulkRateBytesPerSec <= 0 || cfg.BulkMinimumAge <= 0 {
-		phased := cfg.Phased
 		cfg = DefaultConfig()
-		cfg.Phased = phased
 	}
 	defaults := DefaultConfig()
 	if cfg.BulkExitWindow <= 0 {
@@ -273,7 +267,7 @@ func (c *Classifier) Class() Class {
 	return c.class
 }
 
-// Current is what the flow is doing now. Under the legacy bundle it is Class.
+// Current is what the flow is doing now.
 func (c *Classifier) Current() Class {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -299,10 +293,6 @@ func (c *Classifier) SetBacklogBytes(n uint64) {
 	c.cfg.BulkBacklogBytes = n
 }
 
-// Phased reports whether this classifier keeps a current class apart from the
-// sticky one.
-func (c *Classifier) Phased() bool { return c.cfg.Phased }
-
 // PhaseTransitions reports how many times the current class left BULK and
 // re-entered it after the flow first became BULK.
 func (c *Classifier) PhaseTransitions() (exits, reentries uint64) {
@@ -314,17 +304,12 @@ func (c *Classifier) PhaseTransitions() (exits, reentries uint64) {
 // Observe advances the flow class. The caller should call this at a bounded
 // cadence (for example, once per scheduler tick), not once per packet.
 //
-// It returns the current class: under the legacy bundle that is the sticky
-// class, under the phased bundle what the flow is doing now.
+// It returns the current class: what the flow is doing now.
 func (c *Classifier) Observe(o Observation) Class {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	before := c.class
 	c.observeSticky(o)
-	if !c.cfg.Phased {
-		c.current = c.class
-		return c.current
-	}
 	c.observeCurrent(o, before)
 	return c.current
 }

@@ -123,11 +123,10 @@ type ErasureSender struct {
 	// charged must agree, and a counter is how that is checked from outside.
 	passed atomic.Uint64
 
-	// path is shared with every other lane to the same endpoint pair, or nil
-	// for a lane that is on its own. share is this lane's allowance of the
-	// endpoint's bottleneck in bytes per second, zero while it is unknown.
+	// path is the path's knowledge (erasure, burst, round trip), shared by
+	// every controller of the same path, or nil for a sender on its own.
+	// Nothing is divided through it: it carries no rate.
 	path   pathmodel.Model
-	share  atomic.Uint64
 	member pathmodel.Member
 
 	// The bytes of packets that elicit no acknowledgement (QUIC ACK-only
@@ -138,9 +137,8 @@ type ErasureSender struct {
 	nonElicitingDebited   atomic.Uint64
 	nonElicitingUndebited atomic.Uint64
 
-	// authority says this sender is the control law of a PathController
-	// (congestion=path): the one controller of its path and direction. It
-	// takes no share and no seed, because nothing is divided; its estimator
+	// authority says this sender is the control law of a PathController: the
+	// one controller of its path and direction. Its estimator
 	// is fed in the path's send order by the controller rather than from
 	// each acknowledgement batch; its sampler retires packet states by fate;
 	// and its pacer keeps debt.
@@ -169,64 +167,16 @@ const (
 )
 
 // NewErasureSender returns a controller for a path whose loss is mostly not
-// congestion, deciding on its own. Use NewErasureSenderOn when more than one
-// lane shares an endpoint pair.
+// congestion, deciding on its own: a connection's controller until it
+// attaches to its path's PathController, or one that never does.
 func NewErasureSender(initialPacketSize quiccongestion.ByteCount) *ErasureSender {
-	return NewErasureSenderOn(initialPacketSize, nil)
-}
-
-// NewErasureSenderOn returns a controller that pools its measurements with
-// every other lane on the same path.
-//
-// Deciding alone is what made lanes cost more than they earn: each lane
-// measures the erasure floor from only its own packets, and each discovers the
-// bottleneck from only its own delivered rate, so the aggregate overshoots by
-// however many lanes there are and the path's loss stops being memoryless.
-func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmodel.Model) *ErasureSender {
-	e := newErasureSender(initialPacketSize)
-	e.path = path
-	if path != nil {
-		// Start where its siblings already are rather than at the initial
-		// window. On a path that erases 40% of packets the ramp is the
-		// expensive part, and a lane opened to replace one that died would
-		// otherwise pay it again on a path nothing has forgotten.
-		//
-		// What is seeded is the delivered rate, compensated for the erasure --
-		// which is what this sender puts on the wire to deliver it. BBR sizes
-		// both its pacing and its window from that one number, so seeding it
-		// moves both; seeding a pacing rate alone leaves the window at the
-		// initial one and the pacer waiting on it.
-		//
-		// The seed and the cap are separate: a lane joining a path that is
-		// already occupied takes both, and a lane that is alone takes the
-		// seed only. Sharing one number for the two used to mean that the
-		// only lane on a path capped itself at whatever the last one managed.
-		state := path.Current()
-		// The measured erasure is path knowledge, so a replacement lane paces
-		// from it rather than rediscovering it. On a channel that erases 42% of
-		// packets that rediscovery is expensive -- it is the same ramp that
-		// costs a loss-based controller the path in the first place -- and a
-		// lane opened because its predecessor died would pay it every time.
-		if state.Erasure > 0 {
-			e.arrival.Store(uint64((1 - state.Erasure) * partsPerMillion))
-			e.erasure.Store(uint64(state.Erasure * partsPerMillion))
-		}
-		if state.Seed > 0 {
-			if state.Share > 0 {
-				e.share.Store(uint64(state.Share))
-			}
-			e.inner.seedBandwidth(uint64(state.Seed/e.arrivalRate()), state.RoundTrip)
-		}
-	}
-	return e
+	return newErasureSender(initialPacketSize)
 }
 
 // newPathLaw returns the erasure control law a PathController hosts. It
 // reports what it measures to path, which the coded path's FEC and the
 // prewarm read, and reads back only the path's knowledge of its erasure as a
-// prior for the compensation, exactly as a lane did. It takes no seed and no
-// share: those divided the path between controllers, and a path controller is
-// the only one.
+// prior for the compensation.
 func newPathLaw(initialPacketSize quiccongestion.ByteCount, path pathmodel.Model) *ErasureSender {
 	e := newErasureSender(initialPacketSize)
 	e.authority = true
@@ -263,28 +213,18 @@ func newErasureSender(initialPacketSize quiccongestion.ByteCount) *ErasureSender
 	return e
 }
 
-// deliveredRate is BBR's estimate of what arrives, bounded by this lane's
-// share of the endpoint pair's bottleneck.
-//
-// The cap is what keeps lanes from compounding. Each lane's own estimate is
-// what it alone is receiving, so four lanes each probing above their own
-// estimate put four times the overshoot into one bottleneck; capping at the
-// share means the aggregate on the wire is what a single sender would have put
-// there. The burst allowance is measured against this for the same reason.
-func (e *ErasureSender) deliveredRate() float64 {
-	delivered := float64(e.inner.bandwidth())
-	if share := float64(e.share.Load()); share > 0 && share < delivered {
-		delivered = share
-	}
-	return delivered
-}
-
 // bandwidth is the rate to put on the wire: what arrives, divided by the
 // fraction that arrives.
 func (e *ErasureSender) bandwidth() quiccongestion.ByteCount {
 	// The delay bound is applied after the erasure compensation rather than
 	// before it, because the queue holds what was sent and not what arrived.
 	return quiccongestion.ByteCount(e.delayBounded(e.deliveredRate() / e.arrivalRate()))
+}
+
+// deliveredRate is what this sender has measured arriving, in bytes per
+// second. Nothing caps it: no share divides the path between controllers.
+func (e *ErasureSender) deliveredRate() float64 {
+	return float64(e.inner.bandwidth())
 }
 
 // compensationFor decides how much of a proposed compensation to apply, by
@@ -672,29 +612,15 @@ func (e *ErasureSender) publishMeasurement() {
 	}
 	erasure := snapshot.Loss
 	if e.path != nil {
-		// Pool with the other lanes: the estimate converges on all their
-		// samples together, and the share is what stops their probes
-		// compounding.
-		delivered := float64(e.inner.bandwidth())
-		if e.authority {
-			// A path controller divides nothing, so it keeps the model's
-			// bandwidth-share history out of it: a delivered rate would
-			// make every report append to and scan that history, under
-			// the lock every sibling's admission waits on, for a share
-			// nothing reads.
-			delivered = 0
-		}
+		// Pool the knowledge with the path's other controllers: the
+		// estimate converges on all their samples together.
 		state := e.path.Report(e.id(), pathmodel.Observation{
 			Erasure: snapshot.Loss, BurstFactor: snapshot.BurstFactor,
 			ObservedSamples: float64(snapshot.Decided),
-			Delivered:       delivered,
 			RoundTrip:       e.inner.minRoundTrip(),
 		})
 		erasure = state.Erasure
 		e.erasure.Store(uint64(state.Erasure * partsPerMillion))
-		if !e.authority {
-			e.share.Store(uint64(state.Share))
-		}
 	}
 	// The compensation rides on the measurement rather than on a floor biased
 	// low for pacing. Under-compensating is not the safe direction it looks
@@ -767,11 +693,6 @@ func (e *ErasureSender) Telemetry() ControllerTelemetry {
 // id identifies this lane within its shared model. It avoids pointer-derived
 // identity so a report never exposes an address, even inside the process.
 func (e *ErasureSender) id() pathmodel.Member { return e.member }
-
-// Share is this lane's allowance of the endpoint pair's bottleneck in bytes
-// per second, or zero when it is deciding alone or the bottleneck is not yet
-// known.
-func (e *ErasureSender) Share() float64 { return float64(e.share.Load()) }
 
 // Channel reports what this sender has measured about the path and how many
 // losses it has handed to the controller.

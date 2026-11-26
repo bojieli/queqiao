@@ -25,18 +25,14 @@ type carrierPairOptions struct {
 	path pathsim.Config
 	// serve runs the destination; nil echoes.
 	serve func(net.Listener)
-	// clientRecovery and gatewayRecovery default to carrier.
-	clientRecovery, gatewayRecovery RecoveryMode
-	// releasedGateway runs the gateway with every switch off and released
-	// admission: an old peer.
+	// releasedGateway runs the gateway with a released gateway's admission
+	// (every stream charged a session slot before its first frame is read).
 	releasedGateway bool
-	// legacyClient runs the client with every switch off: an old peer.
-	legacyClient bool
-	transport    TransportKind
-	clientWires  []byte
-	gatewayHook  func(protocol.Frame) error
-	recovery     CarrierRecoveryConfig
-	maxSessions  int
+	transport       TransportKind
+	clientWires     []byte
+	gatewayHook     func(protocol.Frame) error
+	recovery        CarrierRecoveryConfig
+	maxSessions     int
 	// onFlow is handed every flow the client starts.
 	onFlow func(*multipathFlow)
 }
@@ -50,8 +46,8 @@ type carrierPair struct {
 	clientLogs, gatewayLogs *lockedBuffer
 	clientMetrics           *metrics.Registry
 	gatewayMetrics          *metrics.Registry
-	// gatewayCarrier says the gateway runs recovery=carrier, so it demotes
-	// no lane either.
+	// gatewayCarrier says the gateway is not the released-gateway emulation,
+	// so it demotes no lane either.
 	gatewayCarrier bool
 	tcpRelay       net.Listener
 }
@@ -61,12 +57,6 @@ func newCarrierPair(t *testing.T, o carrierPairOptions) *carrierPair {
 	requireStableImpairmentClock(t)
 	pathmodel.Reset()
 	t.Cleanup(pathmodel.Reset)
-	if o.clientRecovery == "" {
-		o.clientRecovery = RecoveryCarrier
-	}
-	if o.gatewayRecovery == "" {
-		o.gatewayRecovery = RecoveryCarrier
-	}
 	if o.transport == "" {
 		o.transport = TransportQUIC
 	}
@@ -97,20 +87,13 @@ func newCarrierPair(t *testing.T, o carrierPairOptions) *carrierPair {
 		Metrics:   p.gatewayMetrics, HandshakeTimeout: 30 * time.Second, testLaneWriteHook: o.gatewayHook,
 		MaxSessions: o.maxSessions,
 	}
-	if o.releasedGateway {
-		scfg.testReleasedAdmission = true
-	} else {
-		scfg.CCAPI, scfg.Sched, scfg.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
-		scfg.CodedRetry, scfg.Memory, scfg.Classifier = CodedRetrySticky, MemoryOwned, ClassifierPhased
-		scfg.GatewayAdmission = GatewayAdmissionOwned
-		scfg.Recovery = o.gatewayRecovery
-	}
+	scfg.testReleasedAdmission = o.releasedGateway
 	server, err := NewServer(scfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	p.server = server
-	p.gatewayCarrier = !o.releasedGateway && o.gatewayRecovery == RecoveryCarrier
+	p.gatewayCarrier = !o.releasedGateway
 	remote := packetConn.LocalAddr().String()
 	relay, err := pathsim.New("127.0.0.1:0", remote, o.path)
 	if err != nil {
@@ -139,14 +122,10 @@ func newCarrierPair(t *testing.T, o carrierPairOptions) *carrierPair {
 	}
 	ccfg := ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: remote, Credentials: roots, Transport: o.transport,
-		EnableQUICPool: true, Metrics: p.clientMetrics, WireVersions: o.clientWires,
+		Metrics: p.clientMetrics, WireVersions: o.clientWires,
 		Logger: slog.New(slog.NewJSONHandler(p.clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
-	if !o.legacyClient {
-		ccfg.CCAPI, ccfg.Sched, ccfg.CongestionScope, ccfg.Topology = CCAPIV2, SchedClass, CongestionScopePath, TopologySingle
-		ccfg.CodedRetry, ccfg.Memory, ccfg.Classifier = CodedRetrySticky, MemoryOwned, ClassifierPhased
-		ccfg.Recovery, ccfg.CarrierRecovery = o.clientRecovery, o.recovery
-	}
+	ccfg.CarrierRecovery = o.recovery
 	client, err := NewClient(ccfg)
 	if err != nil {
 		t.Fatal(err)

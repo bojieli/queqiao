@@ -94,36 +94,24 @@ func blockingEcho(held *atomic.Bool, release <-chan struct{}) func(net.Listener)
 	}
 }
 
-// The switch is what removes per-flow rescue (§14 stage 8): the same credit
-// stall that makes today's watchdog demote the lane and ask for a rescue
-// demotes nothing and dials nothing under recovery=carrier.
+// Carrier recovery removed per-flow rescue (§10.4): a credit stall on a live
+// stream demotes nothing and dials nothing; it is waited out.
 func TestCarrierRecoveryDisablesRescueDialsAndDemotion(t *testing.T) {
-	for _, mode := range []RecoveryMode{RecoveryFlow, RecoveryCarrier} {
-		t.Run(string(mode), func(t *testing.T) {
-			var held atomic.Bool
-			release := make(chan struct{})
-			p := newCarrierPair(t, carrierPairOptions{
-				path:  pathsim.Config{OneWayDelay: 15 * time.Millisecond, Seed: 6},
-				serve: blockingEcho(&held, release), clientRecovery: mode, gatewayRecovery: mode,
-			})
-			e := startEchoStream(t, p, 4096, 2*time.Millisecond)
-			e.waitEchoed(t, 32<<10, 20*time.Second)
-			held.Store(true)
-			time.Sleep(3 * time.Second)
-			close(release)
-			e.waitEchoed(t, e.echoed.Load()+64<<10, 30*time.Second)
-			demotions := countRecords(t, p.clientLogs, "flow stall suspected; lane demoted and rescue requested")
-			if mode == RecoveryFlow {
-				if demotions == 0 {
-					t.Fatalf("today's recovery never demoted the stalled lane; the stall did not happen")
-				}
-				return
-			}
-			assertNoLegacyRecovery(t, p)
-			if countRecords(t, p.clientLogs, "flow credit missing on a live stream; waiting") == 0 {
-				t.Fatalf("the stall did not happen")
-			}
-		})
+	var held atomic.Bool
+	release := make(chan struct{})
+	p := newCarrierPair(t, carrierPairOptions{
+		path:  pathsim.Config{OneWayDelay: 15 * time.Millisecond, Seed: 6},
+		serve: blockingEcho(&held, release),
+	})
+	e := startEchoStream(t, p, 4096, 2*time.Millisecond)
+	e.waitEchoed(t, 32<<10, 20*time.Second)
+	held.Store(true)
+	time.Sleep(3 * time.Second)
+	close(release)
+	e.waitEchoed(t, e.echoed.Load()+64<<10, 30*time.Second)
+	assertNoLegacyRecovery(t, p)
+	if countRecords(t, p.clientLogs, "flow credit missing on a live stream; waiting") == 0 {
+		t.Fatalf("the stall did not happen")
 	}
 }
 
@@ -211,18 +199,18 @@ func TestCarrierRecoveryReturnsASuspectCarrierToActive(t *testing.T) {
 	assertNoLegacyRecovery(t, p)
 }
 
-// Mixed peers (test 17). A new client against a gateway with every switch
-// off and released admission, and an old client against a new gateway:
-// either way a dead carrier is recovered and the bytes arrive. Against the
-// released gateway the rebinding JOIN adds a lane beside the dead one and
-// the client closes the old stream.
+// Mixed peers (test 17). A client against a gateway with released admission,
+// and a client pinned to wire 1: either way a dead carrier is recovered and
+// the bytes arrive. Against the released gateway the rebinding JOIN adds a
+// lane beside the dead one and the client closes the old stream. An old
+// client against a new gateway can no longer be built in-process; the
+// released-binary interop gate (scripts/wire_interop.py) covers it.
 func TestCarrierRecoveryWithMixedPeers(t *testing.T) {
 	cases := []struct {
 		name string
 		o    carrierPairOptions
 	}{
 		{"new client, released gateway", carrierPairOptions{releasedGateway: true}},
-		{"old client, new gateway", carrierPairOptions{legacyClient: true}},
 		{"new client on wire 1", carrierPairOptions{clientWires: []byte{1}}},
 	}
 	for _, tc := range cases {
@@ -233,12 +221,6 @@ func TestCarrierRecoveryWithMixedPeers(t *testing.T) {
 			e.waitEchoed(t, 32<<10, 20*time.Second)
 			p.relay.BlackholeSources()
 			e.waitEchoed(t, e.echoed.Load()+64<<10, 40*time.Second)
-			if tc.o.legacyClient {
-				if n := countRecords(t, p.gatewayLogs, "flow stall suspected; lane demoted and rescue requested"); n != 0 {
-					t.Fatalf("the new gateway demoted a lane %d times", n)
-				}
-				return
-			}
 			if got := p.client.carriers.promotions.Load(); got != 1 {
 				t.Fatalf("%d promotions, want 1", got)
 			}

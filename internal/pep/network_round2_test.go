@@ -231,7 +231,7 @@ func TestRound2PooledPathProbePreservesSibling(t *testing.T) {
 	defer rig.client.closeQUICPool()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	sibling, err := rig.client.dialPooledQUICLane(ctx, congestionConfig{kind: defaultCongestion()})
+	sibling, err := rig.client.dialPooledQUICLane(ctx, congestionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestRound2PooledPathProbePreservesSibling(t *testing.T) {
 
 func TestRound2QueuedReliableChunkCannotTurnIntoDatagram(t *testing.T) {
 	model := pathmodel.NewPathModel()
-	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000, Delivered: 2e6})
+	model.Report(1, pathmodel.Observation{Erasure: .2, BurstFactor: 1, ObservedSamples: 5000})
 	path := coded.New(newPipeCarrier(), coded.Config{Path: model})
 	defer path.Close()
 	capture := newAckCaptureConn(0, nil)

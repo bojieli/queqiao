@@ -117,44 +117,13 @@ func checkNegotiatedWire(alpn string, offered []byte) (byte, bool) {
 }
 
 const (
-	defaultAdaptiveMinBytesPerSec = 64 * 1024
-	defaultAdaptiveMaxBytesPerSec = 200 * 1024 * 1024
-	maxConfiguredSessions         = 1 << 16
+	maxConfiguredSessions = 1 << 16
 )
 
-// CongestionControlKind selects the QUIC sender.
-//
-// Erasure is the default and the only one that should normally be chosen. Reno
-// leaves the apNet quic-go default untouched and is the safe control. BBR is
-// the original queqiao controller. BBRTUIC is a faithful Go port of TUIC's
-// quinn-congestions BBR model. Adaptive is a conservative rate-estimating
-// controller for unknown paths. Brutal is a fixed-rate mode for controlled
-// experiments where the operator knows the per-lane budget.
-type CongestionControlKind string
-
-const (
-	CongestionReno     CongestionControlKind = "reno"
-	CongestionBBR      CongestionControlKind = "bbr"
-	CongestionBBRTUIC  CongestionControlKind = "bbr-tuic"
-	CongestionAdaptive CongestionControlKind = "adaptive"
-	CongestionBrutal   CongestionControlKind = "brutal"
-	// CongestionErasure is BBR corrected for a path that erases packets for
-	// reasons unrelated to congestion. It is the right choice on a long-haul
-	// path with a loss floor; on a clean path it reduces to BBR, because the
-	// floor it measures is zero and the correction it applies is one.
-	CongestionErasure CongestionControlKind = "erasure"
-)
-
-// defaultCongestion is the controller used when none is configured. It is a
-// function rather than a constant so the choice has one home and a test can
-// name it.
-func defaultCongestion() CongestionControlKind { return CongestionErasure }
-
+// congestionConfig is what a QUIC connection needs to attach to its path's
+// controller (design §4): every connection runs the erasure law of one
+// PathController per path and sending direction, with class arbitration.
 type congestionConfig struct {
-	kind                   CongestionControlKind
-	brutalBytesPerSecond   uint64
-	adaptiveMinBytesPerSec uint64
-	adaptiveMaxBytesPerSec uint64
 	// hierarchicalPath models the path as a chain of segments rather than a
 	// single endpoint pair, so that flows to different peers pool what they
 	// share -- the uplink -- while keeping separate what they do not.
@@ -165,17 +134,6 @@ type congestionConfig struct {
 	// one client serves several providers, which share the client's uplink and
 	// nothing else.
 	hierarchicalPath bool
-	// discoverGrouping lets the tree's shape follow the evidence rather than
-	// the static hierarchy. It does nothing without hierarchicalPath.
-	discoverGrouping bool
-	// ccAPI selects how the controller is driven; see CCAPIVersion.
-	ccAPI CCAPIVersion
-	// sched selects the class scheduler; see SchedMode. It applies only
-	// with ccAPI v2.
-	sched SchedMode
-	// scope selects what one controller governs; see CongestionScope. It
-	// applies only with ccAPI v2 and the erasure law.
-	scope CongestionScope
 	// provisional says the connection's peer is not yet known to be an
 	// authorised data connection (a gateway installs a controller before it
 	// knows the ALPN or the principal). Under congestion=path such a
@@ -1202,93 +1160,14 @@ func configureQUICController(conn *quic.Conn, cfg congestionConfig) wancongestio
 	if conn == nil {
 		return nil
 	}
-	switch cfg.kind {
-	case CongestionBBR:
-		controller := wancongestion.NewBBRSender(conn.InitialPacketSize())
-		conn.SetCongestionControl(controller)
-		return controller
-	case CongestionBBRTUIC:
-		controller := wancongestion.NewTUICBBRSender(conn.InitialPacketSize())
-		conn.SetCongestionControl(controller)
-		return controller
-	case CongestionAdaptive:
-		controller := wancongestion.NewAdaptiveSender(conn.InitialPacketSize(), cfg.adaptiveMinBytesPerSec, cfg.adaptiveMaxBytesPerSec)
-		conn.SetCongestionControl(controller)
-		return controller
-	case CongestionErasure:
-		// Every lane to the same peer shares one model. Deciding alone is what
-		// made lanes cost more than they earn on this path: each measured the
-		// erasure floor from only its own packets and discovered the
-		// bottleneck from only its own delivered rate, so the aggregate
-		// overshot by however many lanes there were. Live, four lanes
-		// delivered about 8 Mbit/s where one delivered 11.
-		if cfg.ccAPI == CCAPIV2 && cfg.scope == CongestionScopePath {
-			if cfg.provisional {
-				return provisionalPathController(conn)
-			}
-			principal := cfg.principal
-			if principal == nil {
-				principal = func() string { return clientPathPrincipal }
-			}
-			return attachPathController(conn, cfg, principal)
-		}
-		if cfg.ccAPI == CCAPIV2 {
-			// One resolution of the path names both the model and the key a
-			// migration is compared against.
-			egress, key := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
-			controller := wancongestion.NewErasureSenderOn(
-				conn.InitialPacketSize(), pathModelForKey(key, egress, cfg.hierarchicalPath, cfg.discoverGrouping))
-			attached := wancongestion.NewErasurePathSender(controller, erasureRekey(conn, cfg, key))
-			attached.SetAddresses(func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
-			if cfg.sched == SchedClass {
-				attached.EnableClassScheduling(wancongestion.DefaultClassWeights)
-				markClassScheduled(conn)
-			}
-			conn.SetCongestionControl(attached)
-			return attached
-		}
-		controller := wancongestion.NewErasureSenderOn(
-			conn.InitialPacketSize(), pathModelFor(conn, cfg.hierarchicalPath, cfg.discoverGrouping))
-		conn.SetCongestionControl(controller)
-		return controller
-	case CongestionBrutal:
-		if cfg.brutalBytesPerSecond > 0 {
-			controller := wancongestion.NewBrutalSender(cfg.brutalBytesPerSecond, false)
-			conn.SetCongestionControl(controller)
-			return controller
-		}
-	case CongestionReno, "":
-		// Keep the controller selected by the QUIC implementation.
-	default:
-		// Configuration is validated before dialing. Fail-safe to the stock
-		// controller if a future caller constructs an invalid config directly.
+	if cfg.provisional {
+		return provisionalPathController(conn)
 	}
-	return nil
-}
-
-// erasureRekey decides, after a connection migrated, whether it moved to
-// another path. A NAT rebinding that changes only the port, or a local
-// rebinding onto the same uplink, keeps the path key and so keeps the
-// controller with everything it has measured. A new remote host or a new
-// uplink is another path, and gets a fresh controller for it, which is what
-// re-attaching to that path's state means while each connection still owns
-// its controller.
-//
-// The comparison is against the key resolved when the current controller was
-// chosen, not one recomputed from the old addresses: a wildcard-bound socket's
-// key comes from the routing table, which after an uplink change resolves the
-// old addresses to the new uplink too.
-func erasureRekey(conn *quic.Conn, cfg congestionConfig, current string) func(oldLocal, newLocal, oldRemote, newRemote net.Addr) *wancongestion.ErasureSender {
-	return func(_, newLocal, _, newRemote net.Addr) *wancongestion.ErasureSender {
-		egress, next := resolvePath(newLocal, newRemote)
-		if next == current {
-			return nil
-		}
-		current = next
-		// The connection's other readers of the path follow it too.
-		rekeyPathModel(conn, next)
-		return wancongestion.NewErasureSenderOn(conn.InitialPacketSize(), pathModelForKey(next, egress, cfg.hierarchicalPath, cfg.discoverGrouping))
+	principal := cfg.principal
+	if principal == nil {
+		principal = func() string { return clientPathPrincipal }
 	}
+	return attachPathController(conn, cfg, principal)
 }
 
 // peerKey identifies the endpoint pair a connection belongs to. It is the
@@ -1305,31 +1184,6 @@ func erasureRekey(conn *quic.Conn, cfg congestionConfig, current string) func(ol
 // downstream is sized from it. The local address is what distinguishes them:
 // changing uplink changes it, so the model for the new path starts empty
 // rather than inheriting the old one's conclusions.
-// pathModelFor returns the model this connection contributes to and reads.
-//
-// Flat, that is one model per endpoint pair, which is what every deployment
-// had before the tree existed and what the WAN results were measured on.
-// Hierarchical, it is the uplink's model and the peer's, and a flow may do
-// only what the tighter of the two permits -- so a second provider reached
-// over the same uplink starts from what the first measured about it, and a
-// congested peer does not throttle traffic to a healthy one.
-func pathModelFor(conn *quic.Conn, hierarchical, discover bool) pathmodel.Model {
-	egress, key := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
-	return pathModelForKey(key, egress, hierarchical, discover)
-}
-
-// pathModelForKey selects the model for a resolved path key and egress, so a
-// caller that also remembers the key resolves the route once.
-func pathModelForKey(key, egress string, hierarchical, discover bool) pathmodel.Model {
-	if !hierarchical {
-		return pathmodel.Shared(key)
-	}
-	k := pathmodel.Key{Egress: egress, Dest: key}
-	if discover {
-		return pathmodel.SharedChainRegrouping(k)
-	}
-	return pathmodel.SharedChain(k)
-}
 
 func peerKey(conn *quic.Conn) string {
 	return pathKey(conn.LocalAddr(), conn.RemoteAddr())

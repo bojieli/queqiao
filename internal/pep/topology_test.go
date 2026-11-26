@@ -13,131 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bojieli/queqiao/internal/classifier"
-	wancongestion "github.com/bojieli/queqiao/internal/congestion"
 	"github.com/bojieli/queqiao/internal/metrics"
 )
 
-// newBundleClient is the stage-7 client configuration under test: the
-// congestion=path bundle with classifier=phased, as the stage 6/7 campaigns
-// run it (design §15.3), and the given topology.
-func newBundleClientConfig(topology Topology) ClientConfig {
-	return ClientConfig{
-		Transport: TransportQUIC, EnableQUICPool: true,
-		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
-		Classifier: ClassifierPhased, Topology: topology,
-	}
-}
-
-func TestTopologyValidator(t *testing.T) {
-	for _, c := range []struct {
-		topology Topology
-		scope    CongestionScope
-		fanOut   int
-		ok       bool
-	}{
-		{"", "", 0, true},
-		{TopologyIsolated, CongestionScopeConnection, 0, true},
-		{TopologyIsolated, CongestionScopePath, 1, true},
-		{TopologySingle, CongestionScopePath, 0, true},
-		{TopologySingle, CongestionScopePath, maxTopologyFanOut, true},
-		// One connection per path needs the path controller's arbitration.
-		{TopologySingle, CongestionScopeConnection, 0, false},
-		{TopologySingle, "", 0, false},
-		// A fan-out is a policy of the single topology only.
-		{TopologyIsolated, CongestionScopePath, 2, false},
-		{TopologySingle, CongestionScopePath, maxTopologyFanOut + 1, false},
-		{TopologySingle, CongestionScopePath, -1, false},
-		{"mesh", CongestionScopePath, 0, false},
-	} {
-		err := ValidateTopology(c.topology, c.scope, c.fanOut)
-		if (err == nil) != c.ok {
-			t.Errorf("ValidateTopology(%q, %q, %d) = %v, want ok=%v", c.topology, c.scope, c.fanOut, err, c.ok)
-		}
-	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, ClassifierPhased, CongestionScopePath, TopologySingle, ""); got != "cc-api=v2,sched=class,congestion=path,topology=single,classifier=phased" {
-		t.Errorf("bundle %q", got)
-	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, ClassifierLegacy, CongestionScopePath, TopologyIsolated, ""); got != "cc-api=v2,sched=class,congestion=path" {
-		t.Errorf("isolated topology is the default and not named: %q", got)
-	}
-
-	_, roots := testCertificate(t)
-	base := func(mutate func(*ClientConfig)) error {
-		cfg := newBundleClientConfig(TopologySingle)
-		cfg.ListenAddr, cfg.RemoteAddr, cfg.Credentials = "127.0.0.1:0", "127.0.0.1:1", roots
-		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-		mutate(&cfg)
-		_, err := NewClient(cfg)
-		return err
-	}
-	if err := base(func(*ClientConfig) {}); err != nil {
-		t.Fatalf("the stage-7 bundle was rejected: %v", err)
-	}
-	for name, mutate := range map[string]func(*ClientConfig){
-		"without the path controller": func(c *ClientConfig) { c.CongestionScope = CongestionScopeConnection },
-		"without the pool":            func(c *ClientConfig) { c.EnableQUICPool = false },
-		"fan-out beyond the iOS pool": func(c *ClientConfig) {
-			c.TopologyFanOut = 3
-			c.MemoryLimits = iosMemoryLimits()
-			c.ChunkSize = iosChunkSize
-		},
-		"fan-out without single": func(c *ClientConfig) { c.Topology = TopologyIsolated; c.TopologyFanOut = 2 },
-	} {
-		if err := base(mutate); err == nil {
-			t.Errorf("%s: accepted", name)
-		}
-	}
-	// iOS has one secondary connection: a fan-out of two fits.
-	if err := base(func(c *ClientConfig) {
-		c.TopologyFanOut = 2
-		c.MemoryLimits = iosMemoryLimits()
-		c.ChunkSize = iosChunkSize
-	}); err != nil {
-		t.Fatalf("a fan-out within the iOS pool was rejected: %v", err)
-	}
-}
-
-// The placement decision itself: under topology=single nothing moves a flow
-// to a second connection unless a fan-out is configured, and then the
-// trigger is a bulk flow sharing its generation of the preferred connection,
-// within the fan-out's connection budget.
-func TestSingleTopologyIsolatesOnlyForAnExplicitFanOut(t *testing.T) {
-	bulk := flowSnapshot{Class: classifier.ClassBulk}
-	quiet := flowSnapshot{Class: classifier.ClassInteractive}
-	for _, c := range []struct {
-		name     string
-		topology Topology
-		fanOut   int
-		shared   int64
-		snapshot flowSnapshot
-		want     bool
-		budget   int
-	}{
-		{"isolated: bulk sharing the pool isolates", TopologyIsolated, 0, 2, bulk, true, isolatedBulkConns},
-		{"isolated: a lone bulk flow stays", TopologyIsolated, 0, 1, bulk, false, isolatedBulkConns},
-		{"isolated: interactive stays", TopologyIsolated, 0, 2, quiet, false, isolatedBulkConns},
-		{"single: bulk sharing the connection stays", TopologySingle, 0, 8, bulk, false, 0},
-		{"single, fan-out 1 is off", TopologySingle, 1, 8, bulk, false, 0},
-		{"single, fan-out 3: bulk sharing fans out", TopologySingle, 3, 2, bulk, true, 2},
-		{"single, fan-out 3: a lone bulk flow stays", TopologySingle, 3, 1, bulk, false, 2},
-		{"single, fan-out 3: interactive stays", TopologySingle, 3, 2, quiet, false, 2},
-	} {
-		c := c
-		t.Run(c.name, func(t *testing.T) {
-			client := &Client{cfg: ClientConfig{Topology: c.topology, TopologyFanOut: c.fanOut}}
-			client.memoryLimits.maxBulkConnections = isolatedBulkConns
-			client.quicPoolActive.Store(c.shared)
-			generation := &controlQUICGeneration{}
-			generation.flows.Store(c.shared)
-			if got := client.secondConnectionWanted(c.snapshot, func() *controlQUICGeneration { return generation }); got != c.want {
-				t.Fatalf("secondConnectionWanted = %v, want %v", got, c.want)
-			}
-			if got := client.maxBulkConns(); got != c.budget {
-				t.Fatalf("bulk pool budget %d, want %d", got, c.budget)
-			}
-		})
-	}
+// newBundleClientConfig is the client configuration under test: QUIC, one
+// connection per path (design §7).
+func newBundleClientConfig() ClientConfig {
+	return ClientConfig{Transport: TransportQUIC}
 }
 
 // Connection-level flow control is not the new bottleneck. Under isolation
@@ -159,7 +41,7 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 		windows flowWindows
 		maxBulk int
 	}{
-		{"desktop", flowWindows{}, isolatedBulkConns},
+		{"desktop", flowWindows{}, maxWindowCreditConnections},
 		// mobile/core/resources.go.
 		{"ios", flowWindows{stream: 64 * kib, maxStream: 64 * kib, connection: 2 * mib, maxConnection: 2 * mib, maxStreams: 32}, 1},
 		{"android", flowWindows{stream: mib, maxStream: mib, connection: 4 * mib, maxConnection: 4 * mib, maxStreams: 64}, 2},
@@ -168,7 +50,6 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 	} {
 		t.Run(p.name, func(t *testing.T) {
 			client := &Client{cfg: ClientConfig{
-				Topology:            TopologySingle,
 				StreamReceiveWindow: p.windows.stream, MaxStreamReceiveWindow: p.windows.maxStream,
 				ConnectionReceiveWindow: p.windows.connection, MaxConnectionReceiveWindow: p.windows.maxConnection,
 				MaxIncomingStreams: p.windows.maxStreams,
@@ -204,8 +85,8 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 			t.Logf("connection window %d..%d -> %d..%d", conn, connMax, sConn, sConnMax)
 		})
 	}
-	desktop := &Client{cfg: ClientConfig{Topology: TopologySingle}}
-	desktop.memoryLimits.maxBulkConnections = isolatedBulkConns
+	desktop := &Client{cfg: ClientConfig{}}
+	desktop.memoryLimits.maxBulkConnections = maxWindowCreditConnections
 	if w, hold := desktop.reservePreferredWindows(); w != desktop.windows() {
 		t.Fatalf("desktop windows changed: %+v", w)
 	} else {
@@ -404,80 +285,47 @@ func TestSingleTopologyKeepsConcurrentBulkFlowsOnOneConnection(t *testing.T) {
 	if testing.Short() {
 		t.Skip("multi-second end-to-end transfer")
 	}
-	for _, arm := range []struct {
-		topology Topology
-		fanOut   int
-	}{{TopologyIsolated, 0}, {TopologySingle, 0}, {TopologySingle, 2}} {
-		topology := arm.topology
-		t.Run(fmt.Sprintf("%s fan-out %d", topology, arm.fanOut), func(t *testing.T) {
-			pathAuthorities.forget()
-			clientMetrics := metrics.New()
-			cfg := newBundleClientConfig(topology)
-			cfg.Metrics = clientMetrics
-			cfg.TopologyFanOut = arm.fanOut
-			rig := newTopologyRig(t, ServerConfig{
-				CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath, Classifier: ClassifierPhased,
-			}, cfg)
-			maxAttached := 0
-			if err := rig.download(4, func() {
-				deadline := time.Now().Add(2500 * time.Millisecond)
-				for time.Now().Before(deadline) {
-					_, n := pathAttachments(rig.client.pathPrincipalNow() + "|")
-					maxAttached = max(maxAttached, n)
-					time.Sleep(20 * time.Millisecond)
-				}
-			}); err != nil {
-				t.Fatal(err)
-			}
-			isolations := clientMetrics.Snapshot().BulkIsolations
-			t.Logf("bulk isolations %d, bulk connections %d, most client attachments %d", isolations, rig.client.bulkConnCount(), maxAttached)
-			switch topology {
-			case TopologyIsolated:
-				// The scenario does provoke isolation, so the single arm's
-				// result is the switch's doing.
-				if isolations == 0 || maxAttached < 2 {
-					t.Fatalf("isolated topology did not isolate: %d isolations, %d attachments", isolations, maxAttached)
-				}
-			case TopologySingle:
-				if arm.fanOut > 1 {
-					// The explicit fan-out triggers on the same condition
-					// and stays inside its budget: the preferred
-					// connection plus fanOut-1, all one controller's.
-					controllers, _ := pathAttachments(rig.client.pathPrincipalNow() + "|")
-					if isolations == 0 || rig.client.bulkConnCount() > arm.fanOut-1 || maxAttached > arm.fanOut || controllers != 1 {
-						t.Fatalf("fan-out %d: %d isolations, %d bulk connections, %d attachments over %d controllers",
-							arm.fanOut, isolations, rig.client.bulkConnCount(), maxAttached, controllers)
-					}
-					return
-				}
-				if isolations != 0 || rig.client.bulkConnCount() != 0 {
-					t.Fatalf("topology=single isolated %d flows onto %d bulk connections", isolations, rig.client.bulkConnCount())
-				}
-				if maxAttached != 1 {
-					t.Fatalf("topology=single used %d connections on its path, want 1", maxAttached)
-				}
-			}
-		})
+	pathAuthorities.forget()
+	clientMetrics := metrics.New()
+	cfg := newBundleClientConfig()
+	cfg.Metrics = clientMetrics
+	rig := newTopologyRig(t, ServerConfig{}, cfg)
+	maxAttached := 0
+	if err := rig.download(4, func() {
+		deadline := time.Now().Add(2500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			_, n := pathAttachments(rig.client.pathPrincipalNow() + "|")
+			maxAttached = max(maxAttached, n)
+			time.Sleep(20 * time.Millisecond)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	isolations := clientMetrics.Snapshot().BulkIsolations
+	t.Logf("bulk isolations %d, most client attachments %d", isolations, maxAttached)
+	if isolations != 0 {
+		t.Fatalf("the client isolated %d flows", isolations)
+	}
+	if maxAttached != 1 {
+		t.Fatalf("the client used %d connections on its path, want 1", maxAttached)
 	}
 }
 
-// Rescue still works under topology=single. One of two concurrent downloads
-// loses its only lane (the gateway closes the stream); the client's per-flow
-// rescue opens a replacement, which on its own connection would be an
-// attachment of the same path controller, the flow's bytes all arrive, and
-// its sibling is undisturbed.
+// A flow that loses its only lane on one connection per path: one of two
+// concurrent downloads has its stream closed by the gateway, and the carrier
+// manager rebinds the flow by a JOIN on the live carrier. Its bytes all
+// arrive, its sibling is undisturbed, and the client never has more than one
+// path controller.
 func TestSingleTopologyRescuesAFlowThatLosesItsLane(t *testing.T) {
 	if testing.Short() {
 		t.Skip("multi-second end-to-end transfer")
 	}
 	pathAuthorities.forget()
 	clientMetrics := metrics.New()
-	cfg := newBundleClientConfig(TopologySingle)
+	cfg := newBundleClientConfig()
 	cfg.Metrics = clientMetrics
-	rig := newTopologyRig(t, ServerConfig{
-		CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath, Classifier: ClassifierPhased,
-	}, cfg)
-	var maxAttached, maxControllers int
+	rig := newTopologyRig(t, ServerConfig{}, cfg)
+	var maxControllers int
 	if err := rig.download(2, func() {
 		time.Sleep(800 * time.Millisecond)
 		var failed *mpLane
@@ -496,226 +344,131 @@ func TestSingleTopologyRescuesAFlowThatLosesItsLane(t *testing.T) {
 		if err := failed.fc.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Error(err)
 		}
-		// The rescue round races a stream on the pooled connection
-		// against dedicated dials; each dial that completes its handshake
-		// is an attachment of the client's one path controller.
 		deadline := time.Now().Add(1500 * time.Millisecond)
 		for time.Now().Before(deadline) {
-			controllers, n := pathAttachments(rig.client.pathPrincipalNow() + "|")
+			controllers, _ := pathAttachments(rig.client.pathPrincipalNow() + "|")
 			maxControllers = max(maxControllers, controllers)
-			maxAttached = max(maxAttached, n)
 			time.Sleep(5 * time.Millisecond)
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
 	s := clientMetrics.Snapshot()
+	m := rig.client.carriers
+	joins := m.sameCarrierJoins.Load() + m.newCarrierJoins.Load()
 	controllers, _ := pathAttachments(rig.client.pathPrincipalNow() + "|")
-	t.Logf("lane replacements %d, bulk isolations %d, client controllers %d (at most %d), attachments at most %d",
-		s.LaneReplacements, s.BulkIsolations, controllers, maxControllers, maxAttached)
-	if maxControllers != 1 {
-		t.Fatalf("during the rescue the client's connections spread over %d controllers", maxControllers)
+	t.Logf("rebinding JOINs %d, bulk isolations %d, client controllers %d (at most %d)",
+		joins, s.BulkIsolations, controllers, maxControllers)
+	if maxControllers != 1 || controllers != 1 {
+		t.Fatalf("the client's connections spread over %d controllers (at most %d), want one path authority", controllers, maxControllers)
 	}
-	// On loopback the pooled candidate wins the race before a dedicated
-	// dial finishes its handshake, so dial one directly, as a rescue
-	// round's sprayed attempt does: it is a second attachment of the same
-	// controller, not a second controller.
-	// The identity is compared directly, not inferred from an attachment
-	// count that moves as the rescue round's losers detach (#201).
-	rig.client.quicMu.Lock()
-	preferred := rig.client.quicGeneration
-	rig.client.quicMu.Unlock()
-	if preferred == nil {
-		t.Fatal("no preferred connection")
-	}
-	want, ok := preferred.controller.(*wancongestion.PathAttachment)
-	if !ok {
-		t.Fatalf("the preferred connection's controller is %T, not a path attachment", preferred.controller)
-	}
-	lane, err := rig.client.dialJoinLane(context.Background(), TransportQUIC, [16]byte{7}, 9)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dedicated, ok := lane.outer.(*quicStreamConn)
-	if !ok || dedicated.conn == preferred.conn {
-		t.Fatalf("the rescue dial is not a connection of its own: %T", lane.outer)
-	}
-	got, ok := dedicated.controller.(*wancongestion.PathAttachment)
-	if !ok {
-		t.Fatalf("the rescue connection's controller is %T, not a path attachment", dedicated.controller)
-	}
-	if got == want {
-		t.Fatal("the rescue connection shares the preferred connection's attachment")
-	}
-	if got.Controller() != want.Controller() {
-		t.Fatal("the rescue connection attached to a different path controller")
-	}
-	_ = lane.fc.Close()
-	if s.LaneReplacements == 0 {
-		t.Fatal("the flow completed without a rescue; the lane was not lost")
+	if joins == 0 {
+		t.Fatal("the flow completed without a rebinding JOIN; the lane was not lost")
 	}
 	if s.BulkIsolations != 0 {
-		t.Fatalf("%d isolations under topology=single", s.BulkIsolations)
+		t.Fatalf("%d isolations", s.BulkIsolations)
 	}
-	if controllers != 1 {
-		t.Fatalf("the client's connections are spread over %d controllers, want one path authority", controllers)
+	if n := s.LaneRescueAttempts; n != 0 {
+		t.Fatalf("%d per-flow rescue dials", n)
 	}
 }
 
-// Old-client compatibility (design §12, §15.1 test 17): a released client
-// that isolates (the legacy bundle) against a gateway running the stage-7
-// gateway bundle. Its flows isolate and complete, and the gateway attaches
-// every data connection of that device -- pooled and isolated -- to one
-// path controller. And the reverse: a topology=single client against a
-// legacy gateway, which sees one connection. The old peer in each arm speaks
-// only wire 1.
+// Old-peer compatibility (design §12, §15.1 test 17): a client against a
+// gateway that accepts only wire 1, as a released gateway does, sees one
+// connection and isolates nothing. An isolating released client against a
+// new gateway can no longer be built in-process; the released-binary interop
+// gate (scripts/wire_interop.py) covers it, and the gateway still attaches
+// every data connection of one device to one controller.
 func TestTopologyAcrossOldAndNewPeers(t *testing.T) {
 	if testing.Short() {
 		t.Skip("multi-second end-to-end transfer")
 	}
-	t.Run("isolating wire-1 old client, new gateway", func(t *testing.T) {
-		pathAuthorities.forget()
-		clientMetrics := metrics.New()
-		rig := newTopologyRig(t, ServerConfig{
-			CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath, Classifier: ClassifierPhased,
-		}, ClientConfig{Transport: TransportQUIC, EnableQUICPool: true, Metrics: clientMetrics, WireVersions: []byte{1}})
-		maxGateway := 0
-		if err := rig.download(4, func() {
-			deadline := time.Now().Add(2500 * time.Millisecond)
-			for time.Now().Before(deadline) {
-				controllers, n := pathAttachments("principal:")
-				if controllers > 1 {
-					t.Errorf("the gateway split one device over %d controllers", controllers)
-					return
-				}
-				maxGateway = max(maxGateway, n)
-				time.Sleep(20 * time.Millisecond)
-			}
-		}); err != nil {
-			t.Fatal(err)
-		}
-		isolations := clientMetrics.Snapshot().BulkIsolations
-		t.Logf("old client isolations %d; gateway attachments at most %d on one controller", isolations, maxGateway)
-		if isolations == 0 || maxGateway < 2 {
-			t.Fatalf("old client isolated %d flows; gateway saw at most %d attachments", isolations, maxGateway)
-		}
-	})
-	t.Run("single client, legacy wire-1 gateway", func(t *testing.T) {
-		pathAuthorities.forget()
-		clientMetrics := metrics.New()
-		cfg := newBundleClientConfig(TopologySingle)
-		cfg.Metrics = clientMetrics
-		rig := newTopologyRig(t, ServerConfig{AcceptWire: []byte{1}}, cfg)
-		if err := rig.download(4, nil); err != nil {
-			t.Fatal(err)
-		}
-		if n := clientMetrics.Snapshot().BulkIsolations; n != 0 {
-			t.Fatalf("%d isolations", n)
-		}
-	})
+	pathAuthorities.forget()
+	clientMetrics := metrics.New()
+	cfg := newBundleClientConfig()
+	cfg.Metrics = clientMetrics
+	rig := newTopologyRig(t, ServerConfig{AcceptWire: []byte{1}}, cfg)
+	if err := rig.download(4, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := clientMetrics.Snapshot().BulkIsolations; n != 0 {
+		t.Fatalf("%d isolations", n)
+	}
 }
 
-// Memory on the iOS profile (design §11.5, §15.1 test 14) under
-// topology=single: 200 idle flows and four bulk downloads at once, against
-// the same load under isolation. Every byte arrives in both; the single
-// client holds one QUIC connection where isolation also takes the profile's
-// one secondary connection, so its QUIC receive commitment (connections times
-// connection window) is lower even with the grown window; the shared budgets
-// are never exceeded; and the heap the load adds is no more than isolation's.
-// The heap is the test process's, client and gateway together, so it is
-// compared between the arms rather than against the 28 MiB device limit.
+// Memory on the iOS profile (design §11.5, §15.1 test 14): 200 idle flows
+// and four bulk downloads at once. Every byte arrives; the client holds one
+// QUIC connection, with the preferred connection's window grown by the one
+// stream window the profile's secondary connection would have added; and the
+// shared budgets are never exceeded. Until stage 11 the heap the load added
+// was also compared with the isolated topology's under the same load.
 func TestSingleTopologyStaysInsideTheIOSMemoryProfile(t *testing.T) {
 	if testing.Short() {
 		t.Skip("multi-second end-to-end transfer")
 	}
-	growth := map[Topology]uint64{}
-	commitment := map[Topology]uint64{}
-	for _, topology := range []Topology{TopologyIsolated, TopologySingle} {
-		t.Run(string(topology), func(t *testing.T) {
-			pathAuthorities.forget()
-			cfg := newBundleClientConfig(topology)
-			cfg.MemoryLimits, cfg.ChunkSize, cfg.Memory = iosMemoryLimits(), iosChunkSize, MemoryOwned
-			cfg.MaxSessions, cfg.MaxPendingOpens = 1024, 128
-			cfg.StreamReceiveWindow, cfg.MaxStreamReceiveWindow = 64*1024, 64*1024
-			cfg.ConnectionReceiveWindow, cfg.MaxConnectionReceiveWindow = 2*1024*1024, 2*1024*1024
-			cfg.MaxIncomingStreams = 32
-			rig := newTopologyRig(t, ServerConfig{
-				CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath, Classifier: ClassifierPhased,
-				MaxSessions: 2048,
-			}, cfg)
-			w, hold := rig.client.reservePreferredWindows()
-			hold.release()
-			if topology == TopologySingle && rig.client.windows().connection != 2*1024*1024 {
-				t.Fatal("a secondary connection would get the preferred connection's grown window")
-			}
-			if topology == TopologySingle && (w.connection != 2*1024*1024+64*1024 || w.maxConnection != w.connection) {
-				// Grown by the one stream window isolation's second
-				// connection would have added.
-				t.Fatalf("iOS single-connection windows %+v", w)
-			}
-			// The baseline is taken before the idle flows open, so their
-			// setup counts toward each arm's growth.
-			runtime.GC()
-			var before runtime.MemStats
-			runtime.ReadMemStats(&before)
-			var peak uint64
-			idleListener, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer idleListener.Close()
-			go echoDestination(idleListener)
-			idle := make([]net.Conn, 0, 200)
-			defer func() {
-				for _, c := range idle {
-					_ = c.Close()
-				}
-			}()
-			for range cap(idle) {
-				idle = append(idle, dialTestSOCKS(t, rig.clientAddr, idleListener.Addr().String()))
-			}
-			{
-				var m runtime.MemStats
-				runtime.ReadMemStats(&m)
-				peak = m.HeapInuse
-			}
-			maxAttached := 0
-			if err := rig.download(4, func() {
-				deadline := time.Now().Add(3 * time.Second)
-				for time.Now().Before(deadline) {
-					var m runtime.MemStats
-					runtime.ReadMemStats(&m)
-					peak = max(peak, m.HeapInuse)
-					_, n := pathAttachments(rig.client.pathPrincipalNow() + "|")
-					maxAttached = max(maxAttached, n)
-					time.Sleep(50 * time.Millisecond)
-				}
-			}); err != nil {
-				t.Fatal(err)
-			}
-			stats := rig.client.MemoryStats()
-			if peak > before.HeapInuse {
-				growth[topology] = peak - before.HeapInuse
-			}
-			commitment[topology] = uint64(maxAttached) * w.maxConnection
-			t.Logf("heap growth %d KiB; QUIC receive commitment %d KiB over %d connections; send %+v; receive %+v",
-				growth[topology]>>10, commitment[topology]>>10, maxAttached, stats.Send, stats.Receive)
-			if stats.Send.Peak > stats.Send.Capacity || stats.Receive.Peak > stats.Receive.Capacity {
-				t.Fatalf("shared budgets exceeded: %+v", stats)
-			}
-			if topology == TopologySingle && (maxAttached != 1 || rig.client.bulkConnCount() != 0) {
-				t.Fatalf("client held %d attached connections and %d bulk connections, want one", maxAttached, rig.client.bulkConnCount())
-			}
-		})
+	pathAuthorities.forget()
+	cfg := newBundleClientConfig()
+	cfg.MemoryLimits, cfg.ChunkSize = iosMemoryLimits(), iosChunkSize
+	cfg.MaxSessions, cfg.MaxPendingOpens = 1024, 128
+	cfg.StreamReceiveWindow, cfg.MaxStreamReceiveWindow = 64*1024, 64*1024
+	cfg.ConnectionReceiveWindow, cfg.MaxConnectionReceiveWindow = 2*1024*1024, 2*1024*1024
+	cfg.MaxIncomingStreams = 32
+	rig := newTopologyRig(t, ServerConfig{
+		MaxSessions: 2048,
+	}, cfg)
+	w, hold := rig.client.reservePreferredWindows()
+	hold.release()
+	if rig.client.windows().connection != 2*1024*1024 {
+		t.Fatal("a secondary connection would get the preferred connection's grown window")
 	}
-	if len(commitment) < 2 {
-		return // a filtered run of one arm has nothing to compare
+	if w.connection != 2*1024*1024+64*1024 || w.maxConnection != w.connection {
+		t.Fatalf("iOS single-connection windows %+v", w)
 	}
-	if commitment[TopologySingle] >= commitment[TopologyIsolated] {
-		t.Errorf("one connection commits %d receive bytes, isolation %d", commitment[TopologySingle], commitment[TopologyIsolated])
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	var peak uint64
+	idleListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if growth[TopologySingle] > growth[TopologyIsolated]+4<<20 {
-		t.Errorf("the load grew the heap by %d KiB on one connection, %d KiB isolated", growth[TopologySingle]>>10, growth[TopologyIsolated]>>10)
+	defer idleListener.Close()
+	go echoDestination(idleListener)
+	idle := make([]net.Conn, 0, 200)
+	defer func() {
+		for _, c := range idle {
+			_ = c.Close()
+		}
+	}()
+	for range cap(idle) {
+		idle = append(idle, dialTestSOCKS(t, rig.clientAddr, idleListener.Addr().String()))
+	}
+	maxAttached := 0
+	if err := rig.download(4, func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			peak = max(peak, m.HeapInuse)
+			_, n := pathAttachments(rig.client.pathPrincipalNow() + "|")
+			maxAttached = max(maxAttached, n)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stats := rig.client.MemoryStats()
+	var growth uint64
+	if peak > before.HeapInuse {
+		growth = peak - before.HeapInuse
+	}
+	t.Logf("heap growth %d KiB; QUIC receive commitment %d KiB over %d connections; send %+v; receive %+v",
+		growth>>10, uint64(maxAttached)*w.maxConnection>>10, maxAttached, stats.Send, stats.Receive)
+	if stats.Send.Peak > stats.Send.Capacity || stats.Receive.Peak > stats.Receive.Capacity {
+		t.Fatalf("shared budgets exceeded: %+v", stats)
+	}
+	if maxAttached != 1 {
+		t.Fatalf("client held %d attached connections, want one", maxAttached)
 	}
 }
 
@@ -741,7 +494,6 @@ func TestPreferredWindowCreditIsBoundedOverEveryLiveGeneration(t *testing.T) {
 	server, err := NewServer(ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, Logger: logger,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true},
-		CCAPI:             CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -749,7 +501,7 @@ func TestPreferredWindowCreditIsBoundedOverEveryLiveGeneration(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = server.ServePacketConn(ctx, packetConn) }()
-	cfg := newBundleClientConfig(TopologySingle)
+	cfg := newBundleClientConfig()
 	cfg.ListenAddr, cfg.RemoteAddr, cfg.Credentials, cfg.Logger = "127.0.0.1:0", packetConn.LocalAddr().String(), roots, logger
 	cfg.StreamReceiveWindow, cfg.MaxStreamReceiveWindow = mib, mib
 	cfg.ConnectionReceiveWindow, cfg.MaxConnectionReceiveWindow = mib, mib
@@ -760,7 +512,7 @@ func TestPreferredWindowCreditIsBoundedOverEveryLiveGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.closeQUICPool()
-	ccfg := congestionConfig{kind: CongestionErasure, ccAPI: CCAPIV2, sched: SchedClass, scope: CongestionScopePath, principal: client.pathPrincipalNow}
+	ccfg := congestionConfig{principal: client.pathPrincipalNow}
 
 	const generations = 3
 	var live []*controlQUICGeneration
@@ -773,7 +525,7 @@ func TestPreferredWindowCreditIsBoundedOverEveryLiveGeneration(t *testing.T) {
 		if i < generations-1 {
 			// Its borrow is a flow that keeps it draining after it is
 			// superseded.
-			client.supersedeSilentGeneration(g, nil)
+			retirePooledGenerationForTest(client, g)
 		}
 	}
 	var total uint64
@@ -816,7 +568,6 @@ func TestPreferredWindowCreditIsBoundedOverEveryLiveGeneration(t *testing.T) {
 func TestEndedConnectionHoldsNoWindowCredit(t *testing.T) {
 	const mib = 1024 * 1024
 	client := &Client{cfg: ClientConfig{
-		Topology:            TopologySingle,
 		StreamReceiveWindow: mib, MaxStreamReceiveWindow: mib,
 		ConnectionReceiveWindow: mib, MaxConnectionReceiveWindow: mib,
 	}}
@@ -841,198 +592,5 @@ func TestEndedConnectionHoldsNoWindowCredit(t *testing.T) {
 	third, none := client.reservePreferredWindows()
 	if third.maxConnection != mib || none != nil {
 		t.Fatalf("a second live preferred connection got %d KiB beside a live holder", third.maxConnection>>10)
-	}
-}
-
-// Fan-out judges sharing on the flow's own generation (#201). After a
-// handover one flow still drains on the old generation while one bulk flow
-// is alone on the replacement: the client-wide pooled count is two, but
-// neither connection is shared, so the bulk flow stays on its warm
-// connection. A second flow on the replacement is sharing, and fans out.
-func TestFanOutJudgesSharingPerGeneration(t *testing.T) {
-	pathAuthorities.forget()
-	// A client that is not serving a listener runs no path prewarm, so the
-	// only pooled flows are the test's.
-	certificate, roots := testCertificate(t)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	server, err := NewServer(ServerConfig{
-		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, Logger: logger,
-		DestinationPolicy: DestinationPolicy{AllowPrivate: true},
-		CCAPI:             CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	serving, stop := context.WithCancel(context.Background())
-	defer stop()
-	go func() { _ = server.ServePacketConn(serving, packetConn) }()
-	cfg := newBundleClientConfig(TopologySingle)
-	cfg.TopologyFanOut = 2
-	cfg.ListenAddr, cfg.RemoteAddr, cfg.Credentials, cfg.Logger = "127.0.0.1:0", packetConn.LocalAddr().String(), roots, logger
-	client, err := NewClient(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.closeQUICPool()
-	ctx := context.Background()
-	pooled := func(id byte) (*authenticatedLane, *controlQUICGeneration) {
-		t.Helper()
-		lane, err := client.dialLaneMode(ctx, TransportQUIC, [16]byte{id}, 0, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = lane.fc.Close() })
-		s, ok := lane.outer.(*controlPoolStreamConn)
-		if !ok || s.generation == nil {
-			t.Fatalf("lane %d is not a pooled stream: %T", id, lane.outer)
-		}
-		return lane, s.generation
-	}
-	// Each pooled lane is the control lane of a flow, so the decision goes
-	// through flowGeneration as the lane manager's does.
-	flowOn := func(lane *authenticatedLane) *multipathFlow {
-		f := newIsolationTestFlow(t, true)
-		if err := f.addLane(&mpLane{id: 0, kind: TransportQUIC, fc: lane.fc, control: true}); err != nil {
-			t.Fatal(err)
-		}
-		return f
-	}
-	wanted := func(f *multipathFlow) bool {
-		return client.secondConnectionWanted(flowSnapshot{Class: classifier.ClassBulk}, func() *controlQUICGeneration { return flowGeneration(f) })
-	}
-	oldLane, old := pooled(1)
-	oldFlow := flowOn(oldLane)
-	// A handover: the old generation stops lending and drains while its
-	// flow lives on.
-	client.supersedeSilentGeneration(old, nil)
-	newLane, replacement := pooled(2)
-	newFlow := flowOn(newLane)
-	if replacement == old || old.conn.Context().Err() != nil {
-		t.Fatal("no draining generation beside the replacement")
-	}
-	if flowGeneration(oldFlow) != old || flowGeneration(newFlow) != replacement {
-		t.Fatal("flowGeneration does not report the generation a flow's control lane is on")
-	}
-	if n := client.quicPoolActive.Load(); n != 2 {
-		t.Fatalf("pooled flows across generations = %d, want 2 (the count the old trigger read)", n)
-	}
-	if wanted(newFlow) {
-		t.Fatal("a bulk flow alone on the replacement fans out because a flow drains on the old generation")
-	}
-	if wanted(oldFlow) {
-		t.Fatal("the flow alone on the draining generation fans out")
-	}
-	_, again := pooled(3)
-	if again != replacement {
-		t.Fatal("the second flow landed on another generation")
-	}
-	if !wanted(newFlow) {
-		t.Fatal("a bulk flow sharing the replacement does not fan out")
-	}
-	// Two flows on the current generation do not make the lone flow on the
-	// draining one look shared.
-	if wanted(oldFlow) {
-		t.Fatal("the flow alone on the draining generation fans out once the replacement is shared")
-	}
-	if client.secondConnectionWanted(flowSnapshot{Class: classifier.ClassBulk}, func() *controlQUICGeneration { return nil }) {
-		t.Fatal("a flow on no pooled generation fans out")
-	}
-}
-
-// Reusing a fan-out lane that is already open judges sharing on the
-// generation of the flow's selected control lane too (#201, after #203).
-// After a handover, one flow drains on the old generation while a bulk flow
-// with an open fan-out lane is alone on the replacement: its chunks stay on
-// its warm control lane. A second flow on the replacement sends them back
-// to the fan-out lane.
-func TestFanOutLaneReuseJudgesSharingPerGeneration(t *testing.T) {
-	pathAuthorities.forget()
-	certificate, roots := testCertificate(t)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	server, err := NewServer(ServerConfig{
-		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, Logger: logger,
-		DestinationPolicy: DestinationPolicy{AllowPrivate: true},
-		CCAPI:             CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	serving, stop := context.WithCancel(context.Background())
-	defer stop()
-	go func() { _ = server.ServePacketConn(serving, packetConn) }()
-	cfg := newBundleClientConfig(TopologySingle)
-	cfg.TopologyFanOut = 2
-	cfg.ListenAddr, cfg.RemoteAddr, cfg.Credentials, cfg.Logger = "127.0.0.1:0", packetConn.LocalAddr().String(), roots, logger
-	client, err := NewClient(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.closeQUICPool()
-	ctx := context.Background()
-	pooled := func(id byte) (*authenticatedLane, *controlQUICGeneration) {
-		t.Helper()
-		lane, err := client.dialLaneMode(ctx, TransportQUIC, [16]byte{id}, 0, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = lane.fc.Close() })
-		s, ok := lane.outer.(*controlPoolStreamConn)
-		if !ok || s.generation == nil {
-			t.Fatalf("lane %d is not a pooled stream: %T", id, lane.outer)
-		}
-		return lane, s.generation
-	}
-	// A flow whose control lane is the pooled lane, wired to the client as
-	// handleLocal wires it.
-	flowOn := func(lane *authenticatedLane) (*multipathFlow, *mpLane) {
-		f := newIsolationTestFlow(t, true)
-		control := &mpLane{id: 0, kind: TransportQUIC, fc: lane.fc, control: true}
-		if err := f.addLane(control); err != nil {
-			t.Fatal(err)
-		}
-		f.controlLaneShared = client.controlLaneShared
-		return f, control
-	}
-	oldLane, old := pooled(1)
-	oldFlow, oldControl := flowOn(oldLane)
-	client.supersedeSilentGeneration(old, nil)
-	newLane, replacement := pooled(2)
-	bulkFlow, bulkControl := flowOn(newLane)
-	if replacement == old || old.conn.Context().Err() != nil {
-		t.Fatal("no draining generation beside the replacement")
-	}
-	if n := client.quicPoolActive.Load(); n != 2 {
-		t.Fatalf("pooled flows across generations = %d, want 2 (the count reuse used to read)", n)
-	}
-	if bulkFlow.isolateFromControlLane(bulkControl) {
-		t.Fatal("a bulk flow alone on the replacement moves its chunks to its fan-out lane because a flow drains on the old generation")
-	}
-	if oldFlow.isolateFromControlLane(oldControl) {
-		t.Fatal("the flow alone on the draining generation moves its chunks off its control lane")
-	}
-	if _, again := pooled(3); again != replacement {
-		t.Fatal("the second flow landed on another generation")
-	}
-	if !bulkFlow.isolateFromControlLane(bulkControl) {
-		t.Fatal("a bulk flow sharing the replacement keeps its chunks on the shared control lane")
-	}
-	if oldFlow.isolateFromControlLane(oldControl) {
-		t.Fatal("the flow alone on the draining generation looks shared once the replacement is")
-	}
-	if client.controlLaneShared(&mpLane{id: 7, kind: TransportQUIC}) {
-		t.Fatal("a control lane on no pooled generation looks shared")
-	}
-	// Without a fan-out, isolation keeps the client-wide count.
-	client.cfg.TopologyFanOut = 0
-	if !client.controlLaneShared(oldControl) {
-		t.Fatal("isolation stopped judging sharing by the client-wide pooled count")
 	}
 }

@@ -318,25 +318,18 @@ Refusals are counted at `queqiao_account_admission_refused_total` by reason —
 open refused"` naming the account and device. Check those first when a user
 reports that some sites work and others do not.
 
-The gateway-wide `--max-sessions` ceiling is charged by `--gateway-admission`:
-
-- `owned`, the default since the path-authority bundle became the default,
-  charges the ceiling to flows, at OPEN, on QUIC and TLS/TCP alike. Lanes a
-  flow adds by JOIN count against that flow's lane limit and PROBEs against a
-  small per-connection allowance; a refused flow is told `remote session limit
-  reached` with the flow-limit code. A UDP association whose replacement
-  arrives while it is still running hands its relay, and its slots, to the
-  replacement, so the destination keeps the same source address.
-- `legacy` (and `--bundle=legacy`) charges one slot to every stream before
-  reading it, as earlier releases did. When every slot is held, a stream is
-  still read under a small separate bound, and a JOIN or PROBE for a flow the
-  gateway already carries is admitted without a slot; a new flow is refused as
-  before. Without that, a saturated gateway refused exactly the recovery
-  streams that would let its own flows survive a lost lane.
-
-In both modes a full QUIC connection limit still admits one standby connection
-beside a device's existing data connections, which is what the client dials to
-move its flows off a failing one.
+The gateway-wide `--max-sessions` ceiling is charged to flows, at OPEN, on
+QUIC and TLS/TCP alike. Lanes a flow adds by JOIN count against that flow's
+lane limit and PROBEs against a small per-connection allowance, so a gateway
+whose slots are all held still admits the recovery streams that let its own
+flows survive a lost lane; a refused flow is told `remote session limit
+reached` with the flow-limit code. A UDP association whose replacement
+arrives while it is still running hands its relay, and its slots, to the
+replacement, so the destination keeps the same source address. Releases
+before v0.15 charged one slot to every stream instead. A full QUIC connection
+limit still admits one standby connection beside a device's existing data
+connections, which is what the client dials to move its flows off a failing
+one.
 
 Create a one-time invitation and deliver the single printed URI through an
 authenticated private channel:
@@ -678,43 +671,27 @@ current client never does this, so a non-zero
 `queqiao_lane_join_refused_total{reason="wire_mismatch"}` means a peer that
 disagrees about the wire.
 
-### The path-authority bundle
+### The path-authority architecture
 
-Both roles run the path-authority bundle by default
-([DESIGN-PATH-AUTHORITY.md](DESIGN-PATH-AUTHORITY.md), section 14, stage 10):
-one congestion controller per path that every connection attaches to, with
-class scheduling, one QUIC connection per path on a client, recovery owned by
-the client's carrier manager, owned memory and phased flow classification,
-and on a gateway flow-charged admission. In flags, the default is:
+Both roles run the path-authority architecture
+([DESIGN-PATH-AUTHORITY.md](DESIGN-PATH-AUTHORITY.md)): one congestion
+controller per path that every connection attaches to, with class
+scheduling, one QUIC connection per path on a client, recovery owned by the
+client's carrier manager, owned memory and phased flow classification, and on
+a gateway flow-charged admission. There is nothing to configure for it. The
+flags that selected between it and the earlier per-flow design during the
+migration (`--cc-api`, `--sched`, `--congestion-scope`, `--coded-retry`,
+`--mem`, `--classifier`, `--recovery`, `--topology`, `--topology-fanout`,
+`--quic-pool`, `--gateway-admission`, `--bundle`, `--congestion` and the
+brutal and adaptive rate flags) are gone, and start-up refuses a command line
+that still names one. Remove them from service definitions before upgrading.
 
-| Switch | Default | Legacy value |
-| --- | --- | --- |
-| `--cc-api` | `v2` | `v1` |
-| `--sched` | `class` | `legacy` |
-| `--congestion-scope` | `path` | `connection` |
-| `--coded-retry` | `sticky` | `legacy` |
-| `--recovery` | `carrier` | `flow` |
-| `--mem` | `owned` | `legacy` |
-| `--classifier` | `phased` | `legacy` |
-| `--topology` (client) | `single` | `isolated` |
-| `--gateway-admission` (gateway) | `owned` | `legacy` |
-
-`--bundle=legacy` turns every switch back to its legacy value at once, on
-either role; it is the rollback while the new defaults soak, and is removed
-with the legacy code (stage 11). A switch given explicitly overrides its bundle
-value, and start-up refuses a combination the design does not support: a
-switch can be turned off on its own only while nothing that needs it is on
-(for example `--recovery=flow` alone, or `--mem=legacy` alone).
-`queqiaod service install --bundle legacy` installs a client service on the
-legacy bundle.
-
-The bundle does not change the wire. An upgraded gateway serves wire-1
-clients and clients still running the legacy bundle, whether released or
-started with `--bundle=legacy`, which is why gateways are upgraded first.
-`--congestion` other than `erasure` and a client's `--quic-pool=false` run
-only on the legacy bundle; start-up says so and names `--bundle=legacy`.
-Each endpoint logs the switches it runs in its `runtime configuration`
-record (`bundle` and `bundle_name`).
+The architecture does not change the wire. An upgraded gateway serves wire-1
+clients and released clients, which run the per-flow design, which is why
+gateways are upgraded first. To go back to the per-flow design, install the
+previous release (see [ROLLOUT-v0.15.md](ROLLOUT-v0.15.md)). Each endpoint
+logs what it runs in the `bundle` field of its `runtime configuration`
+record.
 
 ## User and device lifecycle
 

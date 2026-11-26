@@ -1,26 +1,21 @@
 package pep
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/bojieli/queqiao/internal/classifier"
-	"github.com/bojieli/queqiao/internal/profile"
 	"github.com/bojieli/queqiao/internal/protocol"
 	"github.com/bojieli/queqiao/internal/stripe"
 )
 
-// ClassifierMode selects the flow-classifier bundle.
+// The phased flow classifier (workload model R1). A flow that became BULK
+// used to be BULK for life: an SSH session after one large output, a
+// browser's HTTP/2 connection after a page, an LLM call on a reused
+// connection, a messaging connection after a photo, its later small writes
+// sent as BULK DATA, uncoded. The class is split in two:
 //
-// Under ClassifierLegacy a flow that becomes BULK is BULK for life: an SSH
-// session after one large output, a browser's HTTP/2 connection after a page,
-// an LLM call on a reused connection, a messaging connection after a photo.
-// Its later small writes are then sent as BULK DATA, uncoded.
-//
-// ClassifierPhased splits the class in two (workload model R1):
-//
-//   - the sticky class (everBulk) keeps today's meaning and still decides
-//     lane choice, bulk isolation and pre-warm, which are expensive to undo;
+//   - the sticky class (everBulk) still decides lane choice and pre-warm,
+//     which are expensive to undo;
 //   - the current class (nowBulk) decides the DATA class byte, the lane
 //     queue, the aggregate budget's interactive flag and coding. It leaves
 //     BULK after two payload-carrying windows with no bulk evidence and
@@ -30,59 +25,9 @@ import (
 //     the current class says (R1a).
 //
 // Each endpoint classifies the direction it sends, and no peer reads the
-// class byte of DATA, so either end may run either mode: a phased client with
-// a legacy gateway gets phased upstream DATA and legacy downstream DATA. Both
-// ends must run phased for the downstream half (LLM deltas, SSH echoes,
-// pushes). The class byte keeps the three values every peer already accepts.
-type ClassifierMode string
-
-const (
-	// ClassifierLegacy is today's sticky classifier.
-	ClassifierLegacy ClassifierMode = "legacy"
-	// ClassifierPhased is the sticky/current split with the sparse-write rule.
-	ClassifierPhased ClassifierMode = "phased"
-)
-
-// ParseClassifierMode accepts the configuration spelling. The empty string is
-// the legacy default.
-func ParseClassifierMode(value string) (ClassifierMode, error) {
-	switch ClassifierMode(value) {
-	case "", ClassifierLegacy:
-		return ClassifierLegacy, nil
-	case ClassifierPhased:
-		return ClassifierPhased, nil
-	}
-	return "", fmt.Errorf("classifier must be %s or %s, not %q", ClassifierLegacy, ClassifierPhased, value)
-}
-
-// ValidateClassifier reports whether the classifier mode is spelled
-// correctly. Whether a profile accepts it with the rest of the bundle is
-// ValidateProfileBundle's: the dc-long-haul profile takes classifier=phased
-// only with its new-architecture bundle (design §11.3), since its own
-// classifier thresholds (32 MiB, idle veto) were tuned against the sticky
-// class and its legacy bundle keeps them exactly.
-func ValidateClassifier(mode ClassifierMode, _ profile.Profile) error {
-	_, err := ParseClassifierMode(string(mode))
-	return err
-}
-
-func resolveClassifier(mode *ClassifierMode, p profile.Profile) error {
-	parsed, err := ParseClassifierMode(string(*mode))
-	if err != nil {
-		return err
-	}
-	if err := ValidateClassifier(parsed, p); err != nil {
-		return err
-	}
-	*mode = parsed
-	return nil
-}
-
-// phasedClassifierConfig applies the mode to a profile's classifier policy.
-func phasedClassifierConfig(cfg classifier.Config, mode ClassifierMode) classifier.Config {
-	cfg.Phased = mode == ClassifierPhased
-	return cfg
-}
+// class byte of DATA, so an old peer that still runs the sticky classifier
+// interoperates: its own direction keeps its labels. The class byte keeps the
+// three values every peer already accepts.
 
 // sparseWriteBytes is the largest write the sparse-write rule treats as a
 // message rather than content: two packets of about 1,400 bytes. A keystroke
@@ -112,8 +57,7 @@ const sparseAllowanceBytes = smallExchangeBytes
 //     reads: a staged read is extended only if the connection takes a read
 //     deadline and the shared send memory has a whole chunk free, and under
 //     contention neither is promised;
-//   - under mem=owned, the autotuned retention bound, which can sit at its
-//     startup floor of stripe.DefaultAutotuneStartupChunks chunks.
+//   - the autotuned retention bound, which can sit at its startup floor of stripe.DefaultAutotuneStartupChunks chunks.
 //
 // A continuously backlogged flow dips below that capacity each time the peer
 // acknowledges a read before the producer refills its slot, and a dip to the
@@ -121,14 +65,14 @@ const sparseAllowanceBytes = smallExchangeBytes
 // stretch. The threshold is therefore half of what remains after one read is
 // acknowledged: a blocked transfer stays above it between refills, and it is
 // still far above any conversation's backlog. It only ever lowers base.
-func backlogThresholdFor(base uint64, limits flowMemoryLimits, chunkSize, readSize int, memOwned bool) (threshold uint64, refill bool) {
+func backlogThresholdFor(base uint64, limits flowMemoryLimits, chunkSize, readSize int) (threshold uint64, refill bool) {
 	if base == 0 {
 		base = classifier.DefaultConfig().BulkBacklogBytes
 	}
 	if readSize <= 0 || readSize > chunkSize {
 		readSize = chunkSize
 	}
-	residual, ok := leastResidual(limits, chunkSize, readSize, memOwned)
+	residual, ok := leastResidual(limits, chunkSize, readSize)
 	if !ok {
 		return base, false
 	}
@@ -163,10 +107,10 @@ const refillWindow = 20 * time.Millisecond
 //   - the send bytes: the limit less one release;
 //   - the chunk count: one whole chunk and maxOutstanding-1 minimum-size
 //     reads, less one release;
-//   - under mem=owned, the autotune floor less one release.
+//   - the autotune floor less one release.
 //
 // It reports false when no bound applies.
-func leastResidual(limits flowMemoryLimits, chunkSize, readSize int, memOwned bool) (int, bool) {
+func leastResidual(limits flowMemoryLimits, chunkSize, readSize int) (int, bool) {
 	if chunkSize <= 0 {
 		return 0, false
 	}
@@ -184,9 +128,7 @@ func leastResidual(limits flowMemoryLimits, chunkSize, readSize int, memOwned bo
 	if limits.maxOutstanding > 0 {
 		take(chunkSize + (limits.maxOutstanding-1)*readSize - release)
 	}
-	if memOwned {
-		take(stripe.DefaultAutotuneStartupChunks*chunkSize - release)
-	}
+	take(stripe.DefaultAutotuneStartupChunks*chunkSize - release)
 	return residual, bounded
 }
 
@@ -204,19 +146,16 @@ func minPositive(a, b int) int {
 }
 
 // fitBacklogThreshold applies backlogThresholdFor once the flow's chunk size,
-// memory limits and memory bundle are all settled, which is when its send
-// loop starts. It starts from the threshold the profile configured.
+// memory limits are settled, which is when its send loop starts. It starts
+// from the threshold the profile configured.
 func (f *multipathFlow) fitBacklogThreshold() {
-	if !f.phased() {
-		return
-	}
 	readSize := f.chunkSize
 	if f.sendMemory != nil {
 		// The scheduler stages each read in stagingBytes and extends it only
 		// when it can; size for the reads a contended flow is left with.
 		readSize = min(readSize, stagingBytes)
 	}
-	threshold, refill := backlogThresholdFor(f.classifier.BacklogBytes(), f.memoryLimits, f.chunkSize, readSize, f.memOwned)
+	threshold, refill := backlogThresholdFor(f.classifier.BacklogBytes(), f.memoryLimits, f.chunkSize, readSize)
 	f.classifier.SetBacklogBytes(threshold)
 	f.ackMu.Lock()
 	f.refillTracking = true
@@ -224,17 +163,8 @@ func (f *multipathFlow) fitBacklogThreshold() {
 	f.ackMu.Unlock()
 }
 
-// phased reports whether this flow runs the phased classifier.
-func (f *multipathFlow) phased() bool {
-	return f.classifier != nil && f.classifier.Phased()
-}
-
-// sparseBytes is the scheduler's sparse-write threshold: zero, which marks
-// nothing, under the legacy bundle.
+// sparseBytes is the scheduler's sparse-write threshold.
 func (f *multipathFlow) sparseBytes() int {
-	if !f.phased() {
-		return 0
-	}
 	return sparseWriteBytes
 }
 
@@ -242,7 +172,7 @@ func (f *multipathFlow) sparseBytes() int {
 // is called by the stripe scheduler under its own lock and takes only
 // recentMu.
 func (f *multipathFlow) admitSparse(n int) bool {
-	if n <= 0 || !f.phased() {
+	if n <= 0 {
 		return false
 	}
 	f.recentMu.Lock()
@@ -255,11 +185,10 @@ func (f *multipathFlow) admitSparse(n int) bool {
 	return true
 }
 
-// sendClass is the class byte a DATA frame carries. Under the legacy bundle
-// it is the flow's class. Under the phased bundle it is the current class,
-// except that a sparse write is INTERACTIVE.
+// sendClass is the class byte a DATA frame carries: the current class, except
+// that a sparse write is INTERACTIVE.
 func (f *multipathFlow) sendClass(sparse bool) protocol.Class {
-	if sparse && f.phased() {
+	if sparse {
 		return protocol.ClassInteractive
 	}
 	return protocol.Class(f.class.Load()) // #nosec G115 -- f.class only ever stores a protocol.Class.
@@ -509,17 +438,6 @@ func (f *multipathFlow) noteDataFrame(frame protocol.Frame, coded bool) {
 	f.noteDataBytes(frame.Header.Class, coded, len(frame.Payload))
 }
 
-// codedDataOutstanding reports whether a chunk this endpoint sent on the
-// coded substrate is still unacknowledged. Under the phased classifier a BULK
-// flow codes only its sparse writes, so whether the lane could code says
-// nothing about whether a stalled flow has coded work pending. The scheduler
-// is the authority: a chunk acknowledged selectively has left it, and each
-// attempt records the substrate its write actually used.
-func (f *multipathFlow) codedDataOutstanding() bool {
-	sched := f.scheduler.Load()
-	return sched != nil && sched.UnreliableOutstanding()
-}
-
 // noteDataBytes records one DATA frame's payload by its class byte and the
 // substrate that took it (R3).
 func (f *multipathFlow) noteDataBytes(class protocol.Class, coded bool, n int) {
@@ -542,7 +460,7 @@ func (f *multipathFlow) noteDataBytes(class protocol.Class, coded bool, n int) {
 func (f *multipathFlow) classLogFields() []any {
 	exits, reentries := f.classifier.PhaseTransitions()
 	return []any{
-		"classifier_phased", f.phased(),
+		"classifier_phased", true,
 		"class_ever_bulk", f.everBulk.Load(),
 		"class_exits", exits, "class_reentries", reentries,
 		"data_bytes_new_coded", f.classBytes[0][1].Load(),

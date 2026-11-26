@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -50,8 +49,8 @@ func idleReaderMemoryLimits() *MemoryLimits {
 // flight, owed an ACK, or met the no-progress predicate. A request behind
 // them was never read, and neither was an EOF on a later socket.
 func TestIdleReadersCannotStarveAnActiveRequestUnderIOSLimits(t *testing.T) {
-	for _, mode := range []MemoryMode{MemoryLegacy, MemoryOwned} {
-		t.Run(string(mode), func(t *testing.T) {
+	{
+		t.Run("owned", func(t *testing.T) {
 			// Enough idle readers to hold the whole shared budget a chunk
 			// each, and then some.
 			limits := idleReaderMemoryLimits()
@@ -71,7 +70,7 @@ func TestIdleReadersCannotStarveAnActiveRequestUnderIOSLimits(t *testing.T) {
 				t.Fatal(err)
 			}
 			server, err := NewServer(ServerConfig{
-				ListenAddr: "127.0.0.1:0", Credentials: certificate, Memory: mode,
+				ListenAddr: "127.0.0.1:0", Credentials: certificate,
 				DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
 				Metrics: metrics.New(), MaxSessions: 2048,
 			})
@@ -84,11 +83,11 @@ func TestIdleReadersCannotStarveAnActiveRequestUnderIOSLimits(t *testing.T) {
 			}
 			client, err := NewClient(ClientConfig{
 				ListenAddr: clientListener.Addr().String(), RemoteAddr: packetConn.LocalAddr().String(), Credentials: roots,
-				Transport: TransportQUIC, EnableQUICPool: true, Logger: logger, Metrics: metrics.New(),
+				Transport: TransportQUIC, Logger: logger, Metrics: metrics.New(),
 				ChunkSize: iosChunkSize, MaxSessions: 1024, MaxPendingOpens: 128,
 				StreamReceiveWindow: 64 * 1024, MaxStreamReceiveWindow: 64 * 1024,
 				ConnectionReceiveWindow: 2 * 1024 * 1024, MaxConnectionReceiveWindow: 2 * 1024 * 1024,
-				MaxIncomingStreams: 32, MemoryLimits: limits, Memory: mode,
+				MaxIncomingStreams: 32, MemoryLimits: limits,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -237,22 +236,17 @@ func TestFlowSourceReadsOnlyWhatIsAvailable(t *testing.T) {
 	})
 }
 
-// TestReadyBytesArePendingWorkOnlyUnderOwnedMemory: bytes read while a flow
-// has no binding hold a shared reservation, so under the owned bundle they
-// count toward the no-progress budget that ends the flow (design §8.3).
-func TestReadyBytesArePendingWorkOnlyUnderOwnedMemory(t *testing.T) {
-	for _, owned := range []bool{false, true} {
-		t.Run(fmt.Sprintf("owned=%v", owned), func(t *testing.T) {
-			flow := newGraceTestFlow(t)
-			flow.memOwned = owned
-			sched := stripe.New(bytes.NewReader([]byte("ready but unbound")), stripe.Config{ChunkSize: 1024})
-			defer sched.Close()
-			flow.scheduler.Store(sched)
-			waitFor(t, time.Second, "READY bytes", func() bool { return sched.ReadyBytes() > 0 })
-			if got := flow.pendingOutbound(); got != owned {
-				t.Fatalf("pendingOutbound = %v with only READY bytes", got)
-			}
-		})
+// TestReadyBytesArePendingWork: bytes read while a flow has no binding hold
+// a shared reservation, so they count toward the no-progress budget that ends
+// the flow (design §8.3).
+func TestReadyBytesArePendingWork(t *testing.T) {
+	flow := newGraceTestFlow(t)
+	sched := stripe.New(bytes.NewReader([]byte("ready but unbound")), stripe.Config{ChunkSize: 1024})
+	defer sched.Close()
+	flow.scheduler.Store(sched)
+	waitFor(t, time.Second, "READY bytes", func() bool { return sched.ReadyBytes() > 0 })
+	if !flow.pendingOutbound() {
+		t.Fatal("READY bytes are not pending work")
 	}
 }
 
@@ -260,7 +254,6 @@ func TestReadyBytesArePendingWorkOnlyUnderOwnedMemory(t *testing.T) {
 // it has no bytes.
 func TestQueuedFinalMarkerIsPendingWorkUnderOwnedMemory(t *testing.T) {
 	flow := newGraceTestFlow(t)
-	flow.memOwned = true
 	sched := stripe.New(bytes.NewReader(nil), stripe.Config{ChunkSize: 1024})
 	defer sched.Close()
 	flow.scheduler.Store(sched)
@@ -272,7 +265,6 @@ func TestQueuedFinalMarkerIsPendingWorkUnderOwnedMemory(t *testing.T) {
 
 func TestReadyBytesWithNoBindingEndTheOwnedFlow(t *testing.T) {
 	flow := newGraceTestFlow(t)
-	flow.memOwned = true
 	flow.progressGrace = 150 * time.Millisecond
 	flow.stallScan = time.Millisecond
 	flow.stallGrace = 2 * time.Millisecond
@@ -293,36 +285,22 @@ func TestReadyBytesWithNoBindingEndTheOwnedFlow(t *testing.T) {
 	}
 }
 
-func TestMemoryBundleValidator(t *testing.T) {
-	for _, value := range []string{"", "legacy", "owned"} {
-		if _, err := ParseMemoryMode(value); err != nil {
-			t.Fatalf("%q rejected: %v", value, err)
-		}
-	}
-	for _, value := range []string{"on", "OWNED", "owned,legacy"} {
-		if _, err := ParseMemoryMode(value); err == nil {
-			t.Fatalf("%q accepted", value)
-		}
-	}
-	_, sendMemory, _, err := resolveMemoryLimits(iosMemoryLimits(), iosChunkSize, MemoryOwned)
+func TestSharedSendMemoryIsGrantedFairly(t *testing.T) {
+	_, sendMemory, _, err := resolveMemoryLimits(iosMemoryLimits(), iosChunkSize)
 	if err != nil || sendMemory == nil {
-		t.Fatalf("owned iOS limits: %v", err)
+		t.Fatalf("iOS limits: %v", err)
 	}
 }
 
-// Replay safety (design §8.4) does not depend on the memory bundle: retained
-// bytes are released only by validated flow ACKs, so a flow whose lane dies,
-// or which is rescued from QUIC onto TCP, replays everything the peer had not
-// acknowledged. These run the existing end-to-end replay tests with a shared
-// send budget -- so every chunk goes through staging -- in both bundles.
+// Replay safety (design §8.4): retained bytes are released only by validated
+// flow ACKs, so a flow whose lane dies, or which is rescued from QUIC onto
+// TCP, replays everything the peer had not acknowledged. These run the
+// existing end-to-end replay tests with a shared send budget, so every chunk
+// goes through staging.
 func TestReplaySurvivesLaneDeathWithSharedMemory(t *testing.T) {
-	for _, mode := range []MemoryMode{MemoryLegacy, MemoryOwned} {
-		t.Run(string(mode), func(t *testing.T) { runQUICFlowSurvivesOneLaneFailure(t, mode, iosMemoryLimits()) })
-	}
+	runQUICFlowSurvivesOneLaneFailure(t, iosMemoryLimits())
 }
 
 func TestReplaySurvivesQUICToTCPRescueWithSharedMemory(t *testing.T) {
-	for _, mode := range []MemoryMode{MemoryLegacy, MemoryOwned} {
-		t.Run(string(mode), func(t *testing.T) { runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t, mode, iosMemoryLimits()) })
-	}
+	runAutoFlowInstallsTCPRescueAfterAllQUICLanesFail(t, iosMemoryLimits())
 }

@@ -6,33 +6,12 @@ import (
 	"github.com/bojieli/queqiao/internal/memlimit"
 )
 
-// MemoryMode selects the memory-ownership bundle of the path-authority
-// migration (docs/DESIGN-PATH-AUTHORITY.md §8.3, §14 stage 3).
-//
-// Both modes acquire shared send memory only for bytes a producer already
-// holds, so an application socket waiting to be read holds none (issue
-// #169); that fix is not a policy and is not switchable. MemoryOwned adds the
-// rest of the bundle: first-come grants of the shared send budget, the
-// flow-layer retention autotune in place of summed congestion windows, and
-// READY bytes counted as pending work by the no-progress budget.
-type MemoryMode string
-
-const (
-	MemoryLegacy MemoryMode = "legacy"
-	MemoryOwned  MemoryMode = "owned"
-)
-
-// ParseMemoryMode accepts the configuration spelling of the bundle. The empty
-// string is the legacy default.
-func ParseMemoryMode(value string) (MemoryMode, error) {
-	switch MemoryMode(value) {
-	case "", MemoryLegacy:
-		return MemoryLegacy, nil
-	case MemoryOwned:
-		return MemoryOwned, nil
-	}
-	return "", fmt.Errorf("memory bundle must be %s or %s, not %q", MemoryLegacy, MemoryOwned, value)
-}
+// Memory ownership (docs/DESIGN-PATH-AUTHORITY.md §8.3): shared send memory
+// is acquired only for bytes a producer already holds, so an application
+// socket waiting to be read holds none (issue #169); the shared send budget
+// is granted to waiting flows in turn; a flow's retention follows its own
+// flow credit rather than summed congestion windows; and READY bytes count
+// as pending work for the no-progress budget.
 
 // MemoryLimits turns the transport's multiplicative per-flow buffering into
 // fixed endpoint budgets. A nil *MemoryLimits keeps the throughput-oriented
@@ -53,7 +32,12 @@ type MemoryLimits struct {
 	LaneInteractiveReserve int
 	FrameReadBufferBytes   int
 	MaxUDPPacketBytes      int
-	MaxBulkConnections     int
+	// MaxBulkConnections is the receive-window credit of the preferred QUIC
+	// connection, in stream windows: one for each secondary connection the
+	// profile's memory plan was sized for when bulk flows were isolated on
+	// connections of their own (topology.go). Its name is kept so that
+	// existing profiles keep their meaning.
+	MaxBulkConnections int
 }
 
 type flowMemoryLimits struct {
@@ -76,11 +60,11 @@ func defaultFlowMemoryLimits() flowMemoryLimits {
 		eventQueue: maxLaneEvents, laneWriteQueue: maxLaneWriteQueue,
 		laneControlReserve: maxLaneInteractiveReserve, frameReadBuffer: frameReadBuffer,
 		maxUDPPacketBytes:  65535,
-		maxBulkConnections: isolatedBulkConns,
+		maxBulkConnections: maxWindowCreditConnections,
 	}
 }
 
-func resolveMemoryLimits(configured *MemoryLimits, chunkSize int, modes ...MemoryMode) (flowMemoryLimits, *memlimit.Budget, *memlimit.Budget, error) {
+func resolveMemoryLimits(configured *MemoryLimits, chunkSize int) (flowMemoryLimits, *memlimit.Budget, *memlimit.Budget, error) {
 	limits := defaultFlowMemoryLimits()
 	if configured == nil {
 		return limits, nil, nil, nil
@@ -149,18 +133,15 @@ func resolveMemoryLimits(configured *MemoryLimits, chunkSize int, modes ...Memor
 	if limits.maxUDPPacketBytes < 1280 || limits.maxUDPPacketBytes > 65535 {
 		return flowMemoryLimits{}, nil, nil, fmt.Errorf("UDP packet buffer must be between 1280 and 65535 bytes")
 	}
-	if limits.maxBulkConnections < 1 || limits.maxBulkConnections > isolatedBulkConns {
-		return flowMemoryLimits{}, nil, nil, fmt.Errorf("bulk connection limit must be between 1 and %d", isolatedBulkConns)
+	if limits.maxBulkConnections < 1 || limits.maxBulkConnections > maxWindowCreditConnections {
+		return flowMemoryLimits{}, nil, nil, fmt.Errorf("bulk connection limit must be between 1 and %d", maxWindowCreditConnections)
 	}
-	if len(modes) > 0 && modes[0] == MemoryOwned {
-		// One chunk per waiting flow, in turn: a flow cannot be overtaken
-		// forever by others that happen to win the wake-up race. Only send
-		// admission waits; receive admission is TryAcquire by design (a
-		// lane reader that blocked on memory could not service ACKs), so
-		// there is no receive queue to order.
-		return limits, memlimit.NewFair(configured.SendBudgetBytes), memlimit.New(configured.ReceiveBudgetBytes), nil
-	}
-	return limits, memlimit.New(configured.SendBudgetBytes), memlimit.New(configured.ReceiveBudgetBytes), nil
+	// One chunk per waiting flow, in turn: a flow cannot be overtaken forever
+	// by others that happen to win the wake-up race. Only send admission
+	// waits; receive admission is TryAcquire by design (a lane reader that
+	// blocked on memory could not service ACKs), so there is no receive queue
+	// to order.
+	return limits, memlimit.NewFair(configured.SendBudgetBytes), memlimit.New(configured.ReceiveBudgetBytes), nil
 }
 
 // MemoryStats exposes exact retained-payload accounting. It deliberately does

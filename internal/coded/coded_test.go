@@ -34,12 +34,12 @@ type lossyPipe struct {
 func newPipes(seed int64, loss float64) (*lossyPipe, *lossyPipe) {
 	a2b, b2a := make(chan []byte, 8192), make(chan []byte, 8192)
 	return &lossyPipe{
-			rng: rand.New(rand.NewSource(seed)), loss: loss,
-			out: a2b, in: b2a, done: make(chan struct{}),
-		}, &lossyPipe{
-			rng: rand.New(rand.NewSource(seed + 1)), loss: loss,
-			out: b2a, in: a2b, done: make(chan struct{}),
-		}
+		rng: rand.New(rand.NewSource(seed)), loss: loss,
+		out: a2b, in: b2a, done: make(chan struct{}),
+	}, &lossyPipe{
+		rng: rand.New(rand.NewSource(seed + 1)), loss: loss,
+		out: b2a, in: a2b, done: make(chan struct{}),
+	}
 }
 
 func TestConfiguredPendingBoundsBothPathMailboxes(t *testing.T) {
@@ -111,7 +111,7 @@ func (p *lossyPipe) stats() (sent, lost int) {
 // connection.
 func measuredPath(floor float64) *pathmodel.PathModel {
 	m := pathmodel.NewPathModel()
-	m.Report(1, pathmodel.Observation{Erasure: floor, BurstFactor: 1, ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 0})
+	m.Report(1, pathmodel.Observation{Erasure: floor, BurstFactor: 1, ObservedSamples: 5000, RoundTrip: 0})
 	return m
 }
 
@@ -463,7 +463,7 @@ func TestTheCodeIsSizedFromTheMeasurementNotTheFloor(t *testing.T) {
 	m := pathmodel.NewPathModel()
 	m.Report(1, pathmodel.Observation{
 		Erasure: measured, BurstFactor: 1,
-		ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 250 * time.Millisecond,
+		ObservedSamples: 5000, RoundTrip: 250 * time.Millisecond,
 	})
 
 	pa, _ := newPipes(1, measured)
@@ -580,7 +580,7 @@ func TestParityCostsACodeRateAndNotAByteRate(t *testing.T) {
 		m := pathmodel.NewPathModel()
 		m.Report(1, pathmodel.Observation{
 			Erasure: erasure, BurstFactor: 1,
-			ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
+			ObservedSamples: 5000, RoundTrip: 200 * time.Millisecond,
 		})
 		pa, _ := newBudgetedPipes(budget)
 		p := New(pa, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Path: m})
@@ -640,7 +640,7 @@ func TestTailProtectionCostsOneBurstNotOnePerWrite(t *testing.T) {
 		m := pathmodel.NewPathModel()
 		m.Report(1, pathmodel.Observation{
 			Erasure: 0.14, BurstFactor: 1,
-			ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
+			ObservedSamples: 5000, RoundTrip: 200 * time.Millisecond,
 		})
 		pa, _ := newPipes(1, 0)
 		p := New(pa, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Path: m, tailDefer: testTailDefer})
@@ -702,7 +702,7 @@ func TestAShortExchangeIsStillProtectedPromptly(t *testing.T) {
 	m := pathmodel.NewPathModel()
 	m.Report(1, pathmodel.Observation{
 		Erasure: 0.14, BurstFactor: 1,
-		ObservedSamples: 5000, Delivered: 2e6, RoundTrip: 200 * time.Millisecond,
+		ObservedSamples: 5000, RoundTrip: 200 * time.Millisecond,
 	})
 	pa, _ := newPipes(1, 0)
 	p := New(pa, Config{SymbolBytes: 1100, RoundTrip: 200 * time.Millisecond, Path: m})
