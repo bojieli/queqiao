@@ -593,8 +593,9 @@ func (f *multipathFlow) laneCarriesData(lane *mpLane, bulk bool) bool {
 
 // sendChunk writes one chunk on one lane. The chunk's offset is its sequence
 // number, so the receiver can place it without knowing which lane it came from
-// or what order the lanes ran in.
-func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stripe.Chunk, bulk bool) error {
+// or what order the lanes ran in. The lane's bulk queue choice is not taken
+// from the caller: it follows the class the frame is stamped with.
+func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stripe.Chunk, _ bool) error {
 	if len(chunk.Data) == 0 {
 		// An empty final chunk carries no bytes; the FIN that follows the
 		// stream is what ends it.
@@ -610,7 +611,7 @@ func (f *multipathFlow) sendChunk(ctx context.Context, lane *mpLane, chunk *stri
 	}, Payload: chunk.Data}
 	// The lane was chosen by the sticky class; the queue within it and the
 	// aggregate budget's interactive flag follow what this frame is.
-	bulk = frame.Header.Class == protocol.ClassBulk
+	bulk := frame.Header.Class == protocol.ClassBulk
 	// Deliberately not retained here: the scheduler is holding this chunk until
 	// it is acknowledged, and is the thing that will re-issue it if this lane
 	// stops. Recording it again would put the same bytes under two limits.
