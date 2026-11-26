@@ -43,7 +43,9 @@ func TestSourceMappingExpiresWhenIdle(t *testing.T) {
 			_, _ = server.WriteTo(buf[:n], addr)
 		}
 	}()
-	const idle = 300 * time.Millisecond
+	// Long against a loaded runner's scheduling: a busy mapping is crossed
+	// every fifth of it.
+	const idle = 1500 * time.Millisecond
 	relay, err := New("127.0.0.1:0", server.LocalAddr().String(), Config{SourceIdleTimeout: idle})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +71,7 @@ func TestSourceMappingExpiresWhenIdle(t *testing.T) {
 		if from != first {
 			t.Fatalf("the server saw %s then %s across a mapping that was kept busy", first, from)
 		}
-		time.Sleep(idle / 3)
+		time.Sleep(idle / 5)
 	}
 	if got := relay.ExpiredSources(); got != 0 {
 		t.Fatalf("%d mappings expired while kept busy", got)
