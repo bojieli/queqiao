@@ -57,7 +57,7 @@ type ControllerTelemetry struct {
 	DelayBrake float64
 	// InflightBound is the path authority's loss bound on its flight in
 	// bytes, zero while none applies.
-	InflightBound uint64
+	InflightBound int64
 	// Authority identifies the path controller this telemetry describes
 	// (congestion=path), zero for a controller one connection owns. Every
 	// connection attached to one controller reports the same window, pacing

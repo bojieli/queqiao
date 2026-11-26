@@ -101,7 +101,7 @@ type ErasureSender struct {
 
 	// boundHi is the loss bound's current value in bytes, zero while none
 	// applies, published for telemetry.
-	boundHi atomic.Uint64
+	boundHi atomic.Int64
 
 	// arrival is the last computed arrival rate, published for the pacer and
 	// the congestion window, which run outside the callback that computes it.
@@ -680,13 +680,13 @@ func (e *ErasureSender) afterOutcomes(priorInFlight quiccongestion.ByteCount, ev
 			now = monotime.Now()
 		}
 		if e.bound.observe(now, e.inner.round, len(acked), len(lost), queue, minRTT,
-			quiccongestion.ByteCount(e.inFlight.Load()), e.inner.maxDatagramSize, e.unboundedWindow(),
+			e.inner.bytesInFlight, e.inner.maxDatagramSize, e.unboundedWindow(),
 			quiccongestion.ByteCount(float64(e.inner.targetCwnd(1))/e.arrivalRate()), e.inner.mode == tuicBbrProbeRTT) {
 			// A queue this sender has overflowed is a pipe it has filled:
 			// startup has nothing left to find, whatever its samples say.
 			e.inner.fullBandwidth = true
 		}
-		e.boundHi.Store(uint64(max(e.bound.hi, 0)))
+		e.boundHi.Store(int64(e.bound.hi))
 	}
 }
 

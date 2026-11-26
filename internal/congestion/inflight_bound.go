@@ -74,7 +74,7 @@ type inflightBound struct {
 
 	// The round being accumulated.
 	round        uint64
-	acked, lost  uint64
+	acked, lost  int
 	peakQueue    time.Duration // the deepest queue seen in this round
 	standing     time.Duration // the shallowest: what stood through all of it
 	events       int           // acknowledgement events accounted
@@ -82,7 +82,7 @@ type inflightBound struct {
 
 	// The run of consecutive rounds through which a queue stood near full.
 	runRounds         int
-	runAcked, runLost uint64
+	runAcked, runLost int
 	runInFlight       quiccongestion.ByteCount
 	// settle is how many rounds remain in which the losses still arriving
 	// belong to what was sent before the last cut.
@@ -96,7 +96,7 @@ type inflightBound struct {
 	// one transient does not set "near full" for good.
 	deepest time.Duration
 
-	// congestionRounds counts rounds judged congestion, for telemetry.
+	// congestionRounds counts the rounds judged congestion.
 	congestionRounds uint64
 }
 
@@ -162,12 +162,8 @@ func (b *inflightBound) observe(now monotime.Time, round uint64, acked, lost int
 		b.round, b.acked, b.lost, b.peakQueue, b.peakInFlight = round, 0, 0, 0, 0
 		b.standing, b.events = 0, 0
 	}
-	if acked > 0 {
-		b.acked += uint64(acked)
-	}
-	if lost > 0 {
-		b.lost += uint64(lost)
-	}
+	b.acked += max(acked, 0)
+	b.lost += max(lost, 0)
 	b.peakQueue = max(b.peakQueue, queue)
 	if b.events == 0 || queue < b.standing {
 		b.standing = queue
@@ -236,7 +232,7 @@ func (b *inflightBound) closeRound(now monotime.Time, minRTT time.Duration, mss,
 
 // noise is inflightNoiseSigmas standard errors of the loss of n packets
 // sampled from the erasure base.
-func (b *inflightBound) noise(n uint64) float64 {
+func (b *inflightBound) noise(n int) float64 {
 	return inflightNoiseSigmas * math.Sqrt(max(b.base, 1/float64(n))*(1-b.base)/float64(n))
 }
 
