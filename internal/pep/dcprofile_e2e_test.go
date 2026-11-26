@@ -64,6 +64,8 @@ const dcLatencySlack = 15 * time.Millisecond
 type dcArm struct {
 	name   string
 	legacy bool
+	// congestion, if set, overrides a legacy arm's controller on both ends.
+	congestion CongestionControlKind
 }
 
 var (
@@ -189,6 +191,12 @@ func dcHost(t *testing.T, base, i int) string {
 // leaf starts leaf i. relay builds its emulated path from the relay's listen
 // address to the gateway's.
 func (b *dcBed) leaf(i int, relay func(listen, target string) (*pathsim.Relay, error)) *dcLeaf {
+	return b.leafAs(i, b.arm, relay)
+}
+
+// leafAs is leaf with an arm of its own, for beds where different bundles
+// share one bottleneck.
+func (b *dcBed) leafAs(i int, arm dcArm, relay func(listen, target string) (*pathsim.Relay, error)) *dcLeaf {
 	t := b.t
 	t.Helper()
 	dc, err := profile.ByName(dcLongHaulProfile)
@@ -208,7 +216,8 @@ func (b *dcBed) leaf(i int, relay func(listen, target string) (*pathsim.Relay, e
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true,
 		Logger: discard, Metrics: metrics.New(), HandshakeTimeout: 30 * time.Second,
 	}
-	if !b.arm.legacy {
+	scfg.Congestion = arm.congestion
+	if !arm.legacy {
 		scfg.CCAPI, scfg.Sched, scfg.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
 		scfg.CodedRetry, scfg.Memory, scfg.Classifier = CodedRetrySticky, MemoryOwned, ClassifierPhased
 		scfg.GatewayAdmission, scfg.Recovery = GatewayAdmissionOwned, RecoveryCarrier
@@ -230,7 +239,8 @@ func (b *dcBed) leaf(i int, relay func(listen, target string) (*pathsim.Relay, e
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: r.LocalAddr(), Credentials: roots,
 		Transport: TransportQUIC, EnableQUICPool: true, Profile: dc, Metrics: metrics.New(), Logger: discard,
 	}
-	if !b.arm.legacy {
+	ccfg.Congestion = arm.congestion
+	if !arm.legacy {
 		ccfg.CCAPI, ccfg.Sched, ccfg.CongestionScope, ccfg.Topology = CCAPIV2, SchedClass, CongestionScopePath, TopologySingle
 		ccfg.CodedRetry, ccfg.Memory, ccfg.Classifier = CodedRetrySticky, MemoryOwned, ClassifierPhased
 		ccfg.Recovery = RecoveryCarrier

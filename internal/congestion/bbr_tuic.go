@@ -744,6 +744,14 @@ func (b *TUICBBRSender) maybeExitStartupDrain(now monotime.Time, inFlight quicco
 	}
 }
 
+// probeJitter is a uniformly spread delay in [0, inflightProbeJitter), drawn
+// from the same per-controller state as the cycle offset so that senders cut by
+// one overflow do not probe again in step.
+func (b *TUICBBRSender) probeJitter() time.Duration {
+	b.nextCycleOffset()
+	return time.Duration(b.randomState % uint64(inflightProbeJitter))
+}
+
 func (b *TUICBBRSender) nextCycleOffset() uint8 {
 	// A per-controller xorshift state avoids synchronized ProbeBW cycles while
 	// keeping the hot path allocation- and lock-free. The time/MTU seed is
