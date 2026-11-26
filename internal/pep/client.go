@@ -1168,7 +1168,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	}
 	flowSession.tcpStriping.Store(flow.kind == TransportTCP && c.cfg.TCPFallbackLanes > 1)
 	flowSession.reserveControlLane = flow.reserveControl
-	flowSession.controlLaneShared = func() bool { return c.quicPoolActive.Load() > 1 }
+	flowSession.controlLaneShared = c.controlLaneShared
 	if err := flowSession.addLane(&mpLane{
 		id: flow.laneID, kind: flow.kind, fc: flow.fc,
 		control: flow.reserveControl && flow.kind == TransportQUIC,
