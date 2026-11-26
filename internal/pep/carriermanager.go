@@ -235,7 +235,8 @@ func (f *carrierFSM) step(ev carrierEvidence) (from, to carrierState, promote bo
 	if !f.started {
 		f.started, f.epoch = true, ev.Epoch
 	}
-	if ev.Epoch > f.epoch {
+	progressed := ev.Epoch > f.epoch
+	if progressed {
 		f.epoch = ev.Epoch
 		if f.state == carrierSuspect {
 			// Progress before promotion: back to ACTIVE.
@@ -246,10 +247,14 @@ func (f *carrierFSM) step(ev carrierEvidence) (from, to carrierState, promote bo
 		// Nothing returns after promotion, and nothing else moves it.
 		return from, f.state, false
 	}
+	wasSuspect := f.state == carrierSuspect
 	if f.state == carrierActive && ev.PTOs >= f.suspectPTOs {
 		f.state, f.suspectEpoch = carrierSuspect, f.epoch
 	}
-	if f.state == carrierSuspect && ev.PTOs >= f.replacePTOs && f.epoch == f.suspectEpoch {
+	// Promotion needs a carrier that was already SUSPECT before this
+	// reading, with the epoch unchanged since: never in the reading that
+	// made it SUSPECT, nor in one that saw progress.
+	if wasSuspect && !progressed && ev.PTOs >= f.replacePTOs && f.epoch == f.suspectEpoch {
 		promote = true
 	}
 	return from, f.state, promote

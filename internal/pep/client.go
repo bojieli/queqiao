@@ -332,6 +332,9 @@ type Client struct {
 	// that pin exact dial counts see only the recovery they injected, not
 	// rescue rounds the watchdog starts on a slow runner.
 	disableStallWatchdogForTest bool
+	// flowStartedForTest, if set, is handed every flow the client starts,
+	// so a test can act on its lanes as the transport would.
+	flowStartedForTest func(*multipathFlow)
 
 	// quicPoolActive counts flows currently sharing the pooled control
 	// connection. A bulk flow only needs to move off it when another flow
@@ -1149,6 +1152,9 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	flowSession.carrierShadow = c.carrierShadow
 	flowSession.carrierRecovery = c.carriers != nil
 	flowSession.wire = flow.fc.wire
+	if c.flowStartedForTest != nil {
+		c.flowStartedForTest(flowSession)
+	}
 	c.declareClass(ctx, inner, flowSession)
 	flowSession.ackRanges.Store(true)
 	flowSession.idleTimeout = c.cfg.FlowIdleTimeout

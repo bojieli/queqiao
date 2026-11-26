@@ -2326,8 +2326,10 @@ func (f *multipathFlow) noteCreditStall(threshold time.Duration, since time.Time
 		f.metrics.FlowStallDetected()
 	}
 	var lane *mpLane
-	if data := f.dataLane(f.healthyLanes()); len(data) > 0 {
-		lane = data[0]
+	if healthy := f.healthyLanes(); len(healthy) > 0 {
+		if data := f.dataLane(healthy); len(data) > 0 {
+			lane = data[0]
+		}
 	}
 	if f.logger != nil {
 		f.logger.Info("flow credit missing on a live stream; waiting",

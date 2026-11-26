@@ -1,13 +1,10 @@
 package pep
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -40,6 +37,8 @@ type carrierPairOptions struct {
 	gatewayHook  func(protocol.Frame) error
 	recovery     CarrierRecoveryConfig
 	maxSessions  int
+	// onFlow is handed every flow the client starts.
+	onFlow func(*multipathFlow)
 }
 
 type carrierPair struct {
@@ -51,7 +50,10 @@ type carrierPair struct {
 	clientLogs, gatewayLogs *lockedBuffer
 	clientMetrics           *metrics.Registry
 	gatewayMetrics          *metrics.Registry
-	tcpRelay                net.Listener
+	// gatewayCarrier says the gateway runs recovery=carrier, so it demotes
+	// no lane either.
+	gatewayCarrier bool
+	tcpRelay       net.Listener
 }
 
 func newCarrierPair(t *testing.T, o carrierPairOptions) *carrierPair {
@@ -108,6 +110,7 @@ func newCarrierPair(t *testing.T, o carrierPairOptions) *carrierPair {
 		t.Fatal(err)
 	}
 	p.server = server
+	p.gatewayCarrier = !o.releasedGateway && o.gatewayRecovery == RecoveryCarrier
 	remote := packetConn.LocalAddr().String()
 	relay, err := pathsim.New("127.0.0.1:0", remote, o.path)
 	if err != nil {
@@ -149,6 +152,7 @@ func newCarrierPair(t *testing.T, o carrierPairOptions) *carrierPair {
 		t.Fatal(err)
 	}
 	p.client = client
+	client.flowStartedForTest = o.onFlow
 	go func() { _ = server.ServePacketConn(ctx, packetConn) }()
 	go func() { _ = client.ServeListener(ctx, clientListener) }()
 	p.socks = clientListener.Addr().String()
@@ -268,7 +272,11 @@ func countRecords(t *testing.T, logs *lockedBuffer, msg string) int {
 // a per-flow rescue round: under recovery=carrier neither exists.
 func assertNoLegacyRecovery(t *testing.T, p *carrierPair) {
 	t.Helper()
-	for _, logs := range []*lockedBuffer{p.clientLogs, p.gatewayLogs} {
+	endpoints := []*lockedBuffer{p.clientLogs}
+	if p.gatewayCarrier {
+		endpoints = append(endpoints, p.gatewayLogs)
+	}
+	for _, logs := range endpoints {
 		if n := countRecords(t, logs, "flow stall suspected; lane demoted and rescue requested"); n != 0 {
 			t.Fatalf("a lane was demoted %d times under recovery=carrier", n)
 		}
@@ -418,8 +426,3 @@ func TestCarrierRecoveryWaitsOutACreditStallOnALiveCarrier(t *testing.T) {
 	}
 	assertNoLegacyRecovery(t, p)
 }
-
-// silence is unused but keeps strings imported for helpers below.
-var _ = strings.Contains
-var _ = bytes.Equal
-var _ = io.EOF
