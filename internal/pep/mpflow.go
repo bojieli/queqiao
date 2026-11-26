@@ -519,6 +519,9 @@ type multipathFlow struct {
 	acksIn            atomic.Uint64
 	acksOut           atomic.Uint64
 	acksSched         atomic.Uint64
+	// ackWritten is the cumulative point the ACK loop last wrote: a flow
+	// whose ackSequence is above it owes its peer an ACK.
+	ackWritten        atomic.Uint64
 	ackWriteNS        atomic.Uint64
 	finSequence       atomic.Uint64
 	remoteFinSequence atomic.Uint64
@@ -3257,6 +3260,7 @@ func (f *multipathFlow) ackLoop(ctx context.Context) {
 				continue
 			}
 			sent = sequence
+			f.ackWritten.Store(sequence)
 			// If more bytes arrived during the write, immediately emit the
 			// newer cumulative value. Otherwise return to the wake channel.
 			if f.ackSequence.Load() <= sent {

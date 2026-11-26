@@ -109,6 +109,10 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		tcpNextAt  time.Time
 		tcpBackoff time.Duration
 	)
+	// wake fires at the next time this loop must act on its own: the latest
+	// handoff start, the binding deadline, or the end of a backoff. The
+	// ticker alone could start a handoff a poll late.
+	var wake <-chan time.Time
 	for {
 		select {
 		case <-flow.doneChan():
@@ -117,6 +121,7 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			return
 		case <-m.changes():
 		case <-ticker.C:
+		case <-wake:
 		case <-flow.stallSignals():
 			// Nothing sends these under this mode; drained so a stale one
 			// cannot accumulate.
@@ -148,7 +153,7 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		// must not stall every new flow for its whole backoff.
 		setUnbound(len(healthy) == 0 && !m.now().Before(nextAttempt))
 		if len(healthy) > 0 && !superseded {
-			observed, tcpTried, tcpNextAt, tcpBackoff = time.Time{}, false, time.Time{}, 0
+			observed, tcpTried, tcpNextAt, tcpBackoff, wake = time.Time{}, false, time.Time{}, 0, nil
 			// The per-flow budget resets only after a sustained healthy
 			// dwell, as today's does: a stream that fails again just after
 			// each JOIN cannot JOIN without bound.
@@ -167,6 +172,7 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 				"latest_handoff_start", latest.Sub(now), "binding_deadline", deadline.Sub(now))
 		}
 		latest, deadline := m.cfg.bindingDeadlines(observed)
+		wake = nextWake(now, latest, deadline, nextAttempt, tcpNextAt, observed.Add(c.fallbackGrace()))
 		if !now.Before(deadline) {
 			m.deadlineFailures.Add(1)
 			c.cfg.Logger.Warn("flow binding deadline passed", "flow_id", flowID, "attempts", attempts,
@@ -188,10 +194,19 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			due := tcpNow || !now.Before(latest) || (target == nil && now.Sub(observed) >= c.fallbackGrace())
 			if due && !now.Before(tcpNextAt) {
 				tcpNow = false
-				if c.carrierTCPHandoff(manageCtx, flow, sessionID, flowID, healthy, superseded, deadline) {
+				herr := c.carrierTCPHandoff(manageCtx, flow, sessionID, flowID, healthy, superseded, deadline)
+				switch {
+				case herr == nil:
 					m.tcpHandoffs.Add(1)
 					tcpTried = true
-				} else {
+				case errors.Is(herr, errLaneJoinRejected) && !errors.Is(herr, errLaneJoinTCPMode):
+					// The gateway does not hold this session: terminal.
+					flow.noteRefusalCause(herr)
+					flow.resumeRefused.Store(true)
+					return
+				case manageCtx.Err() != nil || flow.doneChanClosed():
+					return
+				default:
 					// A transient failure: try again, paced, until the
 					// binding deadline.
 					tcpBackoff = max(min(2*tcpBackoff, carrierRoundCooldownMax), time.Second)
@@ -276,6 +291,20 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 	}
 }
 
+// nextWake is a timer for the earliest of times still in the future.
+func nextWake(now time.Time, times ...time.Time) <-chan time.Time {
+	var next time.Time
+	for _, t := range times {
+		if t.After(now) && (next.IsZero() || t.Before(next)) {
+			next = t
+		}
+	}
+	if next.IsZero() {
+		return nil
+	}
+	return time.After(next.Sub(now))
+}
+
 // rebindFlow moves flow onto target with one JOIN on a stream of it, with
 // RESERVE_CONTROL, through the JOIN queue (§10.3 steps 1-3). On a superseded
 // binding the old stream is closed once the replacement's OPEN_OK arrived.
@@ -327,7 +356,7 @@ func (c *Client) rebindFlow(ctx context.Context, flow *multipathFlow, sessionID 
 	if srtt <= 0 {
 		srtt = 100 * time.Millisecond
 	}
-	lane.replayGate = &replayGate{until: time.Now().Add(srtt)}
+	lane.replayGate = &replayGate{wait: srtt}
 	if err := c.installRecoveryLane(flow, lane); err != nil {
 		return err
 	}
@@ -355,7 +384,7 @@ func flowGenerationID(flow *multipathFlow) uint64 {
 // carrierTCPHandoff starts AUTO's TCP handoff for a flow that no QUIC JOIN
 // can rebind in time. It reports whether the TCP lane was installed; the
 // binding loop then hands the flow to the TCP bundle manager.
-func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64, healthy []*mpLane, superseded bool, deadline time.Time) bool {
+func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64, healthy []*mpLane, superseded bool, deadline time.Time) error {
 	joinCtx, cancel := context.WithTimeout(ctx, max(deadline.Sub(c.carriers.now()), time.Millisecond))
 	defer cancel()
 	if superseded && len(healthy) > 0 {
@@ -365,20 +394,20 @@ func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, ses
 	}
 	laneID, err := flow.allocateJoinID()
 	if err != nil {
-		return false
+		return err
 	}
 	c.metrics.LaneRescueAttempt()
 	lane, err := c.openJoinLane(joinCtx, TransportTCP, sessionID, flowID, laneID)
 	if err != nil {
 		c.cfg.Logger.Info("carrier TCP handoff unavailable", "flow_id", flowID, "failure_kind", replacementFailureKind(err), "error", err)
-		return false
+		return err
 	}
 	if err := c.installRecoveryLane(flow, lane); err != nil {
-		return false
+		return err
 	}
 	c.metrics.LaneRescueWin(0)
 	c.cfg.Logger.Info("flow handed off to TCP before its binding deadline", "flow_id", flowID, "lane", lane.id)
-	return true
+	return nil
 }
 
 // replayGate holds a rebound lane's READY data until the first flow ACK
@@ -386,7 +415,9 @@ func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, ses
 // on the old lane during make-before-break does not open it. ACK and FIN
 // frames do not pass through it.
 type replayGate struct {
-	until time.Time
+	// wait is one SRTT, counted from when the lane starts carrying data:
+	// after OPEN_OK, when the lane is activated.
+	wait time.Duration
 }
 
 // waitReplayGate blocks the lane's puller until its gate opens.
@@ -395,8 +426,9 @@ func (f *multipathFlow) waitReplayGate(ctx context.Context, lane *mpLane) {
 	if gate == nil {
 		return
 	}
-	for lane.acksIn.Load() == 0 && time.Now().Before(gate.until) {
-		wait := min(time.Until(gate.until), 5*time.Millisecond)
+	until := time.Now().Add(gate.wait)
+	for lane.acksIn.Load() == 0 && time.Now().Before(until) {
+		wait := min(time.Until(until), 5*time.Millisecond)
 		select {
 		case <-ctx.Done():
 			return

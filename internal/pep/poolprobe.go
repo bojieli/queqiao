@@ -257,6 +257,10 @@ func (s *controlPoolStreamConn) trackOpen(deadline time.Time, size int) bool {
 	if s.owner.quicGeneration != g || g.conn.Context().Err() != nil || g.liveness.silent(time.Now()) {
 		return false
 	}
+	if m := s.owner.carriers; m != nil && (!m.accepting(g) || m.openGated(g)) {
+		// recovery=carrier: SUSPECT, or flows are waiting to rebind onto it.
+		return false
+	}
 	if g.highErasure() {
 		stop := g.protectPrefix(s.stream, size)
 		g.probeMu.Lock()

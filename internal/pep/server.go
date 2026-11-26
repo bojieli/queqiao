@@ -1688,7 +1688,7 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 				srtt = measured
 			}
 		}
-		replacement.replayGate = &replayGate{until: time.Now().Add(srtt)}
+		replacement.replayGate = &replayGate{wait: srtt}
 	}
 	if err := serverSession.addLaneReplacing(replacement, replacedLaneID, replaceLane); err != nil {
 		s.cfg.Logger.Debug("lane join admission refused", "lane", laneID, "error", err)

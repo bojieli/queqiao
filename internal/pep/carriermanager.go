@@ -748,6 +748,11 @@ func (m *carrierManager) usableStandbyLocked() *managedCarrier {
 	if sb == nil || !sb.verified || sb.gen.conn.Context().Err() != nil || sb.current() != carrierActive {
 		return nil
 	}
+	// Its state may be a tick old: read its evidence now, so a standby that
+	// has itself gone quiet is not promoted over the carrier it replaces.
+	if sb.gen.conn.ConnectionStats().PTOExpiriesSinceProgress >= m.cfg.SuspectPTOs {
+		return nil
+	}
 	return sb
 }
 
@@ -920,13 +925,18 @@ func (m *carrierManager) installLocked(sb *managedCarrier, expected *controlQUIC
 	return true
 }
 
-// pathReset ends every carrier of the old path: a new uplink is a new path
-// key, so its carriers are DEAD (§10.2).
-func (m *carrierManager) pathReset(reason string) {
+// resetPool ends every carrier of the old path: a new uplink is a new path
+// key, so its carriers are DEAD (§10.2). Detaching the pool and taking the
+// old path's carriers is one transition under the manager's lock, so no
+// standby can be installed, and no carrier of the new path dialled and
+// then closed, in between.
+func (m *carrierManager) resetPool(reason string) {
+	c := m.c
 	m.mu.Lock()
-	var gens []*controlQUICGeneration
+	gens := make([]*controlQUICGeneration, 0, len(m.carriers))
 	for g := range m.carriers {
 		gens = append(gens, g)
+		delete(m.carriers, g)
 	}
 	m.standby = nil
 	m.pathEpoch++
@@ -936,7 +946,19 @@ func (m *carrierManager) pathReset(reason string) {
 	if m.cancelStandby != nil {
 		m.cancelStandby()
 	}
+	c.quicMu.Lock()
+	c.quicEpoch++
+	pooled, dial := c.quicGeneration, c.quicDial
+	c.quicGeneration, c.quicDial = nil, nil
+	c.quicMu.Unlock()
 	m.mu.Unlock()
+	m.broadcast()
+	if dial != nil {
+		dial.cancel()
+	}
+	if pooled != nil {
+		pooled.close(reason)
+	}
 	for _, g := range gens {
 		g.close(reason)
 	}
@@ -1110,7 +1132,7 @@ func (q *joinQueue) acquire(ctx context.Context, priority int, deadline time.Tim
 // joinPriority is a flow's place in the JOIN order of §10.3 step 3.
 func joinPriority(flow *multipathFlow) int {
 	switch {
-	case flow.finSent.Load() || flow.remoteFinSeen.Load():
+	case flow.finSent.Load() || flow.remoteFinSeen.Load() || flow.ackSequence.Load() > flow.ackWritten.Load() || flow.gapPending.Load():
 		return 0
 	case !flow.carriesBulk():
 		return 1

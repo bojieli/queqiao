@@ -1070,6 +1070,10 @@ func (c *Client) closeQUICPool() {
 }
 
 func (c *Client) closeControlQUICPool(reason string) {
+	if c.carriers != nil {
+		c.carriers.resetPool(reason)
+		return
+	}
 	c.quicMu.Lock()
 	c.quicEpoch++
 	generation, dial := c.quicGeneration, c.quicDial
@@ -1080,11 +1084,6 @@ func (c *Client) closeControlQUICPool(reason string) {
 	}
 	if generation != nil {
 		generation.close(reason)
-	}
-	if c.carriers != nil {
-		// A pool reset is a path boundary: the standby and draining
-		// carriers belong to the old path too.
-		c.carriers.pathReset(reason)
 	}
 }
 
