@@ -1189,7 +1189,7 @@ class RoundFourFixes(unittest.TestCase):
             g["resamples"] = 500
             dec = an.interim_decisions(root, g, [list(u) for u in units])
             self.assertIn("pass", dec[("a", "bulk")])
-            failed = {"job_failures": [{"block": 6, "path": "a", "trial": "bulk"}], "fetch_failures": []}
+            failed = {"job_failures": [{"block": 6, "path": "a", "trial": "bulk", "exit": 255}], "fetch_failures": []}
             dec = an.interim_decisions(root, g, [list(u) for u in units], failed)
             self.assertNotIn("pass", dec[("a", "bulk")])
             dec = an.interim_decisions(root, g, [list(u) for u in units], {"fetch_failures": ["x"], "job_failures": []})

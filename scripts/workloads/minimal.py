@@ -296,8 +296,9 @@ def wake_script(campaign, job, arm, duration, start_at=0):
                       f"--follow {p['follow']} --duration {int(duration)}{ready}")
 
 
-for _name, _fn in (("wl-call", call_script), ("wl-browse", browse_script), ("wl-wake", wake_script)):
-    w.generator(_name, w.Generator(_fn, pa.parse_rows, lambda job: 0, w.json_records))
+for _name, _fn, _kind in (("wl-call", call_script, "call"), ("wl-browse", browse_script, "browse"),
+                          ("wl-wake", wake_script, None)):
+    w.generator(_name, w.Generator(_fn, pa.parse_rows, lambda job: 0, w.json_records, _kind))
 
 
 # --- workloads --------------------------------------------------------------------
