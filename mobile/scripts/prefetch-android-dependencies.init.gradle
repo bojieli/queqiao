@@ -1,0 +1,20 @@
+// Applied only by prefetch-android-dependencies.sh. It registers one task that
+// resolves every resolvable configuration of every project, which downloads
+// (and, under --dependency-verification strict, verifies) all of the
+// dependencies the Android build and its instrumentation runner will ask for.
+// Later Gradle invocations in CI then run with --offline: a dependency missing
+// from this set fails the same way every time instead of turning into an
+// intermittent Maven Central fetch in the middle of a test step.
+allprojects {
+    tasks.register("queqiaoPrefetchDependencies") {
+        group = "help"
+        description = "Resolves every resolvable configuration so later builds can run offline."
+        def resolvable = project.configurations.matching { it.canBeResolved }
+        doLast {
+            resolvable.each { configuration ->
+                int count = configuration.incoming.files.files.size()
+                logger.lifecycle("resolved ${project.path}:${configuration.name} (${count} files)")
+            }
+        }
+    }
+}
