@@ -34,12 +34,12 @@ type lossyPipe struct {
 func newPipes(seed int64, loss float64) (*lossyPipe, *lossyPipe) {
 	a2b, b2a := make(chan []byte, 8192), make(chan []byte, 8192)
 	return &lossyPipe{
-		rng: rand.New(rand.NewSource(seed)), loss: loss,
-		out: a2b, in: b2a, done: make(chan struct{}),
-	}, &lossyPipe{
-		rng: rand.New(rand.NewSource(seed + 1)), loss: loss,
-		out: b2a, in: a2b, done: make(chan struct{}),
-	}
+			rng: rand.New(rand.NewSource(seed)), loss: loss,
+			out: a2b, in: b2a, done: make(chan struct{}),
+		}, &lossyPipe{
+			rng: rand.New(rand.NewSource(seed + 1)), loss: loss,
+			out: b2a, in: a2b, done: make(chan struct{}),
+		}
 }
 
 func TestConfiguredPendingBoundsBothPathMailboxes(t *testing.T) {
