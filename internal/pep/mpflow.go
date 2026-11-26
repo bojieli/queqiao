@@ -430,9 +430,10 @@ type multipathFlow struct {
 	stallGrace    time.Duration
 	progressGrace time.Duration // test override; production uses laneReplacementWait
 	// controlLaneShared reports whether another flow is currently using the
-	// pooled control connection. Nil means "no", which is what a flow on a
-	// dedicated connection should answer.
-	controlLaneShared func() bool
+	// pooled control connection that control, the flow's selected control
+	// lane, is on. Nil means "no", which is what a flow on a dedicated
+	// connection should answer.
+	controlLaneShared func(control *mpLane) bool
 	// resetOnFailure makes a failed flow tell its peer before it closes: a
 	// RESET goes out on every lane still open. The gateway sets it. Without
 	// it the peer sees only the streams end, takes that for a path failure,
@@ -1707,7 +1708,7 @@ func (f *multipathFlow) isolateFromControlLane(control *mpLane) bool {
 		// is what a flow that has not been told otherwise should do.
 		return true
 	}
-	return f.controlLaneShared()
+	return f.controlLaneShared(control)
 }
 
 // errPeerReset is the peer ending the flow with RESET.

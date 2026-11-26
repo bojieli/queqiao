@@ -596,7 +596,7 @@ func TestControlAndDataTakeDifferentLanesWhenAFlowIsIsolated(t *testing.T) {
 		done:               make(chan struct{}),
 		lanes:              map[uint64]*mpLane{0: {id: 0}, 1: {id: 1}},
 		reserveControlLane: true,
-		controlLaneShared:  func() bool { return true },
+		controlLaneShared:  func(*mpLane) bool { return true },
 	}
 	control, err := flow.laneCandidates(false)
 	if err != nil {
@@ -622,7 +622,7 @@ func TestControlRoleSurvivesANonzeroGenerationReplacement(t *testing.T) {
 			4: {id: 4, kind: TransportQUIC},
 		},
 		reserveControlLane: true,
-		controlLaneShared:  func() bool { return true },
+		controlLaneShared:  func(*mpLane) bool { return true },
 	}
 	control, err := flow.laneCandidates(false)
 	if err != nil {
@@ -654,7 +654,7 @@ func TestBothPlanesShareTheControlLaneWhileItIsUnshared(t *testing.T) {
 		done:               make(chan struct{}),
 		lanes:              map[uint64]*mpLane{0: {id: 0}, 1: {id: 1}},
 		reserveControlLane: true,
-		controlLaneShared:  func() bool { return false },
+		controlLaneShared:  func(*mpLane) bool { return false },
 	}
 	data, err := flow.laneCandidates(true)
 	if err != nil {
@@ -927,7 +927,7 @@ func TestTheDataPlaneMovesOffTheControlLaneWhenThePoolIsShared(t *testing.T) {
 			1: {id: 1},
 		},
 		reserveControlLane: true,
-		controlLaneShared:  shared.Load,
+		controlLaneShared:  func(*mpLane) bool { return shared.Load() },
 	}
 
 	candidates, err := flow.laneCandidates(true)

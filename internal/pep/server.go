@@ -1270,7 +1270,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow.idleTimeout = s.cfg.FlowIdleTimeout
 	flow.maxLifetime = s.cfg.FlowMaxLifetime
 	flow.reserveControlLane = open.Header.Flags&protocol.FlagReserveControl != 0
-	flow.controlLaneShared = auth.shared
+	flow.controlLaneShared = func(*mpLane) bool { return auth.shared() }
 	// A flow that fails here is gone for good: tell the client on every lane
 	// so it does not spend a JOIN discovering that (issue #159).
 	flow.resetOnFailure = true
