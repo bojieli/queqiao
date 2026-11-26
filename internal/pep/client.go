@@ -1662,7 +1662,7 @@ func (c *Client) openFlowMode(ctx context.Context, destination string, _ bool) (
 		if !ok || pooled.trackOpen(openDeadline, protocol.HeaderSize+len(payload)) {
 			break
 		}
-		finishHandshake()
+		_ = finishHandshake()
 		if c.carriers == nil || ctx.Err() != nil {
 			return fail(errPoolRetired)
 		}

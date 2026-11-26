@@ -1434,10 +1434,20 @@ func parseInvitationPaths(values []string) ([]identity.InvitationPath, error) {
 	return routes, nil
 }
 
+// probeTimeoutCount narrows a probe-timeout flag. validateRuntime has
+// already rejected anything above 64; a larger value maps past every valid
+// threshold, so a direct caller is refused by the pep validator too.
+func probeTimeoutCount(v uint) uint32 {
+	if v > 64 {
+		return 65
+	}
+	return uint32(v) // #nosec G115 -- bounded to 64 above.
+}
+
 // carrierRecoveryConfig is the carrier manager's configuration.
 func (opts runtimeOptions) carrierRecoveryConfig() pep.CarrierRecoveryConfig {
 	return pep.CarrierRecoveryConfig{
-		SuspectPTOs: uint32(opts.recoveryKS), ReplacePTOs: uint32(opts.recoveryKP),
+		SuspectPTOs: probeTimeoutCount(opts.recoveryKS), ReplacePTOs: probeTimeoutCount(opts.recoveryKP),
 		DetectionSkew: opts.recoverySkew, HandoffBudget: opts.recoveryHandoffBudget,
 	}
 }

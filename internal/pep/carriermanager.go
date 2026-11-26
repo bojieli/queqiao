@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1155,5 +1154,5 @@ func randomJitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 0
 	}
-	return d + time.Duration(rand.Int64N(int64(d)/4+1))
+	return d + randomDuration(d/4)
 }
