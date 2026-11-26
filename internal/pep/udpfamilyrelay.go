@@ -18,9 +18,10 @@ import (
 // the destination's answers. A udp4 socket is allocated from the same table as
 // those IPv4 sockets, so it cannot be given a port one of them holds, and a
 // udp6 socket is IPv6-only, so IPv4 datagrams never reach it. Linux checks
-// both families when it picks a dual-stack port, so it never had the problem;
-// the relay is the same on every platform so that one implementation is
-// tested everywhere.
+// both families when it picks a dual-stack port, so it never had the problem:
+// OpenUDPRelay uses this relay only on darwin and keeps one dual-stack socket
+// elsewhere, without this relay's per-datagram hand-off. Its unit tests
+// construct it directly, so it is tested on every platform.
 //
 // One association can send to IPv4 and IPv6 destinations alike, so the relay
 // sends each datagram on the socket of its destination's family. The IPv4

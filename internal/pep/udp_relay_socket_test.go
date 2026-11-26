@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -22,6 +23,9 @@ import (
 // none is given a port one of them holds. Linux never gives out such a port,
 // so there it passes either way.
 func TestAGatewayUDPRelayNeverSharesAPortWithAnIPv4Socket(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("the dual-stack port theft is macOS-only; elsewhere the relay keeps one dual-stack socket")
+	}
 	const holders, relays, spare = 600, 3000, 32
 	var conns []net.PacketConn
 	for range holders {
@@ -83,7 +87,7 @@ func udpEcho(t *testing.T, network, address string) *net.UDPAddr {
 // come back through the one relay. The IPv6 socket opens only when an IPv6
 // destination is first used.
 func TestGatewayUDPRelayCarriesBothFamilies(t *testing.T) {
-	relay, err := DestinationPolicy{AllowPrivate: true}.OpenUDPRelay(context.Background())
+	relay, err := openFamilyUDPRelay(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,13 +112,11 @@ func TestGatewayUDPRelayCarriesBothFamilies(t *testing.T) {
 		}
 	}
 	roundTrip(udpEcho(t, "udp4", "127.0.0.1:0"), []byte("over IPv4"))
-	if family, ok := relay.(*familyUDPRelay); ok {
-		family.mu.Lock()
-		opened := family.conns[familyIPv6] != nil
-		family.mu.Unlock()
-		if opened {
-			t.Fatal("a relay that has only seen IPv4 destinations opened an IPv6 socket")
-		}
+	relay.mu.Lock()
+	opened := relay.conns[familyIPv6] != nil
+	relay.mu.Unlock()
+	if opened {
+		t.Fatal("a relay that has only seen IPv4 destinations opened an IPv6 socket")
 	}
 	roundTrip(udpEcho(t, "udp6", "[::1]:0"), []byte("over IPv6"))
 	roundTrip(udpEcho(t, "udp4", "127.0.0.1:0"), []byte("IPv4 again"))
@@ -123,7 +125,7 @@ func TestGatewayUDPRelayCarriesBothFamilies(t *testing.T) {
 // The gateway's relay reader interrupts a read by moving the deadline to now
 // (startUDPRelayReader), and a closed relay ends every read.
 func TestGatewayUDPRelayReadDeadlineAndClose(t *testing.T) {
-	relay, err := DestinationPolicy{AllowPrivate: true}.OpenUDPRelay(context.Background())
+	relay, err := openFamilyUDPRelay(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +159,26 @@ func TestGatewayUDPRelayReadDeadlineAndClose(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("closing the relay did not end a waiting read")
+	}
+}
+
+// The gateway's direct relay is one socket per family only on macOS, where a
+// dual-stack socket can lose a destination's replies; elsewhere it stays one
+// dual-stack socket, with no per-datagram hand-off.
+func TestGatewayUDPRelayIsPerFamilyOnlyOnDarwin(t *testing.T) {
+	relay, err := DestinationPolicy{AllowPrivate: true}.OpenUDPRelay(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	_, perFamily := relay.(*familyUDPRelay)
+	if want := runtime.GOOS == "darwin"; perFamily != want {
+		t.Fatalf("on %s the direct relay is %T; want per-family %v", runtime.GOOS, relay, want)
+	}
+	if !perFamily {
+		if _, ok := relay.(*net.UDPConn); !ok {
+			t.Fatalf("on %s the direct relay is %T; want the dual-stack *net.UDPConn", runtime.GOOS, relay)
+		}
 	}
 }
 
