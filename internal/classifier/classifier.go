@@ -344,6 +344,12 @@ func (c *Classifier) observeCurrent(o Observation, before Class) {
 		// started after that, so it is a new stretch.
 		c.inBacklog = false
 	}
+	if backlogged && o.BacklogProvisional && !c.inBacklog {
+		// A provisional backlog only preserves a stretch that already
+		// exists; with none to preserve it is no evidence at all -- neither
+		// the start of a stretch nor a reason to stay in BULK.
+		backlogged = false
+	}
 	if backlogged {
 		if !c.inBacklog {
 			c.inBacklog = true

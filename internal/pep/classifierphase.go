@@ -398,11 +398,13 @@ func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool, b
 			// Still behind, or a prompt full refill took the room, however
 			// small that refill is beside the threshold.
 			backlog = max(backlog, f.refillThreshold+1)
-		case f.lastReadFull && f.drainPending:
+		case f.drainPending:
 			// A drain is being decided: an observation before the read
 			// that decides it completes -- receive-side bytes, a
 			// re-examination, the first source read of a staged read still
-			// being extended -- does not end the stretch.
+			// being extended -- does not end the stretch, whether it rested
+			// on a full read or on bytes queued behind a short one. Being
+			// provisional, it cannot start one either.
 			backlog = max(backlog, f.refillThreshold+1)
 		case f.refillMode:
 			// Below the floor bytes outstanding say nothing; only full
@@ -420,7 +422,11 @@ func (f *multipathFlow) countAndSample(now time.Time, n int, up, publish bool, b
 // drain opened.
 func (f *multipathFlow) noteReadLocked(now time.Time, full bool) {
 	f.readInProgress = false
-	if f.drainPending {
+	// A read that completed before the acknowledgement that opened the
+	// pending drain cannot have taken the room it freed: its completion time
+	// was taken before ackMu, and the acknowledgement landed in between.
+	// The drain stays pending for a later read to decide.
+	if f.drainPending && !now.Before(f.drainPendingAt) {
 		if full && now.Sub(f.drainPendingAt) <= refillWindow {
 			f.drainPending, f.continuing = false, true
 		} else {
