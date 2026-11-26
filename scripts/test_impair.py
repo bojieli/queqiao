@@ -419,3 +419,54 @@ class FetchVia(unittest.TestCase):
         argv = run.call_args[0][0]
         self.assertIn("ProxyJump=relayhost", argv)
         self.assertFalse([a for a in argv if a.startswith("ControlPath")])
+
+
+class Offsets(unittest.TestCase):
+    def test_offsets_are_drawn_per_trial_from_the_seed(self):
+        cfg = parse(BASE)
+        bh = next(p for p in cfg.wl.phases(cfg, "a") if p.name == "blackhole")
+        slots = [s for s in ab.schedule(cfg) if s.trial == "blackhole"]
+        arms = {a.name: a for a in cfg.arms}
+        drawn = []
+        for s in slots:
+            p = cfg.wl.per_trial(cfg, s, arms[s.arm], bh)
+            llm = next(j for j in p.jobs if j.kind == "wl-llm").params["delay"]
+            outs = next(j for j in p.jobs if j.kind == "impair-outages").params["outages"]
+            self.assertTrue(imp.LEAD <= llm <= imp.LEAD + imp.LLM_JITTER)
+            self.assertTrue(30 <= outs[0][0] <= 40 and outs[0][1] == 8)
+            self.assertTrue(70 <= outs[1][0] <= 75 and outs[1][0] + outs[1][1] <= 120 - 20)
+            drawn.append((llm, outs[1][0]))
+            # Reproducible from the frozen seed.
+            again = cfg.wl.per_trial(cfg, s, arms[s.arm], bh)
+            self.assertEqual(next(j for j in again.jobs if j.kind == "wl-llm").params["delay"], llm)
+        self.assertEqual(len(set(drawn)), len(drawn))           # independent per arm and trial
+        # The type's own phase is untouched.
+        self.assertEqual(next(j for j in bh.jobs if j.kind == "wl-llm").params["delay"], imp.LEAD)
+
+    def test_the_outage_job_runs_the_drawn_offsets(self):
+        cfg = parse(BASE)
+        c = ab.Campaign(cfg, "/nonexistent", ".", dry=True, stream=io.StringIO())
+        script = c.impair.outage_script("blackhole", [(33.5, 8), (72.25, 25)])
+        self.assertIn("t0 + 33.5 - n", script)
+        self.assertIn("t0 + 72.25 - n", script)
+
+
+class TtftSplit(unittest.TestCase):
+    def call(self, t0, t1, ttft=0.6, fail=""):
+        return {"_phase": "blackhole", "kind": "llm", "t0": t0, "t1": t1, "ttft": ttft, "T": 0.5, "fail": fail}
+
+    def test_clear_calls_leave_out_the_outage_and_the_five_seconds_after(self):
+        outs = [[30.0, 38.0], [70.0, 95.0]]
+        recs = [{"_phase": "blackhole", "kind": "impair", "fail": "", "outages": outs},
+                self.call(10, 14), self.call(28, 31), self.call(40, 44), self.call(44, 48), self.call(96, 99),
+                self.call(101, 104)]
+        t = types.SimpleNamespace(records=recs)
+        self.assertEqual([c["t0"] for c in imp.clear_calls([t], "blackhole")], [10, 44, 101])
+
+    def test_after_restore_is_from_the_restore_to_the_first_token(self):
+        outs = [[30.0, 38.0], [70.0, 95.0]]
+        recs = [self.call(29.0, 45.0, ttft=10.5),           # first token at 39.5: 1.5 s after the restore
+                self.call(20.0, 33.0, ttft=0.5),            # first token before the outage: not caught
+                self.call(68.0, 99.0, ttft=28.0),           # first token at 96.0
+                self.call(80.0, 110.0, ttft=None, fail="TimeoutError: timed out")]   # none: censored at its end
+        self.assertEqual(imp.after_restore(outs, recs, 120.0), [1.5, 15.0])

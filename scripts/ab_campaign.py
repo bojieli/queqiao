@@ -1763,6 +1763,7 @@ rm -f "$f"''', what=f"stop {tag}")
         of the window, the others (measuring under that load) until the load
         has finished."""
         import ab_workloads
+        phase = self.cfg.wl.per_trial(self.cfg, slot, arm, phase)
         results: Dict[int, Tuple[float, float, int, str]] = {}
         duration = phase.duration
         gens = [ab_workloads.GENERATORS[j.kind] for j in phase.jobs]

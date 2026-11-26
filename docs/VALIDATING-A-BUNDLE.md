@@ -858,6 +858,17 @@ probes every 0.25 s, each its own connection.
   connection opened after it (`reopen_ttfb_s`), and the first byte again
   of every flow in flight across it (`inflight_ttfb_s`), each `lower 1.0`.
 
+- *Blackhole TTFT*, split: `ttft_clear_p99_s` over the calls clear of
+  the outages (neither starting nor running within one or the 5 s after
+  it), `atmost 1.10 0.200`; and `ttft_after_restore_s`, for the calls
+  caught by an outage, from its restore to their first token (the worse
+  outage), `lower 1.0`. The p99 over all calls is reported only: with fixed
+  timing an LLM turn lined up with the 25 s outage, and that p99 reported
+  which arm had a call in flight.
+- *Offsets*: each trial's LLM start (+0 to 6 s) and outage starts (+0 to
+  10 s and +0 to 5 s) are drawn from the frozen seed, independently per
+  block, slot and arm.
+
 D is judged as its own campaign in `<campaign>/idle-wake` by
 `[workload:idle-wake]`; its trials are not voided for host CPU records,
 which only the blocks take. Goodput is reported only. The first impaired
