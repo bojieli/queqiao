@@ -78,16 +78,18 @@ class SnapshotThroughSudo(unittest.TestCase):
         self.assertTrue(any('for u in queqiaod; do observe "sudo -n"' in l for l in snap[1]))
 
 
-def write_hostcpu(root, t, host, busy, prod=0.0, every=2.0):
+def write_hostcpu(root, t, host, busy, prod=0.0, steal=0.0, every=2.0):
     """Samples over trial t's window: `busy` (a function of the interval's
-    index, or a number) of one CPU, production taking `prod` of it."""
-    rows, user, idle, pt = [], 0.0, 0.0, 0.0
+    index, or a number) of one CPU, production taking `prod` of it, and the
+    hypervisor stealing `steal` of it."""
+    rows, user, idle, pt, st_ = [], 0.0, 0.0, 0.0, 0.0
     n = int((t.end - t.start) / every) + 2
     for i in range(n):
         when = t.start - 0.5 + i * every
-        rows.append(f"{int(when * 1000)} {user:.0f} 0 0 {idle:.0f} 0 0 0 0 0.5 {pt:.0f} 1")
+        rows.append(f"{int(when * 1000)} {user:.0f} 0 0 {idle:.0f} 0 0 0 {st_:.0f} 0.5 {pt:.0f} 1")
         b = busy(i) if callable(busy) else busy
-        user += 200 * b
+        user += 200 * (b - steal)
+        st_ += 200 * steal
         idle += 200 * (1 - b)
         pt += 200 * prod
     os.makedirs(os.path.join(root, "hostcpu"), exist_ok=True)
@@ -95,7 +97,7 @@ def write_hostcpu(root, t, host, busy, prod=0.0, every=2.0):
 
 
 class ContentionVoid(unittest.TestCase):
-    def campaign(self, d, hot=(), prod_heavy=(), missing=()):
+    def campaign(self, d, hot=(), prod_heavy=(), missing=(), stolen=(), cand_busy=0.5):
         root = os.path.join(d, "c")
         tm.unit_campaign(root, [(b, "a", "bulk") for b in range(1, 8)])
         plan = json.loads(pathlib.Path(root, "plan.json").read_text())
@@ -108,8 +110,9 @@ class ContentionVoid(unittest.TestCase):
             for host in ("gw", "c1"):
                 if (t.block, host) in missing:
                     continue
-                busy = 0.95 if (t.block, host) in hot else (0.5 if t.arm == "cand" else 0.3)
-                write_hostcpu(root, t, host, busy, 0.25 if (t.block, host) in prod_heavy else 0.05)
+                busy = 0.95 if (t.block, host) in hot else (cand_busy if t.arm == "cand" else 0.3)
+                write_hostcpu(root, t, host, busy, 0.25 if (t.block, host) in prod_heavy else 0.05,
+                              0.15 if (t.block, host) in stolen else 0.0)
         return root
 
     def gates(self):
@@ -126,22 +129,29 @@ class ContentionVoid(unittest.TestCase):
         self.assertEqual(line, "| gateway host CPU busy, mean | 30% | 50% |")      # main, cand
         self.assertIn("| gateway host production CPU share, mean | 5.0% | 5.0% |", text)
 
-    def test_a_hot_host_voids_its_block_which_is_not_evidence(self):
+    def test_a_host_busy_with_the_test_is_reported_not_voided(self):
+        # The test's own load saturating a 1-CPU host is not contention of
+        # production: no block is void, and the busy share is reported.
         with tempfile.TemporaryDirectory() as d:
             text, v = an.report(self.campaign(d, hot={(3, "gw")}), self.gates())
+        self.assertNotIn("void under contention", text)
+        self.assertIn("| gateway host share of the window at or above 90% CPU, mean |", text)
+        self.assertEqual(v[("a", "cand", "rule:bulk.goodput_bps")], "pass")
+
+    def test_an_arm_busy_for_most_of_its_trials_is_flagged_cpu_bound(self):
+        with tempfile.TemporaryDirectory() as d:
+            text, _ = an.report(self.campaign(d, cand_busy=0.97), self.gates())
+        self.assertIn("**CPU-bound:** `cand` on the gateway host (14 of 14 trials", text)
+        self.assertNotIn("`main` on the", text)
+        self.assertNotIn("void under contention", text)
+
+    def test_hypervisor_steal_voids_the_block_which_is_not_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            text, v = an.report(self.campaign(d, stolen={(3, "gw")}), self.gates())
         self.assertIn("1 block(s) void under contention", text)
-        self.assertIn("block 3 on a bulk: gw at or above 90% CPU", text)
+        self.assertIn("block 3 on a bulk: 15% of gw's CPU stolen by the hypervisor", text)
         row = next(l for l in text.splitlines() if l.startswith("| bulk.goodput_bps | atleast"))
         self.assertIn("| cand | 6 |", row)                 # 7 blocks ran, 6 are evidence
-
-    def test_busy_for_less_than_the_allowed_fraction_is_not_void(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = self.campaign(d)
-            _, trials = an.read_campaign(root)
-            t = next(t for t in trials.values() if t.block == 2)
-            write_hostcpu(root, t, "gw", lambda i: 0.95 if i < 2 else 0.3)          # 2 of ~31 intervals
-            text, _ = an.report(root, self.gates())
-        self.assertNotIn("void under contention", text)
 
     def test_production_taking_too_much_cpu_voids_the_block(self):
         with tempfile.TemporaryDirectory() as d:
@@ -155,7 +165,7 @@ class ContentionVoid(unittest.TestCase):
 
     def test_the_bounds_are_registered(self):
         c = an.load_gates()["contention"]
-        self.assertEqual(c, {"busy_threshold": 0.90, "busy_max_fraction": 0.10, "production_share_max": 0.20})
+        self.assertEqual(c, {"busy_threshold": 0.90, "production_share_max": 0.20, "steal_max_fraction": 0.10})
 
 
 class Sampler(unittest.TestCase):

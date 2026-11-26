@@ -87,8 +87,8 @@ def load_gates(path: str = GATES) -> dict:
             "resamples": p.getint("bootstrap_resamples"), "seed": p.getint("bootstrap_seed"),
             "max_zero_main_fraction": p.getfloat("max_zero_main_fraction"),
             "secondary_min_coverage": p.getfloat("secondary_min_coverage", fallback=1.0),
-            "contention": ({k: cp["contention"].getfloat(k) for k in ("busy_threshold", "busy_max_fraction",
-                                                                       "production_share_max")}
+            "contention": ({k: cp["contention"].getfloat(k) for k in ("busy_threshold", "production_share_max",
+                                                                       "steal_max_fraction")}
                            if cp.has_section("contention") else None),
             "pilot_blocks": w.getint("pilot_blocks"), "power": w.getfloat("power"),
             "true_ratio": w.getfloat("true_ratio"), "secondary": sec}
@@ -337,12 +337,12 @@ def read_campaign(campaign: str) -> Tuple[dict, Dict[Tuple[int, str, int], Trial
     return plan, trials
 
 
-def host_cpu(campaign: str, t: "Trial", host: str) -> Optional[dict]:
-    """A trial's host CPU over its window (the runner's samples, host_cpu):
-    {"busy": fraction of sample intervals at or above the busy threshold is
-    computed by the caller from "intervals" (each interval's busy share),
-    "production": production's share of all CPU time, "mean": mean busy}.
-    None when there are no samples spanning the window."""
+def host_cpu(campaign: str, t: "Trial", host: str, busy_threshold: float = 0.90) -> Optional[dict]:
+    """A trial's host CPU over its window, from the runner's samples
+    (host_cpu): "mean" busy share, "hot" the fraction of sample intervals at
+    or above busy_threshold, "production" production's share of all CPU
+    time, "steal" the share stolen by the hypervisor. None when no two
+    samples fall in the window."""
     p = os.path.join(campaign, "hostcpu", f"{t.tag}-s{t.slot}-{t.arm}-{host}.tsv")
     try:
         lines = open(p).read().split("\n")
@@ -363,29 +363,34 @@ def host_cpu(campaign: str, t: "Trial", host: str) -> Optional[dict]:
     rows = [r for r in rows if t.start - 1 <= r[0] <= t.end + 1]
     if len(rows) < 2:
         return None
-    intervals, total, prod_ticks = [], 0.0, 0.0
-    for (_, a, pa), (_, b, pb) in zip(rows, rows[1:]):
-        d = [y - x for x, y in zip(a, b)]
+    intervals, total, prod_ticks, steal = [], 0.0, 0.0, 0.0
+    for (_, a_, pa), (_, b_, pb) in zip(rows, rows[1:]):
+        d = [y - x for x, y in zip(a_, b_)]
         tot = sum(d)
         if tot <= 0:
             continue
-        idle = d[3] + d[4]
-        intervals.append(1.0 - idle / tot)
+        intervals.append(1.0 - (d[3] + d[4]) / tot)       # all but idle and iowait
         total += tot
+        steal += d[7]
         prod_ticks += pb - pa
     if not intervals:
         return None
-    return {"intervals": intervals, "mean": sum(intervals) / len(intervals),
-            "production": prod_ticks / total if total else float("nan")}
+    return {"mean": sum(intervals) / len(intervals),
+            "hot": sum(1 for x in intervals if x >= busy_threshold) / len(intervals),
+            "production": prod_ticks / total if total else float("nan"),
+            "steal": steal / total if total else float("nan")}
 
 
 def contention_void(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], "Trial"],
                     bounds: Optional[dict]) -> Tuple[Dict[Tuple[int, str, str], str], Dict[Tuple[str, str], dict]]:
     """Units (block, path, trial type) void under contention, with why, and
-    each trial's host CPU by (trial key, host). A unit is void when any trial
-    in it lacks a CPU record, or on any loaded host spent more than the
-    allowed fraction of its window at or above the busy threshold, or saw
-    production take more than its allowed share of the host's CPU."""
+    each trial's host CPU by (trial key, host). A unit is void when, in any
+    of its trials on any loaded host, production took more than its allowed
+    share of the host's CPU, the hypervisor stole more than its allowed
+    share (a neighbour contending, which hits the arms unpredictably), or
+    the CPU record or production's CPU is missing. A host busy with the test
+    itself is not contention of production: it is reported (an arm may be
+    CPU-bound), not voided."""
     void: Dict[Tuple[int, str, str], str] = {}
     cpu: Dict[Tuple[str, str], dict] = {}
     hosts = (plan.get("hostcpu_hosts") or {})
@@ -395,19 +400,17 @@ def contention_void(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int]
         if key[2] >= 100:
             continue
         for host in hosts.get(t.path, []):
-            c = host_cpu(campaign, t, host)
+            c = host_cpu(campaign, t, host, bounds["busy_threshold"])
             cpu[(t.tag + f"-s{t.slot}", host)] = c
             if c is None:
                 void.setdefault(t.unit, f"no CPU record of {host} in slot {t.slot}")
                 continue
-            hot = sum(1 for x in c["intervals"] if x >= bounds["busy_threshold"]) / len(c["intervals"])
-            if hot > bounds["busy_max_fraction"]:
-                void.setdefault(t.unit, f"{host} at or above {bounds['busy_threshold']:.0%} CPU for {hot:.0%} of slot "
-                                        f"{t.slot}")
             if not c["production"] == c["production"]:
                 void.setdefault(t.unit, f"production CPU on {host} unreadable in slot {t.slot}")
             elif c["production"] > bounds["production_share_max"]:
                 void.setdefault(t.unit, f"production took {c['production']:.0%} of {host}'s CPU in slot {t.slot}")
+            if c["steal"] > bounds["steal_max_fraction"]:
+                void.setdefault(t.unit, f"{c['steal']:.0%} of {host}'s CPU stolen by the hypervisor in slot {t.slot}")
     return void, cpu
 
 
@@ -923,6 +926,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
         row("client CPU p90, cores (median)", [fmt(med(a, "cpu_p90"), ".2f") for a in arms])
         # Host CPU per arm over all its trials, void ones included, so an
         # arm that burns more CPU shows.
+        cpu_bound: List[str] = []
         for host in (plan.get("hostcpu_hosts") or {}).get(path, []):
             def host_stat(arm_, k, host=host):
                 xs = [cpu_of.get((t.tag + f"-s{t.slot}", host)) for t in all_trials.values()
@@ -930,10 +934,25 @@ def report(campaign: str, gates: dict, interim: bool = False,
                 xs = [x[k] for x in xs if x and x[k] == x[k]]
                 return st.mean(xs)
             label = "gateway" if host == plan.get("gateway_host") else "client"
+            thr = (gates.get("contention") or {}).get("busy_threshold", 0.90)
             row(f"{label} host CPU busy, mean", [fmt(host_stat(a, "mean"), ".0%") for a in arms])
+            row(f"{label} host share of the window at or above {thr:.0%} CPU, mean",
+                [fmt(host_stat(a, "hot"), ".0%") for a in arms])
             row(f"{label} host production CPU share, mean", [fmt(host_stat(a, "production"), ".1%") for a in arms])
+            row(f"{label} host CPU stolen, mean", [fmt(host_stat(a, "steal"), ".1%") for a in arms])
+            for a_ in arms:
+                ts_ = [cpu_of.get((t.tag + f"-s{t.slot}", host)) for t in all_trials.values()
+                       if t.path == path and t.arm == a_]
+                ts_ = [x for x in ts_ if x]
+                bound = sum(1 for x in ts_ if x["hot"] > 0.5)
+                if ts_ and bound > len(ts_) / 2:
+                    cpu_bound.append(f"`{a_}` on the {label} host ({bound} of {len(ts_)} trials at or above "
+                                     f"{thr:.0%} CPU for most of their window)")
         if any(t.m.get("interactive_p99_s") == t.m.get("interactive_p99_s") for a in arms for t in pts[a]):
             row("interactive p99, s (median)", [fmt(med(a, "interactive_p99_s"), ".3f") for a in arms])
+        if cpu_bound:
+            out += ["", "**CPU-bound:** " + "; ".join(cpu_bound) + ". Its bulk numbers may be limited by the "
+                    "host's CPU rather than by the network."]
 
         judged: Dict[str, int] = {}
         if wl.primary:
