@@ -123,6 +123,16 @@ VS_MAIN: Dict[str, Callable[[float, float, Tuple[float, ...]], bool]] = {
 }
 
 
+# How to read a rule's row: the contrast is the candidate's headroom inside
+# its bound, so positive is good whichever way the measure points.
+RULE_LEGEND = ("Per block, the contrast is how far the candidate is inside its bound: `lower v` main + v - cand; "
+               "`higher v` cand - (main - v); `atmost m a` m x main + a - cand; `atleast m a` cand - (m x main - a). "
+               "Positive is inside the bound, whichever way the measure points. A rule passes when both one-sided "
+               "lower bounds of the mean contrast are above zero, and fails when an upper bound is below zero; "
+               "otherwise it is undecided, which at the block cap (or the end of a fixed campaign) is a fail. "
+               "`floor`/`ceiling` assert on the candidate in every judged block.")
+
+
 def rule_contrasts(kind: str, value, cand: Sequence[float], main: Sequence[float]) -> List[float]:
     v = value if isinstance(value, tuple) else (float(value),)
     return [RULES[kind](c, m, v) for c, m in zip(cand, main)]
@@ -417,11 +427,26 @@ def contention_void(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int]
     return void, cpu
 
 
+# A session run beside the blocks (D) has its own instances, "<arm>.wake",
+# whose logs are under directories ending ".wake/".
+BESIDE_LOG = re.compile(r"\.wake/")
+
+
+def own_fetch_failures(paths: Sequence[str], beside: bool) -> List[str]:
+    """The fetch failures that belong to this campaign: a beside session's
+    logs are its own campaign's (the `idle-wake` subdirectory), never the
+    blocks'. (A runner before this split recorded both in each status.)"""
+    return [p for p in paths or [] if bool(BESIDE_LOG.search(p)) == beside]
+
+
 def fetch_failed(campaign: str) -> List[str]:
     """Remote log paths the runner could not fetch (status.json)."""
     try:
         with open(os.path.join(campaign, "status.json")) as f:
-            return list(json.load(f).get("fetch_failures") or [])
+            got = list(json.load(f).get("fetch_failures") or [])
+        with open(os.path.join(campaign, "plan.json")) as f:
+            beside = bool(json.load(f).get("beside_of"))
+        return own_fetch_failures(got, beside)
     except (OSError, ValueError):
         return []
 
@@ -494,8 +519,9 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
             # The runner's failures so far: a look applies the same evidence
             # rules as the final analysis.
             failed_jobs = control_plane((failures or {}).get("job_failures"))
-            if (failures or {}).get("fetch_failures"):
-                problems.append(f"{len(failures['fetch_failures'])} log file(s) could not be fetched")
+            own = own_fetch_failures((failures or {}).get("fetch_failures"), bool(plan.get("beside_of")))
+            if own:
+                problems.append(f"{len(own)} log file(s) could not be fetched")
         else:
             problems.append("no status.json: the campaign did not finish")
     else:
@@ -508,8 +534,9 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
             problems.append(f"the campaign {status.get('status')} (exit {status.get('exit')})")
         if status.get("production") != "unchanged":
             problems.append("production changed during the campaign")
-        if status.get("fetch_failures"):
-            problems.append(f"{len(status['fetch_failures'])} log file(s) could not be fetched; the log-derived "
+        own = own_fetch_failures(status.get("fetch_failures"), bool(plan.get("beside_of")))
+        if own:
+            problems.append(f"{len(own)} log file(s) could not be fetched; the log-derived "
                             "measures of the affected trials are withheld")
         failed_jobs = control_plane(status.get("job_failures"))
     planned: Dict[Tuple[int, str, str], set] = collections.defaultdict(set)
@@ -906,7 +933,9 @@ def report(campaign: str, gates: dict, interim: bool = False,
             stopped_early = bool(json.load(f).get("stopped"))
     except (OSError, ValueError):
         pass
-    undecided_ok = interim or stopped_early
+    # A campaign without a status (still running, or killed) has no final
+    # verdict: an undecided contrast is shown undecided, never FAIL.
+    undecided_ok = interim or stopped_early or not os.path.exists(os.path.join(campaign, "status.json"))
     method = measure(campaign, plan, trials)
     wl = ab_workloads.get(plan.get("workload", "bulk"))
     for t in trials.values():
@@ -1200,6 +1229,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
                 out.append(f"| {k}{tag} | " + " | ".join(cells) + " |")
         if judged_rules:
             out += ["", f"**{wl.name} rules (pre-registered in gates.ini [workload:{wl.name}]), {path}**", "",
+                    RULE_LEGEND, "",
                     "| measure | rule | candidate | blocks | mean contrast | t lower bound | bootstrap lower bound | verdict |",
                     "|---|---|---|---:|---:|---:|---:|---|"]
             for key, (kind, values) in judged_rules.items():

@@ -1880,9 +1880,16 @@ rm -f "$f"''', what=f"stop {tag}")
         cfg = self.cfg
         for th in self.beside_threads:
             th.join(timeout=beside.phase.duration + 240)
-        if beside.impair and self.impair and self.impair.remove("w"):
-            self.beside_impair_fired = True
-            self.log(f"{beside.name}: the impairment watchdog fired before the session ended")
+        if beside.impair and self.impair:
+            fired = self.impair.remove("w")
+            ended = max((r_[1] for r_ in self.beside_results.values()), default=time.time())
+            if fired is not None and fired < ended:
+                # The session ran partly unimpaired: the harness's failure.
+                self.beside_impair_fired = utc(fired)
+                self.log(f"{beside.name}: the impairment watchdog fired at {utc(fired)}, before the session ended")
+            elif fired is not None:
+                self.log(f"{beside.name}: the impairment watchdog removed it at {utc(fired)}, after the session ended "
+                         f"({utc(ended)}): the session ran impaired throughout")
         clients = [cfg.clients[p] for p in cfg.paths()]
         for c in clients:
             for arm in cfg.beside_arms():
@@ -1893,7 +1900,10 @@ rm -f "$f"''', what=f"stop {tag}")
             return
         sub = os.path.join(self.out, beside.name)
         os.makedirs(sub, exist_ok=True)
+        before = len(self.fetch_failures)
         self.collect(beside.name, clients, cfg.beside_arms(), out=sub)
+        # Its logs are its own campaign's evidence, not the blocks'.
+        self.beside_fetch_failures = self.fetch_failures[before:]
         gen = ab_workloads.GENERATORS[beside.phase.jobs[0].kind]
         with open(os.path.join(sub, "trials.tsv"), "w") as tsv:
             tsv.write("\t".join(TRIAL_COLUMNS) + "\n")
@@ -1905,10 +1915,11 @@ rm -f "$f"''', what=f"stop {tag}")
                 res = self.beside_results.get((slot.path, real.name), (time.time(), time.time(), -1, ""))
                 self.record_job(slot, real, beside.phase, 0, job, gen, res, writer,
                                 os.path.join(sub, "measures.jsonl"), beside.phase.duration)
-            if getattr(self, "beside_impair_fired", False):
+            if getattr(self, "beside_impair_fired", ""):
                 self.job_failures.append({"failure": "control-plane", "block": 1, "path": cfg.paths()[0], "trial": "",
                                           "slot": 1, "arm": cfg.main.name, "phase": beside.phase.name,
-                                          "client": cfg.paths()[0], "kind": "impairment", "exit": JOB_KILLED_BY_RUNNER})
+                                          "client": cfg.paths()[0], "kind": "impairment", "exit": JOB_KILLED_BY_RUNNER,
+                                          "fired_utc": self.beside_impair_fired})
             self.beside_failures = self.job_failures[failures_before:]
             # Its failures are its own; the blocks' verdicts do not depend on them.
             del self.job_failures[failures_before:]
@@ -1958,7 +1969,7 @@ rm -f "$f"''', what=f"stop {tag}")
                     for phase in phases:
                         self.run_phase(s, arm, phase, writer)
                 finally:
-                    if scenario and self.impair.remove("b"):
+                    if scenario and self.impair.remove("b") is not None:
                         # Its watchdog removed the impairment before the trial
                         # ended: the harness's failure, not the arm's.
                         self.job_failures.append({"failure": "control-plane", "block": s.block, "path": s.path,
@@ -2378,7 +2389,9 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             with open(os.path.join(self.out, "status.json"), "w") as f:
                 json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
                            "production": production, "teardown_leftovers": leftovers, "cleanup_failures": clean_failures,
-                           "fetch_failures": self.fetch_failures, "job_failures": self.job_failures,
+                           "fetch_failures": [f for f in self.fetch_failures
+                                              if f not in getattr(self, "beside_fetch_failures", [])],
+                           "job_failures": self.job_failures,
                            "workload_failures": self.workload_failures,
                            "impairment": (None if not self.impair else
                                           "not restored" if self.impair.leftovers else "restored"),
@@ -2391,7 +2404,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 with open(os.path.join(sub, "status.json"), "w") as f:
                     json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
                                "production": production, "teardown_leftovers": leftovers,
-                               "cleanup_failures": clean_failures, "fetch_failures": self.fetch_failures,
+                               "cleanup_failures": clean_failures,
+                               "fetch_failures": getattr(self, "beside_fetch_failures", []),
                                "job_failures": getattr(self, "beside_failures", []), "blocks_run": 1,
                                "finished_utc": utc(time.time())}, f, indent=2)
         return status
