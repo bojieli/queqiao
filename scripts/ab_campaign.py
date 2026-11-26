@@ -297,6 +297,9 @@ class Config:
     aux_relays: List[Any] = field(default_factory=list)
     # Fetch logs through this ssh host instead of directly ("" for direct).
     fetch_via: str = ""
+    # Per host: reach it through this ssh host (ProxyJump), from the
+    # ssh_proxy_jump setting of a section naming the host.
+    proxy_jumps: Dict[str, str] = field(default_factory=dict)
 
     @property
     def work_dir(self) -> str:
@@ -394,6 +397,28 @@ def _relay(cp: configparser.ConfigParser) -> Optional["Relay"]:
         if f.lstrip("-").split("=", 1)[0] in ("listen", "upstream"):
             raise ConfigError("[relay] flags: the runner sets --listen and --upstream")
     return Relay(host=r["host"], address=r["address"], platform=r.get("platform", "linux/amd64"), flags=flags)
+
+
+def _proxy_jumps(cp: configparser.ConfigParser) -> Dict[str, str]:
+    """host -> jump host, from `ssh_proxy_jump` in any section that names a
+    host ([gateway], [relay], [client:...], [production:...]). One host, one
+    jump: two sections naming different jumps for it are refused."""
+    out: Dict[str, str] = {}
+    for sec in cp.sections():
+        s = cp[sec]
+        j = s.get("ssh_proxy_jump", "").strip()
+        if not j:
+            continue
+        if not s.get("host"):
+            raise ConfigError(f"[{sec}] ssh_proxy_jump needs the section's host")
+        if not re.match(r"^[A-Za-z0-9_.@-]+$", j):
+            raise ConfigError(f"[{sec}] ssh_proxy_jump: {j!r} is not an ssh host alias")
+        if out.get(s["host"], j) != j:
+            raise ConfigError(f"[{sec}] ssh_proxy_jump: host {s['host']} already jumps through {out[s['host']]}")
+        if j == s["host"]:
+            raise ConfigError(f"[{sec}] ssh_proxy_jump: {j} cannot jump through itself")
+        out[s["host"]] = j
+    return out
 
 
 def _impair(cp: configparser.ConfigParser) -> Any:
@@ -511,6 +536,7 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=3")),
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
+    cfg.proxy_jumps = _proxy_jumps(cp)
     if wl.impairs and not cfg.impair:
         raise ConfigError(f"workload {cfg.workload} runs under network impairment: it needs an [impair] section")
     if cfg.impair and not wl.impairs:
@@ -655,8 +681,15 @@ def unit_tag(block: int, path: str, trial: str = "") -> str:
 class Host:
     """Runs shell on one host: locally when dest is "local", else over ssh."""
 
-    def __init__(self, dest: str, ssh_options: Sequence[str], dry: bool, out=None, control_dir: str = ""):
+    def __init__(self, dest: str, ssh_options: Sequence[str], dry: bool, out=None, control_dir: str = "",
+                 proxy_jump: str = ""):
         self.dest = dest
+        # Reach this host through another ssh host (its section's
+        # ssh_proxy_jump): every session and copy, with this machine's own
+        # keys end to end.
+        self.proxy_jump = proxy_jump
+        if proxy_jump and dest != "local":
+            ssh_options = list(ssh_options) + ["-o", f"ProxyJump={proxy_jump}"]
         # One ssh connection per host, reused by every session (ControlMaster):
         # a session then costs a round trip, not a handshake. Its socket lives
         # in the campaign's own directory; close() ends it.
@@ -712,10 +745,11 @@ class Host:
             time.sleep(min(30.0, 2.0 * 2 ** k))
         return p.returncode, p.stdout + (("\n" + p.stderr) if p.returncode and p.stderr else "")
 
-    def put(self, local: str, remote: str, if_changed: bool = False) -> None:
+    def put(self, local: str, remote: str, if_changed: bool = False, compress: bool = False) -> None:
         """Copy a file to the host. if_changed: skip the copy when the host
         already has a file with the same SHA-256 there (a binary from an
-        earlier campaign or arm), checked on the host, not assumed."""
+        earlier campaign or arm), checked on the host, not assumed.
+        compress: send it gzipped and unpack it there, checking its SHA-256."""
         if self.dry:
             print(f"[{self.dest}] copy {local} -> {remote}", file=self.out)
             return
@@ -730,9 +764,39 @@ class Host:
                 return
         if self.dest == "local":
             subprocess.run(["cp", local, remote], check=True)
-        else:
+            self._time(f"copy {os.path.basename(local)}", t0)
+            return
+        if not compress:
             subprocess.run(["scp", "-q", *self.ssh_options, local, f"{self.dest}:{remote}"], check=True)
-        self._time(f"copy {os.path.basename(local)}", t0)
+            self._time(f"copy {os.path.basename(local)}", t0)
+            return
+        # Compressed: gzip here, gunzip there, and the file's SHA-256 checked
+        # on the host against this one's before it replaces anything.
+        import gzip
+        import tempfile
+        with open(local, "rb") as f:
+            data = f.read()
+        want = hashlib.sha256(data).hexdigest()
+        with tempfile.NamedTemporaryFile(suffix=".gz", delete=False) as tmp:
+            tmp.write(gzip.compress(data, compresslevel=6))
+        try:
+            # A dropped connection is retried (the jump adds a hop).
+            for k in range(3):
+                if subprocess.run(["scp", "-q", *self.ssh_options, tmp.name, f"{self.dest}:{remote}.gz"]).returncode == 0:
+                    break
+                if k == 2:
+                    raise RuntimeError(f"{self.dest}: could not copy {os.path.basename(local)} (3 tries)")
+                time.sleep(5 * (k + 1))
+        finally:
+            os.unlink(tmp.name)
+        rc, out = self.run(f"gunzip -c {_q(remote + '.gz')} > {_q(remote + '.part')} && rm -f {_q(remote + '.gz')} && "
+                           f"got=$( (sha256sum {_q(remote + '.part')} 2>/dev/null || shasum -a 256 {_q(remote + '.part')}) "
+                           f"| cut -c1-64) && [ \"$got\" = {want} ] && mv {_q(remote + '.part')} {_q(remote)} && echo QQ_COPY_OK",
+                           what=f"unpack and check {os.path.basename(remote)}")
+        if rc != 0 or "QQ_COPY_OK" not in out:
+            self.run(f"rm -f {_q(remote + '.gz')} {_q(remote + '.part')}", what="remove a failed copy")
+            raise RuntimeError(f"{self.dest}: {remote}: the uploaded copy failed or its SHA-256 differs ({out.strip()[-200:]})")
+        self._time(f"copy {os.path.basename(local)} (compressed)", t0)
 
     def get(self, remote: str, local: str) -> bool:
         if self.dry:
@@ -741,7 +805,7 @@ class Host:
         os.makedirs(os.path.dirname(local), exist_ok=True)
         if self.dest == "local":
             return subprocess.run(["cp", remote, local]).returncode == 0
-        if self.fetch_via and self.fetch_via != self.dest:
+        if self.fetch_via and self.fetch_via != self.dest and not self.proxy_jump:
             # Its own connection through the jump host: a shared connection
             # would carry it over the direct link.
             return subprocess.run(["scp", "-q", *self.base_options, "-o", f"ProxyJump={self.fetch_via}",
@@ -1185,7 +1249,7 @@ class Campaign:
         self.dry = dry
         self.stream = stream
         self.ssh_dir = "" if dry else ssh_control_dir(self.out)
-        self.hosts: Dict[str, Host] = {h: Host(h, cfg.ssh_options, dry, stream, self.ssh_dir)
+        self.hosts: Dict[str, Host] = {h: Host(h, cfg.ssh_options, dry, stream, self.ssh_dir, cfg.proxy_jumps.get(h, ""))
                                       for h in cfg.hosts() + [p.host for p in cfg.production]}
         for h in self.hosts.values():
             h.fetch_via = cfg.fetch_via
@@ -1494,7 +1558,7 @@ class Campaign:
         for arm in cfg.arms + cfg.beside_arms():
             d = self.gw_dir(arm)
             self.must(gh, f"mkdir -p {d}/logs", f"gateway directory for {arm.name}")
-            gh.put(self.binary(arm, g.platform, "gateway"), f"{d}/queqiaod", if_changed=True)
+            gh.put(self.binary(arm, g.platform, "gateway"), f"{d}/queqiaod", if_changed=True, compress=True)
             # Fresh provider state every campaign: a kept work directory from
             # an earlier run must not supply this one's identity or users. The
             # account has no device or flow limit of its own (0: every device,
@@ -1528,7 +1592,7 @@ class Campaign:
         if not self.dry and not m:
             raise RuntimeError(f"no invitation from gateway {arm.name}: {out.strip()[:300]}")
         self.must(ch, f"mkdir -p {d}/logs", f"client directory {client.name}/{arm.name}")
-        ch.put(self.binary(arm, client.platform, "client"), f"{d}/queqiaod", if_changed=True)
+        ch.put(self.binary(arm, client.platform, "client"), f"{d}/queqiaod", if_changed=True, compress=True)
         local = " ".join(_q(x) for x in local_address_args(self.client_flags(client, arm)))
         # A profile left by an earlier run would point at another gateway:
         # remove it, enroll, and fail the campaign if enrollment fails.
@@ -1544,7 +1608,7 @@ class Campaign:
         gh, ch = self.hosts[self.cfg.gateway.host], self.hosts[client.host]
         d = self.cl_dir(client, arm)
         self.must(ch, f"mkdir -p {d}/logs", f"client directory {client.name}/{arm.name}")
-        ch.put(self.binary(arm, client.platform, "client"), f"{d}/queqiaod", if_changed=True)
+        ch.put(self.binary(arm, client.platform, "client"), f"{d}/queqiaod", if_changed=True, compress=True)
         local = " ".join(_q(x) for x in local_address_args(self.client_flags(client, arm)))
         entries = []
         for leaf, address, relay_base, base in client.providers:
@@ -1579,7 +1643,7 @@ class Campaign:
         for r in cfg.aux_relays:
             h, W = self.hosts[r.host], self.w(r.host)
             self.must(h, f"mkdir -p {W}/relay {W}/run", f"relay directory for {r.name}")
-            h.put(self.binary(cfg.main, r.platform, "gateway"), f"{W}/relay/queqiaod", if_changed=True)
+            h.put(self.binary(cfg.main, r.platform, "gateway"), f"{W}/relay/queqiaod", if_changed=True, compress=True)
             self.must(h, f"chmod +x {W}/relay/queqiaod", f"relay binary for {r.name}")
             for arm in cfg.arms:
                 tag = f"relay-{r.name}-{arm.name}"
@@ -2161,7 +2225,7 @@ rm -f "$f"''', what=f"stop {tag}")
         rh = self.hosts[r.host]
         W = self.w(r.host)
         self.must(rh, f"mkdir -p {W}/relay {W}/run", "relay directory")
-        rh.put(self.binary(cfg.main, r.platform, "gateway"), f"{W}/relay/queqiaod", if_changed=True)
+        rh.put(self.binary(cfg.main, r.platform, "gateway"), f"{W}/relay/queqiaod", if_changed=True, compress=True)
         self.must(rh, f"chmod +x {W}/relay/queqiaod", "relay binary")
         for arm in cfg.arms + cfg.beside_arms():
             port = g.port_base + arm.index
