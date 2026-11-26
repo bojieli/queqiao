@@ -61,6 +61,16 @@ FETCH_TIMEOUT = 30          # a download not done in this long failed (a 25 s ou
 # The LLM swarm: AGENTS concurrent loops of TURNS turns, short responses, so
 # a trial has AGENTS x TURNS calls: enough opportunities for the pooled
 # call-failure rate over a 4-to-6-block campaign (gates.ini `events`).
+# Per-trial offsets, drawn from the frozen seed independently per block, slot
+# and arm, so an LLM turn boundary does not fall at the same point of an
+# outage in every trial: the LLM swarm starts LEAD + U(0, LLM_JITTER) s in,
+# the outages at their nominal times + U(0, OUTAGE_JITTER[k]) s (the last
+# outage still ends at least 20 s before the trial does).
+LLM_JITTER = 6.0
+OUTAGE_JITTER = (10.0, 5.0)
+# A call is clear of the outages when it neither starts nor runs within an
+# outage or the CLEAR_AFTER seconds after it ends.
+CLEAR_AFTER = 5.0
 AGENTS = 4
 TURNS = 10
 DELTAS = 100
@@ -127,7 +137,7 @@ def fetch_rows(out, job, duration):
 
 
 def outage_script(campaign, job, arm, duration, start_at=0):
-    return campaign.impair.outage_script(job.params["scenario"])
+    return campaign.impair.outage_script(job.params["scenario"], job.params.get("outages"))
 
 
 w.generator("imp-probe", w.Generator(probe_script, lambda out, job, d: ab.job_rows(out, "probe", 1, 1, d),
@@ -195,6 +205,51 @@ def inflight_ttfb(outages, recs, end) -> List[float]:
     return out
 
 
+def _outages(trial, ph):
+    ev = next((r for r in getattr(trial, "records", []) if r.get("_phase") == ph and r.get("kind") == "impair"
+               and not r.get("fail")), None)
+    return (ev or {}).get("outages") or []
+
+
+def clear_calls(trials, ph) -> List[dict]:
+    """Completed LLM calls clear of every outage: neither starting nor
+    running within an outage or the CLEAR_AFTER s after it."""
+    out = []
+    for t in trials:
+        outs = _outages(t, ph)
+        for c in getattr(t, "records", []):
+            if c.get("_phase") != ph or c.get("kind") != "llm" or c.get("fail") or c.get("ttft") is None:
+                continue
+            a, b = float(c["t0"]), float(c.get("t1") or c["t0"])
+            if not any(a < e + CLEAR_AFTER and b > s for s, e in outs):
+                out.append(c)
+    return out
+
+
+def after_restore(outages, recs, end) -> List[float]:
+    """Per outage: of the LLM calls running across it (started before its
+    end, not finished before its start), the latest first token after the
+    restore, in seconds from the restore; a call that got no token is
+    censored at its end (or the next outage, or the trial's end). An outage
+    no call ran across: 0."""
+    calls = [c for c in recs if c.get("kind") == "llm" and c.get("t0") is not None]
+    out = []
+    for k, (s, e) in enumerate(outages):
+        nxt = outages[k + 1][0] if k + 1 < len(outages) else end
+        worst = 0.0
+        for c in calls:
+            a, b = float(c["t0"]), float(c.get("t1") or c["t0"])
+            if not (a < e and b > s):
+                continue
+            first = (a + float(c.get("connect") or 0) + float(c["ttft"])) if c.get("ttft") is not None else None
+            if first is not None and first <= s:
+                continue                      # its first token came before the outage
+            t_ = first if first is not None and not c.get("fail") else min(b, nxt)
+            worst = max(worst, max(0.0, min(t_, nxt) - e))
+        out.append(worst)
+    return out
+
+
 def fetch_completion(trials, ph) -> float:
     """Completed over attempted short downloads, per trial, averaged: a
     download the window's end cut (curl's timeout while its limit was the
@@ -229,7 +284,7 @@ class Impaired(mn.Minimal):
     # Flow completion is the trial's own (completed / attempted short
     # downloads), not the generic single-flow one.
     generic = {t: ("stalls_per_trial",) for t in TRIAL_TYPES}
-    report_only = ("goodput_bps", "ttft_net_p50_s", "echo_p50_s", "recover_8s_s", "recover_25s_s",
+    report_only = ("goodput_bps", "ttft_net_p50_s", "ttft_all_p99_s", "echo_p50_s", "recover_8s_s", "recover_25s_s",
                    "reopen_ttfb_8s_s", "reopen_ttfb_25s_s", "inflight_ttfb_8s_s", "inflight_ttfb_25s_s")
 
     def generics(self, plan):
@@ -318,6 +373,22 @@ class Impaired(mn.Minimal):
             out.append(w.Phase(t, secs, jobs))
         return out
 
+    def per_trial(self, cfg, slot, arm, phase):
+        import dataclasses
+        import random
+        rng = random.Random(f"{cfg.seed}/{slot.block}/{slot.path}/{slot.trial}/{slot.slot}/{arm.name}")
+        jobs = []
+        for j in phase.jobs:
+            params = dict(j.params)
+            if j.kind == "wl-llm":
+                params["delay"] = round(LEAD + rng.uniform(0, LLM_JITTER), 3)
+            if j.kind == "impair-outages":
+                nominal = ab_impair.SCENARIOS[params["scenario"]].outages
+                params["outages"] = [(round(at + rng.uniform(0, jit), 3), dur)
+                                     for (at, dur), jit in zip(nominal, OUTAGE_JITTER)]
+            jobs.append(dataclasses.replace(j, params=params))
+        return dataclasses.replace(phase, jobs=jobs)
+
     def has_evidence(self, ph, recs):
         kinds = {r.get("kind") for r in recs}
         need = {"llm", "term"} | ({"impair"} if ph == "blackhole" else set())
@@ -337,7 +408,14 @@ class Impaired(mn.Minimal):
                 continue
             recs = [r for t in pt for r in getattr(t, "records", []) if r.get("_phase") == ph]
             ok = [c for c in recs if c.get("kind") == "llm" and not c.get("fail")]
-            out[f"{ph}.ttft_net_p99_s"] = (0.99, [c["ttft"] - c["T"] for c in ok if c.get("ttft") is not None])
+            ttft = [c["ttft"] - c["T"] for c in ok if c.get("ttft") is not None]
+            if ph == "blackhole":
+                # Gated on the calls clear of the outages; the rest are timed
+                # from the restore (ttft_after_restore_s).
+                out[f"{ph}.ttft_all_p99_s"] = (0.99, ttft)
+                out[f"{ph}.ttft_clear_p99_s"] = (0.99, [c["ttft"] - c["T"] for c in clear_calls(pt, ph)])
+            else:
+                out[f"{ph}.ttft_net_p99_s"] = (0.99, ttft)
             out[f"{ph}.echo_p99_s"] = (0.99, pa.term_samples([r for r in recs if r.get("kind") == "term"])["a"])
         return out
 
@@ -371,7 +449,8 @@ class Impaired(mn.Minimal):
             "completion": fetch_completion(trials, ph),
             "call_failures": lm.get("call_failures", nan),
             "silent_rate": silent_deaths(recs) / len(sessions) if sessions else nan,
-            "ttft_net_p50_s": st.quantile(ttft, 0.5), "ttft_net_p99_s": st.quantile(ttft, 0.99),
+            "ttft_net_p50_s": st.quantile(ttft, 0.5),
+            ("ttft_all_p99_s" if ph == "blackhole" else "ttft_net_p99_s"): st.quantile(ttft, 0.99),
             "echo_p50_s": st.quantile(echo, 0.5), "echo_p99_s": st.quantile(echo, 0.99),
             "silent_deaths": silent_deaths(recs) / len(trials) if trials else nan,
             "goodput_bps": got * 8 / (secs * len(trials)) if trials and secs else nan,
@@ -397,6 +476,18 @@ class Impaired(mn.Minimal):
             m["recover_s"] = sum(worst) / len(worst) if worst and all(x == x for x in worst) else nan
             m["recover_8s_s"] = sum(per8) / len(per8) if per8 else nan
             m["recover_25s_s"] = sum(per25) / len(per25) if per25 else nan
+            # Calls clear of the outages, and calls caught by one: the time
+            # from its restore to their first token (the worse outage of a
+            # trial, averaged over trials).
+            m["ttft_clear_p99_s"] = st.quantile([c["ttft"] - c["T"] for c in clear_calls(trials, ph)], 0.99)
+            per_t = []
+            for t in trials:
+                ev = next((r for r in getattr(t, "records", []) if r.get("_phase") == ph and
+                           r.get("kind") == "impair" and not r.get("fail")), None)
+                trecs = [r for r in getattr(t, "records", []) if r.get("_phase") == ph]
+                per_t.append(max(after_restore(ev["outages"], trecs, trial_end(ev["outages"], trecs)))
+                             if ev and ev.get("outages") else nan)
+            m["ttft_after_restore_s"] = sum(per_t) / len(per_t) if per_t and all(x == x for x in per_t) else nan
             # Per outage, from the path's restore: the first byte of a
             # connection opened after it, and of a flow in flight across it.
             for name, fn in (("reopen_ttfb", reopen_ttfb), ("inflight_ttfb", inflight_ttfb)):

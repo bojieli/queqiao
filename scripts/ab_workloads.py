@@ -260,6 +260,12 @@ class Workload:
     # config must then have.
     impairs = False
 
+    def per_trial(self, cfg: Any, slot: Any, arm: Any, phase: Phase) -> Phase:
+        """The phase one trial runs: by default the type's own; a workload may
+        vary its jobs' parameters per trial (offsets drawn from the frozen
+        seed)."""
+        return phase
+
     def impairment(self, cfg: Any, trial: str) -> str:
         """The frozen ab_impair scenario a trial of this type runs under
         ("" for none): applied to the blocks' arm ports just before the
