@@ -79,7 +79,12 @@ type tuicBandwidthEstimator struct {
 	// would delete the states of the others' packets still in flight, whose
 	// acknowledgements would then be state misses and their bytes never
 	// counted as delivered.
-	retireByFate       bool
+	retireByFate bool
+	// staleEvidence, when set, is how many bytes an application-limited
+	// sample must have seen delivered, more than this, before it may replace
+	// an estimate that has outlived its window (see onAckBatch). Only the
+	// path authority's law sets it.
+	staleEvidence      uint64
 	legacyPrevAcked    uint64
 	legacyPrevAckTime  monotime.Time
 	legacyPrevSent     uint64
@@ -262,6 +267,9 @@ type tuicAckSample struct {
 	hasSample        bool
 	maxBandwidth     uint64
 	sampleAppLimited bool
+	// sampleDelivered is the bytes acknowledged over the interval the
+	// maxBandwidth sample was measured on.
+	sampleDelivered uint64
 	// filled says some packet this event acknowledged was sent outside an
 	// application-limited phase: the sender had more to send than its
 	// window or its pacer let it. filledPN is the largest such packet.
@@ -387,6 +395,10 @@ func (e *tuicBandwidthEstimator) onAckBatch(eventTime monotime.Time, acked []qui
 		if sample > result.maxBandwidth {
 			result.maxBandwidth = sample
 			result.sampleAppLimited = state.appLimited
+			result.sampleDelivered = 0
+			if e.totalAcked >= state.totalAckedAtSend {
+				result.sampleDelivered = e.totalAcked - state.totalAckedAtSend
+			}
 		}
 		if !haveLargest || packet.PacketNumber > largestPN {
 			largestPN, largestState, haveLargest = packet.PacketNumber, state, true
@@ -424,8 +436,19 @@ func (e *tuicBandwidthEstimator) onAckBatch(eventTime monotime.Time, acked []qui
 	// connection that is application limited essentially always -- 99.98% of
 	// samples on the path this was measured against -- that exception is the
 	// only way the estimate ever comes down.
+	//
+	// Under the path authority's law the sample must also have seen more than
+	// a minimum window delivered. One that has not measured the sender, not
+	// the path: a lone 21-byte packet acknowledged a round trip later is
+	// 173 B/s on any path. Such a packet, sent 1.7 s into a pause between
+	// bursts, replaced a 20 Mbit/s estimate the pause had aged out, and the
+	// next burst was paced from it: a 1.5 MB segment that took 1 s took 4.5 s
+	// (W10 under recovery=carrier). ProbeRTT's four-packet window is the same
+	// case. The stale estimate stands until a sample with evidence arrives.
+	staleReplaced := e.maxFilter.stale(eventTime) &&
+		(e.staleEvidence == 0 || result.sampleDelivered > e.staleEvidence)
 	if result.maxBandwidth > 0 &&
-		(!result.sampleAppLimited || result.maxBandwidth > e.maxFilter.get() || e.maxFilter.stale(eventTime)) {
+		(!result.sampleAppLimited || result.maxBandwidth > e.maxFilter.get() || staleReplaced) {
 		if result.minRTT > 0 {
 			e.maxFilter.setRoundTrip(result.minRTT)
 		}
