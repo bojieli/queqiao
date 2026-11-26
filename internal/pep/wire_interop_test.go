@@ -35,6 +35,10 @@ type wireAudit struct {
 	replaces   [3]uint64
 	resets     map[string]int
 	violations []string
+	// opened is closed when the first OPEN_OK is read: the gateway has
+	// admitted a session and the client has its confirmation in hand.
+	opened     chan struct{}
+	openedOnce sync.Once
 }
 
 func (a *wireAudit) observe(wire byte, f protocol.Frame) {
@@ -48,6 +52,9 @@ func (a *wireAudit) observe(wire byte, f protocol.Frame) {
 				a.replaces[wire]++
 			}
 		}
+	}
+	if f.Header.Type == protocol.TypeOpenOK {
+		a.openedOnce.Do(func() { close(a.opened) })
 	}
 	if f.Header.Type == protocol.TypeReset && len(f.Payload) > 0 {
 		if a.resets == nil {
@@ -79,7 +86,7 @@ func (a *wireAudit) snapshot() (frames, joins, replaces [3]uint64, violations []
 // lane on a transport that negotiates nothing (a pipe) speak it.
 func auditWire(t *testing.T, pin byte) *wireAudit {
 	t.Helper()
-	audit := &wireAudit{}
+	audit := &wireAudit{opened: make(chan struct{})}
 	observe := audit.observe
 	testFrameObserver.Store(&observe)
 	if pin != 0 {
@@ -93,6 +100,17 @@ func auditWire(t *testing.T, pin byte) *wireAudit {
 		testFrameWire.Store(nil)
 	})
 	return audit
+}
+
+// waitOpened blocks until an OPEN_OK has been read, or fails the test after
+// bound.
+func (a *wireAudit) waitOpened(t *testing.T, bound time.Duration) {
+	t.Helper()
+	select {
+	case <-a.opened:
+	case <-time.After(bound):
+		t.Fatalf("no OPEN_OK within %v", bound)
+	}
 }
 
 func (a *wireAudit) requireClean(t *testing.T, wire byte) {
@@ -434,6 +452,7 @@ func TestStallRescueAcrossWireVersions(t *testing.T) {
 						n, err := conn.Read(buf)
 						received += n
 						if !frozen && received >= 2<<20 {
+							audit.waitOpened(t, stallRescueProgressBound)
 							relay.freeze()
 							frozen = true
 						}
@@ -453,6 +472,14 @@ func TestStallRescueAcrossWireVersions(t *testing.T) {
 					chunk := make([]byte, 64*1024)
 					for sent := 0; sent < size; sent += len(chunk) {
 						if sent >= 2<<20 && sent < 2<<20+len(chunk) {
+							// The client accepts upload bytes before the
+							// gateway has seen its OPEN, so 2 MiB written
+							// says nothing about the session existing. A lane
+							// frozen before the OPEN arrives is a flow that
+							// was never admitted, which no JOIN can rescue
+							// and the client rightly does not reopen (#159):
+							// under load that was this test's failure (#202).
+							audit.waitOpened(t, stallRescueProgressBound)
 							relay.freeze()
 						}
 						_ = conn.SetDeadline(time.Now().Add(stallRescueProgressBound))
