@@ -65,6 +65,8 @@ type ErasureSender struct {
 
 	outcomes []packetOutcome
 
+	debugLog []debugEntry
+
 	// compensationRound, deliveredAtCompensation and appliedArrival are the
 	// probe behind the compensation: what the path was delivering when this
 	// sender last agreed to send faster to make up for erasure, and when.
@@ -715,6 +717,7 @@ func (e *ErasureSender) publishMeasurement() {
 	// compensation may not run ahead of the brake that bounds it.
 	if _, minRTT := e.queueDelay(); minRTT > 0 {
 		e.arrival.Store(uint64(e.compensationFor(1-erasure) * partsPerMillion))
+		e.debugNote(1 - erasure)
 	}
 }
 

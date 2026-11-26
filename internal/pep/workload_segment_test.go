@@ -4,10 +4,12 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 
+	wancongestion "github.com/bojieli/queqiao/internal/congestion"
 	"github.com/bojieli/queqiao/internal/pathsim"
 )
 
@@ -104,6 +106,8 @@ func TestSegmentFetchOnAnEmulatedPath(t *testing.T) {
 		path.LossRate = 0
 	}
 
+	wancongestion.DebugCompensation.Store(true)
+	defer wancongestion.DebugCompensation.Store(false)
 	arms := workloadArms()
 	outcomes := make([]segmentOutcome, len(arms))
 	rigs := make([]*workloadRig, len(arms))
@@ -148,6 +152,23 @@ func TestSegmentFetchOnAnEmulatedPath(t *testing.T) {
 	for err := range errs {
 		t.Fatal(err)
 	}
+	defer func() {
+		if !t.Failed() && runtime.GOOS == "linux" {
+			return
+		}
+		up, down := rigs[1].relay.Stats()
+		t.Logf("DIAG238 flip relay: up dropped %d of %d, down dropped %d of %d", up.PacketsDropped, up.PacketsIn, down.PacketsDropped, down.PacketsIn)
+		pathAuthorities.mu.Lock()
+		defer pathAuthorities.mu.Unlock()
+		for name, c := range pathAuthorities.controllers {
+			s := c.Stats()
+			x := c.Telemetry()
+			t.Logf("DIAG238 %s: stats %+v telemetry %+v", name, s, x)
+			for _, line := range c.DebugLog() {
+				t.Logf("DIAG238 %s", line)
+			}
+		}
+	}()
 	for i, arm := range arms {
 		o := outcomes[i]
 		rounded := make([]time.Duration, len(o.times))

@@ -33,6 +33,17 @@ type pcSimPath struct {
 	erasure float64
 	buffer  float64 // bottleneck buffer, bytes
 	seed    int64
+	// policer, when set, replaces the queue with a token bucket refilled
+	// with rate × policer every policer, one refill and a packet deep: it
+	// drops what it cannot pass and holds nothing.
+	policer time.Duration
+	// wakeEvery, when set, is how often the sending host's run loop wakes:
+	// acknowledgements are processed and packets sent only then, as on a
+	// loaded host whose timers fire coarsely and late (#238).
+	wakeEvery time.Duration
+	// wakeJitter, when set, draws each wake's delay after the previous one
+	// uniformly from [1 ms, wakeJitter], from its own seeded generator.
+	wakeJitter time.Duration
 }
 
 // pcSimLane is one connection's life and traffic.
@@ -49,6 +60,8 @@ type pcSimLane struct {
 	ackOnly          int
 	// requests, for a lane that is neither: one small packet a round trip.
 	requests bool
+	// pauseEvery, for a bulk lane, pauses it for pauseFor that often.
+	pauseEvery, pauseFor time.Duration
 }
 
 type pcSimResult struct {
@@ -216,8 +229,20 @@ func runPCSim(path pcSimPath, lanes []pcSimLane, duration, measureFrom time.Dura
 	var r pcSimResult
 	r.perSecond = make([]float64, int(duration/time.Second)+1)
 	var busyUntil time.Duration
+	var tokens float64
+	var refilledAt, nextWake time.Duration
+	wakeRNG := rand.New(rand.NewSource(path.seed + 7))
 	for now = 0; now < duration; now += pcSimTick {
 		at := base.Add(now)
+		if path.wakeEvery > 0 && now%path.wakeEvery != 0 {
+			continue
+		}
+		if path.wakeJitter > 0 {
+			if now < nextWake {
+				continue
+			}
+			nextWake = now + pcSimTick + time.Duration(wakeRNG.Int63n(int64(path.wakeJitter/pcSimTick)))*pcSimTick
+		}
 		for i, c := range conns {
 			if !c.open && now >= c.plan.join && (c.plan.stop == 0 || now < c.plan.stop) {
 				c.open = true
@@ -299,6 +324,23 @@ func runPCSim(path pcSimPath, lanes []pcSimLane, duration, measureFrom time.Dura
 				r.sent++
 				start := max(busyUntil, now)
 				p := pcSimPacket{number: n, bytes: bytes, sent: now, bulk: bulk}
+				if path.policer > 0 {
+					quantum := path.rate * path.policer.Seconds()
+					for refilledAt+path.policer <= now {
+						refilledAt += path.policer
+						tokens = min(tokens+quantum, quantum+pcSimPacketSize)
+					}
+					if tokens < float64(bytes) {
+						p.lost, p.due = true, now+path.rtt
+						r.dropped++
+					} else {
+						tokens -= float64(bytes)
+						p.due = now + path.rtt
+						p.lost = rng.Float64() < path.erasure
+					}
+					c.pending = append(c.pending, p)
+					return
+				}
 				if backlog := (start - now).Seconds() * path.rate; backlog+float64(bytes) > path.buffer {
 					p.lost, p.due = true, start+path.rtt
 					r.dropped++
@@ -311,6 +353,8 @@ func runPCSim(path pcSimPath, lanes []pcSimLane, duration, measureFrom time.Dura
 				c.pending = append(c.pending, p)
 			}
 			switch {
+			case c.plan.bulk && c.plan.pauseEvery > 0 && now%c.plan.pauseEvery >= c.plan.pauseEvery-c.plan.pauseFor:
+				c.idle()
 			case c.plan.bulk:
 				for c.admit(at, quiccongestion.ClassBulk) {
 					send(pcSimPacketSize, true, true, quiccongestion.ClassBulk)

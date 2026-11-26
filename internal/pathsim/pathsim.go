@@ -144,6 +144,18 @@ type Config struct {
 	// no single bandwidth -- which is the case a max filter reports wrongly by
 	// construction, and the reason a bandwidth estimate has to be able to fall.
 	PolicerBurstBytes int
+	// IngressBatch, when set, holds every packet that reaches the emulator
+	// until the next multiple of this period and lets the period's packets
+	// in together, in both directions. It models a host whose timers and
+	// socket wakeups fire coarsely and late, as a loaded macOS-intel runner
+	// does (#238): a pacer's packets leave in clumps, and acknowledgements
+	// reach the sender in clumps. Zero disables it.
+	IngressBatch time.Duration
+	// IngressStallEvery and IngressStallFor model a host that is
+	// descheduled now and then: every IngressStallEvery, the packets that
+	// reach the emulator in the next IngressStallFor are let in together at
+	// its end, in both directions. Zero disables it.
+	IngressStallEvery, IngressStallFor time.Duration
 	// Seed makes the loss pattern reproducible across runs.
 	Seed int64
 	// MTU bounds a single datagram. Zero selects 1500.
@@ -799,6 +811,14 @@ func (r *Relay) forward(d *direction, perFlow *direction, payload []byte, send f
 	d.packetsIn.Add(1)
 	d.bytesIn.Add(uint64(len(payload)))
 	now := time.Now()
+	if g := r.cfg.IngressBatch; g > 0 {
+		now = now.Truncate(g).Add(g)
+	}
+	if every, stall := r.cfg.IngressStallEvery, r.cfg.IngressStallFor; every > 0 && stall > 0 {
+		if base := now.Truncate(every); now.Sub(base) < stall {
+			now = base.Add(stall)
+		}
+	}
 	if perFlow != nil && r.cfg.PerFlowRateBytesPerSec > 0 {
 		// The per-flow policer runs first and contributes only queueing delay
 		// and its own tail drop; the shared path then adds loss and the
