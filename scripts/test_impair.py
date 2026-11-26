@@ -253,6 +253,9 @@ class Actions(unittest.TestCase):
         c.impair.leftovers = []
         c.reserved = ["c1"]
         c.hosts["c1"].run = mock.Mock(side_effect=lambda *a, **k: order.append("processes") or (0, ""))
+        for name, h in c.hosts.items():
+            if name != "c1":
+                h.run = mock.Mock(return_value=(0, ""))
         c.teardown()
         self.assertEqual(order[0], "impair")
 
@@ -470,3 +473,14 @@ class TtftSplit(unittest.TestCase):
                 self.call(68.0, 99.0, ttft=28.0),           # first token at 96.0
                 self.call(80.0, 110.0, ttft=None, fail="TimeoutError: timed out")]   # none: censored at its end
         self.assertEqual(imp.after_restore(outs, recs, 120.0), [1.5, 15.0])
+
+
+class PatientTeardown(unittest.TestCase):
+    def test_teardown_makes_every_host_patient(self):
+        cfg = parse(BASE)
+        c = ab.Campaign(cfg, "/nonexistent", ".", dry=False, stream=io.StringIO())
+        c.reserved = []
+        c.impair = None
+        with mock.patch.object(ab.Host, "run", return_value=(0, "")):
+            c.teardown()
+        self.assertTrue(c.hosts and all(h.retry_255 == c.TEARDOWN_SSH_TRIES for h in c.hosts.values()))

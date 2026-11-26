@@ -674,6 +674,12 @@ class Host:
         # Every session's wall time, for the overhead profile (timing.tsv):
         # set by the campaign once its directory exists.
         self.timing_path = ""
+        # Sessions that fail to connect (exit 255) are retried this many
+        # times, with backoff, before the failure is returned: set while the
+        # campaign tears down, whose steps are idempotent, so a brief outage
+        # of the runner's link delays the teardown instead of leaving the
+        # hosts as they were.
+        self.retry_255 = 0
 
     def _time(self, what: str, t0: float) -> None:
         if self.timing_path:
@@ -692,12 +698,18 @@ class Host:
                 for line in script.strip().splitlines():
                     print(f"    {line}", file=self.out)
             return 0, ""
-        t0 = time.time()
-        try:
-            p = subprocess.run(self._argv(), input="set -uo pipefail\n" + script, capture_output=True, text=True,
-                               timeout=timeout)
-        finally:
-            self._time(what or "run", t0)
+        for k in range(self.retry_255 + 1):
+            t0 = time.time()
+            try:
+                p = subprocess.run(self._argv(), input="set -uo pipefail\n" + script, capture_output=True, text=True,
+                                   timeout=timeout)
+            finally:
+                self._time(what or "run", t0)
+            if p.returncode != 255 or k == self.retry_255:
+                break
+            print(f"{utc(time.time())} {self.dest}: ssh session failed ({what or 'run'}); retry {k + 1} of "
+                  f"{self.retry_255}", file=self.out, flush=True)
+            time.sleep(min(30.0, 2.0 * 2 ** k))
         return p.returncode, p.stdout + (("\n" + p.stderr) if p.returncode and p.stderr else "")
 
     def put(self, local: str, remote: str, if_changed: bool = False) -> None:
@@ -1739,6 +1751,9 @@ rm -f "$f"''', what=f"stop {tag}")
     # The CPU sampler's launch, stop and fetch: 9 sessions, about three and a
     # half minutes of backoff, since its record decides whether a block counts.
     SAMPLER_SSH_TRIES = 9
+    # Teardown, its verification and the final production snapshot: every
+    # session retried through about ten minutes of an unreachable host.
+    TEARDOWN_SSH_TRIES = 24
 
     def run_job(self, host: str, script: str, timeout: float, what: str) -> Tuple[int, str]:
         """Run a job detached on host and return (exit status, output). An ssh
@@ -2259,6 +2274,8 @@ rm -f "$f"''', what=f"stop {tag}")
     def teardown(self) -> None:
         self.log("teardown")
         self.tearing_down = True
+        for h in self.hosts.values():
+            h.retry_255 = self.TEARDOWN_SSH_TRIES
         if self.impair:
             # Before any process is stopped (the watchdogs among them): every
             # set removed and the tc state compared with the snapshot.
