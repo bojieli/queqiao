@@ -328,23 +328,25 @@ func TestKeepAliveFloorIsFourRoundTripsOrHalfASecond(t *testing.T) {
 // one SRTT (§10.3 step 5).
 func TestReplayGateOpensOnTheFirstACKOrAfterOneSRTT(t *testing.T) {
 	f := &multipathFlow{done: make(chan struct{})}
-	lane := &mpLane{replayGate: &replayGate{acks: 0, until: time.Now().Add(time.Hour)}}
+	lane := &mpLane{replayGate: &replayGate{until: time.Now().Add(time.Hour)}}
 	go func() {
-		time.Sleep(30 * time.Millisecond)
+		// An ACK on the old lane, during make-before-break, opens nothing.
 		f.acksIn.Add(1)
+		time.Sleep(30 * time.Millisecond)
+		lane.acksIn.Add(1)
 	}()
 	start := time.Now()
 	f.waitReplayGate(context.Background(), lane)
 	if took := time.Since(start); took < 25*time.Millisecond || took > time.Second {
-		t.Fatalf("gate opened after %v; the ACK came at 30ms", took)
+		t.Fatalf("gate opened after %v; the rebound lane's ACK came at 30ms", took)
 	}
-	lane.replayGate = &replayGate{acks: f.acksIn.Load(), until: time.Now().Add(40 * time.Millisecond)}
+	quiet := &mpLane{replayGate: &replayGate{until: time.Now().Add(40 * time.Millisecond)}}
+	f.acksIn.Add(1)
 	start = time.Now()
-	f.waitReplayGate(context.Background(), lane)
+	f.waitReplayGate(context.Background(), quiet)
 	if took := time.Since(start); took < 35*time.Millisecond || took > time.Second {
-		t.Fatalf("gate without an ACK opened after %v, want one SRTT (40ms)", took)
+		t.Fatalf("gate without an ACK on its lane opened after %v, want one SRTT (40ms)", took)
 	}
-	// No gate, no wait.
 	start = time.Now()
 	f.waitReplayGate(context.Background(), &mpLane{})
 	if time.Since(start) > 10*time.Millisecond {

@@ -56,7 +56,14 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 	ticker := time.NewTicker(carrierRebindPoll)
 	defer ticker.Stop()
 	m.flows.Add(1)
-	defer m.flows.Add(-1)
+	counted := true
+	uncount := func() {
+		if counted {
+			counted = false
+			m.flows.Add(-1)
+		}
+	}
+	defer uncount()
 	unbound := false
 	setUnbound := func(on bool) {
 		if on != unbound {
@@ -98,6 +105,10 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			return
 		}
 		if hasTCPLane(flow) {
+			// The flow leaves the carrier manager: it holds no QUIC
+			// reservation and no wire pin while it lives on TCP.
+			setUnbound(false)
+			uncount()
 			retired := flow.retireLanesExcept(TransportTCP)
 			c.cfg.Logger.Info("flow handed off to TCP fallback", "flow_id", flowID, "retired_quic_lanes", retired, "tcp_lanes", flow.laneCount())
 			c.manageTCPBundle(manageCtx, flow, sessionID, flowID)
@@ -133,17 +144,18 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 				"latest_handoff_start", latest.Sub(now), "binding_deadline", deadline.Sub(now))
 		}
 		latest, deadline := m.cfg.bindingDeadlines(observed)
-		if superseded && flow.openConfirmationRequired.Load() {
-			// A JOIN can overtake an OPEN the gateway has not admitted; the
-			// old carrier's probes keep retransmitting it (§10.3 step 7).
-			continue
-		}
 		if !now.Before(deadline) {
 			m.deadlineFailures.Add(1)
 			c.cfg.Logger.Warn("flow binding deadline passed", "flow_id", flowID, "attempts", attempts,
 				"since_observed", now.Sub(observed))
 			flow.failBinding(errBindingDeadline)
 			return
+		}
+		if superseded && flow.openConfirmationRequired.Load() {
+			// A JOIN can overtake an OPEN the gateway has not admitted; the
+			// old carrier's probes keep retransmitting it (§10.3 step 7).
+			// Its binding deadline still runs.
+			continue
 		}
 		target := m.eligible()
 		if c.cfg.Transport == TransportAuto && !tcpTried {
@@ -170,8 +182,13 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			continue
 		}
 		if attempts >= maxLaneRecoveryAttempts {
-			c.cfg.Logger.Info("lane recovery abandoned", "attempts", attempts, "flow_id", flowID)
-			return
+			// The QUIC budget is spent: no more QUIC JOINs, but AUTO still
+			// has its TCP handoff, and the binding deadline still ends the
+			// flow.
+			if c.cfg.Transport == TransportAuto && !tcpTried {
+				tcpNow = true
+			}
+			continue
 		}
 		attempts++
 		lastAttemptAt = now
@@ -280,7 +297,7 @@ func (c *Client) rebindFlow(ctx context.Context, flow *multipathFlow, sessionID 
 	if srtt <= 0 {
 		srtt = 100 * time.Millisecond
 	}
-	lane.replayGate = &replayGate{acks: flow.acksIn.Load(), until: time.Now().Add(srtt)}
+	lane.replayGate = &replayGate{until: time.Now().Add(srtt)}
 	if err := c.installRecoveryLane(flow, lane); err != nil {
 		return err
 	}
@@ -335,10 +352,10 @@ func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, ses
 }
 
 // replayGate holds a rebound lane's READY data until the first flow ACK
-// after the rebinding, or until one SRTT has passed (§10.3 step 5). ACK and
-// FIN frames do not pass through it.
+// arrives on that lane, or until one SRTT has passed (§10.3 step 5). An ACK
+// on the old lane during make-before-break does not open it. ACK and FIN
+// frames do not pass through it.
 type replayGate struct {
-	acks  uint64
 	until time.Time
 }
 
@@ -348,7 +365,7 @@ func (f *multipathFlow) waitReplayGate(ctx context.Context, lane *mpLane) {
 	if gate == nil {
 		return
 	}
-	for f.acksIn.Load() == gate.acks && time.Now().Before(gate.until) {
+	for lane.acksIn.Load() == 0 && time.Now().Before(gate.until) {
 		wait := min(time.Until(gate.until), 5*time.Millisecond)
 		select {
 		case <-ctx.Done():

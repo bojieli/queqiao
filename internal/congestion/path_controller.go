@@ -1491,11 +1491,11 @@ type PathAttachment struct {
 	counters   ControllerTelemetry
 
 	// Run loop only.
-	wake      func()
-	attached  bool
+	wake     func()
+	attached bool
 	// live mirrors attached for readers off the run loop: 0 before OnAttach,
 	// 1 attached, 2 after OnDetach.
-	live atomic.Int32
+	live      atomic.Int32
 	maxPacket quiccongestion.ByteCount
 	connRTT   quiccongestion.RTTStatsProvider
 }

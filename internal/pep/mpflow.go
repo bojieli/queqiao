@@ -120,6 +120,8 @@ type mpLane struct {
 	// replayGate, set on a lane that rebinds a flow under recovery=carrier,
 	// holds READY data until the first ACK after the rebinding or one SRTT.
 	replayGate *replayGate
+	// acksIn counts flow ACKs that arrived on this lane.
+	acksIn atomic.Uint64
 	// writeHook is an internal deterministic fault-injection point used by
 	// integration tests. Production lanes leave it nil, so the data path has
 	// only one predictable nil check before the real framed write.
@@ -3306,6 +3308,9 @@ func (f *multipathFlow) receiveACK(event inboundEvent) error {
 		return errors.New("ack belongs to another flow")
 	}
 	f.acksIn.Add(1)
+	if event.lane != nil {
+		event.lane.acksIn.Add(1)
+	}
 	if frame.Header.Flags&f.sendAckFlag == 0 {
 		return errors.New("acknowledgement has wrong direction")
 	}

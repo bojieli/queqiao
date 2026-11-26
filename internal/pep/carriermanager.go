@@ -319,6 +319,12 @@ func (h *attemptHistory) observe(now time.Time, healthy bool) {
 	}
 }
 
+func (h *attemptHistory) reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.charged, h.cooldown, h.next, h.healthySince = 0, 0, time.Time{}, time.Time{}
+}
+
 func (h *attemptHistory) rounds() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -336,7 +342,10 @@ type managedCarrier struct {
 	fsm       carrierFSM
 	verified  bool
 	warmUntil time.Time
-	keepAlive time.Duration
+	// standbyTried says this carrier's current SUSPECT episode has had its
+	// one standby dial round; a new episode gets another (§10.2).
+	standbyTried bool
+	keepAlive    time.Duration
 	// rebinding counts the flows queued for or running a JOIN onto this
 	// carrier: a new OPEN does not take a stream slot one of them needs
 	// (§10.3 step 2).
@@ -646,16 +655,16 @@ func (m *carrierManager) tick() bool {
 			if a, ok := g.controller.(*wancongestion.PathAttachment); ok {
 				a.SetProbing(true)
 			}
-			m.dialStandbyLocked()
+			mc.standbyTried = m.dialStandbyLocked()
 		case from == carrierSuspect && to == carrierActive:
+			mc.standbyTried = false
 			if sb := m.standby; sb != nil && sb.warmUntil.IsZero() {
 				sb.warmUntil = now.Add(standbyWarmFor)
 			}
-		case to == carrierSuspect:
-			if m.standby == nil {
-				// The first round failed; the history paces another.
-				m.dialStandbyLocked()
-			}
+		case to == carrierSuspect && !mc.standbyTried:
+			// The round could not start (cooldown, connection budget);
+			// one round per episode, when it can.
+			mc.standbyTried = m.dialStandbyLocked()
 		}
 		if promote {
 			if sb := m.usableStandbyLocked(); sb != nil {
@@ -749,9 +758,11 @@ func (m *carrierManager) connectionBudget() int {
 // if the attempt history and the device's connection budget allow it. A
 // DRAINING carrier still holding flows counts against the budget; without
 // room, recovery is break-before-make (§10.2).
-func (m *carrierManager) dialStandbyLocked() {
+//
+// It reports whether a round is running or was started.
+func (m *carrierManager) dialStandbyLocked() bool {
 	if m.standby != nil || m.dialing {
-		return
+		return true
 	}
 	live := 0
 	for g, mc := range m.carriers {
@@ -760,20 +771,21 @@ func (m *carrierManager) dialStandbyLocked() {
 		}
 	}
 	if live >= m.connectionBudget() {
-		return
-	}
-	if ok, _ := m.admitDial(true); !ok {
-		return
+		return false
 	}
 	serving := m.c.serving.Load()
 	if serving == nil || (*serving).Err() != nil {
-		return
+		return false
+	}
+	if ok, _ := m.admitDial(true); !ok {
+		return false
 	}
 	ctx, cancel := context.WithTimeout(*serving, m.c.cfg.DialTimeout)
 	m.dialing = true
 	m.cancelStandby = cancel
 	m.standbyDials.Add(1)
 	go m.dialStandby(ctx, cancel, m.pathEpoch)
+	return true
 }
 
 func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelFunc, epoch uint64) {
@@ -831,6 +843,9 @@ func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelF
 // which becomes DRAINING. It is single-flight: only the tick holding the
 // manager's lock does it, once per standby.
 func (m *carrierManager) promoteLocked(old, sb *managedCarrier, reason string) {
+	// The displaced flows are counted before the new carrier is published,
+	// so no new OPEN on it can run ahead of them (§10.3 step 2).
+	m.displaced.Add(old.gen.flows.Load())
 	m.installLocked(sb, reason)
 	if !old.fsm.state.terminal() {
 		old.fsm.drain()
@@ -842,9 +857,6 @@ func (m *carrierManager) promoteLocked(old, sb *managedCarrier, reason string) {
 	}
 	old.gen.stopBorrowing(errPoolRetired)
 	old.drainUntil = m.now().Add(m.cfg.grace - m.cfg.DetectionSkew)
-	// Counted before the promotion is visible, so no new OPEN on the new
-	// carrier can run ahead of the flows it displaced.
-	m.displaced.Add(old.gen.flows.Load())
 	go m.c.drainControlQUICGeneration(old.gen)
 	m.promotions.Add(1)
 	m.log.Info("carrier promoted", "old", old.gen.id, "new", sb.gen.id, "reason", reason,
@@ -888,6 +900,9 @@ func (m *carrierManager) pathReset(reason string) {
 	}
 	m.standby = nil
 	m.pathEpoch++
+	// A new path funds its own recovery: the old one's cooldown and cap
+	// say nothing about it.
+	m.history.reset()
 	if m.cancelStandby != nil {
 		m.cancelStandby()
 	}
