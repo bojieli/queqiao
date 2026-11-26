@@ -314,17 +314,18 @@ type m5Check struct {
 	legacy  float64
 }
 
-// m5Checks are the model's bounds (W7, W6) against legacy's means over nine
-// blocks measured at stage 10, on a 32-core Linux host: 2.00 % and 2.83 % of
-// audio late or lost, lateness p99 of 210 ms and 311 ms, keystroke echo p99
-// of 352 ms. The path controller's means over the same blocks were 1.98 %,
-// 2.46 %, 223 ms, 286 ms and 324 ms.
+// m5Checks are the model's bounds (W7, W6) against legacy's means over 21
+// blocks measured at stage 10, on a 32-core Linux host: 2.19 % and 2.60 % of
+// audio late or lost, lateness p99 of 224 ms and 289 ms, keystroke echo p99
+// of 341 ms. Paired with those blocks, the path-authority bundle was not
+// decided either way at the cap on the audio measures: its uplink lateness
+// p99 ran at 223 to 249 ms, beside a bound of 257.
 var m5Checks = []m5Check{
-	{"uplink audio late loss (%)", 0, 1, 0.005, 100, 0.0200},
-	{"downlink audio late loss (%)", 1, 1, 0.005, 100, 0.0283},
-	{"uplink audio lateness p99 (ms)", 2, 1.10, 0.010, 1000, 0.2100},
-	{"downlink audio lateness p99 (ms)", 3, 1.10, 0.010, 1000, 0.3114},
-	{"keystroke echo p99 (ms)", 4, 1.10, 0.020, 1000, 0.3523},
+	{"uplink audio late loss (%)", 0, 1, 0.005, 100, 0.0219},
+	{"downlink audio late loss (%)", 1, 1, 0.005, 100, 0.0260},
+	{"uplink audio lateness p99 (ms)", 2, 1.10, 0.010, 1000, 0.2242},
+	{"downlink audio lateness p99 (ms)", 3, 1.10, 0.010, 1000, 0.2892},
+	{"keystroke echo p99 (ms)", 4, 1.10, 0.020, 1000, 0.3406},
 }
 
 type m5Verdict int

@@ -155,13 +155,13 @@ func TestSegmentFetchOnAnEmulatedPath(t *testing.T) {
 }
 
 // What the legacy bundle measured on W10's paths at stage 10, before it was
-// deleted, on a 32-core Linux host: the median of five full runs (p10 of
-// 11.79, 10.70, 10.39, 9.60 and 7.14 Mbit/s; no rebuffering) and of four
-// -short runs (medians of 10.02, 9.63, 9.54 and 9.42 Mbit/s). The path
-// controller's own figures in the same runs were a p10 of 10.8 to 11.4 and a
+// deleted, on a 32-core Linux host: the median of 16 full runs (p10 from 6.5
+// to 12.0 Mbit/s, three of them under 9; no rebuffering) and of four -short
+// runs (medians of 10.02, 9.63, 9.54 and 9.42 Mbit/s). The path-authority
+// bundle's own figures in the same runs were a p10 of 10.2 to 11.7 and a
 // -short median of 9.7 to 10.2.
 const (
-	segmentLegacyP10Mbps         = 10.39
+	segmentLegacyP10Mbps         = 10.65
 	segmentLegacyShortMedianMbps = 9.6
 	segmentLegacyRebuffer        = 0.0
 )
