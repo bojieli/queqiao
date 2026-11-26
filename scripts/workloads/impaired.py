@@ -288,13 +288,21 @@ class Impaired(mn.Minimal):
                    "reopen_ttfb_8s_s", "reopen_ttfb_25s_s", "inflight_ttfb_8s_s", "inflight_ttfb_25s_s")
 
     def generics(self, plan):
-        return dict(self.generic)
+        """At stage 10 (`[workload:impaired] stage = 10`) sender-side credit
+        delay p95 is also a rule of every trial type ([secondary] bound)."""
+        if mn.campaign_stage(plan) < 10:
+            return dict(self.generic)
+        return {ph: ks + ("credit_delay_p95_s",) for ph, ks in self.generic.items()}
 
     def report_only_for(self, plan):
-        return self.report_only
+        return self.report_only + (("false_promotion_rate",) if mn.campaign_stage(plan) >= 10 else ())
 
     def reported(self, plan):
-        return {}
+        # The shadow false-promotion rate is reported at stage 10 (it needs
+        # --carrier-shadow on every endpoint), never gated here.
+        if mn.campaign_stage(plan) < 10:
+            return {}
+        return {ph: ("false_promotion_rate",) for ph in self.generic}
 
     def read(self, cfg, p):
         cfg.scenario_udp_port = int(p.get("udp_port", "23487"))
@@ -304,7 +312,10 @@ class Impaired(mn.Minimal):
         if bad or not trials or len(set(trials)) != len(trials):
             raise ab.ConfigError(f"[workload:impaired] trials: want some of {', '.join(TRIAL_TYPES)}, each once")
         cfg.minimal_trials = [t for t in TRIAL_TYPES if t in trials]
-        cfg.minimal_stage = 7
+        stage = p.get("stage", "7").strip()
+        if stage not in ("7", "10"):
+            raise ab.ConfigError("[workload:impaired] stage: 7 or 10 (10 adds credit delay to the rules)")
+        cfg.minimal_stage = int(stage)
         iw = p.get("idle_wake", "true").strip().lower()
         if iw not in ("true", "false"):
             raise ab.ConfigError("[workload:impaired] idle_wake: true or false")
@@ -401,7 +412,9 @@ class Impaired(mn.Minimal):
         return True
 
     def block_tails(self, trials, plan):
-        out: Dict[str, Tuple[Optional[float], List[float]]] = {}
+        # The generic secondaries' pooled evidence (credit delay histograms,
+        # promotion counts), then this workload's own tails.
+        out: Dict[str, Tuple[Optional[float], List[float]]] = dict(mn.Minimal.block_tails(self, trials, plan))
         for ph in TRIAL_TYPES:
             pt = [t for t in trials if getattr(t, "trial", "") == ph]
             if not pt:
