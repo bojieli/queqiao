@@ -373,10 +373,12 @@ type managedCarrier struct {
 	probes    atomic.Int32
 	lastProbe time.Time
 	// received and receivedAt are the connection's received-packet count at
-	// the last tick that saw it move, and when; sentAtReceive is its sent
-	// count then (guarded by the manager).
-	received, sentAtReceive uint64
-	receivedAt              time.Time
+	// the last tick that saw it move, and when; elicitingSince is when a
+	// tick first saw an ack-eliciting packet outstanding with nothing heard
+	// since (guarded by the manager).
+	received       uint64
+	receivedAt     time.Time
+	elicitingSince time.Time
 	// bound counts the managed flows bound to this carrier. A UDP
 	// association's stream is a pooled stream but not a binding this
 	// manager moves, so it is not counted.
@@ -704,21 +706,29 @@ func (m *carrierManager) tick() bool {
 			mc.standbyTried = m.dialStandbyLocked()
 		}
 		if st.PacketsReceived != mc.received || mc.receivedAt.IsZero() {
-			mc.received, mc.sentAtReceive, mc.receivedAt = st.PacketsReceived, st.PacketsSent, now
+			mc.received, mc.receivedAt, mc.elicitingSince = st.PacketsReceived, now, time.Time{}
 		}
-		// Probe a SUSPECT carrier; and probe one with flows that has sent
-		// since it last heard anything and has heard nothing for a while.
+		switch {
+		case !st.ElicitingOutstanding:
+			mc.elicitingSince = time.Time{}
+		case mc.elicitingSince.IsZero():
+			mc.elicitingSince = now
+		}
+		// Probe a SUSPECT carrier; and probe one with flows whose
+		// ack-eliciting packet (a keep-alive PING counts) has gone unanswered,
+		// with nothing heard at all, for max(1 s, 4 SRTT).
 		// A carrier carrying mostly downloads has almost nothing of its own
 		// outstanding: its probe timeouts -- the evidence SUSPECT is built on
 		// -- barely accrue during an outage, and the one keep-alive PING it
 		// sent early in it has backed off for seconds by the time the path
 		// returns. The probe is ack-eliciting, so it both notices a returned
 		// path and supplies that evidence on a dead one. It changes no state
-		// by itself. A healthy idle carrier sends nothing between keep-alives
-		// and hears each one acknowledged within a round trip, so it is never
-		// probed.
-		silent := mc.gen.flows.Load() > 0 && st.PacketsSent != mc.sentAtReceive &&
-			now.Sub(mc.receivedAt) >= max(pathProbeEvery, keepAliveFloorRTTs*st.SmoothedRTT)
+		// by itself. A healthy idle carrier has nothing ack-eliciting
+		// outstanding between keep-alives (an ACK it sends elicits nothing)
+		// and hears each keep-alive acknowledged within a round trip, so it
+		// is never probed.
+		silent := mc.gen.flows.Load() > 0 && !mc.elicitingSince.IsZero() &&
+			now.Sub(mc.elicitingSince) >= max(pathProbeEvery, keepAliveFloorRTTs*st.SmoothedRTT)
 		if to == carrierSuspect || silent {
 			m.probePathLocked(mc, now)
 		}
