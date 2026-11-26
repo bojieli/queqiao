@@ -90,27 +90,32 @@ type TUICBBRSender struct {
 	appLimitedBy func() bool
 
 	// skipAppLimitedProbeRTT has the sender skip a ProbeRTT that its own
-	// flight cannot have made necessary (design §4.2). BBR's standing queue
-	// is a flight held at the window above the path's BDP. A sender that,
-	// since the minimum RTT was last measured, has run out of work at least
-	// once (appLimitedSinceMinRTT: its own backlog drained) and whose
-	// flight never reached its window (filledSinceMinRTT unset) built none,
-	// whatever else held it back -- briefly its pacer in a gain cycle, say.
-	// When the minimum expires for such a sender, the expiry renews it from
-	// the current sample, as it always does, without entering ProbeRTT. A
-	// sender that always has work, as a bulk one does, takes every ProbeRTT.
-	// A path controller sets it, and reports each admission its window
-	// refused (noteWindowLimited) and each unused opportunity (caughtUp).
-	// probeRTTs and probeRTTsSkipped count entries and skips.
+	// flight cannot have made necessary (design §4.2). A sender builds a
+	// queue at the bottleneck only by sending faster than the bottleneck
+	// drains, which it can do only while it has more to send than it is
+	// let: while its window or its pacer, not its application, holds it.
+	// When the minimum RTT expires and every packet acknowledged since the
+	// minimum was measured was sent in an application-limited phase, and no
+	// admission found the flight at the window (filledSinceMinRTT unset),
+	// the sender built no queue of its own: the minimum is renewed from the
+	// least RTT sampled in that time (rttSinceMinRTT) without entering
+	// ProbeRTT. A path controller sets it, and reports each admission its
+	// window refused (noteWindowLimited) and each unused opportunity
+	// (caughtUp). probeRTTs and probeRTTsSkipped count entries and skips.
 	//
 	// catchingUp is set when a ProbeRTT ends, until the sender is next
 	// application-limited: until the backlog the ProbeRTT held back has
-	// drained, however long that takes beside the sender's own demand. A
-	// window it meets meanwhile is the ProbeRTT's doing, not its own.
+	// drained, however long that takes beside the sender's own demand.
+	// catchUpEndPN is then the last packet it had sent. The packets up to it
+	// carry the ProbeRTT's backlog, not the sender's own, and do not count
+	// as filling. A sender that never drains, as a bulk one does not, is
+	// filling on its own account: an expiry that finds it still catching up
+	// is taken.
 	skipAppLimitedProbeRTT bool
 	filledSinceMinRTT      bool
-	appLimitedSinceMinRTT  bool
+	rttSinceMinRTT         time.Duration
 	catchingUp             bool
+	catchUpEndPN           quiccongestion.PacketNumber
 	probeRTTs              uint64
 	probeRTTsSkipped       uint64
 }
@@ -198,6 +203,7 @@ func NewTUICBBRSender(initialPacketSize quiccongestion.ByteCount) *TUICBBRSender
 		lossIsCongestion: true,
 		maxAckedPN:       quiccongestion.PacketNumber(-1),
 		maxSentPN:        quiccongestion.PacketNumber(-1),
+		catchUpEndPN:     quiccongestion.PacketNumber(-1),
 		endRecoveryPN:    quiccongestion.PacketNumber(-1),
 		roundEndPN:       quiccongestion.PacketNumber(-1),
 		estimator:        newTUICBandwidthEstimator(),
@@ -539,24 +545,36 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 				rttSample = latest
 			}
 		}
-		ownQueue := b.filledSinceMinRTT || !b.appLimitedSinceMinRTT || b.catchingUp
+		// A packet sent while the sender caught up on what a ProbeRTT
+		// held back carries the ProbeRTT's backlog, not the sender's own.
+		fill := sample.filled && !b.catchingUp && sample.filledPN > b.catchUpEndPN
+		ownQueue := b.filledSinceMinRTT || fill || b.catchingUp
+		least := b.rttSinceMinRTT
+		if rttSample > 0 && (least <= 0 || rttSample < least) {
+			least = rttSample
+		}
 		if rttSample > 0 {
 			stamped := b.minRTTAt
 			minRTTExpired = b.refreshRTTSample(eventTime, rttSample)
 			if b.minRTTAt != stamped {
 				// A new minimum-RTT window starts with this event.
-				b.filledSinceMinRTT, b.appLimitedSinceMinRTT = false, false
+				b.filledSinceMinRTT, b.rttSinceMinRTT = false, 0
+			} else {
+				b.filledSinceMinRTT, b.rttSinceMinRTT = b.filledSinceMinRTT || fill, least
 			}
+		} else {
+			b.filledSinceMinRTT = b.filledSinceMinRTT || fill
 		}
 		if minRTTExpired && b.skipAppLimitedProbeRTT && !ownQueue && b.mode != tuicBbrProbeRTT {
-			// In this window of the minimum the sender drained its own
-			// work and its flight never reached the window, so it built no
-			// standing queue for ProbeRTT to drain. A higher minimum is
-			// other traffic's queue, on the path or on the
+			// Application-limited throughout this window of the minimum:
+			// the sender built no queue for ProbeRTT to drain. A higher
+			// minimum is other traffic's queue, on the path or on the
 			// acknowledgements' return, which capping this sender cannot
 			// remove; the cap would only hold its packets for a round trip
-			// and 200 ms.
+			// and 200 ms. The minimum becomes the least RTT the window
+			// sampled, as a windowed minimum filter would have it.
 			minRTTExpired = false
+			b.minRTT = least
 			b.probeRTTsSkipped++
 		}
 		b.maxAckedPN = largestAck
@@ -835,9 +853,8 @@ func (b *TUICBBRSender) shouldExitStartupForLoss(lastSendState tuicSendState) bo
 // caughtUp is told that the sender has just been found application-limited:
 // a backlog a ProbeRTT left has drained.
 func (b *TUICBBRSender) caughtUp() {
-	if b.mode != tuicBbrProbeRTT {
-		b.catchingUp = false
-		b.appLimitedSinceMinRTT = true
+	if b.catchingUp && b.mode != tuicBbrProbeRTT {
+		b.catchingUp, b.catchUpEndPN = false, b.maxSentPN
 	}
 }
 
@@ -874,7 +891,7 @@ func (b *TUICBBRSender) maybeProbeRTT(now monotime.Time, roundStart bool, inFlig
 	}
 	if !b.exitProbeRTT.IsZero() && b.probeRTTRoundPassed && !now.Before(b.exitProbeRTT) {
 		b.minRTTAt = now
-		b.filledSinceMinRTT, b.appLimitedSinceMinRTT = false, false
+		b.filledSinceMinRTT, b.rttSinceMinRTT = false, 0
 		b.catchingUp = true
 		if b.fullBandwidth {
 			b.mode = tuicBbrProbeBW

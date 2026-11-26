@@ -744,9 +744,9 @@ func BenchmarkPruneStates(b *testing.B) {
 }
 
 // The evidence a path controller's sender keeps for skipping ProbeRTT
-// (#210): a window met while catching up on a ProbeRTT's backlog is not the
-// sender's own, the catch-up ends when the sender is next application-
-// limited, and from then a window it meets is.
+// (#210): a window met during a ProbeRTT, or while catching up on its
+// backlog, is not the sender's own; the catch-up ends when the sender is
+// next application-limited, and from then a window it meets is.
 func TestTUICProbeRTTSkipEvidence(t *testing.T) {
 	sender := NewTUICBBRSender(1200)
 	sender.skipAppLimitedProbeRTT = true
@@ -754,22 +754,20 @@ func TestTUICProbeRTTSkipEvidence(t *testing.T) {
 	sender.minRTT, sender.minRTTAt = 100*time.Millisecond, start
 	sender.maybeProbeRTT(start, false, 0, true)
 	sender.noteWindowLimited() // the ProbeRTT's own four-packet window
-	sender.caughtUp()          // nor is an idle moment inside it a drain
+	sender.caughtUp()          // nor does an idle moment inside it end anything
 	sender.maybeProbeRTT(start.Add(100*time.Millisecond), true, 0, false)
 	sender.maybeProbeRTT(start.Add(201*time.Millisecond), false, 0, false)
-	if sender.mode == tuicBbrProbeRTT || !sender.catchingUp {
-		t.Fatalf("after ProbeRTT: mode %v, catching up %v", sender.mode, sender.catchingUp)
-	}
-	if sender.filledSinceMinRTT || sender.appLimitedSinceMinRTT {
-		t.Fatalf("ProbeRTT left evidence: filled %v, application-limited %v", sender.filledSinceMinRTT, sender.appLimitedSinceMinRTT)
+	if sender.mode == tuicBbrProbeRTT || !sender.catchingUp || sender.filledSinceMinRTT {
+		t.Fatalf("after ProbeRTT: mode %v, catching up %v, filled %v", sender.mode, sender.catchingUp, sender.filledSinceMinRTT)
 	}
 	sender.noteWindowLimited()
 	if sender.filledSinceMinRTT {
 		t.Fatal("a window met while catching up counted as filling")
 	}
+	sender.maxSentPN = 41
 	sender.caughtUp()
-	if sender.catchingUp || !sender.appLimitedSinceMinRTT {
-		t.Fatalf("drained: catching up %v, application-limited %v", sender.catchingUp, sender.appLimitedSinceMinRTT)
+	if sender.catchingUp || sender.catchUpEndPN != 41 {
+		t.Fatalf("drained: catching up %v, catch-up ends at packet %d", sender.catchingUp, sender.catchUpEndPN)
 	}
 	sender.noteWindowLimited()
 	if !sender.filledSinceMinRTT {
