@@ -6,6 +6,6 @@ an emulated 20 Mbit/s, 120 ms path, a call's downlink audio beside a
 tunnelled download waited up to 440 ms for about half a second at each
 ProbeRTT, which put its 99th-percentile lateness at about 310 ms; it is now
 about 80 ms, with a peak of about 145 ms, and late or lost audio fell from
-about 1.8% to under 0.1%. Half a product is less than the pipe holds, so the
+1.3-1.7% of packets to 0-0.7%. Half a product is less than the pipe holds, so the
 sender's own queue still drains and the round trip measured is the path's.
 The per-connection controllers keep the four-packet window.
