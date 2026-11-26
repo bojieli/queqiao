@@ -935,6 +935,9 @@ probes every 0.25 s, each its own connection.
   evidence against its arm, not a missing measure.
 - *Wildcard rules* skip a trial type that declares they do not apply
   (`Workload.rule_exempt`): blackhole has no `ttft_net_p99_s`.
+- *Stage 10* (`[workload:impaired] stage = 10`): sender-side credit delay
+  p95 is also a rule of every trial type (its `[secondary]` bound, pooled
+  over blocks when sparse); the shadow false-promotion rate is reported.
 - *Offsets*: each trial's LLM start (+0 to 6 s) and outage starts (+0 to
   10 s and +0 to 5 s) are drawn from the frozen seed, independently per
   block, slot and arm.
