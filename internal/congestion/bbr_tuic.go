@@ -436,14 +436,13 @@ func (b *TUICBBRSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 	// adapter boundary; otherwise every packet's sampler flight is one packet
 	// too large and a first packet can never be recognized as opening a flight.
 	preSendFlight := preSendBytesInFlight(bytesInFlight, bytes, retransmittable)
-	samplerFlight := uint64(preSendFlight)
-	if retransmittable && bytes > 0 && b.estimator.opensFlight(samplerFlight) || preSendFlight == 0 {
+	if preSendFlight == 0 {
 		b.exitingQuiescence = true
 		b.restartFromIdle(sentTime)
 	}
 	// Keep the controller telemetry in the same post-send units as quic-go.
 	b.bytesInFlight = maxByteCount(0, bytesInFlight)
-	b.estimator.onSentPacket(sentTime, number, uint64(maxByteCount(0, bytes)), samplerFlight, retransmittable)
+	b.estimator.onSentPacket(sentTime, number, uint64(maxByteCount(0, bytes)), uint64(preSendFlight), retransmittable)
 	b.pacer.sentPacket(sentTime, bytes)
 	b.publishTelemetry()
 }

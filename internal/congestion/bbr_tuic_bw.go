@@ -140,19 +140,6 @@ func (e *tuicBandwidthEstimator) markAppLimited() {
 	e.endAppLimitedAt = e.lastSentPacket
 }
 
-// opensFlight reports whether a sample packet sent with bytesInFlight already
-// in flight starts a new flight for the sampler.
-//
-// A retireByFate table holds exactly the sample packets whose fate is
-// undecided, so when it is empty the packet opens a flight whatever flight
-// the caller counts. A path's flight includes packets that are not samples (a
-// keep-alive, a probe). One of those in flight at the start of a burst kept
-// the burst on the delivery curves of the burst before it, so its whole first
-// flight was measured over the pause between them.
-func (e *tuicBandwidthEstimator) opensFlight(bytesInFlight uint64) bool {
-	return bytesInFlight == 0 || e.retireByFate && len(e.packetStates) == 0
-}
-
 // onSentPacket records the cumulative state at the time a congestion
 // controlled packet is sent. Non-retransmittable packets are intentionally
 // excluded from delivery-rate samples, matching QUIC BBR practice.
@@ -168,7 +155,7 @@ func (e *tuicBandwidthEstimator) onSentPacket(now monotime.Time, number quiccong
 	// be recovery-limited, permanently seeding BBR at only a few packets per
 	// RTT. The first packet itself has a zero send interval and therefore uses
 	// the ACK slope; later packets in the same flight obtain both slopes.
-	if e.opensFlight(bytesInFlight) {
+	if bytesInFlight == 0 {
 		e.lastAckedAckTime = now
 		e.lastAckedSentTime = now
 		e.totalSentAtAck = e.totalSent
