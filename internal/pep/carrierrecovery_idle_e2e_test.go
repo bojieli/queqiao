@@ -68,8 +68,20 @@ func (m *carrierManager) moved() int64 {
 		m.sameCarrierJoins.Load() + m.newCarrierJoins.Load() + m.silentDeaths.Load()
 }
 
-// A healthy idle carrier is kept by the transport's own keep-alive, every
-// five seconds, as under legacy recovery: the manager adds no traffic to it.
+// keepAlivesWithin is how many keep-alive PINGs one endpoint's adaptive
+// schedule (design §10.2: from the floor, doubling to the keep-alive period)
+// sends in window, starting from the floor.
+func keepAlivesWithin(window, floor, period time.Duration) int {
+	n := 0
+	for at, step := floor, floor; at <= window; n++ {
+		step = min(2*step, period)
+		at += step
+	}
+	return n
+}
+
+// A healthy idle carrier is kept by the transport's own keep-alive, as under
+// legacy recovery: the manager adds no traffic to it.
 func TestCarrierManagerAddsNothingToAHealthyIdleCarrier(t *testing.T) {
 	p, e := newIdleFlow(t, pathsim.Config{OneWayDelay: 20 * time.Millisecond, Seed: 7}, nil)
 	m := p.client.carriers
@@ -80,11 +92,24 @@ func TestCarrierManagerAddsNothingToAHealthyIdleCarrier(t *testing.T) {
 	if got := m.pathProbes.Load() - probes; got != 0 {
 		t.Fatalf("the manager probed a healthy idle carrier %d times in %v", got, idle)
 	}
-	// A keep-alive and the acknowledgement of the gateway's, every five
-	// seconds, and nothing else.
+	// What the client sends is then the transport's keep-alive schedule and
+	// nothing else. Each endpoint's schedule starts at its floor when the
+	// flow's last payload crosses and doubles to the five-second period:
+	// 0.5, 1.5, 3.5, 7.5 and 12.5 s in, five PINGs in this window. The two
+	// schedules interleave (each is timed from the last packet that endpoint
+	// heard), so the client sends at most its own five PINGs and five
+	// acknowledgements of the gateway's. The bound is twice that: the
+	// schedule starts again from its floor if a late frame of the flow (an
+	// acknowledgement the runner was slow to send) crosses inside the
+	// window, and it can do so once. Fifteen idle seconds measured 8 packets
+	// on a quiet host and 11 to 13 on a loaded CI runner. A manager probing
+	// this carrier would be caught by the count above first; this bound is
+	// for anything else that starts sending on an idle carrier, at a packet
+	// a second or more.
 	up, _ = p.relay.Stats()
-	if got, most := up.PacketsIn-sent, uint64(2*(idle/(5*time.Second))+4); got > most {
-		t.Fatalf("an idle carrier sent %d packets in %v, want at most %d", got, idle, most)
+	schedule := keepAlivesWithin(idle, keepAliveFloorMin, 5*time.Second)
+	if got, most := up.PacketsIn-sent, uint64(2*2*schedule); got > most {
+		t.Fatalf("an idle carrier sent %d packets in %v, want at most %d (%d keep-alives a side, acknowledged, and one restart of the schedule)", got, idle, most, schedule)
 	}
 	if got := m.moved(); got != 0 {
 		t.Fatalf("an idle flow on a live path was moved or its carrier replaced (%d):\n%s", got, p.clientLogs.String())
