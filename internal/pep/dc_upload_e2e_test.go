@@ -101,11 +101,8 @@ func newGatePair(t *testing.T, arm gateArm, path pathsim.Config) *gatePair {
 		Logger: slog.New(slog.DiscardHandler), Profile: dc,
 	}
 	if arm == gatePathAuth {
-		scfg.CCAPI, scfg.Sched, scfg.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
-		scfg.CodedRetry, scfg.Memory, scfg.GatewayAdmission = CodedRetrySticky, MemoryOwned, GatewayAdmissionOwned
-		scfg.Classifier, scfg.Recovery = ClassifierPhased, RecoveryCarrier
-		ccfg.CCAPI, ccfg.Sched, ccfg.CongestionScope, ccfg.Topology = CCAPIV2, SchedClass, CongestionScopePath, TopologySingle
-		ccfg.CodedRetry, ccfg.Memory, ccfg.Classifier, ccfg.Recovery = CodedRetrySticky, MemoryOwned, ClassifierPhased, RecoveryCarrier
+		applyFlipBundleToServer(&scfg)
+		applyFlipBundleToClient(&ccfg)
 	}
 	server, err := NewServer(scfg)
 	if err != nil {
