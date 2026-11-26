@@ -12,7 +12,13 @@ allprojects {
         def resolvable = project.configurations.matching { it.canBeResolved }
         doLast {
             resolvable.each { configuration ->
-                int count = configuration.incoming.files.files.size()
+                // Only external modules are fetched. A project dependency (the
+                // instrumentation APK's tested app) is built, not downloaded,
+                // and selecting its artifacts outside the task that consumes
+                // them is ambiguous.
+                int count = configuration.incoming.artifactView {
+                    componentFilter { it instanceof org.gradle.api.artifacts.component.ModuleComponentIdentifier }
+                }.files.files.size()
                 logger.lifecycle("resolved ${project.path}:${configuration.name} (${count} files)")
             }
         }
