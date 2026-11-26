@@ -400,9 +400,17 @@ type carrierManager struct {
 	changed atomic.Pointer[chan struct{}]
 	joins   joinQueue
 
-	// Counters, for tests and the client's log.
-	promotions, standbyDials, standbyFailures, replacementDials      atomic.Int64
-	sameCarrierJoins, newCarrierJoins, deadlineFailures, tcpHandoffs atomic.Int64
+	// Counters, for tests; count also exports each to the client's
+	// metrics registry.
+	suspects, promotions, standbyDials, standbyFailures, replacementDials atomic.Int64
+	sameCarrierJoins, newCarrierJoins, deadlineFailures, tcpHandoffs      atomic.Int64
+}
+
+// count records one carrier-recovery event in its counter and in the
+// client's metrics.
+func (m *carrierManager) count(counter *atomic.Int64, event metrics.CarrierRecoveryEvent) {
+	counter.Add(1)
+	m.c.metrics.CarrierRecovery(event)
 }
 
 func newCarrierManager(c *Client, cfg CarrierRecoveryConfig) *carrierManager {
@@ -532,7 +540,7 @@ func (m *carrierManager) admitDial(replacement bool) (bool, time.Duration) {
 	ok, next := m.history.admit(now, replacement)
 	if ok {
 		if replacement {
-			m.replacementDials.Add(1)
+			m.count(&m.replacementDials, metrics.CarrierReplacementDial)
 		}
 		return true, 0
 	}
@@ -657,6 +665,7 @@ func (m *carrierManager) tick() bool {
 		case from == carrierActive && to == carrierSuspect:
 			// SUSPECT takes no new flows, makes the attachment PROBING
 			// and dials one standby. Nothing moves.
+			m.count(&m.suspects, metrics.CarrierSuspect)
 			if a, ok := g.controller.(*wancongestion.PathAttachment); ok {
 				a.SetProbing(true)
 			}
@@ -683,7 +692,7 @@ func (m *carrierManager) tick() bool {
 		// stream's report before this tick saw it: a verified standby
 		// takes over.
 		if sb := m.usableStandbyLocked(); sb != nil && m.installLocked(sb, nil, "carrier gone with a verified standby") {
-			m.promotions.Add(1)
+			m.count(&m.promotions, metrics.CarrierPromotion)
 			changed = true
 		}
 	}
@@ -794,11 +803,24 @@ func (m *carrierManager) dialStandbyLocked() bool {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(*serving, m.c.cfg.DialTimeout)
+	// Each address candidate the dial races is a connection the gateway
+	// counts against the device: race only as many as the budget has room
+	// for, so a named gateway with several addresses cannot take the device
+	// over its limit (#222). With one slot left they are dialled one at a
+	// time.
+	ctx = withAddressRaceLimit(ctx, standbyAddressRace(m.connectionBudget(), live))
 	m.dialing = true
 	m.cancelStandby = cancel
-	m.standbyDials.Add(1)
+	m.count(&m.standbyDials, metrics.CarrierStandbyDial)
 	go m.dialStandby(ctx, cancel, m.pathEpoch)
 	return true
+}
+
+// standbyAddressRace is how many of the gateway's addresses a standby dial
+// may handshake at once: the device's free connection slots, at least one,
+// and no more than an ordinary dial races.
+func standbyAddressRace(budget, live int) int {
+	return min(max(budget-live, 1), defaultAddressRace)
 }
 
 func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelFunc, epoch uint64) {
@@ -827,7 +849,7 @@ func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelF
 		return
 	}
 	if err != nil {
-		m.standbyFailures.Add(1)
+		m.count(&m.standbyFailures, metrics.CarrierStandbyFailure)
 		m.mu.Unlock()
 		m.log.Info("carrier standby unavailable", "error", err)
 		return
@@ -835,7 +857,7 @@ func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelF
 	mc := g.managed
 	if m.carriers[g] != mc || g.conn.Context().Err() != nil {
 		// It died between its echo and this commit.
-		m.standbyFailures.Add(1)
+		m.count(&m.standbyFailures, metrics.CarrierStandbyFailure)
 		m.mu.Unlock()
 		g.close("queqiao standby died before verification")
 		return
@@ -887,7 +909,7 @@ func (m *carrierManager) promoteLocked(old, sb *managedCarrier, reason string) b
 	old.gen.stopBorrowing(errPoolRetired)
 	old.drainUntil = m.now().Add(m.cfg.grace - m.cfg.DetectionSkew)
 	go m.c.drainControlQUICGeneration(old.gen)
-	m.promotions.Add(1)
+	m.count(&m.promotions, metrics.CarrierPromotion)
 	m.log.Info("carrier promoted", "old", old.gen.id, "new", sb.gen.id, "reason", reason,
 		"path_generation", m.generation, "flows_to_move", displaced)
 	return true

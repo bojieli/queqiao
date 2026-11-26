@@ -599,3 +599,36 @@ func TestReceiveRatiosOnAPathWithNoCodedTraffic(t *testing.T) {
 		t.Fatalf("erasure %v residual %v with no symbols", s.ReceiveErasure(), s.ReceiveResidual())
 	}
 }
+
+// The carrier manager's counters are Prometheus counters (#222), so the
+// validation harness and dashboards read them rather than logs.
+func TestCarrierRecoveryCountersAreExported(t *testing.T) {
+	registry := New()
+	registry.CarrierRecovery(CarrierSuspect)
+	registry.CarrierRecovery(CarrierSuspect)
+	registry.CarrierRecovery(CarrierPromotion)
+	registry.CarrierRecovery(CarrierRebindNewCarrier)
+	registry.CarrierRecovery(CarrierBindingDeadlineFailure)
+	registry.CarrierRecovery(CarrierRecoveryEvents) // out of range: ignored
+	if got := registry.Snapshot().CarrierRecovery; got[CarrierSuspect] != 2 || got[CarrierPromotion] != 1 {
+		t.Fatalf("snapshot %v", got)
+	}
+	recorder := httptest.NewRecorder()
+	registry.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"queqiao_carrier_suspects_total 2",
+		"queqiao_carrier_promotions_total 1",
+		"queqiao_carrier_standby_dials_total 0",
+		"queqiao_carrier_standby_failures_total 0",
+		"queqiao_carrier_replacement_dials_total 0",
+		`queqiao_carrier_rebinds_total{carrier="same"} 0`,
+		`queqiao_carrier_rebinds_total{carrier="new"} 1`,
+		"queqiao_carrier_binding_deadline_failures_total 1",
+		"queqiao_carrier_tcp_handoffs_total 0",
+	} {
+		if !strings.Contains(body, want+"\n") {
+			t.Fatalf("metrics output is missing %q", want)
+		}
+	}
+}

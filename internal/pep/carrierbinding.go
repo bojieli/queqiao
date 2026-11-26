@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/bojieli/queqiao/internal/metrics"
 )
 
 // errBindingDeadline ends a flow that could not be rebound before the
@@ -174,7 +176,7 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		latest, deadline := m.cfg.bindingDeadlines(observed)
 		wake = nextWake(now, latest, deadline, nextAttempt, tcpNextAt, observed.Add(c.fallbackGrace()))
 		if !now.Before(deadline) {
-			m.deadlineFailures.Add(1)
+			m.count(&m.deadlineFailures, metrics.CarrierBindingDeadlineFailure)
 			c.cfg.Logger.Warn("flow binding deadline passed", "flow_id", flowID, "attempts", attempts,
 				"since_observed", now.Sub(observed))
 			flow.failBinding(errBindingDeadline)
@@ -200,7 +202,7 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 					// The gateway has committed the flow to TCP: the TCP
 					// bundle manager owns it from here, even if the new lane
 					// fails before the next look.
-					m.tcpHandoffs.Add(1)
+					m.count(&m.tcpHandoffs, metrics.CarrierTCPHandoff)
 					setUnbound(false)
 					bindTo(nil)
 					uncount()
@@ -256,9 +258,9 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		err := c.rebindFlow(manageCtx, flow, sessionID, flowID, target, healthy, superseded, cutoff, deadline)
 		if err == nil {
 			if target == lastCarrier {
-				m.sameCarrierJoins.Add(1)
+				m.count(&m.sameCarrierJoins, metrics.CarrierRebindSameCarrier)
 			} else {
-				m.newCarrierJoins.Add(1)
+				m.count(&m.newCarrierJoins, metrics.CarrierRebindNewCarrier)
 			}
 			continue
 		}
