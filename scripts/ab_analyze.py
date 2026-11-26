@@ -1312,6 +1312,9 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     # evidence present or not), not every block on the path.
                     need = math.ceil(gates["secondary_min_coverage"] *
                                      (judged.get(cand, len(common)) if wl.primary else len(common)) - 1e-9)
+                    if key.split(".", 1)[-1] in getattr(wl, "paired_only", ()):
+                        # Compared only where both arms have it (Workload.paired_only).
+                        need = 2
                     measured = [(x, y) for x, y in zip(c, m) if x == x and (y == y or kind in HARD)]
                     if key in getattr(wl, "primaries", ()) and kind in RULES and m:
                         # A primary outcome: void, not judged, when too many

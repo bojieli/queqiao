@@ -342,15 +342,25 @@ def term_script(campaign, job, arm, duration, start_at=0):
                    f"--burst-every {p['burst_every']} --burst-bytes {p['burst_bytes']}{canary}")
 
 
+def _bg_opts(job) -> str:
+    """A workload's background-transfer options (the impaired workload's
+    frozen per-scenario timeout, and going on after a failed object)."""
+    p = job.params
+    return ((f" --io-timeout {p['io_timeout']:g}" if p.get("io_timeout") else "") +
+            (" --continue-after-failure" if p.get("continue_after_failure") else ""))
+
+
 def bgdown_script(campaign, job, arm, duration, start_at=0):
     cfg = campaign.cfg
+    obj = job.params.get("object_bytes", cfg.object_bytes)
     return _client(campaign, job, arm, "bgdown", cfg.gateway.origin_port,
-                   f"--flows {job.n} --path /obj-{cfg.object_bytes} --duration {int(duration)} --no-tls")
+                   f"--flows {job.n} --path /obj-{obj} --duration {int(duration)} --no-tls{_bg_opts(job)}")
 
 
 def bgup_script(campaign, job, arm, duration, start_at=0):
     return _client(campaign, job, arm, "bgup", campaign.cfg.scenario_http_port,
-                   f"--flows {job.n} --object-bytes {job.params.get('object_bytes', 8 << 20)} --duration {int(duration)}")
+                   f"--flows {job.n} --object-bytes {job.params.get('object_bytes', 8 << 20)} --duration {int(duration)}"
+                   f"{_bg_opts(job)}")
 
 
 def parse_rows(out: str, job: w.Job, duration: float) -> List[Tuple[str, ...]]:
