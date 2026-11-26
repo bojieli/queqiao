@@ -79,7 +79,12 @@ type tuicBandwidthEstimator struct {
 	// would delete the states of the others' packets still in flight, whose
 	// acknowledgements would then be state misses and their bytes never
 	// counted as delivered.
-	retireByFate       bool
+	retireByFate bool
+	// staleEvidence, when set, is how many bytes an application-limited
+	// sample must have seen delivered, more than this, before it may replace
+	// an estimate that has outlived its window (see onAckBatch). Only the
+	// path authority's law sets it.
+	staleEvidence      uint64
 	legacyPrevAcked    uint64
 	legacyPrevAckTime  monotime.Time
 	legacyPrevSent     uint64
@@ -135,6 +140,19 @@ func (e *tuicBandwidthEstimator) markAppLimited() {
 	e.endAppLimitedAt = e.lastSentPacket
 }
 
+// opensFlight reports whether a sample packet sent with bytesInFlight already
+// in flight starts a new flight for the sampler.
+//
+// A retireByFate table holds exactly the sample packets whose fate is
+// undecided, so when it is empty the packet opens a flight whatever flight
+// the caller counts. A path's flight includes packets that are not samples (a
+// keep-alive, a probe). One of those in flight at the start of a burst kept
+// the burst on the delivery curves of the burst before it, so its whole first
+// flight was measured over the pause between them.
+func (e *tuicBandwidthEstimator) opensFlight(bytesInFlight uint64) bool {
+	return bytesInFlight == 0 || e.retireByFate && len(e.packetStates) == 0
+}
+
 // onSentPacket records the cumulative state at the time a congestion
 // controlled packet is sent. Non-retransmittable packets are intentionally
 // excluded from delivery-rate samples, matching QUIC BBR practice.
@@ -150,7 +168,7 @@ func (e *tuicBandwidthEstimator) onSentPacket(now monotime.Time, number quiccong
 	// be recovery-limited, permanently seeding BBR at only a few packets per
 	// RTT. The first packet itself has a zero send interval and therefore uses
 	// the ACK slope; later packets in the same flight obtain both slopes.
-	if bytesInFlight == 0 {
+	if e.opensFlight(bytesInFlight) {
 		e.lastAckedAckTime = now
 		e.lastAckedSentTime = now
 		e.totalSentAtAck = e.totalSent
@@ -262,8 +280,11 @@ type tuicAckSample struct {
 	hasSample        bool
 	maxBandwidth     uint64
 	sampleAppLimited bool
-	minRTT           time.Duration
-	lastSendState    tuicSendState
+	// sampleDelivered is the bytes acknowledged over the interval the
+	// maxBandwidth sample was measured on.
+	sampleDelivered uint64
+	minRTT          time.Duration
+	lastSendState   tuicSendState
 }
 
 // onAckBatch consumes one congestion event. ACK packets are processed in the
@@ -379,6 +400,10 @@ func (e *tuicBandwidthEstimator) onAckBatch(eventTime monotime.Time, acked []qui
 		if sample > result.maxBandwidth {
 			result.maxBandwidth = sample
 			result.sampleAppLimited = state.appLimited
+			result.sampleDelivered = 0
+			if e.totalAcked >= state.totalAckedAtSend {
+				result.sampleDelivered = e.totalAcked - state.totalAckedAtSend
+			}
 		}
 		if !haveLargest || packet.PacketNumber > largestPN {
 			largestPN, largestState, haveLargest = packet.PacketNumber, state, true
@@ -416,8 +441,19 @@ func (e *tuicBandwidthEstimator) onAckBatch(eventTime monotime.Time, acked []qui
 	// connection that is application limited essentially always -- 99.98% of
 	// samples on the path this was measured against -- that exception is the
 	// only way the estimate ever comes down.
+	//
+	// Under the path authority's law the sample must also have seen more than
+	// a minimum window delivered. One that has not measured the sender, not
+	// the path: a lone 21-byte packet acknowledged a round trip later is
+	// 173 B/s on any path. Such a packet, sent 1.7 s into a pause between
+	// bursts, replaced a 20 Mbit/s estimate the pause had aged out, and the
+	// next burst was paced from it: a 1.5 MB segment that took 1 s took 4.5 s
+	// (W10 under recovery=carrier). ProbeRTT's four-packet window is the same
+	// case. The stale estimate stands until a sample with evidence arrives.
+	staleReplaced := e.maxFilter.stale(eventTime) &&
+		(e.staleEvidence == 0 || result.sampleDelivered > e.staleEvidence)
 	if result.maxBandwidth > 0 &&
-		(!result.sampleAppLimited || result.maxBandwidth > e.maxFilter.get() || e.maxFilter.stale(eventTime)) {
+		(!result.sampleAppLimited || result.maxBandwidth > e.maxFilter.get() || staleReplaced) {
 		if result.minRTT > 0 {
 			e.maxFilter.setRoundTrip(result.minRTT)
 		}

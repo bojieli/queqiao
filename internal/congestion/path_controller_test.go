@@ -1936,3 +1936,123 @@ func TestAProbeDemotionSettlesAtTheProbesTime(t *testing.T) {
 		t.Fatalf("after the demoting probe the balance is %d at %v; want %d at the probe's time %v", got, last, want, probeAt)
 	}
 }
+
+// A burst that starts after a pause is a new flight for the delivery sampler,
+// whatever else the path has in flight. The sampler restarts its delivery
+// curves when a packet is sent with nothing in flight; it was told the path's
+// flight, which counts packets that are not samples. Under recovery=carrier a
+// gateway sends a keep-alive each second while a connection has streams, so a
+// burst could start inside a keep-alive's round trip. Its whole first flight
+// was then measured from the last acknowledgement before the pause, a window
+// of data over seconds of silence, and those samples replaced an estimate the
+// pause had aged out. A segment fetched every 4 s on a 120 ms, 20 Mbit/s path
+// (W10) took 2.4 to 4.8 s instead of 1 s in two runs out of five, with the
+// gateway's estimate at a third of the path afterwards.
+func TestABurstAfterAPauseIsMeasuredFromItsOwnStart(t *testing.T) {
+	const rtt = 100 * time.Millisecond
+	c := newPCController()
+	start := base()
+	a := attachPC(t, c, start)
+	// burst sends a packet every millisecond for d from at, each acknowledged
+	// one round trip after it was sent, and returns the estimate when the
+	// acknowledgement of the packet sent at probe arrives.
+	burst := func(at monotime.Time, d, probe time.Duration, also func(now monotime.Time)) (estimate uint64) {
+		var sent []quiccongestion.PacketNumber
+		round := int(rtt / time.Millisecond)
+		for ms := 0; ms < int(d/time.Millisecond)+round; ms++ {
+			now := at.Add(time.Duration(ms) * time.Millisecond)
+			if also != nil {
+				also(now)
+			}
+			if ms >= round {
+				a.event(now, sent[ms-round:ms-round+1], nil)
+				if ms == round+int(probe/time.Millisecond) {
+					estimate = c.Telemetry().MaxBandwidth
+				}
+			}
+			if ms < int(d/time.Millisecond) {
+				sent = append(sent, a.send(now, 1200))
+			}
+		}
+		return estimate
+	}
+	// 1.2 MB/s for a second.
+	peak := burst(start, time.Second, 500*time.Millisecond, nil)
+	if peak < 1_000_000 {
+		t.Fatalf("the first burst measured %d B/s, want about 1.2 MB/s", peak)
+	}
+	if s := c.Stats(); s.SamplerStates != 0 {
+		t.Fatalf("%d sample packets still undecided after the burst", s.SamplerStates)
+	}
+	// Three seconds of silence, longer than the estimate's window, and a
+	// keep-alive in flight when the next burst starts.
+	resume := start.Add(time.Second + rtt + 3*time.Second)
+	keepAlive := a.sendKind(resume.Add(-rtt/2), 60, quiccongestion.KindLiveness, true)
+	// Most of a round trip into the burst's acknowledgements, a sample
+	// spans what the burst has delivered since it began: 80 packets in
+	// 180 ms, 0.53 MB/s. Measured from before the pause it is 80 packets in
+	// 3.3 s, 30 kB/s.
+	resumed := burst(resume, 500*time.Millisecond, 80*time.Millisecond, func(now monotime.Time) {
+		if now == resume.Add(rtt/2) {
+			a.event(now, []quiccongestion.PacketNumber{keepAlive}, nil)
+		}
+	})
+	if resumed < peak/4 {
+		t.Fatalf("estimate %d B/s 80 ms into the resumed burst's acknowledgements, %d B/s before the pause: "+
+			"its first flight was measured over the pause", resumed, peak)
+	}
+}
+
+// A packet that measured the sender, not the path, does not replace an
+// estimate the wall clock has aged out. An application-limited sample may
+// replace such an estimate, since nothing else brings it down on a connection
+// that is always application limited, but a lone small packet acknowledged a
+// round trip later reads as a few hundred bytes a second on any path. Sent
+// 1.7 s into a pause between bursts, one replaced a 20 Mbit/s estimate and the
+// next burst was paced from it: a segment that took 1 s took 4.5 s (W10 under
+// recovery=carrier, whose idle carrier still carries the odd small frame).
+func TestALonePacketInAPauseDoesNotBecomeTheEstimate(t *testing.T) {
+	const rtt = 100 * time.Millisecond
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	// 1.2 MB/s for a second: a packet a millisecond, each acknowledged one
+	// round trip after it was sent.
+	var sent []quiccongestion.PacketNumber
+	for ms := range 1100 {
+		at := now.Add(time.Duration(ms) * time.Millisecond)
+		if ms >= 100 {
+			a.event(at, sent[ms-100:ms-99], nil)
+		}
+		if ms < 1000 {
+			sent = append(sent, a.send(at, 1200))
+		}
+	}
+	peak := c.Telemetry().MaxBandwidth
+	if peak < 1_000_000 {
+		t.Fatalf("the burst measured %d B/s, want about 1.2 MB/s", peak)
+	}
+	// 1.7 s into the pause, past the estimate's window, one 21-byte frame.
+	now = now.Add(1100*time.Millisecond + 1700*time.Millisecond)
+	lone := a.send(now, 21)
+	a.event(now.Add(rtt), []quiccongestion.PacketNumber{lone}, nil)
+	if got := c.Telemetry().MaxBandwidth; got < peak/2 {
+		t.Fatalf("estimate %d B/s after a lone 21-byte packet in a pause, %d B/s before it", got, peak)
+	}
+	// A burst that does load the path still brings the estimate down to
+	// what it measures: a quarter of the rate, for longer than the window.
+	now = now.Add(time.Second)
+	sent = sent[:0]
+	for ms := range 2100 {
+		at := now.Add(time.Duration(ms) * time.Millisecond)
+		if ms >= 100 && ms%4 == 0 {
+			a.event(at, sent[(ms-100)/4:(ms-100)/4+1], nil)
+		}
+		if ms < 2000 && ms%4 == 0 {
+			sent = append(sent, a.send(at, 1200))
+		}
+	}
+	if got := c.Telemetry().MaxBandwidth; got > peak/2 || got < peak/8 {
+		t.Fatalf("estimate %d B/s after two seconds at 0.3 MB/s, %d B/s before: a narrowed path was not believed", got, peak)
+	}
+}
