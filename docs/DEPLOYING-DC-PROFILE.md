@@ -137,10 +137,9 @@ The client also needs `--topology=single`. `--classifier=phased`,
 Start-up refuses any partial set with this profile. Each endpoint pair then has
 one rate controller, and the path tree only supplies starting estimates of
 erasure and round trip for a destination that has not been measured yet. It
-no longer caps destinations jointly. The first emulated measurement found the
-worst-served destination behind a shared bottleneck about 15% worse off than on
-the default bundle, so prefer the default where fairness across destinations
-matters.
+no longer caps destinations jointly. Emulated measurements of fairness across
+destinations behind a shared bottleneck have gone both ways so far. Until the
+live comparison has run, prefer the default where that fairness matters.
 
 That is the foreground form. To install it as a service, pass the same profile
 to the installer, which threads it into the LaunchAgent or systemd user unit:
