@@ -780,16 +780,22 @@ class EndToEnd(unittest.TestCase):
         stop = os.path.join(self.tmp.name, "stop")
         threading.Timer(1.0, lambda: open(stop, "w").close()).start()
         t0 = time.time()
+        # One object far larger than loopback can carry before the stop (a
+        # terabyte, streamed a chunk at a time, never held): the stop always
+        # lands inside an upload. With objects that finish in a fraction of a
+        # second it can land between two, and then the last row is a completed
+        # upload with exit 0 and there is nothing cut to check.
+        size = 10 ** 12
         _, rows = self.client("bgup", "--target", f"127.0.0.1:{self.http}", "--flows", "1", "--duration", "30",
-                              "--object-bytes", "100000000", "--stop-file", stop, tls=False)
+                              "--object-bytes", str(size), "--stop-file", stop, tls=False)
         self.assertLess(time.time() - t0, 25)   # far short of the 30 s window
-        self.assertTrue(rows and rows[-1][2].startswith("u1o"))
+        self.assertEqual([r[2] for r in rows if r[2].startswith("u1o")], ["u1o1"])
         # The upload the stop cut counts what the sink received, as a 200
         # with the window's exit (28); never the bytes handed to the socket.
         last = rows[-1]
         self.assertEqual((last[3], last[6]), ("200", "28"))
         self.assertGreater(int(last[4]), 0)
-        self.assertLess(int(last[4]), 100_000_000)
+        self.assertLess(int(last[4]), size)
 
 
 if __name__ == "__main__":
