@@ -606,6 +606,20 @@ func (m *carrierManager) eligible() *controlQUICGeneration {
 	return g
 }
 
+// quicComing reports whether a QUIC carrier is on its way: a replacement is
+// being dialled, or the pooled generation is alive and not yet accepting
+// flows.
+func (m *carrierManager) quicComing() bool {
+	if m.replacing.Load() || m.replacementProbes.Load() > 0 {
+		return true
+	}
+	c := m.c
+	c.quicMu.Lock()
+	g := c.quicGeneration
+	c.quicMu.Unlock()
+	return g != nil && g.conn.Context().Err() == nil && !m.accepting(g)
+}
+
 // superseded reports whether a flow on g must move: g was promoted away from
 // or has ended.
 func (m *carrierManager) superseded(g *controlQUICGeneration) bool {
