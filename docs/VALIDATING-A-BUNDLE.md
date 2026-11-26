@@ -929,6 +929,12 @@ probes every 0.25 s, each its own connection.
   outage), `lower 1.0`. The p99 over all calls is reported only: with fixed
   timing an LLM turn lined up with the 25 s outage, and that p99 reported
   which arm had a call in flight.
+- *Keystroke echo* counts a broken session: a keystroke the session did
+  not echo is censored at the trial window's end (its echo time is from
+  when it was sent to then), so a session that broke during an outage is
+  evidence against its arm, not a missing measure.
+- *Wildcard rules* skip a trial type that declares they do not apply
+  (`Workload.rule_exempt`): blackhole has no `ttft_net_p99_s`.
 - *Offsets*: each trial's LLM start (+0 to 6 s) and outage starts (+0 to
   10 s and +0 to 5 s) are drawn from the frozen seed, independently per
   block, slot and arm.
@@ -948,6 +954,12 @@ host>` fetches logs through that host, for a slow direct link.
 other for every session and copy (ssh ProxyJump, this machine's own keys
 end to end). Binaries are uploaded gzipped, unpacked on the host and
 checked against the local SHA-256 before they replace anything.
+
+**Several candidates.** Each candidate is decided on each trial type on
+its own: once any of its rules fails, or all pass, at a look, it is judged
+on the blocks up to that look (`status.json` `stopped_candidates`); the
+type stops when every candidate is decided. One candidate's failure does
+not leave another undecided.
 
 **Reading a rule's row.** Every rule's per-block contrast is the
 candidate's headroom inside its bound, positive when inside whichever way
