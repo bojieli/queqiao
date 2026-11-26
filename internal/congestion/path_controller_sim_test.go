@@ -345,7 +345,11 @@ func runPCSim(path pcSimPath, lanes []pcSimLane, duration, measureFrom time.Dura
 					c.queue = c.queue[1:]
 					send(c.plan.ackSize, true, false, quiccongestion.ClassControl)
 				}
-				c.idle()
+				// A lane with acknowledgements still waiting keeps its
+				// demand: only an empty queue is an unused opportunity.
+				if len(c.queue) == 0 {
+					c.idle()
+				}
 			}
 		}
 	}
