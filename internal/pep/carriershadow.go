@@ -823,7 +823,7 @@ func designLaneFailureRemedyFor(role string, obs carrierObservation) metrics.Car
 // so the label is the request, and the dials actually made are the join
 // attempts the client logs.
 func (o *carrierShadow) legacyStallRemedy(f *multipathFlow) string {
-	if f != nil && f.carrierRecovery {
+	if f != nil && f.carrierRecovery && !hasTCPLane(f) {
 		// recovery=carrier acts as the design does: no remedy for missing
 		// credit on a live stream (§10.4).
 		return "none"

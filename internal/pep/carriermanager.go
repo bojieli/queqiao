@@ -353,6 +353,10 @@ type managedCarrier struct {
 	// drainUntil bounds how long a DRAINING carrier's flows hold new OPENs
 	// back: their binding deadline from the promotion.
 	drainUntil time.Time
+	// bound counts the managed flows bound to this carrier. A UDP
+	// association's stream is a pooled stream but not a binding this
+	// manager moves, so it is not counted.
+	bound atomic.Int64
 }
 
 func (mc *managedCarrier) current() carrierState { return carrierState(mc.state.Load()) }
@@ -643,6 +647,8 @@ func (m *carrierManager) tick() bool {
 			// probe or a pool reset): it is draining what it carries.
 			mc.fsm.drain()
 			mc.state.Store(uint32(carrierDraining))
+			mc.drainUntil = now.Add(m.cfg.grace - m.cfg.DetectionSkew)
+			go c.drainControlQUICGeneration(g)
 			changed = true
 			continue
 		}
@@ -667,8 +673,7 @@ func (m *carrierManager) tick() bool {
 			mc.standbyTried = m.dialStandbyLocked()
 		}
 		if promote {
-			if sb := m.usableStandbyLocked(); sb != nil {
-				m.promoteLocked(mc, sb, "suspect carrier made no progress")
+			if sb := m.usableStandbyLocked(); sb != nil && m.promoteLocked(mc, sb, "suspect carrier made no progress") {
 				pooled = sb.gen
 				changed = true
 			}
@@ -678,8 +683,7 @@ func (m *carrierManager) tick() bool {
 		// No carrier at all -- it died, or the pool retired it on a
 		// stream's report before this tick saw it: a verified standby
 		// takes over.
-		if sb := m.usableStandbyLocked(); sb != nil {
-			m.installLocked(sb, "carrier gone with a verified standby")
+		if sb := m.usableStandbyLocked(); sb != nil && m.installLocked(sb, nil, "carrier gone with a verified standby") {
 			m.promotions.Add(1)
 			changed = true
 		}
@@ -687,9 +691,9 @@ func (m *carrierManager) tick() bool {
 	// Flows still bound to DRAINING carriers hold new OPENs back until they
 	// move, or until their binding deadline.
 	displaced := int64(0)
-	for g, mc := range m.carriers {
+	for _, mc := range m.carriers {
 		if mc.current() == carrierDraining && now.Before(mc.drainUntil) {
-			displaced += g.flows.Load()
+			displaced += mc.bound.Load()
 		}
 	}
 	if m.displaced.Swap(displaced) != displaced {
@@ -761,7 +765,12 @@ func (m *carrierManager) connectionBudget() int {
 //
 // It reports whether a round is running or was started.
 func (m *carrierManager) dialStandbyLocked() bool {
-	if m.standby != nil || m.dialing {
+	if m.standby != nil {
+		// A warm standby serves this episode: it is no longer due to close.
+		m.standby.warmUntil = time.Time{}
+		return true
+	}
+	if m.dialing {
 		return true
 	}
 	live := 0
@@ -820,6 +829,13 @@ func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelF
 		return
 	}
 	mc := g.managed
+	if m.carriers[g] != mc || g.conn.Context().Err() != nil {
+		// It died between its echo and this commit.
+		m.standbyFailures.Add(1)
+		m.mu.Unlock()
+		g.close("queqiao standby died before verification")
+		return
+	}
 	mc.verified = true
 	m.standby = mc
 	m.log.Info("carrier standby verified", "carrier", g.id)
@@ -831,7 +847,7 @@ func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelF
 	if pooled == nil {
 		// The suspect carrier died while this one was dialled: there is
 		// nothing to drain, and the flows are waiting.
-		m.installLocked(mc, "carrier dead before standby verified")
+		m.installLocked(mc, nil, "carrier dead before standby verified")
 	} else if pooled.managed != nil && pooled.managed.current() == carrierActive {
 		mc.warmUntil = m.now().Add(standbyWarmFor)
 	}
@@ -842,11 +858,15 @@ func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelF
 // promoteLocked makes the verified standby sb the path's carrier over old,
 // which becomes DRAINING. It is single-flight: only the tick holding the
 // manager's lock does it, once per standby.
-func (m *carrierManager) promoteLocked(old, sb *managedCarrier, reason string) {
+func (m *carrierManager) promoteLocked(old, sb *managedCarrier, reason string) bool {
 	// The displaced flows are counted before the new carrier is published,
 	// so no new OPEN on it can run ahead of them (§10.3 step 2).
-	m.displaced.Add(old.gen.flows.Load())
-	m.installLocked(sb, reason)
+	displaced := old.bound.Load()
+	m.displaced.Add(displaced)
+	if !m.installLocked(sb, old.gen, reason) {
+		m.displaced.Add(-displaced)
+		return false
+	}
 	if !old.fsm.state.terminal() {
 		old.fsm.drain()
 		old.state.Store(uint32(carrierDraining))
@@ -860,19 +880,28 @@ func (m *carrierManager) promoteLocked(old, sb *managedCarrier, reason string) {
 	go m.c.drainControlQUICGeneration(old.gen)
 	m.promotions.Add(1)
 	m.log.Info("carrier promoted", "old", old.gen.id, "new", sb.gen.id, "reason", reason,
-		"path_generation", m.generation, "flows_to_move", old.gen.flows.Load())
+		"path_generation", m.generation, "flows_to_move", displaced)
+	return true
 }
 
-// installLocked makes sb the pooled carrier.
-func (m *carrierManager) installLocked(sb *managedCarrier, reason string) {
+// installLocked makes sb the pooled carrier, if the pool still holds
+// expected (the carrier sb replaces, or nil for an empty pool): the check
+// and the swap are one step under the pool's lock, so a generation a
+// concurrent dial published is never overwritten. It reports whether sb was
+// installed.
+func (m *carrierManager) installLocked(sb *managedCarrier, expected *controlQUICGeneration, reason string) bool {
 	c := m.c
+	c.quicMu.Lock()
+	if c.quicGeneration != expected {
+		c.quicMu.Unlock()
+		return false
+	}
 	if m.standby == sb {
 		m.standby = nil
 	}
 	sb.standby, sb.warmUntil = false, time.Time{}
 	m.generation++
 	m.noteWireLocked(sb.gen)
-	c.quicMu.Lock()
 	// A break-before-make dial still in flight would install over the
 	// promoted carrier; supersede it, and its waiters retry on this one.
 	dial := c.quicDial
@@ -888,6 +917,7 @@ func (m *carrierManager) installLocked(sb *managedCarrier, reason string) {
 	if reason != "" && sb.gen != nil {
 		m.log.Debug("carrier installed", "carrier", sb.gen.id, "reason", reason)
 	}
+	return true
 }
 
 // pathReset ends every carrier of the old path: a new uplink is a new path

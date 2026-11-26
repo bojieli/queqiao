@@ -1833,6 +1833,17 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 	}, nil
 }
 
+// carrierAdmits rechecks, at OPEN admission, what the borrow checked when it
+// began: under recovery=carrier the carrier may have become SUSPECT, or
+// flows may be waiting to rebind onto it, while the borrow waited for proof
+// or stream credit. Nothing has been written to the stream yet.
+func (c *Client) carrierAdmits(ctx context.Context, g *controlQUICGeneration) bool {
+	if c.carriers == nil {
+		return true
+	}
+	return c.carriers.accepting(g) && (isCarrierRebind(ctx) || !c.carriers.openGated(g))
+}
+
 // pooledCongestionConfig is the controller configuration of every QUIC
 // connection this client dials.
 func (c *Client) pooledCongestionConfig() congestionConfig {
@@ -1899,7 +1910,7 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 			}
 			return nil, err
 		}
-		if dialCtx.Err() == nil && c.currentControlGeneration(generation) {
+		if dialCtx.Err() == nil && c.currentControlGeneration(generation) && c.carrierAdmits(dialCtx, generation) {
 			break
 		}
 		// QUIC has assigned a stream ID but no application bytes or OPEN

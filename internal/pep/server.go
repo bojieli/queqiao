@@ -1679,6 +1679,17 @@ func (s *Server) admitLaneJoin(ctx context.Context, conn streamConn, fc *frameCo
 		id: laneID, kind: kind, fc: fc, writeHook: s.cfg.testLaneWriteHook,
 		control: controlReplacement, staged: true,
 	}
+	if s.cfg.Recovery == RecoveryCarrier && kind == TransportQUIC {
+		// Replay towards the client waits for its ACK state on the new
+		// lane, or one SRTT, as the client's own does (§10.3 step 5).
+		srtt := 100 * time.Millisecond
+		if qs, ok := fc.transport().(*quicStreamConn); ok && qs.conn != nil {
+			if measured := qs.conn.ConnectionStats().SmoothedRTT; measured > 0 {
+				srtt = measured
+			}
+		}
+		replacement.replayGate = &replayGate{until: time.Now().Add(srtt)}
+	}
 	if err := serverSession.addLaneReplacing(replacement, replacedLaneID, replaceLane); err != nil {
 		s.cfg.Logger.Debug("lane join admission refused", "lane", laneID, "error", err)
 		// The handshake deadline was cleared above; the refusal is bounded

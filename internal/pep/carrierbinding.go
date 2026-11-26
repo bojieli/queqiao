@@ -76,6 +76,24 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		}
 	}
 	defer setUnbound(false)
+	var boundTo *managedCarrier
+	bindTo := func(g *controlQUICGeneration) {
+		var next *managedCarrier
+		if g != nil {
+			next = g.managed
+		}
+		if next == boundTo {
+			return
+		}
+		if boundTo != nil {
+			boundTo.bound.Add(-1)
+		}
+		if next != nil {
+			next.bound.Add(1)
+		}
+		boundTo = next
+	}
+	defer bindTo(nil)
 	var (
 		observed      time.Time
 		lastCarrier   *controlQUICGeneration
@@ -85,8 +103,11 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		lastAttemptAt time.Time
 		tcpTried      bool
 		// tcpNow asks for the TCP handoff at once: the gateway said the
-		// flow is already in TCP mode.
-		tcpNow bool
+		// flow is already in TCP mode. tcpNextAt paces retries of a failed
+		// handoff within the binding budget.
+		tcpNow     bool
+		tcpNextAt  time.Time
+		tcpBackoff time.Duration
 	)
 	for {
 		select {
@@ -108,6 +129,7 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			// The flow leaves the carrier manager: it holds no QUIC
 			// reservation and no wire pin while it lives on TCP.
 			setUnbound(false)
+			bindTo(nil)
 			uncount()
 			retired := flow.retireLanesExcept(TransportTCP)
 			c.cfg.Logger.Info("flow handed off to TCP fallback", "flow_id", flowID, "retired_quic_lanes", retired, "tcp_lanes", flow.laneCount())
@@ -119,13 +141,14 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		if current != nil {
 			lastCarrier = current
 		}
+		bindTo(current)
 		superseded := len(healthy) > 0 && current != nil && m.superseded(current)
 		// An unbound flow holds new OPENs back while it is due a JOIN; one
 		// backing off after a refusal does not need a stream slot now, and
 		// must not stall every new flow for its whole backoff.
 		setUnbound(len(healthy) == 0 && !m.now().Before(nextAttempt))
 		if len(healthy) > 0 && !superseded {
-			observed, tcpTried = time.Time{}, false
+			observed, tcpTried, tcpNextAt, tcpBackoff = time.Time{}, false, time.Time{}, 0
 			// The per-flow budget resets only after a sustained healthy
 			// dwell, as today's does: a stream that fails again just after
 			// each JOIN cannot JOIN without bound.
@@ -162,10 +185,17 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			// AUTO's TCP handoff starts no later than the latest handoff
 			// start; when there is no QUIC carrier to JOIN at all it starts
 			// once the fallback grace has passed, as today's rescue does.
-			if tcpNow || !now.Before(latest) || (target == nil && now.Sub(observed) >= c.fallbackGrace()) {
-				tcpTried, tcpNow = true, false
+			due := tcpNow || !now.Before(latest) || (target == nil && now.Sub(observed) >= c.fallbackGrace())
+			if due && !now.Before(tcpNextAt) {
+				tcpNow = false
 				if c.carrierTCPHandoff(manageCtx, flow, sessionID, flowID, healthy, superseded, deadline) {
 					m.tcpHandoffs.Add(1)
+					tcpTried = true
+				} else {
+					// A transient failure: try again, paced, until the
+					// binding deadline.
+					tcpBackoff = max(min(2*tcpBackoff, carrierRoundCooldownMax), time.Second)
+					tcpNextAt = now.Add(randomJitter(tcpBackoff))
 				}
 				continue
 			}
