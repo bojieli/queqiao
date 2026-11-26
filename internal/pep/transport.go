@@ -1027,7 +1027,13 @@ func quicDialSocket(listenAddress string, remoteAddr *net.UDPAddr) (network, add
 		// A local binding names an address, which fixes the family.
 		return "udp", listenAddress
 	}
-	if remoteAddr.IP.To4() != nil {
+	return wildcardUDPSocket(remoteAddr.IP)
+}
+
+// wildcardUDPSocket names the unbound socket of a peer's own address family:
+// udp4 0.0.0.0:0 for an IPv4 (or IPv4-mapped) peer, udp6 [::]:0 otherwise.
+func wildcardUDPSocket(peer net.IP) (network, address string) {
+	if peer.To4() != nil {
 		return "udp4", "0.0.0.0:0"
 	}
 	return "udp6", "[::]:0"

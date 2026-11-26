@@ -175,11 +175,8 @@ func dialDestinationSerial(ctx context.Context, addresses []string, dial func(co
 
 func (p DestinationPolicy) OpenUDPRelay(ctx context.Context) (serverUDPRelay, error) {
 	if p.OutboundSOCKS5 == "" {
-		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
-		if err != nil {
-			return nil, err
-		}
-		return conn, nil
+		// One socket per address family, not a dual-stack one (#197).
+		return openFamilyUDPRelay(nil)
 	}
 	timeout := p.DialTimeout
 	if timeout <= 0 {

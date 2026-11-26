@@ -163,7 +163,16 @@ func openSOCKS5UDPRelay(ctx context.Context, upstream string, timeout time.Durat
 		_ = control.Close()
 		return nil, errors.New("loopback SOCKS5 upstream returned a non-loopback or invalid UDP relay address")
 	}
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{})
+	// The upstream relay has one address, so the socket takes its family
+	// rather than a dual-stack wildcard, which macOS can give a port an IPv4
+	// socket elsewhere already holds (#197, as for a QUIC dial in #192).
+	network, address := wildcardUDPSocket(relay.IP)
+	udpAddress, err := net.ResolveUDPAddr(network, address)
+	if err != nil {
+		_ = control.Close()
+		return nil, fmt.Errorf("open SOCKS5 UDP socket: %w", err)
+	}
+	udpConn, err := net.ListenUDP(network, udpAddress)
 	if err != nil {
 		_ = control.Close()
 		return nil, fmt.Errorf("open SOCKS5 UDP socket: %w", err)
