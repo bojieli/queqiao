@@ -139,6 +139,9 @@ class Endpoint:
         # The latest timestamp of any record, shadow or not: where the
         # capture really ends, for deciding what is censored.
         self.capture_end = 0.0
+        # Each process's runtime configuration record: whether the observer
+        # ran there, and its thresholds.
+        self.configs: dict[Any, dict[str, Any]] = {}
 
     def load(self, paths: list[str], offset_s: float = 0.0) -> None:
         for path in paths:
@@ -148,6 +151,9 @@ class Endpoint:
                     if stamp is not None:
                         self.capture_end = max(self.capture_end, stamp - offset_s)
                     msg = record.get("msg")
+                    if msg == "runtime configuration":
+                        self.configs[record.get("pid", path)] = record
+                        continue
                     if not isinstance(msg, str) or not msg.startswith("carrier shadow"):
                         continue
                     at = parse_instant(record.get("time"))
@@ -238,8 +244,45 @@ def calibration(endpoint: Endpoint) -> dict[str, Any]:
         "carriers_ended": len(summarized), "open_carrier_episodes": open_episodes,
         "open_episodes_censored": open_censored, "rows": rows,
         "transitions": dict(transitions), "false_replacements": false_replacements,
+        **promotion_rate(endpoint, rows, thresholds, bool(open_carrier_records(endpoint, summarized)) or any(
+            carrier_key(r) not in summarized for r in endpoint.of(BOUND) if r.get("carrier_id") not in (None, 0))),
         "thresholds": [{"k_s": k[0], "k_p": k[1], "records": n} for k, n in thresholds.items()],
     }
+
+
+def promotion_rate(endpoint: Endpoint, rows: list[dict[str, Any]], thresholds: Counter,
+                   open_carriers: bool = False) -> dict[str, Any]:
+    """The shadow false-promotion rate (design section 15.4): the calibration
+    row at the endpoint's own k_p, so a promotion is an episode that reached
+    k_p and was resolved, and a false one is such an episode that then
+    progressed. None when the observer cannot be shown to have run, when
+    k_p is not known, or when no promotion was resolved (a zero
+    denominator)."""
+    configs = list(endpoint.configs.values())
+    # Every process must have run the observer, at one k_p: the rows pool
+    # every process's episodes, so they are read at one threshold. A
+    # process's k_p is its configuration's, and any k_p its own shadow
+    # records logged counts too, so a process without a configuration
+    # record cannot hide a different threshold.
+    observed = all(c.get("carrier_shadow") is True for c in configs) if configs else bool(endpoint.records)
+    kps = set()
+    for c in configs:
+        ks = int(c.get("carrier_shadow_ks") or 0) or 2
+        kps.add(int(c.get("carrier_shadow_kp") or 0) or max(4, ks))
+    kps |= {r.get("k_p") for r in endpoint.records
+            if isinstance(r.get("k_p"), int) and not isinstance(r.get("k_p"), bool) and r.get("k_p") > 0}
+    kp = next(iter(kps)) if len(kps) == 1 else None
+    if kp == 1 and open_carriers:
+        # One-expiry episodes are counted only in a carrier's closing
+        # summary, never logged one by one: a carrier still open at capture
+        # end has resolved promotions at k_p = 1 these logs cannot count.
+        # The /metrics counters can; the logs cannot give the rate.
+        return {"observer": observed, "k_p": kp, "promotions_resolved": None, "false_promotion_rate": None,
+                "incomplete": "carriers still open at capture end hide their k_p=1 episodes"}
+    row = rows[min(kp, BUCKETS) - 1] if observed and kp else None
+    return {"observer": observed, "k_p": kp,
+            "promotions_resolved": None if row is None else row["recovered"] + row["dead"],
+            "false_promotion_rate": None if row is None else row["false_rate"]}
 
 
 def open_carrier_records(endpoint: Endpoint, summarized: set) -> dict[tuple, list[dict[str, Any]]]:
@@ -758,6 +801,16 @@ def render(report: dict[str, Any], out) -> None:
         print(f"== {name}: probe-timeout episodes (k_s/k_p calibration)", file=out)
         print(f"   carriers ended {cal['carriers_ended']}, episodes from still-open carriers {cal['open_carrier_episodes']}, open at capture end (censored) {cal['open_episodes_censored']}", file=out)
         print(f"   transitions {cal['transitions']}, false replacements {cal['false_replacements']}", file=out)
+        if not cal["observer"]:
+            rate = "not measured: the observer did not run"
+        elif cal.get("incomplete"):
+            rate = f"not measured: {cal['incomplete']} (read the /metrics counters)"
+        elif cal["false_promotion_rate"] is None:
+            rate = (f"none resolved at k_p={cal['k_p']} (zero denominator)" if cal["k_p"] else
+                    "not measured: k_p unknown or differs between processes")
+        else:
+            rate = f"{cal['false_promotion_rate']:.3f} of {cal['promotions_resolved']} at k_p={cal['k_p']}"
+        print(f"   false-promotion rate: {rate}", file=out)
         print("   n   reached  recovered  dead  censored  P(recover|n)  upper95", file=out)
         for row in cal["rows"]:
             rate = "-" if row["false_rate"] is None else f"{row['false_rate']:.3f}"

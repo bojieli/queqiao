@@ -366,7 +366,10 @@ type quicBidiStream interface {
 // connection counters.  Keeping the QUIC type out of the flow and metrics
 // packages lets TCP rescue lanes remain dependency-independent.
 type laneTransportStats struct {
-	latestRTT, smoothedRTT   time.Duration
+	latestRTT, smoothedRTT time.Duration
+	// minRTT is the transport's own minimum round trip on the active path,
+	// measured whatever congestion controller is installed.
+	minRTT                   time.Duration
 	bytesSent, bytesReceived uint64
 	// Coded receive-direction symbol outcomes. Every source symbol the peer
 	// sent ends in exactly one of the three, which is what makes them a
@@ -453,7 +456,7 @@ func (c *quicStreamConn) transportStats() laneTransportStats {
 	}
 	s := c.conn.ConnectionStats()
 	stats := laneTransportStats{
-		latestRTT: s.LatestRTT, smoothedRTT: s.SmoothedRTT,
+		latestRTT: s.LatestRTT, smoothedRTT: s.SmoothedRTT, minRTT: s.MinRTT,
 		bytesSent: s.BytesSent, bytesReceived: s.BytesReceived,
 		packetsSent: s.PacketsSent, packetsReceived: s.PacketsReceived,
 	}

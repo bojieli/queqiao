@@ -455,10 +455,14 @@ SERVER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation
 
 def rpc_script(campaign: Any, job: Job, arm: Any, duration: float, start_at: int = 0) -> str:
     """W4 at minimal size through the leaf's client: wlclient rpc, on the
-    phase's shared start."""
+    phase's shared start. The barrier is passed to the client rather than
+    waited for in the shell: the interpreter starts at once and waits for
+    the barrier itself after initialising, so its start-up time is not added
+    to every wave on one leaf host and not on another."""
     dc = campaign.cfg.dc
     W = campaign.w(job.client.host)
-    return (_barrier(start_at) + f"python3 {W}/wlclient.py rpc --socks 127.0.0.1:{job.client.socks_port_base + arm.index} "
+    at = f"--start-at {start_at} " if start_at else ""
+    return (f"python3 {W}/wlclient.py rpc {at}--socks 127.0.0.1:{job.client.socks_port_base + arm.index} "
             f"--target 127.0.0.1:{dc.rpc_port} --count {dc.rpc_requests} --spacing {dc.rpc_spacing:g} "
             f"--timeout {dc.request_timeout} --asr-up {ASR_UP} --asr-down {ASR_DOWN} --tts-up {TTS_UP} "
             f"--tts-down {TTS_DOWN}")
