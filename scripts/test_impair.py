@@ -181,10 +181,10 @@ class Actions(unittest.TestCase):
         out = ["IMPAIR-REMOVED\n"]
         c = campaign(cfg, host)
         c.impair.apply("b", "slow-lossy", 90)
-        self.assertFalse(c.impair.remove("b"))
+        self.assertIsNone(c.impair.remove("b"))
         c.impair.apply("b", "slow-lossy", 90)
-        out[0] = "WATCHDOG-FIRED\nIMPAIR-REMOVED\n"
-        self.assertTrue(c.impair.remove("b"))
+        out[0] = "WATCHDOG-FIRED 1795660000\nIMPAIR-REMOVED\n"
+        self.assertEqual(c.impair.remove("b"), 1795660000.0)
         # Left behind: loud.
         c.impair.apply("b", "slow-lossy", 90)
         out[0] = "IMPAIR-LEFT device qqimp-bu\n"
@@ -211,7 +211,7 @@ class Actions(unittest.TestCase):
         calls = []
         c.impair = mock.Mock()
         c.impair.apply.side_effect = lambda s, sc, secs: calls.append(("apply", s, sc))
-        c.impair.remove.side_effect = lambda s: calls.append(("remove", s)) or False
+        c.impair.remove.side_effect = lambda s: calls.append(("remove", s)) or None
         for name in ("stop", "start_gateway", "start_client", "stop_client", "scrape", "scrape_client", "collect"):
             setattr(c, name, mock.Mock())
         c.run_phase = mock.Mock(side_effect=RuntimeError("job host gone"))
@@ -225,7 +225,7 @@ class Actions(unittest.TestCase):
         cfg = parse(BASE)
         c = ab.Campaign(cfg, "/nonexistent", ".", dry=False, stream=io.StringIO())
         c.impair = mock.Mock()
-        c.impair.remove.return_value = True
+        c.impair.remove.return_value = 1795660000.0
         for name in ("stop", "start_gateway", "start_client", "stop_client", "scrape", "scrape_client", "collect",
                      "run_phase"):
             setattr(c, name, mock.Mock())
@@ -305,3 +305,32 @@ class DryRun(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BesideWatchdog(unittest.TestCase):
+    def finish(self, fired, ended):
+        cfg = parse(BASE)
+        c = ab.Campaign(cfg, "/nonexistent", ".", dry=False, stream=io.StringIO())
+        c.impair = mock.Mock()
+        c.impair.remove.return_value = fired
+        c.beside_threads = []
+        c.beside_results = {("a", "main"): (ended - 900, ended, 0, "")}
+        for name in ("stop", "stop_client", "collect"):
+            setattr(c, name, mock.Mock())
+        c.dry = True                     # stop before writing the sub-campaign
+        c.finish_beside(cfg.wl.beside(cfg))
+        return getattr(c, "beside_impair_fired", "")
+
+    def test_a_watchdog_after_the_session_ended_is_not_a_failure(self):
+        self.assertEqual(self.finish(fired=2000.0, ended=1000.0), "")
+
+    def test_a_watchdog_during_the_session_is(self):
+        self.assertTrue(self.finish(fired=900.0, ended=1000.0))
+
+
+class FetchFailures(unittest.TestCase):
+    def test_a_beside_sessions_logs_are_its_own(self):
+        import ab_analyze as an
+        paths = ["gw:/h/qq-ab-x/gw-main.wake/logs/server-idle-wake.jsonl.gz", "gw:/h/qq-ab-x/gw-s7/logs/server-b001.jsonl"]
+        self.assertEqual(an.own_fetch_failures(paths, beside=False), paths[1:])
+        self.assertEqual(an.own_fetch_failures(paths, beside=True), paths[:1])

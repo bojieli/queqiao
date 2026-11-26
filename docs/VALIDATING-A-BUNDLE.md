@@ -825,6 +825,19 @@ first probe completed after it, the worse of the two). D is judged as its own
 campaign in `<campaign>/idle-wake` by `[workload:idle-wake]`. Goodput is
 reported only.
 
+**Reading a rule's row.** Every rule's per-block contrast is the
+candidate's headroom inside its bound, positive when inside whichever way
+the measure points: `lower v` is main + v - cand, `higher v` is cand -
+(main - v), `atmost m a` is m x main + a - cand, `atleast m a` is cand -
+(m x main - a). A rule passes when the t and the bootstrap lower bounds of
+the mean contrast are both above zero, fails when an upper bound is below
+zero, and is otherwise undecided; undecided at the block cap is a fail. A
+negative mean contrast is the candidate outside its bound (for example,
+more stalls than main plus the margin). The analyzer shows an undecided rule
+as undecided while the campaign has no `status.json` (still running), and
+prints this legend above each rules table. A beside session's (D's) log
+fetch failures are its own campaign's, not the blocks'.
+
 **How the impairment is applied.**
 
 - A `clsact` qdisc on the interface that carries the route to the address
