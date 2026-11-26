@@ -440,9 +440,9 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 // noteGapReissued counts chunks the scheduler re-offered on receiver gap
 // evidence as lane reinjections. It runs under the scheduler's lock, so it
 // only touches counters.
-func (f *multipathFlow) noteGapReissued(n int) {
-	f.reinjections.Add(uint64(n))
-	for i := 0; i < n && f.metrics != nil; i++ {
+func (f *multipathFlow) noteGapReissued(n uint64) {
+	f.reinjections.Add(n)
+	for i := uint64(0); i < n && f.metrics != nil; i++ {
 		f.metrics.Reinjected()
 	}
 }

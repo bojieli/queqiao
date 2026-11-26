@@ -198,7 +198,7 @@ type Config struct {
 	// evidence and completed the proof. Each such retry is reported once,
 	// whichever order the evidence and the report arrived in. It is called
 	// with the scheduler's lock held and must not call back into it.
-	GapReissued func(n int)
+	GapReissued func(n uint64)
 	// Windows supplies admission limits. When nil, only LaneWindow and
 	// MaxOutstanding apply, which is the behaviour of a flow with no
 	// congestion coupling.
@@ -1413,6 +1413,7 @@ func (s *Scheduler) ReissueUnacknowledgedBelowAt(offset uint64, seen time.Time) 
 		s.gapHigh = max(s.gapHigh, offset)
 	}()
 	reissued := 0
+	var requeued uint64 // reissued, for the unsigned accounting
 	for _, out := range s.live {
 		if out.chunk.End() > offset || len(out.attempts) == 0 {
 			continue
@@ -1443,9 +1444,10 @@ func (s *Scheduler) ReissueUnacknowledgedBelowAt(offset uint64, seen time.Time) 
 		}
 		s.requeueLocked(out.chunk)
 		reissued++
+		requeued++
 	}
 	if reissued > 0 {
-		s.noteGapReissuedLocked(reissued)
+		s.noteGapReissuedLocked(requeued)
 		s.ready.Broadcast()
 	}
 	return reissued
@@ -1454,8 +1456,8 @@ func (s *Scheduler) ReissueUnacknowledgedBelowAt(offset uint64, seen time.Time) 
 // noteGapReissuedLocked accounts chunks receiver gap evidence returned to the
 // ready set. Every gap-driven retry goes through here, whichever of the
 // evidence and the attempt's own reports arrived last.
-func (s *Scheduler) noteGapReissuedLocked(n int) {
-	s.stats.GapReissued += uint64(n)
+func (s *Scheduler) noteGapReissuedLocked(n uint64) {
+	s.stats.GapReissued += n
 	if s.cfg.GapReissued != nil {
 		s.cfg.GapReissued(n)
 	}

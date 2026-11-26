@@ -353,8 +353,8 @@ func TestGapDrivenRetriesAreCountedInEveryOrder(t *testing.T) {
 	for _, order := range []string{"evidence last", "registration last", "write last"} {
 		t.Run(order, func(t *testing.T) {
 			f := newCodedRetryFixture(t, true, bytes.Repeat([]byte("x"), 64), 16)
-			counted := 0
-			f.sched.cfg.GapReissued = func(n int) { counted += n }
+			counted := uint64(0)
+			f.sched.cfg.GapReissued = func(n uint64) { counted += n }
 			a := f.next(0)
 			returned := 0
 			switch order {
