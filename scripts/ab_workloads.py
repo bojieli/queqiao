@@ -83,6 +83,9 @@ class Beside:
     workload: str
     phase: Phase
     ready_seconds: float = 120.0
+    # A frozen ab_impair scenario on the session's own ports for its whole
+    # length ("" for none).
+    impair: str = ""
 
 
 @dataclass
@@ -101,6 +104,9 @@ class Generator:
     # with none gets a failed record of this kind, so the arm's failure is
     # measured rather than lost. None: rows only.
     record_kind: Optional[str] = None
+    # The harness's own job (the impairment's timed outages): its failure is
+    # the control plane's, never the arm's.
+    harness: bool = False
 
 
 def json_records(out: str) -> List[dict]:
@@ -249,6 +255,16 @@ class Workload:
 
     def gateway_flags(self, cfg: Any) -> List[str]:
         return []
+
+    # True: the workload's trials run under [impair]'s scenarios, which the
+    # config must then have.
+    impairs = False
+
+    def impairment(self, cfg: Any, trial: str) -> str:
+        """The frozen ab_impair scenario a trial of this type runs under
+        ("" for none): applied to the blocks' arm ports just before the
+        trial, removed right after it."""
+        return ""
 
     def client_files(self, cfg: Any) -> List[str]:
         """Local files its generators run on client hosts, copied into each

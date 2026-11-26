@@ -29,7 +29,7 @@ REPO = HERE.parent
 sys.path.insert(0, str(HERE))
 ab = importlib.import_module("ab_campaign")
 
-EXAMPLES = ["minimal-campaign.example.ini", "campaign.example.ini", "scenario-campaign.example.ini"]
+EXAMPLES = ["minimal-campaign.example.ini", "impaired-campaign.example.ini", "campaign.example.ini", "scenario-campaign.example.ini"]
 HOST_SPECIFIC = ("local-address", "tcp-congestion")
 
 
@@ -114,6 +114,9 @@ def local_config(example, binary, home):
     cp["production:relayhost"] = {"host": "relayhost"}
     cp["relay"] = {"host": "relayhost", "address": "127.0.0.1", "platform": plat}
     cp["campaign"]["sequential"] = "false"
+    if cp.has_section("impair"):
+        # The impairment is tc on the client host, not a binary role.
+        cp["impair"]["host"] = "local"
     cfg = ab.parse_config(cp)
     camp = ab.Campaign(cfg, os.path.join(home, "out"), str(REPO), dry=False, stream=io.StringIO())
     camp.hosts["local"].home = home
@@ -210,6 +213,10 @@ class ArgvSmoke(unittest.TestCase):
 
     def test_scenario_example(self):
         self.check("scenario-campaign.example.ini")
+
+    def test_impaired_example(self):
+        # Three arms, the third with stage 8's carrier recovery.
+        self.check("impaired-campaign.example.ini")
 
     @unittest.skipUnless(os.environ.get("QQ_SMOKE_CONFIG"), "set QQ_SMOKE_CONFIG to a campaign config to check it")
     def test_a_given_campaign_config(self):
