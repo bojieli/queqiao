@@ -49,6 +49,8 @@ type pcSimLane struct {
 	ackOnly          int
 	// requests, for a lane that is neither: one small packet a round trip.
 	requests bool
+	// pauseEvery, for a bulk lane, pauses it for pauseFor that often.
+	pauseEvery, pauseFor time.Duration
 }
 
 type pcSimResult struct {
@@ -311,6 +313,8 @@ func runPCSim(path pcSimPath, lanes []pcSimLane, duration, measureFrom time.Dura
 				c.pending = append(c.pending, p)
 			}
 			switch {
+			case c.plan.bulk && c.plan.pauseEvery > 0 && now%c.plan.pauseEvery < c.plan.pauseFor:
+				c.idle()
 			case c.plan.bulk:
 				for c.admit(at, quiccongestion.ClassBulk) {
 					send(pcSimPacketSize, true, true, quiccongestion.ClassBulk)
@@ -345,7 +349,11 @@ func runPCSim(path pcSimPath, lanes []pcSimLane, duration, measureFrom time.Dura
 					c.queue = c.queue[1:]
 					send(c.plan.ackSize, true, false, quiccongestion.ClassControl)
 				}
-				c.idle()
+				// A lane with acknowledgements still waiting keeps its
+				// demand: only an empty queue is an unused opportunity.
+				if len(c.queue) == 0 {
+					c.idle()
+				}
 			}
 		}
 	}
@@ -487,4 +495,92 @@ func TestPathControllerReverseAckOnlyIsNotThrottled(t *testing.T) {
 	}
 	pooled, _ := runPCSim(path, lanes, 10*time.Second, measureFrom, false)
 	t.Logf("today's pooled connections: pacer wait p50 %v p90 %v", pcPercentile(pooled.ackWaits, 0.5), pcPercentile(pooled.ackWaits, 0.9))
+}
+
+// The reverse direction of a download again, past the ten seconds at which
+// the path's minimum RTT expires (#210). Once the step in demand is behind
+// them the connections are application-limited, so their flight builds no
+// queue of its own; a ProbeRTT would cap the window at four packets for a
+// round trip and 200 ms, holding every flow acknowledgement and datagram
+// behind it, which on a real uplink also stalls the download those
+// acknowledgements release. The first expiry follows the tenfold step,
+// which the pacer held back, so it is taken; its catch-up is the ProbeRTT's
+// own backlog and does not count, so the later two are skipped. A bulk
+// path, which always has work, still takes its ProbeRTTs.
+func TestPathControllerApplicationLimitedPathSkipsProbeRTT(t *testing.T) {
+	path := pcSimPath{rate: 2e6, rtt: 200 * time.Millisecond, erasure: 0.015, buffer: 2e6 * 0.1, seed: 1}
+	lanes := make([]pcSimLane, 4)
+	for i := range lanes {
+		lanes[i] = pcSimLane{join: time.Duration(i) * 20 * time.Millisecond, ackRate: 6e3, ackStep: 60e3,
+			stepAt: 3 * time.Second, ackSize: 200, ackOnly: 2}
+	}
+	const duration = 35 * time.Second
+	measureFrom := 12 * time.Second // after the first expiry's ProbeRTT
+	r, ctl := runPCSim(path, lanes, duration, measureFrom, true)
+	law := ctl.law.inner
+	worst := pcPercentile(r.ackWaits, 1)
+	t.Logf("application-limited path: %d ProbeRTTs, %d skipped; flow acknowledgement wait after %v p99 %v, max %v",
+		law.probeRTTs, law.probeRTTsSkipped, measureFrom, pcPercentile(r.ackWaits, 0.99), worst)
+	if law.probeRTTs != 1 || law.probeRTTsSkipped < 2 {
+		t.Errorf("application-limited path: %d ProbeRTTs, %d skipped; want the first taken and the later two skipped",
+			law.probeRTTs, law.probeRTTsSkipped)
+	}
+	if worst > path.rtt/4 {
+		t.Errorf("a flow acknowledgement waited %v on an application-limited path", worst)
+	}
+
+	_, bulk := runPCSim(pcErasurePath(), bulkLanes(1, 0), duration, 0, true)
+	if bulk.law.inner.probeRTTs < 3 || bulk.law.inner.probeRTTsSkipped != 0 {
+		t.Errorf("a bulk path took %d ProbeRTTs in %v and skipped %d", bulk.law.inner.probeRTTs, duration, bulk.law.inner.probeRTTsSkipped)
+	}
+}
+
+// A steady producer at half the path's capacity: application-limited, with
+// less spare service to clear a backlog than the sparse lanes above, so
+// after a ProbeRTT its catch-up takes many rounds. The catch-up is the
+// ProbeRTT's backlog, however long it takes to drain, so it must not become
+// the evidence for the next ProbeRTT (#210).
+func TestPathControllerLoadedProducerSkipsProbeRTT(t *testing.T) {
+	path := pcSimPath{rate: 2e6, rtt: 200 * time.Millisecond, erasure: 0.015, buffer: 2e6 * 0.1, seed: 1}
+	lanes := make([]pcSimLane, 4)
+	for i := range lanes {
+		lanes[i] = pcSimLane{ackRate: 0.5 * 2e6 / 4, ackStep: 0.5 * 2e6 / 4, ackSize: pcSimPacketSize}
+	}
+	measureFrom := 12 * time.Second
+	r, ctl := runPCSim(path, lanes, 45*time.Second, measureFrom, true)
+	law := ctl.law.inner
+	worst := pcPercentile(r.ackWaits, 1)
+	t.Logf("producer at 0.5 of the path: %d ProbeRTTs, %d skipped; wait after %v p99 %v, max %v",
+		law.probeRTTs, law.probeRTTsSkipped, measureFrom, pcPercentile(r.ackWaits, 0.99), worst)
+	if law.probeRTTs > 1 || law.probeRTTsSkipped < 3 {
+		t.Errorf("producer at 0.5 of the path: %d ProbeRTTs, %d skipped; want at most the first taken and the later three skipped",
+			law.probeRTTs, law.probeRTTsSkipped)
+	}
+	if worst > path.rtt {
+		t.Errorf("a packet waited %v behind the producer's ProbeRTT", worst)
+	}
+}
+
+// A bulk sender that pauses for a few milliseconds every second is briefly
+// out of work, but resumes at the path's rate with its flight well above
+// the bottleneck's BDP: it keeps a queue of its own, below its window. It
+// must take its ProbeRTTs.
+func TestPathControllerBrieflyIdleBulkTakesProbeRTT(t *testing.T) {
+	path := pcErasurePath()
+	// Pauses once a second, and pauses more often than once a round trip,
+	// which keeps every packet's application-limited marker set: the
+	// pacer's refusals between them are the evidence then.
+	for _, pause := range []struct{ every, length time.Duration }{
+		{time.Second, 5 * time.Millisecond}, {50 * time.Millisecond, 2 * time.Millisecond},
+	} {
+		lanes := []pcSimLane{{bulk: true, pauseEvery: pause.every, pauseFor: pause.length}}
+		const duration = 35 * time.Second
+		_, ctl := runPCSim(path, lanes, duration, 0, true)
+		law := ctl.law.inner
+		t.Logf("bulk idle %v every %v: %d ProbeRTTs, %d skipped", pause.length, pause.every, law.probeRTTs, law.probeRTTsSkipped)
+		if law.probeRTTs < 3 || law.probeRTTsSkipped != 0 {
+			t.Errorf("a bulk sender idle %v every %v took %d ProbeRTTs in %v and skipped %d",
+				pause.length, pause.every, law.probeRTTs, duration, law.probeRTTsSkipped)
+		}
+	}
 }
