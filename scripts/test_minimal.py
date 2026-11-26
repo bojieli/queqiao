@@ -482,7 +482,7 @@ class Runner(unittest.TestCase):
             def looks(campaign, gates, units_run, failures=None):
                 out = {}
                 for b, p, ty in units_run:
-                    out[(p, ty)] = decide(p, ty, sum(1 for u in units_run if (u[1], u[2]) == (p, ty)))
+                    out[(p, ty, "cand")] = decide(p, ty, sum(1 for u in units_run if (u[1], u[2]) == (p, ty)))
                 return out
             with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok), \
                     mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
@@ -494,7 +494,7 @@ class Runner(unittest.TestCase):
                     mock.patch.object(ab.Campaign, "teardown"), mock.patch.object(ab.Campaign, "verify_teardown", return_value=[]), \
                     mock.patch.object(ab.Campaign, "clean", return_value=[]), \
                     mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), mock.patch.object(ab.time, "sleep"), \
-                    mock.patch.object(an, "interim_decisions", side_effect=looks):
+                    mock.patch.object(an, "interim_decisions_by_candidate", side_effect=looks):
                 rc = camp.run()
             status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
             plan = json.loads(pathlib.Path(tmp, "out", "plan.json").read_text())
@@ -1215,10 +1215,10 @@ class RoundFourFixes(unittest.TestCase):
         camp = ab.Campaign(cfg, "/nonexistent", ".", dry=False, stream=io.StringIO())
         camp.job_failures.append({"block": 1, "path": "a", "trial": "bulk"})
         camp.fetch_failures.append("f")
-        with mock.patch.object(an, "interim_decisions", return_value={}) as look:
+        with mock.patch.object(an, "interim_decisions_by_candidate", return_value={}) as look:
             camp.interim("a", "bulk")
         self.assertEqual(look.call_args[0][3], {"job_failures": [{"block": 1, "path": "a", "trial": "bulk"}],
-                                                "fetch_failures": ["f"]})
+                                                "fetch_failures": ["f"], "stopped_candidates": {}})
 
     def test_the_rpc_deadline_covers_socks_and_tls_setup(self):
         # A SOCKS proxy that answers each step just under the timeout: each

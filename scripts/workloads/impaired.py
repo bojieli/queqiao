@@ -250,6 +250,38 @@ def after_restore(outages, recs, end) -> List[float]:
     return out
 
 
+def window_end(trial, ph) -> Optional[float]:
+    """The trial window's end on the client host's clock: the first short
+    download starts with the window, which lasts TRIAL_SECONDS[ph]."""
+    starts = [float(r["t_start"]) for r in trial.rows
+              if r["phase"] == ph and r["kind"] == "imp-fetch" and r.get("flow") == "w1r1" and r.get("t_start")]
+    return min(starts) + TRIAL_SECONDS[ph] if starts else None
+
+
+def echo_samples(trial, ph) -> List[float]:
+    """Keystroke echo times, a broken session included: a keystroke the
+    session did not echo (wlclient lists them last, `unanswered` of them,
+    censored at the session's end) is censored instead at the trial
+    window's end -- its echo time is from when it was sent to then -- so a
+    session that broke counts against its arm rather than leaving the
+    measure unmeasured. Adopted before imp3's first look, outcome-blind."""
+    out: List[float] = []
+    end = window_end(trial, ph)
+    for s in getattr(trial, "records", []):
+        if s.get("_phase") != ph or s.get("kind") != "term":
+            continue
+        keys = s.get("keys") or []
+        n_open = int(s.get("unanswered") or 0)
+        answered = keys[:len(keys) - n_open] if n_open else keys
+        out += [float(e) for _, e in answered]
+        if n_open and end is not None and s.get("t0") is not None:
+            # Key send times are seconds from the session's start (t0).
+            out += [max(float(e), end - float(s["t0"]) - float(sent)) for sent, e in keys[len(keys) - n_open:]]
+        elif n_open:
+            out += [float(e) for _, e in keys[len(keys) - n_open:]]
+    return out
+
+
 def fetch_completion(trials, ph) -> float:
     """Completed over attempted short downloads, per trial, averaged: a
     download the window's end cut (curl's timeout while its limit was the
@@ -279,6 +311,9 @@ class Impaired(mn.Minimal):
     under its scenario; D (idle-wake-lossy) beside them."""
     name = "impaired"
     impairs = True
+    # Wildcard rules that do not apply to a type: blackhole judges TTFT as
+    # ttft_clear_p99_s and ttft_after_restore_s instead (#239).
+    rule_exempt = {"blackhole": ("ttft_net_p99_s",)}
     trials_per_arm = 1
     primaries: Tuple[str, ...] = ()
     # Flow completion is the trial's own (completed / attempted short
@@ -429,7 +464,7 @@ class Impaired(mn.Minimal):
                 out[f"{ph}.ttft_clear_p99_s"] = (0.99, [c["ttft"] - c["T"] for c in clear_calls(pt, ph)])
             else:
                 out[f"{ph}.ttft_net_p99_s"] = (0.99, ttft)
-            out[f"{ph}.echo_p99_s"] = (0.99, pa.term_samples([r for r in recs if r.get("kind") == "term"])["a"])
+            out[f"{ph}.echo_p99_s"] = (0.99, [x for t in pt for x in echo_samples(t, ph)])
         return out
 
     def block_events(self, trials, plan) -> Dict[str, Tuple[int, int]]:
@@ -454,7 +489,7 @@ class Impaired(mn.Minimal):
         lm = pa.llm_metrics(llm)
         ok = [c for c in llm if not c.get("fail")]
         ttft = [c["ttft"] - c["T"] for c in ok if c.get("ttft") is not None]
-        echo = pa.term_samples([r for r in recs if r.get("kind") == "term"])["a"]
+        echo = [x for t in trials for x in echo_samples(t, ph)]
         secs = TRIAL_SECONDS.get(ph, 0)
         got = sum(int(r["bytes"] or 0) for r in rows if r["kind"] == "imp-fetch" and r.get("http") == "200")
         sessions = [r for r in recs if r.get("kind") in ("llm", "term")]

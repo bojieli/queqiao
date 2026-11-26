@@ -1272,6 +1272,9 @@ class Campaign:
         self.impair = ab_impair.Impairer(self, cfg.impair) if cfg.impair else None
         self.stopped = ""
         self.stopped_types: Dict[str, str] = {}
+        # "<path>/<type>/<candidate>" -> the block after which that candidate
+        # was decided on that type.
+        self.stopped_candidates: Dict[str, int] = {}
         self.beside_threads: List[threading.Thread] = []
         self.t_start = time.time()
         self.job_failures: List[dict] = []
@@ -1907,20 +1910,38 @@ rm -f "$f"''', what=f"stop {tag}")
                 return JOB_TIMEOUT, ""
             time.sleep(self.JOB_POLL)
 
-    def interim(self, path: str, trial: str = "") -> Tuple[bool, str]:
+    def interim(self, path: str, trial: str = "", block: int = 0) -> Tuple[bool, str]:
         """(stop?, summary) for one path x trial type's sequential gate on
-        the blocks run so far. Each type stops on its own; the others go on."""
+        the blocks run so far. Each type stops on its own; the others go on.
+        Each candidate is decided on its own: one decided (any rule failed,
+        or every rule passed) is judged on the blocks up to this look
+        (stopped_candidates), and the type stops once every candidate is."""
         import ab_analyze
         try:
-            by_cell = ab_analyze.interim_decisions(self.out, ab_analyze.load_gates(), self.units_run,
-                                                   {"job_failures": list(self.job_failures),
-                                                    "fetch_failures": list(self.fetch_failures)})
+            by = ab_analyze.interim_decisions_by_candidate(
+                self.out, ab_analyze.load_gates(), self.units_run,
+                {"job_failures": list(self.job_failures), "fetch_failures": list(self.fetch_failures),
+                 "stopped_candidates": dict(self.stopped_candidates)})
         except Exception as e:  # an analysis error must not end the campaign
             return False, f"interim analysis failed ({type(e).__name__}: {e}); continuing"
         import ab_stats
-        decisions = [d for (p_, cell), ds in by_cell.items() if p_ == path and (not trial or cell == trial) for d in ds]
-        counts = {d: decisions.count(d) for d in sorted(set(decisions))}
-        return ab_stats.overall_stop(decisions), ", ".join(f"{v} {k}" for k, v in counts.items()) or "nothing to judge"
+        cands = sorted({c_ for (p_, cell, c_) in by if p_ == path and (not trial or cell == trial)})
+        parts, all_decided = [], bool(cands)
+        for cand in cands:
+            key = f"{path}/{trial}/{cand}"
+            ds = [d for (p_, cell, c_), xs in by.items() if p_ == path and c_ == cand and (not trial or cell == trial)
+                  for d in xs]
+            counts = ", ".join(f"{ds.count(d)} {d}" for d in sorted(set(ds))) or "nothing to judge"
+            if key in self.stopped_candidates:
+                parts.append(f"{cand}: decided after block {self.stopped_candidates[key]}")
+                continue
+            if ab_stats.overall_stop(ds):
+                self.stopped_candidates[key] = block
+                parts.append(f"{cand}: {counts} (decided)")
+            else:
+                all_decided = False
+                parts.append(f"{cand}: {counts}")
+        return all_decided, "; ".join(parts) or "nothing to judge"
 
     def pause(self, seconds: float) -> None:
         if not self.dry:
@@ -2537,7 +2558,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                     # once its verdict is determined (ab_stats.Sequential).
                     if tsv:
                         tsv.flush()
-                    stop, why = self.interim(path, trial)
+                    stop, why = self.interim(path, trial, block)
                     self.log(f"look after block {block} on {path}{' ' + trial if trial else ''}: {why}")
                     if stop:
                         done_types[(path, trial)] = f"after block {block}: {why}"
@@ -2611,7 +2632,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                            "impairment": (None if not self.impair else
                                           "not restored" if self.impair.leftovers else "restored"),
                            "blocks_run": self.blocks_run, "units_run": self.units_run, "stopped": self.stopped,
-                           "stopped_types": self.stopped_types,
+                           "stopped_types": self.stopped_types, "stopped_candidates": self.stopped_candidates,
                            "wall_seconds": round(time.time() - self.t_start, 1),
                            "finished_utc": utc(time.time())}, f, indent=2)
             sub = os.path.join(self.out, cfg.wl.beside(cfg).name) if cfg.wl.beside(cfg) else None
