@@ -230,6 +230,10 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 	return e
 }
 
+// pathProbeRTTGain is the path authority's ProbeRTT window in bandwidth-delay
+// products: BBRv2's and v3's BBRProbeRTTCwndGain.
+const pathProbeRTTGain = 0.5
+
 // newPathLaw returns the erasure control law a PathController hosts. It
 // reports what it measures to path, which the coded path's FEC and the
 // prewarm read, and reads back only the path's knowledge of its erasure as a
@@ -242,6 +246,8 @@ func newPathLaw(initialPacketSize quiccongestion.ByteCount, path pathmodel.Model
 	e.inner.estimator.retireByFate = true
 	e.inner.estimator.maxFilter.retireAged = true
 	e.bound = &inflightBound{jitter: e.inner.probeJitter}
+	e.inner.probeRTTGain = pathProbeRTTGain
+	e.inner.flightScale = func() float64 { return 1 / e.arrivalRate() }
 	e.pacer.keepDebt = true
 	e.path = path
 	if path != nil {
