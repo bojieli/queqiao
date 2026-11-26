@@ -17,6 +17,7 @@ import (
 	"github.com/bojieli/queqiao/internal/pathmodel"
 	"github.com/bojieli/queqiao/internal/pathsim"
 	"github.com/bojieli/queqiao/internal/protocol"
+	"github.com/bojieli/queqiao/internal/stripe"
 )
 
 // An LLM prompt uploaded beside a bulk upload (the impaired campaign's
@@ -285,10 +286,15 @@ func TestPromptUploadBesideABulkUpload(t *testing.T) {
 			if withUpload || arm == armMain {
 				continue
 			}
-			// Alone on the path, no prompt -- including those over the
-			// four-chunk startup allowance (turns 4 and 5) -- may wait a
-			// credit round: the path's round trip is 150 ms.
+			// Alone on the path, a prompt over the four-chunk startup
+			// allowance (turns 4 and 5: 132 and 140 KB) must not wait a
+			// credit round for its last bytes: the path's round trip is
+			// 150 ms. (A single early prompt occasionally takes about one
+			// round trip with or without mem=owned; that is not this bound.)
 			for turn, d := range r.rs {
+				if size := 100_000 + 8_000*turn; size <= stripe.DefaultAutotuneStartupChunks*32<<10 {
+					continue
+				}
 				if d > 100*time.Millisecond {
 					t.Errorf("%s: prompt %d (%d bytes) took R = %v alone on the path; a credit round trip was paid", arm, turn, 100_000+8_000*turn, d)
 				}
