@@ -431,18 +431,30 @@ The last line per candidate is the overall verdict:
 
 ## Gate 2: the DC gate (stage 9)
 
-Section 11.3 keeps `dc-long-haul` on the legacy bundle through the migration.
-It moves the profile only if the profile passes its own gate on the new
-architecture. The bounds are in `scripts/validation/dc_gate.ini`. They are
+Section 11.3 keeps `dc-long-haul` on the legacy bundle by default through the
+migration. Since stage 9 the profile also starts on the whole new architecture
+(`--cc-api=v2 --sched=class --congestion-scope=path --coded-retry=sticky
+--recovery=carrier`, `--topology=single` on clients, optionally
+`--classifier=phased --mem=owned --gateway-admission=owned`), which is the
+candidate in both DC example campaigns; the daemon refuses any bundle in
+between. The default moves only if the profile passes its own gate on the
+new architecture. The bounds are in `scripts/validation/dc_gate.ini`. They are
 **frozen**: section 11.3 and the round-5 review both require them to be fixed
 before the campaign runs. A change must land in its own commit before any
 stage 9 data exists.
 
 ### The workload
 
-A leaf is an endpoint pair, and the gateway is the sender for downloads. So
-the gateway's tree runs from its egress to a group to each client address,
-and each client host is one leaf under a shared ancestor. The DC campaign
+A leaf is an endpoint pair, and the gateway is the sender for downloads, so
+each client host is one leaf under the gateway's shared egress. Under the
+candidate the gateway's authorities sit in its tree as knowledge only. The
+legacy gateway has no tree at all: its per-peer controllers are independent,
+and the legacy tree's joint limit couples only clients in one process. So
+this campaign compares one authority per leaf with independent legacy
+controllers. The joint limit itself is exercised by the deterministic test
+`TestDCMultiLeafFairnessHoldsWithAKnowledgeOnlyTree` (uploads, several
+clients in one process), which computes the same contrasts with the same
+bounds. The DC campaign
 (`scripts/validation/dc-campaign.example.ini`) has these parts:
 
 - One temporary gateway per arm, with `--path-profile dc-long-haul` on both
@@ -544,6 +556,12 @@ time:
 - each client: its runtime configuration record;
 - the gateway: its running command line, recorded by the runner at every
   start, because the gateway's record carries no profile.
+
+Each endpoint's bundle comes from the runtime configuration record it logs
+at every start. Every candidate endpoint must have run the new-architecture
+bundle (clients with `topology=single`), and every legacy endpoint must have
+run without `cc-api=v2`. Otherwise the campaign compared something else and
+is VOID. If an endpoint recorded no bundle, there is no verdict.
 
 ```sh
 ./scripts/ab_campaign.py --config scripts/validation/dc.local.ini --dry-run

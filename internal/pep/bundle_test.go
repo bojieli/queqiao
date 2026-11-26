@@ -37,6 +37,9 @@ func TestBundleValidatorRejectsUnsupportedCombinations(t *testing.T) {
 		{CCAPIV1, CongestionBBR, longHaul},
 		{CCAPIV1, CongestionErasure, longHaul},
 		{CCAPIV2, CongestionErasure, access},
+		// Stage 9: v2 is accepted here and the profile's whole bundle is
+		// checked by validateProfileBundle.
+		{CCAPIV2, CongestionErasure, longHaul},
 	}
 	for _, c := range accepted {
 		api := c.api
@@ -59,13 +62,70 @@ func TestBundleValidatorRejectsUnsupportedCombinations(t *testing.T) {
 		{CCAPIV2, CongestionBBRTUIC, access, "requires --congestion=erasure"},
 		{CCAPIV2, CongestionAdaptive, access, "requires --congestion=erasure"},
 		{CCAPIV2, CongestionBrutal, access, "requires --congestion=erasure"},
-		{CCAPIV2, CongestionErasure, longHaul, "legacy bundle"},
+		{CCAPIV2, CongestionBBR, longHaul, "requires --congestion=erasure"},
 	}
 	for _, c := range rejected {
 		api := c.api
 		err := validateBundle(&api, c.cc, c.p)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("cc-api %q, congestion %q, profile %q: got %v, want an error containing %q", c.api, c.cc, c.p.Name, err, c.want)
+		}
+	}
+}
+
+// dc-long-haul runs the legacy bundle or its whole new-architecture bundle
+// (design §11.3, §14 stage 9), and nothing in between; classifier=phased only
+// with the new one. Every other profile is unrestricted here.
+func TestDCLongHaulRunsTheLegacyOrTheWholeNewBundle(t *testing.T) {
+	dc, err := profile.ByName(dcLongHaulProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type bundle struct {
+		api        CCAPIVersion
+		sched      SchedMode
+		scope      CongestionScope
+		coded      CodedRetryMode
+		topology   Topology
+		recovery   RecoveryMode
+		classifier ClassifierMode
+		gateway    bool
+	}
+	whole := bundle{CCAPIV2, SchedClass, CongestionScopePath, CodedRetrySticky, TopologySingle, RecoveryCarrier, ClassifierLegacy, false}
+	with := func(f func(*bundle)) bundle { b := whole; f(&b); return b }
+	accepted := []bundle{
+		{},              // legacy, every default
+		{gateway: true}, // legacy gateway
+		whole,           // the new architecture
+		with(func(b *bundle) { b.classifier = ClassifierPhased }),
+		with(func(b *bundle) { b.gateway, b.topology = true, "" }),
+		with(func(b *bundle) { b.gateway, b.topology, b.classifier = true, "", ClassifierPhased }),
+	}
+	for _, b := range accepted {
+		if err := ValidateProfileBundle(dc, b.api, b.sched, b.scope, b.coded, b.topology, b.recovery, b.classifier, b.gateway); err != nil {
+			t.Errorf("%+v rejected under dc-long-haul: %v", b, err)
+		}
+	}
+	rejected := []bundle{
+		{classifier: ClassifierPhased},
+		{classifier: ClassifierPhased, gateway: true},
+		{api: CCAPIV2},
+		{api: CCAPIV2, sched: SchedClass},
+		{api: CCAPIV2, sched: SchedClass, scope: CongestionScopePath},
+		{api: CCAPIV2, sched: SchedClass, scope: CongestionScopePath, coded: CodedRetrySticky, topology: TopologySingle},
+		with(func(b *bundle) { b.recovery = RecoveryFlow }),
+		with(func(b *bundle) { b.topology = TopologyIsolated }),
+		with(func(b *bundle) { b.coded = CodedRetryLegacy }),
+		with(func(b *bundle) { b.gateway, b.topology, b.recovery = true, "", RecoveryFlow }),
+	}
+	for _, b := range rejected {
+		err := ValidateProfileBundle(dc, b.api, b.sched, b.scope, b.coded, b.topology, b.recovery, b.classifier, b.gateway)
+		if err == nil || !strings.Contains(err.Error(), dcLongHaulProfile) {
+			t.Errorf("%+v under dc-long-haul: got %v, want a refusal naming the profile", b, err)
+		}
+		// The access-link profile does not restrict the whole bundle.
+		if err := ValidateProfileBundle(profile.Default(), b.api, b.sched, b.scope, b.coded, b.topology, b.recovery, b.classifier, b.gateway); err != nil {
+			t.Errorf("%+v refused by the default profile: %v", b, err)
 		}
 	}
 }

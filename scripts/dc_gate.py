@@ -301,6 +301,39 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
     return sorted(set(missing)), sorted(set(wrong))
 
 
+# The candidate's bundle: dc-long-haul runs the legacy bundle or this one and
+# nothing in between (DESIGN-PATH-AUTHORITY.md section 11.3; the daemon's
+# validator refuses the rest). classifier=phased, mem=owned and
+# gateway-admission=owned may ride along; a client also needs topology=single.
+DC_BUNDLE = ("cc-api=v2", "sched=class", "congestion=path", "coded-retry=sticky", "recovery=carrier")
+
+
+def bundle_evidence(campaign: str, plan: dict, loaded: List[str], control: str) -> Tuple[List[str], List[str]]:
+    """Each endpoint's bundle, from the runtime configuration it logged at
+    every start: the main arm must have run the legacy bundle (no cc-api=v2)
+    and every candidate the new-architecture bundle, or the campaign compared
+    something else. Returns (missing, wrong)."""
+    missing: List[str] = []
+    wrong: List[str] = []
+    for arm in plan["arms"]:
+        candidate = arm != plan["main"]
+        for who, d, need in [("gateway", f"gw-{arm}", DC_BUNDLE)] + \
+                [(f"client {leaf}", f"cl-{leaf}-{arm}", DC_BUNDLE + ("topology=single",)) for leaf in loaded + [control]]:
+            files = glob.glob(os.path.join(campaign, "logs", d, "*.jsonl*"))
+            seen = {rec.get("bundle") for rec in iter_json(files, ('"runtime configuration"',))
+                    if rec.get("msg") == "runtime configuration"} - {None}
+            if not seen:
+                missing.append(f"{who}/{arm}: no bundle recorded")
+            for b in sorted(seen):
+                parts = set(b.split(","))
+                if candidate and not set(need) <= parts:
+                    wrong.append(f"{who}/{arm}: ran bundle {b!r}, not dc-long-haul's new-architecture bundle "
+                                 f"({','.join(need)})")
+                elif not candidate and "cc-api=v2" in parts:
+                    wrong.append(f"{who}/{arm}: the legacy arm ran bundle {b!r}")
+    return missing, wrong
+
+
 def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     plan, trials = read_campaign(campaign)
     if plan.get("workload") != "dc" or not plan.get("dc"):
@@ -322,6 +355,8 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     for t in ab:
         t.m = dc_measures(t, loaded, control, dc["request_timeout"], duration)
     evidence_missing, evidence_wrong = carrier_evidence(campaign, plan, ab, solo, loaded, control)
+    bundle_missing, bundle_wrong = bundle_evidence(campaign, plan, loaded, control)
+    evidence_missing, evidence_wrong = evidence_missing + bundle_missing, bundle_wrong + evidence_wrong
 
     def per_block(arm: str, key: str, agg) -> Dict[int, float]:
         out: Dict[int, List[float]] = {}

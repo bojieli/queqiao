@@ -121,6 +121,26 @@ queqiaod client --profile ~/.config/queqiao/*.json \
 
 Applications reach it at `127.0.0.1:12080` over SOCKS5.
 
+### The new architecture (opt-in, under evaluation)
+
+Both ends can instead run the profile on the path-authority architecture,
+which is still being evaluated against the bundle above
+([DESIGN-PATH-AUTHORITY.md](DESIGN-PATH-AUTHORITY.md) §11.3). Add the same
+switches on both ends:
+
+```sh
+--cc-api=v2 --sched=class --congestion-scope=path --coded-retry=sticky --recovery=carrier
+```
+
+The client also needs `--topology=single`. `--classifier=phased`,
+`--mem=owned` and, on the gateway, `--gateway-admission=owned` are optional.
+Start-up refuses any partial set with this profile. Each endpoint pair then has
+one rate controller, and the path tree only supplies starting estimates of
+erasure and round trip for a destination that has not been measured yet. It
+no longer caps destinations jointly. Emulated measurements of fairness across
+destinations behind a shared bottleneck have gone both ways so far. Until the
+live comparison has run, prefer the default where that fairness matters.
+
 That is the foreground form. To install it as a service, pass the same profile
 to the installer, which threads it into the LaunchAgent or systemd user unit:
 
