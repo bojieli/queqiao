@@ -30,6 +30,19 @@ func iosMemoryLimits() *MemoryLimits {
 
 const iosChunkSize = 16 * 1024
 
+// idleReaderMemoryLimits is the iOS profile scaled down eight times: a
+// 512 KiB shared send budget, so 32 chunks fill it. The socket-based idle
+// reader test needs four descriptors per proxied flow in one process; at
+// the full iOS scale that is about 800, more than a runner limited to 512
+// allows (#174). The stripe package's TestIdleProducersHoldNoSharedMemory
+// covers the full iOS scale without sockets.
+func idleReaderMemoryLimits() *MemoryLimits {
+	limits := iosMemoryLimits()
+	limits.SendBudgetBytes, limits.ReceiveBudgetBytes = 512*1024, 512*1024
+	limits.MaxFlowSendBytes, limits.MaxFlowReceiveBytes = 256*1024, 256*1024
+	return limits
+}
+
 // TestIdleReadersCannotStarveAnActiveRequestUnderIOSLimits is issue #169. On
 // main a flow's producer reserved a whole chunk of the endpoint budget before
 // blocking in Read on its application socket, so budget/chunk idle keep-alive
@@ -39,7 +52,9 @@ const iosChunkSize = 16 * 1024
 func TestIdleReadersCannotStarveAnActiveRequestUnderIOSLimits(t *testing.T) {
 	for _, mode := range []MemoryMode{MemoryLegacy, MemoryOwned} {
 		t.Run(string(mode), func(t *testing.T) {
-			limits := iosMemoryLimits()
+			// Enough idle readers to hold the whole shared budget a chunk
+			// each, and then some.
+			limits := idleReaderMemoryLimits()
 			idle := int(limits.SendBudgetBytes/iosChunkSize) + 8
 
 			destinationListener, err := net.Listen("tcp", "127.0.0.1:0")

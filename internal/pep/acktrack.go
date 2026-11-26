@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"time"
 )
 
 // ackTracker records which byte ranges of an outbound stream the peer has
@@ -30,6 +31,14 @@ type ackTracker struct {
 	// gen advances whenever the acknowledged set changes, so a watcher can
 	// wait for news without polling.
 	gen uint64
+	// top is the highest offset acknowledged so far, and topAt when the
+	// acknowledgement that raised it was applied: the observation time of
+	// the gap-evidence frontier, which the scheduler places against coded
+	// registrations. A watcher's pass runs later than that.
+	top   uint64
+	topAt time.Time
+	// now is the clock, for tests; nil is time.Now.
+	now func() time.Time
 }
 
 func newAckTracker() *ackTracker {
@@ -48,6 +57,7 @@ func (t *ackTracker) Advance(sequence uint64) {
 	}
 	t.cumulative = sequence
 	t.compactLocked()
+	t.noteTopLocked()
 	t.gen++
 	t.cond.Broadcast()
 }
@@ -72,9 +82,28 @@ func (t *ackTracker) Add(ranges [][2]uint64) bool {
 	}
 	t.mergeLocked()
 	t.compactLocked()
+	t.noteTopLocked()
 	t.gen++
 	t.cond.Broadcast()
 	return true
+}
+
+// noteTopLocked stamps an advance of the highest acknowledged offset.
+func (t *ackTracker) noteTopLocked() {
+	top := t.cumulative
+	if n := len(t.ranges); n > 0 {
+		// Sorted and merged: the last range ends highest.
+		top = max(top, t.ranges[n-1][1])
+	}
+	if top <= t.top {
+		return
+	}
+	t.top = top
+	if t.now != nil {
+		t.topAt = t.now()
+	} else {
+		t.topAt = time.Now()
+	}
 }
 
 // mergeLocked sorts and coalesces overlapping ranges so Covered is a scan
@@ -252,13 +281,15 @@ func (t *ackTracker) Touch() {
 type ackSnapshot struct {
 	cumulative uint64
 	ranges     [][2]uint64
+	// highestAt is when the acknowledgement that raised highest() arrived.
+	highestAt time.Time
 }
 
 // Snapshot copies the acknowledged set.
 func (t *ackTracker) Snapshot() ackSnapshot {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	out := ackSnapshot{cumulative: t.cumulative}
+	out := ackSnapshot{cumulative: t.cumulative, highestAt: t.topAt}
 	if len(t.ranges) > 0 {
 		out.ranges = append(make([][2]uint64, 0, len(t.ranges)), t.ranges...)
 	}

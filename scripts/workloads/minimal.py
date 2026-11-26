@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import ab_campaign as ab
 import ab_stats as st
 import ab_workloads as w
+import generic_metrics as gm
 
 pa = __import__("sys").modules.get("ab_workload_phase_a")
 if pa is None:                                   # loaded alone (tests): import its sibling
@@ -296,8 +297,9 @@ def wake_script(campaign, job, arm, duration, start_at=0):
                       f"--follow {p['follow']} --duration {int(duration)}{ready}")
 
 
-for _name, _fn in (("wl-call", call_script), ("wl-browse", browse_script), ("wl-wake", wake_script)):
-    w.generator(_name, w.Generator(_fn, pa.parse_rows, lambda job: 0, w.json_records))
+for _name, _fn, _kind in (("wl-call", call_script, "call"), ("wl-browse", browse_script, "browse"),
+                          ("wl-wake", wake_script, None)):
+    w.generator(_name, w.Generator(_fn, pa.parse_rows, lambda job: 0, w.json_records, _kind))
 
 
 # --- workloads --------------------------------------------------------------------
@@ -305,6 +307,27 @@ for _name, _fn in (("wl-call", call_script), ("wl-browse", browse_script), ("wl-
 # The trial table of the model's Minimal live plan (DESIGN-PATH-AUTHORITY.md
 # section 15.3): every setting is fixed there, so none is configurable here.
 TRIAL_TYPES = ("bulk", "mixed-67", "mixed-all")
+# Generic secondaries of section 15.4 that gate stage 10 and are reported,
+# not gated, at stages 6 and 7.
+STAGE10_GENERIC = ("credit_delay_p95_s", "false_promotion_rate")
+
+
+def pooled_generic(ms: Sequence[dict], key: str) -> float:
+    """Credit delay p95 or the false-promotion rate over several trials'
+    measures, from their pooled histograms and promotion counts."""
+    if key == "credit_delay_p95_s":
+        return gm.quantile(0.95, gm.pool([m.get("_credit_hist") for m in ms]))
+    return gm.rate(gm.pooled_promotions([m.get("_promotions") for m in ms]))
+
+
+def campaign_stage(plan: dict) -> int:
+    """The stage a minimal campaign gates (`[workload:minimal] stage`). A
+    plan from before the setting has its default: 10 with trial type C,
+    else 7."""
+    c = plan.get("config") or {}
+    if c.get("minimal_stage"):
+        return int(c["minimal_stage"])
+    return 10 if "mixed-all" in (c.get("minimal_trials") or ()) else 7
 TRIAL_SECONDS = {"bulk": 60, "mixed-67": 90, "mixed-all": 120}
 LEAD = 5              # backgrounds start this long before the foreground (model 3.0)
 UPLOAD = 100_000      # U, the LLM prompt
@@ -333,26 +356,59 @@ class Minimal(pa._Scenario):
     name = "minimal"
     report_only = (pa.LLM_REPORT_ONLY + pa.TERM_REPORT_ONLY +
                    ("html_first_byte_p50_s", "sessions_failed", "call_sessions_failed", "call_late_loss_up",
-                    "call_late_loss_down", "call_audio_gaps_per_min_up", "call_audio_gaps_per_min_down"))
+                    "call_late_loss_down", "call_audio_gaps_per_min_up", "call_audio_gaps_per_min_down") +
+                   STAGE10_GENERIC)
 
     # The primaries: only bulk flows' bytes (section 15.3).
     primaries = ("bulk.goodput_bps", "mixed-67.bg_down_rate_bps", "mixed-all.bg_down_rate_bps",
                  "mixed-all.bg_up_rate_bps")
     # Generic secondaries where defined (section 15.4): flow completion and
     # wire bytes per useful byte need A's bulk flows; the others apply to
-    # every trial. Credit delay and false promotion have no measurement yet.
+    # every trial. Credit delay and the shadow false-promotion rate gate
+    # every trial type of a stage-10 campaign and are reported, not gated,
+    # at stages 6 and 7 (see `generics`).
     generic = {"bulk": ("completion", "stalls_per_trial", "reissued_per_source", "wire_per_useful", "queue_p90_ms",
                         "cpu_p90"),
                "mixed-67": ("stalls_per_trial", "reissued_per_source", "queue_p90_ms", "cpu_p90"),
                "mixed-all": ("stalls_per_trial", "reissued_per_source", "queue_p90_ms", "cpu_p90")}
 
+    def generics(self, plan) -> Dict[str, Tuple[str, ...]]:
+        """The generic secondaries each trial type is judged on in this
+        campaign: at stage 10, `generic` plus STAGE10_GENERIC."""
+        if campaign_stage(plan) < 10:
+            return dict(self.generic)
+        return {ph: ks + STAGE10_GENERIC for ph, ks in self.generic.items()}
+
+    def report_only_for(self, plan) -> Tuple[str, ...]:
+        """The measures shown without a rule. Stage 10's generic
+        secondaries are report-only below stage 10 only: at stage 10 one
+        without a rule in gates.ini leaves the cell INCOMPLETE."""
+        if campaign_stage(plan) < 10:
+            return self.report_only
+        return tuple(k for k in self.report_only if k not in STAGE10_GENERIC)
+
+    def reported(self, plan) -> Dict[str, Tuple[str, ...]]:
+        """The generic secondaries each trial type reports without gating."""
+        if campaign_stage(plan) < 10:
+            return {ph: STAGE10_GENERIC for ph in self.generic}
+        return {}
+
     def block_extract(self, trials, plan):
         out = super().block_extract(trials, plan)
-        for ph, ks in self.generic.items():
+        measured: Dict[str, Tuple[str, ...]] = {}
+        for src in (self.generics(plan), self.reported(plan)):
+            for ph, ks in src.items():
+                measured[ph] = measured.get(ph, ()) + ks
+        for ph, ks in measured.items():
             pt = [t for t in trials if getattr(t, "trial", "") == ph]
             if not pt:
                 continue
             for k in ks:
+                if k in STAGE10_GENERIC:
+                    # Pooled over the block's trials, never an average of
+                    # per-trial percentiles or rates.
+                    out[f"{ph}.{k}"] = pooled_generic([getattr(t, "m", {}) for t in pt], k)
+                    continue
                 vals = [getattr(t, "m", {}).get(k, float("nan")) for t in pt]
                 out[f"{ph}.{k}"] = (sum(vals) / len(vals) if all(v is not None and v == v for v in vals)
                                     else float("nan"))
@@ -370,6 +426,20 @@ class Minimal(pa._Scenario):
         if bad or not trials or len(set(trials)) != len(trials):
             raise ab.ConfigError(f"[workload:minimal] trials: want some of {', '.join(TRIAL_TYPES)}, each once")
         cfg.minimal_trials = [t for t in TRIAL_TYPES if t in trials]
+        # The stage this campaign gates. Stage 10 gates credit delay and the
+        # shadow false-promotion rate (the latter needs --carrier-shadow on
+        # every endpoint of both arms); stages 6 and 7 report them.
+        stage = p.get("stage", "auto").strip().lower()
+        if stage == "auto":
+            cfg.minimal_stage = 10 if "mixed-all" in cfg.minimal_trials else 7
+        elif stage in ("6", "7", "10"):
+            cfg.minimal_stage = int(stage)
+        else:
+            raise ab.ConfigError("[workload:minimal] stage: auto, 6, 7 or 10")
+        if cfg.minimal_stage < 10 and "mixed-all" in cfg.minimal_trials:
+            # C gates stage 10 only, with stage 10's generic secondaries.
+            raise ab.ConfigError("[workload:minimal] stage: trial type mixed-all (C) gates stage 10; "
+                                 "use stage = 10 or auto")
         iw = p.get("idle_wake", "auto").strip().lower()
         if iw not in ("auto", "true", "false"):
             raise ab.ConfigError("[workload:minimal] idle_wake: auto, true or false")
@@ -414,7 +484,8 @@ class Minimal(pa._Scenario):
         dc = 4 * DC_TRIAL_SECONDS + ab.BLOCK_OVERHEAD
         every = sum(4 * s + ab.BLOCK_OVERHEAD for s in TRIAL_SECONDS.values()) + dc
         notes = [f"DC (stage 9) is its own campaign (dc-minimal.example.ini): about {dc / 60:.0f} min a block; "
-                 f"one block each of A, B, C and DC is about {every / 60:.0f} min a path (design section 15.4), "
+                 f"one block each of A, B, C and DC is about {every / 60:.0f} min a path (as measured; the design "
+                 f"budgets about 26), "
                  f"{6 * every / 3600:.1f} h at 6 blocks, {12 * every / 3600:.1f} h at the 12-block cap"]
         if cfg.minimal_wake:
             notes.append(f"D (idle-wake) runs beside the blocks on its own instances: one {wake_session_seconds() / 60:.0f}-minute "
@@ -494,7 +565,20 @@ class Minimal(pa._Scenario):
         return True
 
     def block_tails(self, trials, plan):
-        out: Dict[str, Tuple[float, List[float]]] = {}
+        out: Dict[str, Tuple[Optional[float], List[float]]] = {}
+        # The generic secondaries' raw evidence, for pooling over blocks:
+        # credit delay as samples (a p95), the promotions as 0/1 events (a
+        # proportion, q None). Absent when any of the type's trials lacks it.
+        for ph in self.generic:
+            ms = [getattr(t, "m", {}) for t in trials if getattr(t, "trial", "") == ph]
+            if not ms:
+                continue
+            h = gm.pool([m.get("_credit_hist") for m in ms])
+            if h is not None:
+                out[f"{ph}.credit_delay_p95_s"] = (0.95, gm.Tail(h))
+            ev = gm.outcomes(gm.pooled_promotions([m.get("_promotions") for m in ms]))
+            if ev is not None:
+                out[f"{ph}.false_promotion_rate"] = (None, ev)
         for ph in ("mixed-67", "mixed-all"):
             pt = [t for t in trials if getattr(t, "trial", "") == ph]
             if not pt:

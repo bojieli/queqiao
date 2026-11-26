@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
 import ab_workloads  # noqa: E402
+import generic_metrics as gm  # noqa: E402
 
 GATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "gates.ini")
 CLK_TCK = 100  # ticks per second in the runner's CPU samples
@@ -70,9 +71,11 @@ def load_gates(path: str = GATES) -> dict:
             rules = {}
             for k, v in cp[section].items():
                 parts = v.split()
-                kinds = list(RULES) + list(HARD) + list(VS_MAIN)
+                kinds = list(RULES) + list(HARD) + list(VS_MAIN) + ["events"]
                 if parts and parts[0] in ("atmost", "atleast") and len(parts) in (2, 3):
                     pass
+                elif parts and parts[0] == "events" and len(parts) == 3:
+                    pass                    # events <margin> <minimum opportunities per arm>
                 elif len(parts) != 2 or parts[0] not in kinds:
                     raise SystemExit(f"gates: [{section}] {k}: want one of {', '.join(kinds)} and a number "
                                      "(atmost/atleast take an optional absolute slack)")
@@ -87,6 +90,8 @@ def load_gates(path: str = GATES) -> dict:
             "resamples": p.getint("bootstrap_resamples"), "seed": p.getint("bootstrap_seed"),
             "max_zero_main_fraction": p.getfloat("max_zero_main_fraction"),
             "secondary_min_coverage": p.getfloat("secondary_min_coverage", fallback=1.0),
+            "harness": ({"control_plane_void_max": cp["harness"].getint("control_plane_void_max")}
+                        if cp.has_section("harness") else None),
             "contention": ({k: cp["contention"].getfloat(k) for k in ("busy_threshold", "production_share_max",
                                                                        "steal_max_fraction")}
                            if cp.has_section("contention") else None),
@@ -118,6 +123,19 @@ HARD: Dict[str, Callable[[float, Tuple[float, ...]], bool]] = {
 VS_MAIN: Dict[str, Callable[[float, float, Tuple[float, ...]], bool]] = {
     "nofewer": lambda c, m, v: c >= m - v[0],
 }
+
+
+# How to read a rule's row: the contrast is the candidate's headroom inside
+# its bound, so positive is good whichever way the measure points.
+RULE_LEGEND = ("Per block, the contrast is how far the candidate is inside its bound: `lower v` main + v - cand; "
+               "`higher v` cand - (main - v); `atmost m a` m x main + a - cand; `atleast m a` cand - (m x main - a). "
+               "Positive is inside the bound, whichever way the measure points. A rule passes when both one-sided "
+               "lower bounds of the mean contrast are above zero, and fails when an upper bound is below zero; "
+               "otherwise it is undecided, which at the block cap (or the end of a fixed campaign) is a fail. "
+               "`floor`/`ceiling` assert on the candidate in every judged block. `events v n` pools failures over "
+               "opportunities across blocks: pass when an exact binomial test puts the candidate's count below "
+               "main's pooled rate + v and a block-permutation check does not find it worse; it needs at least n "
+               "opportunities per arm.")
 
 
 def rule_contrasts(kind: str, value, cand: Sequence[float], main: Sequence[float]) -> List[float]:
@@ -394,7 +412,10 @@ def contention_void(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int]
     void: Dict[Tuple[int, str, str], str] = {}
     cpu: Dict[Tuple[str, str], dict] = {}
     hosts = (plan.get("hostcpu_hosts") or {})
-    if not plan.get("config", {}).get("host_cpu") or not bounds:
+    if not plan.get("config", {}).get("host_cpu") or not bounds or plan.get("beside_of"):
+        # A session beside the blocks (D) has no CPU samplers of its own: it
+        # overlaps the blocks, whose own samples judge contention on those
+        # hosts. Its trials are never void for a record it never had.
         return void, cpu
     for key, t in trials.items():
         if key[2] >= 100:
@@ -414,23 +435,70 @@ def contention_void(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int]
     return void, cpu
 
 
+# A session run beside the blocks (D) has its own instances, "<arm>.wake",
+# whose logs are under directories ending ".wake/".
+BESIDE_LOG = re.compile(r"\.wake/")
+
+
+def own_fetch_failures(paths: Sequence[str], beside: bool) -> List[str]:
+    """The fetch failures that belong to this campaign: a beside session's
+    logs are its own campaign's (the `idle-wake` subdirectory), never the
+    blocks'. (A runner before this split recorded both in each status.)"""
+    return [p for p in paths or [] if bool(BESIDE_LOG.search(p)) == beside]
+
+
 def fetch_failed(campaign: str) -> List[str]:
     """Remote log paths the runner could not fetch (status.json)."""
     try:
         with open(os.path.join(campaign, "status.json")) as f:
-            return list(json.load(f).get("fetch_failures") or [])
+            got = list(json.load(f).get("fetch_failures") or [])
+        with open(os.path.join(campaign, "plan.json")) as f:
+            beside = bool(json.load(f).get("beside_of"))
+        return own_fetch_failures(got, beside)
     except (OSError, ValueError):
         return []
 
 
-# Section 15.4 secondaries with no measurement in any build yet.
-NOT_YET_MEASURED = ("credit_delay_p95_s", "false_promotion_rate")
-LOG_MEASURES = ("queue_p90_ms", "reissued_per_source", "transit_p50_s", "transit_p90_s", "cpu_p90")
+LOG_MEASURES = ("queue_p90_ms", "reissued_per_source", "transit_p50_s", "transit_p90_s", "cpu_p90",
+                "false_promotion_rate")
+
+
+
+def minimal_stage(plan: dict) -> int:
+    """The stage a minimal campaign gates ([workload:minimal] stage)."""
+    c = plan.get("config") or {}
+    if c.get("minimal_stage"):
+        return int(c["minimal_stage"])
+    return 10 if "mixed-all" in (c.get("minimal_trials") or ()) else 7
+
+
+def pooled_generic(trials: Sequence["Trial"], key: str) -> Optional[float]:
+    """Credit delay p95 and the false-promotion rate of a set of trials (an
+    arm's block), from their pooled histograms and promotion counts rather
+    than an average of per-trial figures; None for any other measure."""
+    if key == "credit_delay_p95_s":
+        return gm.quantile(0.95, gm.pool([t.m.get("_credit_hist") for t in trials]))
+    if key == "false_promotion_rate":
+        return gm.rate(gm.pooled_promotions([t.m.get("_promotions") for t in trials]))
+    return None
+
+
+# The runner's exits that are the control plane, not the arm: the host
+# unreachable through every ssh retry, and the runner's own kill when it tore
+# down (ab_campaign.CONTROL_PLANE). A job past its window, lost or silent on a
+# reachable host is the arm's failure, recorded in its rows, never void.
+CONTROL_PLANE_EXITS = (255, -4)
+
+
+def control_plane(job_failures: Optional[Sequence[dict]]) -> List[dict]:
+    return [j for j in job_failures or [] if j.get("exit") in CONTROL_PLANE_EXITS]
 
 
 def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial],
                  interim: bool = False, units_run: Optional[Sequence[Sequence[Any]]] = None,
-                 failures: Optional[dict] = None) -> Tuple[List[str], Dict[Tuple[int, str, int], Trial]]:
+                 failures: Optional[dict] = None, control_plane_max: Optional[int] = None,
+                 voids: Optional[Dict[Tuple[int, str, str], str]] = None
+                 ) -> Tuple[List[str], Dict[Tuple[int, str, int], Trial]]:
     """Problems that forbid a verdict, and the trials of complete blocks only.
 
     A verdict needs a campaign that finished (status.json from the runner)
@@ -458,9 +526,10 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
             last_block = max((b for b, _, s_ in trials if s_ < 100), default=0)
             # The runner's failures so far: a look applies the same evidence
             # rules as the final analysis.
-            failed_jobs = list((failures or {}).get("job_failures") or [])
-            if (failures or {}).get("fetch_failures"):
-                problems.append(f"{len(failures['fetch_failures'])} log file(s) could not be fetched")
+            failed_jobs = control_plane((failures or {}).get("job_failures"))
+            own = own_fetch_failures((failures or {}).get("fetch_failures"), bool(plan.get("beside_of")))
+            if own:
+                problems.append(f"{len(own)} log file(s) could not be fetched")
         else:
             problems.append("no status.json: the campaign did not finish")
     else:
@@ -473,10 +542,11 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
             problems.append(f"the campaign {status.get('status')} (exit {status.get('exit')})")
         if status.get("production") != "unchanged":
             problems.append("production changed during the campaign")
-        if status.get("fetch_failures"):
-            problems.append(f"{len(status['fetch_failures'])} log file(s) could not be fetched; the log-derived "
+        own = own_fetch_failures(status.get("fetch_failures"), bool(plan.get("beside_of")))
+        if own:
+            problems.append(f"{len(own)} log file(s) could not be fetched; the log-derived "
                             "measures of the affected trials are withheld")
-        failed_jobs = status.get("job_failures") or []
+        failed_jobs = control_plane(status.get("job_failures"))
     planned: Dict[Tuple[int, str, str], set] = collections.defaultdict(set)
     for sl in plan.get("schedule", []):
         u = (sl["block"], sl["path"], sl.get("trial") or "")
@@ -487,17 +557,35 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
         if slot < 100:
             have[t.unit].add(slot)
     bad = sorted(k for k, slots in planned.items() if not slots <= have.get(k, set()))
-    # A block in which a generator did not run to its end has harness
+    # A block in which the runner lost a job to the control plane has harness
     # evidence, not the arm's: left out like a missing trial.
     broken = sorted({(j["block"], j["path"], j.get("trial") or "") for j in failed_jobs})
-    if broken:
+    if broken and control_plane_max is not None and voids is not None:
+        # A control-plane failure (the runner lost a job: its host unreachable
+        # through every retry, or the runner killing it tearing down) voids
+        # its whole block, both arms: not evidence, though it
+        # counted toward the cap. Up to control_plane_max per trial type;
+        # more, and the type has no verdict.
+        per: Dict[Tuple[str, str], List[Tuple[int, str, str]]] = collections.defaultdict(list)
+        for u in broken:
+            per[(u[1], u[2])].append(u)
+            why = next(j for j in failed_jobs if (j["block"], j["path"], j.get("trial") or "") == u)
+            voids.setdefault(u, f"control plane: job {why.get('kind')} on "
+                                f"{why.get('client')} (slot {why.get('slot')}) exited {why.get('exit')}")
+        for (p_, ty), us in sorted(per.items()):
+            if len(us) > control_plane_max:
+                problems.append(f"{len(us)} block(s) of {ty or 'the workload'} on {p_} lost a job to the control plane, "
+                                f"more than the {control_plane_max} allowed")
+        bad = sorted(set(bad) - set(broken))
+    elif broken:
         problems.append(f"{len(broken)} block(s) had a job that did not run to its end "
                         f"(first: block {broken[0][0]} on {broken[0][1]}); they are left out")
         bad = sorted(set(bad) | set(broken))
     if bad:
         problems.append(f"{len(bad)} of {len(planned)} planned blocks are missing trials "
                         f"(first: block {bad[0][0]} on {bad[0][1]}); they are left out")
-    keep = {k: t for k, t in trials.items() if t.unit not in set(bad) and (k[2] >= 100 or t.unit in planned or not planned)}
+    gone = set(bad) | (set(broken) if voids is not None and control_plane_max is not None else set())
+    keep = {k: t for k, t in trials.items() if t.unit not in gone and (k[2] >= 100 or t.unit in planned or not planned)}
     return problems, keep
 
 
@@ -612,6 +700,9 @@ def cpu_p90(files: List[str], t: Trial) -> float:
 # "runtime configuration" record (design section 14: every test arm publishes
 # its effective configuration per endpoint).
 EFFECTIVE: Dict[Tuple[str, str], set] = {}
+# Whether each endpoint of an (arm, block tag) ran the carrier-shadow
+# observer, and its k_p, from its runtime configuration record(s).
+SHADOW: Dict[Tuple[str, str, str, Optional[int]], set] = {}
 
 
 def effective(r: dict) -> str:
@@ -669,6 +760,8 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
             for r in recs:
                 if r.get("msg") == "runtime configuration":
                     EFFECTIVE.setdefault((t.arm, "gateway"), set()).add(effective(r))
+                    SHADOW.setdefault((t.arm, t.tag, "gateway", None), set()).add(
+                        (r.get("carrier_shadow") is True, gm.effective_kp(r)))
             for r in recs:
                 try:
                     r["_t"] = ts(r["time"])
@@ -689,6 +782,10 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
                 if r.get("msg") == "runtime configuration":
                     EFFECTIVE.setdefault((t.arm, "client"), set()).add(effective(r))
                     t.m["client_transport"] = r.get("transport", "")
+                    # A small client is a fresh process per slot: its own
+                    # record, never another slot's.
+                    SHADOW.setdefault((t.arm, t.tag, f"client-{c}", t.slot if small else None), set()).add(
+                        (r.get("carrier_shadow") is True, gm.effective_kp(r)))
             for r in crecs:
                 try:
                     r["_t"] = ts(r["time"])
@@ -721,11 +818,28 @@ def measure(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial]
         t.m["transit_p50_s"] = st.quantile(ex, 0.5)
         t.m["transit_p90_s"] = st.quantile(ex, 0.9)
         t.m["cpu_p90"] = cpu_p90(cpus, t)
+        # The generic secondaries from every endpoint's /metrics around the
+        # trial: the gateway (the download's sender) and the path's client
+        # (the upload's), each timing what it sends.
+        ends = [(pre, post)] + [(a, b) for a, b in zip(cpre, cpost)][:len(clients)]
+        t.m["_credit_hist"] = gm.credit_histogram(ends)
+        t.m["credit_delay_p95_s"] = gm.quantile(0.95, t.m["_credit_hist"])
+        # The observer must have been on at every endpoint the trial used,
+        # as each one's runtime configuration record says, with one k_p.
+        kps = []
+        for n, slot in [("gateway", None)] + [
+                (f"client-{c}", t.slot if plan.get("clients", {}).get(c, {}).get("small", False) else None)
+                for c in clients]:
+            seen = SHADOW.get((t.arm, t.tag, n, slot)) or set()
+            kps.append(next(iter(seen))[1] if len(seen) == 1 and next(iter(seen))[0] else None)
+        t.m["_promotions"] = gm.promotions(ends, kps)
+        t.m["false_promotion_rate"] = gm.rate(t.m["_promotions"])
         # A trial whose logs were not all fetched has partial telemetry: a
         # finite number from a subset is not a measurement of the trial.
         if any(f"-{t.tag}" in x and (f"/gw-{t.arm}/" in x or f"-{t.arm}/" in x) for x in failed):
             for k in LOG_MEASURES:
                 t.m[k] = float("nan")
+            t.m["_promotions"] = None      # whether the observer ran is in the logs
             t.m["_transit"] = []
     return "/".join(sorted(method)) or "none"
 
@@ -749,6 +863,9 @@ def block_outcome(ts_: List[Trial]) -> float:
 def block_metric(ts_: List[Trial], key: str) -> float:
     """The arm's mean over its trials in the block; NaN unless every trial
     has the measure, so a block cannot be judged on half its evidence."""
+    pooled = pooled_generic(ts_, key)
+    if pooled is not None:
+        return pooled
     vals = [t.m.get(key, float("nan")) for t in ts_]
     if not vals or any(v is None or v != v for v in vals):
         return float("nan")
@@ -795,12 +912,19 @@ def report(campaign: str, gates: dict, interim: bool = False,
     if plan.get("workload") == "dc":
         raise SystemExit("this is a DC gate campaign: evaluate it with scripts/dc_gate.py")
     EFFECTIVE.clear()
+    SHADOW.clear()
     sq = sequential_of(plan)
-    problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run, failures=failures)
+    cp_voids: Dict[Tuple[int, str, str], str] = {}
+    all_rows = dict(trials)
+    problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run, failures=failures,
+                                    control_plane_max=(gates.get("harness") or {}).get("control_plane_void_max"),
+                                    voids=cp_voids)
     # Contention: units void under host CPU contention are not evidence (they
     # still counted toward the cap when they ran).
     void_units, cpu_of = contention_void(campaign, plan, trials, gates.get("contention"))
     all_trials = dict(trials)
+    for u, why in cp_voids.items():
+        void_units.setdefault(u, why)
     if void_units:
         trials = {k: t for k, t in trials.items() if t.unit not in void_units}
     frozen = plan.get("gates_sha256")
@@ -817,7 +941,9 @@ def report(campaign: str, gates: dict, interim: bool = False,
             stopped_early = bool(json.load(f).get("stopped"))
     except (OSError, ValueError):
         pass
-    undecided_ok = interim or stopped_early
+    # A campaign without a status (still running, or killed) has no final
+    # verdict: an undecided contrast is shown undecided, never FAIL.
+    undecided_ok = interim or stopped_early or not os.path.exists(os.path.join(campaign, "status.json"))
     method = measure(campaign, plan, trials)
     wl = ab_workloads.get(plan.get("workload", "bulk"))
     for t in trials.values():
@@ -825,7 +951,8 @@ def report(campaign: str, gates: dict, interim: bool = False,
     rules = dict(gates.get("workloads", {}).get(wl.name, {}))
     # The generic secondaries that apply to a rule-judged workload's phases,
     # as rules of those phases with their [secondary] bounds.
-    for ph, ks in getattr(wl, "generic", {}).items():
+    generics = wl.generics(plan) if hasattr(wl, "generics") else getattr(wl, "generic", {})
+    for ph, ks in generics.items():
         for k in ks:
             if k in gates["secondary"]:
                 better, margin = gates["secondary"][k]
@@ -849,6 +976,16 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     return True
         return False
     tail_cache: Dict[Tuple[str, int, str], Dict[str, Tuple[float, List[float]]]] = {}
+    event_cache: Dict[Tuple[str, int, str], Dict[str, Tuple[int, int]]] = {}
+
+    def block_events(path: str, block: int, arm: str) -> Dict[str, Tuple[int, int]]:
+        """(events, opportunities) of an arm's block, for `events` rules."""
+        k = (path, block, arm)
+        if k not in event_cache:
+            ts_ = [t for t in trials.values() if t.path == path and t.block == block and t.arm == arm and t.slot < 100]
+            f = getattr(wl, "block_events", None)
+            event_cache[k] = f(ts_, plan) if f and ts_ else {}
+        return event_cache[k]
 
     def block_tails(path: str, block: int, arm: str) -> Dict[str, Tuple[float, List[float]]]:
         k = (path, block, arm)
@@ -887,9 +1024,33 @@ def report(campaign: str, gates: dict, interim: bool = False,
         out += ["", "**No verdict: the campaign is incomplete.** " + "; ".join(problems) + ". "
                 "The numbers below are for diagnosis only."]
     if void_units:
-        out += ["", f"**{len(void_units)} block(s) void under contention** (not evidence; they counted toward the "
-                "cap): " + "; ".join(f"block {b} on {p}{' ' + ty if ty else ''}: {why}"
-                                     for (b, p, ty), why in sorted(void_units.items()))]
+        out += ["", f"**{len(void_units)} block(s) void** (under contention or lost to the control plane: not "
+                "evidence; they counted toward the cap): " + "; ".join(f"block {b} on {p}{' ' + ty if ty else ''}: {why}"
+                                                                     for (b, p, ty), why in sorted(void_units.items()))]
+    # Workload failures, per block and arm: transfers the job itself recorded
+    # as failed (curl exit other than 0, and 28 at a bulk window's end; a
+    # generator's failed session). They are the arm's evidence, never voided.
+    wf: Dict[Tuple[int, str, str], Dict[str, int]] = collections.defaultdict(lambda: collections.Counter())
+    for t in all_rows.values():
+        for r in t.rows:
+            ex = str(r.get("curl_exit") or "")
+            if ex not in ("", "0") and not (ex == "28" and r.get("kind") in ("bulk", "wl-bgdown", "wl-bgup")):
+                wf[t.unit][t.arm] += 1
+    try:
+        with open(os.path.join(campaign, "status.json")) as f:
+            jobs_failed = json.load(f).get("workload_failures") or []
+    except (OSError, ValueError):
+        jobs_failed = []
+    if jobs_failed:
+        # Jobs the runner saw fail on a reachable host (past their window,
+        # lost, silent): their rows and sessions count as the arm's failures.
+        out += ["", "Failed jobs (the arm's evidence, not void): " + "; ".join(
+            f"block {j['block']} on {j['path']}{' ' + j['trial'] if j.get('trial') else ''}: {j['kind']} on "
+            f"{j['client']} ({j['arm']}) {j['reason']}" for j in jobs_failed)]
+    if wf:
+        out += ["", "Workload failures (recorded by the jobs; evidence against the arm): " + "; ".join(
+            f"block {b} on {p}{' ' + ty if ty else ''}: " + ", ".join(f"{arm} {n}" for arm, n in sorted(c.items()))
+            for (b, p, ty), c in sorted(wf.items()))]
     if EFFECTIVE:
         out.append("")
         out.append("Effective configuration, from each endpoint's runtime configuration record:")
@@ -1000,6 +1161,43 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     "|---|---|---:|---:|---:|---:|---|"]
             for key, (better, margin) in secondary.items():
                 for cand in arms[1:]:
+                    need = math.ceil(gates["secondary_min_coverage"] * judged.get(cand, 0) - 1e-9)
+                    if key == "false_promotion_rate":
+                        # Event-weighted and pooled over blocks, as a rule.
+                        ev = lambda ts_: gm.outcomes(gm.pooled_promotions([t.m.get("_promotions") for t in ts_]))
+                        c, m, common = paired(trials, path, main, cand, ev)
+                        have = [(x, y) for x, y in zip(c, m) if x is not None and y is not None]
+                        verdict, d_, bound, n_c, n_m = proportion_verdict(
+                            have, need, lambda c__, m__: RULES[better](c__, m__, (margin,)), None, gates, False)
+                        verdicts[(path, cand, key)] = verdict
+                        # The columns show the contrast with its margin
+                        # applied (pass when its lower bound is above zero).
+                        out.append(f"| {SECONDARY_LABELS.get(key, key)} | {cand} | {len(have)} (pooled, {n_c} and "
+                                   f"{n_m} events) | {fmt(d_, '.4g')} (with margin) | lower {fmt(bound, '.4g')} | "
+                                   f"{'+' if better == 'lower' else '-'}{margin:g} | {verdict} |")
+                        continue
+                    if key == "credit_delay_p95_s":
+                        # Block histograms, pooled over blocks when a block is
+                        # sparse (section 15.4), as in a rule.
+                        hb = lambda ts_: gm.pool([t.m.get("_credit_hist") for t in ts_])
+                        hc, hm, common = paired(trials, path, main, cand, hb)
+                        # A pair counts only when both arms have samples: a
+                        # complete histogram that did not move measured nothing.
+                        have = [(gm.Tail(x), gm.Tail(y)) for x, y in zip(hc, hm)
+                                if x is not None and y is not None and len(gm.Tail(x)) and len(gm.Tail(y))]
+                        if have and min(min(len(x), len(y)) for x, y in have) < tail_min(0.95):
+                            a_ = gates["alpha"]
+                            d_, lo_, _ = st.pooled_quantile_bounds(
+                                [x for x, _ in have], [y for _, y in have], 0.95,
+                                lambda c__, m__: RULES[better](c__, m__, (margin,)), a_, gates["resamples"],
+                                gates["seed"], combine=gm.Tail.quantile)
+                            verdict = "n/a" if len(have) < max(need, 2) or lo_ != lo_ else (
+                                "pass" if lo_ > 0 else "**FAIL**")
+                            verdicts[(path, cand, key)] = verdict
+                            out.append(f"| {SECONDARY_LABELS.get(key, key)} | {cand} | {len(have)} (pooled) | "
+                                       f"{fmt(d_, '.4g')} (with margin) | lower {fmt(lo_, '.4g')} | "
+                                       f"{'+' if better == 'lower' else '-'}{margin:g} | {verdict} |")
+                            continue
                     c, m, common = paired(trials, path, main, cand, lambda ts_, k=key: block_metric(ts_, k))
                     upper = better == "lower"
                     mdiff, bound, n = st.paired_secondary(c, m, alpha=gates["alpha"], resamples=gates["resamples"],
@@ -1027,7 +1225,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
             rule = rules.get(k.lower()) or rules.get(f"*.{metric.lower()}")
             if rule:
                 judged_rules[k] = rule
-            elif metric not in wl.report_only:
+            elif metric not in (wl.report_only_for(plan) if hasattr(wl, "report_only_for") else wl.report_only):
                 unruled.append(k)
         # And every configured rule must find its measure: in each phase that
         # ran on this path for a wildcard, by name otherwise. A measure the
@@ -1049,6 +1247,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
                 out.append(f"| {k}{tag} | " + " | ".join(cells) + " |")
         if judged_rules:
             out += ["", f"**{wl.name} rules (pre-registered in gates.ini [workload:{wl.name}]), {path}**", "",
+                    RULE_LEGEND, "",
                     "| measure | rule | candidate | blocks | mean contrast | t lower bound | bootstrap lower bound | verdict |",
                     "|---|---|---|---:|---:|---:|---:|---|"]
             for key, (kind, values) in judged_rules.items():
@@ -1080,6 +1279,37 @@ def report(campaign: str, gates: dict, interim: bool = False,
                         out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {n_} samples | "
                                    f"{fmt(mean_d, '.4g')} | n/a | {fmt(bl, '.4g')} | {verdict} |")
                         continue
+                    if kind == "events":
+                        # A pooled event rate (ab_stats.events_decision).
+                        pairs = [(block_events(path, b, cand).get(key), block_events(path, b, main).get(key))
+                                 for b in common]
+                        pairs = [p_ for p_ in pairs if p_[0] is not None and p_[1] is not None]
+                        final = not sq or len(common) >= sq.cap or not undecided_ok
+                        a_ = sq.alpha_at(len(pairs)) if sq else gates["alpha"]
+                        if len(pairs) < max(need, 1):
+                            dec, info = ("n/a" if final else "continue"), {}
+                        else:
+                            dec, info = st.events_decision(pairs, values[0], int(values[1]), a_,
+                                                           final=bool(not sq or len(common) >= sq.cap))
+                        verdict = "n/a" if dec == "n/a" else decision_verdict(dec, undecided_ok)
+                        verdicts[(path, cand, f"rule:{key}")] = verdict
+                        out.append(f"| {key} | events {values[0]:g} min {int(values[1])} | {cand} | {len(pairs)} "
+                                   f"({info.get('ec', 0):g}/{info.get('nc', 0):g} vs {info.get('em', 0):g}/"
+                                   f"{info.get('nm', 0):g} events) | {fmt(info.get('diff', float('nan')), '.4g')} | "
+                                   f"exact p {fmt(info.get('p_ni', float('nan')), '.3g')} | "
+                                   f"permutation p {fmt(info.get('p_worse', float('nan')), '.3g')} | {verdict} |")
+                        continue
+                    events = [(block_tails(path, b, cand).get(key), block_tails(path, b, main).get(key)) for b in common]
+                    if kind in RULES and any(e is not None and e[0] is None for pair in events for e in pair):
+                        # A proportion over events (the false-promotion rate).
+                        have = [(c_[1], m_[1]) for c_, m_ in events if c_ is not None and m_ is not None]
+                        verdict, mean_d, lo_, n_c, n_m = proportion_verdict(
+                            have, need, lambda c__, m__: RULES[kind](c__, m__, values), sq, gates, undecided_ok)
+                        verdicts[(path, cand, f"rule:{key}")] = verdict
+                        out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {len(have)} "
+                                   f"(pooled, {n_c} and {n_m} events) | {fmt(mean_d, '.4g')} | n/a | {fmt(lo_, '.4g')} | "
+                                   f"{verdict + (' (no promotion in an arm: zero denominator)' if verdict == 'reported' else '')} |")
+                        continue
                     dec = None
                     # Only blocks whose measure is valid in both arms and that
                     # have samples on both sides go into a pooled tail.
@@ -1094,9 +1324,11 @@ def report(campaign: str, gates: dict, interim: bool = False,
                         # by resampling blocks (section 15.4).
                         a_ = sq.alpha_at(len(tails)) if sq else gates["alpha"]
                         q = tails[0][0][0] if tails else 0.95
+                        hist = bool(tails) and isinstance(tails[0][0][1], gm.Tail)
                         mean_d, lo_, hi_ = st.pooled_quantile_bounds(
                             [c_[1] for c_, _ in tails], [m_[1] for _, m_ in tails], q,
-                            lambda c__, m__: RULES[kind](c__, m__, values), a_, gates["resamples"], gates["seed"])
+                            lambda c__, m__: RULES[kind](c__, m__, values), a_, gates["resamples"], gates["seed"],
+                            combine=gm.Tail.quantile if hist else None)
                         if lo_ > 0:
                             dec = "pass"
                         elif hi_ < 0 or (sq and len(tails) >= sq.cap) or not sq:
@@ -1130,11 +1362,10 @@ def report(campaign: str, gates: dict, interim: bool = False,
         for k in unruled:
             for cand in arms[1:]:
                 verdicts[(path, cand, f"rule:{k}")] = "n/a"
-        unmeasurable = [k for k in gates["secondary"] if getattr(wl, "generic", None)
-                        and k not in {x for ks in wl.generic.values() for x in ks} and k in NOT_YET_MEASURED]
-        if unmeasurable:
-            out += ["", "Generic secondaries the design requires but no build measures yet (stage 0 "
-                    "instrumentation), listed and not gated: " + ", ".join(f"`{k}`" for k in unmeasurable) + "."]
+        reported = sorted({k for ks in (wl.reported(plan).values() if hasattr(wl, "reported") else ()) for k in ks})
+        if reported:
+            out += ["", "Generic secondaries the design gates at stage 10, reported and not gated at this "
+                    "campaign's stage: " + ", ".join(f"`{k}`" for k in reported) + "."]
         if unruled:
             out += ["", f"Measures without a rule in gates.ini [workload:{wl.name}] (the verdict stays INCOMPLETE): "
                     + ", ".join(f"`{k}`" for k in unruled)]
@@ -1159,6 +1390,27 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     + ")"]
     write_per_trial(campaign, trials)
     return "\n".join(out) + "\n", verdicts
+
+
+def proportion_verdict(have: Sequence[Tuple[List[float], List[float]]], need: int,
+                       contrast: Callable[[float, float], float], sq, gates: dict, undecided_ok: bool):
+    """A proportion over events (the false-promotion rate, events as 0/1
+    samples per block and arm), pooled over every block's events and tested
+    by resampling blocks, so a block with one event weighs no more than its
+    event. `have` holds the blocks measured in both arms; fewer than `need`
+    is unmeasured. An arm with no event at all has a zero denominator: the
+    rate is reported, not gated (section 15.4). Returns (verdict, observed
+    contrast, lower bound, events of the candidate, events of main)."""
+    n_c, n_m = sum(len(x) for x, _ in have), sum(len(y) for _, y in have)
+    if len(have) < max(need, 2):
+        return "n/a", float("nan"), float("nan"), n_c, n_m
+    if not n_c or not n_m:
+        return "reported", float("nan"), float("nan"), n_c, n_m
+    a_ = sq.alpha_at(len(have)) if sq else gates["alpha"]
+    mean_d, lo_, hi_ = st.pooled_quantile_bounds([x for x, _ in have], [y for _, y in have], None, contrast, a_,
+                                                 gates["resamples"], gates["seed"], combine=gm.Events.rate)
+    dec = "pass" if lo_ > 0 else "fail" if hi_ < 0 or (sq and len(have) >= sq.cap) or not sq else "continue"
+    return decision_verdict(dec, undecided_ok), mean_d, lo_, n_c, n_m
 
 
 def tail_min(q: float) -> int:
@@ -1239,6 +1491,9 @@ def interim_decisions(campaign: str, gates: dict, units_run: Optional[Sequence[S
             verdict = "INCOMPLETE"
         # Only the gates that apply: a workload without a byte outcome has no
         # primary gate to wait for.
+        if verdict == "reported":
+            # A rate with a zero denominator abstains (section 15.4).
+            continue
         if (key == "primary" and wl.primary) or key.startswith("rule:"):
             cell = key[5:].split(".", 1)[0] if key.startswith("rule:") and "." in key else ""
             out[(path, cell)].append({"**PASS**": "pass", "pass": "pass", "**FAIL**": "fail"}.get(verdict, "continue"))
@@ -1355,7 +1610,7 @@ def cell_verdicts(verdicts: dict, path: str, cand: str) -> Dict[str, str]:
                      "VOID" if "VOID" in vs else
                      "INCOMPLETE" if "n/a" in vs else
                      "FAIL" if "**FAIL**" in vs else
-                     "PASS" if all(v in ("pass", "**PASS**") for v in vs) else "INCOMPLETE")
+                     "PASS" if all(v in ("pass", "**PASS**", "reported") for v in vs) else "INCOMPLETE")
     return out
 
 
@@ -1494,10 +1749,14 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
             continue
         paths_all |= set(plan["paths"])
         _, v = report(campaign, gates)
+        # A minimal campaign below stage 10 did not gate stage 10's generic
+        # secondaries: its cells can carry forward, never stand as the
+        # final bundle's own evidence.
+        early = name == "minimal" and minimal_stage(plan) < 10
         for path in plan["paths"]:
             for cand in [a for a in plan["arms"] if a != plan["main"]]:
                 for cell, verdict in sorted(cell_verdicts(v, path, cand).items()):
-                    rows.append((name, path, cand, cell, verdict, ident[(cand, path)], order, base))
+                    rows.append((name, path, cand, cell, verdict, ident[(cand, path)], order, base, early))
 
     def same(a: tuple, b: tuple) -> bool:
         """Same build (binaries: every role and platform both used) and arm flags."""
@@ -1523,7 +1782,8 @@ def flip_report(campaigns: Sequence[str], gates: dict, profile: str = "minimal",
     for key in sorted({r[:4] for r in rows}):
         rs = sorted((r for r in rows if r[:4] == key), key=lambda r: r[6])
         fin = final.get(key[2])
-        on_final = [r for r in rs if fin and same(r[5], fin[0]) and r[5][3] == final_sw.get((key[2], key[1]))]
+        on_final = [r for r in rs if fin and same(r[5], fin[0]) and r[5][3] == final_sw.get((key[2], key[1]))
+                    and not (len(r) > 8 and r[8])]
         if on_final:
             chosen[key] = (on_final[-1][4], "")
             final_rows.append(on_final[-1])

@@ -131,9 +131,43 @@ built to refuse rather than to trust:
   teardown is reported as unverified, for manual cleanup. A record whose
   fields do not each check out is left alone; a `run/` directory that
   cannot be read and searched, or a failed check, is unverified, never
-  clean. A job that does not run to its end (ssh dropped, timed out, the
-  generator crashed) is a harness failure, not the arm's, and its block gets
-  no verdict.
+  clean.
+- **Jobs are detached, and survive ssh drops.** A job is started under
+  `setsid nohup`, keeps its output and exit status in `run/job-N.out` and
+  `run/job-N.rc`, and the runner polls for them and fetches them over fresh
+  ssh sessions (`ServerAliveInterval=10`), retrying a dropped session with
+  backoff (5 tries). A dropped session costs nothing.
+- **Control-plane failures void the block; workload failures are evidence.**
+  Only two things are the harness rather than the arm: a job host that stays
+  unreachable over ssh through every retry, and a job the runner itself
+  killed for a reason it records (tearing down after an abort). Either voids
+  the whole block for both arms (not evidence; it still counts toward the
+  cap), and a trial type with more than `control_plane_void_max` (2) such
+  blocks in a campaign has no verdict (`gates.ini [harness]`). Everything
+  else is the arm's failure and stays evidence: a job that outlives its
+  window (the runner stops it at the deadline and records a `timeout`), a job
+  lost or silent while its host stays reachable, and the failures a job
+  records itself -- a transfer cut or reset inside the tunnel (curl exit 18,
+  56, ...), a failed session. Such a job's flows are failed rows and a
+  measuring job without a record of its own gets a failed session, so the
+  failure lowers that arm's completion and session measures. The report
+  lists both kinds per block.
+- **Overhead.** Every ssh session to a host shares one connection
+  (ControlMaster, sockets under the campaign directory), the arms' gateways
+  restart together, scrapes and CPU samplers run in parallel, jobs are
+  polled every second, and a binary already on a host with the same SHA-256
+  is not copied again. `timing.tsv` in the campaign directory records every
+  session's wall time, for profiling the overhead between windows.
+- **A relay hop is declared, and temporary.** Where production clients
+  reach their gateway through a relay, a `[relay]` section (`host`,
+  `address`, optional `platform` and `flags`) puts the same hop in the
+  measured path: per arm the runner starts `queqiaod relay` (the main arm's
+  build, for both arms) on the relay host on that arm's gateway port,
+  forwarding TCP and UDP to the gateway's same port, and clients enroll with
+  and dial the relay's address. The relay host needs its own
+  `[production:...]` section; its ports are reserved and checked like every
+  other, its relays are stopped by teardown, and with `host_cpu` its CPU and
+  production's are sampled too.
 - **Teardown always runs**, on success, on error, and on SIGINT or SIGTERM.
   It stops every temporary process, checks that no planned port is still
   listening, and removes the work directory (pass `--keep-remote` to keep it).
@@ -188,8 +222,8 @@ candidate build.
 |---|---|---|---|
 | 0, 1 | `origin/main` | `--cc-api=v2` | baseline experiments only; the class scheduler is not available yet (round-5 review) |
 | 2 | today's controllers | {isolated, single connection} × {round-robin, `--sched=class`} | the product-configuration screen of 15.3: four arms. It chooses a configuration; it does not attribute a result to topology |
-| 6 | `origin/main` | `--cc-api=v2 --sched=class --congestion=path` | works with isolation on |
-| 7 | `--congestion=path` with isolation | `--congestion=path --topology=single` | the topology test of 15.3: the reference arm is *not* main |
+| 6 | `origin/main` | `--cc-api=v2 --sched=class --congestion-scope=path` | works with isolation on |
+| 7 | `--congestion-scope=path` with isolation | `--congestion-scope=path`, and `--topology=single` on the client only (`client_flags`) | the topology test of 15.3: the reference arm is *not* main |
 | 8 | stage 7's bundle | `... --recovery=carrier` | |
 
 More than two arms is fine. Each arm runs twice per block, in a rotated order
@@ -341,10 +375,46 @@ is where fallback is counted. A client whose runtime configuration says
 gateway flow record shows a TCP carrier, or a TCP lane that carried bytes:
 an AUTO rescue can hand a flow to TCP without counting a client fallback.
 Without those records, QUIC-only cannot be shown, and wire cost is
-unmeasured. Sender-side credit delay p95 and the
-shadow false-promotion rate need the stage 0 instrumentation. They are listed
-as required and reported as not measured, so until that instrumentation
-lands, no campaign reaches an overall PASS.
+unmeasured.
+
+Sender-side credit delay p95 comes from every endpoint's
+`queqiao_credit_delay_seconds` histogram, scraped before and after each
+trial. Each endpoint times what it sends over a QUIC stream: from a chunk's
+last byte being taken by the carrier to the flow acknowledgement that covers
+it, minus the path's minimum round trip as the QUIC transport measures it
+(whatever congestion controller runs, and only once the path has a
+round-trip sample), one chunk per flow at a time. Only an original
+transmission starts a sample, judged by the byte ranges carriers have
+already taken rather than by order, since lanes finish out of order; a
+re-issue can complete a sample but never starts one, so a repair is timed
+from the first take. Writes before OPEN_OK are not timed. A scrape must carry
+every exported bucket. An
+arm's block p95 is taken over the histograms of its trials, gateway and
+client, pooled, never as a mean of per-trial percentiles; a block with fewer
+than 20 samples per arm is pooled over blocks like any sparse tail. A build
+without the histogram, or a scrape that is truncated or went back (a
+restart), leaves it unmeasured.
+
+The shadow false-promotion rate is, from the same scrapes, the
+carrier-shadow observer's resolved no-progress episodes that reached its
+`k_p` (the promotions the design would have made) and the share of them
+that then progressed again, so that the promotion would have been in vain.
+Each episode is counted once, when it is resolved, in the numerator and the
+denominator together. It is the calibration rate at `n = k_p` that
+`carrier_shadow_summary.py` prints from the logs. Promotions are rare, so
+the rate is pooled over every block's promotions and tested by resampling
+blocks; an arm with no promotion at all has a zero denominator, and the rate
+is reported, not gated (design section 15.4). A block resample that leaves
+out every block with an arm's promotions has no rate; such draws count
+against both bounds rather than being dropped, so a rate seen in one block
+is never certain. With `k_p = 1` the summary script cannot count a carrier
+still open at capture end (its one-expiry episodes are in no log line) and
+reports the rate as unmeasured; the analyzer reads the `/metrics` counters,
+which count them. It needs `--carrier-shadow` on
+every endpoint of both arms, as each endpoint's runtime configuration
+record shows; otherwise it is unmeasured. Both read the existing
+`[secondary]` bounds in `gates.ini`, which is unchanged, so campaigns that
+froze it keep their verdicts.
 
 The last line per candidate is the overall verdict:
 
@@ -361,18 +431,30 @@ The last line per candidate is the overall verdict:
 
 ## Gate 2: the DC gate (stage 9)
 
-Section 11.3 keeps `dc-long-haul` on the legacy bundle through the migration.
-It moves the profile only if the profile passes its own gate on the new
-architecture. The bounds are in `scripts/validation/dc_gate.ini`. They are
+Section 11.3 keeps `dc-long-haul` on the legacy bundle by default through the
+migration. Since stage 9 the profile also starts on the whole new architecture
+(`--cc-api=v2 --sched=class --congestion-scope=path --coded-retry=sticky
+--recovery=carrier`, `--topology=single` on clients, optionally
+`--classifier=phased --mem=owned --gateway-admission=owned`), which is the
+candidate in both DC example campaigns; the daemon refuses any bundle in
+between. The default moves only if the profile passes its own gate on the
+new architecture. The bounds are in `scripts/validation/dc_gate.ini`. They are
 **frozen**: section 11.3 and the round-5 review both require them to be fixed
 before the campaign runs. A change must land in its own commit before any
 stage 9 data exists.
 
 ### The workload
 
-A leaf is an endpoint pair, and the gateway is the sender for downloads. So
-the gateway's tree runs from its egress to a group to each client address,
-and each client host is one leaf under a shared ancestor. The DC campaign
+A leaf is an endpoint pair, and the gateway is the sender for downloads, so
+each client host is one leaf under the gateway's shared egress. Under the
+candidate the gateway's authorities sit in its tree as knowledge only. The
+legacy gateway has no tree at all: its per-peer controllers are independent,
+and the legacy tree's joint limit couples only clients in one process. So
+this campaign compares one authority per leaf with independent legacy
+controllers. The joint limit itself is exercised by the deterministic test
+`TestDCMultiLeafFairnessHoldsWithAKnowledgeOnlyTree` (uploads, several
+clients in one process), which computes the same contrasts with the same
+bounds. The DC campaign
 (`scripts/validation/dc-campaign.example.ini`) has these parts:
 
 - One temporary gateway per arm, with `--path-profile dc-long-haul` on both
@@ -390,7 +472,10 @@ and each client host is one leaf under a shared ancestor. The DC campaign
     measurement.
 - **A shared start:** a phase's jobs start on a barrier, five seconds ahead
   on the hosts' clocks. Request wave *w* starts at the barrier plus
-  (*w* − 1) × `request_timeout` on every leaf. The analysis requires every
+  (*w* − 1) × `request_timeout` on every leaf. A W4 client (`wlclient rpc`)
+  is given the barrier's absolute time, starts at once and waits for the
+  barrier after initialising, so the leaf hosts' interpreter start-up times
+  do not shift their waves. The analysis requires every
   loaded leaf to have been in each wave together for at least 0.1 s, on
   millisecond times; otherwise latency and spread are unmeasured. This also
   relies on NTP-synchronised clocks.
@@ -471,6 +556,12 @@ time:
 - each client: its runtime configuration record;
 - the gateway: its running command line, recorded by the runner at every
   start, because the gateway's record carries no profile.
+
+Each endpoint's bundle comes from the runtime configuration record it logs
+at every start. Every candidate endpoint must have run the new-architecture
+bundle (clients with `topology=single`), and every legacy endpoint must have
+run without `cc-api=v2`. Otherwise the campaign compared something else and
+is VOID. If an endpoint recorded no bundle, there is no verdict.
 
 ```sh
 ./scripts/ab_campaign.py --config scripts/validation/dc.local.ini --dry-run
@@ -585,9 +676,17 @@ from the model):
 - **Generic secondaries** (`[secondary]`), as rules of each trial type
   where defined: stalls, reissued bytes, queue p90 and client CPU in every
   type; flow completion and wire bytes per useful byte in A, whose bulk
-  flows define them. Credit delay and the shadow false-promotion rate have
-  no measurement in any build yet; the report lists them and does not gate
-  them.
+  flows define them. Credit delay p95 and the shadow false-promotion rate
+  are rules of every trial type in a stage-10 campaign, and are reported
+  without being gated at stages 6 and 7. `[workload:minimal] stage` sets the
+  stage: `auto`, the default, is 10 when the campaign runs C and 7
+  otherwise; C cannot run below stage 10. Run every endpoint of both arms
+  with `--carrier-shadow` at stage 10, or the false-promotion rate is
+  unmeasured and the cell is INCOMPLETE. A cell from a campaign below stage
+  10 never stands as the final bundle's own evidence at the flip: it counts
+  only when carried forward (`--carry`), so a rerun on the final bundle
+  sets `stage = 10`. D is judged on its own rules only (design section
+  15.4).
 - **B:** the LLM's TTFT p50 and p95, delta lateness p99, stalls and
   freezes per streamed minute, call failures, and class correctness (at
   least 99 % of the response's DATA bytes sent INTERACTIVE, from the
@@ -601,7 +700,10 @@ from the model):
   direction is its own open-loop stream on its own clock: the far side
   starts its downlink when the call's first packet names the call and its
   return address, and uplink arrivals never pace it; its report gives the
-  uplink's arrivals and the downlink's sends; the page load time p50 and p95 (from the first CONNECT)
+  uplink's arrivals and the downlink's sends. The call ends, for C's
+  background window, with its media (the uplink's last send or the
+  downlink's last arrival), not with the report's fetches, which cross the
+  same SOCKS path afterwards; the page load time p50 and p95 (from the first CONNECT)
   and failed objects.
 - **D** (`gates.ini [workload:idle-wake]`). The idle interval starts when
   the client has the whole 200 KB sync and acknowledges it, for pushes and
@@ -707,6 +809,116 @@ not a gate:
 
 `ab_analyze.py --flip --profile full` judges the full matrix instead of
 the minimal one.
+
+## Impaired networks
+
+`workload = impaired` (`scripts/workloads/impaired.py`, `scripts/ab_impair.py`,
+`validation/impaired-campaign.example.ini`) measures reliability rather than
+throughput: the mixed foreground under slow, lossy and broken networks, with
+the impairment applied by tc/netem on the path's client host (`[impair]`,
+which needs root there). One path per campaign; any number of arms; one trial
+per arm per block, the arms in random order.
+
+**Scenarios** (frozen in `ab_impair.SCENARIOS` and recorded in `plan.json`;
+round-trip delay, split evenly between the directions; loss and rate per
+direction):
+
+| trial type | scenario | trial |
+|---|---|---:|
+| `slow-lossy` | 5 Mbit/s, +250 ms, 20 ms jitter, Gilbert-Elliott bursty loss (p 1 %, r 30 %: 3.2 % average) | 120 s |
+| `blackhole` | 20 Mbit/s, +150 ms; 100 % drop for 8 s at 30 s and for 25 s at 70 s | 120 s |
+| `policed` | a 4 Mbit/s token-bucket policer with a 12 KB bucket, +150 ms | 120 s |
+| D, `idle-wake-lossy` | 2 % random loss, +200 ms, on D's own ports for its whole session | about 17 min, beside the blocks |
+
+Every trial runs an LLM swarm (4 concurrent loops of 10 turns with short
+responses: 40 calls), W6 keystrokes, and 8 short downloads of 4 MiB one after
+the other across the window (one started every window/8, or when the one
+before ends; each allowed 30 s). `blackhole` adds a long download and a long
+upload with progress timelines (flows in flight across the outages), and
+probes every 0.25 s, each its own connection.
+
+**Gates** (`gates.ini [workload:impaired]`, each one-sided against main):
+
+- *Pooled event rates* (`events v n`): LLM call failures over calls, and
+  silent deaths over sessions (LLM calls and keystroke sessions), pooled
+  over all blocks. Pass when an exact binomial test puts the candidate's
+  count below main's pooled rate + v (lower tail at most the look's alpha)
+  and a block-permutation check (the arms' counts swapped within blocks,
+  every assignment) does not find the candidate worse; fail when the
+  binomial upper tail does, or the permutation finds it worse by more than
+  v; otherwise undecided. Each arm needs at least n opportunities: n is the
+  fewest at which a candidate with no event can pass a main with none,
+  (1 - v)^n <= alpha, 150 for v = 0.02.
+- *Silent deaths*: none, in every block (hard), beside the pooled rate.
+- *Flow completion*: completed over attempted short downloads per trial
+  (one the window's end cut is not an attempt), `higher 0.02`.
+- *Stalls per trial* (`[secondary]`), *TTFT p99*, *keystroke echo p99*.
+- *Per blackhole*, from the path's restore, the worse of a trial's two
+  outages: the first completed probe (`recover_s`), the first byte of a
+  connection opened after it (`reopen_ttfb_s`), and the first byte again
+  of every flow in flight across it (`inflight_ttfb_s`), each `lower 1.0`.
+
+D is judged as its own campaign in `<campaign>/idle-wake` by
+`[workload:idle-wake]`; its trials are not voided for host CPU records,
+which only the blocks take. Goodput is reported only. The first impaired
+campaign (commit 42728e4) was judged by the gates of that commit.
+
+**Host CPU samplers** run detached, like the jobs, and are not followed
+while they run: their samples stay on the host and are fetched once the
+trial ends, with about three minutes of ssh retries, so a brief outage of
+the runner's link no longer voids a block. `[campaign] fetch_via = <ssh
+host>` fetches logs through that host, for a slow direct link.
+
+**Reading a rule's row.** Every rule's per-block contrast is the
+candidate's headroom inside its bound, positive when inside whichever way
+the measure points: `lower v` is main + v - cand, `higher v` is cand -
+(main - v), `atmost m a` is m x main + a - cand, `atleast m a` is cand -
+(m x main - a). A rule passes when the t and the bootstrap lower bounds of
+the mean contrast are both above zero, fails when an upper bound is below
+zero, and is otherwise undecided; undecided at the block cap is a fail. A
+negative mean contrast is the candidate outside its bound (for example,
+more stalls than main plus the margin). The analyzer shows an undecided rule
+as undecided while the campaign has no `status.json` (still running), and
+prints this legend above each rules table. A beside session's (D's) log
+fetch failures are its own campaign's, not the blocks'.
+
+**How the impairment is applied.**
+
+- A `clsact` qdisc on the interface that carries the route to the address
+  clients dial adds classification hooks; the interface's root qdisc is never
+  replaced, so production traffic keeps its queueing.
+- Flower filters match only IPv4 to (egress) or from (ingress) that address,
+  UDP and TCP, with the remote port in the campaign's arm ports (D's own
+  ports for D). They redirect to the campaign's own IFB devices
+  (`qqimp-<set><u|d>`), each with the direction's netem; a policer is an
+  action on the same filters.
+- The blocks' set is applied just before each trial and removed right after
+  it, on every exit; a `blackhole` trial's outages are a harness job on the
+  client host that changes only those IFB devices' netem, with a trap that
+  restores the base on any exit, and prints when each outage began and ended
+  (the probes' clock). A failure of that job is the control plane's.
+
+**Safety.**
+
+- Preflight refuses when a filter could match production: a filter port
+  declared production on any host, a filter port inside either end's
+  ephemeral port range, or a remote address that is not an IPv4 literal. It
+  also refuses when the interface already has a clsact or ingress qdisc, a
+  device with the campaign's IFB names exists, the route to the remote leaves
+  by another interface, or the host is not root. Each apply checks the
+  production ports again.
+- Before the first trial it snapshots every interface's qdiscs, classes and
+  filters and the interface list (`impair-before.txt`). After every removal
+  that leaves no set applied, and at teardown, the state must equal the
+  snapshot: a difference fails the campaign loudly (a teardown leftover;
+  `status.json` `impairment: not restored`).
+- Each applied set has a watchdog on the host that removes it after its
+  deadline (the trial's cap plus `watchdog_slack`, 300 s) even if the runner
+  or its connection dies. A trial whose watchdog fired is void (control
+  plane). A failed apply removes whatever it had applied.
+- Teardown removes every set before stopping any process. The one host-wide
+  effect is loading the `ifb` module (with no default devices), which is
+  left loaded.
 
 ## Scenario workloads
 
@@ -834,6 +1046,15 @@ sets on both ends (`owned_flags`, such as `dc`'s `--path-profile`) may not
 be set in the config.
 
 ## Tests
+
+`scripts/test_argv_smoke.py` starts every binary role a campaign uses (each
+arm's gateway and client, and the relay hop) with the runner's exact
+command line for about a second on scratch ports on the machine running the
+tests, after a real provider init and enrollment. It builds `cmd/queqiaod`
+(skipped without Go) and covers the example configs built from
+`origin/main`; `QQ_SMOKE_CONFIG=<config> python3 -m unittest test_argv_smoke`
+checks a live campaign's own config before it starts, so a wrong subcommand
+or flag fails there rather than on production hosts.
 
 ```sh
 python3 -m unittest discover -s scripts -p 'test_*.py'

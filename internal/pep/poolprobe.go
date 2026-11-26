@@ -69,7 +69,10 @@ func (c *Client) verifyControlPath(ctx context.Context, g *controlQUICGeneration
 				probe = c.probeControlGenerationForTest
 			}
 			pending.err = probe(probeCtx, g, c.cfg.HandshakeTimeout)
-			if pending.err != nil {
+			if pending.err != nil && c.carriers == nil {
+				// Under recovery=carrier a failed borrow fails only that
+				// borrow: replacing the carrier is the carrier manager's
+				// decision, on transport evidence (§10.2).
 				c.drainControlQUICGeneration(g)
 			}
 			g.probeMu.Lock()
@@ -97,9 +100,20 @@ func probeControlGeneration(ctx context.Context, g *controlQUICGeneration, budge
 }
 
 func probePooledQUIC(ctx context.Context, conn *quic.Conn, budget time.Duration, g *controlQUICGeneration) error {
+	return probePooledQUICGranted(ctx, conn, budget, g, false)
+}
+
+// probePooledQUICGranted is probePooledQUIC with, when grant is set, a
+// verification grant bound to the probe's bytes, so the exchange is
+// admitted while the path's window and balance are held by a silent sibling
+// (§4.3, §10.2).
+func probePooledQUICGranted(ctx context.Context, conn *quic.Conn, budget time.Duration, g *controlQUICGeneration, grant bool) error {
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return err
+	}
+	if grant {
+		bindProbeGrant(conn, stream, 0, budget)
 	}
 	if g.highErasure() {
 		if stop := g.protectPrefix(stream, protocol.HeaderSize+1); stop != nil {
@@ -241,6 +255,10 @@ func (s *controlPoolStreamConn) trackOpen(deadline time.Time, size int) bool {
 	s.owner.quicMu.Lock()
 	defer s.owner.quicMu.Unlock()
 	if s.owner.quicGeneration != g || g.conn.Context().Err() != nil || g.liveness.silent(time.Now()) {
+		return false
+	}
+	if m := s.owner.carriers; m != nil && (!m.accepting(g) || m.openGated(g)) {
+		// recovery=carrier: SUSPECT, or flows are waiting to rebind onto it.
 		return false
 	}
 	if g.highErasure() {

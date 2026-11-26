@@ -55,10 +55,10 @@ func TestTopologyValidator(t *testing.T) {
 			t.Errorf("ValidateTopology(%q, %q, %d) = %v, want ok=%v", c.topology, c.scope, c.fanOut, err, c.ok)
 		}
 	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, ClassifierPhased, CongestionScopePath, TopologySingle); got != "cc-api=v2,sched=class,congestion=path,topology=single,classifier=phased" {
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, ClassifierPhased, CongestionScopePath, TopologySingle, ""); got != "cc-api=v2,sched=class,congestion=path,topology=single,classifier=phased" {
 		t.Errorf("bundle %q", got)
 	}
-	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, ClassifierLegacy, CongestionScopePath, TopologyIsolated); got != "cc-api=v2,sched=class,congestion=path" {
+	if got := Bundle(CCAPIV2, MemoryLegacy, CodedRetryLegacy, GatewayAdmissionLegacy, SchedClass, ClassifierLegacy, CongestionScopePath, TopologyIsolated, ""); got != "cc-api=v2,sched=class,congestion=path" {
 		t.Errorf("isolated topology is the default and not named: %q", got)
 	}
 
@@ -940,5 +940,99 @@ func TestFanOutJudgesSharingPerGeneration(t *testing.T) {
 	}
 	if client.secondConnectionWanted(flowSnapshot{Class: classifier.ClassBulk}, func() *controlQUICGeneration { return nil }) {
 		t.Fatal("a flow on no pooled generation fans out")
+	}
+}
+
+// Reusing a fan-out lane that is already open judges sharing on the
+// generation of the flow's selected control lane too (#201, after #203).
+// After a handover, one flow drains on the old generation while a bulk flow
+// with an open fan-out lane is alone on the replacement: its chunks stay on
+// its warm control lane. A second flow on the replacement sends them back
+// to the fan-out lane.
+func TestFanOutLaneReuseJudgesSharingPerGeneration(t *testing.T) {
+	pathAuthorities.forget()
+	certificate, roots := testCertificate(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0", Credentials: certificate, EnableQUIC: true, Logger: logger,
+		DestinationPolicy: DestinationPolicy{AllowPrivate: true},
+		CCAPI:             CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serving, stop := context.WithCancel(context.Background())
+	defer stop()
+	go func() { _ = server.ServePacketConn(serving, packetConn) }()
+	cfg := newBundleClientConfig(TopologySingle)
+	cfg.TopologyFanOut = 2
+	cfg.ListenAddr, cfg.RemoteAddr, cfg.Credentials, cfg.Logger = "127.0.0.1:0", packetConn.LocalAddr().String(), roots, logger
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.closeQUICPool()
+	ctx := context.Background()
+	pooled := func(id byte) (*authenticatedLane, *controlQUICGeneration) {
+		t.Helper()
+		lane, err := client.dialLaneMode(ctx, TransportQUIC, [16]byte{id}, 0, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = lane.fc.Close() })
+		s, ok := lane.outer.(*controlPoolStreamConn)
+		if !ok || s.generation == nil {
+			t.Fatalf("lane %d is not a pooled stream: %T", id, lane.outer)
+		}
+		return lane, s.generation
+	}
+	// A flow whose control lane is the pooled lane, wired to the client as
+	// handleLocal wires it.
+	flowOn := func(lane *authenticatedLane) (*multipathFlow, *mpLane) {
+		f := newIsolationTestFlow(t, true)
+		control := &mpLane{id: 0, kind: TransportQUIC, fc: lane.fc, control: true}
+		if err := f.addLane(control); err != nil {
+			t.Fatal(err)
+		}
+		f.controlLaneShared = client.controlLaneShared
+		return f, control
+	}
+	oldLane, old := pooled(1)
+	oldFlow, oldControl := flowOn(oldLane)
+	client.supersedeSilentGeneration(old, nil)
+	newLane, replacement := pooled(2)
+	bulkFlow, bulkControl := flowOn(newLane)
+	if replacement == old || old.conn.Context().Err() != nil {
+		t.Fatal("no draining generation beside the replacement")
+	}
+	if n := client.quicPoolActive.Load(); n != 2 {
+		t.Fatalf("pooled flows across generations = %d, want 2 (the count reuse used to read)", n)
+	}
+	if bulkFlow.isolateFromControlLane(bulkControl) {
+		t.Fatal("a bulk flow alone on the replacement moves its chunks to its fan-out lane because a flow drains on the old generation")
+	}
+	if oldFlow.isolateFromControlLane(oldControl) {
+		t.Fatal("the flow alone on the draining generation moves its chunks off its control lane")
+	}
+	if _, again := pooled(3); again != replacement {
+		t.Fatal("the second flow landed on another generation")
+	}
+	if !bulkFlow.isolateFromControlLane(bulkControl) {
+		t.Fatal("a bulk flow sharing the replacement keeps its chunks on the shared control lane")
+	}
+	if oldFlow.isolateFromControlLane(oldControl) {
+		t.Fatal("the flow alone on the draining generation looks shared once the replacement is")
+	}
+	if client.controlLaneShared(&mpLane{id: 7, kind: TransportQUIC}) {
+		t.Fatal("a control lane on no pooled generation looks shared")
+	}
+	// Without a fan-out, isolation keeps the client-wide count.
+	client.cfg.TopologyFanOut = 0
+	if !client.controlLaneShared(oldControl) {
+		t.Fatal("isolation stopped judging sharing by the client-wide pooled count")
 	}
 }

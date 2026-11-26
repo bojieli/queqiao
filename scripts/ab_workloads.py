@@ -83,6 +83,9 @@ class Beside:
     workload: str
     phase: Phase
     ready_seconds: float = 120.0
+    # A frozen ab_impair scenario on the session's own ports for its whole
+    # length ("" for none).
+    impair: str = ""
 
 
 @dataclass
@@ -97,6 +100,13 @@ class Generator:
     # The job's raw records for the extractor; by default its
     # "J<TAB>{json}" lines. None: the generator has none.
     records: Optional[Callable[[str], List[dict]]] = None
+    # The kind of record a measuring job writes (e.g. "llm"): a failed job
+    # with none gets a failed record of this kind, so the arm's failure is
+    # measured rather than lost. None: rows only.
+    record_kind: Optional[str] = None
+    # The harness's own job (the impairment's timed outages): its failure is
+    # the control plane's, never the arm's.
+    harness: bool = False
 
 
 def json_records(out: str) -> List[dict]:
@@ -245,6 +255,16 @@ class Workload:
 
     def gateway_flags(self, cfg: Any) -> List[str]:
         return []
+
+    # True: the workload's trials run under [impair]'s scenarios, which the
+    # config must then have.
+    impairs = False
+
+    def impairment(self, cfg: Any, trial: str) -> str:
+        """The frozen ab_impair scenario a trial of this type runs under
+        ("" for none): applied to the blocks' arm ports just before the
+        trial, removed right after it."""
+        return ""
 
     def client_files(self, cfg: Any) -> List[str]:
         """Local files its generators run on client hosts, copied into each
@@ -455,10 +475,14 @@ SERVER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation
 
 def rpc_script(campaign: Any, job: Job, arm: Any, duration: float, start_at: int = 0) -> str:
     """W4 at minimal size through the leaf's client: wlclient rpc, on the
-    phase's shared start."""
+    phase's shared start. The barrier is passed to the client rather than
+    waited for in the shell: the interpreter starts at once and waits for
+    the barrier itself after initialising, so its start-up time is not added
+    to every wave on one leaf host and not on another."""
     dc = campaign.cfg.dc
     W = campaign.w(job.client.host)
-    return (_barrier(start_at) + f"python3 {W}/wlclient.py rpc --socks 127.0.0.1:{job.client.socks_port_base + arm.index} "
+    at = f"--start-at {start_at} " if start_at else ""
+    return (f"python3 {W}/wlclient.py rpc {at}--socks 127.0.0.1:{job.client.socks_port_base + arm.index} "
             f"--target 127.0.0.1:{dc.rpc_port} --count {dc.rpc_requests} --spacing {dc.rpc_spacing:g} "
             f"--timeout {dc.request_timeout} --asr-up {ASR_UP} --asr-down {ASR_DOWN} --tts-up {TTS_UP} "
             f"--tts-down {TTS_DOWN}")

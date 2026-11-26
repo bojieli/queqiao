@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 __all__ = [
     "mean", "stdev", "quantile", "median", "contrasts", "t_cdf", "t_quantile",
@@ -347,30 +347,48 @@ def bounds(d: Sequence[float], alpha: float, resamples: int = 20000, seed: int =
 
 def pooled_quantile_bounds(cand_blocks: Sequence[Sequence[float]], main_blocks: Sequence[Sequence[float]], q: float,
                            contrast: Callable[[float, float], float], alpha: float, resamples: int = 20000,
-                           seed: int = 1):
+                           seed: int = 1, combine: Optional[Callable[[Sequence[Any], float], float]] = None):
     """A tail percentile over all blocks' pooled samples: the contrast of the
     arms' pooled q-quantiles, and its one-sided (lower, upper) bounds at
     level alpha from a bootstrap that resamples blocks (both arms' samples
     of a block together), so the blocks stay the unit of analysis. Returns
-    (observed, lower, upper)."""
+    (observed, lower, upper). With q None the statistic is the pooled mean
+    (a proportion over events given as 0/1 samples). With `combine`, each
+    block is one opaque item (a histogram) and combine(items, q) is the
+    pooled statistic."""
     n = len(cand_blocks)
     if n == 0 or n != len(main_blocks):
         return float("nan"), float("nan"), float("nan")
 
     def stat(idx):
+        if combine is not None:
+            c_, m_ = [cand_blocks[i] for i in idx], [main_blocks[i] for i in idx]
+            if not any(len(x) for x in c_) or not any(len(x) for x in m_):
+                return float("nan")
+            return contrast(combine(c_, q), combine(m_, q))
         c = [x for i in idx for x in cand_blocks[i]]
         m = [x for i in idx for x in main_blocks[i]]
         if not c or not m:
             return float("nan")
-        return contrast(quantile(c, q), quantile(m, q))
+        return contrast(quantile(c, q) if q is not None else mean(c), quantile(m, q) if q is not None else mean(m))
     observed = stat(range(n))
     rng = random.Random(seed)
     reps = resamples
-    ds = sorted(d for d in (stat([rng.randrange(n) for _ in range(n)]) for _ in range(reps)) if d == d)
-    if not ds:
+    draws = [stat([rng.randrange(n) for _ in range(n)]) for _ in range(reps)]
+    defined = sorted(d for d in draws if d == d)
+    if not defined:
         return observed, float("nan"), float("nan")
-    k = int(math.floor(alpha * len(ds)))
-    return observed, ds[k], ds[min(len(ds) - 1, len(ds) - 1 - k)]
+    # A draw that left out every block with an arm's samples (a rare event
+    # seen in one block) has no statistic. Dropping such draws would compute
+    # the bounds conditional on seeing the event, which can make a single
+    # event look certain. They count against each bound instead: as minus
+    # infinity for the lower bound and plus infinity for the upper, so a
+    # bound is finite only when fewer than alpha of all draws are undefined.
+    undefined = reps - len(defined)
+    k = int(math.floor(alpha * reps))
+    lower = defined[k - undefined] if k >= undefined else -math.inf
+    upper = defined[reps - 1 - k] if reps - 1 - k < len(defined) else math.inf
+    return observed, lower, upper
 
 
 def _phi(x: float) -> float:
@@ -526,3 +544,90 @@ def overall_stop(decisions: Sequence[str]) -> bool:
     """A gate of several contrasts stops once its verdict is determined:
     any contrast decided fail, or every contrast decided pass."""
     return any(x == "fail" for x in decisions) or (bool(decisions) and all(x == "pass" for x in decisions))
+
+
+# --- pooled event rates (gates.ini `events margin min_opportunities`) ----------------
+
+def binom_cdf(k: int, n: int, p: float) -> float:
+    """P[X <= k] for X ~ Binomial(n, p), exactly (log space)."""
+    import math
+    if k < 0:
+        return 0.0
+    if k >= n or p <= 0.0:
+        return 1.0
+    if p >= 1.0:
+        return 0.0
+    lp, lq = math.log(p), math.log1p(-p)
+    terms = [math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * lp + (n - i) * lq
+             for i in range(0, k + 1)]
+    m = max(terms)
+    return min(1.0, math.exp(m) * sum(math.exp(t - m) for t in terms))
+
+
+def binom_sf(k: int, n: int, p: float) -> float:
+    """P[X >= k] for X ~ Binomial(n, p)."""
+    return 1.0 - binom_cdf(k - 1, n, p)
+
+
+def block_permutation_worse(blocks: Sequence[Tuple[Tuple[int, int], Tuple[int, int]]]) -> float:
+    """One-sided p-value that the candidate's pooled rate exceeds main's,
+    under the null that the arms are exchangeable within each block: every
+    assignment of the arms' (events, opportunities) within the blocks (all of
+    them up to 2^14, else 20000 drawn with a fixed seed), counting those whose
+    rate difference is at least the observed one."""
+    import itertools
+    import random
+
+    def diff(pairs):
+        ec = sum(c[0] for c, _ in pairs); nc = sum(c[1] for c, _ in pairs)
+        em = sum(m[0] for _, m in pairs); nm = sum(m[1] for _, m in pairs)
+        return (ec / nc if nc else 0.0) - (em / nm if nm else 0.0)
+    obs = diff(blocks)
+    b = len(blocks)
+    if b <= 14:
+        flips = itertools.product((False, True), repeat=b)
+        total = 2 ** b
+    else:
+        rng = random.Random(7)
+        flips = ([rng.random() < 0.5 for _ in range(b)] for _ in range(20000))
+        total = 20000
+    hit = 0
+    for f in flips:
+        perm = [((m, c) if s else (c, m)) for (c, m), s in zip(blocks, f)]
+        if diff(perm) >= obs - 1e-12:
+            hit += 1
+    return hit / total
+
+
+def events_decision(blocks: Sequence[Tuple[Tuple[int, int], Tuple[int, int]]], margin: float, min_opps: int,
+                    alpha: float, final: bool) -> Tuple[str, Dict[str, float]]:
+    """A pooled event rate (failures over opportunities) of the candidate
+    against main's, over the blocks measured in both arms.
+
+    pass: the candidate's count is significantly below main's pooled rate
+          plus the margin (exact binomial, lower tail <= alpha) and the
+          block-permutation check does not find the candidate worse
+          (p > alpha);
+    fail: the candidate's count is significantly above main's rate plus the
+          margin (exact binomial, upper tail <= alpha), or the permutation
+          check finds it worse (p <= alpha) by more than the margin;
+    otherwise undecided ("continue"; at the cap, "fail"). Fewer opportunities
+    than min_opps in either arm: unmeasured ("n/a"; "continue" before the
+    cap)."""
+    ec = sum(c[0] for c, _ in blocks); nc = sum(c[1] for c, _ in blocks)
+    em = sum(m[0] for _, m in blocks); nm = sum(m[1] for _, m in blocks)
+    info = {"ec": ec, "nc": nc, "em": em, "nm": nm, "diff": float("nan"), "p_ni": float("nan"),
+            "p_inf": float("nan"), "p_worse": float("nan")}
+    if nc < min_opps or nm < min_opps:
+        return ("n/a" if final else "continue"), info
+    pm = em / nm
+    p0 = min(1.0, pm + margin)
+    info["diff"] = ec / nc - pm
+    info["p_ni"] = binom_cdf(int(ec), int(nc), p0)
+    info["p_inf"] = binom_sf(int(ec), int(nc), p0) if p0 < 1.0 else 1.0
+    info["p_worse"] = block_permutation_worse(blocks)
+    if info["p_ni"] <= alpha and info["p_worse"] > alpha:
+        return "pass", info
+    if info["p_inf"] <= alpha or (info["p_worse"] <= alpha and info["diff"] > margin):
+        return "fail", info
+    return ("fail" if final else "continue"), info

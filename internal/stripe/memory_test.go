@@ -422,6 +422,40 @@ func waitBlockedOnBound(t *testing.T, s *Scheduler) {
 	})
 }
 
+// The credit round is sampled once per round, not at every event that
+// re-evaluates the bound: the flow layer's Round walks its lanes and takes
+// their locks, under the scheduler mutex (#174).
+func TestAutotuneSamplesTheCreditRoundOncePerRound(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	var calls atomic.Int64
+	s := New(infiniteSource{}, Config{
+		ChunkSize: tuneChunk, LaneWindow: 1024, MaxOutstanding: 1024, MaxOutstandingBytes: tuneMax,
+		Now: clock.Now, Autotune: &Autotune{Round: func() time.Duration {
+			calls.Add(1)
+			return tuneRound
+		}},
+	})
+	t.Cleanup(s.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lane := startLane(ctx, s)
+	const rounds = 5
+	for range rounds {
+		waitBlockedOnBound(t, s)
+		for range 200 {
+			_ = s.RetentionBound()
+		}
+		lane.completeAll(s)
+		clock.advance(tuneRound)
+	}
+	_ = s.RetentionBound()
+	// One sample at New and one per closed round; the dispatches,
+	// completions and queries in between read the cached length.
+	if got := calls.Load(); got > rounds+1 {
+		t.Fatalf("Round called %d times over %d rounds; want at most %d", got, rounds, rounds+1)
+	}
+}
+
 // The retention bound never grows while flow ACKs are withheld, however long
 // the producer waits on it with a lane idle beside it.
 func TestRetentionBoundDoesNotGrowWithoutCredit(t *testing.T) {

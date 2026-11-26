@@ -580,6 +580,11 @@ type runtimeOptions struct {
 	// empty.
 	topology       string
 	topologyFanOut int
+	// recovery and its thresholds are the recovery owner (design §10, §14
+	// stage 8).
+	recovery                            string
+	recoveryKS, recoveryKP              uint
+	recoverySkew, recoveryHandoffBudget time.Duration
 	// carrierShadow runs the carrier-liveness observer (design §10, §14
 	// stage 0 and the groundwork of stage 8). It only records.
 	carrierShadow                    bool
@@ -643,6 +648,11 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.BoolVar(&opts.carrierShadow, "carrier-shadow", false, "record the carrier state the path-authority design would assign to every QUIC connection, and the remedy it would take at every flow stall, beside today's recovery (observation only)")
 	fs.UintVar(&opts.carrierShadowKS, "carrier-shadow-ks", 0, "carrier-shadow k_s: probe timeouts without transport progress before a carrier is labelled suspect (0 = default)")
 	fs.UintVar(&opts.carrierShadowKP, "carrier-shadow-kp", 0, "carrier-shadow k_p: probe timeouts before a suspect carrier is labelled for replacement (0 = default)")
+	fs.StringVar(&opts.recovery, "recovery", string(pep.RecoveryFlow), "who owns QUIC recovery: flow (each flow rescues its own lanes, with per-flow dials), or carrier (the client's carrier manager replaces a carrier only on its transport evidence and rebinds failed streams on it; no per-flow rescue dials or lane demotion; requires --congestion-scope=path, --coded-retry=sticky and, on a client, --topology=single)")
+	fs.UintVar(&opts.recoveryKS, "recovery-ks", 0, "recovery=carrier k_s: probe timeouts without transport progress before a carrier is suspect and a standby is dialled (0 = provisional default)")
+	fs.UintVar(&opts.recoveryKP, "recovery-kp", 0, "recovery=carrier k_p: probe timeouts, without progress since suspect, before a verified standby is promoted (0 = provisional default)")
+	fs.DurationVar(&opts.recoverySkew, "recovery-skew", 0, "recovery=carrier S: how much later than the gateway the client may observe a lost binding (0 = 15s)")
+	fs.DurationVar(&opts.recoveryHandoffBudget, "recovery-handoff-budget", 0, "recovery=carrier J: time from starting a rebinding JOIN or TCP handoff to the gateway parsing it (0 = provisional 5s)")
 	fs.StringVar(&opts.memory, "mem", string(pep.MemoryLegacy), "memory-ownership bundle: legacy, or owned (fair shared send-memory grants and the credit-driven retention bound)")
 	fs.Uint64Var(&opts.brutalBytesPerSec, "brutal-bytes-per-sec", 0, "Brutal fixed byte rate")
 	fs.Uint64Var(&opts.adaptiveMinBytesSec, "adaptive-min-bytes-per-sec", 64*1024, "Adaptive minimum byte rate")
@@ -798,6 +808,27 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	}
 	if err := pep.ValidateClassifier(pep.ClassifierMode(opts.classifierMode), bundleProfile); err != nil {
 		return fmt.Errorf("--classifier: %w", err)
+	}
+	if opts.recovery == "" {
+		return errors.New("--recovery must be flow or carrier")
+	}
+	if err := pep.ValidateRecovery(pep.RecoveryMode(opts.recovery), pep.CongestionScope(opts.congestionScope), pep.CodedRetryMode(opts.codedRetry), pep.Topology(opts.topology), opts.topologyFanOut, !client); err != nil {
+		return fmt.Errorf("--recovery: %w", err)
+	}
+	// The profile restricts the whole bundle (dc-long-haul runs the legacy
+	// bundle or its whole new-architecture bundle, design §11.3).
+	profileTopology := pep.Topology(opts.topology)
+	if !client {
+		profileTopology = ""
+	}
+	if err := pep.ValidateProfileBundle(bundleProfile, pep.CCAPIVersion(opts.ccAPI), pep.SchedMode(opts.sched), pep.CongestionScope(opts.congestionScope), pep.CodedRetryMode(opts.codedRetry), profileTopology, pep.RecoveryMode(opts.recovery), pep.ClassifierMode(opts.classifierMode), !client); err != nil {
+		return fmt.Errorf("--path-profile: %w", err)
+	}
+	if opts.recoveryKS > 64 || opts.recoveryKP > 64 {
+		return errors.New("--recovery-ks and --recovery-kp must be small probe-timeout counts")
+	}
+	if err := pep.ValidateCarrierRecovery(opts.carrierRecoveryConfig()); err != nil {
+		return fmt.Errorf("--recovery: %w", err)
 	}
 	if opts.carrierShadowKS > 64 || opts.carrierShadowKP > 64 {
 		return errors.New("--carrier-shadow-ks and --carrier-shadow-kp must be small probe-timeout counts")
@@ -981,6 +1012,7 @@ func runServer(args []string) (returnErr error) {
 		Sched:               pep.SchedMode(opts.sched),
 		CongestionScope:     pep.CongestionScope(opts.congestionScope),
 		CodedRetry:          pep.CodedRetryMode(opts.codedRetry),
+		Recovery:            pep.RecoveryMode(opts.recovery),
 		CarrierShadow:       opts.carrierShadowConfig(),
 		Memory:              pep.MemoryMode(opts.memory),
 		Classifier:          pep.ClassifierMode(opts.classifierMode),
@@ -1105,8 +1137,13 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("congestion_scope", opts.congestionScope),
 		slog.String("classifier", opts.classifierMode),
 		slog.String("coded_retry", opts.codedRetry),
-		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)), pep.SchedMode(opts.sched), pep.ClassifierMode(opts.classifierMode), pep.CongestionScope(opts.congestionScope), pep.Topology(opts.topology))),
+		slog.String("bundle", pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry), pep.GatewayAdmission(effectiveGatewayAdmission(opts.gatewayAdmission)), pep.SchedMode(opts.sched), pep.ClassifierMode(opts.classifierMode), pep.CongestionScope(opts.congestionScope), pep.Topology(opts.topology), pep.RecoveryMode(opts.recovery))),
 		slog.String("mem", opts.memory),
+		slog.String("recovery", opts.recovery),
+		slog.Uint64("recovery_ks", uint64(opts.recoveryKS)),
+		slog.Uint64("recovery_kp", uint64(opts.recoveryKP)),
+		slog.Duration("recovery_skew", opts.recoverySkew),
+		slog.Duration("recovery_handoff_budget", opts.recoveryHandoffBudget),
 		slog.Bool("carrier_shadow", opts.carrierShadow),
 		slog.Uint64("carrier_shadow_ks", uint64(opts.carrierShadowKS)),
 		slog.Uint64("carrier_shadow_kp", uint64(opts.carrierShadowKP)),
@@ -1404,6 +1441,24 @@ func parseInvitationPaths(values []string) ([]identity.InvitationPath, error) {
 		routes = append(routes, route)
 	}
 	return routes, nil
+}
+
+// probeTimeoutCount narrows a probe-timeout flag. validateRuntime has
+// already rejected anything above 64; a larger value maps past every valid
+// threshold, so a direct caller is refused by the pep validator too.
+func probeTimeoutCount(v uint) uint32 {
+	if v > 64 {
+		return 65
+	}
+	return uint32(v) // #nosec G115 -- bounded to 64 above.
+}
+
+// carrierRecoveryConfig is the carrier manager's configuration.
+func (opts runtimeOptions) carrierRecoveryConfig() pep.CarrierRecoveryConfig {
+	return pep.CarrierRecoveryConfig{
+		SuspectPTOs: probeTimeoutCount(opts.recoveryKS), ReplacePTOs: probeTimeoutCount(opts.recoveryKP),
+		DetectionSkew: opts.recoverySkew, HandoffBudget: opts.recoveryHandoffBudget,
+	}
 }
 
 // carrierShadowConfig is the carrier-liveness observer's configuration.

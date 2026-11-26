@@ -241,6 +241,8 @@ func newRuntimeClient(profile identity.ClientProfile, listen string, opts runtim
 		Classifier:          pep.ClassifierMode(opts.classifierMode),
 		Topology:            pep.Topology(opts.topology),
 		TopologyFanOut:      opts.topologyFanOut,
+		Recovery:            pep.RecoveryMode(opts.recovery),
+		CarrierRecovery:     opts.carrierRecoveryConfig(),
 		AdaptiveMinBytesSec: opts.adaptiveMinBytesSec, AdaptiveMaxBytesSec: opts.adaptiveMaxBytesSec,
 		AggregateBytesPerSec: opts.aggregateBytesPerSec, InteractiveReserveBytesPerSec: opts.interactiveReserveBytesPerSec,
 		Profile:            opts.resolvedProfile,

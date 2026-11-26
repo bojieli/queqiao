@@ -1,0 +1,33 @@
+// Applied by gradle-with-retries.sh. It registers queqiaoPrefetchDependencies,
+// which resolves the external modules of every resolvable configuration whose
+// name matches the regular expression in -Pqueqiao.prefetch. CI uses it for
+// the configurations a later offline step resolves but no build task does:
+// the instrumentation runner's (unified-test-platform) dependencies, which
+// connectedDebugAndroidTest would otherwise fetch from Maven Central while the
+// emulator is already up.
+allprojects {
+    tasks.register("queqiaoPrefetchDependencies") {
+        group = "help"
+        description = "Resolves the configurations named by -Pqueqiao.prefetch."
+        def pattern = providers.gradleProperty("queqiao.prefetch")
+        def configurations = project.configurations
+        doLast {
+            if (!pattern.isPresent()) {
+                throw new GradleException("queqiaoPrefetchDependencies needs -Pqueqiao.prefetch=<regex>")
+            }
+            def regex = java.util.regex.Pattern.compile(pattern.get())
+            def matched = configurations.findAll { it.canBeResolved && regex.matcher(it.name).find() }
+            if (matched.isEmpty()) {
+                throw new GradleException("no resolvable configuration of ${project.path} matches ${pattern.get()}")
+            }
+            matched.each { configuration ->
+                // Only external modules are fetched; a project dependency is
+                // built, not downloaded.
+                int count = configuration.incoming.artifactView {
+                    componentFilter { it instanceof org.gradle.api.artifacts.component.ModuleComponentIdentifier }
+                }.files.files.size()
+                logger.lifecycle("prefetched ${project.path}:${configuration.name} (${count} files)")
+            }
+        }
+    }
+}
