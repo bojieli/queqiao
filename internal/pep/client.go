@@ -210,7 +210,15 @@ type ClientConfig struct {
 	// connection with another flow (§7; see Client.fanOutWanted). Zero or one
 	// is off, the default. It is bounded by the profile's bulk pool.
 	TopologyFanOut int
-	Metrics        *metrics.Registry
+	// Recovery selects who owns QUIC recovery; see RecoveryMode. Empty is
+	// flow (today's per-flow rescue). Carrier requires Topology single and
+	// CodedRetry sticky.
+	Recovery RecoveryMode
+	// CarrierRecovery holds the carrier manager's thresholds under
+	// Recovery carrier; zero values select the design's provisional
+	// defaults.
+	CarrierRecovery CarrierRecoveryConfig
+	Metrics         *metrics.Registry
 	// FallbackDelay is when AUTO starts connecting its warm-standby TCP
 	// candidate. It is not a deadline for QUIC and not a transport-selection
 	// race.
@@ -353,6 +361,8 @@ type Client struct {
 
 	// carrierShadow is the carrier-liveness observer; nil when it is off.
 	carrierShadow *carrierShadow
+	// carriers is the carrier manager under recovery=carrier; nil otherwise.
+	carriers *carrierManager
 }
 
 // SessionLimit bounds concurrent local SOCKS sessions across one or more
@@ -498,6 +508,10 @@ type controlQUICGeneration struct {
 	// Silent retirement wakes borrowers still waiting for proof or stream credit.
 	borrowing     context.Context
 	stopBorrowing context.CancelCauseFunc
+	// managed is the carrier manager's view of this connection under
+	// recovery=carrier, set before the generation is published; nil
+	// otherwise.
+	managed *managedCarrier
 }
 
 // watchLiveness samples the connection's packet counters until it closes.
@@ -714,6 +728,14 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := cfg.CarrierShadow.resolve(); err != nil {
 		return nil, err
 	}
+	if err := validateRecovery(&cfg.Recovery, cfg.CongestionScope, cfg.CodedRetry, cfg.Topology, cfg.TopologyFanOut, false); err != nil {
+		return nil, err
+	}
+	if cfg.Recovery == RecoveryCarrier {
+		if err := cfg.CarrierRecovery.resolve(); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.AdaptiveMinBytesSec == 0 {
 		cfg.AdaptiveMinBytesSec = defaultAdaptiveMinBytesPerSec
 	}
@@ -788,6 +810,10 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		sendMemory: sendMemory, receiveMemory: receiveMemory, memoryLimits: memoryLimits,
 	}
 	client.carrierShadow = newCarrierShadow(cfg.CarrierShadow, carrierShadowClient, cfg.Logger, cfg.Metrics)
+	if cfg.Recovery == RecoveryCarrier {
+		client.carriers = newCarrierManager(client, cfg.CarrierRecovery)
+		client.carriers.joins.rtt = client.carrierRTT
+	}
 	client.checkSystemResume()
 	return client, nil
 }
@@ -1052,6 +1078,11 @@ func (c *Client) closeControlQUICPool(reason string) {
 	if generation != nil {
 		generation.close(reason)
 	}
+	if c.carriers != nil {
+		// A pool reset is a path boundary: the standby and draining
+		// carriers belong to the old path too.
+		c.carriers.pathReset(reason)
+	}
 }
 
 func (c *Client) closeBulkQUICPool(reason string) {
@@ -1116,6 +1147,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	flowSession.memOwned = c.cfg.Memory == MemoryOwned
 	flowSession.codedRetrySticky = c.cfg.CodedRetry == CodedRetrySticky
 	flowSession.carrierShadow = c.carrierShadow
+	flowSession.carrierRecovery = c.carriers != nil
 	flowSession.wire = flow.fc.wire
 	c.declareClass(ctx, inner, flowSession)
 	flowSession.ackRanges.Store(true)
@@ -1762,13 +1794,7 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 	case TransportTCP:
 		outer, err = dialTCP(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.dialWires(ctx), c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl)
 	case TransportQUIC:
-		ccfg := congestionConfig{
-			hierarchicalPath: c.cfg.Profile.HierarchicalPath,
-			discoverGrouping: c.cfg.Profile.DiscoverGrouping,
-			kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
-			adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
-			ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipalNow, generation: c.uplinkGeneration.Load,
-		}
+		ccfg := c.pooledCongestionConfig()
 		if pooled {
 			outer, err = c.dialPooledQUICLane(ctx, ccfg)
 			reserveControl = true
@@ -1799,6 +1825,18 @@ func (c *Client) dialLaneMode(ctx context.Context, kind TransportKind, sessionID
 		reserveControl: reserveControl,
 		tcpStriping:    kind == TransportTCP && c.cfg.TCPFallbackLanes > 1,
 	}, nil
+}
+
+// pooledCongestionConfig is the controller configuration of every QUIC
+// connection this client dials.
+func (c *Client) pooledCongestionConfig() congestionConfig {
+	return congestionConfig{
+		hierarchicalPath: c.cfg.Profile.HierarchicalPath,
+		discoverGrouping: c.cfg.Profile.DiscoverGrouping,
+		kind:             c.cfg.Congestion, brutalBytesPerSecond: c.cfg.BrutalBytesPerSec,
+		adaptiveMinBytesPerSec: c.cfg.AdaptiveMinBytesSec, adaptiveMaxBytesPerSec: c.cfg.AdaptiveMaxBytesSec,
+		ccAPI: c.cfg.CCAPI, sched: c.cfg.Sched, scope: c.cfg.CongestionScope, principal: c.pathPrincipalNow, generation: c.uplinkGeneration.Load,
+	}
 }
 
 // dialPooledQUICLane opens a stream on the current shared QUIC generation.
@@ -1907,6 +1945,32 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 		}
 		c.checkSystemResume()
 		c.quicMu.Lock()
+		if generation := c.quicGeneration; generation != nil && generation.conn.Context().Err() == nil && c.carriers != nil {
+			// Under recovery=carrier the carrier manager judges the carrier
+			// on its transport evidence (§10.2), not on packet counts. A
+			// SUSPECT carrier takes no new flows, and while flows wait to be
+			// rebound onto a carrier a new OPEN does not take a stream slot
+			// one of them needs (§10.3 step 2); a rebinding JOIN does.
+			rebind := isCarrierRebind(ctx)
+			mc := generation.managed
+			if c.carriers.accepting(generation) && (rebind || mc == nil || mc.rebinding.Load() == 0) {
+				generation.borrowMu.Lock()
+				generation.borrowers++
+				generation.borrowMu.Unlock()
+				c.quicMu.Unlock()
+				return generation, nil
+			}
+			wait := c.carriers.changes()
+			c.quicMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-wait:
+			case <-time.After(c.carriers.cfg.Interval):
+				// Rebinding counts change without a carrier transition.
+			}
+			continue
+		}
 		if generation := c.quicGeneration; generation != nil && generation.conn.Context().Err() == nil {
 			if !generation.liveness.silent(time.Now()) {
 				generation.borrowMu.Lock()
@@ -1923,8 +1987,27 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 			continue
 		}
 		stale := c.quicGeneration
-		c.quicGeneration = nil
 		attempt := c.quicDial
+		if attempt == nil && c.carriers != nil {
+			// Every dial round is charged to the path's attempt history; a
+			// round for flows waiting to be rebound is also capped (§10.2).
+			if ok, retry := c.carriers.admitDial(isCarrierRebind(ctx)); !ok {
+				wait := c.carriers.changes()
+				c.quicMu.Unlock()
+				var timer <-chan time.Time
+				if retry > 0 {
+					timer = time.After(retry)
+				}
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-wait:
+				case <-timer:
+				}
+				continue
+			}
+		}
+		c.quicGeneration = nil
 		if attempt == nil {
 			c.quicEpoch++
 			dialCtx, cancel := context.WithCancel(context.Background())
@@ -1954,26 +2037,50 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 	}
 }
 
-func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDial, ccfg congestionConfig) {
+// dialControlGeneration dials one pooled connection offering wires. Under
+// recovery=carrier a standby is handed to the carrier manager at once; a
+// pooled generation is handed to it when it is installed. Otherwise the
+// generation watches its own liveness.
+func (c *Client) dialControlGeneration(ctx context.Context, id uint64, ccfg congestionConfig, wires []byte, standby bool) (*controlQUICGeneration, error) {
 	windows, credit := c.reservePreferredWindows()
-	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), c.cfg.WireVersions, c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, windows, c.hopDialConfig())
-	var generation *controlQUICGeneration
+	conn, packet, err := dialQUICConnection(ctx, c.cfg.RemoteAddr, c.currentCredentials(), wires, c.cfg.DialTimeout, c.cfg.LocalAddress, c.cfg.SocketControl, c.observeTransientUDPSendFailure, windows, c.hopDialConfig())
 	if err != nil {
 		credit.release()
-	} else {
-		// The connection's window is fixed at dial; its credit returns to
-		// the ledger only when it ends.
-		credit.bind(conn.Context())
+		return nil, err
 	}
-	if err == nil {
-		borrowing, stopBorrowing := context.WithCancelCause(conn.Context())
-		generation = &controlQUICGeneration{borrowing: borrowing, stopBorrowing: stopBorrowing,
-			id: attempt.epoch, conn: conn, packet: packet, verified: time.Now(),
-			controller: configureQUICController(conn, ccfg),
-			lossPath:   pathModelOf(conn),
-		}
+	// The connection's window is fixed at dial; its credit returns to the
+	// ledger only when it ends.
+	credit.bind(conn.Context())
+	if id == 0 {
+		id = carrierIDs.Add(1) | standbyCarrierIDBit
+	}
+	borrowing, stopBorrowing := context.WithCancelCause(conn.Context())
+	generation := &controlQUICGeneration{borrowing: borrowing, stopBorrowing: stopBorrowing,
+		id: id, conn: conn, packet: packet, verified: time.Now(),
+		controller: configureQUICController(conn, ccfg),
+		lossPath:   pathModelOf(conn),
+	}
+	switch {
+	case c.carriers != nil && standby:
+		c.carriers.watch(generation, true)
+	case c.carriers == nil:
 		go generation.watchLiveness(func(g *controlQUICGeneration) { c.supersedeSilentGeneration(g, &ccfg) })
 	}
+	return generation, nil
+}
+
+// carrierIDs numbers standby generations, which are dialled outside the
+// pool's epochs; standbyCarrierIDBit keeps their IDs apart from epochs.
+var carrierIDs atomic.Uint64
+
+const standbyCarrierIDBit = 1 << 62
+
+func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDial, ccfg congestionConfig) {
+	wires := c.cfg.WireVersions
+	if c.carriers != nil {
+		wires = c.carriers.dialWires()
+	}
+	generation, err := c.dialControlGeneration(ctx, attempt.epoch, ccfg, wires, false)
 
 	c.quicMu.Lock()
 	current := c.quicDial == attempt && c.quicEpoch == attempt.epoch
@@ -1987,6 +2094,9 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 		}
 	}
 	c.quicMu.Unlock()
+	if current && generation != nil && c.carriers != nil {
+		c.carriers.watch(generation, false)
+	}
 	if !current && generation != nil {
 		generation.close("queqiao superseded pooled connection")
 	}
@@ -2569,6 +2679,10 @@ func (c *Client) manageLanes(ctx context.Context, flow *multipathFlow, sessionID
 		return
 	}
 	if initialKind != TransportQUIC {
+		return
+	}
+	if c.carriers != nil {
+		c.manageCarrierBoundLanes(ctx, flow, sessionID, flowID)
 		return
 	}
 	c.manageQUICLanes(ctx, flow, sessionID, flowID)

@@ -97,9 +97,20 @@ func probeControlGeneration(ctx context.Context, g *controlQUICGeneration, budge
 }
 
 func probePooledQUIC(ctx context.Context, conn *quic.Conn, budget time.Duration, g *controlQUICGeneration) error {
+	return probePooledQUICGranted(ctx, conn, budget, g, false)
+}
+
+// probePooledQUICGranted is probePooledQUIC with, when grant is set, a
+// verification grant bound to the probe's bytes, so the exchange is
+// admitted while the path's window and balance are held by a silent sibling
+// (§4.3, §10.2).
+func probePooledQUICGranted(ctx context.Context, conn *quic.Conn, budget time.Duration, g *controlQUICGeneration, grant bool) error {
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return err
+	}
+	if grant {
+		bindProbeGrant(conn, stream, 0, budget)
 	}
 	if g.highErasure() {
 		if stop := g.protectPrefix(stream, protocol.HeaderSize+1); stop != nil {

@@ -117,6 +117,9 @@ type mpLane struct {
 	// pooled flow, but after a connection-generation reset its replacement has
 	// a non-zero join ID and must inherit the same scheduling protection.
 	control bool
+	// replayGate, set on a lane that rebinds a flow under recovery=carrier,
+	// holds READY data until the first ACK after the rebinding or one SRTT.
+	replayGate *replayGate
 	// writeHook is an internal deterministic fault-injection point used by
 	// integration tests. Production lanes leave it nil, so the data path has
 	// only one predictable nil check before the real framed write.
@@ -253,6 +256,12 @@ type multipathFlow struct {
 	memOwned bool
 	// codedRetrySticky selects the coded-retry bundle (CodedRetrySticky).
 	codedRetrySticky bool
+	// carrierRecovery is recovery=carrier (§10.4): the stall watchdog only
+	// observes missing credit and enforces the no-progress budget. It
+	// demotes no lane, requests no rescue and pins no coded frontier; coded
+	// attempts move to the stream by their own deadline (coded-retry=sticky),
+	// and a lost binding is the carrier manager's.
+	carrierRecovery bool
 	// carrierShadow is the endpoint's carrier-liveness observer, nil when it
 	// is off. It only records; nothing here reads what it computes.
 	carrierShadow *carrierShadow
@@ -2228,6 +2237,16 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			continue
 		}
 		newEpisode := !episode
+		if f.carrierRecovery {
+			// Unacknowledged bytes on a live stream: QUIC is delivering, the
+			// peer application is slow, or the ACK is in transit. None has a
+			// remedy between waiting and the no-progress budget above.
+			if newEpisode {
+				episode = true
+				f.noteCreditStall(threshold, sendSince)
+			}
+			continue
+		}
 		if newEpisode {
 			episode = true
 			// An application stall is evidence against the current DATA substrate,
@@ -2298,6 +2317,35 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			}
 		}
 	}
+}
+
+// noteCreditStall records, under recovery=carrier, a stall episode the
+// watchdog does nothing about (§10.4): missing credit on a live stream.
+func (f *multipathFlow) noteCreditStall(threshold time.Duration, since time.Time) {
+	if f.metrics != nil {
+		f.metrics.FlowStallDetected()
+	}
+	var lane *mpLane
+	if data := f.dataLane(f.healthyLanes()); len(data) > 0 {
+		lane = data[0]
+	}
+	if f.logger != nil {
+		f.logger.Info("flow credit missing on a live stream; waiting",
+			"flow_id", f.flowID, "threshold", threshold, "lanes", f.laneCount(),
+			"bytes_up", f.bytesUp.Load(), "bytes_down", f.bytesDown.Load())
+	}
+	if f.carrierShadow != nil {
+		f.carrierShadow.noteStall(f, lane, since, threshold, false, false)
+	}
+}
+
+// failBinding ends a flow whose binding could not be restored in time.
+func (f *multipathFlow) failBinding(err error) {
+	select {
+	case f.ackErr <- err:
+	default:
+	}
+	f.failClose(err)
 }
 
 // escapePendingCoding keeps the current stalled bytes on a reliable carrier

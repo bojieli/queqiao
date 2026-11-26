@@ -696,7 +696,8 @@ func (c *PathController) attach(a *PathAttachment, now monotime.Time, inFlight, 
 		}
 	}
 	c.attached.Store(int64(len(c.atts)))
-	a.probing = false
+	// A drained attachment stays out of the sum on its new controller too.
+	a.probing = a.drained
 	a.gauge = 0
 	c.setGauge(a, inFlight)
 	c.notePacketSize(maxPacket)
@@ -1430,9 +1431,13 @@ type PathAttachment struct {
 	addrs func() (local, remote net.Addr)
 
 	// Under the controller's lock.
-	epoch         uint64
-	gauge         quiccongestion.ByteCount
-	probing       bool
+	epoch   uint64
+	gauge   quiccongestion.ByteCount
+	probing bool
+	// drained says the client promoted a replacement over this attachment's
+	// connection (§10.2): it is PROBING for good, and transport progress no
+	// longer returns it to COUNTED (§4.4).
+	drained       bool
 	demand        quiccongestion.Demand
 	pkts          map[packetKey]sampleRef
 	windowBlocked bool
@@ -1777,7 +1782,9 @@ func (c *PathController) applyProgress(a *PathAttachment, tp TransportProgress, 
 	}
 	if tp.Epoch != a.progressEpoch {
 		a.progressEpoch = tp.Epoch
-		c.promote(a)
+		if !a.drained {
+			c.promote(a)
+		}
 		return nil
 	}
 	if !a.probing && tp.PTOExpiries >= pathProbingPTOExpiries {
@@ -1804,8 +1811,26 @@ func (a *PathAttachment) SetProbing(on bool) {
 		if c.flight < before {
 			wakes = c.collectBlocked(a, wakes)
 		}
-	} else {
+	} else if !a.drained {
 		c.promote(a)
+	}
+	c.mu.Unlock()
+	runWakes(wakes)
+}
+
+// SetDraining makes the attachment PROBING irreversibly: its endpoint
+// promoted a replacement over this connection, which is now DRAINING, and a
+// late acknowledgement on it must not put its flight back into the sum
+// (§4.4: a DRAINING carrier's attachment never returns). Only a client calls
+// it; a gateway's rule stays local and reversible.
+func (a *PathAttachment) SetDraining() {
+	c := a.ctl.Load()
+	c.mu.Lock()
+	a.drained = true
+	before := c.flight
+	wakes := c.demote(a, 0)
+	if c.flight < before {
+		wakes = c.collectBlocked(a, wakes)
 	}
 	c.mu.Unlock()
 	runWakes(wakes)

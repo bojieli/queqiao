@@ -482,6 +482,7 @@ func (f *multipathFlow) startLanePuller(ctx context.Context, lane *mpLane, sched
 func (f *multipathFlow) runLanePuller(ctx context.Context, lane *mpLane, sched *stripe.Scheduler) {
 	defer lane.pulling.Store(false)
 	defer sched.RetireLane(lane.id)
+	f.waitReplayGate(ctx, lane)
 	for {
 		if lane.closed.Load() || f.doneChanClosed() {
 			return
