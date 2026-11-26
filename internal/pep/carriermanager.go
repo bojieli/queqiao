@@ -101,6 +101,22 @@ const (
 	// carrierRoundCooldownMax caps the attempt history's doubling cooldown,
 	// as today's per-flow recovery backoff is capped.
 	carrierRoundCooldownMax = 15 * time.Second
+	// pathProbeEvery bounds how long a silent path can come back unnoticed.
+	// While a carrier is SUSPECT its own probe timeouts back off
+	// exponentially, and so does a dialling standby's handshake: after an 8 s
+	// outage the next of either can fall several seconds after the path
+	// returned. A PROBE exchange, under a verification grant so the path's
+	// window cannot hold it, is sent at this cadence instead; the first one
+	// that crosses a returned path is acknowledged, which is progress, and
+	// the carrier is ACTIVE again with its losses detected at once.
+	pathProbeEvery = time.Second
+	// pathProbesInFlight caps the probes outstanding on one carrier.
+	pathProbesInFlight = 3
+	// replacementProbeEvery is the same bound when there is no carrier at
+	// all: a fresh replacement handshake starts at this cadence while flows
+	// wait to be rebound, each with its own Initial timer, rather than one
+	// handshake waiting out its retransmission backoff.
+	replacementProbeEvery = 2 * time.Second
 	// joinTarget is T of §10.3 step 3: the time a JOIN queue should drain in.
 	joinTarget = 3 * time.Second
 	// minJoinConcurrency is the floor of §10.3 step 3.
@@ -352,6 +368,15 @@ type managedCarrier struct {
 	// drainUntil bounds how long a DRAINING carrier's flows hold new OPENs
 	// back: their binding deadline from the promotion.
 	drainUntil time.Time
+	// probes counts the path-return probes in flight on this carrier, and
+	// lastProbe is when the last one started (guarded by the manager).
+	probes    atomic.Int32
+	lastProbe time.Time
+	// received and receivedAt are the connection's received-packet count at
+	// the last tick that saw it move, and when; sentAtReceive is its sent
+	// count then (guarded by the manager).
+	received, sentAtReceive uint64
+	receivedAt              time.Time
 	// bound counts the managed flows bound to this carrier. A UDP
 	// association's stream is a pooled stream but not a binding this
 	// manager moves, so it is not counted.
@@ -403,6 +428,13 @@ type carrierManager struct {
 	// Counters, for tests and the client's log.
 	promotions, standbyDials, standbyFailures, replacementDials      atomic.Int64
 	sameCarrierJoins, newCarrierJoins, deadlineFailures, tcpHandoffs atomic.Int64
+	// pathProbes counts path-return probes sent on SUSPECT carriers;
+	// replacementProbes the replacement handshakes in flight while there is
+	// no carrier, and lastReplacementProbe when the last began (guarded by
+	// mu).
+	pathProbes           atomic.Int64
+	replacementProbes    atomic.Int32
+	lastReplacementProbe time.Time
 }
 
 func newCarrierManager(c *Client, cfg CarrierRecoveryConfig) *carrierManager {
@@ -671,12 +703,34 @@ func (m *carrierManager) tick() bool {
 			// one round per episode, when it can.
 			mc.standbyTried = m.dialStandbyLocked()
 		}
+		if st.PacketsReceived != mc.received || mc.receivedAt.IsZero() {
+			mc.received, mc.sentAtReceive, mc.receivedAt = st.PacketsReceived, st.PacketsSent, now
+		}
+		// Probe a SUSPECT carrier; and probe one with flows that has sent
+		// since it last heard anything and has heard nothing for a while.
+		// A carrier carrying mostly downloads has almost nothing of its own
+		// outstanding: its probe timeouts -- the evidence SUSPECT is built on
+		// -- barely accrue during an outage, and the one keep-alive PING it
+		// sent early in it has backed off for seconds by the time the path
+		// returns. The probe is ack-eliciting, so it both notices a returned
+		// path and supplies that evidence on a dead one. It changes no state
+		// by itself. A healthy idle carrier sends nothing between keep-alives
+		// and hears each one acknowledged within a round trip, so it is never
+		// probed.
+		silent := mc.gen.flows.Load() > 0 && st.PacketsSent != mc.sentAtReceive &&
+			now.Sub(mc.receivedAt) >= max(pathProbeEvery, keepAliveFloorRTTs*st.SmoothedRTT)
+		if to == carrierSuspect || silent {
+			m.probePathLocked(mc, now)
+		}
 		if promote {
 			if sb := m.usableStandbyLocked(); sb != nil && m.promoteLocked(mc, sb, "suspect carrier made no progress") {
 				pooled = sb.gen
 				changed = true
 			}
 		}
+	}
+	if pooled == nil && m.unbound.Load() > 0 {
+		m.probeReplacementLocked(now)
 	}
 	if pooled == nil {
 		// No carrier at all -- it died, or the pool retired it on a
@@ -738,6 +792,95 @@ func absDuration(d time.Duration) time.Duration {
 		return -d
 	}
 	return d
+}
+
+// probePathLocked sends a path-return probe on a SUSPECT carrier, at most
+// every pathProbeEvery and with at most pathProbesInFlight outstanding. It is
+// not a dial, so it is not charged to the attempt history; what it can
+// produce is the carrier's own transport evidence.
+func (m *carrierManager) probePathLocked(mc *managedCarrier, now time.Time) {
+	if now.Sub(mc.lastProbe) < pathProbeEvery || mc.probes.Load() >= pathProbesInFlight {
+		return
+	}
+	mc.lastProbe = now
+	mc.probes.Add(1)
+	m.pathProbes.Add(1)
+	g := mc.gen
+	// A probe lives for a few cadences, not a handshake timeout: its own
+	// retransmissions back off like everything else on the carrier, so a
+	// fresh one must keep going out every pathProbeEvery while the path is
+	// silent. Its answer is irrelevant; the acknowledgement of any of its
+	// packets is the carrier's progress.
+	life := pathProbesInFlight * pathProbeEvery
+	go func() {
+		defer mc.probes.Add(-1)
+		ctx, cancel := context.WithTimeout(g.conn.Context(), life)
+		defer cancel()
+		_ = probePooledQUICGranted(ctx, g.conn, life, g, true)
+	}()
+}
+
+// probeReplacementLocked starts a fresh replacement handshake while there is
+// no carrier and flows wait to be rebound (DEAD with no standby), at most
+// every replacementProbeEvery and within the device's connection budget.
+// Each attempt keeps its full dial timeout, so a lossy but working path can
+// still complete a slow handshake; the cadence only bounds how long a path
+// that came back goes unnoticed. The first verified attempt is installed;
+// the rest close. Only the first attempt of an outage is charged to the
+// attempt history: the others are bounded by the flows' binding deadlines,
+// and stop when no flow waits.
+func (m *carrierManager) probeReplacementLocked(now time.Time) {
+	if now.Sub(m.lastReplacementProbe) < replacementProbeEvery {
+		return
+	}
+	if int(m.replacementProbes.Load())+1 > m.connectionBudget() {
+		return
+	}
+	serving := m.c.serving.Load()
+	if serving == nil || (*serving).Err() != nil {
+		return
+	}
+	if m.replacementProbes.Load() == 0 && !m.replacing.Load() {
+		if ok, _ := m.admitDial(true); !ok {
+			return
+		}
+	}
+	m.lastReplacementProbe = now
+	m.replacementProbes.Add(1)
+	m.replacementDials.Add(1)
+	ctx, cancel := context.WithTimeout(*serving, m.c.cfg.DialTimeout)
+	go func(epoch uint64) {
+		defer m.replacementProbes.Add(-1)
+		defer cancel()
+		c := m.c
+		g, err := c.dialControlGeneration(ctx, 0, c.pooledCongestionConfig(), m.dialWires(), true)
+		if err != nil {
+			return
+		}
+		probeCtx, cancelProbe := context.WithTimeout(g.conn.Context(), c.cfg.HandshakeTimeout)
+		probe := probeStandbyGeneration
+		if c.probeControlGenerationForTest != nil {
+			probe = c.probeControlGenerationForTest
+		}
+		err = probe(probeCtx, g, c.cfg.HandshakeTimeout)
+		cancelProbe()
+		m.mu.Lock()
+		mc := g.managed
+		installed := false
+		if err == nil && epoch == m.pathEpoch && m.carriers[g] == mc && g.conn.Context().Err() == nil {
+			mc.verified = true
+			g.probeMu.Lock()
+			g.verified = time.Now()
+			g.probeMu.Unlock()
+			installed = m.installLocked(mc, nil, "replacement probe answered")
+		}
+		m.mu.Unlock()
+		if installed {
+			m.broadcast()
+			return
+		}
+		g.close("queqiao replacement probe not needed")
+	}(m.pathEpoch)
 }
 
 // usableStandbyLocked is the standby, if it is verified and still healthy
