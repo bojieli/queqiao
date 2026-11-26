@@ -514,8 +514,8 @@ func TestPathControllerApplicationLimitedPathSkipsProbeRTT(t *testing.T) {
 	worst := pcPercentile(r.ackWaits, 1)
 	t.Logf("application-limited path: %d ProbeRTTs, %d skipped; flow acknowledgement wait after %v p99 %v, max %v",
 		law.probeRTTs, law.probeRTTsSkipped, measureFrom, pcPercentile(r.ackWaits, 0.99), worst)
-	if law.probeRTTs > 1 || law.probeRTTsSkipped < 2 {
-		t.Errorf("application-limited path: %d ProbeRTTs, %d skipped; want at most the first taken and the later two skipped",
+	if law.probeRTTs != 1 || law.probeRTTsSkipped < 2 {
+		t.Errorf("application-limited path: %d ProbeRTTs, %d skipped; want the first taken and the later two skipped",
 			law.probeRTTs, law.probeRTTsSkipped)
 	}
 	if worst > path.rtt/4 {
