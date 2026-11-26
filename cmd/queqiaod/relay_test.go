@@ -1,6 +1,10 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,5 +136,153 @@ func TestRenderRelayUnits(t *testing.T) {
 	svc := files["vless-cn-a.service"]
 	if !strings.Contains(svc, "systemd-socket-proxyd 94.74.126.245:18443") {
 		t.Error("service unit missing systemd-socket-proxyd upstream")
+	}
+}
+
+// relayClockSlack is how much earlier than its timeout a test may see the
+// relay close a connection: the relay stamps a byte when it reads it, a
+// moment before the test's own clock reading for the same byte.
+const relayClockSlack = 50 * time.Millisecond
+
+// relayedEcho starts an echo server and a TCP relay in front of it with the
+// given idle timeout, and returns a connection through the relay.
+func relayedEcho(t *testing.T, idle time.Duration) net.Conn {
+	t.Helper()
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = echo.Close() })
+	go func() {
+		for {
+			conn, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+	front, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); _ = front.Close() })
+	go func() { _ = serveRelayTCP(ctx, front, echo.Addr().String(), 3*time.Second, idle, 16) }()
+	conn, err := net.Dial("tcp", front.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// A TCP connection through the relay that keeps carrying bytes outlives
+// --idle-timeout, several times over; it used to be cut at that age however
+// busy it was (#253). Once it goes quiet it is closed one timeout later, and
+// not before.
+func TestRelayTCPIdleTimeoutIsResetByTraffic(t *testing.T) {
+	const idle = time.Second
+	conn := relayedEcho(t, idle)
+	opened := time.Now()
+	msg := []byte("still here")
+	buf := make([]byte, len(msg))
+	var last time.Time
+	for time.Since(opened) < 7*idle/2 {
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write(msg); err != nil {
+			t.Fatalf("a busy connection was cut %v after it opened: %v", time.Since(opened), err)
+		}
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			t.Fatalf("a busy connection was cut %v after it opened: %v", time.Since(opened), err)
+		}
+		last = time.Now()
+		time.Sleep(idle / 5)
+	}
+	// Quiet from here: the relay closes it, one idle timeout after the last
+	// byte.
+	_ = conn.SetReadDeadline(time.Now().Add(idle + 5*time.Second))
+	n, err := conn.Read(buf)
+	quiet := time.Since(last)
+	if err == nil || n != 0 {
+		t.Fatalf("read %d bytes (%v) from a connection that should have been closed for idleness", n, err)
+	}
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		t.Fatalf("an idle connection was still open %v after its last byte", quiet)
+	}
+	if quiet < idle-relayClockSlack {
+		t.Fatalf("closed %v after its last byte, before the %v idle timeout", quiet, idle)
+	}
+}
+
+// One direction is enough: a connection that only receives (a download) is
+// as busy as one that only sends.
+func TestRelayTCPIdleTimeoutCountsEitherDirection(t *testing.T) {
+	const idle = time.Second
+	sink, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+	stop := make(chan struct{})
+	defer close(stop)
+	// The upstream sends without ever being sent anything.
+	go func() {
+		conn, err := sink.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(idle / 5):
+			}
+			if _, err := conn.Write([]byte("x")); err != nil {
+				return
+			}
+		}
+	}()
+	front, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); _ = front.Close() }()
+	go func() { _ = serveRelayTCP(ctx, front, sink.Addr().String(), 3*time.Second, idle, 16) }()
+	conn, err := net.Dial("tcp", front.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	opened := time.Now()
+	buf := make([]byte, 16)
+	for time.Since(opened) < 3*idle {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Read(buf); err != nil {
+			t.Fatalf("a connection that was receiving was cut %v after it opened: %v", time.Since(opened), err)
+		}
+	}
+}
+
+// A connection that never carries a byte is closed at the idle timeout.
+func TestRelayTCPClosesAnIdleConnection(t *testing.T) {
+	const idle = 500 * time.Millisecond
+	conn := relayedEcho(t, idle)
+	opened := time.Now()
+	_ = conn.SetReadDeadline(time.Now().Add(idle + 5*time.Second))
+	n, err := conn.Read(make([]byte, 1))
+	age := time.Since(opened)
+	var timeout net.Error
+	if err == nil || n != 0 || (errors.As(err, &timeout) && timeout.Timeout()) {
+		t.Fatalf("an idle connection was still open after %v (read %d, %v)", age, n, err)
+	}
+	if age < idle-relayClockSlack {
+		t.Fatalf("an idle connection was closed after %v, before the %v idle timeout", age, idle)
 	}
 }
