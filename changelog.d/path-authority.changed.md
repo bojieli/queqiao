@@ -12,7 +12,9 @@ serves wire-1 clients and released clients, so upgrade gateways first.
   probe-timeout probes, keep-alives and path validation can still be sent
   while the window is full. On a gateway every data connection of one device,
   a released client's isolated and rescue connections included, attaches to
-  the same controller.
+  the same controller. On Windows the QUIC stack now reads the performance
+  counter: Go's clock there advances once per clock interrupt (15.6 ms by
+  default), too coarse for the controller to measure a short path.
 - Class scheduling. The controller chooses whether the next packet carries
   CONTROL (flow control frames and QUIC window updates), INTERACTIVE (new and
   interactive flows' data, the datagram substrate) or BULK work, by weighted
