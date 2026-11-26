@@ -74,18 +74,22 @@ func TestFailingGatewayFlowResetsEveryOpenLane(t *testing.T) {
 	}
 }
 
-// The client end keeps closing silently: only the gateway knows that a session
-// is gone for good, and the client may still re-OPEN or fall back.
+// The client end keeps closing silently when its flow fails: only the gateway
+// knows that a session is gone for good, and the client may still re-OPEN or
+// fall back. (A client flow that ends at its own idle or lifetime limit is
+// not failing; it says so, see
+// TestAClientIdleTimeoutReachesTheDestinationWithinFiveSeconds.)
 func TestFailingClientFlowDoesNotSendReset(t *testing.T) {
 	inner, application := net.Pipe()
 	defer application.Close()
 	flow := newMultipathFlow(context.Background(), inner, [16]byte{1}, 7, 1024,
 		protocol.FlagAckUp, protocol.FlagAckDown, nil, metrics.New())
-	flow.idleTimeout = 50 * time.Millisecond
+	flow.idleTimeout = time.Minute
 	flow.maxLifetime = time.Minute
 	flow.stallWatchdogDisabled = true
 	outer, peer := net.Pipe()
 	defer peer.Close()
+	failure := errors.New("no delivery progress")
 	if err := flow.addLane(&mpLane{id: 0, kind: TransportQUIC, fc: newFrameConn(outer)}); err != nil {
 		t.Fatal(err)
 	}
@@ -103,8 +107,12 @@ func TestFailingClientFlowDoesNotSendReset(t *testing.T) {
 			}
 		}
 	}()
-	if _, err := flow.run(context.Background()); !errors.Is(err, errFlowIdleTimeout) {
-		t.Fatalf("flow error = %v, want idle timeout", err)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		flow.ackErr <- failure
+	}()
+	if _, err := flow.run(context.Background()); !errors.Is(err, failure) {
+		t.Fatalf("flow error = %v, want %v", err, failure)
 	}
 	if <-sawReset {
 		t.Fatal("client flow sent RESET")

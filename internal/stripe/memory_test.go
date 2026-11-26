@@ -531,6 +531,7 @@ func TestRetentionBoundDecaysTowardUse(t *testing.T) {
 	cancel()
 	<-lane.done
 	lane.completeAll(s)
+	waitProducerOnBound(t, s)
 	previous := peak
 	for range 40 {
 		clock.advance(tuneRound)
@@ -542,6 +543,110 @@ func TestRetentionBoundDecaysTowardUse(t *testing.T) {
 	}
 	if startup := DefaultAutotuneStartupChunks * tuneChunk; previous != startup {
 		t.Fatalf("idle bound settled at %d, want the startup allowance %d", previous, startup)
+	}
+}
+
+// waitProducerOnBound waits until the producer has read up to the bound and
+// is waiting on it. Until then a flow whose source never runs dry can look,
+// for an instant, like one waiting on its application.
+func waitProducerOnBound(t *testing.T, s *Scheduler) {
+	t.Helper()
+	waitUntil(t, "the producer to wait on the bound", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.tune.waiting && s.readyBytes > 0
+	})
+}
+
+// gatedSource reads like infiniteSource while open, and blocks like an
+// application with nothing to write while closed.
+type gatedSource struct {
+	mu      sync.Mutex
+	cond    sync.Cond
+	shut    bool
+	blocked int // reads waiting at the gate
+}
+
+func newGatedSource() *gatedSource {
+	g := &gatedSource{}
+	g.cond.L = &g.mu
+	return g
+}
+
+func (g *gatedSource) Read(p []byte) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for g.shut {
+		g.blocked++
+		g.cond.Wait()
+		g.blocked--
+	}
+	return len(p), nil
+}
+
+func (g *gatedSource) waiting() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.blocked > 0
+}
+
+func (g *gatedSource) set(open bool) {
+	g.mu.Lock()
+	g.shut = !open
+	g.mu.Unlock()
+	g.cond.Broadcast()
+}
+
+// A flow whose application pauses keeps its bound through the pause: with
+// nothing read, nothing in flight and the producer waiting on the
+// application, it holds no memory, and its idle rounds say nothing about
+// what it will need when the application writes again. Decaying through
+// them made a segment fetched every few seconds (W10) restart from the
+// startup allowance every time. Past RFC 7661's non-validated period the
+// bound decays as before.
+func TestRetentionBoundIsKeptAcrossAnApplicationPause(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	src := newGatedSource()
+	s := New(src, Config{
+		ChunkSize: tuneChunk, LaneWindow: 1024, MaxOutstanding: 1024, MaxOutstandingBytes: tuneMax,
+		Now: clock.Now, Autotune: &Autotune{Round: func() time.Duration { return tuneRound }},
+	})
+	t.Cleanup(s.Close)
+	t.Cleanup(func() { src.set(true) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lane := startLane(ctx, s)
+	for range 8 {
+		waitBlockedOnBound(t, s)
+		clock.advance(tuneRound)
+		lane.completeAll(s)
+	}
+	peak := s.RetentionBound()
+	if peak != tuneMax {
+		t.Fatalf("bound reached only %d", peak)
+	}
+
+	// The application stops writing. The lane takes what was read and the
+	// peer acknowledges it, so the flow is left holding nothing.
+	src.set(false)
+	waitUntil(t, "the flow to hold nothing while it waits on the application", func() bool {
+		lane.completeAll(s)
+		if !src.waiting() {
+			return false
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return !s.tune.reading.IsZero() && s.uniqueBytes == 0 && s.readyBytes == 0 && len(s.live) == 0
+	})
+	for range 80 { // four seconds of credit rounds
+		clock.advance(tuneRound)
+		if bound := s.RetentionBound(); bound != peak {
+			t.Fatalf("after %v of application pause the bound fell from %d to %d", 4*time.Second, peak, bound)
+		}
+	}
+	clock.advance(autotuneIdleHold)
+	if bound, startup := s.RetentionBound(), DefaultAutotuneStartupChunks*tuneChunk; bound != startup {
+		t.Fatalf("past the idle hold the bound is %d, want the startup allowance %d", bound, startup)
 	}
 }
 
@@ -580,6 +685,7 @@ func TestRetentionBoundDecaysAcrossOneLongIdleGap(t *testing.T) {
 	cancel()
 	<-lane.done
 	lane.completeAll(s)
+	waitProducerOnBound(t, s)
 	clock.advance(time.Hour)
 	if bound, startup := s.RetentionBound(), DefaultAutotuneStartupChunks*tuneChunk; bound != startup {
 		t.Fatalf("after an hour idle the bound is %d, want %d", bound, startup)
