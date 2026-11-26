@@ -103,6 +103,8 @@ func TestCarrierEndIsDeadOrClosed(t *testing.T) {
 	}{
 		{&quic.IdleTimeoutError{}, carrierDead},
 		{&quic.StatelessResetError{}, carrierDead},
+		// The manager's own silence bound: its flows are rebound.
+		{errCarrierSilent, carrierDead},
 		{&quic.ApplicationError{ErrorCode: 0}, carrierClosed},
 		{context.Canceled, carrierClosed},
 	} {
@@ -439,5 +441,52 @@ func TestClientAndServerValidateTheRecoveryBundle(t *testing.T) {
 		if (err == nil) != tc.ok {
 			t.Errorf("server %s/%s: %v, want ok=%v", tc.scope, tc.coded, err, tc.ok)
 		}
+	}
+}
+
+// A carrier is silent past a bound when it has open flows and has heard
+// nothing for that long since its first ack-eliciting packet after the last
+// packet it heard. Hearing anything, or having no flows, clears it; and time
+// in which the manager itself did not run is not time the carrier was silent
+// in.
+func TestCarrierSilenceIsCountedFromTheFirstUnansweredPacket(t *testing.T) {
+	const bound = 15 * time.Second
+	start := time.Unix(1_700_000_000, 0)
+	g := &controlQUICGeneration{}
+	g.flows.Store(1)
+	mc := &managedCarrier{gen: g, received: 10, receivedAt: start}
+	st := quic.ConnectionStats{PacketsReceived: 10, ElicitingOutstanding: true}
+	// Nothing was asked: an idle carrier that sends nothing is not silent,
+	// however long it has heard nothing.
+	if mc.silentPast(st, start.Add(time.Hour), bound) {
+		t.Fatal("a carrier that asked nothing was found silent")
+	}
+	mc.askedSince = start.Add(5 * time.Second)
+	if mc.silentPast(st, start.Add(19*time.Second), bound) {
+		t.Fatal("silent 14 s after its first unanswered packet")
+	}
+	if !mc.silentPast(st, start.Add(20*time.Second), bound) {
+		t.Fatal("not silent 15 s after its first unanswered packet")
+	}
+	// A packet arrived since the last tick's bookkeeping.
+	heard := st
+	heard.PacketsReceived++
+	if mc.silentPast(heard, start.Add(time.Minute), bound) {
+		t.Fatal("a carrier that has just heard a packet was found silent")
+	}
+	// The manager did not run for ten seconds.
+	mc.excuse(10 * time.Second)
+	if mc.silentPast(st, start.Add(29*time.Second), bound) {
+		t.Fatal("time the manager did not run was counted as silence")
+	}
+	if !mc.silentPast(st, start.Add(30*time.Second), bound) {
+		t.Fatal("not silent 15 s of running time after its first unanswered packet")
+	}
+	if got := mc.receivedAt; !got.Equal(start.Add(10 * time.Second)) {
+		t.Fatalf("the last packet heard is at %v after an excused gap, want it moved by the gap", got.Sub(start))
+	}
+	g.flows.Store(0)
+	if mc.silentPast(st, start.Add(time.Hour), bound) {
+		t.Fatal("a carrier with no flows was found silent")
 	}
 }

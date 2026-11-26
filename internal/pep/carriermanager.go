@@ -110,6 +110,39 @@ const (
 	// that crosses a returned path is acknowledged, which is progress, and
 	// the carrier is ACTIVE again with its losses detected at once.
 	pathProbeEvery = time.Second
+	// carrierQuietProbeAfter is how long a carrier with open flows may hear
+	// nothing at all before the manager probes it, and carrierSilenceDead how
+	// long its ack-eliciting packets may then go unanswered, still with
+	// nothing heard, before it is DEAD. Both are wall-clock, as the
+	// transport's own bounds are not: its keep-alive goes out every
+	// max(KeepAlivePeriod, 1.5 PTO) and its idle timeout is
+	// max(MaxIdleTimeout, 3 PTO), and an idle carrier's PTO does not heal.
+	// One stall leaves round-trip samples of several seconds behind it, and a
+	// carrier whose peer's keep-alives keep arriving sends nothing
+	// ack-eliciting of its own, so it takes no sample to replace them. With a
+	// PTO of 33 s -- measured on an idle carrier in a live session, after a
+	// stall of some ten seconds -- the keep-alives are 50 s apart, which no
+	// NAT or relay mapping is promised to outlive, and the idle timeout is
+	// 100 s: that carrier's death was noticed 152 s after the gateway
+	// noticed it, when the gateway's grace for its flows (45 s) was long
+	// over. The skew rule of §10.3 step 4 budgets S = laneDeadPathDetection
+	// for that.
+	//
+	// A healthy idle carrier hears a keep-alive or its acknowledgement every
+	// KeepAlivePeriod (5 s) plus a round trip, so it is never probed and
+	// sends what it sent before. Half the detection bound leaves the other
+	// half for several probes to be answered; the probe's acknowledgement is
+	// also the round-trip sample that heals the estimate. DEAD is counted
+	// from the first unanswered ack-eliciting packet, as the transport's idle
+	// timeout is, so with a sane PTO the two coincide.
+	carrierQuietProbeAfter = laneDeadPathDetection / 2
+	carrierSilenceDead     = laneDeadPathDetection
+	// carrierTickStall is the gap between two ticks beyond which the manager
+	// itself was not running (a suspended device, a starved host). What a
+	// carrier did not hear in that time says nothing about its path: the
+	// packets may be waiting in the socket, and the transport reads them no
+	// sooner than this tick runs. The gap is taken out of both clocks.
+	carrierTickStall = time.Second
 	// pathProbesInFlight caps the probes outstanding on one carrier.
 	pathProbesInFlight = 3
 	// replacementProbeEvery is the same bound when there is no carrier at
@@ -379,6 +412,11 @@ type managedCarrier struct {
 	received       uint64
 	receivedAt     time.Time
 	elicitingSince time.Time
+	// askedSince is when a tick first saw an ack-eliciting packet outstanding
+	// after the last packet heard. Unlike elicitingSince it is cleared only
+	// by hearing something: a probe timeout takes its packet's frames into a
+	// new one, and for a moment nothing is outstanding.
+	askedSince time.Time
 	// bound counts the managed flows bound to this carrier. A UDP
 	// association's stream is a pooled stream but not a binding this
 	// manager moves, so it is not counted.
@@ -386,6 +424,31 @@ type managedCarrier struct {
 }
 
 func (mc *managedCarrier) current() carrierState { return carrierState(mc.state.Load()) }
+
+// errCarrierSilent ends a carrier the manager found silent past
+// carrierSilenceDead.
+var errCarrierSilent = errors.New("carrier silent past the detection bound")
+
+// silentPast reports whether the carrier has open flows and has heard
+// nothing for bound since its first ack-eliciting packet after the last one
+// it heard, as of the previous tick's bookkeeping and this tick's reading st.
+func (mc *managedCarrier) silentPast(st quic.ConnectionStats, now time.Time, bound time.Duration) bool {
+	if mc.gen.flows.Load() == 0 || mc.askedSince.IsZero() || st.PacketsReceived != mc.received {
+		return false
+	}
+	return now.Sub(mc.askedSince) >= bound
+}
+
+// excuse takes gap out of the carrier's silence: the manager was not running
+// for that long (carrierTickStall).
+func (mc *managedCarrier) excuse(gap time.Duration) {
+	if !mc.receivedAt.IsZero() {
+		mc.receivedAt = mc.receivedAt.Add(gap)
+	}
+	if !mc.askedSince.IsZero() {
+		mc.askedSince = mc.askedSince.Add(gap)
+	}
+}
 
 // carrierManager is one client's carrier manager. The client has one remote
 // gateway address, so one path, except across an uplink change, which is a
@@ -435,9 +498,13 @@ type carrierManager struct {
 	// replacementProbes the replacement handshakes in flight while there is
 	// no carrier, and lastReplacementProbe when the last began (guarded by
 	// mu).
-	pathProbes           atomic.Int64
+	pathProbes atomic.Int64
+	// silentDeaths counts the carriers ended at carrierSilenceDead.
+	silentDeaths         atomic.Int64
 	replacementProbes    atomic.Int32
 	lastReplacementProbe time.Time
+	// lastTick is when the previous tick ran (guarded by mu).
+	lastTick time.Time
 }
 
 // count records one carrier-recovery event in its counter and in the
@@ -634,6 +701,12 @@ func (m *carrierManager) tick() bool {
 	changed := false
 	var closeLater []*controlQUICGeneration
 	now := m.now()
+	if gap := now.Sub(m.lastTick); !m.lastTick.IsZero() && gap > carrierTickStall {
+		for _, mc := range m.carriers {
+			mc.excuse(gap)
+		}
+	}
+	m.lastTick = now
 	for g, mc := range m.carriers {
 		st := g.conn.ConnectionStats()
 		ev := carrierEvidence{Epoch: st.ProgressEpoch, PTOs: st.PTOExpiriesSinceProgress}
@@ -642,6 +715,15 @@ func (m *carrierManager) tick() bool {
 			if ev.Ended == nil {
 				ev.Ended = ctx.Err()
 			}
+		}
+		if ev.Ended == nil && g == pooled && !mc.standby && mc.silentPast(st, now, carrierSilenceDead) {
+			// The transport would say the same at its idle timeout, were
+			// its probe timeout not inflated (carrierSilenceDead).
+			ev.Ended = errCarrierSilent
+			m.count(&m.silentDeaths, metrics.CarrierSilentDeath)
+			m.log.Warn("carrier silent past the detection bound; treating it as dead", "carrier", g.id,
+				"unanswered_for", now.Sub(mc.askedSince), "nothing_heard_for", now.Sub(mc.receivedAt),
+				"srtt", st.SmoothedRTT, "rtt_deviation", st.MeanDeviation, "flows", g.flows.Load())
 		}
 		from, to, promote := mc.fsm.step(ev)
 		mc.state.Store(uint32(to))
@@ -715,7 +797,10 @@ func (m *carrierManager) tick() bool {
 			mc.standbyTried = m.dialStandbyLocked()
 		}
 		if st.PacketsReceived != mc.received || mc.receivedAt.IsZero() {
-			mc.received, mc.receivedAt, mc.elicitingSince = st.PacketsReceived, now, time.Time{}
+			mc.received, mc.receivedAt, mc.elicitingSince, mc.askedSince = st.PacketsReceived, now, time.Time{}, time.Time{}
+		}
+		if st.ElicitingOutstanding && mc.askedSince.IsZero() {
+			mc.askedSince = now
 		}
 		switch {
 		case !st.ElicitingOutstanding:
@@ -738,7 +823,11 @@ func (m *carrierManager) tick() bool {
 		// is never probed.
 		silent := mc.gen.flows.Load() > 0 && !mc.elicitingSince.IsZero() &&
 			now.Sub(mc.elicitingSince) >= max(pathProbeEvery, keepAliveFloorRTTs*st.SmoothedRTT)
-		if to == carrierSuspect || silent {
+		// And probe one with flows that has heard nothing at all for
+		// carrierQuietProbeAfter, whether or not anything is outstanding:
+		// its transport's keep-alive may be far apart by now.
+		quiet := mc.gen.flows.Load() > 0 && now.Sub(mc.receivedAt) >= carrierQuietProbeAfter
+		if to == carrierSuspect || silent || quiet {
 			m.probePathLocked(mc, now)
 		}
 		if promote {
@@ -773,7 +862,7 @@ func (m *carrierManager) tick() bool {
 	}
 	left := len(m.carriers) > 0
 	if !left {
-		m.running = false
+		m.running, m.lastTick = false, time.Time{}
 	}
 	m.mu.Unlock()
 	for _, g := range closeLater {
