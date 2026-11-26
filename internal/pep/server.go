@@ -213,6 +213,9 @@ type serverFlow struct {
 type quicAuthState struct {
 	principal identity.Principal
 	flows     atomic.Int64
+	// probeGranted says this connection's one verification grant for a
+	// PROBE reply has been issued (recovery=carrier).
+	probeGranted atomic.Bool
 }
 
 // shared reports whether more than one flow is using this connection.
@@ -1137,7 +1140,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 			defer func() { <-admission.probes }()
 			releaseFirstFrame()
 		}
-		s.handlePathProbe(fc, open)
+		s.handlePathProbeFor(fc, open, auth)
 		return
 	}
 	if open.Header.Type == protocol.TypeJoin {
@@ -1375,6 +1378,16 @@ const (
 // source for its sending direction; reverse-direction arrivals cannot reveal
 // which losses the peer caused by its offered rate.
 func (s *Server) handlePathProbe(fc *frameConn, first protocol.Frame) {
+	s.handlePathProbeFor(fc, first, nil)
+}
+
+// handlePathProbeFor is handlePathProbe on a connection. Under
+// recovery=carrier the reply to the first PROBE a connection carries before
+// any flow is under a verification grant: that is a client verifying a new
+// standby (§10.2), and the grant lets the reply go out while a silent
+// sibling holds the path's window. Routine probes on a carrier with flows
+// stay under ordinary admission, and a connection gets at most one grant.
+func (s *Server) handlePathProbeFor(fc *frameConn, first protocol.Frame, auth *quicAuthState) {
 	frames, bytes := 0, 0
 	frame := first
 	sessionID := first.Header.SessionID
@@ -1386,7 +1399,7 @@ func (s *Server) handlePathProbe(fc *frameConn, first protocol.Frame) {
 			bytes+len(frame.Payload) > maxPathProbeBytes {
 			return
 		}
-		if frames == 0 && s.cfg.Recovery == RecoveryCarrier {
+		if frames == 0 && s.cfg.Recovery == RecoveryCarrier && auth != nil && auth.flows.Load() == 0 && auth.probeGranted.CompareAndSwap(false, true) {
 			// The reply verifies a client's standby in this direction while
 			// a silent sibling holds the path's window (§10.2).
 			if qs, ok := fc.transport().(*quicStreamConn); ok {

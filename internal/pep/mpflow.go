@@ -2237,7 +2237,9 @@ func (f *multipathFlow) stallWatchdog(stop <-chan struct{}) {
 			continue
 		}
 		newEpisode := !episode
-		if f.carrierRecovery {
+		// The carrier manager owns QUIC bindings only; a flow on TCP keeps
+		// its bundle's own stall rescue.
+		if f.carrierRecovery && !hasTCPLane(f) {
 			// Unacknowledged bytes on a live stream: QUIC is delivering, the
 			// peer application is slow, or the ACK is in transit. None has a
 			// remedy between waiting and the no-progress budget above.

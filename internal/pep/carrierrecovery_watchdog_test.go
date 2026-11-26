@@ -141,3 +141,27 @@ func TestCarrierRecoveryCodedTailMovesToTheExistingStream(t *testing.T) {
 		t.Fatal("recovering one chunk stopped coding fresh exchanges")
 	}
 }
+
+// The carrier manager owns QUIC bindings only. A flow on TCP -- opened on
+// it, or handed off to it -- keeps its bundle's stall rescue under
+// recovery=carrier.
+func TestCarrierRecoveryLeavesTCPStallRescueAlone(t *testing.T) {
+	flow := newStallTestFlow(t, nil)
+	flow.carrierRecovery = true
+	local, remote := net.Pipe()
+	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
+	if err := flow.addLane(&mpLane{id: 0, kind: TransportTCP, fc: newFrameConn(local)}); err != nil {
+		t.Fatal(err)
+	}
+	flow.noteSent(0, 512)
+	flow.stallScan = 5 * time.Millisecond
+	flow.stallGrace = 20 * time.Millisecond
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go flow.stallWatchdog(stop)
+	select {
+	case <-flow.stallSignals():
+	case <-time.After(2 * time.Second):
+		t.Fatal("a stalled TCP flow raised no rescue request under recovery=carrier")
+	}
+}

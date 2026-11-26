@@ -69,7 +69,10 @@ func (c *Client) verifyControlPath(ctx context.Context, g *controlQUICGeneration
 				probe = c.probeControlGenerationForTest
 			}
 			pending.err = probe(probeCtx, g, c.cfg.HandshakeTimeout)
-			if pending.err != nil {
+			if pending.err != nil && c.carriers == nil {
+				// Under recovery=carrier a failed borrow fails only that
+				// borrow: replacing the carrier is the carrier manager's
+				// decision, on transport evidence (§10.2).
 				c.drainControlQUICGeneration(g)
 			}
 			g.probeMu.Lock()

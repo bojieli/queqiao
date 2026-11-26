@@ -1958,8 +1958,7 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 			// rebound onto a carrier a new OPEN does not take a stream slot
 			// one of them needs (§10.3 step 2); a rebinding JOIN does.
 			rebind := isCarrierRebind(ctx)
-			mc := generation.managed
-			if c.carriers.accepting(generation) && (rebind || mc == nil || mc.rebinding.Load() == 0) {
+			if c.carriers.accepting(generation) && (rebind || !c.carriers.openGated(generation)) {
 				generation.borrowMu.Lock()
 				generation.borrowers++
 				generation.borrowMu.Unlock()
@@ -2067,9 +2066,15 @@ func (c *Client) dialControlGeneration(ctx context.Context, id uint64, ccfg cong
 		lossPath:   pathModelOf(conn),
 	}
 	switch {
-	case c.carriers != nil && standby:
-		c.carriers.watch(generation, true)
-	case c.carriers == nil:
+	case c.carriers != nil:
+		// Managed state exists before any borrower can see the generation;
+		// a standby is sampled from now, a pooled generation once it is
+		// installed.
+		c.carriers.prepare(generation, standby)
+		if standby {
+			c.carriers.watch(generation)
+		}
+	default:
 		go generation.watchLiveness(func(g *controlQUICGeneration) { c.supersedeSilentGeneration(g, &ccfg) })
 	}
 	return generation, nil
@@ -2101,7 +2106,7 @@ func (c *Client) runControlQUICDial(ctx context.Context, attempt *controlQUICDia
 	}
 	c.quicMu.Unlock()
 	if current && generation != nil && c.carriers != nil {
-		c.carriers.watch(generation, false)
+		c.carriers.watch(generation)
 	}
 	if !current && generation != nil {
 		generation.close("queqiao superseded pooled connection")

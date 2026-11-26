@@ -460,7 +460,19 @@ func TestCarrierRecoveryHoldsNewOpensWhileFlowsRebind(t *testing.T) {
 	if carrier == nil || carrier.managed == nil {
 		t.Fatal("no managed carrier")
 	}
-	carrier.managed.rebinding.Add(1)
+	for _, hold := range []struct {
+		name          string
+		take, release func()
+	}{
+		{"a JOIN queued onto the carrier", func() { carrier.managed.rebinding.Add(1) }, func() { carrier.managed.rebinding.Add(-1) }},
+		{"an unbound flow", func() { p.client.carriers.unbound.Add(1) }, func() { p.client.carriers.unbound.Add(-1) }},
+	} {
+		t.Run(hold.name, func(t *testing.T) { holdNewOpen(t, p, hold.take, hold.release) })
+	}
+}
+
+func holdNewOpen(t *testing.T, p *carrierPair, take, release func()) {
+	take()
 	opened := make(chan error, 1)
 	go func() {
 		conn, err := trySocksDial(p.socks, p.destination, 20*time.Second)
@@ -479,7 +491,7 @@ func TestCarrierRecoveryHoldsNewOpensWhileFlowsRebind(t *testing.T) {
 		t.Fatalf("a new flow opened while a rebinding was waiting (err %v)", err)
 	case <-time.After(700 * time.Millisecond):
 	}
-	carrier.managed.rebinding.Add(-1)
+	release()
 	select {
 	case err := <-opened:
 		if err != nil {

@@ -341,6 +341,9 @@ type managedCarrier struct {
 	// carrier: a new OPEN does not take a stream slot one of them needs
 	// (§10.3 step 2).
 	rebinding atomic.Int64
+	// drainUntil bounds how long a DRAINING carrier's flows hold new OPENs
+	// back: their binding deadline from the promotion.
+	drainUntil time.Time
 }
 
 func (mc *managedCarrier) current() carrierState { return carrierState(mc.state.Load()) }
@@ -368,6 +371,18 @@ type carrierManager struct {
 	wireSet bool
 	// replacing says a break-before-make dial is running.
 	replacing atomic.Bool
+	// pathEpoch changes at every path reset; a standby dialled for an older
+	// path is discarded, and cancelStandby stops one still dialling.
+	pathEpoch     uint64
+	cancelStandby context.CancelFunc
+	// flows counts the flows whose bindings this manager reconciles; the
+	// path's wire stays pinned while there are any (§7).
+	flows atomic.Int64
+	// displaced is the number of flows still bound to DRAINING carriers, and
+	// unbound the number of flows with no binding at all. While either is
+	// non-zero a new OPEN waits, so it cannot take a stream slot one of them
+	// needs, whichever goroutine wakes first (§10.3 step 2).
+	displaced, unbound atomic.Int64
 
 	history attemptHistory
 	changed atomic.Pointer[chan struct{}]
@@ -397,15 +412,22 @@ func (m *carrierManager) broadcast() {
 	close(*old)
 }
 
-// watch starts managing a freshly dialled generation. standby says it is a
-// standby, which carries no flow until it is promoted.
-func (m *carrierManager) watch(g *controlQUICGeneration, standby bool) {
+// prepare gives a freshly dialled generation its managed state, before the
+// generation is visible to any borrower. standby says it is a standby, which
+// carries no flow until it is promoted.
+func (m *carrierManager) prepare(g *controlQUICGeneration, standby bool) {
 	mc := &managedCarrier{gen: g, standby: standby, fsm: newCarrierFSM(m.cfg.SuspectPTOs, m.cfg.ReplacePTOs)}
 	mc.state.Store(uint32(carrierActive))
 	g.managed = mc
+}
+
+// watch starts sampling a prepared generation: a standby as soon as it is
+// dialled, a pooled generation once it is installed.
+func (m *carrierManager) watch(g *controlQUICGeneration) {
+	mc := g.managed
 	m.mu.Lock()
 	m.carriers[g] = mc
-	if !standby {
+	if !mc.standby {
 		m.noteWireLocked(g)
 	}
 	if !m.running {
@@ -413,6 +435,16 @@ func (m *carrierManager) watch(g *controlQUICGeneration, standby bool) {
 		go m.run()
 	}
 	m.mu.Unlock()
+}
+
+// openGated reports whether a new OPEN on g must wait: flows are queued to
+// rebind onto it, flows are still bound to a carrier promoted away from, or
+// flows have no binding at all (§10.3 step 2). It reads no lock.
+func (m *carrierManager) openGated(g *controlQUICGeneration) bool {
+	if mc := g.managed; mc != nil && mc.rebinding.Load() > 0 {
+		return true
+	}
+	return m.displaced.Load() > 0 || m.unbound.Load() > 0
 }
 
 func (m *carrierManager) noteWireLocked(g *controlQUICGeneration) {
@@ -428,7 +460,7 @@ func (m *carrierManager) noteWireLocked(g *controlQUICGeneration) {
 func (m *carrierManager) dialWires() []byte {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.wireSet && m.c.quicPoolActive.Load() > 0 {
+	if m.wireSet && (m.flows.Load() > 0 || m.c.quicPoolActive.Load() > 0) {
 		return []byte{m.wire}
 	}
 	return m.c.cfg.WireVersions
@@ -571,15 +603,14 @@ func (m *carrierManager) tick() bool {
 			if m.standby == mc {
 				m.standby = nil
 			}
+			// The connection is gone; its packet socket is ours to close.
+			closeLater = append(closeLater, g)
 			if g == pooled && !mc.standby {
-				// DEAD: a verified standby takes over at once; otherwise
-				// the flows are unbound and share the path's one grace.
-				if sb := m.standby; sb != nil && sb.verified && sb.gen.conn.Context().Err() == nil {
-					m.promoteLocked(mc, sb, "carrier dead")
-					pooled = sb.gen
-				} else {
-					c.retireControlQUICGeneration(g, "queqiao carrier dead")
-				}
+				// DEAD: a verified standby takes over at once (below);
+				// otherwise the flows are unbound and share the path's one
+				// grace.
+				c.retireControlQUICGeneration(g, "queqiao carrier dead")
+				pooled = nil
 			}
 			continue
 		case mc.standby:
@@ -627,12 +658,33 @@ func (m *carrierManager) tick() bool {
 			}
 		}
 		if promote {
-			if sb := m.standby; sb != nil && sb.verified && sb.gen.conn.Context().Err() == nil {
+			if sb := m.usableStandbyLocked(); sb != nil {
 				m.promoteLocked(mc, sb, "suspect carrier made no progress")
 				pooled = sb.gen
 				changed = true
 			}
 		}
+	}
+	if pooled == nil {
+		// No carrier at all -- it died, or the pool retired it on a
+		// stream's report before this tick saw it: a verified standby
+		// takes over.
+		if sb := m.usableStandbyLocked(); sb != nil {
+			m.installLocked(sb, "carrier gone with a verified standby")
+			m.promotions.Add(1)
+			changed = true
+		}
+	}
+	// Flows still bound to DRAINING carriers hold new OPENs back until they
+	// move, or until their binding deadline.
+	displaced := int64(0)
+	for g, mc := range m.carriers {
+		if mc.current() == carrierDraining && now.Before(mc.drainUntil) {
+			displaced += g.flows.Load()
+		}
+	}
+	if m.displaced.Swap(displaced) != displaced {
+		changed = true
 	}
 	left := len(m.carriers) > 0
 	if !left {
@@ -676,10 +728,38 @@ func absDuration(d time.Duration) time.Duration {
 	return d
 }
 
+// usableStandbyLocked is the standby, if it is verified and still healthy
+// now: alive and ACTIVE on its own evidence.
+func (m *carrierManager) usableStandbyLocked() *managedCarrier {
+	sb := m.standby
+	if sb == nil || !sb.verified || sb.gen.conn.Context().Err() != nil || sb.current() != carrierActive {
+		return nil
+	}
+	return sb
+}
+
+// connectionBudget is how many QUIC connections the device may hold to the
+// path at once: the pooled one and the profile's secondary slots (one on
+// iOS, §11.5).
+func (m *carrierManager) connectionBudget() int {
+	return 1 + max(m.c.memoryLimits.maxBulkConnections, 1)
+}
+
 // dialStandbyLocked starts the one standby dial round of a SUSPECT carrier,
-// if the attempt history allows it.
+// if the attempt history and the device's connection budget allow it. A
+// DRAINING carrier still holding flows counts against the budget; without
+// room, recovery is break-before-make (§10.2).
 func (m *carrierManager) dialStandbyLocked() {
 	if m.standby != nil || m.dialing {
+		return
+	}
+	live := 0
+	for g, mc := range m.carriers {
+		if !mc.current().terminal() && g.conn.Context().Err() == nil {
+			live++
+		}
+	}
+	if live >= m.connectionBudget() {
 		return
 	}
 	if ok, _ := m.admitDial(true); !ok {
@@ -689,15 +769,16 @@ func (m *carrierManager) dialStandbyLocked() {
 	if serving == nil || (*serving).Err() != nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(*serving, m.c.cfg.DialTimeout)
 	m.dialing = true
+	m.cancelStandby = cancel
 	m.standbyDials.Add(1)
-	go m.dialStandby(*serving)
+	go m.dialStandby(ctx, cancel, m.pathEpoch)
 }
 
-func (m *carrierManager) dialStandby(serving context.Context) {
-	c := m.c
-	ctx, cancel := context.WithTimeout(serving, c.cfg.DialTimeout)
+func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelFunc, epoch uint64) {
 	defer cancel()
+	c := m.c
 	g, err := c.dialControlGeneration(ctx, 0, c.pooledCongestionConfig(), m.dialWires(), true)
 	if err == nil {
 		probeCtx, cancelProbe := context.WithTimeout(g.conn.Context(), c.cfg.HandshakeTimeout)
@@ -713,6 +794,13 @@ func (m *carrierManager) dialStandby(serving context.Context) {
 	}
 	m.mu.Lock()
 	m.dialing = false
+	m.cancelStandby = nil
+	if err == nil && epoch != m.pathEpoch {
+		// Dialled for a path that has since been reset.
+		m.mu.Unlock()
+		g.close("queqiao standby of a previous path")
+		return
+	}
 	if err != nil {
 		m.standbyFailures.Add(1)
 		m.mu.Unlock()
@@ -753,6 +841,10 @@ func (m *carrierManager) promoteLocked(old, sb *managedCarrier, reason string) {
 		a.SetDraining()
 	}
 	old.gen.stopBorrowing(errPoolRetired)
+	old.drainUntil = m.now().Add(m.cfg.grace - m.cfg.DetectionSkew)
+	// Counted before the promotion is visible, so no new OPEN on the new
+	// carrier can run ahead of the flows it displaced.
+	m.displaced.Add(old.gen.flows.Load())
 	go m.c.drainControlQUICGeneration(old.gen)
 	m.promotions.Add(1)
 	m.log.Info("carrier promoted", "old", old.gen.id, "new", sb.gen.id, "reason", reason,
@@ -795,6 +887,10 @@ func (m *carrierManager) pathReset(reason string) {
 		gens = append(gens, g)
 	}
 	m.standby = nil
+	m.pathEpoch++
+	if m.cancelStandby != nil {
+		m.cancelStandby()
+	}
 	m.mu.Unlock()
 	for _, g := range gens {
 		g.close(reason)

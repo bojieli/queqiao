@@ -3,6 +3,7 @@ package congestion
 import (
 	"math"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1492,6 +1493,9 @@ type PathAttachment struct {
 	// Run loop only.
 	wake      func()
 	attached  bool
+	// live mirrors attached for readers off the run loop: 0 before OnAttach,
+	// 1 attached, 2 after OnDetach.
+	live atomic.Int32
 	maxPacket quiccongestion.ByteCount
 	connRTT   quiccongestion.RTTStatsProvider
 }
@@ -1584,6 +1588,7 @@ func (a *PathAttachment) OnAttach(now monotime.Time, inFlight, maxPacket quiccon
 	a.wake = wake
 	a.maxPacket = maxPacket
 	a.attached = true
+	a.live.Store(1)
 	c := a.ctl.Load()
 	// The connection may have migrated between choosing the controller and
 	// this installation on the run loop: revalidate the path.
@@ -1687,6 +1692,7 @@ func (a *PathAttachment) OnDetach(now monotime.Time) {
 		return
 	}
 	a.attached = false
+	a.live.Store(2)
 	c := a.ctl.Load()
 	c.mu.Lock()
 	wakes := c.detach(a, now)
@@ -1802,8 +1808,7 @@ func (c *PathController) applyProgress(a *PathAttachment, tp TransportProgress, 
 // transport progress (§4.4): PROBING takes its flight out of the sum and
 // stops its packets being samples; COUNTED returns its current gauge.
 func (a *PathAttachment) SetProbing(on bool) {
-	c := a.ctl.Load()
-	c.mu.Lock()
+	c := a.lockCurrent()
 	var wakes []func()
 	if on {
 		before := c.flight
@@ -1818,14 +1823,32 @@ func (a *PathAttachment) SetProbing(on bool) {
 	runWakes(wakes)
 }
 
+// lockCurrent locks the controller the attachment is attached to now and
+// returns it. The setters below are called from outside the connection's
+// run loop, which is where a migration moves the attachment: a controller
+// read before the move would be mutated under the wrong lock, so membership
+// is checked under the lock and the read retried until it holds. An
+// attachment that has detached for good is locked on its last controller,
+// where the state change is harmless.
+func (a *PathAttachment) lockCurrent() *PathController {
+	for {
+		c := a.ctl.Load()
+		c.mu.Lock()
+		if _, member := c.atts[a]; (member && a.ctl.Load() == c) || a.live.Load() != 1 {
+			return c
+		}
+		c.mu.Unlock()
+		runtime.Gosched()
+	}
+}
+
 // SetDraining makes the attachment PROBING irreversibly: its endpoint
 // promoted a replacement over this connection, which is now DRAINING, and a
 // late acknowledgement on it must not put its flight back into the sum
 // (§4.4: a DRAINING carrier's attachment never returns). Only a client calls
 // it; a gateway's rule stays local and reversible.
 func (a *PathAttachment) SetDraining() {
-	c := a.ctl.Load()
-	c.mu.Lock()
+	c := a.lockCurrent()
 	a.drained = true
 	before := c.flight
 	wakes := c.demote(a, 0)

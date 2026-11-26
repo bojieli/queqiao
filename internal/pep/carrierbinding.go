@@ -55,13 +55,31 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 	}()
 	ticker := time.NewTicker(carrierRebindPoll)
 	defer ticker.Stop()
+	m.flows.Add(1)
+	defer m.flows.Add(-1)
+	unbound := false
+	setUnbound := func(on bool) {
+		if on != unbound {
+			unbound = on
+			if on {
+				m.unbound.Add(1)
+			} else {
+				m.unbound.Add(-1)
+			}
+		}
+	}
+	defer setUnbound(false)
 	var (
-		observed    time.Time
-		lastCarrier *controlQUICGeneration
-		attempts    int
-		backoff     time.Duration
-		nextAttempt time.Time
-		tcpTried    bool
+		observed      time.Time
+		lastCarrier   *controlQUICGeneration
+		attempts      int
+		backoff       time.Duration
+		nextAttempt   time.Time
+		lastAttemptAt time.Time
+		tcpTried      bool
+		// tcpNow asks for the TCP handoff at once: the gateway said the
+		// flow is already in TCP mode.
+		tcpNow bool
 	)
 	for {
 		select {
@@ -91,13 +109,18 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			lastCarrier = current
 		}
 		superseded := len(healthy) > 0 && current != nil && m.superseded(current)
+		// An unbound flow holds new OPENs back while it is due a JOIN; one
+		// backing off after a refusal does not need a stream slot now, and
+		// must not stall every new flow for its whole backoff.
+		setUnbound(len(healthy) == 0 && !m.now().Before(nextAttempt))
 		if len(healthy) > 0 && !superseded {
-			if !observed.IsZero() {
-				observed = time.Time{}
+			observed, tcpTried = time.Time{}, false
+			// The per-flow budget resets only after a sustained healthy
+			// dwell, as today's does: a stream that fails again just after
+			// each JOIN cannot JOIN without bound.
+			if attempts > 0 && m.now().Sub(lastAttemptAt) >= laneRecoveryResetAfter {
+				attempts, backoff, nextAttempt = 0, 0, time.Time{}
 			}
-			// A binding that holds starts the next outage with a fresh
-			// per-flow budget, as today's sustained dwell does.
-			attempts, backoff, nextAttempt, tcpTried = 0, 0, time.Time{}, false
 			continue
 		}
 		now := m.now()
@@ -127,9 +150,9 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			// AUTO's TCP handoff starts no later than the latest handoff
 			// start; when there is no QUIC carrier to JOIN at all it starts
 			// once the fallback grace has passed, as today's rescue does.
-			if !now.Before(latest) || (target == nil && now.Sub(observed) >= c.fallbackGrace()) {
-				tcpTried = true
-				if c.carrierTCPHandoff(manageCtx, flow, sessionID, flowID, healthy, superseded) {
+			if tcpNow || !now.Before(latest) || (target == nil && now.Sub(observed) >= c.fallbackGrace()) {
+				tcpTried, tcpNow = true, false
+				if c.carrierTCPHandoff(manageCtx, flow, sessionID, flowID, healthy, superseded, deadline) {
 					m.tcpHandoffs.Add(1)
 				}
 				continue
@@ -151,8 +174,15 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			return
 		}
 		attempts++
+		lastAttemptAt = now
 		attempt := flow.noteReplacementAttempt()
-		err := c.rebindFlow(manageCtx, flow, sessionID, flowID, target, healthy, superseded, deadline)
+		// In AUTO a QUIC JOIN, queued or running, must leave room for the
+		// TCP handoff: it gives up at the latest handoff start.
+		cutoff := deadline
+		if c.cfg.Transport == TransportAuto && !tcpTried {
+			cutoff = latest
+		}
+		err := c.rebindFlow(manageCtx, flow, sessionID, flowID, target, healthy, superseded, cutoff, deadline)
 		if err == nil {
 			if target == lastCarrier {
 				m.sameCarrierJoins.Add(1)
@@ -167,6 +197,15 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		err = classifyUnconfirmedRefusal(flow, err)
 		flow.noteReplacementFailure(err)
 		c.logLaneRecoveryFailure(manageCtx, flowID, attempt, err)
+		if errors.Is(err, errLaneJoinTCPMode) {
+			// The gateway already committed this flow to TCP: a handoff
+			// whose acknowledgement was lost. AUTO retries the TCP JOIN
+			// within the binding budget; QUIC-only cannot follow it.
+			if c.cfg.Transport == TransportAuto {
+				tcpTried, tcpNow = false, true
+				continue
+			}
+		}
 		if errors.Is(err, errLaneJoinRejected) {
 			// The gateway does not hold this session: terminal.
 			flow.noteRefusalCause(err)
@@ -193,19 +232,22 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 // rebindFlow moves flow onto target with one JOIN on a stream of it, with
 // RESERVE_CONTROL, through the JOIN queue (§10.3 steps 1-3). On a superseded
 // binding the old stream is closed once the replacement's OPEN_OK arrived.
-func (c *Client) rebindFlow(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64, target *controlQUICGeneration, healthy []*mpLane, superseded bool, deadline time.Time) error {
+//
+// The JOIN, queued or running, gives up at cutoff; the queue orders it by
+// deadline.
+func (c *Client) rebindFlow(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64, target *controlQUICGeneration, healthy []*mpLane, superseded bool, cutoff, deadline time.Time) error {
 	m := c.carriers
 	if mc := target.managed; mc != nil {
 		mc.rebinding.Add(1)
 		defer mc.rebinding.Add(-1)
 	}
-	release, err := m.joins.acquire(ctx, joinPriority(flow), deadline)
+	joinCtx, cancel := context.WithTimeout(withCarrierRebind(ctx), max(cutoff.Sub(m.now()), time.Millisecond))
+	defer cancel()
+	release, err := m.joins.acquire(joinCtx, joinPriority(flow), deadline)
 	if err != nil {
 		return err
 	}
 	defer release()
-	joinCtx, cancel := context.WithTimeout(withCarrierRebind(ctx), max(deadline.Sub(m.now()), time.Millisecond))
-	defer cancel()
 	var replaced *mpLane
 	if superseded {
 		for _, lane := range healthy {
@@ -266,8 +308,9 @@ func flowGenerationID(flow *multipathFlow) uint64 {
 // carrierTCPHandoff starts AUTO's TCP handoff for a flow that no QUIC JOIN
 // can rebind in time. It reports whether the TCP lane was installed; the
 // binding loop then hands the flow to the TCP bundle manager.
-func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64, healthy []*mpLane, superseded bool) bool {
-	joinCtx := ctx
+func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64, healthy []*mpLane, superseded bool, deadline time.Time) bool {
+	joinCtx, cancel := context.WithTimeout(ctx, max(deadline.Sub(c.carriers.now()), time.Millisecond))
+	defer cancel()
 	if superseded && len(healthy) > 0 {
 		joinCtx = context.WithValue(joinCtx, laneReplacementContextKey{}, laneReplacementHint{id: healthy[0].id})
 	} else if hint := flow.rescueHint.Load(); hint != nil {
