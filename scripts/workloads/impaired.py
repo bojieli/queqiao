@@ -15,8 +15,8 @@ impairment, one trial per arm per block in random order:
   +200 ms RTT; judged as the campaign in `<campaign>/idle-wake` by
   [workload:idle-wake].
 
-Each trial: the W5 LLM loop (5 turns), W6 keystrokes without bursts, and one
-bulk download of 4 MiB objects for the whole window.
+Each trial: the LLM swarm (4 x 10 turns), W6 keystrokes without bursts, and 25
+short downloads of 1 MiB across the window.
 
 Gated on reliability, each pre-registered and one-sided ([workload:impaired]
 in gates.ini, plus the [secondary] bounds of flow completion and stalls):
@@ -55,8 +55,8 @@ TRIAL_SECONDS = {"slow-lossy": 120, "blackhole": 120, "policed": 120}
 TRIAL_TYPES = tuple(TRIAL_SECONDS)
 WAKE_SCENARIO = "idle-wake-lossy"
 LEAD = 5                    # the foreground starts this long after the download
-BULK_OBJECT = 4 << 20       # each short download's object
-FETCHES = 8                 # short downloads per trial, sequential, one started every window/8 (or after the last)
+BULK_OBJECT = 1 << 20       # each short download's object
+FETCHES = 25                # short downloads per trial, sequential, one started every window/25 (or after the last)
 FETCH_TIMEOUT = 30          # a download not done in this long failed (a 25 s outage fits inside)
 # The LLM swarm: AGENTS concurrent loops of TURNS turns, short responses, so
 # a trial has AGENTS x TURNS calls: enough opportunities for the pooled
