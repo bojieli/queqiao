@@ -527,5 +527,124 @@ class SummaryFollowUpTest(unittest.TestCase):
                   rec(72.0, "carrier shadow outage ended", endpoint="client", session_id=SESSION, flow_id=1, outage_id=5)]
         self.assertIsNone(summarize(client, gateway_far)["recovery_deadline"]["skew_s"])
 
+
+class CountingList(list):
+    """A list that counts element reads, so a test can bound list scans."""
+
+    reads = 0
+
+    def __getitem__(self, index):
+        CountingList.reads += 1
+        return super().__getitem__(index)
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+
+def counted(value):
+    """Wrap every list reachable from value in a CountingList."""
+    if isinstance(value, list):
+        return CountingList(counted(v) for v in value)
+    if isinstance(value, dict):
+        return {k: counted(v) for k, v in value.items()}
+    return value
+
+
+class AttributionEdgeCaseTest(unittest.TestCase):
+    """The four attribution edge cases of #196."""
+
+    GATEWAY_FAR = [rec(100.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=1, grace=45_000_000_000),
+                   rec(110.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=1)]
+
+    def test_tied_outage_starts_are_ordered_by_outage_id(self):
+        t0 = int(MODULE.parse_instant(at(10.0)) * 1000)
+        # Gateway: two starts in one millisecond, the newer (id 2) logged
+        # first and still open at capture end; the older one ends.
+        gateway = [
+            rec(10.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=1, outage_id=2,
+                grace=45_000_000_000, observed_unix_ms=t0),
+            rec(10.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=1, outage_id=1,
+                grace=45_000_000_000, observed_unix_ms=t0),
+            rec(10.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=1, outage_id=1,
+                observed_unix_ms=t0),
+            rec(12.0, "unrelated", endpoint="gateway"),
+        ]
+        deadline = summarize([stall(1.0, 9, 9, 1)], gateway)["recovery_deadline"]
+        self.assertEqual(deadline["outages_without_join"], 0, "the open outage was closed by its older sibling")
+        self.assertEqual(deadline["outages_unfinished_at_capture_end"], 1)
+        # Client: the same order; the newer outage stays open, so the
+        # client's incident is not over when the gateway's outage starts.
+        client = [
+            rec(70.0, "carrier shadow outage", endpoint="client", session_id=SESSION, flow_id=1, outage_id=2,
+                grace=45_000_000_000, observed_unix_ms=int(MODULE.parse_instant(at(70.0)) * 1000)),
+            rec(70.0, "carrier shadow outage", endpoint="client", session_id=SESSION, flow_id=1, outage_id=1,
+                grace=45_000_000_000, observed_unix_ms=int(MODULE.parse_instant(at(70.0)) * 1000)),
+            rec(70.0, "carrier shadow outage ended", endpoint="client", session_id=SESSION, flow_id=1, outage_id=1,
+                observed_unix_ms=int(MODULE.parse_instant(at(70.0)) * 1000)),
+        ]
+        skew = summarize(client, self.GATEWAY_FAR)["recovery_deadline"]["skew_s"]
+        self.assertIsNotNone(skew, "the open outage's incident was closed by its older sibling's end")
+        self.assertAlmostEqual(skew["max"], 30.0, places=3)
+
+    def test_a_state_record_in_a_newer_epoch_ends_an_incident(self):
+        client = [
+            stall(70.0, 1, 1, 5),
+            # The carrier made progress, then became suspect again: epoch 6.
+            rec(75.0, "carrier shadow state", endpoint="client", carrier_id=1, to="suspect", transport_epoch=6, **{"from": "active"}),
+        ]
+        self.assertIsNone(summarize(client, self.GATEWAY_FAR)["recovery_deadline"]["skew_s"])
+
+    def test_an_unmatched_end_does_not_close_an_outage_with_another_id(self):
+        # Gateway: outage 2 has no end; the end of outage 1, whose start the
+        # capture lost, is not outage 2's.
+        gateway = [
+            rec(10.0, "carrier shadow outage", endpoint="gateway", session_id=SESSION, flow_id=1, outage_id=2, grace=45_000_000_000),
+            rec(12.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=1, outage_id=1),
+        ]
+        deadline = summarize([stall(1.0, 9, 9, 1)], gateway)["recovery_deadline"]
+        self.assertEqual(deadline["outages_unfinished_at_capture_end"], 1, "a foreign end closed the outage")
+        # An end without an identifier is still flow-level evidence.
+        gateway[1] = rec(12.0, "carrier shadow outage ended", endpoint="gateway", session_id=SESSION, flow_id=1)
+        deadline = summarize([stall(1.0, 9, 9, 1)], gateway)["recovery_deadline"]
+        self.assertEqual(deadline["outages_unfinished_at_capture_end"], 0)
+        # Client: the same; outage 2 is open when the gateway's starts.
+        client = [
+            rec(70.0, "carrier shadow outage", endpoint="client", session_id=SESSION, flow_id=1, outage_id=2, grace=45_000_000_000),
+            rec(72.0, "carrier shadow outage ended", endpoint="client", session_id=SESSION, flow_id=1, outage_id=1),
+        ]
+        skew = summarize(client, self.GATEWAY_FAR)["recovery_deadline"]["skew_s"]
+        self.assertIsNotNone(skew, "a foreign end closed the client's incident")
+        self.assertAlmostEqual(skew["max"], 30.0, places=3)
+        client[1] = rec(72.0, "carrier shadow outage ended", endpoint="client", session_id=SESSION, flow_id=1)
+        self.assertIsNone(summarize(client, self.GATEWAY_FAR)["recovery_deadline"]["skew_s"])
+
+    def test_an_epoch_reset_keeps_progress_lookups_logarithmic(self):
+        n = 4000
+        endpoint = MODULE.Endpoint("client")
+        # A reused process/carrier key: one high epoch, then n stalls in a
+        # lower one.
+        records = [stall(0.0, 0, 1, 100)] + [stall(1.0, i, 1, 1) for i in range(1, n + 1)]
+        for i, record in enumerate(records):
+            record.update(_t=float(i), _process=7, _seq=i)
+            endpoint.records.append(record)
+        original = MODULE.CarrierProgress
+
+        class Counted(original):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                for name, value in vars(self).items():
+                    setattr(self, name, counted(value))
+
+        MODULE.CarrierProgress = Counted
+        try:
+            CountingList.reads = 0
+            report = MODULE.stall_comparison(endpoint)
+        finally:
+            MODULE.CarrierProgress = original
+        self.assertEqual(report["stalls"], n + 1)
+        self.assertLess(CountingList.reads, 100 * n, "each progress lookup scanned the carrier's later history")
+
+
 if __name__ == "__main__":
     unittest.main()
