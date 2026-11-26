@@ -312,3 +312,57 @@ func TestASamplerThatIsAlwaysAppLimitedStillComesDown(t *testing.T) {
 			"application-limited sample replace an expired estimate", settled, peak)
 	}
 }
+
+// The collapse the wall clock caused on a queued path. Ten minimum round trips
+// (1.5 s here) is less than ten rounds whenever a queue stands (a round is the
+// smoothed round trip, 350 ms here), so the estimate ages out in steady state,
+// and it used to be replaced by whatever sample arrived at that moment. When
+// that was the one a four-packet ProbeRTT delivered, a 20 Mbit/s path was
+// estimated at 0.3 Mbit/s and probing took twelve seconds to climb back.
+// Expiry must forget what is old, not what is recent. The path authority's
+// law retires aged samples; the per-connection senders keep the replacement.
+func TestProbeRTTDoesNotBecomeTheEstimateWhenTheEstimateAgesOut(t *testing.T) {
+	const (
+		minRTT, srtt = 150 * time.Millisecond, 350 * time.Millisecond
+		path         = 2_500_000 // 20 Mbit/s
+		probeRTT     = 37_500    // 0.3 Mbit/s: four packets a round trip
+	)
+	m := newPathLaw(quiccongestion.InitialPacketSize, nil).inner.estimator.maxFilter
+	m.setRoundTrip(minRTT)
+	now := base()
+	// Steady state: one sample a round, the best at the start and the rest a
+	// little below it, as the saturated path delivers.
+	m.updateMax(1, now, path+path/100)
+	elapsed := time.Duration(0)
+	round := uint64(1)
+	for elapsed+srtt <= m.timeWindow {
+		elapsed += srtt
+		round++
+		m.updateMax(round, now.Add(elapsed), path-uint64(round%3)*path/200)
+	}
+	// The best ages out while the sender is in ProbeRTT, and the sample on
+	// offer is ProbeRTT's.
+	m.updateMax(round+1, now.Add(m.timeWindow+time.Millisecond), probeRTT)
+	if got := m.get(); got < path*9/10 {
+		t.Fatalf("estimate = %d after one ProbeRTT sample, want about %d: the window held samples "+
+			"younger than the expired best, and expiry replaced them all with the trough", got, path)
+	}
+}
+
+// What the runners-up hold must itself expire: a path that really narrowed is
+// believed within the window, not held up by the samples that followed the
+// peak.
+func TestRetiringTheEstimateStillBelievesANarrowedPath(t *testing.T) {
+	m := newPathLaw(quiccongestion.InitialPacketSize, nil).inner.estimator.maxFilter
+	m.setRoundTrip(150 * time.Millisecond)
+	now := base()
+	m.updateMax(1, now, 2_500_000)
+	elapsed := time.Duration(0)
+	for elapsed < 3*m.timeWindow {
+		elapsed += 100 * time.Millisecond
+		m.updateMax(2, now.Add(elapsed), 500_000)
+	}
+	if got := m.get(); got != 500_000 {
+		t.Fatalf("estimate = %d three windows after the path narrowed, want 500000", got)
+	}
+}

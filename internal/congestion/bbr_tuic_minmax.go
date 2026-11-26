@@ -44,6 +44,11 @@ type tuicMinMax struct {
 	// rounds" and "the time ten rounds takes" are the same statement on a path
 	// whose rounds are advancing; see setRoundTrip.
 	timeWindow time.Duration
+	// retireAged makes wall-clock expiry forget only what aged out (see
+	// retire) instead of replacing the filter with the arriving sample. Only
+	// the path authority's law sets it (congestion=path); the per-connection
+	// senders keep the replacement they have always had.
+	retireAged bool
 	samples    [3]tuicMinMaxSample
 }
 
@@ -126,10 +131,40 @@ func (m *tuicMinMax) stale(now monotime.Time) bool {
 }
 
 func (m *tuicMinMax) expired(sample tuicMinMaxSample, now monotime.Time) bool {
+	return m.aged(sample, now, m.timeWindow)
+}
+
+// aged reports whether sample has stood longer than d of wall time. A sample
+// or an instant carrying no time is never aged: the round clock governs it.
+func (m *tuicMinMax) aged(sample tuicMinMaxSample, now monotime.Time, d time.Duration) bool {
 	if sample.at.IsZero() || now.IsZero() || m.timeWindow <= 0 {
 		return false
 	}
-	return now.Sub(sample.at) > m.timeWindow
+	return now.Sub(sample.at) > d
+}
+
+// retire drops the samples that have outlived the wall-clock window, oldest
+// first, and keeps the ones that have not.
+//
+// Expiring the standing estimate used to replace the whole filter with the
+// sample that happened to arrive at that moment. The three samples are the
+// best of the whole window, of its later half and of its last quarter; when
+// the best has aged out, the best of what remains is the later ones, not the
+// newcomer. On a queued path the wall-clock bound fires first -- ten minimum
+// round trips is less than ten rounds whenever there is a queue -- so it fires
+// in steady state, and the sample it lands on can be the one a four-packet
+// ProbeRTT delivered: measured on a 20 Mbit/s path with a 512 KiB queue, the
+// estimate fell to 0.3 Mbit/s from one such sample, and probing climbed back
+// for twelve seconds at a quarter per cycle while the upload carried a tenth
+// of the path. The newcomer still replaces everything when nothing in the
+// window is younger than it, as before.
+func (m *tuicMinMax) retire(now monotime.Time) {
+	for range len(m.samples) {
+		if m.samples[0].value == 0 || !m.expired(m.samples[0], now) {
+			return
+		}
+		m.samples[0], m.samples[1], m.samples[2] = m.samples[1], m.samples[2], tuicMinMaxSample{}
+	}
 }
 
 func (m *tuicMinMax) updateMax(round uint64, now monotime.Time, value uint64) {
@@ -143,7 +178,11 @@ func (m *tuicMinMax) updateMax(round uint64, now monotime.Time, value uint64) {
 	windowExpired := round >= oldest.round && round-oldest.round > m.window
 	// The wall-clock test is against the standing estimate rather than the
 	// oldest sample: it is the estimate that is being trusted, and it is the
-	// one that outlived its window on the live path.
+	// one that outlived its window on the live path. What outlived it leaves;
+	// what has not stays (see retire).
+	if m.retireAged {
+		m.retire(now)
+	}
 	if m.samples[0].value == 0 || value >= m.samples[0].value || windowExpired || m.expired(m.samples[0], now) {
 		m.samples = [3]tuicMinMaxSample{current, current, current}
 		return
@@ -172,11 +211,17 @@ func (m *tuicMinMax) subWindowUpdate(sample tuicMinMaxSample) {
 			m.samples[2] = sample
 		}
 	} else if m.samples[1].value == m.samples[0].value &&
-		sample.round >= m.samples[1].round && sample.round-m.samples[1].round > m.window/4 {
+		(sample.round >= m.samples[1].round && sample.round-m.samples[1].round > m.window/4 ||
+			m.retireAged && m.aged(m.samples[1], sample.at, m.timeWindow/4)) {
+		// The runners-up are refreshed on whichever clock is ahead, as the
+		// estimate is expired on it: on the wall clock alone they would still
+		// be copies of the estimate when it ages out, and retire would have
+		// nothing younger to keep.
 		m.samples[2] = sample
 		m.samples[1] = sample
 	} else if m.samples[2].value == m.samples[1].value &&
-		sample.round >= m.samples[2].round && sample.round-m.samples[2].round > m.window/2 {
+		(sample.round >= m.samples[2].round && sample.round-m.samples[2].round > m.window/2 ||
+			m.retireAged && m.aged(m.samples[2], sample.at, m.timeWindow/2)) {
 		m.samples[2] = sample
 	}
 }
