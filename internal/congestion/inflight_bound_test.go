@@ -262,6 +262,10 @@ func TestPathControllerHeldAtTheLossBoundStillTakesProbeRTT(t *testing.T) {
 		t.Errorf("a bulk sender held at the loss bound took %d ProbeRTTs in %v and skipped %d",
 			law.probeRTTs, duration, law.probeRTTsSkipped)
 	}
+	// ProbeRTT at half a product must still find the path's round trip.
+	if law.minRTT > path.rtt*11/10 {
+		t.Errorf("minimum round trip %v after three ProbeRTTs on a %v path", law.minRTT, path.rtt)
+	}
 	if rate < 0.8*path.rate {
 		t.Errorf("the bounded sender delivered %.2f of the path's rate", rate/path.rate)
 	}
