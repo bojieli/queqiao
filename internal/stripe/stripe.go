@@ -465,13 +465,18 @@ type Scheduler struct {
 type autotuneState struct {
 	bound      int
 	roundStart time.Time
-	covered    bool // newly validated unique coverage arrived this round
-	blocked    bool // the producer waited on the bound this round
-	room       bool // ...while a lane had room to take more
-	waiting    bool // the producer is waiting on the bound now
-	roundMaxU  uint64
-	history    [autotuneHistory]uint64
-	rounds     int
+	// roundLen is the length of the current credit round, sampled from
+	// Autotune.Round once when the round starts. Round can be costly (the
+	// flow layer walks its lanes under their locks) and autotuneLocked runs
+	// at every read admission, dispatch and completion, under s.mu.
+	roundLen  time.Duration
+	covered   bool // newly validated unique coverage arrived this round
+	blocked   bool // the producer waited on the bound this round
+	room      bool // ...while a lane had room to take more
+	waiting   bool // the producer is waiting on the bound now
+	roundMaxU uint64
+	history   [autotuneHistory]uint64
+	rounds    int
 }
 
 // New returns a scheduler that reads src and hands it out in chunks. It starts
@@ -496,6 +501,7 @@ func New(src io.Reader, cfg Config) *Scheduler {
 	if cfg.Autotune != nil {
 		s.tune.bound = s.autotuneStartup()
 		s.tune.roundStart = cfg.Now()
+		s.tune.roundLen = s.autotuneRound()
 	}
 	go s.produce()
 	return s
@@ -806,7 +812,10 @@ func (s *Scheduler) autotuneLocked(now time.Time) {
 	if s.cfg.Autotune == nil {
 		return
 	}
-	round := s.autotuneRound()
+	round := s.tune.roundLen
+	if now.Sub(s.tune.roundStart) < round {
+		return
+	}
 	for i := 0; now.Sub(s.tune.roundStart) >= round; i++ {
 		if i >= autotuneMaxCatchUp {
 			// Every further empty round is the same as the last, and by
@@ -817,6 +826,9 @@ func (s *Scheduler) autotuneLocked(now time.Time) {
 		s.closeRoundLocked()
 		s.tune.roundStart = s.tune.roundStart.Add(round)
 	}
+	// The next round's length is sampled once, now that it has started:
+	// an RTT that changed mid-round takes effect a round later.
+	s.tune.roundLen = s.autotuneRound()
 }
 
 func (s *Scheduler) closeRoundLocked() {
