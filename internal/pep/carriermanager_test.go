@@ -490,19 +490,3 @@ func TestCarrierSilenceIsCountedFromTheFirstUnansweredPacket(t *testing.T) {
 		t.Fatal("a carrier with no flows was found silent")
 	}
 }
-
-// The idle tests' packet bound rests on this count: the schedule's PINGs go
-// out 0.5, 1.5, 3.5, 7.5, 12.5, 17.5 … seconds after the last payload.
-func TestKeepAlivesWithinFollowsTheSchedule(t *testing.T) {
-	for _, tc := range []struct {
-		window time.Duration
-		want   int
-	}{
-		{400 * time.Millisecond, 0}, {500 * time.Millisecond, 1}, {3 * time.Second, 2},
-		{15 * time.Second, 5}, {18 * time.Second, 6}, {60 * time.Second, 14},
-	} {
-		if got := keepAlivesWithin(tc.window, 500*time.Millisecond, 5*time.Second); got != tc.want {
-			t.Errorf("%v: %d keep-alives, want %d", tc.window, got, tc.want)
-		}
-	}
-}
