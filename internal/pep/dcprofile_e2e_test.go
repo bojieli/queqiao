@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -828,6 +829,22 @@ func TestDCProfileRunsOnThePathAuthorityWithTheTreeAsKnowledge(t *testing.T) {
 	}
 	if egress == nil || endpoint == nil {
 		t.Fatalf("the authority did not report through the tree: %+v", nodes)
+	}
+	// Only the client's authority is in a tree: one uplink and one endpoint
+	// pair, the client's to its relay. The gateway's authority takes no tree
+	// view (#235), so no node is keyed by the gateway's own address.
+	gateway := dcHost(t, 40, 1)
+	var dests int
+	for _, n := range nodes {
+		if strings.Contains(n.Key, gateway+"->") {
+			t.Errorf("the gateway's authority reported into a tree: node %s", n.Key)
+		}
+		if strings.HasPrefix(n.Key, "dest|") {
+			dests++
+		}
+	}
+	if dests != 1 || !strings.Contains(endpoint.Key, "->"+dcHost(t, 20, 1)) {
+		t.Errorf("want exactly the client's endpoint pair to the relay, got %d dest nodes (%s)", dests, endpoint.Key)
 	}
 	for _, n := range []*pathmodel.NodeReport{egress, endpoint} {
 		if n.State.ObservedSamples == 0 {

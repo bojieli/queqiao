@@ -994,10 +994,9 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 		}
 		controller = attachPathController(conn, congestionConfig{
 			kind: s.cfg.Congestion, ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched, scope: s.cfg.CongestionScope,
-			// Under a hierarchical profile the gateway's authorities sit in
-			// its own tree (its uplink, then each client endpoint pair) as
-			// knowledge only (§11.3). The legacy gateway had no tree.
-			hierarchicalPath: s.cfg.Profile.HierarchicalPath,
+			// No hierarchicalPath: the tree is a client's (§11.3). The
+			// gateway's authorities take no tree view, as the legacy gateway
+			// had no tree; no gate judges one (#235).
 		}, func() string { return gatewayPathPrincipal(principal) })
 	}
 	s.metrics.DataConnectionAccepted(wire)

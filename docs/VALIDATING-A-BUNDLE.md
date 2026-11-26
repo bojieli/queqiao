@@ -446,15 +446,14 @@ stage 9 data exists.
 ### The workload
 
 A leaf is an endpoint pair, and the gateway is the sender for downloads, so
-each client host is one leaf under the gateway's shared egress. Under the
-candidate the gateway's authorities sit in its tree as knowledge only. The
-legacy gateway has no tree at all: its per-peer controllers are independent,
-and the legacy tree's joint limit couples only clients in one process. So
-this campaign compares one authority per leaf with independent legacy
-controllers. The joint limit itself is exercised by the deterministic test
-`TestDCMultiLeafFairnessHoldsWithAKnowledgeOnlyTree` (uploads, several
-clients in one process), which computes the same contrasts with the same
-bounds. The DC campaign
+each client host is one leaf under the gateway's shared egress. Neither arm
+has a tree on the gateway: the candidate's gateway authorities take no tree
+view, and the legacy gateway's per-peer controllers are independent,
+and the legacy tree's joint limit couples only clients in one process. So the
+download phases compare one authority per leaf with independent legacy
+controllers. The joint limit itself is exercised by the upload phase below,
+and by the deterministic test `TestDCMultiLeafFairnessHoldsWithAKnowledgeOnlyTree`.
+Both run several leaves in one client process. The DC campaign
 (`scripts/validation/dc-campaign.example.ini`) has these parts:
 
 - One temporary gateway per arm, with `--path-profile dc-long-haul` on both
@@ -497,6 +496,51 @@ bounds. The DC campaign
 - **The temporary account** has no device or flow limit of its own, so the
   gateway's `--max-sessions` is the only admission limit. A campaign then
   measures the path rather than account admission.
+
+### The upload phase
+
+The download phases cannot see the legacy tree's joint limit. That limit
+lives in a client process and couples only the clients inside it, and the
+download phases run one client process per leaf host, with the gateway
+sending. The upload phase is where the gate sees the tree (design §11.3,
+#235). It is configured in `[dc]` and the `[upleaf:...]` sections:
+
+- **One uploader process.** `uploader` names a `[client:...]` on a host of
+  its own. Per arm it runs one `queqiaod client --providers` process, with
+  one provider per upload leaf. Each provider is enrolled with
+  `provider invite --path NAME=ADDRESS:PORT`, so it dials its leaf's relay,
+  and listens on its own loopback port.
+- **One relay per leaf.** Each `[upleaf:NAME]` (`host`, `address`) runs a
+  `queqiaod relay` per arm that forwards to that arm's gateway. Every upload
+  leaf is then its own remote host, so its own leaf, and the uploader's uplink
+  is the common ancestor. A relay may share a host with a download leaf but
+  not with the uploader or the gateway, and no two relays share a host or an
+  address.
+- **The phase.** `upload_leaves` each run `upload_flows_per_leaf` backlogged
+  uploads of `upload_object_bytes` objects to wlserver's sink, all at once on
+  a barrier. `upload_control` is the light sibling: one ASR-shaped request
+  (355 KB up) every `control_interval`. A cut object counts the bytes the sink
+  received.
+- **Calibration.** Each upload leaf also runs alone, after the download
+  calibration (the same `calibrate` rule). The legacy arm's simultaneous
+  upload rate must be at most `[upload] binding_max` (0.80) of the sum of the
+  solo rates. Otherwise the uplink did not bind and the campaign is VOID: pick
+  an uploader with a narrower uplink, or add upload load.
+- **Evidence.** In each upload window the gateway must see only QUIC flows,
+  one leaf key per upload leaf plus one for the sibling (one per solo run),
+  and the uploader must run `dc-long-haul` with the arm's bundle. Leaves
+  behind one relay void the campaign.
+
+The upload criteria are the download criteria with their own frozen bounds,
+in `dc_gate.ini` `[upload]`:
+
+| Criterion | Contrast |
+|---|---|
+| upload goodput (aggregate of upload leaves) | `cand − 0.90 × legacy` |
+| worst upload leaf's bytes | `cand − 0.90 × legacy` |
+| completion spread (slowest leaf's median whole-object time over the fastest's) | `1.25 × legacy − cand`, and `3.5 − cand` |
+| Jain's index over upload leaves | `cand − (legacy − 0.05)` |
+| sibling request p50 | `1.10 × legacy − cand` |
 
 ### The criteria
 

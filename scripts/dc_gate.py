@@ -38,6 +38,9 @@ def load_bounds(path: str = BOUNDS) -> dict:
         raise SystemExit(f"cannot read {path}")
     s, v, g = cp["statistics"], cp["validity"], cp["gate"]
     out = {k: g.getfloat(k) for k in g}
+    # The upload phase's own bounds (frozen like the rest), prefixed "up_".
+    if cp.has_section("upload"):
+        out.update({"up_" + k: cp["upload"].getfloat(k) for k in cp["upload"]})
     out.update(alpha=s.getfloat("alpha"), resamples=s.getint("bootstrap_resamples"), seed=s.getint("bootstrap_seed"),
                max_zero_main_fraction=s.getfloat("max_zero_main_fraction"), binding_max=v.getfloat("binding_max"),
                min_legacy_completion=v.getfloat("min_legacy_completion"))
@@ -100,7 +103,8 @@ def shared_window(rows: List[dict], leaves: List[str], duration: float, share: f
     return sum(b - a for a, b in (common or [])) >= share * duration - 2 * OVERLAP_MIN
 
 
-def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: float, duration: float = 0.0) -> Dict[str, float]:
+def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: float, duration: float = 0.0,
+                dc_upload: Optional[dict] = None) -> Dict[str, float]:
     m: Dict[str, float] = {}
     sus = [r for r in t.rows if r["phase"] == "sustained" and r["kind"] == "bulk"]
     m["sim_rate"] = sum(leaf_rate([r for r in sus if r["client"] == leaf]) for leaf in loaded)
@@ -173,12 +177,46 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     # that fails everything; completion does.
     m["completion"] = ((m["requests_ok"] + sum(1 for r in probes if r["complete"] == "1")) / (len(req) + len(probes))
                        if req or probes else float("nan"))
+    m.update(upload_measures(t, dc_upload or {}, request_timeout, duration))
+    return m
+
+
+def upload_measures(t: Trial, up: dict, request_timeout: float, duration: float) -> Dict[str, float]:
+    """The upload phase (section 11.3, #235): several leaves uploading at once
+    through one multi-provider client process, whose uplink is their common
+    ancestor, and a light sibling's requests under them. The same criteria
+    as the download phase, on the direction where the legacy tree's shared
+    node caps every member. Empty when the campaign has no upload phase."""
+    leaves, control = up.get("upload_leaves") or [], up.get("upload_control", "")
+    if not leaves:
+        return {}
+    m: Dict[str, float] = {}
+    rows = [r for r in t.rows if r["phase"] == "uploads" and r["kind"] == "dc-upload"]
+    per_leaf = {leaf: float(sum(useful(r) for r in rows if r["client"] == leaf)) for leaf in leaves}
+    m["up_sim_rate"] = sum(leaf_rate([r for r in rows if r["client"] == leaf]) for leaf in leaves)
+    m["up_aggregate_bytes"] = sum(per_leaf.values())
+    m["up_worst_leaf_bytes"] = min(per_leaf.values())
+    m["up_jain"] = st.jain(list(per_leaf.values()))
+    # Completion times: each leaf's median whole-object upload.
+    meds = [st.median([float(r["seconds"]) for r in rows if r["client"] == leaf and r["complete"] == "1"])
+            for leaf in leaves]
+    m["up_spread"] = (max(meds) / min(meds) if all(x == x for x in meds) and min(meds) > 0 else float("nan"))
+    if not shared_window(rows, leaves, duration):
+        for k in ("up_sim_rate", "up_aggregate_bytes", "up_worst_leaf_bytes", "up_jain", "up_spread"):
+            m[k] = float("nan")
+    probes = under_load([r for r in t.rows if r["phase"] == "uploads" and r["client"] == control
+                         and r["kind"] == "dc-upprobe"], rows)
+    ctl = [float(r["seconds"]) if r["complete"] == "1" else float(request_timeout) for r in probes]
+    m["_upctl"] = ctl
+    m["up_control_p50"] = st.quantile(ctl, 0.5) if ctl else float("nan")
+    m["up_capped"] = float(capped_flows(rows, duration))
     return m
 
 
 # Percentile measures computed over an arm's pooled samples in a block:
 # measure -> (sample list in Trial.m, quantile).
-POOLED = {"latency_p50": ("_lat", 0.5), "latency_p99": ("_lat", 0.99), "control_p50": ("_ctl", 0.5)}
+POOLED = {"latency_p50": ("_lat", 0.5), "latency_p99": ("_lat", 0.99), "control_p50": ("_ctl", 0.5),
+          "up_control_p50": ("_upctl", 0.5)}
 
 
 def pooled_block_stat(trials: List[Trial], key: str) -> float:
@@ -221,7 +259,10 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
         return records[k]
 
     def in_trial(t: Trial) -> List[dict]:
-        return [r for r in recs(t.arm, t.block) if t.start - 1 <= r["_t"] <= t.end + 5]
+        # The download phases only: the upload phase's flows (through the
+        # upload leaves' relays) are checked by upload_evidence.
+        end = min([t.end] + [ts(r["start_utc"]) - 1 for r in t.rows if r["phase"] == "uploads" and r.get("start_utc")])
+        return [r for r in recs(t.arm, t.block) if t.start - 1 <= r["_t"] <= end + 5]
 
     def fallbacks(t: Trial, leaf: str) -> float:
         name = f"{t.tag}-s{t.slot}-{t.arm}"
@@ -334,6 +375,56 @@ def bundle_evidence(campaign: str, plan: dict, loaded: List[str], control: str) 
     return missing, wrong
 
 
+def upload_evidence(campaign: str, plan: dict, ab: List[Trial], upsolo: List[Trial]) -> Tuple[List[str], List[str]]:
+    """Did the upload phase run through the leaves it is about? From the
+    gateway's flow records in each upload window: every flow QUIC; each solo
+    upload calibration one leaf key; each simultaneous upload phase one key
+    per upload leaf and one for the sibling, all distinct (one relay host
+    each). The uploader's single process and uplink -- the common ancestor --
+    are the runner's construction (one --providers client on its own host),
+    recorded in effective/. Returns (missing, wrong)."""
+    missing: List[str] = []
+    wrong: List[str] = []
+    dc = plan["dc"]
+    want = len(dc["upload_leaves"]) + 1
+
+    def recs(t: Trial, phase: str) -> Optional[List[dict]]:
+        rows = [r for r in t.rows if r["phase"] == phase and r.get("start_utc") and r.get("end_utc")]
+        if not rows:
+            return None
+        lo, hi = min(ts(r["start_utc"]) for r in rows), max(ts(r["end_utc"]) for r in rows)
+        files = glob.glob(os.path.join(campaign, "logs", f"gw-{t.arm}", f"server-b{t.block:03d}-dc.jsonl*"))
+        out = []
+        for r in iter_json(files, ('"remote flow complete"', '"remote flow ended with error"')):
+            try:
+                when = ts(r["time"])
+            except (KeyError, ValueError):
+                continue
+            if lo - 1 <= when <= hi + 5:
+                out.append(r)
+        return out
+
+    for t, phase, n, what in [(t, "uploads", want, f"block {t.block} slot {t.slot} ({t.arm}) uploads") for t in ab] + \
+            [(t, "upsolo", 1, f"block {t.block} upload solo {next((r['client'] for r in t.rows), '')}") for t in upsolo]:
+        rs = recs(t, phase)
+        if rs is None:
+            missing.append(f"{what}: no upload rows")
+            continue
+        if not rs:
+            missing.append(f"{what}: no gateway record of its flows")
+            continue
+        if any(tcp_evidence(r) for r in rs):
+            wrong.append(f"{what}: some flows ran over TCP, not only QUIC")
+            continue
+        if any("path_key" not in r for r in rs):
+            missing.append(f"{what}: no gateway record of its leaves (needs QUEQIAO_LANE_TRACE=1)")
+            continue
+        keys = {r["path_key"] for r in rs}
+        if len(keys) != n:
+            wrong.append(f"{what}: gateway saw {len(keys)} leaf key(s), expected {n} (one relay host per leaf)")
+    return missing, wrong
+
+
 def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     plan, trials = read_campaign(campaign)
     if plan.get("workload") != "dc" or not plan.get("dc"):
@@ -350,12 +441,19 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     main = plan["main"]
     cands = [a for a in plan["arms"] if a != main]
     ab = [t for t in trials.values() if t.slot < 100]
-    solo = [t for t in trials.values() if t.slot >= 100]
+    # Solo calibrations: the download leaves' ("solo") and the upload
+    # leaves' ("upsolo").
+    upsolo = [t for t in trials.values() if t.slot >= 100 and any(r["phase"] == "upsolo" for r in t.rows)]
+    solo = [t for t in trials.values() if t.slot >= 100 and t not in upsolo]
     duration = float(plan.get("config", {}).get("duration") or 0)
+    uploads = bool(dc.get("upload_leaves"))
     for t in ab:
-        t.m = dc_measures(t, loaded, control, dc["request_timeout"], duration)
+        t.m = dc_measures(t, loaded, control, dc["request_timeout"], duration, dc)
     evidence_missing, evidence_wrong = carrier_evidence(campaign, plan, ab, solo, loaded, control)
-    bundle_missing, bundle_wrong = bundle_evidence(campaign, plan, loaded, control)
+    if uploads:
+        up_missing, up_wrong = upload_evidence(campaign, plan, ab, upsolo)
+        evidence_missing, evidence_wrong = evidence_missing + up_missing, evidence_wrong + up_wrong
+    bundle_missing, bundle_wrong = bundle_evidence(campaign, plan, loaded + ([dc["uploader"]] if uploads else []), control)
     evidence_missing, evidence_wrong = evidence_missing + bundle_missing, bundle_wrong + evidence_wrong
 
     def per_block(arm: str, key: str, agg) -> Dict[int, float]:
@@ -407,6 +505,31 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
         evidence_missing = evidence_missing + [f"{len(uncalibrated)} block(s) lack a usable solo calibration of every "
                                                f"loaded leaf (first: block {uncalibrated[0]})"]
     binding_mean = st.mean(binding)
+    # The same validity rule for the upload phase, from the upload solos:
+    # the uploader's uplink must bind the upload leaves together.
+    up_binding: List[float] = []
+    up_bound_ok = True
+    if uploads:
+        up_leaves = dc["upload_leaves"]
+        up_uncal: List[int] = []
+        for b in sorted({t.block for t in ab}):
+            rates = {}
+            for t in upsolo:
+                if t.block == (1 if once else b):
+                    leaf = next((r["client"] for r in t.rows), None)
+                    up = [r for r in t.rows if r["kind"] == "dc-upload"]
+                    rates[leaf] = leaf_rate(up) if shared_window(up, [leaf], duration) else float("nan")
+            sim = [t.m.get("up_sim_rate", float("nan")) for t in ab if t.block == b and t.arm == main]
+            if not (set(up_leaves) <= set(rates) and all(rates[x] == rates[x] and rates[x] > 0 for x in up_leaves)
+                    and sim and all(x == x for x in sim)):
+                up_uncal.append(b)
+                continue
+            up_binding.append(st.mean(sim) / sum(rates[x] for x in up_leaves))
+        if up_uncal or not up_binding:
+            evidence_missing = evidence_missing + [f"{len(up_uncal)} block(s) lack a usable upload solo calibration of "
+                                                   "every upload leaf"]
+        up_mean = st.mean(up_binding)
+        up_bound_ok = not (up_mean == up_mean) or up_mean <= bounds.get("up_binding_max", bounds["binding_max"])
     # VOID only for a measured ratio over the bound; no ratio at all (no
     # usable calibration, or calibrate = false) is missing evidence.
     bound_ok = not (binding_mean == binding_mean) or binding_mean <= bounds["binding_max"]
@@ -415,7 +538,7 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
                                                "(set [dc] calibrate = true)"]
     # The sustained outcome is bytes within the window; if a flow ran out of
     # bytes first, the arms are capped at the object size and look alike.
-    capped = sum(int(t.m["capped"]) for t in ab)
+    capped = sum(int(t.m["capped"]) + int(t.m.get("up_capped", 0) or 0) for t in ab)
 
     # Every endpoint of every arm must have run dc-long-haul, checked one
     # endpoint at a time. Clients log their path profile; the gateway does
@@ -429,7 +552,7 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
             gw = []
         if not gw or not all("--path-profile dc-long-haul" in line for line in gw):
             problems = problems + [f"gateway {arm}: no evidence it ran --path-profile dc-long-haul"]
-        for leaf in loaded + [control]:
+        for leaf in loaded + [control] + ([dc["uploader"]] if uploads else []):
             files = glob.glob(os.path.join(campaign, "logs", f"cl-{leaf}-{arm}", "*.jsonl*"))
             seen = {rec.get("path_profile", "") for rec in iter_json(files, ('"runtime configuration"',))
                     if rec.get("msg") == "runtime configuration"}
@@ -453,7 +576,9 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
                    "more than the pre-registered fraction of legacy blocks delivered nothing" if zero_void else
                    f"the legacy arm completed only {legacy_completion:.0%} of requests; the workload does not work"
                    if workload_broken else
-                   "the shared ancestor did not bind; add load" if not bound_ok else "")
+                   "the shared ancestor did not bind; add load" if not bound_ok else
+                   "the uploader's uplink did not bind the upload leaves; add upload load or narrow the uplink"
+                   if not up_bound_ok else "")
     criteria = [
         # name, key, per-block aggregation, contrast builder (cand, legacy) -> d
         ("sustained goodput (aggregate bytes)", "aggregate_bytes", total,
@@ -475,6 +600,24 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
         ("control leaf request p50", "control_p50", avg,
          lambda c, l: bounds["control_max_ratio"] * l - c, f"{bounds['control_max_ratio']:g} x legacy - cand"),
     ]
+    if uploads:
+        # The upload phase, where the legacy tree's joint limit acts (#235),
+        # judged by the same criteria with its own frozen bounds.
+        u = lambda k: bounds["up_" + k]
+        criteria += [
+            ("uploads: aggregate goodput (bytes)", "up_aggregate_bytes", total,
+             lambda c, l: c - u("goodput_ratio") * l, f"cand - {u('goodput_ratio'):g} x legacy"),
+            ("uploads: worst leaf's service (bytes)", "up_worst_leaf_bytes", total,
+             lambda c, l: c - u("worst_leaf_ratio") * l, f"cand - {u('worst_leaf_ratio'):g} x legacy"),
+            ("uploads: completion spread", "up_spread", avg,
+             lambda c, l: u("spread_max_ratio") * l - c, f"{u('spread_max_ratio'):g} x legacy - cand"),
+            ("uploads: completion spread ceiling", "up_spread", avg,
+             lambda c, l: u("spread_ceiling") - c, f"{u('spread_ceiling'):g} - cand"),
+            ("uploads: cross-leaf fairness (Jain)", "up_jain", avg,
+             lambda c, l: c - (l - u("jain_margin")), f"cand - (legacy - {u('jain_margin'):g})"),
+            ("uploads: sibling request p50", "up_control_p50", avg,
+             lambda c, l: u("control_max_ratio") * l - c, f"{u('control_max_ratio'):g} x legacy - cand"),
+        ]
     name = os.path.basename(os.path.normpath(campaign))
     out = [f"## DC gate (stage 9): {name}", "",
            "Bounds frozen in `scripts/validation/dc_gate.ini` (DESIGN-PATH-AUTHORITY.md section 11.3). Each row is a "
@@ -487,13 +630,20 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
         out += ["**No verdict: the campaign is incomplete.** " + "; ".join(problems) + ".", ""]
     arms = [main] + cands
     out += ["| per block, mean | " + " | ".join(arms) + " |", "|---|" + "---:|" * len(arms)]
-    for label, key, agg, scale, spec in (("aggregate sustained MB", "aggregate_bytes", total, 1e-6, ".1f"),
-                                         ("worst leaf MB", "worst_leaf_bytes", total, 1e-6, ".1f"),
-                                         ("Jain index", "jain", avg, 1, ".3f"),
-                                         ("completion spread", "spread", avg, 1, ".2f"),
-                                         ("request p50, s", "latency_p50", avg, 1, ".3f"),
-                                         ("request p99, s", "latency_p99", avg, 1, ".3f"),
-                                         ("control p50, s", "control_p50", avg, 1, ".3f")):
+    rows_shown = [("aggregate sustained MB", "aggregate_bytes", total, 1e-6, ".1f"),
+                  ("worst leaf MB", "worst_leaf_bytes", total, 1e-6, ".1f"),
+                  ("Jain index", "jain", avg, 1, ".3f"),
+                  ("completion spread", "spread", avg, 1, ".2f"),
+                  ("request p50, s", "latency_p50", avg, 1, ".3f"),
+                  ("request p99, s", "latency_p99", avg, 1, ".3f"),
+                  ("control p50, s", "control_p50", avg, 1, ".3f")]
+    if uploads:
+        rows_shown += [("uploads: aggregate MB", "up_aggregate_bytes", total, 1e-6, ".1f"),
+                       ("uploads: worst leaf MB", "up_worst_leaf_bytes", total, 1e-6, ".1f"),
+                       ("uploads: Jain index", "up_jain", avg, 1, ".3f"),
+                       ("uploads: completion spread", "up_spread", avg, 1, ".2f"),
+                       ("uploads: sibling p50, s", "up_control_p50", avg, 1, ".3f")]
+    for label, key, agg, scale, spec in rows_shown:
         out.append(f"| {label} | " + " | ".join(fmt(st.mean(list(per_block(x, key, agg).values())) * scale, spec) for x in arms) + " |")
     out.append("| requests completed | " + " | ".join(
         f"{sum(int(t.m['requests_ok']) for t in ab if t.arm == x)}/{sum(int(t.m['requests']) for t in ab if t.arm == x)}" for x in arms) + " |")
