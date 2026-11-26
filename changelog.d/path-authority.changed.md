@@ -14,7 +14,9 @@ serves wire-1 clients and released clients, so upgrade gateways first.
   a released client's isolated and rescue connections included, attaches to
   the same controller. A path that has been application-limited since its
   minimum round trip was measured, such as the uplink beside a download,
-  takes no ProbeRTT. On Windows the QUIC stack now reads the performance
+  takes no ProbeRTT, and at a standing queue the path's flight is bounded by
+  loss, so two senders no longer hold a shared bottleneck's queue full. On
+  Windows the QUIC stack now reads the performance
   counter: Go's clock there advances once per clock interrupt (15.6 ms by
   default), too coarse for the controller to measure a short path.
 - Class scheduling. The controller chooses whether the next packet carries
