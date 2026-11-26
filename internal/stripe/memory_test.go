@@ -670,3 +670,45 @@ func TestStagedBytesDoNotWaitForASpeculativeChunk(t *testing.T) {
 		t.Fatalf("published %d bytes", len(chunk.Data))
 	}
 }
+
+// Floor raises the bound's floor to the path's window: a flow that went idle
+// long enough to decay to Startup still holds one window when it returns, so
+// a request of up to that size goes in one flight instead of paying a credit
+// round per Startup's worth. The floor needs no credit, follows the window
+// as it moves, and never passes MaxOutstandingBytes.
+func TestAutotuneFloorHoldsOnePathWindowAcrossIdle(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	var window atomic.Int64
+	window.Store(10 * tuneChunk)
+	s := New(infiniteSource{}, Config{
+		ChunkSize: tuneChunk, LaneWindow: 1024, MaxOutstanding: 1024, MaxOutstandingBytes: tuneMax,
+		Now: clock.Now, Autotune: &Autotune{
+			Round: func() time.Duration { return tuneRound },
+			Floor: func() int { return int(window.Load()) },
+		},
+	})
+	t.Cleanup(s.Close)
+	startup := DefaultAutotuneStartupChunks * tuneChunk
+	if got := s.RetentionBound(); got != 10*tuneChunk {
+		t.Fatalf("bound %d before any credit; want the floor %d above the startup %d", got, 10*tuneChunk, startup)
+	}
+	// A long idle replays empty rounds; the bound decays only to the floor.
+	clock.advance(100 * tuneRound)
+	if got := s.RetentionBound(); got != 10*tuneChunk {
+		t.Fatalf("bound %d after a long idle; want the floor %d", got, 10*tuneChunk)
+	}
+	// The floor follows the window, both ways, and the bound decays to it.
+	window.Store(20 * tuneChunk)
+	if got := s.RetentionBound(); got != 20*tuneChunk {
+		t.Fatalf("bound %d after the window grew; want %d", got, 20*tuneChunk)
+	}
+	window.Store(2 * tuneChunk)
+	clock.advance(100 * tuneRound)
+	if got := s.RetentionBound(); got != startup {
+		t.Fatalf("bound %d with a window below startup; want the startup floor %d", got, startup)
+	}
+	window.Store(4 * tuneMax)
+	if got := s.RetentionBound(); got != tuneMax {
+		t.Fatalf("bound %d with a huge window; want MaxOutstandingBytes %d", got, tuneMax)
+	}
+}

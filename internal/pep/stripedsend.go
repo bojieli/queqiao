@@ -134,9 +134,21 @@ func (l *mpLane) windowBytes() int {
 // window means. Fixed at 16 MiB it was the binding limit on a fast path and
 // four times more than a slow one will ever use.
 func (f *multipathFlow) retentionBytes() int {
+	total := f.pathWindowBytes()
+	if total <= 0 {
+		return minFlowRetentionBytes
+	}
+	if want := 2 * total; want > minFlowRetentionBytes {
+		return want
+	}
+	return minFlowRetentionBytes
+}
+
+// pathWindowBytes is the combined congestion window of the flow's lanes,
+// counting once the window of lanes attached to one path controller: what
+// the flow's transports can have in flight at once. Zero without telemetry.
+func (f *multipathFlow) pathWindowBytes() int {
 	total := 0
-	// Lanes on connections attached to one path controller share its
-	// window: it counts once.
 	var authorities map[uint64]struct{}
 	for _, lane := range f.healthyLanes() {
 		cwnd, _ := lane.congestionState()
@@ -151,13 +163,7 @@ func (f *multipathFlow) retentionBytes() int {
 		}
 		total += cwnd
 	}
-	if total <= 0 {
-		return minFlowRetentionBytes
-	}
-	if want := 2 * total; want > minFlowRetentionBytes {
-		return want
-	}
-	return minFlowRetentionBytes
+	return total
 }
 
 // creditRound is one flow-credit round trip: the slowest healthy lane's
@@ -354,7 +360,12 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		// The owned-memory bundle replaces the summed congestion windows with
 		// the flow's own credit-driven bound (design §8.3).
 		retention = nil
-		autotune = &stripe.Autotune{Round: f.creditRound, ReadyLimit: f.readyLimit}
+		// The floor is one path window: a flow back from idle may have what
+		// its transport can carry in one flight unacknowledged, rather than
+		// waiting a credit round per startup allowance. A request just over
+		// four chunks -- an LLM prompt of 132 KB -- otherwise paid a round
+		// trip on every turn after an idle gap.
+		autotune = &stripe.Autotune{Round: f.creditRound, ReadyLimit: f.readyLimit, Floor: f.pathWindowBytes}
 	}
 	sched := stripe.New(&flowSource{flow: f}, stripe.Config{
 		ChunkSize:      f.chunkSize,

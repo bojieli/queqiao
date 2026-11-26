@@ -252,6 +252,14 @@ type Autotune struct {
 	// ReadyLimit bounds READY bytes; nil or a non-positive answer leaves them
 	// bounded only by the retention bound.
 	ReadyLimit func() int
+	// Floor, if set, raises the bound's floor above Startup to its answer
+	// (never past MaxOutstandingBytes): what the flow may always hold
+	// unacknowledged, however long it was idle. The flow layer passes its
+	// path's congestion window, so a flow returning from idle sends a
+	// request of up to one flight without waiting a credit round per
+	// Startup's worth. It reserves nothing: shared memory is taken only for
+	// bytes in hand, under the endpoint's grants.
+	Floor func() int
 }
 
 const (
@@ -798,6 +806,16 @@ func (s *Scheduler) autotuneStartup() int {
 	return startup
 }
 
+// autotuneFloor is the bound's floor now: Startup, raised to Floor's answer
+// if that is larger, never past MaxOutstandingBytes.
+func (s *Scheduler) autotuneFloor() int {
+	floor := s.autotuneStartup()
+	if f := s.cfg.Autotune.Floor; f != nil {
+		floor = max(floor, min(f(), s.cfg.MaxOutstandingBytes))
+	}
+	return floor
+}
+
 func (s *Scheduler) autotuneRound() time.Duration {
 	if round := s.cfg.Autotune.Round; round != nil {
 		if d := round(); d > 0 {
@@ -822,6 +840,10 @@ func (s *Scheduler) autotuneLocked(now time.Time) {
 	if s.cfg.Autotune == nil {
 		return
 	}
+	// The floor can rise at any time (the path's window grew), and the
+	// bound is never below it. That is a floor, not growth: it needs no
+	// coverage.
+	defer func() { s.tune.bound = max(s.tune.bound, s.autotuneFloor()) }()
 	round := s.tune.roundLen
 	if now.Sub(s.tune.roundStart) < round {
 		return
@@ -850,7 +872,7 @@ func (s *Scheduler) closeRoundLocked() {
 		t.rounds++
 	}
 	ceiling := s.cfg.MaxOutstandingBytes
-	floor := s.autotuneStartup()
+	floor := s.autotuneFloor()
 	if t.covered && t.blocked && t.room {
 		t.bound = min(2*t.bound, ceiling)
 	} else {
