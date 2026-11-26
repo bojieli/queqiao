@@ -943,6 +943,11 @@ while they run: their samples stay on the host and are fetched once the
 trial ends, with about three minutes of ssh retries, so a brief outage of
 the runner's link no longer voids a block. `[campaign] fetch_via = <ssh
 host>` fetches logs through that host, for a slow direct link.
+`ssh_proxy_jump = <ssh host>` in a section naming a host ([gateway],
+[relay], [client:...], [production:...]) reaches that host through the
+other for every session and copy (ssh ProxyJump, this machine's own keys
+end to end). Binaries are uploaded gzipped, unpacked on the host and
+checked against the local SHA-256 before they replace anything.
 
 **Reading a rule's row.** Every rule's per-block contrast is the
 candidate's headroom inside its bound, positive when inside whichever way

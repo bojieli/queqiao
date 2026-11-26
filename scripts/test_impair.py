@@ -484,3 +484,34 @@ class PatientTeardown(unittest.TestCase):
         with mock.patch.object(ab.Host, "run", return_value=(0, "")):
             c.teardown()
         self.assertTrue(c.hosts and all(h.retry_255 == c.TEARDOWN_SSH_TRIES for h in c.hosts.values()))
+
+
+class ProxyJump(unittest.TestCase):
+    def test_a_section_s_host_is_reached_through_its_jump(self):
+        cfg = parse(BASE.replace("[gateway]\nhost = gw", "[gateway]\nhost = gw\nssh_proxy_jump = rl"))
+        self.assertEqual(cfg.proxy_jumps, {"gw": "rl"})
+        c = ab.Campaign(cfg, "/nonexistent", ".", dry=True, stream=io.StringIO())
+        self.assertIn("ProxyJump=rl", c.hosts["gw"]._argv())
+        self.assertNotIn("ProxyJump=rl", " ".join(c.hosts["c1"]._argv()))
+        with self.assertRaisesRegex(ab.ConfigError, "already jumps"):
+            parse(BASE.replace("[gateway]\nhost = gw", "[gateway]\nhost = gw\nssh_proxy_jump = rl")
+                  .replace("[production:gw]\nhost = gw", "[production:gw]\nhost = gw\nssh_proxy_jump = c1"))
+
+    def test_a_compressed_copy_is_checked_on_the_host(self):
+        import hashlib as hl
+        h = ab.Host("gw", [], False, out=io.StringIO(), proxy_jump="rl")
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "bin")
+            open(f, "wb").write(b"x" * 1000)
+            want = hl.sha256(b"x" * 1000).hexdigest()
+            ran = []
+            with mock.patch.object(ab.subprocess, "run", return_value=mock.Mock(returncode=0)) as scp, \
+                    mock.patch.object(h, "run", side_effect=lambda s, **k: ran.append(s) or (0, "QQ_COPY_OK")):
+                h.put(f, "/r/queqiaod", compress=True)
+            argv = scp.call_args[0][0]
+            self.assertTrue(argv[-1].endswith(":/r/queqiaod.gz") and "ProxyJump=rl" in argv)
+            self.assertIn(want, ran[0])                      # the host compares this file's SHA-256
+            with mock.patch.object(ab.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+                    mock.patch.object(h, "run", return_value=(1, "")):
+                with self.assertRaisesRegex(RuntimeError, "SHA-256 differs"):
+                    h.put(f, "/r/queqiaod", compress=True)
