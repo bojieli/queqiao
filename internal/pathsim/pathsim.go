@@ -206,6 +206,9 @@ type direction struct {
 	// the other, never both.
 	backlog float64
 	drainAt time.Time
+	// rate is the drain rate the backlog was last scheduled at, so that the
+	// occupancy can be read between packets (QueueDelay).
+	rate    float64
 	tokens  float64
 	tokenAt time.Time
 
@@ -246,6 +249,7 @@ func (d *direction) schedule(now time.Time, size int, cfg Config) (time.Time, bo
 		// moves. It is the same quantity only under that assumption, and the
 		// assumption is not one the emulator should need.
 		rate := float64(cfg.RateBytesPerSec)
+		d.rate = rate
 		if !d.drainAt.IsZero() {
 			d.backlog -= now.Sub(d.drainAt).Seconds() * rate
 			if d.backlog < 0 {
@@ -483,6 +487,27 @@ func NewBottleneck(cfg Config) *Bottleneck {
 // Stats returns the shared link's counters, which aggregate every attached
 // relay.
 func (b *Bottleneck) Stats() (up, down Stats) { return b.up.stats(), b.down.stats() }
+
+// QueueDelay is how long a packet arriving now would wait in the shared
+// link's queue, per direction: the standing queue the senders sharing it have
+// built.
+func (b *Bottleneck) QueueDelay() (up, down time.Duration) {
+	now := time.Now()
+	return b.up.queueDelay(now), b.down.queueDelay(now)
+}
+
+func (d *direction) queueDelay(now time.Time) time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.rate <= 0 || d.drainAt.IsZero() {
+		return 0
+	}
+	backlog := d.backlog - now.Sub(d.drainAt).Seconds()*d.rate
+	if backlog <= 0 {
+		return 0
+	}
+	return time.Duration(backlog / d.rate * float64(time.Second))
+}
 
 // Attach starts a relay that contends for this bottleneck instead of having a
 // path of its own.
