@@ -99,6 +99,7 @@ func TestCompleteLaneJoinMapsResetCodesToRetryPolicy(t *testing.T) {
 // meets rather than growing one through the SOCKS path.
 type joinTestRig struct {
 	client     *Client
+	server     *Server
 	serverFlow *multipathFlow
 	serverSess *serverFlow
 	cancel     context.CancelFunc
@@ -147,7 +148,7 @@ func newJoinTestRig(t *testing.T, clientTransport, initialKind TransportKind, tc
 	go func() { errorsCh <- server.ServeListener(ctx, serverListener) }()
 	go func() { errorsCh <- server.ServePacketConn(ctx, packetConn) }()
 	rig := &joinTestRig{
-		client: client, serverFlow: serverFlow, serverSess: serverSession,
+		client: client, server: server, serverFlow: serverFlow, serverSess: serverSession,
 		cancel: cancel, errorsCh: errorsCh,
 	}
 	t.Cleanup(func() {

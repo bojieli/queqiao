@@ -569,13 +569,21 @@ func (c *Client) openTCPHandoffLane(ctx context.Context, sessionID [16]byte, flo
 			// Nothing was sent on the lane but its authentication: closing
 			// it leaves the gateway nothing to clean up but the connection,
 			// which it held idle for at most the handshake wait.
-			_ = lane.fc.Close()
-			_ = lane.outer.Close()
+			discardLane(lane)
 			c.cfg.Logger.Info("TCP handoff stood down for a QUIC carrier", "flow_id", flowID, "dial", now.Sub(began))
 			return nil, errHandoffYielded
 		}
 	}
 	return c.completeLaneJoin(ctx, lane, flowID, 0)
+}
+
+// discardLane closes an authenticated lane that carried no JOIN. The TLS
+// close alert and the FIN go out at once, so the gateway's first-frame read
+// ends with an end of stream and releases the connection's admission slot
+// without waiting out its handshake bound.
+func discardLane(lane *authenticatedLane) {
+	_ = lane.fc.Close()
+	_ = lane.outer.Close()
 }
 
 // tcpHandoffYields reports whether a TCP handoff whose lane is ready should

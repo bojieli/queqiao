@@ -222,7 +222,10 @@ func runBlackholeDownloadOn(t *testing.T, arm workloadArm, transport TransportKi
 			time.Sleep(bhdBetween - bhdAfter)
 		}
 	}
-	res.tcpHandoffs = rig.client.carriers.tcpHandoffs.Load()
+	// The legacy bundle has no carrier manager, and no carrier handoffs.
+	if rig.client.carriers != nil {
+		res.tcpHandoffs = rig.client.carriers.tcpHandoffs.Load()
+	}
 	return res
 }
 
