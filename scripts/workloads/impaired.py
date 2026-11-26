@@ -15,8 +15,8 @@ impairment, one trial per arm per block in random order:
   +200 ms RTT; judged as the campaign in `<campaign>/idle-wake` by
   [workload:idle-wake].
 
-Each trial: the W5 LLM loop (5 turns), W6 keystrokes without bursts, and one
-bulk download of 4 MiB objects for the whole window.
+Each trial: the LLM swarm (4 x 10 turns), W6 keystrokes without bursts, and 30
+short downloads of 1 MiB across the window.
 
 Gated on reliability, each pre-registered and one-sided ([workload:impaired]
 in gates.ini, plus the [secondary] bounds of flow completion and stalls):
@@ -55,8 +55,8 @@ TRIAL_SECONDS = {"slow-lossy": 120, "blackhole": 120, "policed": 120}
 TRIAL_TYPES = tuple(TRIAL_SECONDS)
 WAKE_SCENARIO = "idle-wake-lossy"
 LEAD = 5                    # the foreground starts this long after the download
-BULK_OBJECT = 4 << 20       # each short download's object
-FETCHES = 8                 # short downloads per trial, sequential, one started every window/8 (or after the last)
+BULK_OBJECT = 1 << 20       # each short download's object
+FETCHES = 30                # short downloads per trial, sequential, one started every window/30 (or after the last)
 FETCH_TIMEOUT = 30          # a download not done in this long failed (a 25 s outage fits inside)
 # The LLM swarm: AGENTS concurrent loops of TURNS turns, short responses, so
 # a trial has AGENTS x TURNS calls: enough opportunities for the pooled
@@ -282,6 +282,20 @@ def echo_samples(trial, ph) -> List[float]:
     return out
 
 
+def fetch_attempts(trials, ph) -> Tuple[int, int]:
+    """(failed, attempted) short downloads over the trials, pooled: a download
+    the window's end cut was not a fair attempt and is left out."""
+    failed = tried_n = 0
+    for t in trials:
+        rows = [r for r in t.rows if r["phase"] == ph and r["kind"] == "imp-fetch"]
+        cut = {f"w1r{r.get('k')}" for r in getattr(t, "records", [])
+               if r.get("_phase") == ph and r.get("kind") == "fetch" and r.get("window_cut")}
+        tried = [r for r in rows if not (r["flow"] in cut and r.get("curl_exit") == "28")]
+        tried_n += len(tried)
+        failed += sum(1 for r in tried if r.get("complete") != "1")
+    return failed, tried_n
+
+
 def fetch_completion(trials, ph) -> float:
     """Completed over attempted short downloads, per trial, averaged: a
     download the window's end cut (curl's timeout while its limit was the
@@ -319,7 +333,7 @@ class Impaired(mn.Minimal):
     # Flow completion is the trial's own (completed / attempted short
     # downloads), not the generic single-flow one.
     generic = {t: ("stalls_per_trial",) for t in TRIAL_TYPES}
-    report_only = ("goodput_bps", "ttft_net_p50_s", "ttft_all_p99_s", "echo_p50_s", "recover_8s_s", "recover_25s_s",
+    report_only = ("completion", "goodput_bps", "ttft_net_p50_s", "ttft_all_p99_s", "echo_p50_s", "recover_8s_s", "recover_25s_s",
                    "reopen_ttfb_8s_s", "reopen_ttfb_25s_s", "inflight_ttfb_8s_s", "inflight_ttfb_25s_s")
 
     def generics(self, plan):
@@ -481,6 +495,7 @@ class Impaired(mn.Minimal):
             sessions = [r for r in recs if r.get("kind") in ("llm", "term")]
             out[f"{ph}.call_failures"] = (sum(1 for r in llm if r.get("fail")), len(llm))
             out[f"{ph}.silent_rate"] = (silent_deaths(recs), len(sessions))
+            out[f"{ph}.fetch_failures"] = fetch_attempts(pt, ph)
         return out
 
     def phase_measures(self, ph, recs, rows, trials):
@@ -495,6 +510,9 @@ class Impaired(mn.Minimal):
         sessions = [r for r in recs if r.get("kind") in ("llm", "term")]
         m: Dict[str, float] = {
             "completion": fetch_completion(trials, ph),
+            # Judged as a pooled event rate (gates.ini `events`); completion
+            # itself is reported.
+            "fetch_failures": (lambda f, n: f / n if n else nan)(*fetch_attempts(trials, ph)),
             "call_failures": lm.get("call_failures", nan),
             "silent_rate": silent_deaths(recs) / len(sessions) if sessions else nan,
             "ttft_net_p50_s": st.quantile(ttft, 0.5),
