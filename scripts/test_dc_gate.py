@@ -32,7 +32,8 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
              cand_request=1.0, cand_control=1.0, zero_legacy=(), drop_control=(), finished=False, no_solo=(),
              profile="dc-long-haul", fail_requests=(), stagger=(), gw_args=True, nat=False, tcp_leaf=None,
              no_path_key=False, fallback_leaf=None, tcp_lane_leaf=None, empty_egress=False, calibrate=None,
-             request_kind="requests", per_wave=8, tcp_at=None):
+             request_kind="requests", per_wave=8, tcp_at=None, cand_bundle=None, legacy_bundle="legacy",
+             no_bundle=False):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -139,8 +140,14 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
         for d in [f"gw-{arm}"] + [f"cl-{c}-{arm}" for c in LOADED + ["ctl"]]:
             os.makedirs(os.path.join(root, "logs", d), exist_ok=True)
             with open(os.path.join(root, "logs", d, "x-b001-dc.jsonl"), "w") as f:
-                f.write(json.dumps({"time": iso(t), "msg": "runtime configuration",
-                                    "path_profile": profile if arm == "cand" else "dc-long-haul"}) + "\n")
+                rec = {"time": iso(t), "msg": "runtime configuration",
+                       "path_profile": profile if arm == "cand" else "dc-long-haul"}
+                if not no_bundle:
+                    full = "cc-api=v2,sched=class,congestion=path,recovery=carrier,coded-retry=sticky,classifier=phased"
+                    if d.startswith("cl-"):
+                        full = full.replace("congestion=path,", "congestion=path,topology=single,")
+                    rec["bundle"] = (cand_bundle or full) if arm == "cand" else legacy_bundle
+                f.write(json.dumps(rec) + "\n")
     for (arm, b), recs in srv.items():
         with open(os.path.join(root, "logs", f"gw-{arm}", f"server-b{b:03d}-dc.jsonl"), "w") as f:
             for rec in recs:
@@ -301,6 +308,30 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("stagger", stagger=((3, "lb"),))
         self.assertEqual(v["cand"], "INCOMPLETE")
         self.assertIn("request latency p50: 11 of 12 blocks measured", text)
+
+    def test_the_new_architecture_bundle_is_accepted_as_the_candidate(self):
+        # The whole stage 1-8 bundle with classifier=phased (and the
+        # independent switches riding along) is what stage 9 measures.
+        text, v = self.run_gate("bundle", cand_bundle=None)
+        self.assertEqual(v["cand"], "PASS")
+        self.assertNotIn("new-architecture bundle (", text)
+
+    def test_a_partial_candidate_bundle_voids_the_campaign(self):
+        # Without carrier recovery the daemon refuses dc-long-haul; a campaign
+        # whose candidate ran something else did not test the gate's question.
+        text, v = self.run_gate("partial", cand_bundle="cc-api=v2,sched=class,congestion=path,coded-retry=sticky")
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("not dc-long-haul's new-architecture bundle", text)
+
+    def test_a_legacy_arm_on_the_new_bundle_voids_the_campaign(self):
+        text, v = self.run_gate("legacyv2", legacy_bundle="cc-api=v2,sched=class,congestion=path,coded-retry=sticky,recovery=carrier")
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("the legacy arm ran bundle", text)
+
+    def test_an_unrecorded_bundle_leaves_no_verdict(self):
+        text, v = self.run_gate("nobundle", no_bundle=True)
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("no bundle recorded", text)
 
     def test_gateway_profile_needs_its_own_evidence(self):
         text, v = self.run_gate("nogw", gw_args=False)

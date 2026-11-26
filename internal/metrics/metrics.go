@@ -136,6 +136,8 @@ type Registry struct {
 	quicCounters quicCounterTotals
 	// carrierShadow is written only by the carrier-liveness observer.
 	carrierShadow carrierShadowCounters
+	// carrierRecovery is written only by a client's carrier manager.
+	carrierRecovery [CarrierRecoveryEvents]atomic.Uint64
 	// creditDelay is the sender-side credit delay histogram (creditdelay.go).
 	creditDelay creditDelayHistogram
 	telemetryMu sync.Mutex
@@ -393,6 +395,9 @@ type Snapshot struct {
 	LaneRescueWins [RescueAttemptSlots]uint64
 	// CarrierShadow is the carrier-liveness observer's record.
 	CarrierShadow CarrierShadowSnapshot
+	// CarrierRecovery counts carrier-manager events, indexed by
+	// CarrierRecoveryEvent (--recovery=carrier).
+	CarrierRecovery [CarrierRecoveryEvents]uint64
 	// CreditDelay is the sender-side credit delay histogram.
 	CreditDelay CreditDelaySnapshot
 }
@@ -847,6 +852,9 @@ func (r *Registry) Snapshot() Snapshot {
 		s.LaneRescueWins[i] = r.laneRescueWins[i].Load()
 	}
 	s.CarrierShadow = r.carrierShadowSnapshot()
+	for i := range s.CarrierRecovery {
+		s.CarrierRecovery[i] = r.carrierRecovery[i].Load()
+	}
 	s.CreditDelay = r.creditDelaySnapshot()
 	now := r.now()
 	var expired uint64
@@ -1144,6 +1152,7 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	fmt.Fprintf(w, "queqiao_lane_grace_extensions_total %d\n", s.LaneGraceExtensions)
 	writeCarrierShadow(w, s.CarrierShadow)
+	writeCarrierRecovery(w, s.CarrierRecovery)
 	writeCreditDelay(w, s.CreditDelay)
 }
 

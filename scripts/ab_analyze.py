@@ -71,9 +71,11 @@ def load_gates(path: str = GATES) -> dict:
             rules = {}
             for k, v in cp[section].items():
                 parts = v.split()
-                kinds = list(RULES) + list(HARD) + list(VS_MAIN)
+                kinds = list(RULES) + list(HARD) + list(VS_MAIN) + ["events"]
                 if parts and parts[0] in ("atmost", "atleast") and len(parts) in (2, 3):
                     pass
+                elif parts and parts[0] == "events" and len(parts) == 3:
+                    pass                    # events <margin> <minimum opportunities per arm>
                 elif len(parts) != 2 or parts[0] not in kinds:
                     raise SystemExit(f"gates: [{section}] {k}: want one of {', '.join(kinds)} and a number "
                                      "(atmost/atleast take an optional absolute slack)")
@@ -121,6 +123,19 @@ HARD: Dict[str, Callable[[float, Tuple[float, ...]], bool]] = {
 VS_MAIN: Dict[str, Callable[[float, float, Tuple[float, ...]], bool]] = {
     "nofewer": lambda c, m, v: c >= m - v[0],
 }
+
+
+# How to read a rule's row: the contrast is the candidate's headroom inside
+# its bound, so positive is good whichever way the measure points.
+RULE_LEGEND = ("Per block, the contrast is how far the candidate is inside its bound: `lower v` main + v - cand; "
+               "`higher v` cand - (main - v); `atmost m a` m x main + a - cand; `atleast m a` cand - (m x main - a). "
+               "Positive is inside the bound, whichever way the measure points. A rule passes when both one-sided "
+               "lower bounds of the mean contrast are above zero, and fails when an upper bound is below zero; "
+               "otherwise it is undecided, which at the block cap (or the end of a fixed campaign) is a fail. "
+               "`floor`/`ceiling` assert on the candidate in every judged block. `events v n` pools failures over "
+               "opportunities across blocks: pass when an exact binomial test puts the candidate's count below "
+               "main's pooled rate + v and a block-permutation check does not find it worse; it needs at least n "
+               "opportunities per arm.")
 
 
 def rule_contrasts(kind: str, value, cand: Sequence[float], main: Sequence[float]) -> List[float]:
@@ -397,7 +412,10 @@ def contention_void(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int]
     void: Dict[Tuple[int, str, str], str] = {}
     cpu: Dict[Tuple[str, str], dict] = {}
     hosts = (plan.get("hostcpu_hosts") or {})
-    if not plan.get("config", {}).get("host_cpu") or not bounds:
+    if not plan.get("config", {}).get("host_cpu") or not bounds or plan.get("beside_of"):
+        # A session beside the blocks (D) has no CPU samplers of its own: it
+        # overlaps the blocks, whose own samples judge contention on those
+        # hosts. Its trials are never void for a record it never had.
         return void, cpu
     for key, t in trials.items():
         if key[2] >= 100:
@@ -417,11 +435,26 @@ def contention_void(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int]
     return void, cpu
 
 
+# A session run beside the blocks (D) has its own instances, "<arm>.wake",
+# whose logs are under directories ending ".wake/".
+BESIDE_LOG = re.compile(r"\.wake/")
+
+
+def own_fetch_failures(paths: Sequence[str], beside: bool) -> List[str]:
+    """The fetch failures that belong to this campaign: a beside session's
+    logs are its own campaign's (the `idle-wake` subdirectory), never the
+    blocks'. (A runner before this split recorded both in each status.)"""
+    return [p for p in paths or [] if bool(BESIDE_LOG.search(p)) == beside]
+
+
 def fetch_failed(campaign: str) -> List[str]:
     """Remote log paths the runner could not fetch (status.json)."""
     try:
         with open(os.path.join(campaign, "status.json")) as f:
-            return list(json.load(f).get("fetch_failures") or [])
+            got = list(json.load(f).get("fetch_failures") or [])
+        with open(os.path.join(campaign, "plan.json")) as f:
+            beside = bool(json.load(f).get("beside_of"))
+        return own_fetch_failures(got, beside)
     except (OSError, ValueError):
         return []
 
@@ -494,8 +527,9 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
             # The runner's failures so far: a look applies the same evidence
             # rules as the final analysis.
             failed_jobs = control_plane((failures or {}).get("job_failures"))
-            if (failures or {}).get("fetch_failures"):
-                problems.append(f"{len(failures['fetch_failures'])} log file(s) could not be fetched")
+            own = own_fetch_failures((failures or {}).get("fetch_failures"), bool(plan.get("beside_of")))
+            if own:
+                problems.append(f"{len(own)} log file(s) could not be fetched")
         else:
             problems.append("no status.json: the campaign did not finish")
     else:
@@ -508,8 +542,9 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
             problems.append(f"the campaign {status.get('status')} (exit {status.get('exit')})")
         if status.get("production") != "unchanged":
             problems.append("production changed during the campaign")
-        if status.get("fetch_failures"):
-            problems.append(f"{len(status['fetch_failures'])} log file(s) could not be fetched; the log-derived "
+        own = own_fetch_failures(status.get("fetch_failures"), bool(plan.get("beside_of")))
+        if own:
+            problems.append(f"{len(own)} log file(s) could not be fetched; the log-derived "
                             "measures of the affected trials are withheld")
         failed_jobs = control_plane(status.get("job_failures"))
     planned: Dict[Tuple[int, str, str], set] = collections.defaultdict(set)
@@ -906,7 +941,9 @@ def report(campaign: str, gates: dict, interim: bool = False,
             stopped_early = bool(json.load(f).get("stopped"))
     except (OSError, ValueError):
         pass
-    undecided_ok = interim or stopped_early
+    # A campaign without a status (still running, or killed) has no final
+    # verdict: an undecided contrast is shown undecided, never FAIL.
+    undecided_ok = interim or stopped_early or not os.path.exists(os.path.join(campaign, "status.json"))
     method = measure(campaign, plan, trials)
     wl = ab_workloads.get(plan.get("workload", "bulk"))
     for t in trials.values():
@@ -939,6 +976,16 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     return True
         return False
     tail_cache: Dict[Tuple[str, int, str], Dict[str, Tuple[float, List[float]]]] = {}
+    event_cache: Dict[Tuple[str, int, str], Dict[str, Tuple[int, int]]] = {}
+
+    def block_events(path: str, block: int, arm: str) -> Dict[str, Tuple[int, int]]:
+        """(events, opportunities) of an arm's block, for `events` rules."""
+        k = (path, block, arm)
+        if k not in event_cache:
+            ts_ = [t for t in trials.values() if t.path == path and t.block == block and t.arm == arm and t.slot < 100]
+            f = getattr(wl, "block_events", None)
+            event_cache[k] = f(ts_, plan) if f and ts_ else {}
+        return event_cache[k]
 
     def block_tails(path: str, block: int, arm: str) -> Dict[str, Tuple[float, List[float]]]:
         k = (path, block, arm)
@@ -1200,6 +1247,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
                 out.append(f"| {k}{tag} | " + " | ".join(cells) + " |")
         if judged_rules:
             out += ["", f"**{wl.name} rules (pre-registered in gates.ini [workload:{wl.name}]), {path}**", "",
+                    RULE_LEGEND, "",
                     "| measure | rule | candidate | blocks | mean contrast | t lower bound | bootstrap lower bound | verdict |",
                     "|---|---|---|---:|---:|---:|---:|---|"]
             for key, (kind, values) in judged_rules.items():
@@ -1230,6 +1278,26 @@ def report(campaign: str, gates: dict, interim: bool = False,
                         verdicts[(path, cand, f"rule:{key}")] = verdict
                         out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {n_} samples | "
                                    f"{fmt(mean_d, '.4g')} | n/a | {fmt(bl, '.4g')} | {verdict} |")
+                        continue
+                    if kind == "events":
+                        # A pooled event rate (ab_stats.events_decision).
+                        pairs = [(block_events(path, b, cand).get(key), block_events(path, b, main).get(key))
+                                 for b in common]
+                        pairs = [p_ for p_ in pairs if p_[0] is not None and p_[1] is not None]
+                        final = not sq or len(common) >= sq.cap or not undecided_ok
+                        a_ = sq.alpha_at(len(pairs)) if sq else gates["alpha"]
+                        if len(pairs) < max(need, 1):
+                            dec, info = ("n/a" if final else "continue"), {}
+                        else:
+                            dec, info = st.events_decision(pairs, values[0], int(values[1]), a_,
+                                                           final=bool(not sq or len(common) >= sq.cap))
+                        verdict = "n/a" if dec == "n/a" else decision_verdict(dec, undecided_ok)
+                        verdicts[(path, cand, f"rule:{key}")] = verdict
+                        out.append(f"| {key} | events {values[0]:g} min {int(values[1])} | {cand} | {len(pairs)} "
+                                   f"({info.get('ec', 0):g}/{info.get('nc', 0):g} vs {info.get('em', 0):g}/"
+                                   f"{info.get('nm', 0):g} events) | {fmt(info.get('diff', float('nan')), '.4g')} | "
+                                   f"exact p {fmt(info.get('p_ni', float('nan')), '.3g')} | "
+                                   f"permutation p {fmt(info.get('p_worse', float('nan')), '.3g')} | {verdict} |")
                         continue
                     events = [(block_tails(path, b, cand).get(key), block_tails(path, b, main).get(key)) for b in common]
                     if kind in RULES and any(e is not None and e[0] is None for pair in events for e in pair):

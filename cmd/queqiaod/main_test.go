@@ -351,6 +351,8 @@ func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
 			{"--cc-api=v2", "--sched=class", "--congestion-scope="},
 			{"--cc-api=v2", "--sched=class", "--congestion-scope=path", "--path-profile=dc-long-haul"},
 			{"--cc-api=v2", "--sched=class", "--congestion-scope=path", "--congestion=bbr"},
+			{"--classifier=phased", "--path-profile=dc-long-haul"},
+			{"--cc-api=v2", "--sched=class", "--congestion-scope=path", "--coded-retry=sticky", "--path-profile=dc-long-haul"},
 		} {
 			fs := flag.NewFlagSet("test", flag.ContinueOnError)
 			fs.SetOutput(io.Discard)
@@ -362,6 +364,41 @@ func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
 			if err := validateRuntime(opts, client); err == nil {
 				t.Errorf("client=%v %v accepted", client, args)
 			}
+		}
+	}
+}
+
+// dc-long-haul starts on its whole new-architecture bundle (design §11.3,
+// stage 9), with classifier=phased, on both roles.
+func TestRuntimeValidationAcceptsTheDCBundle(t *testing.T) {
+	for _, client := range []bool{true, false} {
+		args := []string{"--path-profile=dc-long-haul", "--cc-api=v2", "--sched=class", "--congestion-scope=path",
+			"--coded-retry=sticky", "--recovery=carrier", "--classifier=phased", "--mem=owned"}
+		if client {
+			args = append(args, "--topology=single")
+		} else {
+			args = append(args, "--gateway-admission=owned")
+		}
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		var opts runtimeOptions
+		bindRuntimeFlags(fs, &opts, client)
+		if err := fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateRuntime(opts, client); err != nil {
+			t.Errorf("client=%v %v refused: %v", client, args, err)
+		}
+		// Without carrier recovery it is a partial bundle.
+		fs = flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		opts = runtimeOptions{}
+		bindRuntimeFlags(fs, &opts, client)
+		if err := fs.Parse(append(args, "--recovery=flow")); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateRuntime(opts, client); err == nil || !strings.Contains(err.Error(), "dc-long-haul") {
+			t.Errorf("client=%v partial DC bundle: got %v", client, err)
 		}
 	}
 }

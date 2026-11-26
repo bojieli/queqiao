@@ -135,8 +135,9 @@ func ValidateCongestionScope(scope CongestionScope, ccAPI CCAPIVersion, sched Sc
 	return validateCongestionScope(&scope, ccAPI, sched)
 }
 
-// dcLongHaulProfile is the profile that stays on today's code throughout the
-// migration (§0 decision 9).
+// dcLongHaulProfile is the hierarchical profile (§11.3). It ran only today's
+// code until stage 9; it now runs either the legacy bundle or the whole new
+// architecture, and nothing in between (validateProfileBundle).
 const dcLongHaulProfile = "dc-long-haul"
 
 // validateBundle rejects a combination of switches the migration does not
@@ -158,10 +159,93 @@ func validateBundle(ccAPI *CCAPIVersion, congestion CongestionControlKind, p pro
 	if congestion != CongestionErasure {
 		return fmt.Errorf("cc-api=%s requires --congestion=%s, not %q", CCAPIV2, CongestionErasure, congestion)
 	}
-	if p.Name == dcLongHaulProfile {
-		return fmt.Errorf("cc-api=%s is not supported with the %s profile, which stays on the legacy bundle", CCAPIV2, dcLongHaulProfile)
+	// dc-long-haul accepts v2 only as part of the whole new architecture,
+	// which validateProfileBundle checks once every switch is known.
+	return nil
+}
+
+// validateProfileBundle rejects a bundle a profile does not support, once
+// every switch has been validated and normalised on its own. Only the
+// hierarchical dc-long-haul profile restricts the bundle (design §11.3, §14
+// stage 9). It runs exactly two:
+//
+//   - the legacy bundle: every switch off, the per-connection erasure
+//     senders reporting to the path tree's chain, and the legacy classifier
+//     its thresholds were tuned against;
+//   - the new architecture: cc-api=v2, sched=class, congestion=path,
+//     coded-retry=sticky and recovery=carrier, and on a client
+//     topology=single. One path authority per leaf (the authority's key is
+//     the endpoint pair and the sender's identity), the tree used only as
+//     knowledge: priors for erasure, burst and round trip while a leaf has not
+//     measured enough, never a share, seed or joint limit. classifier=phased
+//     is accepted here.
+//
+// Every intermediate combination is refused: a v2 per-connection sender
+// under the chain, a path controller beside per-flow recovery, isolation
+// beside a path controller. None of them was designed for the hierarchy and
+// none is what the stage-9 gate measures. mem=owned and
+// gateway-admission=owned are independent and accepted with either bundle.
+// A topology fan-out is refused with recovery=carrier (validateRecovery);
+// the profile gets no exception (§7: fan-out stays off until the
+// single-connection ceiling is identified).
+func validateProfileBundle(p profile.Profile, ccAPI CCAPIVersion, sched SchedMode, scope CongestionScope, codedRetry CodedRetryMode, topology Topology, recovery RecoveryMode, classifierMode ClassifierMode, gateway bool) error {
+	if p.Name != dcLongHaulProfile {
+		return nil
+	}
+	if ccAPI != CCAPIV2 {
+		if classifierMode == ClassifierPhased {
+			// The profile's classifier thresholds (32 MiB, the idle veto)
+			// were tuned against the sticky class, and the legacy bundle
+			// keeps them exactly.
+			return fmt.Errorf("classifier=%s with the %s profile requires its new-architecture bundle (%s)", ClassifierPhased, dcLongHaulProfile, dcBundleSpelling(gateway))
+		}
+		return nil
+	}
+	whole := sched == SchedClass && scope == CongestionScopePath && codedRetry == CodedRetrySticky && recovery == RecoveryCarrier
+	if !gateway {
+		whole = whole && topology == TopologySingle
+	}
+	if !whole {
+		return fmt.Errorf("the %s profile runs the legacy bundle or its whole new-architecture bundle (%s), nothing in between", dcLongHaulProfile, dcBundleSpelling(gateway))
 	}
 	return nil
+}
+
+// dcBundleSpelling names dc-long-haul's new-architecture bundle in flags.
+func dcBundleSpelling(gateway bool) string {
+	s := "--cc-api=v2 --sched=class --congestion-scope=path --coded-retry=sticky --recovery=carrier"
+	if !gateway {
+		s += " --topology=single"
+	}
+	return s
+}
+
+// ValidateProfileBundle reports whether a profile supports a client's
+// (gateway false) or gateway's (gateway true) whole bundle. Check every
+// switch on its own first; empty values are their defaults.
+func ValidateProfileBundle(p profile.Profile, ccAPI CCAPIVersion, sched SchedMode, scope CongestionScope, codedRetry CodedRetryMode, topology Topology, recovery RecoveryMode, classifierMode ClassifierMode, gateway bool) error {
+	if ccAPI == "" {
+		ccAPI = CCAPIV1
+	}
+	if sched == "" {
+		sched = SchedLegacy
+	}
+	if scope == "" {
+		scope = CongestionScopeConnection
+	}
+	if codedRetry == "" {
+		codedRetry = CodedRetryLegacy
+	}
+	if topology == "" && !gateway {
+		topology = TopologyIsolated
+	}
+	if recovery == "" {
+		recovery = RecoveryFlow
+	}
+	if classifierMode == "" {
+		classifierMode = ClassifierLegacy
+	}
+	return validateProfileBundle(p, ccAPI, sched, scope, codedRetry, topology, recovery, classifierMode, gateway)
 }
 
 // ValidateBundle reports whether a combination of switches is supported.

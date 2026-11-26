@@ -58,8 +58,16 @@ func newClientPathPrincipal() string {
 // pointing the connection's readers (follow) at its model. It is called
 // only on the connection's run loop.
 func pathRekey(principal func() string, current string, initial quiccongestion.ByteCount, follow func(next string)) func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
+	return pathRekeyIn(principal, current, initial, false, func(next, _, _ string) { follow(next) })
+}
+
+// pathRekeyIn is pathRekey for an authority that may sit in a hierarchical
+// profile's tree (§11.3): the new key's controller is created with its
+// knowledge view, and follow also learns the new key's egress and address
+// part, from which the readers' view is rebuilt.
+func pathRekeyIn(principal func() string, current string, initial quiccongestion.ByteCount, hierarchical bool, follow func(next, egress, addrs string)) func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
 	return func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
-		_, nextAddrs := resolvePath(newLocal, newRemote)
+		egress, nextAddrs := resolvePath(newLocal, newRemote)
 		nextWho := principal()
 		next := nextWho + "|" + nextAddrs
 		if next == current {
@@ -69,10 +77,33 @@ func pathRekey(principal func() string, current string, initial quiccongestion.B
 		// Resolve the controller first: a lookup may sweep an expired entry
 		// and its model, and the readers must follow the model the
 		// controller reports to.
-		c := pathAuthorities.controller(nextWho, nextAddrs, initial)
-		follow(next)
+		c := pathAuthorities.controllerIn(nextWho, nextAddrs, initial, treePosition(hierarchical, egress, nextAddrs))
+		follow(next, egress, nextAddrs)
 		return c
 	}
+}
+
+// treePosition is where an authority's path sits in a hierarchical
+// profile's tree (§11.3): under its uplink, as the endpoint pair. Nil when
+// the profile has no tree.
+func treePosition(hierarchical bool, egress, addrs string) *pathmodel.Key {
+	if !hierarchical {
+		return nil
+	}
+	return &pathmodel.Key{Egress: egress, Dest: addrs}
+}
+
+// pathModelIn is an authority's model: the path's own model, viewed through
+// the tree when the profile has one. The tree supplies priors only -- the
+// erasure, burst factor and round trip its confident nodes know while the
+// path's own model has not measured enough -- and never a share or seed
+// (pathmodel.Knowledge).
+func pathModelIn(name string, position *pathmodel.Key) pathmodel.Model {
+	leaf := pathmodel.Shared(name)
+	if position == nil {
+		return leaf
+	}
+	return pathmodel.SharedKnowledge(*position, leaf)
 }
 
 // pathPrincipalNow is the client's identity in path keys for a connection
@@ -109,6 +140,15 @@ type pathAuthorityRegistry struct {
 
 // controller returns the path's controller, creating it on first use.
 func (r *pathAuthorityRegistry) controller(principal, key string, initialPacketSize quiccongestion.ByteCount) *wancongestion.PathController {
+	return r.controllerIn(principal, key, initialPacketSize, nil)
+}
+
+// controllerIn is controller for a path at a position in a hierarchical
+// profile's tree, or at none (nil). A controller created at a position
+// reports to its own model through the tree's knowledge view and takes its
+// erasure prior from it; one that already exists keeps the view it was
+// created with.
+func (r *pathAuthorityRegistry) controllerIn(principal, key string, initialPacketSize quiccongestion.ByteCount, position *pathmodel.Key) *wancongestion.PathController {
 	name := principal + "|" + key
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -136,7 +176,7 @@ func (r *pathAuthorityRegistry) controller(principal, key string, initialPacketS
 		delete(r.controllers, name)
 		pathmodel.Forget(name)
 	}
-	c := wancongestion.NewPathController(initialPacketSize, pathmodel.Shared(name), wancongestion.DefaultClassWeights)
+	c := wancongestion.NewPathController(initialPacketSize, pathModelIn(name, position), wancongestion.DefaultClassWeights)
 	r.controllers[name] = c
 	return c
 }
@@ -163,15 +203,21 @@ func (r *pathAuthorityRegistry) forget() {
 // flight, and every connection on one physical path must resolve the same
 // key. A migration compares the whole key, principal included.
 func attachPathController(conn *quic.Conn, cfg congestionConfig, principal func() string) wancongestion.TelemetryProvider {
-	_, addrs := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
+	egress, addrs := resolvePath(conn.LocalAddr(), conn.RemoteAddr())
 	who := principal()
 	current := who + "|" + addrs
 	initial := conn.InitialPacketSize()
-	controller := pathAuthorities.controller(who, addrs, initial)
+	position := treePosition(cfg.hierarchicalPath, egress, addrs)
+	controller := pathAuthorities.controllerIn(who, addrs, initial, position)
 	// The connection's FEC and probe readers read the model the law reports
-	// to: the principal's.
+	// to: the principal's, through the tree's knowledge under a hierarchical
+	// profile.
 	readers := pathModelOfKey(conn, current)
-	rekey := pathRekey(principal, current, initial, func(next string) { rekeyPathModel(conn, next) })
+	readers.setKnowledge(knowledgeAt(current, position))
+	rekey := pathRekeyIn(principal, current, initial, cfg.hierarchicalPath, func(next, egress, addrs string) {
+		rekeyPathModel(conn, next)
+		pathModelOf(conn).setKnowledge(knowledgeAt(next, treePosition(cfg.hierarchicalPath, egress, addrs)))
+	})
 	attachment := controller.Attach(rekey, func() (net.Addr, net.Addr) { return conn.LocalAddr(), conn.RemoteAddr() })
 	if cfg.generation != nil {
 		// An uplink change that keeps this connection's addresses is no
@@ -191,6 +237,15 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal func(
 	markClassScheduled(conn)
 	conn.SetCongestionControl(attachment)
 	return attachment
+}
+
+// knowledgeAt is the readers' knowledge view of the path named name at a
+// tree position, or nil without one.
+func knowledgeAt(name string, position *pathmodel.Key) *pathmodel.Knowledge {
+	if position == nil {
+		return nil
+	}
+	return pathmodel.SharedKnowledge(*position, pathmodel.Shared(name))
 }
 
 // provisionalPathController is a gateway connection's controller until it is

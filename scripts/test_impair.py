@@ -181,10 +181,10 @@ class Actions(unittest.TestCase):
         out = ["IMPAIR-REMOVED\n"]
         c = campaign(cfg, host)
         c.impair.apply("b", "slow-lossy", 90)
-        self.assertFalse(c.impair.remove("b"))
+        self.assertIsNone(c.impair.remove("b"))
         c.impair.apply("b", "slow-lossy", 90)
-        out[0] = "WATCHDOG-FIRED\nIMPAIR-REMOVED\n"
-        self.assertTrue(c.impair.remove("b"))
+        out[0] = "WATCHDOG-FIRED 1795660000\nIMPAIR-REMOVED\n"
+        self.assertEqual(c.impair.remove("b"), 1795660000.0)
         # Left behind: loud.
         c.impair.apply("b", "slow-lossy", 90)
         out[0] = "IMPAIR-LEFT device qqimp-bu\n"
@@ -211,7 +211,7 @@ class Actions(unittest.TestCase):
         calls = []
         c.impair = mock.Mock()
         c.impair.apply.side_effect = lambda s, sc, secs: calls.append(("apply", s, sc))
-        c.impair.remove.side_effect = lambda s: calls.append(("remove", s)) or False
+        c.impair.remove.side_effect = lambda s: calls.append(("remove", s)) or None
         for name in ("stop", "start_gateway", "start_client", "stop_client", "scrape", "scrape_client", "collect"):
             setattr(c, name, mock.Mock())
         c.run_phase = mock.Mock(side_effect=RuntimeError("job host gone"))
@@ -225,7 +225,7 @@ class Actions(unittest.TestCase):
         cfg = parse(BASE)
         c = ab.Campaign(cfg, "/nonexistent", ".", dry=False, stream=io.StringIO())
         c.impair = mock.Mock()
-        c.impair.remove.return_value = True
+        c.impair.remove.return_value = 1795660000.0
         for name in ("stop", "start_gateway", "start_client", "stop_client", "scrape", "scrape_client", "collect",
                      "run_phase"):
             setattr(c, name, mock.Mock())
@@ -305,3 +305,117 @@ class DryRun(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BesideWatchdog(unittest.TestCase):
+    def finish(self, fired, ended):
+        cfg = parse(BASE)
+        c = ab.Campaign(cfg, "/nonexistent", ".", dry=False, stream=io.StringIO())
+        c.impair = mock.Mock()
+        c.impair.remove.return_value = fired
+        c.beside_threads = []
+        c.beside_results = {("a", "main"): (ended - 900, ended, 0, "")}
+        for name in ("stop", "stop_client", "collect"):
+            setattr(c, name, mock.Mock())
+        c.dry = True                     # stop before writing the sub-campaign
+        c.finish_beside(cfg.wl.beside(cfg))
+        return getattr(c, "beside_impair_fired", "")
+
+    def test_a_watchdog_after_the_session_ended_is_not_a_failure(self):
+        self.assertEqual(self.finish(fired=2000.0, ended=1000.0), "")
+
+    def test_a_watchdog_during_the_session_is(self):
+        self.assertTrue(self.finish(fired=900.0, ended=1000.0))
+
+
+class FetchFailures(unittest.TestCase):
+    def test_a_beside_sessions_logs_are_its_own(self):
+        import ab_analyze as an
+        paths = ["gw:/h/qq-ab-x/gw-main.wake/logs/server-idle-wake.jsonl.gz", "gw:/h/qq-ab-x/gw-s7/logs/server-b001.jsonl"]
+        self.assertEqual(an.own_fetch_failures(paths, beside=False), paths[1:])
+        self.assertEqual(an.own_fetch_failures(paths, beside=True), paths[:1])
+
+
+class V2Measures(unittest.TestCase):
+    def test_reopen_and_inflight_first_bytes(self):
+        outs = [[30.0, 38.0], [70.0, 95.0]]
+        recs = [{"kind": "probe", "t0": t, "ttfb": 0.3, "http": h} for t, h in
+                ((37.9, "200"), (38.25, "000"), (38.5, "200"), (95.0, "200"))]
+        self.assertEqual([round(x, 2) for x in imp.reopen_ttfb(outs, recs, 130.0)], [0.8, 0.3])
+        # A download in flight across both outages, flat until 39.0 and 96.5.
+        smp = [[t, b] for t, b in ((20, 0), (29, 10), (38.0, 10), (38.75, 10), (39.0, 20), (69, 30), (95, 30),
+                                    (96.5, 40), (110, 50))]
+        recs2 = [{"kind": "bgprog", "samples": smp}, {"kind": "bgprog", "samples": [[50, 0], [60, 5]]}]
+        self.assertEqual(imp.inflight_ttfb(outs, recs2, 130.0), [1.0, 1.5])
+        # Nothing moved before the trial's end: censored there.
+        self.assertEqual(imp.inflight_ttfb([[70.0, 95.0]], [{"kind": "bgprog", "samples": [[60, 0], [120, 0]]}], 120.0),
+                         [25.0])
+
+    def test_completion_counts_attempts_not_the_windows_cut(self):
+        rows = [{"phase": "policed", "kind": "imp-fetch", "flow": f"w1r{k}", "complete": c, "curl_exit": e}
+                for k, c, e in ((1, "1", "0"), (2, "1", "0"), (3, "0", "56"), (4, "0", "28"))]
+        recs = [{"_phase": "policed", "kind": "fetch", "k": 4, "window_cut": 1}]
+        t = types.SimpleNamespace(rows=rows, records=recs)
+        self.assertAlmostEqual(imp.fetch_completion([t], "policed"), 2 / 3)
+        recs = [{"_phase": "policed", "kind": "fetch", "k": 4, "window_cut": 0}]     # a stalled one is a failure
+        t = types.SimpleNamespace(rows=rows, records=recs)
+        self.assertAlmostEqual(imp.fetch_completion([t], "policed"), 2 / 4)
+
+    def test_events_per_block(self):
+        recs = ([{"_phase": "slow-lossy", "kind": "llm", "fail": ""}] * 38 +
+                [{"_phase": "slow-lossy", "kind": "llm", "fail": "TimeoutError: timed out"}] +
+                [{"_phase": "slow-lossy", "kind": "llm", "fail": "short stream (3 of 100)"}] +
+                [{"_phase": "slow-lossy", "kind": "term", "fail": ""}])
+        t = types.SimpleNamespace(trial="slow-lossy", records=recs, rows=[])
+        ev = imp.Impaired().block_events([t], {})
+        self.assertEqual(ev["slow-lossy.call_failures"], (2, 40))
+        self.assertEqual(ev["slow-lossy.silent_rate"], (1, 41))
+
+    def test_a_trial_has_enough_calls(self):
+        cfg = parse(BASE)
+        ph = {p.name: p for p in cfg.wl.phases(cfg, "a")}
+        llm = next(j for j in ph["slow-lossy"].jobs if j.kind == "wl-llm").params
+        self.assertGreaterEqual(llm["agents"] * llm["turns"] * 4, 150)    # 4 valid blocks reach the minimum
+        self.assertEqual([j.kind for j in ph["blackhole"].jobs if j.load], ["imp-fetch", "impair-outages"])
+
+
+class Sampler(unittest.TestCase):
+    def test_a_dropped_session_mid_trial_keeps_the_cpu_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = parse(BASE.replace("[campaign]", "[campaign]\nhost_cpu = true"))
+            c = ab.Campaign(cfg, d, ".", dry=False, stream=io.StringIO())
+            c.out = d
+            calls = {"n": 0}
+
+            def run(script, timeout=120, what=""):
+                calls["n"] += 1
+                if "QQ_AB_JOB_EOF" in script:
+                    return 0, "QQ_AB_LAUNCHED"
+                if "stop the host CPU sampler" in what and calls.setdefault("drops", 0) < 2:
+                    calls["drops"] += 1
+                    return 255, ""          # the link drops twice while stopping
+                if ": poll" in what:
+                    return 0, "QQ_AB_RC 0\nS 1\t2\t3\n"
+                return 0, ""
+            for h in c.hosts.values():
+                h.run = run
+            c.SAMPLER_SSH_TRIES = 4
+            with mock.patch.object(ab.time, "sleep"):
+                s = c.start_host_cpu("b001-a-x-s1-main", "a")
+                c.stop_host_cpu("b001-a-x-s1-main", s)
+            files = os.listdir(os.path.join(d, "hostcpu"))
+            self.assertTrue(files)
+            for f in files:
+                self.assertEqual(open(os.path.join(d, "hostcpu", f)).read(), "1\t2\t3\n")
+
+
+class FetchVia(unittest.TestCase):
+    def test_logs_come_through_the_jump_host_on_their_own_connection(self):
+        h = ab.Host("gw", ["-o", "ConnectTimeout=20"], False, control_dir="/tmp/qqab-ssh-x")
+        h.fetch_via = "relayhost"
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(ab.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            h.get("/r/log.gz", os.path.join(d, "x", "log.gz"))
+        argv = run.call_args[0][0]
+        self.assertIn("ProxyJump=relayhost", argv)
+        self.assertFalse([a for a in argv if a.startswith("ControlPath")])

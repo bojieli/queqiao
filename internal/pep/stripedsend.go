@@ -376,6 +376,7 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		// for itself: the code repairs most loss and not all, and what it
 		// cannot repair has no other way back on a single-lane flow.
 		Reliable:      f.laneRetransmits,
+		GapReissued:   f.noteGapReissued,
 		ForceReliable: f.recoverChunkReliably,
 		// The phased classifier's sparse-write rule (R1a): a small write onto
 		// an empty send queue is INTERACTIVE and coded whatever the flow's
@@ -434,6 +435,16 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		return nil
 	}
 	return f.sendFinal(ctx, sched.Stats().SourceBytes)
+}
+
+// noteGapReissued counts chunks the scheduler re-offered on receiver gap
+// evidence as lane reinjections. It runs under the scheduler's lock, so it
+// only touches counters.
+func (f *multipathFlow) noteGapReissued(n uint64) {
+	f.reinjections.Add(n)
+	for i := uint64(0); i < n && f.metrics != nil; i++ {
+		f.metrics.Reinjected()
+	}
 }
 
 func (f *multipathFlow) reliableReissueBurst() int {
@@ -579,13 +590,12 @@ func (f *multipathFlow) watchChunkCompletion(ctx context.Context, sched *stripe.
 		// waiting a second and a half with the receiver's contiguous point --
 		// and so every acknowledgement, and so this sender's clock -- stopped
 		// behind it.
+		//
+		// The evidence is dated by when it arrived, not by this pass, and
+		// the retries it causes are counted by the scheduler's GapReissued,
+		// together with those a later write or registration report completes.
 		if top := acked.highest(); top > lostChunkEvidence {
-			if n := sched.ReissueUnacknowledgedBelow(top - lostChunkEvidence); n > 0 {
-				f.reinjections.Add(uint64(n))
-				for i := 0; i < n && f.metrics != nil; i++ {
-					f.metrics.Reinjected()
-				}
-			}
+			sched.ReissueUnacknowledgedBelowAt(top-lostChunkEvidence, acked.highestAt)
 		}
 		f.chunkMu.Lock()
 		kept := f.outstandingChunks[:0]

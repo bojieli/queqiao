@@ -23,16 +23,32 @@ type connPathModel struct {
 	// substrate's own loss (congestion=path; design §4.2, §9), which the
 	// coded path sizes parity from in place of the path-wide figure.
 	datagramBurst atomic.Pointer[func() (float64, bool)]
+	// knowledge, if set and still over model, is the hierarchical profile's
+	// view of it (congestion=path under dc-long-haul; design §11.3): the
+	// tree's confident nodes supply erasure, burst and round-trip priors
+	// while the path's own model has not measured enough.
+	knowledge atomic.Pointer[pathmodel.Knowledge]
 }
 
 var _ pathmodel.Model = (*connPathModel)(nil)
 
+// view is what the readers read: the knowledge view when it is over the
+// current model, the model otherwise. A rekey that moved the model without
+// a view leaves the old view behind, and the leaf check drops it.
+func (m *connPathModel) view() pathmodel.Model {
+	model := m.model.Load()
+	if kn := m.knowledge.Load(); kn != nil && kn.Leaf() == model {
+		return kn
+	}
+	return model
+}
+
 func (m *connPathModel) Report(member pathmodel.Member, o pathmodel.Observation) pathmodel.State {
-	return m.model.Load().Report(member, o)
+	return m.view().Report(member, o)
 }
 
 func (m *connPathModel) Current() pathmodel.State {
-	st := m.model.Load().Current()
+	st := m.view().Current()
 	if f := m.datagramBurst.Load(); f != nil {
 		if b, ok := (*f)(); ok {
 			st.BurstFactor = b
@@ -40,6 +56,10 @@ func (m *connPathModel) Current() pathmodel.State {
 	}
 	return st
 }
+
+// setKnowledge installs the hierarchical view of the model, or removes it
+// (nil).
+func (m *connPathModel) setKnowledge(k *pathmodel.Knowledge) { m.knowledge.Store(k) }
 
 // setDatagramBurst installs the datagram burst factor's source.
 func (m *connPathModel) setDatagramBurst(f func() (float64, bool)) { m.datagramBurst.Store(&f) }

@@ -396,8 +396,13 @@ func TestClassifierModeValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateClassifier(ClassifierPhased, dc); err == nil {
-		t.Fatal("classifier=phased accepted with the dc-long-haul profile")
+	// Spelling is ValidateClassifier's; the profile's bundle decides whether
+	// phased runs with dc-long-haul (TestDCLongHaulRunsTheLegacyOrTheWholeNewBundle).
+	if err := ValidateClassifier(ClassifierPhased, dc); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateProfileBundle(dc, "", "", "", "", "", "", ClassifierPhased, false); err == nil {
+		t.Fatal("classifier=phased accepted with the dc-long-haul profile's legacy bundle")
 	}
 	if err := ValidateClassifier(ClassifierPhased, profile.Default()); err != nil {
 		t.Fatal(err)
