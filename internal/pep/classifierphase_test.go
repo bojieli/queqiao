@@ -1436,3 +1436,61 @@ func TestAPendingDrainHoldsAboveTheFloor(t *testing.T) {
 		t.Fatal("a stretch completed on a source read while the drain it followed was still pending")
 	}
 }
+
+// #212 (1): above the refill floor, a stretch kept by bytes queued behind a
+// short read survives an observation taken while the drain an
+// acknowledgement opened is still being decided -- here receive-side bytes
+// between the acknowledgement and the prompt refill.
+func TestAPendingDrainKeepsAStretchBackedByQueuedBytes(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	f.chunkSize = 32 << 10
+	f.memoryLimits.maxSendBytes = 128 << 10
+	f.fitBacklogThreshold()
+	if f.refillMode || f.classifier.BacklogBytes() != 16<<10 {
+		t.Fatalf("setup: threshold %d refill %v, want 16 KiB above the floor", f.classifier.BacklogBytes(), f.refillMode)
+	}
+	h.leaveBulk()
+	// Bytes queued behind a short read: a backlog by bytes.
+	f.observeCarriedRead(32<<10, true, -1)
+	f.noteLogicalRead(false)
+	for i := 0; i < 400 && h.current() != classifier.ClassBulk; i++ {
+		h.advance(5 * time.Millisecond)
+		h.ackTo(f.bytesUp.Load()) // the flight empties: a drain is pending
+		h.advance(time.Millisecond)
+		h.recv(100) // an observation before the refill completes
+		// The prompt full refill, then another short read that leaves
+		// bytes queued again.
+		f.observeCarriedRead(32<<10, true, -1)
+		f.noteLogicalRead(true)
+		f.observeCarriedRead(32<<10, true, -1)
+		f.noteLogicalRead(false)
+	}
+	if h.current() != classifier.ClassBulk {
+		t.Fatal("observations during each pending drain kept a backlogged transfer INTERACTIVE")
+	}
+}
+
+// #212 (2): a read whose completion time was taken before an acknowledgement
+// recorded a pending drain -- the acknowledgement landed between the two --
+// did not take the room that acknowledgement freed, and leaves it pending.
+func TestAReadCompletedBeforeAnAckDoesNotSettleIt(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	f.chunkSize = 32 << 10
+	f.memoryLimits.maxSendBytes, f.memoryLimits.maxOutstanding = 1<<20, 1
+	f.fitBacklogThreshold()
+	h.leaveBulk()
+	f.observeCarriedRead(32<<10, true, -1)
+	f.noteLogicalRead(true)
+	readDone := h.now // the next read completes here...
+	h.advance(time.Millisecond)
+	h.ackTo(f.bytesUp.Load()) // ...and the acknowledgement lands after it
+	f.ackMu.Lock()
+	f.noteReadLocked(readDone, true)
+	pending, continuing := f.drainPending, f.continuing
+	f.ackMu.Unlock()
+	if !pending || continuing {
+		t.Fatalf("a read that completed before the acknowledgement settled it: pending %v continuing %v", pending, continuing)
+	}
+}

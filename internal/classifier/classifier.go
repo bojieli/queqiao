@@ -345,7 +345,7 @@ func (c *Classifier) observeCurrent(o Observation, before Class) {
 		c.inBacklog = false
 	}
 	if backlogged {
-		if !c.inBacklog {
+		if !c.inBacklog && !o.BacklogProvisional {
 			c.inBacklog = true
 			c.backlogSince = o.Age
 		}
