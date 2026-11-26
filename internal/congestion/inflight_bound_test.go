@@ -239,3 +239,30 @@ func TestInflightBoundDoesNotJudgeAQueueThatDoesNotStand(t *testing.T) {
 		}
 	}
 }
+
+// The loss bound and the ProbeRTT skip (#210) compose: a path controller
+// skips ProbeRTT only for a sender that was application-limited and never at
+// its window, and the window its admissions are refused at is the bounded
+// one. A bulk sender the bound has cut is held at the bound, so it is
+// window-limited, keeps a queue of its own, and still takes every ProbeRTT.
+func TestPathControllerHeldAtTheLossBoundStillTakesProbeRTT(t *testing.T) {
+	// A clean path with a buffer of half a bandwidth-delay product: startup
+	// overflows it, which is the congestion the bound exists for.
+	path := pcSimPath{rate: 2e6, rtt: 200 * time.Millisecond, buffer: 2e6 * 0.1, seed: 3}
+	const duration = 35 * time.Second
+	res, ctl := runPCSim(path, []pcSimLane{{bulk: true}}, duration, 5*time.Second, true)
+	law, bound := ctl.law.inner, ctl.law.bound
+	rate := res.delivered / (duration - 5*time.Second).Seconds()
+	t.Logf("%d congestion rounds, bound %d, %d ProbeRTTs, %d skipped, %.2f of the path's rate",
+		bound.congestionRounds, bound.hi, law.probeRTTs, law.probeRTTsSkipped, rate/path.rate)
+	if bound.congestionRounds == 0 {
+		t.Fatal("the bound never judged the overflowing queue congestion; the test exercises nothing")
+	}
+	if law.probeRTTs < 3 || law.probeRTTsSkipped != 0 {
+		t.Errorf("a bulk sender held at the loss bound took %d ProbeRTTs in %v and skipped %d",
+			law.probeRTTs, duration, law.probeRTTsSkipped)
+	}
+	if rate < 0.8*path.rate {
+		t.Errorf("the bounded sender delivered %.2f of the path's rate", rate/path.rate)
+	}
+}
