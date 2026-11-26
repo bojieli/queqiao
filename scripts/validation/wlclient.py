@@ -1221,7 +1221,19 @@ def cmd_rpc(args) -> None:
     scheduled from that instant, not from this interpreter's start: every
     leaf host starts its interpreter before the barrier and waits for it
     after initialising, so start-up skew between hosts does not carry into
-    the waves."""
+    the waves.
+
+    Every request has an absolute slot, barrier + i x spacing, and is
+    measured from it. W4 is one request at a time on one connection
+    (docs/WORKLOAD-MODEL.md), so a request whose slot comes while the
+    previous one is still running is not sent beside it: it is late. It
+    starts when the connection is free, its row's start and its seconds are
+    taken from its slot (the wait is part of its latency), and its --timeout
+    budget runs from the slot too. One whose budget is spent before it can
+    start is not sent and fails at the timeout (latency censored). Either
+    way the slow request counts against its arm, and every leaf's wave i
+    still starts at the same instant, so the waves stay concurrent across
+    leaves however slow one leaf's requests were."""
     sock = reader = None
     c0 = time.monotonic()
     if args.start_at:
@@ -1229,14 +1241,23 @@ def cmd_rpc(args) -> None:
         c0 += args.start_at - time.time()
         if c0 > time.monotonic():
             time.sleep(c0 - time.monotonic())
+    # Wall time of the monotonic origin, so a slot's wall time is exact even
+    # when the request starts late.
+    w0 = time.time() - (time.monotonic() - c0)
     for i in range(args.count):
         due = c0 + i * args.spacing
         if due > time.monotonic():
             time.sleep(due - time.monotonic())
         asr = i % 2 == 0
-        t0 = time.time()
+        # The slot, not the actual start: a late request's wait counts.
+        t0 = w0 + i * args.spacing
         code, got, ex = 0, 0, 0
-        deadline = time.monotonic() + args.timeout
+        deadline = due + args.timeout
+        if time.monotonic() >= deadline:
+            # The previous request held the connection past this one's whole
+            # budget: a failure at the timeout, never sent.
+            row(t0, t0 + args.timeout, f"w{i + 1}r1", 0, 0, float(args.timeout), 28)
+            continue
         try:
             if sock is None:
                 sock = open_conn(args, args.timeout, deadline)
