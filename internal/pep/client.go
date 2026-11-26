@@ -1643,15 +1643,35 @@ func (c *Client) openFlowMode(ctx context.Context, destination string, _ bool) (
 	if err != nil {
 		return nil, err
 	}
-	lane, err := c.chooseAuthenticatedLane(ctx)
-	if err != nil {
-		return nil, err
-	}
+	var (
+		lane            *authenticatedLane
+		openDeadline    time.Time
+		finishHandshake func() error
+	)
 	fail := func(err error) (*openedFlow, error) {
 		_ = lane.fc.Close()
 		return nil, err
 	}
-	openDeadline, finishHandshake := bindHandshake(ctx, lane.outer, handshakeBound(lane.outer, c.cfg.HandshakeTimeout))
+	for {
+		lane, err = c.chooseAuthenticatedLane(ctx)
+		if err != nil {
+			return nil, err
+		}
+		openDeadline, finishHandshake = bindHandshake(ctx, lane.outer, handshakeBound(lane.outer, c.cfg.HandshakeTimeout))
+		pooled, ok := lane.outer.(*controlPoolStreamConn)
+		if !ok || pooled.trackOpen(openDeadline, protocol.HeaderSize+len(payload)) {
+			break
+		}
+		finishHandshake()
+		if c.carriers == nil || ctx.Err() != nil {
+			return fail(errPoolRetired)
+		}
+		// recovery=carrier: the carrier became SUSPECT, or a sibling
+		// started rebinding onto it, after the borrow. Nothing was sent on
+		// the stream; give it back and wait for admission again, within
+		// the request's own deadline.
+		_ = lane.fc.Close()
+	}
 	defer finishHandshake()
 	flowID, err := randomFlowID()
 	if err != nil {
@@ -1660,11 +1680,6 @@ func (c *Client) openFlowMode(ctx context.Context, destination string, _ bool) (
 	openFlags := uint16(0)
 	if lane.reserveControl {
 		openFlags |= protocol.FlagReserveControl
-	}
-	if pooled, ok := lane.outer.(*controlPoolStreamConn); ok {
-		if !pooled.trackOpen(openDeadline, protocol.HeaderSize+len(payload)) {
-			return fail(errPoolRetired)
-		}
 	}
 	if err := lane.fc.Write(protocol.Frame{
 		Header:  protocol.Header{Version: protocol.Version, Type: protocol.TypeOpen, Flags: openFlags, SessionID: lane.sessionID, FlowID: flowID, Class: protocol.ClassNew},
@@ -1979,7 +1994,7 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 			c.quicMu.Unlock()
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, fmt.Errorf("%w: %w", errCarrierAdmissionWait, ctx.Err())
 			case <-wait:
 			case <-time.After(c.carriers.cfg.Interval):
 				// Rebinding counts change without a carrier transition.
@@ -2015,7 +2030,7 @@ func (c *Client) acquireControlQUICGeneration(ctx context.Context, ccfg congesti
 				}
 				select {
 				case <-ctx.Done():
-					return nil, ctx.Err()
+					return nil, fmt.Errorf("%w: %w", errCarrierAdmissionWait, ctx.Err())
 				case <-wait:
 				case <-timer:
 				}

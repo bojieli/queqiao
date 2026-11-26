@@ -842,6 +842,11 @@ func (m *carrierManager) dialStandby(ctx context.Context, cancel context.CancelF
 		return
 	}
 	mc.verified = true
+	// The echo is fresh proof of the path for the pool's own check, so the
+	// first rebinding JOINs do not wait for a second PROBE.
+	g.probeMu.Lock()
+	g.verified = time.Now()
+	g.probeMu.Unlock()
 	m.standby = mc
 	m.log.Info("carrier standby verified", "carrier", g.id)
 	// Promotion is the next tick's decision: it needs the old carrier's
@@ -1016,6 +1021,11 @@ func runKeepAliveSchedule(conn *quic.Conn, active func() bool, every time.Durati
 		conn.SetKeepAliveSchedule(floor)
 	}
 }
+
+// errCarrierAdmissionWait marks a pooled borrow that ran out of time waiting
+// for the carrier manager's admission -- a SUSPECT carrier, or flows
+// rebinding -- rather than for the network.
+var errCarrierAdmissionWait = errors.New("waiting for carrier admission")
 
 // carrierRebindKey marks a pooled borrow made to rebind an existing flow:
 // it is not held back for flows waiting to rebind, and a dial it needs is a

@@ -254,7 +254,9 @@ func classifyQUICPathEvidence(err error) quicPathEvidence {
 	if err == nil || peerResponded(err) {
 		return quicPathAvailable
 	}
-	if errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, errCarrierAdmissionWait) {
+		// A wait for local admission (recovery=carrier) is no evidence about
+		// the network.
 		return quicPathNeutral
 	}
 

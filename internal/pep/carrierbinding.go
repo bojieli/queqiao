@@ -151,7 +151,7 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 		// An unbound flow holds new OPENs back while it is due a JOIN; one
 		// backing off after a refusal does not need a stream slot now, and
 		// must not stall every new flow for its whole backoff.
-		setUnbound(len(healthy) == 0 && !m.now().Before(nextAttempt))
+		setUnbound(len(healthy) == 0 && !m.now().Before(nextAttempt) && attempts < maxLaneRecoveryAttempts)
 		if len(healthy) > 0 && !superseded {
 			observed, tcpTried, tcpNextAt, tcpBackoff, wake = time.Time{}, false, time.Time{}, 0, nil
 			// The per-flow budget resets only after a sustained healthy
@@ -197,12 +197,21 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 				herr := c.carrierTCPHandoff(manageCtx, flow, sessionID, flowID, healthy, superseded, deadline)
 				switch {
 				case herr == nil:
+					// The gateway has committed the flow to TCP: the TCP
+					// bundle manager owns it from here, even if the new lane
+					// fails before the next look.
 					m.tcpHandoffs.Add(1)
-					tcpTried = true
+					setUnbound(false)
+					bindTo(nil)
+					uncount()
+					c.manageTCPBundle(manageCtx, flow, sessionID, flowID)
+					return
 				case errors.Is(herr, errLaneJoinRejected) && !errors.Is(herr, errLaneJoinTCPMode):
-					// The gateway does not hold this session: terminal.
+					// The gateway does not hold this session: terminal, and
+					// the flow ends now, idle or not.
 					flow.noteRefusalCause(herr)
 					flow.resumeRefused.Store(true)
+					flow.closeAll()
 					return
 				case manageCtx.Err() != nil || flow.doneChanClosed():
 					return

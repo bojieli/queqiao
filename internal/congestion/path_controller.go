@@ -1220,7 +1220,9 @@ func (c *PathController) demote(a *PathAttachment, at monotime.Time) []func() {
 
 // promote makes a COUNTED again with its current gauge.
 func (c *PathController) promote(a *PathAttachment) {
-	if !a.probing {
+	if !a.probing || a.drained {
+		// A drained attachment never returns, by whichever path progress
+		// reaches it (§4.4).
 		return
 	}
 	c.accrue(c.now)
