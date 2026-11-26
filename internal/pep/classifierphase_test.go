@@ -1494,3 +1494,30 @@ func TestAReadCompletedBeforeAnAckDoesNotSettleIt(t *testing.T) {
 		t.Fatalf("a read that completed before the acknowledgement settled it: pending %v continuing %v", pending, continuing)
 	}
 }
+
+// A flow that has gone back to small request/reply traffic leaves BULK even
+// when each request's acknowledgement lands just before its reply: the drain
+// that acknowledgement leaves pending preserves no stretch, so the reply's
+// observation is no backlog evidence.
+func TestAPendingDrainWithoutAStretchIsNoEvidence(t *testing.T) {
+	h := newPhaseHarness(t, ClassifierPhased)
+	f := h.f
+	f.fitBacklogThreshold()
+	h.advance(2 * time.Second)
+	h.burst()
+	if h.current() != classifier.ClassBulk {
+		t.Fatal("setup: the burst did not make the flow BULK")
+	}
+	for i := 0; i < 100 && h.current() == classifier.ClassBulk; i++ {
+		f.observeCarriedRead(200, true, -1) // the request
+		f.noteLogicalRead(false)
+		h.advance(50 * time.Millisecond)
+		h.ackTo(f.bytesUp.Load()) // its acknowledgement...
+		h.advance(time.Millisecond)
+		h.recv(300) // ...just before the reply
+		h.advance(50 * time.Millisecond)
+	}
+	if h.current() == classifier.ClassBulk {
+		t.Fatal("small request/reply exchanges, each acknowledged just before its reply, kept the flow BULK")
+	}
+}
