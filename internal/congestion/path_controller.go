@@ -1063,6 +1063,7 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 	// connection builds.
 	if budget := c.law.pacer.budget(now); budget < maxBytes {
 		if budget < maxBytes-debt {
+			c.law.inner.notePacingLimited()
 			c.stats.refusedPacing.Add(1)
 			c.markPacing(a, true)
 			retry := c.law.pacer.timeUntilBudget(maxBytes - debt)

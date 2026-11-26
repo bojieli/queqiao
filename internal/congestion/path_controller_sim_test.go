@@ -567,12 +567,20 @@ func TestPathControllerLoadedProducerSkipsProbeRTT(t *testing.T) {
 // must take its ProbeRTTs.
 func TestPathControllerBrieflyIdleBulkTakesProbeRTT(t *testing.T) {
 	path := pcErasurePath()
-	lanes := []pcSimLane{{bulk: true, pauseEvery: time.Second, pauseFor: 5 * time.Millisecond}}
-	const duration = 35 * time.Second
-	_, ctl := runPCSim(path, lanes, duration, 0, true)
-	law := ctl.law.inner
-	t.Logf("briefly idle bulk: %d ProbeRTTs, %d skipped", law.probeRTTs, law.probeRTTsSkipped)
-	if law.probeRTTs < 3 || law.probeRTTsSkipped != 0 {
-		t.Errorf("a briefly idle bulk sender took %d ProbeRTTs in %v and skipped %d", law.probeRTTs, duration, law.probeRTTsSkipped)
+	// Pauses once a second, and pauses more often than once a round trip,
+	// which keeps every packet's application-limited marker set: the
+	// pacer's refusals between them are the evidence then.
+	for _, pause := range []struct{ every, length time.Duration }{
+		{time.Second, 5 * time.Millisecond}, {50 * time.Millisecond, 2 * time.Millisecond},
+	} {
+		lanes := []pcSimLane{{bulk: true, pauseEvery: pause.every, pauseFor: pause.length}}
+		const duration = 35 * time.Second
+		_, ctl := runPCSim(path, lanes, duration, 0, true)
+		law := ctl.law.inner
+		t.Logf("bulk idle %v every %v: %d ProbeRTTs, %d skipped", pause.length, pause.every, law.probeRTTs, law.probeRTTsSkipped)
+		if law.probeRTTs < 3 || law.probeRTTsSkipped != 0 {
+			t.Errorf("a bulk sender idle %v every %v took %d ProbeRTTs in %v and skipped %d",
+				pause.length, pause.every, law.probeRTTs, duration, law.probeRTTsSkipped)
+		}
 	}
 }

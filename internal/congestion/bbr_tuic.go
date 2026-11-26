@@ -101,7 +101,9 @@ type TUICBBRSender struct {
 	// least RTT sampled in that time (rttSinceMinRTT) without entering
 	// ProbeRTT. A path controller sets it, and reports each admission its
 	// window refused (noteWindowLimited) and each unused opportunity
-	// (caughtUp). probeRTTs and probeRTTsSkipped count entries and skips.
+	// (caughtUp), and each refused by the balance (notePacingLimited); a
+	// sender held at its pacer in most rounds of the window is filling too.
+	// probeRTTs and probeRTTsSkipped count entries and skips.
 	//
 	// catchingUp is set when a ProbeRTT ends, until the sender is next
 	// application-limited: until the backlog the ProbeRTT held back has
@@ -114,10 +116,20 @@ type TUICBBRSender struct {
 	skipAppLimitedProbeRTT bool
 	filledSinceMinRTT      bool
 	rttSinceMinRTT         time.Duration
-	catchingUp             bool
-	catchUpEndPN           quiccongestion.PacketNumber
-	probeRTTs              uint64
-	probeRTTsSkipped       uint64
+	rttSinceMinRTTAt       monotime.Time
+	// roundsSinceMinRTT counts the rounds since the minimum was measured,
+	// and pacedRounds those in which the pacer refused an admission
+	// (notePacingLimited) outside a ProbeRTT and its catch-up. A sender
+	// held at its pacer in most rounds is filling the path, however often
+	// it also runs out of work: one that pauses more often than once a
+	// round trip keeps every packet's application-limited marker set.
+	roundsSinceMinRTT uint64
+	pacedRounds       uint64
+	pacedThisRound    bool
+	catchingUp        bool
+	catchUpEndPN      quiccongestion.PacketNumber
+	probeRTTs         uint64
+	probeRTTsSkipped  uint64
 }
 
 type tuicBbrMode uint8
@@ -516,6 +528,11 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		isRoundStart = true
 		b.roundEndPN = b.maxSentPN
 		b.round++
+		b.roundsSinceMinRTT++
+		if b.pacedThisRound {
+			b.pacedRounds++
+		}
+		b.pacedThisRound = false
 	}
 	// TUIC changes recovery only on events with an ACK. A loss-only callback
 	// updates sampler/loss accounting, but waits for an ACK-clocked event before
@@ -548,10 +565,15 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 		// A packet sent while the sender caught up on what a ProbeRTT
 		// held back carries the ProbeRTT's backlog, not the sender's own.
 		fill := sample.filled && !b.catchingUp && sample.filledPN > b.catchUpEndPN
-		ownQueue := b.filledSinceMinRTT || fill || b.catchingUp
-		least := b.rttSinceMinRTT
+		ownQueue := b.filledSinceMinRTT || fill || b.catchingUp || 2*b.pacedRounds > b.roundsSinceMinRTT
+		least, leastAt := b.rttSinceMinRTT, b.rttSinceMinRTTAt
+		if least > 0 && eventTime.Sub(leastAt) >= tuicProbeRTTInterval {
+			// Sampled before an idle as long as the filter's window: too
+			// old to stand for the path now.
+			least = 0
+		}
 		if rttSample > 0 && (least <= 0 || rttSample < least) {
-			least = rttSample
+			least, leastAt = rttSample, eventTime
 		}
 		if rttSample > 0 {
 			stamped := b.minRTTAt
@@ -559,8 +581,10 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 			if b.minRTTAt != stamped {
 				// A new minimum-RTT window starts with this event.
 				b.filledSinceMinRTT, b.rttSinceMinRTT = false, 0
+				b.roundsSinceMinRTT, b.pacedRounds = 0, 0
 			} else {
-				b.filledSinceMinRTT, b.rttSinceMinRTT = b.filledSinceMinRTT || fill, least
+				b.filledSinceMinRTT = b.filledSinceMinRTT || fill
+				b.rttSinceMinRTT, b.rttSinceMinRTTAt = least, leastAt
 			}
 		} else {
 			b.filledSinceMinRTT = b.filledSinceMinRTT || fill
@@ -574,7 +598,9 @@ func (b *TUICBBRSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 			// and 200 ms. The minimum becomes the least RTT the window
 			// sampled, as a windowed minimum filter would have it.
 			minRTTExpired = false
-			b.minRTT = least
+			if least > 0 {
+				b.minRTT = least
+			}
 			b.probeRTTsSkipped++
 		}
 		b.maxAckedPN = largestAck
@@ -867,6 +893,15 @@ func (b *TUICBBRSender) noteWindowLimited() {
 	}
 }
 
+// notePacingLimited is told that an admission found the balance short of a
+// packet. Inside a ProbeRTT, and while catching up on the backlog it left,
+// the shortfall is the ProbeRTT's.
+func (b *TUICBBRSender) notePacingLimited() {
+	if b.mode != tuicBbrProbeRTT && !b.catchingUp {
+		b.pacedThisRound = true
+	}
+}
+
 func (b *TUICBBRSender) maybeProbeRTT(now monotime.Time, roundStart bool, inFlight quiccongestion.ByteCount, minRTTExpired bool) {
 	if minRTTExpired && !b.exitingQuiescence && b.mode != tuicBbrProbeRTT {
 		b.probeRTTs++
@@ -892,6 +927,7 @@ func (b *TUICBBRSender) maybeProbeRTT(now monotime.Time, roundStart bool, inFlig
 	if !b.exitProbeRTT.IsZero() && b.probeRTTRoundPassed && !now.Before(b.exitProbeRTT) {
 		b.minRTTAt = now
 		b.filledSinceMinRTT, b.rttSinceMinRTT = false, 0
+		b.roundsSinceMinRTT, b.pacedRounds = 0, 0
 		b.catchingUp = true
 		if b.fullBandwidth {
 			b.mode = tuicBbrProbeBW
