@@ -210,9 +210,16 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			}
 			if due && !held && !now.Before(tcpNextAt) {
 				tcpNow = false
-				herr := c.carrierTCPHandoff(manageCtx, flow, sessionID, flowID, healthy, superseded, deadline)
+				herr := c.carrierTCPHandoff(manageCtx, flow, sessionID, flowID, healthy, superseded, deadline, latest, &gate)
 				if herr != nil && isTimeoutError(herr) {
 					gate.timedOut = true
+				}
+				if errors.Is(herr, errHandoffYielded) {
+					// A QUIC carrier came up while the TCP lane waited: the
+					// flow JOINs it below, and a later handoff starts
+					// afresh.
+					tcpNextAt = now
+					continue
 				}
 				switch {
 				case herr == nil:
@@ -486,11 +493,27 @@ func isTimeoutError(err error) bool {
 	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
+// errHandoffYielded says a TCP handoff stood down before its JOIN because a
+// QUIC carrier became eligible: nothing was committed.
+var errHandoffYielded = errors.New("TCP handoff yielded to a QUIC carrier")
+
 // carrierTCPHandoff starts AUTO's TCP handoff for a flow that no QUIC JOIN
 // can rebind in time. It reports whether the TCP lane was installed; the
 // binding loop then hands the flow to the TCP bundle manager.
-func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64, healthy []*mpLane, superseded bool, deadline time.Time) error {
-	joinCtx, cancel := context.WithTimeout(ctx, max(deadline.Sub(c.carriers.now()), time.Millisecond))
+//
+// The handoff has two steps, and only the second commits: the TCP lane is
+// dialled and authenticated, and then the JOIN is sent. A dial that began in
+// an outage completes when the path returns -- the kernel retransmits its
+// SYN, and the handshake above it simply waits -- so it never times out, and
+// the gate on starting a retry never sees it. Between the two steps, then:
+// if the path was away for TCP as well (an earlier attempt timed out, or
+// this dial took longer than a handshake should) and a QUIC replacement is
+// on its way, the lane waits for it, for about one handshake and never past
+// latest. If a QUIC carrier becomes eligible the lane is closed with no JOIN
+// sent, and errHandoffYielded is returned.
+func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, sessionID [16]byte, flowID uint64, healthy []*mpLane, superseded bool, deadline, latest time.Time, gate *tcpHandoffGate) error {
+	m := c.carriers
+	joinCtx, cancel := context.WithTimeout(ctx, max(deadline.Sub(m.now()), time.Millisecond))
 	defer cancel()
 	if superseded && len(healthy) > 0 {
 		joinCtx = context.WithValue(joinCtx, laneReplacementContextKey{}, laneReplacementHint{id: healthy[0].id})
@@ -502,9 +525,11 @@ func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, ses
 		return err
 	}
 	c.metrics.LaneRescueAttempt()
-	lane, err := c.openJoinLane(joinCtx, TransportTCP, sessionID, flowID, laneID)
+	lane, err := c.openTCPHandoffLane(joinCtx, sessionID, flowID, laneID, latest, gate)
 	if err != nil {
-		c.cfg.Logger.Info("carrier TCP handoff unavailable", "flow_id", flowID, "failure_kind", replacementFailureKind(err), "error", err)
+		if !errors.Is(err, errHandoffYielded) {
+			c.cfg.Logger.Info("carrier TCP handoff unavailable", "flow_id", flowID, "failure_kind", replacementFailureKind(err), "error", err)
+		}
 		return err
 	}
 	if err := c.installRecoveryLane(flow, lane); err != nil {
@@ -513,6 +538,73 @@ func (c *Client) carrierTCPHandoff(ctx context.Context, flow *multipathFlow, ses
 	c.metrics.LaneRescueWin(0)
 	c.cfg.Logger.Info("flow handed off to TCP before its binding deadline", "flow_id", flowID, "lane", lane.id)
 	return nil
+}
+
+// openTCPHandoffLane dials the TCP lane, gives a QUIC replacement its chance
+// if the path was away (see carrierTCPHandoff), and sends the JOIN.
+func (c *Client) openTCPHandoffLane(ctx context.Context, sessionID [16]byte, flowID, laneID uint64, latest time.Time, gate *tcpHandoffGate) (*mpLane, error) {
+	if c.openJoinLaneForTest != nil {
+		return c.openJoinLaneForTest(ctx, TransportTCP, laneID)
+	}
+	m := c.carriers
+	c.carrierShadow.noteJoinAttempt(ctx, sessionID, flowID, laneID, TransportTCP)
+	wait := c.quicHandshakeWait()
+	began := m.now()
+	lane, err := c.dialJoinLane(ctx, TransportTCP, sessionID, laneID)
+	if err != nil {
+		return nil, err
+	}
+	now := m.now()
+	if tcpHandoffYields(gate != nil && gate.timedOut, now.Sub(began), wait, now, latest) {
+		until := now.Add(wait)
+		if until.After(latest) {
+			until = latest
+		}
+		if m.eligible() == nil && !m.suspect() {
+			// The path carries packets again: make sure a replacement is
+			// being dialled now, not at the manager's next probe.
+			m.requestCarrier()
+		}
+		if c.awaitQUICCarrier(ctx, until) {
+			// Nothing was sent on the lane but its authentication: closing
+			// it leaves the gateway nothing to clean up but the connection,
+			// which it held idle for at most the handshake wait.
+			_ = lane.fc.Close()
+			_ = lane.outer.Close()
+			c.cfg.Logger.Info("TCP handoff stood down for a QUIC carrier", "flow_id", flowID, "dial", now.Sub(began))
+			return nil, errHandoffYielded
+		}
+	}
+	return c.completeLaneJoin(ctx, lane, flowID, 0)
+}
+
+// tcpHandoffYields reports whether a TCP handoff whose lane is ready should
+// wait for QUIC before its JOIN: the path was away for TCP too -- an earlier
+// attempt of the episode timed out, or this dial took longer than the
+// handshake wait -- and the latest handoff start has not come.
+func tcpHandoffYields(timedOut bool, dial, wait time.Duration, now, latest time.Time) bool {
+	return (timedOut || dial > wait) && now.Before(latest)
+}
+
+// awaitQUICCarrier waits until a QUIC carrier is eligible, a replacement is
+// no longer on its way, or until passes; it reports whether one is eligible.
+func (c *Client) awaitQUICCarrier(ctx context.Context, until time.Time) bool {
+	m := c.carriers
+	for {
+		if m.eligible() != nil {
+			return true
+		}
+		now := m.now()
+		if !m.quicComing() || !now.Before(until) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-m.changes():
+		case <-time.After(min(until.Sub(now), carrierRebindPoll/5)):
+		}
+	}
 }
 
 // replayGate holds a rebound lane's READY data until the first flow ACK

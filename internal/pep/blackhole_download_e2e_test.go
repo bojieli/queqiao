@@ -31,8 +31,12 @@ const (
 	bhdResumeAt = 256 << 10        // "moving again": this much more arrived
 	// The flip bundle's bounds: how soon after the 8 s drop its downloads
 	// move, and how much they carry in the ten seconds after each restore.
-	bhdResumeMax  = 3 * time.Second
-	bhdCarriedMin = 12 // megabytes
+	// bhdBlockedHandoffMax is how long after UDP alone is blocked a flow may
+	// take to be handed off to TCP; set from what it took before the handoff
+	// learned to wait for QUIC.
+	bhdBlockedHandoffMax = 20 * time.Second
+	bhdResumeMax         = 3 * time.Second
+	bhdCarriedMin        = 12 // megabytes
 )
 
 func bhdPath(seed int64) pathsim.Config {
@@ -90,7 +94,9 @@ type bhdTrial struct {
 	arm      string
 	before   float64 // Mbit/s in the 4 s before the first drop
 	restores [2]bhdRestore
-	trace    []string
+	// tcpHandoffs is how many flows the client handed off to TCP.
+	tcpHandoffs int64
+	trace       []string
 }
 
 func (b bhdTrial) String() string {
@@ -104,6 +110,11 @@ func (b bhdTrial) String() string {
 
 func runBlackholeDownload(t *testing.T, arm workloadArm, seed int64) bhdTrial {
 	t.Helper()
+	return runBlackholeDownloadOn(t, arm, TransportQUIC, seed)
+}
+
+func runBlackholeDownloadOn(t *testing.T, arm workloadArm, transport TransportKind, seed int64) bhdTrial {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +122,7 @@ func runBlackholeDownload(t *testing.T, arm workloadArm, seed int64) bhdTrial {
 	t.Cleanup(func() { _ = listener.Close() })
 	go bhdDestination(listener)
 	destination := listener.Addr().String()
-	rig := newWorkloadRig(t, bhdPath(seed), arm, nil)
+	rig := newWorkloadRigOn(t, bhdPath(seed), arm, transport, nil)
 
 	var got atomic.Int64
 	for range 2 {
@@ -167,9 +178,9 @@ func runBlackholeDownload(t *testing.T, arm workloadArm, seed int64) bhdTrial {
 	res.before = float64(got.Load()-mark) * 8 / 4 / 1e6
 	for i, drop := range []time.Duration{8 * time.Second, 25 * time.Second} {
 		note("DROP")
-		rig.relay.SetLossRate(1, 1)
+		rig.blackhole(true)
 		time.Sleep(drop)
-		rig.relay.SetLossRate(0, 0)
+		rig.blackhole(false)
 		note("RESTORE")
 		restored, at := time.Now(), got.Load()
 		r := bhdRestore{resumed: -1, reopened: -1}
@@ -211,7 +222,103 @@ func runBlackholeDownload(t *testing.T, arm workloadArm, seed int64) bhdTrial {
 			time.Sleep(bhdBetween - bhdAfter)
 		}
 	}
+	res.tcpHandoffs = rig.client.carriers.tcpHandoffs.Load()
 	return res
+}
+
+// TestBlackholeAutoKeepsItsFlowsOnQUIC is the flip bundle's downloads across
+// the same drops with the client on transport=auto and TCP dropped and
+// restored with QUIC, as an outage takes both on a real path.
+//
+// On the live campaign every flow in flight across the 25 s outage was
+// handed to TCP 1.2 to 2.1 s after the restore, because the TCP handoff's
+// retry beat the QUIC replacement by a moment, and a flow the gateway has
+// committed to TCP stays there. The emulated TCP path is quicker than a real
+// one to come back (a held connection moves the instant the path returns,
+// where the kernel waits out a backed-off timer), so here TCP wins that race
+// whenever it is allowed to.
+func TestBlackholeAutoKeepsItsFlowsOnQUIC(t *testing.T) {
+	if testing.Short() {
+		t.Skip("wall-clock impairment campaign")
+	}
+	requireStableImpairmentClock(t)
+	repeat := 1
+	if n, err := strconv.Atoi(os.Getenv("QQ_BHD_REPEAT")); err == nil && n > 1 {
+		repeat = n
+	}
+	for n := range repeat {
+		r := runBlackholeDownloadOn(t, flipArm, TransportAuto, int64(91+10*n))
+		t.Logf("%s | TCP handoffs %d", r, r.tcpHandoffs)
+		for _, line := range r.trace {
+			t.Log("  " + line)
+		}
+		if r.tcpHandoffs != 0 {
+			t.Errorf("%d flows were handed to TCP across outages that took TCP down too", r.tcpHandoffs)
+		}
+		for j, restore := range r.restores {
+			if mb := restore.carried(10); mb < bhdCarriedMin {
+				t.Errorf("%.1f MB in the 10 s after restore %d (bound %.0f MB)", mb, j+1, float64(bhdCarriedMin))
+			}
+		}
+	}
+}
+
+// TestBlockedUDPStillHandsOffToTCP is the case the TCP handoff exists for,
+// which waiting for QUIC must not slow: UDP stops and TCP does not. The
+// first handoff attempt finds TCP working, so nothing has timed out and its
+// dial is prompt, and the flow moves to TCP without waiting.
+func TestBlockedUDPStillHandsOffToTCP(t *testing.T) {
+	if testing.Short() {
+		t.Skip("wall-clock impairment campaign")
+	}
+	requireStableImpairmentClock(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go bhdDestination(listener)
+	rig := newWorkloadRigOn(t, bhdPath(95), flipArm, TransportAuto, nil)
+	var got atomic.Int64
+	conn := rig.dial(listener.Addr().String())
+	if _, err := conn.Write([]byte{'D'}); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := conn.Read(buf)
+			got.Add(int64(n))
+			if err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(8 * time.Second)
+	// UDP only: the TCP relay beside it keeps carrying.
+	rig.relay.SetLossRate(1, 1)
+	blocked := time.Now()
+	handoffs := &rig.client.carriers.tcpHandoffs
+	for handoffs.Load() == 0 && time.Since(blocked) < bhdBlockedHandoffMax+5*time.Second {
+		time.Sleep(20 * time.Millisecond)
+	}
+	handedOff := time.Since(blocked)
+	at := got.Load()
+	for got.Load()-at < bhdResumeAt && time.Since(blocked) < bhdBlockedHandoffMax+15*time.Second {
+		time.Sleep(20 * time.Millisecond)
+	}
+	moving := time.Since(blocked)
+	t.Logf("UDP blocked: handed off to TCP after %.2fs, download moving on TCP after %.2fs (TCP handoffs %d)",
+		handedOff.Seconds(), moving.Seconds(), handoffs.Load())
+	if handoffs.Load() == 0 {
+		t.Fatalf("no TCP handoff within %v of UDP being blocked", handedOff)
+	}
+	if handedOff > bhdBlockedHandoffMax {
+		t.Errorf("the flow was handed off to TCP %.2fs after UDP was blocked (bound %v)", handedOff.Seconds(), bhdBlockedHandoffMax)
+	}
+	if got.Load()-at < bhdResumeAt {
+		t.Errorf("the download did not move on TCP within %.2fs", moving.Seconds())
+	}
 }
 
 // TestBlackholeLoadedDownloadRecovers reports, for the legacy bundle and the
