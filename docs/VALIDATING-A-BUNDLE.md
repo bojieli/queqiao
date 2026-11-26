@@ -198,8 +198,8 @@ candidate build.
 |---|---|---|---|
 | 0, 1 | `origin/main` | `--cc-api=v2` | baseline experiments only; the class scheduler is not available yet (round-5 review) |
 | 2 | today's controllers | {isolated, single connection} × {round-robin, `--sched=class`} | the product-configuration screen of 15.3: four arms. It chooses a configuration; it does not attribute a result to topology |
-| 6 | `origin/main` | `--cc-api=v2 --sched=class --congestion=path` | works with isolation on |
-| 7 | `--congestion=path` with isolation | `--congestion=path --topology=single` | the topology test of 15.3: the reference arm is *not* main |
+| 6 | `origin/main` | `--cc-api=v2 --sched=class --congestion-scope=path` | works with isolation on |
+| 7 | `--congestion-scope=path` with isolation | `--congestion-scope=path`, and `--topology=single` on the client only (`client_flags`) | the topology test of 15.3: the reference arm is *not* main |
 | 8 | stage 7's bundle | `... --recovery=carrier` | |
 
 More than two arms is fine. Each arm runs twice per block, in a rotated order
@@ -844,6 +844,15 @@ sets on both ends (`owned_flags`, such as `dc`'s `--path-profile`) may not
 be set in the config.
 
 ## Tests
+
+`scripts/test_argv_smoke.py` starts every binary role a campaign uses (each
+arm's gateway and client, and the relay hop) with the runner's exact
+command line for about a second on scratch ports on the machine running the
+tests, after a real provider init and enrollment. It builds `cmd/queqiaod`
+(skipped without Go) and covers the example configs built from
+`origin/main`; `QQ_SMOKE_CONFIG=<config> python3 -m unittest test_argv_smoke`
+checks a live campaign's own config before it starts, so a wrong subcommand
+or flag fails there rather than on production hosts.
 
 ```sh
 python3 -m unittest discover -s scripts -p 'test_*.py'

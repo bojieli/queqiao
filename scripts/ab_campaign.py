@@ -1759,6 +1759,14 @@ rm -f "$f"''', what=f"stop {tag}")
         relay = [self.cfg.relay.host] if self.cfg.relay else []
         return list(dict.fromkeys([self.cfg.gateway.host] + relay + [c.host for c in self.clients_for(path)]))
 
+    def relay_cmd(self, arm: Arm) -> str:
+        """The relay's command line for one arm (on the relay host)."""
+        r, g = self.cfg.relay, self.cfg.gateway
+        port = g.port_base + arm.index
+        args = [f"{self.w(r.host)}/relay/queqiaod", "relay", "run", "--listen", f":{port}",
+                "--upstream", f"{g.address}:{port}", *r.flags]
+        return " ".join(_q(a) for a in args)
+
     def start_relays(self) -> None:
         """Per arm, a temporary relay on the relay host on that arm's gateway
         port, forwarding TCP and UDP to the gateway; the main arm's build for
@@ -1773,8 +1781,7 @@ rm -f "$f"''', what=f"stop {tag}")
         self.must(rh, f"chmod +x {W}/relay/queqiaod", "relay binary")
         for arm in cfg.arms + cfg.beside_arms():
             port = g.port_base + arm.index
-            args = [f"{W}/relay/queqiaod", "relay", "run", "--listen", f":{port}", "--upstream", f"{g.address}:{port}", *r.flags]
-            self.spawn(rh, f"relay-{arm.name}", f"{W}/relay", " ".join(_q(a) for a in args))
+            self.spawn(rh, f"relay-{arm.name}", f"{W}/relay", self.relay_cmd(arm))
             self.wait_port(rh, port, f"relay {arm.name}", f"relay-{arm.name}")
 
     def start_host_cpu(self, name: str, path: str) -> Dict[str, Any]:

@@ -77,7 +77,7 @@ class DryRun(unittest.TestCase):
         self.assertIn("stop every process this campaign started", text)
         self.assertIn("blocks 2-12 repeat", text)
         # The runner owns these; the arm's bundle is appended after them.
-        self.assertIn("--cc-api=v2 --sched=class --congestion=path", text)
+        self.assertIn("--cc-api=v2 --sched=class --congestion-scope=path", text)
         self.assertNotIn("CAMPAIGN-DONE", text)
 
     def test_probe_stops_when_the_load_finishes(self):
