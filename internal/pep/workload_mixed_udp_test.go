@@ -222,16 +222,17 @@ type m5Outcome struct {
 // block. The measures follow the inner controller's sawtooth, so one block's
 // tail moves by a third from run to run in either arm and either direction,
 // as the design expects of a tail (§15.4 judges tails over blocks). The full
-// suite runs five blocks and applies §15.4's contrast to each measure: it
-// fails when the flip bundle exceeds the bound with one-sided 95 %
-// confidence over the blocks. -short runs one 8 s block as a smoke test: every keystroke echoed,
+// suite runs §15.4's sequential gate on each measure's per-block contrast:
+// 6 blocks, then one at a time to 12, passing when every lower bound clears
+// zero, failing when any upper bound falls below it, and failing as
+// inconclusive at the cap. -short runs one 8 s block as a smoke test: every keystroke echoed,
 // audio measured both ways, the heavy flow moving.
 func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 	requireStableImpairmentClock(t)
 	const playout = 150 * time.Millisecond
-	measure, blocks := 30*time.Second, 5
+	measure, minBlocks, maxBlocks := 30*time.Second, 6, 12
 	if testing.Short() {
-		measure, blocks = 8*time.Second, 1
+		measure, minBlocks, maxBlocks = 8*time.Second, 1, 1
 	}
 	echoListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -241,10 +242,17 @@ func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 	go echoDestination(echoListener)
 
 	arms := workloadArms()
+	checks := []m5Check{
+		{"uplink audio late loss (%)", 0, 1, 0.005, 100},
+		{"downlink audio late loss (%)", 1, 1, 0.005, 100},
+		{"uplink audio lateness p99 (ms)", 2, 1.10, 0.010, 1000},
+		{"downlink audio lateness p99 (ms)", 3, 1.10, 0.010, 1000},
+		{"keystroke echo p99 (ms)", 4, 1.10, 0.020, 1000},
+	}
 	// measures[arm] holds, per block: late fraction up, late fraction down,
 	// lateness p99 up, lateness p99 down, keystroke echo p99.
 	measures := make([][5][]float64, len(arms))
-	for block := range blocks {
+	for block := range maxBlocks {
 		// A subtest per block, so each block's clients, gateways and paths
 		// are torn down before the next starts.
 		var outcomes []m5Outcome
@@ -252,6 +260,9 @@ func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 			outcomes = runM5Block(t, echoListener.Addr().String(), measure, playout)
 		}) {
 			t.FailNow()
+		}
+		if outcomes == nil {
+			continue // not selected by -run
 		}
 		for i, arm := range arms {
 			o := outcomes[i]
@@ -276,62 +287,105 @@ func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 					arm.name, o.heavyGoodput*8/1e6, o.heavyGap.Round(time.Millisecond))
 			}
 		}
-	}
-	if testing.Short() || !judgeComparisons(t) {
-		return
-	}
-	packets := float64(measure / audioInterval)
-	checks := []struct {
-		name    string
-		measure int
-		m, a    float64 // bound: flip ≤ m × legacy + a
-		unit    float64 // for the message: 100 for %, 1000 for ms
-	}{
-		{"uplink audio late loss (%)", 0, 1, 0.005 + 1/packets, 100},
-		{"downlink audio late loss (%)", 1, 1, 0.005 + 1/packets, 100},
-		{"uplink audio lateness p99 (ms)", 2, 1.10, 0.010, 1000},
-		{"downlink audio lateness p99 (ms)", 3, 1.10, 0.010, 1000},
-		{"keystroke echo p99 (ms)", 4, 1.10, 0.020, 1000},
-	}
-	for _, c := range checks {
-		// Design §15.4's contrast for a smaller-is-better measure, per
-		// block: d = (m × legacy + a) − flip. The gate fails when the
-		// one-sided 95 % upper bound of its mean is below zero, so a
-		// tail that moves from block to block fails only when the flip
-		// bundle is worse beyond the bound with confidence.
-		var d []float64
-		for b := range blocks {
-			d = append(d, c.m*measures[0][c.measure][b]+c.a-measures[1][c.measure][b])
+		n := len(measures[0][0])
+		if testing.Short() || n < minBlocks || n != block+1 {
+			continue // too few blocks to look, or -run selected some only
 		}
-		mean, upper := oneSidedUpper(d)
-		t.Logf("%s: legacy %v, flip %v; contrast mean %.3g, upper bound %.3g",
-			c.name, scaled(measures[0][c.measure], c.unit), scaled(measures[1][c.measure], c.unit), mean*c.unit, upper*c.unit)
-		if upper < 0 {
-			t.Errorf("%s: the flip bundle exceeds legacy × %.2f + %.3g in every sense the blocks can show "+
-				"(contrast mean %.3g, one-sided 95 %% upper bound %.3g)", c.name, c.m, c.a*c.unit, mean*c.unit, upper*c.unit)
+		if !judgeComparisons(t) {
+			return
 		}
+		// Design §15.4's sequential gate, at its frozen look levels: pass
+		// when every measure's lower bound clears zero, fail when any upper
+		// bound is below it, and otherwise run one more block.
+		verdict := judgeM5(t, checks, measures, n, n == maxBlocks)
+		if verdict != m5Undecided {
+			if verdict == m5Fail {
+				t.Fail()
+			}
+			return
+		}
+	}
+	if n := len(measures[0][0]); !testing.Short() && n > 0 && n < minBlocks {
+		t.Logf("%d of %d blocks selected by -run: not judged", n, minBlocks)
 	}
 }
 
-// oneSidedUpper is the mean of d and the one-sided 95 % t upper bound of
-// that mean. It supports up to ten samples.
-func oneSidedUpper(d []float64) (mean, upper float64) {
-	// t quantiles at 0.95 for 1 to 9 degrees of freedom.
-	t95 := []float64{6.314, 2.920, 2.353, 2.132, 2.015, 1.943, 1.895, 1.860, 1.833}
+// m5Check is one M5 measure and its bound: flip ≤ m × legacy + a.
+type m5Check struct {
+	name    string
+	measure int
+	m, a    float64
+	unit    float64 // for the message: 100 for %, 1000 for ms
+}
+
+type m5Verdict int
+
+const (
+	m5Undecided m5Verdict = iota
+	m5Pass
+	m5Fail
+)
+
+// m5LookT is the one-sided t quantile of each look, 6 to 12 blocks: the
+// harness's frozen Lan-DeMets Pocock-type levels (0.031, then 0.0185 to
+// 0.0162; scripts/ab_stats.py spending_levels) at n − 1 degrees of freedom.
+var m5LookT = map[int]float64{6: 2.395, 7: 2.669, 8: 2.637, 9: 2.581, 10: 2.526, 11: 2.478, 12: 2.433}
+
+// judgeM5 applies the per-block contrast d = (m × legacy + a) − flip of
+// each check at the look after n blocks.
+func judgeM5(t testing.TB, checks []m5Check, measures [][5][]float64, n int, last bool) m5Verdict {
+	t.Helper()
+	tq := m5LookT[n]
+	allPass, anyFail := true, false
+	for _, c := range checks {
+		d := make([]float64, n)
+		for b := range n {
+			d[b] = c.m*measures[0][c.measure][b] + c.a - measures[1][c.measure][b]
+		}
+		mean, se := meanAndSE(d)
+		lower, upper := mean-tq*se, mean+tq*se
+		t.Logf("look %d, %s: legacy %v, flip %v; contrast mean %.3g, bounds [%.3g, %.3g]",
+			n, c.name, scaled(measures[0][c.measure], c.unit), scaled(measures[1][c.measure], c.unit),
+			mean*c.unit, lower*c.unit, upper*c.unit)
+		if upper < 0 {
+			anyFail = true
+			t.Errorf("%s: the flip bundle exceeds legacy × %.2f + %.3g (contrast upper bound %.3g after %d blocks)",
+				c.name, c.m, c.a*c.unit, upper*c.unit, n)
+		}
+		if lower <= 0 {
+			allPass = false
+			if last && upper >= 0 {
+				t.Errorf("%s: no evidence after %d blocks that the flip bundle is within legacy × %.2f + %.3g (contrast lower bound %.3g)",
+					c.name, n, c.m, c.a*c.unit, lower*c.unit)
+			}
+		}
+	}
+	switch {
+	case anyFail:
+		return m5Fail
+	case allPass:
+		return m5Pass
+	case last:
+		return m5Fail
+	}
+	return m5Undecided
+}
+
+// meanAndSE is the mean of d and its standard error.
+func meanAndSE(d []float64) (mean, se float64) {
 	n := float64(len(d))
 	for _, v := range d {
 		mean += v
 	}
 	mean /= n
-	if len(d) < 2 || len(d) > len(t95)+1 {
-		return mean, mean
+	if len(d) < 2 {
+		return mean, 0
 	}
 	var ss float64
 	for _, v := range d {
 		ss += (v - mean) * (v - mean)
 	}
-	se := math.Sqrt(ss/(n-1)) / math.Sqrt(n)
-	return mean, mean + t95[len(d)-2]*se
+	return mean, math.Sqrt(ss/(n-1)) / math.Sqrt(n)
 }
 
 func scaled(values []float64, unit float64) []float64 {
@@ -520,3 +574,48 @@ func runKeystrokes(conn net.Conn, d time.Duration) ([]time.Duration, error) {
 	}
 	return echoes, <-writeErr
 }
+
+// The M5 gate passes only on evidence: a clear pass, a clear failure, and
+// noise that never settles (which fails at the cap) all come out as §15.4
+// says.
+func TestM5SequentialGateNeedsEvidenceToPass(t *testing.T) {
+	checks := []m5Check{{"lateness (ms)", 0, 1.10, 0.010, 1000}}
+	series := func(legacy, flip []float64) [][5][]float64 {
+		m := make([][5][]float64, 2)
+		m[0][0], m[1][0] = legacy, flip
+		return m
+	}
+	same := []float64{0.200, 0.210, 0.190, 0.205, 0.195, 0.200}
+	better := []float64{0.150, 0.160, 0.155, 0.150, 0.158, 0.152}
+	worse := []float64{0.300, 0.310, 0.290, 0.305, 0.295, 0.300}
+	// Equal arms clear the 10 % + 10 ms margin.
+	if v := judgeM5(t, checks, series(same, same), 6, false); v != m5Pass {
+		t.Errorf("equal arms: verdict %d, want pass", v)
+	}
+	if v := judgeM5(t, checks, series(same, better), 6, false); v != m5Pass {
+		t.Errorf("a better flip arm: verdict %d, want pass", v)
+	}
+	inner := &quietTB{TB: t}
+	if v := judgeM5(inner, checks, series(same, worse), 6, false); v != m5Fail {
+		t.Errorf("a clearly worse flip arm: verdict %d, want fail", v)
+	}
+	// A flip arm right at the bound with block-to-block noise is
+	// undecided before the cap and fails at it.
+	edge := []float64{0.260, 0.180, 0.290, 0.170, 0.250, 0.200}
+	if v := judgeM5(inner, checks, series(same, edge), 6, false); v != m5Undecided {
+		t.Errorf("a noisy flip arm at the bound: verdict %d, want undecided", v)
+	}
+	if v := judgeM5(inner, checks, series(same, edge), 6, true); v != m5Fail {
+		t.Errorf("a noisy flip arm at the cap: verdict %d, want fail", v)
+	}
+}
+
+// quietTB records failures instead of failing, for testing a judge.
+type quietTB struct {
+	testing.TB
+	failed bool
+}
+
+func (q *quietTB) Helper()               {}
+func (q *quietTB) Logf(string, ...any)   {}
+func (q *quietTB) Errorf(string, ...any) { q.failed = true }

@@ -450,13 +450,40 @@ type multipathFlow struct {
 	// isolation read.
 	class    atomic.Uint32
 	everBulk atomic.Bool
-	// ackedCum mirrors acked for the classifier, which must not take
-	// replayMu: it is reached from the scheduler's dispatch.
-	ackedCum atomic.Uint64
-	// backlogDrained records that an acknowledgement took the send backlog
-	// to the classifier's threshold or below since the last observation, so
-	// a backlog that dipped between reads is not taken for a continuous one.
-	backlogDrained atomic.Bool
+	// ackMu guards the classifier's view of acknowledgements: ackCovered,
+	// what the peer holds of this endpoint's stream, and ackDrained, that an
+	// acknowledgement took the send backlog to the threshold or below since
+	// the last observation. They are published and consumed together, so an
+	// observation never pairs a drain with the backlog from before it.
+	ackMu      sync.Mutex
+	ackCovered uint64
+	ackDrained bool
+	// Refill evidence, for a flow whose threshold is too small to separate a
+	// transfer from a conversation by bytes outstanding (refillMode): a drain
+	// pending since drainPendingAt becomes a drain unless a read of at least
+	// fullReadBytes follows within refillWindow, and lastReadFull says whether
+	// the latest read filled its buffer. All under ackMu.
+	//
+	// refillTracking is set for every phased flow once its threshold is
+	// fitted: a drain is then always held pending for refillWindow, because
+	// one coalesced acknowledgement can release a whole flight whatever the
+	// threshold. refillThreshold is the fitted threshold; continuing says a
+	// prompt full refill has taken the room the last drain opened, so the
+	// stretch goes on even if what is outstanding is below the threshold.
+	refillTracking  bool
+	refillMode      bool
+	fullReadBytes   int
+	refillThreshold uint64
+	drainPending    bool
+	drainPendingAt  time.Time
+	lastReadFull    bool
+	continuing      bool
+	// readInProgress says source bytes were counted for a logical read the
+	// scheduler has not yet reported complete.
+	readInProgress bool
+	// ackSampleHook and afterAckSampleHook, when set by a test, run just
+	// before and just after an observation samples the acknowledgement state.
+	ackSampleHook, afterAckSampleHook func()
 	// classBytes counts DATA payload this endpoint sent, by class byte (new,
 	// interactive, bulk) and substrate (stream, coded).
 	classBytes [3][2]atomic.Uint64
@@ -556,6 +583,10 @@ type multipathFlow struct {
 	// clock, when set by a test, replaces time.Now for classification and
 	// for the idle limit (watchLimits).
 	clock func() time.Time
+	// limitTicker, when set by a test, replaces watchLimits' ticker: it
+	// returns the ticks, a call to make after each check that did not end
+	// the flow, and a call to make when the watch stops.
+	limitTicker func() (ticks <-chan time.Time, checked, stop func())
 	// classifyMu serialises observe: sampling, classifying and publishing.
 	classifyMu sync.Mutex
 
@@ -600,7 +631,7 @@ func newMultipathFlowWithMemory(ctx context.Context, inner net.Conn, sessionID [
 		done: make(chan struct{}), localClosedCh: make(chan struct{}), remoteAbortCh: make(chan struct{}),
 		ackWake: make(chan struct{}, 1), ackErr: make(chan error, 1),
 		stallSignal: make(chan struct{}, 1),
-		classifier:  classifier.New(classifierBacklogFor(classifierCfg, memoryLimits)), started: time.Now(), completionGrace: flowCompletionGrace,
+		classifier:  classifier.New(classifierCfg), started: time.Now(), completionGrace: flowCompletionGrace,
 	}
 	f.idleTimeout = defaultFlowIdleTimeout
 	f.maxLifetime = defaultFlowMaxLifetime
@@ -1815,6 +1846,14 @@ func (f *multipathFlow) runFlow(ctx context.Context) (FlowStats, error) {
 				// coming (laneReplacementWait, 45 s): the destination saw
 				// the flow end that long after the application did.
 				f.resetOnce.Do(func() { f.broadcastReset(err) })
+				// The RESET has been handed to the transport, not delivered,
+				// and a dedicated QUIC lane's connection closes with it. The
+				// flow's application I/O stops now; its lanes stay, for a
+				// bounded time, until the peer reads the RESET and closes
+				// them.
+				cancelRun()
+				_ = f.inner.Close()
+				f.awaitPeerTeardown(terminalResetDrain)
 			} else {
 				f.resetLanes(err)
 			}
@@ -1924,8 +1963,17 @@ func (f *multipathFlow) watchLimits(stop <-chan struct{}, out chan<- error) {
 			interval = 10 * time.Millisecond
 		}
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	var tickC <-chan time.Time
+	var checked func()
+	if f.limitTicker != nil {
+		var stopTicks func()
+		tickC, checked, stopTicks = f.limitTicker()
+		defer stopTicks()
+	} else {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		tickC = ticker.C
+	}
 	var lifetimeTimer *time.Timer
 	var lifetimeC <-chan time.Time
 	if lifetime > 0 {
@@ -1952,7 +2000,7 @@ func (f *multipathFlow) watchLimits(stop <-chan struct{}, out chan<- error) {
 				return
 			}
 
-		case <-ticker.C:
+		case <-tickC:
 			if idle > 0 {
 				last := f.lastActivity.Load()
 				if last == 0 || f.clockNow().Sub(time.Unix(0, last)) >= idle {
@@ -1962,6 +2010,9 @@ func (f *multipathFlow) watchLimits(stop <-chan struct{}, out chan<- error) {
 					}
 					return
 				}
+			}
+			if checked != nil {
+				checked()
 			}
 		case <-lifetimeC:
 			select {
@@ -3567,17 +3618,15 @@ func (f *multipathFlow) clockNow() time.Time {
 // byte totals in the same step, so no other observation can see the one
 // without the other.
 func (f *multipathFlow) observeCarried(n int, up bool) bool {
+	return f.observeCarriedRead(n, up, 0)
+}
+
+// observeCarriedRead is observeCarried for a read into a buffer of bufLen
+// bytes, which says whether the read filled it.
+func (f *multipathFlow) observeCarriedRead(n int, up bool, bufLen int) bool {
 	f.classifyMu.Lock()
 	defer f.classifyMu.Unlock()
-	bulk := f.observeLocked(n, up)
-	if n > 0 {
-		if up {
-			f.bytesUp.Add(uint64(n))
-		} else {
-			f.bytesDown.Add(uint64(n))
-		}
-	}
-	return bulk
+	return f.observeLocked(n, up, true, bufLen)
 }
 
 // observe classifies the flow with n more bytes than its totals hold.
@@ -3590,10 +3639,15 @@ func (f *multipathFlow) observeCarried(n int, up bool) bool {
 func (f *multipathFlow) observe(n int, up bool) bool {
 	f.classifyMu.Lock()
 	defer f.classifyMu.Unlock()
-	return f.observeLocked(n, up)
+	return f.observeLocked(n, up, false, 0)
 }
 
-func (f *multipathFlow) observeLocked(n int, up bool) bool {
+// observeLocked observes n bytes carried in direction up. With publish, it
+// also adds them to the flow's totals, in the same step as it samples the
+// acknowledgement state, so an acknowledgement is always judged against a
+// byte count that either includes this read or does not, never one the
+// observation has counted and the ACK path has not.
+func (f *multipathFlow) observeLocked(n int, up, publish bool, bufLen int) bool {
 	now := f.clockNow()
 	previousPayload := f.lastPayload.Load()
 	if n > 0 {
@@ -3604,12 +3658,12 @@ func (f *multipathFlow) observeLocked(n int, up bool) bool {
 	if age <= 0 {
 		age = time.Nanosecond
 	}
-	upBytes := f.bytesUp.Load()
-	downBytes := f.bytesDown.Load()
-	if up {
-		upBytes += uint64(n)
-	} else {
-		downBytes += uint64(n)
+	if f.ackSampleHook != nil {
+		f.ackSampleHook()
+	}
+	upBytes, downBytes, sendBacklog, backlogDrained, backlogProvisional := f.countAndSample(now, n, up, publish, bufLen)
+	if f.afterAckSampleHook != nil {
+		f.afterAckSampleHook()
 	}
 	recentUp, recentDown := f.recentBytes(now, n, up)
 	obs := classifier.Observation{
@@ -3645,10 +3699,11 @@ func (f *multipathFlow) observeLocked(n int, up bool) bool {
 		SmallBidirectionalBursts: recentUp <= smallExchangeBytes && recentDown <= smallExchangeBytes,
 		// What this endpoint has read from its application and the peer has
 		// not acknowledged. Only the phased classifier reads it.
-		SendBacklog:    saturatingSub(upBytes, f.ackedCum.Load()),
-		BacklogDrained: f.backlogDrained.Swap(false),
-		SmoothedRTT:    time.Duration(f.currentRTTNS.Load()),
-		CarriedPayload: n > 0,
+		SendBacklog:        sendBacklog,
+		BacklogDrained:     backlogDrained,
+		BacklogProvisional: backlogProvisional,
+		SmoothedRTT:        time.Duration(f.currentRTTNS.Load()),
+		CarriedPayload:     n > 0,
 	}
 	oldClass := classifier.Class(f.class.Load())
 	newClass := f.classifier.Observe(obs)
@@ -3793,6 +3848,19 @@ func (f *multipathFlow) dataSubstrates() (coded, stream uint64) {
 // flow that is already failing, so a lane that cannot take it at once is
 // simply closed.
 const terminalResetWait = 250 * time.Millisecond
+
+// terminalResetDrain bounds how long a flow that ended at its own limit keeps
+// its lanes open for the peer to read its RESET and close them.
+const terminalResetDrain = 2 * time.Second
+
+// awaitPeerTeardown waits until every lane has been closed, which the peer
+// does on reading a RESET, or until timeout.
+func (f *multipathFlow) awaitPeerTeardown(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for len(f.healthyLanes()) > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 // failClose ends a flow that failed. On an endpoint with resetOnFailure set it
 // first sends RESET on every lane still open, so the peer learns the session is

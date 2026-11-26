@@ -561,7 +561,7 @@ class SnapshotObservation(unittest.TestCase):
                     f'case "$*" in *--value*) echo {pid};; '
                     f'*) printf "LoadState=loaded\\nActiveState=active\\nMainPID={pid}\\nNRestarts=0\\n";; esac\n')
         os.chmod(stub, 0o755)
-        script = ab.SNAPSHOT_SH.format(work="/nonexistent/qq-ab-x", units="queqiaod", launchd="", pattern="'queqiao'")
+        script = ab.SNAPSHOT_SH.format(work="/nonexistent/qq-ab-x", units="queqiaod", sudo_units="", launchd="", pattern="'queqiao'")
         p = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
                            env=dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"]))
         return ab.parse_snapshot(p.stdout)

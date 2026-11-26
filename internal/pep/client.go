@@ -328,6 +328,8 @@ type Client struct {
 	// its classification read it instead of time.Now, so a test can move a
 	// flow through an hour of idleness without waiting one.
 	flowClockForTest func() time.Time
+	// flowLimitTickerForTest, when set, is every flow's limitTicker.
+	flowLimitTickerForTest func() (<-chan time.Time, func(), func())
 
 	// quicPoolActive counts flows currently sharing the pooled control
 	// connection. A bulk flow only needs to move off it when another flow
@@ -477,6 +479,10 @@ func bulkConnFits(ctx context.Context, entry *bulkConn) bool {
 // precise: a late failure from an old stream can retire its own generation but
 // can never close the healthy generation which replaced it.
 type controlQUICGeneration struct {
+	// flows counts the pooled flow streams on this generation, as
+	// quicPoolActive counts them across every generation: what fan-out
+	// under topology=single judges sharing by.
+	flows        atomic.Int64
 	borrowMu     sync.Mutex
 	borrowers    int
 	draining     bool
@@ -1114,6 +1120,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
 	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
 	flowSession.clock = c.flowClockForTest
+	flowSession.limitTicker = c.flowLimitTickerForTest
 	flowSession.memOwned = c.cfg.Memory == MemoryOwned
 	flowSession.codedRetrySticky = c.cfg.CodedRetry == CodedRetrySticky
 	flowSession.carrierShadow = c.carrierShadow
@@ -1868,6 +1875,7 @@ func (c *Client) dialPooledQUICLane(ctx context.Context, ccfg congestionConfig) 
 	// Track how many flows share the control connection. Bulk isolation is
 	// only worth its cost when there is something to protect.
 	c.quicPoolActive.Add(1)
+	generation.flows.Add(1)
 	outer := &controlPoolStreamConn{
 		quicStreamConn: &quicStreamConn{stream: stream, conn: generation.conn, controller: generation.controller, closeConn: false, bulk: connBulkPath(generation.conn, c.memoryLimits.eventQueue)},
 		owner:          c, generation: generation,
@@ -2471,6 +2479,7 @@ func (s *controlPoolStreamConn) Close() error {
 	err := s.quicStreamConn.Close()
 	s.once.Do(func() {
 		if s.generation != nil {
+			s.generation.flows.Add(-1)
 			s.generation.releaseBorrow()
 		}
 		if remaining := s.owner.quicPoolActive.Add(-1); remaining < 0 {
@@ -2822,7 +2831,7 @@ func (c *Client) manageQUICLanes(ctx context.Context, flow *multipathFlow, sessi
 			}
 			// Reactive isolation, or under topology=single only an explicit
 			// fan-out (§7).
-			if !c.secondConnectionWanted(snapshot) {
+			if !c.secondConnectionWanted(snapshot, func() *controlQUICGeneration { return flowGeneration(flow) }) {
 				continue
 			}
 			// Do not consume the decision interval while the flow is still NEW

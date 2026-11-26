@@ -169,6 +169,12 @@ type Observation struct {
 	// at some point since the previous observation, even if it is above it
 	// again now. Only the phased classifier reads it.
 	BacklogDrained bool
+	// BacklogProvisional says the send backlog is reported only because a
+	// drain is still being decided (a refill may yet take the room). It
+	// keeps a backlog stretch going but cannot by itself complete one, so
+	// re-entry into BULK waits for the decision. Only the phased classifier
+	// reads it.
+	BacklogProvisional bool
 }
 
 // Classifier is stateful. Once a flow becomes bulk it remains bulk until it
@@ -276,7 +282,22 @@ func (c *Classifier) Current() Class {
 
 // BacklogBytes is the send backlog above which the phased classifier counts a
 // flow as transferring.
-func (c *Classifier) BacklogBytes() uint64 { return c.cfg.BulkBacklogBytes }
+func (c *Classifier) BacklogBytes() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cfg.BulkBacklogBytes
+}
+
+// SetBacklogBytes replaces BulkBacklogBytes, for a flow whose send path can
+// hold less than the configured threshold. Zero is ignored.
+func (c *Classifier) SetBacklogBytes(n uint64) {
+	if n == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cfg.BulkBacklogBytes = n
+}
 
 // Phased reports whether this classifier keeps a current class apart from the
 // sticky one.
@@ -322,6 +343,12 @@ func (c *Classifier) observeCurrent(o Observation, before Class) {
 		// The backlog dipped since the last look: whatever is queued now
 		// started after that, so it is a new stretch.
 		c.inBacklog = false
+	}
+	if backlogged && o.BacklogProvisional && !c.inBacklog {
+		// A provisional backlog only preserves a stretch that already
+		// exists; with none to preserve it is no evidence at all -- neither
+		// the start of a stretch nor a reason to stay in BULK.
+		backlogged = false
 	}
 	if backlogged {
 		if !c.inBacklog {
@@ -375,7 +402,7 @@ func (c *Classifier) observeCurrent(o Observation, before Class) {
 		if rtts := 4 * o.SmoothedRTT; rtts > hold {
 			hold = rtts
 		}
-		if c.inBacklog && o.Age-c.backlogSince >= hold {
+		if c.inBacklog && !o.BacklogProvisional && o.Age-c.backlogSince >= hold {
 			c.current = ClassBulk
 			c.quietWindows = 0
 			c.reentries++

@@ -314,7 +314,9 @@ func (s *flowSource) ReadAvailable(p []byte) (int, error) {
 func (s *flowSource) Read(p []byte) (int, error) {
 	n, err := s.flow.inner.Read(p)
 	if n > 0 {
-		s.flow.observeCarried(n, true)
+		// Counted now; whether the read was full is the scheduler's to say
+		// once the logical read -- a staged read and its fill -- completes.
+		s.flow.observeCarriedRead(n, true, -1)
 	}
 	if err != nil {
 		// HTTP clients often close a fully-consumed SOCKS socket without a TCP
@@ -344,6 +346,7 @@ func (s *flowSource) Read(p []byte) (int, error) {
 // policy.
 func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 	defer close(f.sendDone)
+	f.fitBacklogThreshold()
 
 	retention := f.retentionBytes
 	var autotune *stripe.Autotune
@@ -377,6 +380,7 @@ func (f *multipathFlow) sendInnerStriped(ctx context.Context) (err error) {
 		// The phased classifier's sparse-write rule (R1a): a small write onto
 		// an empty send queue is INTERACTIVE and coded whatever the flow's
 		// class, within the sparse allowance.
+		ReadDone:       f.noteLogicalRead,
 		SparseBytes:    f.sparseBytes(),
 		Sparse:         f.admitSparse,
 		ReliableSparse: f.laneRetransmitsSparse,

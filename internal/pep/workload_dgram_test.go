@@ -2,6 +2,7 @@ package pep
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -46,13 +47,6 @@ func oneShotAnswer(request []byte) []byte {
 	return a
 }
 
-// oneShotResult is what became of one W11 query.
-type oneShotResult struct {
-	fresh    bool
-	answered bool
-	elapsed  time.Duration
-}
-
 // W11. One-shot datagrams (docs/WORKLOAD-MODEL.md): one 60 B query up, one
 // 300 B answer back, nothing else, half on a fresh UDP association per query
 // and half on one reused association. Nothing follows a query, so a lost
@@ -63,169 +57,184 @@ type oneShotResult struct {
 // and reused associations separately.
 //
 // Bound (model W11): fraction over 1 s ≤ legacy + 0.5 pp, per kind, as a
-// count. The full suite runs 200 queries, 100 of each kind; -short runs 30
-// as a smoke test and reports, since one query there is several points.
+// count. One query there is several points at -short's size, so -short
+// is a smoke test that each kind is answered.
 //
 // The path is a long-haul shape at a modest size: 120 ms round trip, 10 %
 // random loss each way, a policed 20 Mbit/s. Queries run one at a time, the
 // next starting when the last is answered or reaches the 1 s retry: fresh
 // and reused associations share the tunnel's coded symbol stream, so a later
 // query in flight could reveal a lost tail that the tunnel must repair on its
-// own. That is the model's 1 s spacing without its idle remainder.
+// own. Queries are one a second, the model's cadence, and both arms run at
+// once on their own paths. The full suite sends 200; -short sends 16 and
+// reports.
 func TestOneShotDatagramOnAnEmulatedPath(t *testing.T) {
 	requireStableImpairmentClock(t)
 	queries := 200
 	if testing.Short() {
-		queries = 30
+		queries = 16
 	}
 	path := pathsim.Config{
 		OneWayDelay: 60 * time.Millisecond, LossRate: 0.10, Seed: 11,
 		RateBytesPerSec: 20e6 / 8, PolicerRefillPeriod: 8 * time.Millisecond,
 	}
-	const retry = time.Second
-	const wait = retry
 
-	over := map[string][2]int{}
-	for _, arm := range workloadArms() {
-		t.Run(arm.name, func(t *testing.T) {
-			rig := newWorkloadRig(t, path, arm, nil)
-			reflector := udpReflector(t, oneShotAnswer)
-
-			// The reused association, warmed by one exchange first, as a
-			// resolver's long-lived socket is.
-			reused, err := rig.associate()
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = reused.Close() })
-			var (
-				waitersMu sync.Mutex
-				waiters   = map[uint32]chan time.Time{}
-			)
-			go func() {
-				buf := make([]byte, 4096)
-				for {
-					payload, err := reused.receive(buf, time.Now().Add(time.Minute))
-					if err != nil {
-						return
-					}
-					if len(payload) < 4 {
-						continue
-					}
-					waitersMu.Lock()
-					ch := waiters[binary.BigEndian.Uint32(payload)]
-					waitersMu.Unlock()
-					if ch != nil {
-						select {
-						case ch <- time.Now():
-						default:
-						}
-					}
-				}
-			}()
-			exchangeReused := func(id uint32) (time.Duration, bool) {
-				ch := make(chan time.Time, 1)
-				waitersMu.Lock()
-				waiters[id] = ch
-				waitersMu.Unlock()
-				start := time.Now()
-				if err := reused.send(reflector, oneShotQuery(id)); err != nil {
-					return 0, false
-				}
-				select {
-				case at := <-ch:
-					return at.Sub(start), true
-				case <-time.After(wait):
-					return 0, false
-				}
-			}
-			if _, ok := exchangeReused(0); !ok {
-				// The warm-up is retried once: the path loses 10 %.
-				if _, ok := exchangeReused(1); !ok {
-					t.Fatal("the reused association never answered")
-				}
-			}
-
-			results := make([]oneShotResult, queries)
-			for i := range queries {
-				func() {
-					id := uint32(100 + i)
-					fresh := i%2 == 0
-					r := oneShotResult{fresh: fresh}
-					if !fresh {
-						r.elapsed, r.answered = exchangeReused(id)
-						results[i] = r
-						return
-					}
-					start := time.Now()
-					association, err := rig.associate()
-					if err != nil {
-						results[i] = r
-						return
-					}
-					defer association.Close()
-					if err := association.send(reflector, oneShotQuery(id)); err != nil {
-						results[i] = r
-						return
-					}
-					buf := make([]byte, 4096)
-					deadline := start.Add(wait)
-					for {
-						payload, err := association.receive(buf, deadline)
-						if err != nil {
-							break
-						}
-						if len(payload) >= 4 && binary.BigEndian.Uint32(payload) == id {
-							r.answered, r.elapsed = true, time.Since(start)
-							break
-						}
-					}
-					results[i] = r
-				}()
-			}
-
-			var counts [2]int
-			var answered [2][]time.Duration
-			for _, r := range results {
-				kind := 0
-				if r.fresh {
-					kind = 1
-				}
-				if !r.answered || r.elapsed > retry {
-					counts[kind]++
-				}
-				if r.answered {
-					answered[kind] = append(answered[kind], r.elapsed)
-				}
-			}
-			for kind, name := range []string{"reused", "fresh"} {
-				t.Logf("%s: %d of %d over %v; answered p50 %v, p99 %v", name, counts[kind], queries/2, retry,
-					durationQuantile(answered[kind], 0.50).Round(time.Millisecond),
-					durationQuantile(answered[kind], 0.99).Round(time.Millisecond))
-			}
-			over[arm.name] = counts
-		})
+	arms := workloadArms()
+	rigs := make([]*workloadRig, len(arms))
+	reflectors := make([]*net.UDPAddr, len(arms))
+	for i, arm := range arms {
+		rigs[i] = newWorkloadRig(t, path, arm, nil)
+		reflectors[i] = udpReflector(t, oneShotAnswer)
 	}
-	if !judgeComparisons(t) {
-		return
+	results := make([]oneShotArm, len(arms))
+	var wg sync.WaitGroup
+	for i := range arms {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = runOneShotArm(rigs[i], reflectors[i], queries)
+		}()
 	}
-	legacy, legacyRan := over[legacyArm.name]
-	flip, flipRan := over[flipArm.name]
-	if !legacyRan || !flipRan {
-		return // one arm selected with -run
+	wg.Wait()
+	for i, arm := range arms {
+		r := results[i]
+		if r.err != nil {
+			t.Fatalf("%s: %v", arm.name, r.err)
+		}
+		for kind, name := range []string{"reused", "fresh"} {
+			t.Logf("%s, %s: %d of %d over %v; answered p50 %v, p99 %v", arm.name, name, r.over[kind], queries/2, oneShotRetry,
+				durationQuantile(r.answered[kind], 0.50).Round(time.Millisecond),
+				durationQuantile(r.answered[kind], 0.99).Round(time.Millisecond))
+			if len(r.answered[kind]) == 0 {
+				t.Fatalf("%s: no query on a %s association was answered", arm.name, name)
+			}
+		}
 	}
-	if testing.Short() {
-		// At 15 queries a kind one query is several points; the model's
+	if testing.Short() || !judgeComparisons(t) {
+		// At 8 queries a kind one query is several points; the model's
 		// 0.5 pp needs the full suite's count to mean anything.
 		return
 	}
+	legacy, flip := results[0].over, results[1].over
 	for kind, name := range []string{"reused", "fresh"} {
 		if limit := oneShotLimit(legacy[kind], queries/2); flip[kind] > limit {
 			t.Errorf("%s associations: %d of %d queries over %v under the flip bundle against %d under legacy; "+
 				"the bound (legacy + 0.5 pp) allows %d",
-				name, flip[kind], queries/2, retry, legacy[kind], limit)
+				name, flip[kind], queries/2, oneShotRetry, legacy[kind], limit)
 		}
 	}
+}
+
+// oneShotRetry is a stub resolver's first retry.
+const oneShotRetry = time.Second
+
+// oneShotArm is one arm's W11 outcome, by kind: reused, fresh.
+type oneShotArm struct {
+	over     [2]int
+	answered [2][]time.Duration
+	err      error
+}
+
+// runOneShotArm sends one query a second, alternating fresh and reused
+// associations, never more than one outstanding.
+func runOneShotArm(rig *workloadRig, reflector *net.UDPAddr, queries int) (out oneShotArm) {
+	// The reused association, warmed by one exchange first, as a
+	// resolver's long-lived socket is.
+	reused, err := rig.associate()
+	if err != nil {
+		out.err = err
+		return out
+	}
+	defer reused.Close()
+	var (
+		waitersMu sync.Mutex
+		waiters   = map[uint32]chan time.Time{}
+	)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			payload, err := reused.receive(buf, time.Now().Add(time.Minute))
+			if err != nil {
+				return
+			}
+			if len(payload) < 4 {
+				continue
+			}
+			waitersMu.Lock()
+			ch := waiters[binary.BigEndian.Uint32(payload)]
+			waitersMu.Unlock()
+			if ch != nil {
+				select {
+				case ch <- time.Now():
+				default:
+				}
+			}
+		}
+	}()
+	exchangeReused := func(id uint32) (time.Duration, bool) {
+		ch := make(chan time.Time, 1)
+		waitersMu.Lock()
+		waiters[id] = ch
+		waitersMu.Unlock()
+		start := time.Now()
+		if err := reused.send(reflector, oneShotQuery(id)); err != nil {
+			return 0, false
+		}
+		select {
+		case at := <-ch:
+			return at.Sub(start), true
+		case <-time.After(oneShotRetry):
+			return 0, false
+		}
+	}
+	if _, ok := exchangeReused(0); !ok {
+		// The warm-up is retried once: the path loses 10 %.
+		if _, ok := exchangeReused(1); !ok {
+			out.err = errors.New("the reused association never answered")
+			return out
+		}
+	}
+	exchangeFresh := func(id uint32) (time.Duration, bool) {
+		start := time.Now()
+		association, err := rig.associate()
+		if err != nil {
+			return 0, false
+		}
+		defer association.Close()
+		if err := association.send(reflector, oneShotQuery(id)); err != nil {
+			return 0, false
+		}
+		buf := make([]byte, 4096)
+		for {
+			payload, err := association.receive(buf, start.Add(oneShotRetry))
+			if err != nil {
+				return 0, false
+			}
+			if len(payload) >= 4 && binary.BigEndian.Uint32(payload) == id {
+				return time.Since(start), true
+			}
+		}
+	}
+	start := time.Now()
+	for i := range queries {
+		// One query a second, as the model's resolver sends them: an early
+		// answer waits out its second, so both arms offer the same load.
+		if wait := time.Until(start.Add(time.Duration(i) * time.Second)); wait > 0 {
+			time.Sleep(wait)
+		}
+		kind, exchange := 0, exchangeReused
+		if i%2 == 0 {
+			kind, exchange = 1, exchangeFresh
+		}
+		elapsed, ok := exchange(uint32(100 + i))
+		if !ok || elapsed > oneShotRetry {
+			out.over[kind]++
+		}
+		if ok {
+			out.answered[kind] = append(out.answered[kind], elapsed)
+		}
+	}
+	return out
 }
 
 // oneShotLimit is W11's bound as a count: legacy's count plus 0.5 pp of the

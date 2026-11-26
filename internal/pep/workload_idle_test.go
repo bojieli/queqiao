@@ -173,21 +173,34 @@ func TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock(t *testing.T) {
 	targets := []time.Duration{5, 14, 16, 29, 31, 45, 60}
 	heartbeats := []time.Duration{0, time.Minute, 10 * time.Minute}
 	idleTimeout := defaultFlowIdleTimeout
-	// The flow's idle check runs on a real one-second ticker; once the
-	// clock passes the timeout the flow ends within one tick, and its end
-	// must then reach each application within the bound.
+	// Each advance of the clock ticks every flow's limit check and waits for
+	// it, so a flow that crosses the timeout has ended by the time the
+	// advance returns, and its end must then reach each application within
+	// the bound.
 	const propagation = 5 * time.Second
-	const tick = time.Second
 
 	delivered := map[string]map[string]bool{}
 	for _, arm := range workloadArms() {
 		t.Run(arm.name, func(t *testing.T) {
 			var offset atomic.Int64
 			clock := func() time.Time { return time.Now().Add(time.Duration(offset.Load())) }
-			advance := func(to time.Duration) { offset.Store(int64(to)) }
+			ticker := newLimitTicker()
+			// advance returns when it moved the clock: the moment a flow
+			// past its timeout became due to end.
+			advance := func(to time.Duration) time.Time {
+				offset.Store(int64(to))
+				moved := time.Now()
+				if err := ticker.tick(5 * time.Second); err != nil {
+					t.Fatal(err)
+				}
+				return moved
+			}
 
 			rig := newWorkloadRig(t, pathsim.Config{OneWayDelay: 10 * time.Millisecond, Seed: 9}, arm,
-				func(c *Client, s *Server) { c.flowClockForTest, s.flowClockForTest = clock, clock })
+				func(c *Client, s *Server) {
+					c.flowClockForTest, s.flowClockForTest = clock, clock
+					c.flowLimitTickerForTest, s.flowLimitTickerForTest = ticker.subscribe, ticker.subscribe
+				})
 
 			var cells []*idleCell
 			for _, target := range targets {
@@ -283,10 +296,10 @@ func TestIdleFlowSurvivesEachIdleTargetOnAnInjectedClock(t *testing.T) {
 			crossed := false
 			last := targets[len(targets)-1] * time.Minute
 			for now := time.Minute; now <= last; now += time.Minute {
-				advance(now)
+				moved := advance(now)
 				if !crossed && now >= idleTimeout {
 					crossed = true
-					checkIdleEnds(t, cells, idleTimeout, time.Now(), tick+propagation)
+					checkIdleEnds(t, cells, idleTimeout, moved, propagation)
 				}
 				if !crossed && now+time.Minute >= idleTimeout {
 					// The last minute before the timeout: every flow is
@@ -382,6 +395,70 @@ func countTrue(m map[string]bool) int {
 		}
 	}
 	return n
+}
+
+// limitTicker drives every flow's limit check in step with the injected
+// clock: tick sends each watching flow one tick and waits until each has
+// checked it, or stopped watching because the check ended it.
+type limitTicker struct {
+	mu   sync.Mutex
+	next int
+	subs map[int]*limitSub
+}
+
+type limitSub struct {
+	ticks chan time.Time
+	acks  chan struct{}
+	done  chan struct{}
+}
+
+func newLimitTicker() *limitTicker { return &limitTicker{subs: map[int]*limitSub{}} }
+
+// subscribe is a flow's limitTicker.
+func (l *limitTicker) subscribe() (<-chan time.Time, func(), func()) {
+	sub := &limitSub{ticks: make(chan time.Time, 1), acks: make(chan struct{}, 1), done: make(chan struct{})}
+	l.mu.Lock()
+	id := l.next
+	l.next++
+	l.subs[id] = sub
+	l.mu.Unlock()
+	checked := func() { sub.acks <- struct{}{} }
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			l.mu.Lock()
+			delete(l.subs, id)
+			l.mu.Unlock()
+			close(sub.done)
+		})
+	}
+	return sub.ticks, checked, stop
+}
+
+func (l *limitTicker) tick(within time.Duration) error {
+	l.mu.Lock()
+	subs := make([]*limitSub, 0, len(l.subs))
+	for _, sub := range l.subs {
+		subs = append(subs, sub)
+	}
+	l.mu.Unlock()
+	deadline := time.After(within)
+	for _, sub := range subs {
+		select {
+		case sub.ticks <- time.Now():
+		case <-sub.done:
+			continue
+		case <-deadline:
+			return fmt.Errorf("a flow did not take its limit tick within %v", within)
+		}
+		select {
+		case <-sub.acks:
+		case <-sub.done:
+		case <-deadline:
+			return fmt.Errorf("a flow did not complete its limit check within %v", within)
+		}
+	}
+	return nil
 }
 
 // runIdleWake wakes a cell in its direction and records whether the wake
@@ -485,10 +562,23 @@ func checkIdleEnds(t *testing.T, cells []*idleCell, idleTimeout time.Duration, c
 // shorter than the gateway's the destination always waited. This pins the
 // second case, on real time.
 func TestAClientIdleTimeoutReachesTheDestinationWithinFiveSeconds(t *testing.T) {
+	// Pooled, the lane is a stream on a connection that outlives the flow;
+	// dedicated, closing the lane closes the connection, so the RESET must
+	// be delivered before it is.
+	for _, pooled := range []bool{true, false} {
+		name := "pooled"
+		if !pooled {
+			name = "dedicated"
+		}
+		t.Run(name, func(t *testing.T) { clientIdleTimeoutReachesTheDestination(t, pooled) })
+	}
+}
+
+func clientIdleTimeoutReachesTheDestination(t *testing.T, pooled bool) {
 	const idleTimeout = 2 * time.Second
 	arm := workloadArm{
 		name:   "client idle timeout",
-		client: func(c *ClientConfig) { c.FlowIdleTimeout = idleTimeout },
+		client: func(c *ClientConfig) { c.FlowIdleTimeout, c.EnableQUICPool = idleTimeout, pooled },
 		server: func(*ServerConfig) {},
 	}
 	rig := newWorkloadRig(t, pathsim.Config{OneWayDelay: 10 * time.Millisecond, Seed: 3}, arm, nil)
