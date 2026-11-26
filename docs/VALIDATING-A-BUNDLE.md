@@ -134,6 +134,20 @@ built to refuse rather than to trust:
   clean. A job that does not run to its end (ssh dropped, timed out, the
   generator crashed) is a harness failure, not the arm's, and its block gets
   no verdict.
+- **Temporary firewall rules are opt-in, declared and reverted.** A
+  `[firewall:<name>]` section (`host`, `allow = 23471:23472/tcp
+  23471:23472/udp`) lets the campaign open its own gateway ports on a
+  production host's ufw, and nothing else: every port in `allow` must be one
+  the campaign plans on that host. Just before setup the runner reads
+  `sudo -n ufw status numbered`, refuses if a rule already exists (deleting
+  it later would remove a production rule), and adds each rule; on every
+  exit, after teardown, it deletes them and checks the rule listing is the
+  one it read before. A revert that fails, or a listing that differs, is
+  reported loudly with the commands to restore by hand, kept beside the
+  campaign as `firewall-<host>-before.txt` and `-after.txt`, and makes the
+  run exit 8. These rule changes and the production snapshot are the only
+  uses of sudo. A runner killed with SIGKILL cannot revert: the log line
+  written when the rules go in holds the commands to remove them.
 - **Teardown always runs**, on success, on error, and on SIGINT or SIGTERM.
   It stops every temporary process, checks that no planned port is still
   listening, and removes the work directory (pass `--keep-remote` to keep it).

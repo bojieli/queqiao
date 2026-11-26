@@ -62,6 +62,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 sys.modules.setdefault("ab_campaign", sys.modules[__name__])
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+FIREWALL_SPEC_RE = re.compile(r"^[0-9]{1,5}(:[0-9]{1,5})?/(tcp|udp)$")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 ARM_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 WORK_PREFIX = "qq-ab-"
@@ -208,6 +209,17 @@ class Client:
 
 
 @dataclass
+class Firewall:
+    """Temporary inbound rules a campaign adds on a production host's ufw
+    before its first trial and deletes on every exit (opt-in). `allow` holds
+    ufw specs, "PORT[:PORT]/tcp|udp", each covering only ports the campaign
+    itself plans on that host."""
+    name: str
+    host: str
+    allow: List[str]
+
+
+@dataclass
 class Production:
     name: str
     host: str
@@ -254,6 +266,8 @@ class Config:
     # Sample every host's CPU (and production's) through each trial, for the
     # contention void rule (gates.ini [contention]).
     host_cpu: bool = False
+    # Temporary ufw rules ([firewall:*]); empty: none.
+    firewalls: List[Firewall] = field(default_factory=list)
 
     @property
     def work_dir(self) -> str:
@@ -358,6 +372,7 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
     clients: Dict[str, Client] = {}
     arms: List[Arm] = []
     prod: List[Production] = []
+    fws: List[Firewall] = []
     for sec in cp.sections():
         s = cp[sec]
         if sec.startswith("client:"):
@@ -396,6 +411,16 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
             for w, fl in (("flags", arm.flags), ("gateway_flags", arm.gateway_flags), ("client_flags", arm.client_flags)):
                 _check_flags(f"[{sec}] {w}", fl)
             arms.append(arm)
+        elif sec.startswith("firewall:"):
+            if not s.get("host"):
+                raise ConfigError(f"[{sec}] host is required")
+            specs = _words(s.get("allow", ""))
+            if not specs:
+                raise ConfigError(f"[{sec}] allow is required")
+            for spec in specs:
+                if not FIREWALL_SPEC_RE.match(spec):
+                    raise ConfigError(f"[{sec}] allow: {spec!r} is not PORT[:PORT]/tcp or /udp")
+            fws.append(Firewall(name=sec.split(":", 1)[1], host=s["host"], allow=specs))
         elif sec.startswith("production:"):
             if not s.get("host"):
                 raise ConfigError(f"[{sec}] host is required")
@@ -465,6 +490,19 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                 for p_ in prod_paths:
                     if tok == p_ or tok.startswith(p_ + "/"):
                         raise ConfigError(f"{where}: {f!r} names production path {p_}")
+    cfg.firewalls = fws
+    for fw in fws:
+        if fw.host not in {p.host for p in prod}:
+            raise ConfigError(f"[firewall:{fw.name}] host {fw.host} has no [production:...] section")
+        planned = {p for p, _ in cfg.planned_ports().get(fw.host, [])}
+        for spec in fw.allow:
+            a, _, b = spec.split("/")[0].partition(":")
+            ports = range(int(a), int(b or a) + 1)
+            missing_ = [p for p in ports if p not in planned]
+            if not ports or missing_:
+                # Only the campaign's own ports may be opened.
+                raise ConfigError(f"[firewall:{fw.name}] {spec} opens port(s) {missing_ or spec} the campaign does not "
+                                  f"plan on {fw.host}")
     covered = {p.host for p in prod}
     missing = [h for h in cfg.hosts() if h not in covered]
     if missing:
@@ -1008,6 +1046,12 @@ class Campaign:
         self.blocks_run = 0
         self.units_run: List[List[Any]] = []
         self.teardown_notes: List[str] = []
+        # Temporary firewall rules: per host its rule listing before, the
+        # specs applied, and what happened.
+        self.fw_before: Dict[str, str] = {}
+        self.fw_applied: Dict[str, List[str]] = {}
+        self.firewall_state: Dict[str, str] = {}
+        self.firewall_failures: List[str] = []
         self.stopped = ""
         self.stopped_types: Dict[str, str] = {}
         self.beside_threads: List[threading.Thread] = []
@@ -1710,6 +1754,69 @@ rm -f "$f"''', what=f"stop {tag}")
             self.stop(self.hosts[cfg.gateway.host], f"gw-{arm.name}")
         self.collect(tagp, clients)
 
+    # -- temporary firewall rules ([firewall:*]); the only sudo besides the snapshot
+    UFW_STATUS = "sudo -n ufw status numbered"
+
+    def open_firewall(self) -> None:
+        """Add each declared rule on its host's ufw, after reading the rule
+        set; refuse (before anything is added there) when the listing cannot
+        be read or a rule already exists, since deleting it afterwards would
+        remove a production rule."""
+        for fw in self.cfg.firewalls:
+            h = self.hosts[fw.host]
+            rc, before = h.run(self.UFW_STATUS, what=f"read the firewall rules on {fw.host} (before)")
+            if self.dry:
+                before = ""
+            elif rc != 0 or "Status: active" not in before:
+                raise Refused(f"{fw.host}: cannot read the firewall rules (exit {rc}): {before.strip()[:200]}")
+            present = [s for s in fw.allow if re.search(rf"\]\s+{re.escape(s)}\s+ALLOW IN\s", before)]
+            if present:
+                raise Refused(f"{fw.host}: firewall rule(s) {', '.join(present)} already exist; the campaign would "
+                              "remove them when it reverts")
+            self.fw_before[fw.host] = before
+            self.fw_applied.setdefault(fw.host, [])
+            self.log(f"{fw.host}: adding temporary firewall rules {' '.join(fw.allow)}; to revert by hand: "
+                     + "; ".join(f"sudo ufw delete allow {s}" for s in fw.allow))
+            for spec in fw.allow:
+                # Recorded before it runs: a half-applied rule is reverted too.
+                self.fw_applied[fw.host].append(spec)
+                rc, out = h.run(f"sudo -n ufw allow {spec}", what=f"temporary firewall rule {spec} on {fw.host}")
+                if rc != 0 and not self.dry:
+                    raise RuntimeError(f"{fw.host}: ufw allow {spec} failed (exit {rc}): {out.strip()[:200]}")
+            self.firewall_state[fw.host] = "open"
+
+    def close_firewall(self) -> None:
+        """Delete every rule this campaign added, then check the host's rule
+        set is the one read before. Anything else is a failure, reported."""
+        for host, specs in self.fw_applied.items():
+            h = self.hosts[host]
+            ok = True
+            for spec in reversed(specs):
+                try:
+                    rc, out = h.run(f"sudo -n ufw delete allow {spec}", what=f"remove temporary firewall rule {spec} on {host}")
+                except Exception as e:
+                    rc, out = -1, f"{type(e).__name__}: {e}"
+                if rc != 0 and not self.dry:
+                    ok = False
+                    self.firewall_failures.append(f"{host}: ufw delete allow {spec} failed (exit {rc}): {out.strip()[:200]}")
+            try:
+                rc, after = h.run(self.UFW_STATUS, what=f"read the firewall rules on {host} (after)")
+            except Exception as e:
+                rc, after = -1, f"{type(e).__name__}: {e}"
+            if not self.dry and (rc != 0 or after != self.fw_before.get(host)):
+                ok = False
+                self.firewall_failures.append(f"{host}: the firewall rules differ from those before the campaign "
+                                              f"(exit {rc}); compare `sudo ufw status numbered` with "
+                                              f"{os.path.join(self.out, 'firewall-' + host + '-before.txt')}")
+                if not self.dry:
+                    os.makedirs(self.out, exist_ok=True)
+                    with open(os.path.join(self.out, f"firewall-{host}-before.txt"), "w") as f:
+                        f.write(self.fw_before.get(host, ""))
+                    with open(os.path.join(self.out, f"firewall-{host}-after.txt"), "w") as f:
+                        f.write(after)
+            self.firewall_state[host] = "restored" if ok else "REVERT FAILED"
+            specs.clear() if ok else None
+
     def host_cpu_hosts(self, path: str) -> List[str]:
         """The hosts a trial on this path loads: the gateway's and its clients'."""
         return list(dict.fromkeys([self.cfg.gateway.host] + [c.host for c in self.clients_for(path)]))
@@ -1944,6 +2051,9 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         tsv = None
         try:
             self.started = True
+            # Temporary firewall rules, if declared: opened here, inside the
+            # try, so every exit path below closes them again.
+            self.open_firewall()
             self.setup()
             self.record_effective()
             if not self.dry:
@@ -2023,6 +2133,14 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 self.log(f"{len(self.fetch_failures)} log file(s) could not be fetched; the work directories are kept")
             elif clean:
                 clean_failures = self.clean()
+            # The temporary firewall rules come out on every exit, after the
+            # processes they let traffic reach are gone.
+            try:
+                self.close_firewall()
+            except BaseException as e:   # a revert that cannot even run is a revert that failed
+                self.firewall_failures.append(f"the firewall revert did not run: {type(e).__name__}: {e}")
+            if self.firewall_failures:
+                self.log("FIREWALL REVERT FAILED -- restore by hand NOW:\n  " + "\n  ".join(self.firewall_failures))
             for sig, h in prev.items():
                 signal.signal(sig, h)
         production_unknown = False
@@ -2040,6 +2158,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         production = "changed" if self.production_changed else "unknown" if production_unknown else "unchanged"
         if leftovers and status == 0:
             status = 5
+        if self.firewall_failures:
+            status = 8
         if clean_failures:
             self.log("cleanup failed:\n  " + "\n  ".join(clean_failures))
             status = status or 7
@@ -2049,6 +2169,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             with open(os.path.join(self.out, "status.json"), "w") as f:
                 json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
                            "production": production, "teardown_leftovers": leftovers, "cleanup_failures": clean_failures,
+                           "firewall": self.firewall_state, "firewall_failures": self.firewall_failures,
                            "fetch_failures": self.fetch_failures, "job_failures": self.job_failures,
                            "blocks_run": self.blocks_run, "units_run": self.units_run, "stopped": self.stopped,
                            "stopped_types": self.stopped_types,
