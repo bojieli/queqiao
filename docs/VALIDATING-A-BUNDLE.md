@@ -929,6 +929,9 @@ probes every 0.25 s, each its own connection.
   outage), `lower 1.0`. The p99 over all calls is reported only: with fixed
   timing an LLM turn lined up with the 25 s outage, and that p99 reported
   which arm had a call in flight.
+- *Stage 10* (`[workload:impaired] stage = 10`): sender-side credit delay
+  p95 is also a rule of every trial type (its `[secondary]` bound, pooled
+  over blocks when sparse); the shadow false-promotion rate is reported.
 - *Offsets*: each trial's LLM start (+0 to 6 s) and outage starts (+0 to
   10 s and +0 to 5 s) are drawn from the frozen seed, independently per
   block, slot and arm.
