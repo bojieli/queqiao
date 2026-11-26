@@ -980,6 +980,29 @@ func (b *TUICBBRSender) targetCwnd(gain float64) quiccongestion.ByteCount {
 	return quiccongestion.ByteCount(bdp)
 }
 
+// outage is told that the path delivered nothing for d and has now returned.
+// The clocks that age what the sender knows of the path -- the bandwidth
+// estimate's window, the remembered peak, the minimum round trip's -- stop
+// for it: an estimate is aged out so that a path which changed is believed,
+// and a path that was away has not shown what it is now. Without this an
+// outage longer than the estimate's window (ten minimum round trips) left it
+// expired at the restore, and the first trickle acknowledged replaced it.
+func (b *TUICBBRSender) outage(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	b.estimator.maxFilter.suspend(d)
+	if !b.peakBandwidthAt.IsZero() {
+		b.peakBandwidthAt = b.peakBandwidthAt.Add(d)
+	}
+	if !b.minRTTAt.IsZero() {
+		b.minRTTAt = b.minRTTAt.Add(d)
+	}
+	if !b.rttSinceMinRTTAt.IsZero() {
+		b.rttSinceMinRTTAt = b.rttSinceMinRTTAt.Add(d)
+	}
+}
+
 // probeRTTCwnd is the window ProbeRTT holds the flight to.
 //
 // BBRv1's, and the per-connection senders', is four packets: the path carries

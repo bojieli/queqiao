@@ -196,6 +196,9 @@ const (
 	// pathProbeWindowPackets is a PROBING attachment's own window for
 	// ordinary packets (§4.4).
 	pathProbeWindowPackets = 2
+	// pathProbeIntervalFloor is the least time between renewals of a
+	// PROBING attachment's probe allowance (probeFits).
+	pathProbeIntervalFloor = 250 * time.Millisecond
 	// pathProbingPTOProbes is how many PTO probes an attachment may send
 	// without transport progress before it is PROBING: its flight then
 	// leaves the sum, so a connection whose packets are no longer being
@@ -1065,7 +1068,7 @@ func (c *PathController) claimantCanSend(o *PathAttachment, now monotime.Time, t
 		debt = pathControlDebtPackets * c.maxPacket
 	}
 	if o.probing {
-		if o.gauge+size > pathProbeWindowPackets*c.maxPacket {
+		if !c.probeFits(o, now, size) {
 			return false
 		}
 	} else if c.flight+size > c.law.GetCongestionWindow()+debt {
@@ -1099,7 +1102,7 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 	// The packet must fit: refused if the flight after it would exceed the
 	// window (§4.3), or, on a CONTROL turn, the window plus the debt.
 	if a.probing {
-		if a.gauge+maxBytes > pathProbeWindowPackets*c.maxPacket {
+		if !c.probeFits(a, now, maxBytes) {
 			c.markWindow(a, true)
 			a.unable = true
 			c.stats.refusedWindow.Add(1)
@@ -1129,7 +1132,47 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 		}
 		borrowed = true
 	}
+	if a.probing && a.gauge+maxBytes > pathProbeWindowPackets*c.maxPacket {
+		// Admitted on the probe allowance (probeFits): it is spent.
+		if a.probeAt.IsZero() || now.Sub(a.probeAt) >= c.probeInterval() {
+			a.probeAt, a.probeSent = now, 0
+		}
+		a.probeSent += maxBytes
+	}
 	return borrowed, nil
+}
+
+// probeInterval is how often a PROBING attachment's probe allowance is
+// renewed: a smoothed round trip, and no less than pathProbeIntervalFloor.
+func (c *PathController) probeInterval() time.Duration {
+	return max(c.rtt.SmoothedRTT(), pathProbeIntervalFloor)
+}
+
+// probeFits says whether a PROBING attachment may send an ordinary packet of
+// size now (§4.4): while its own gauge is under the probe window, or else
+// within an allowance of one probe window per probe interval.
+//
+// The gauge alone is not enough. An attachment demoted in the middle of a
+// transfer carries everything it had outstanding, far more than the probe
+// window, and none of it is acknowledged or declared lost while the path is
+// away, so by its gauge it could never send an ordinary packet again. Its
+// only ack-eliciting packets were then the transport's own probe timeouts,
+// which back off: after an 8 s outage a gateway serving downloads sent
+// nothing of its own for another 5.5 s, until its 13.5 s timeout, while it
+// answered the client's path-return probes with bare acknowledgements once a
+// second. With the allowance, the first packet the returning path delivers
+// to it prompts a send, that packet is acknowledged a round trip later, and
+// the attachment is COUNTED again.
+func (c *PathController) probeFits(a *PathAttachment, now monotime.Time, size quiccongestion.ByteCount) bool {
+	window := pathProbeWindowPackets * c.maxPacket
+	if a.gauge+size <= window {
+		return true
+	}
+	sent := a.probeSent
+	if a.probeAt.IsZero() || now.Sub(a.probeAt) >= c.probeInterval() {
+		sent = 0
+	}
+	return sent+size <= window
 }
 
 func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []func() {
@@ -1443,6 +1486,10 @@ type PathAttachment struct {
 	epoch   uint64
 	gauge   quiccongestion.ByteCount
 	probing bool
+	// probeSent is what a PROBING attachment has been admitted on its probe
+	// allowance since probeAt (probeFits).
+	probeSent quiccongestion.ByteCount
+	probeAt   monotime.Time
 	// drained says the client promoted a replacement over this attachment's
 	// connection (§10.2): it is PROBING for good, and transport progress no
 	// longer returns it to COUNTED (§4.4).

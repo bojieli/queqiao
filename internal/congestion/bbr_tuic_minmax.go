@@ -167,6 +167,20 @@ func (m *tuicMinMax) retire(now monotime.Time) {
 	}
 }
 
+// suspend moves every sample d later, as if the time had not passed: for a
+// span in which the path delivered nothing at all (an outage), which is no
+// evidence about what it delivers when it does.
+func (m *tuicMinMax) suspend(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	for i := range m.samples {
+		if m.samples[i].value != 0 && !m.samples[i].at.IsZero() {
+			m.samples[i].at = m.samples[i].at.Add(d)
+		}
+	}
+}
+
 func (m *tuicMinMax) updateMax(round uint64, now monotime.Time, value uint64) {
 	if value == 0 {
 		return

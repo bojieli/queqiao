@@ -44,6 +44,14 @@ func attachPC(t *testing.T, c *PathController, now monotime.Time) *pcConn {
 	return p
 }
 
+// spendProbeAllowance leaves a PROBING attachment with nothing of its probe
+// allowance for the interval that starts at now.
+func spendProbeAllowance(c *PathController, p *pcConn, now monotime.Time) {
+	c.mu.Lock()
+	p.a.probeAt, p.a.probeSent = now, pathProbeWindowPackets*c.maxPacket
+	c.mu.Unlock()
+}
+
 // send registers one ordinary bulk packet and returns its number.
 func (p *pcConn) send(now monotime.Time, bytes quiccongestion.ByteCount) quiccongestion.PacketNumber {
 	return p.sendKind(now, bytes, quiccongestion.KindOrdinary, true)
@@ -765,6 +773,7 @@ func TestAStalledClaimantDoesNotThrottleItsSibling(t *testing.T) {
 	for range pathProbingPTOProbes {
 		stuck.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
 	}
+	spendProbeAllowance(c, stuck, now)
 	stuck.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
 	healthy.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
 	if p := stuck.a.Admit(now, 1200); p.OK {
@@ -1517,6 +1526,7 @@ func TestABypassIsChargedOnlyWhenGranted(t *testing.T) {
 	}
 	now = now.Add(time.Second)
 	c.arb.OnSent([4]quiccongestion.ByteCount{quiccongestion.ClassControl: 1 << 20})
+	spendProbeAllowance(c, stuck, now)
 	stuck.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
 	if p := stuck.a.Admit(now, 1200); p.OK {
 		t.Fatalf("a PROBING attachment with a full probe window was admitted: %+v", p)
@@ -1991,5 +2001,47 @@ func TestALonePacketInAPauseDoesNotBecomeTheEstimate(t *testing.T) {
 	}
 	if got := c.Telemetry().MaxBandwidth; got > peak/2 || got < peak/8 {
 		t.Fatalf("estimate %d B/s after two seconds at 0.3 MB/s, %d B/s before: a narrowed path was not believed", got, peak)
+	}
+}
+
+// An attachment demoted to PROBING in the middle of a transfer carries a
+// gauge far over the probe window, and nothing acknowledges or loses it while
+// the path is away. It may still send a probe window of ordinary packets in
+// each probe interval: they are what an acknowledgement can answer when the
+// path returns, sooner than the transport's backed-off probe timeout.
+func TestALoadedProbingAttachmentKeepsAProbeAllowance(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	for range 20 {
+		a.send(now, 1200)
+	}
+	for range pathProbingPTOProbes {
+		a.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
+	}
+	c.mu.Lock()
+	probing, gauge := a.a.probing, a.a.gauge
+	c.mu.Unlock()
+	if !probing || gauge <= pathProbeWindowPackets*1200 {
+		t.Fatalf("the attachment is probing=%v with a gauge of %d; the test needs it PROBING and loaded", probing, gauge)
+	}
+	now = now.Add(time.Second)
+	for i := range pathProbeWindowPackets {
+		if p := a.a.Admit(now, 1200); !p.OK {
+			t.Fatalf("ordinary packet %d of the probe allowance was refused: %+v", i+1, p)
+		}
+		a.send(now, 1200)
+	}
+	if p := a.a.Admit(now, 1200); p.OK {
+		t.Fatal("a PROBING attachment was admitted past its probe allowance")
+	}
+	// Still spent just short of the interval, renewed at it.
+	interval := c.probeInterval()
+	if p := a.a.Admit(now.Add(interval-time.Millisecond), 1200); p.OK {
+		t.Fatal("the probe allowance was renewed before its interval had passed")
+	}
+	if p := a.a.Admit(now.Add(interval), 1200); !p.OK {
+		t.Fatalf("the probe allowance was not renewed after %v: %+v", interval, p)
 	}
 }
