@@ -182,7 +182,7 @@ func newPathLaw(initialPacketSize quiccongestion.ByteCount, path pathmodel.Model
 	e.authority = true
 	e.inner.estimator.retireByFate = true
 	e.inner.estimator.maxFilter.retireAged = true
-	e.inner.estimator.staleEvidence = uint64(e.inner.minCwnd)
+	e.inner.estimator.staleEvidence = byteTotal(e.inner.minCwnd)
 	e.pacer.keepDebt = true
 	e.path = path
 	if path != nil {
