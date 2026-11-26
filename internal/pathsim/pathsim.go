@@ -146,6 +146,16 @@ type Config struct {
 	PolicerBurstBytes int
 	// Seed makes the loss pattern reproducible across runs.
 	Seed int64
+	// SourceIdleTimeout expires a client source's mapping, as a NAT or a
+	// forwarding relay does, once nothing has crossed it in either direction
+	// for this long. What then arrives for the source from the server is
+	// dropped, and the source's next packet leaves from a new port, so the
+	// server sees the connection arrive from a new address. Zero keeps every
+	// mapping forever.
+	//
+	// A transport is responsible for crossing its mapping more often than
+	// this; ExpiredSources counts the times it did not.
+	SourceIdleTimeout time.Duration
 	// MTU bounds a single datagram. Zero selects 1500.
 	MTU int
 }
@@ -451,6 +461,9 @@ type Relay struct {
 	queueMu sync.Mutex
 	queues  map[*direction]*deliveryQueue
 
+	// expired counts the mappings SourceIdleTimeout expired.
+	expired atomic.Int64
+
 	wg   sync.WaitGroup
 	done chan struct{}
 }
@@ -646,6 +659,10 @@ func (r *Relay) BlackholeSourcesDirection(up, down bool) {
 	}
 }
 
+// ExpiredSources is how many times a source's mapping went unused for
+// Config.SourceIdleTimeout and was expired.
+func (r *Relay) ExpiredSources() int { return int(r.expired.Load()) }
+
 // RestoreSources ends every blackhole: an outage that heals.
 func (r *Relay) RestoreSources() {
 	r.mu.Lock()
@@ -764,7 +781,25 @@ func (r *Relay) peerFor(addr net.Addr) (*peer, error) {
 		return nil, errors.New("relay is closed")
 	}
 	if existing, ok := r.peers[key]; ok {
-		existing.last.Store(time.Now().UnixNano())
+		now := time.Now().UnixNano()
+		if r.mappingExpired(existing, now) {
+			// The mapping is gone: this packet opens a new one, from a new
+			// port towards the server.
+			conn, err := net.DialUDP("udp", nil, r.target)
+			if err != nil {
+				return nil, err
+			}
+			if err := configureUDPBuffers(conn); err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("configure peer buffers: %w", err)
+			}
+			r.expired.Add(1)
+			old := existing.conn.Swap(conn)
+			r.wg.Add(1)
+			go r.readServer(existing, conn)
+			_ = old.Close()
+		}
+		existing.last.Store(now)
 		return existing, nil
 	}
 	conn, err := net.DialUDP("udp", nil, r.target)
@@ -784,6 +819,12 @@ func (r *Relay) peerFor(addr net.Addr) (*peer, error) {
 	r.wg.Add(1)
 	go r.readServer(p, conn)
 	return p, nil
+}
+
+// mappingExpired reports whether p's mapping has gone unused for the
+// configured idle timeout as of now (Unix nanoseconds).
+func (r *Relay) mappingExpired(p *peer, now int64) bool {
+	return r.cfg.SourceIdleTimeout > 0 && now-p.last.Load() > int64(r.cfg.SourceIdleTimeout)
 }
 
 func configureUDPBuffers(conn *net.UDPConn) error {
@@ -806,6 +847,15 @@ func (r *Relay) readServer(p *peer, conn *net.UDPConn) {
 		}
 		if p.blackDown.Load() {
 			continue
+		}
+		if r.cfg.SourceIdleTimeout > 0 {
+			// A packet from the server keeps a live mapping alive, and
+			// finds nothing behind an expired one.
+			now := time.Now().UnixNano()
+			if r.mappingExpired(p, now) || p.conn.Load() != conn {
+				continue
+			}
+			p.last.Store(now)
 		}
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
