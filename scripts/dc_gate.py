@@ -27,7 +27,8 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_stats as st  # noqa: E402
 from ab_analyze import (OVERLAP_MIN, PROBE_TIMEOUT, Trial, capped_flows, completeness, flow_rows,  # noqa: E402
-                        fmt, iter_json, metrics, read_campaign, span, tcp_evidence, ts, under_load, useful)
+                        fmt, iter_json, metrics, read_campaign, scaled_overlap, span, tcp_evidence, ts, under_load,
+                        useful)
 
 BOUNDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation", "dc_gate.ini")
 
@@ -134,16 +135,23 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     for w in waves:
         # Demonstrable overlap, on millisecond times: the intersection across
         # leaves of each leaf's actual request intervals (not its first-to-
-        # last envelope, which would fill an idle gap) lasts OVERLAP_MIN.
+        # last envelope, which would fill an idle gap) lasts at least half of
+        # the shortest leaf's time in the wave, within [CLOCK_ERROR_FLOOR,
+        # OVERLAP_MIN] (ab_analyze.scaled_overlap): every wave starts on a
+        # shared barrier, and on a short path a whole warm request can take
+        # less than OVERLAP_MIN.
         common = None
+        lengths = []
         for leaf in loaded:
             sp = [x for x in (span(r) for r in req if r["client"] == leaf and r["flow"].split("r", 1)[0] == w) if x]
             if not sp:
                 common = []
                 break
             iv = merge(sp, 0.0)
+            lengths.append(sum(b - a for a, b in iv))
             common = iv if common is None else intersect(common, iv)
-        if not common or sum(b - a for a, b in common) < OVERLAP_MIN - 1e-6:
+        need = scaled_overlap(min(lengths)) if lengths else OVERLAP_MIN
+        if not common or sum(b - a for a, b in common) < need - 1e-6:
             overlap = False
     m["waves_overlap"] = float(overlap)
     leaf_med = [st.median([done(r) for r in req if r["client"] == leaf]) for leaf in loaded]
@@ -159,10 +167,13 @@ def dc_measures(t: Trial, loaded: List[str], control: str, request_timeout: floa
     if not overlap:
         m["spread"] = m["latency_p50"] = m["latency_p99"] = float("nan")
     # Only control requests that overlapped the loaded leaves' phase count.
+    # The request phase's load is short requests: its margin scales with
+    # them, as the waves' overlap does.
     probes = []
     for ph in ("sustained", "requests"):
         load = [r for r in t.rows if r["phase"] == ph and r["client"] in loaded and r["kind"] != "probe"]
-        probes += under_load([r for r in t.rows if r["client"] == control and r["kind"] == "probe" and r["phase"] == ph], load)
+        probes += under_load([r for r in t.rows if r["client"] == control and r["kind"] == "probe" and r["phase"] == ph], load,
+                             scaled=ph == "requests")
     ctl = [float(r["seconds"]) if r["complete"] == "1" else PROBE_TIMEOUT for r in probes]
     # The control leaf must have been observed under both phases' load; a
     # probe job that produced nothing leaves the trial unmeasured.
@@ -311,11 +322,17 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
             keys = dict(first_keys)
         for t in [t for t in solo if t.block == b]:
             leaf = next((r["client"] for r in t.rows), "")
-            got = check(t, [leaf], f"block {b} solo {leaf}")
+            got = check(t, [leaf], f"block {b} solo {leaf} (slot {t.slot}, {t.arm})")
             if got is None:
                 continue
             if len(got) != 1:
-                wrong.append(f"block {b} solo {leaf}: {len(got)} leaf keys at the gateway, expected 1")
+                wrong.append(f"block {b} solo {leaf} (slot {t.slot}, {t.arm}): {len(got)} leaf keys at the gateway, "
+                             "expected 1")
+            elif leaf in keys and keys[leaf] != next(iter(got)):
+                # Repeated solos (calibrate_repeats, calibrate_arms = all) must
+                # all name the same leaf.
+                wrong.append(f"block {b} solo {leaf}: the gateway keyed its solo runs differently "
+                             f"({keys[leaf]}, {next(iter(got))})")
             else:
                 keys[leaf] = next(iter(got))
         egress_seen |= {r.get("path_egress") for t in solo if t.block == b for r in in_trial(t)}
@@ -425,6 +442,55 @@ def upload_evidence(campaign: str, plan: dict, ab: List[Trial], upsolo: List[Tri
     return missing, wrong
 
 
+def solo_rate(t: Trial, kind: str, duration: float) -> float:
+    """One solo calibration run's rate, NaN unless it is usable: it ran
+    backlogged for the window (a short burst that then failed would inflate
+    the solo rate) and, for downloads, no flow ran out of bytes."""
+    rows = [r for r in t.rows if r["kind"] == kind]
+    leaf = next((r["client"] for r in t.rows), "")
+    usable = shared_window(rows, [leaf], duration) and (kind != "bulk" or capped_flows(rows, duration) == 0)
+    return leaf_rate(rows) if usable else float("nan")
+
+
+def calibrated_rates(solos: List[Trial], kind: str, duration: float) -> Dict[str, float]:
+    """Each leaf's calibrated solo rate: the median of its usable runs
+    ([dc] calibrate_repeats), so one run that collapsed or burst cannot
+    decide whether the ancestor bound. NaN for a leaf with no usable run."""
+    by_leaf: Dict[str, List[float]] = {}
+    for t in solos:
+        leaf = next((r["client"] for r in t.rows), None)
+        if leaf is not None:
+            by_leaf.setdefault(leaf, []).append(solo_rate(t, kind, duration))
+    return {leaf: (st.median([x for x in v if x == x]) if any(x == x for x in v) else float("nan"))
+            for leaf, v in by_leaf.items()}
+
+
+def solo_table(solo: List[Trial], upsolo: List[Trial], arms: List[str], duration: float) -> List[str]:
+    """Every arm's solo runs per leaf (calibrate_arms = all runs them on
+    every arm): the single-connection rate a lone leaf gets, reported, not
+    gated -- the evidence for or against fan-out (design section 11.3, Q3)."""
+    rows: Dict[Tuple[str, str], List[float]] = {}
+    for ts_, kind in ((solo, "bulk"), (upsolo, "dc-upload")):
+        for t in ts_:
+            leaf = next((r["client"] for r in t.rows), "")
+            rows.setdefault((leaf, t.arm), []).append(solo_rate(t, kind, duration))
+    if not rows:
+        return []
+    leaves = sorted({k[0] for k in rows}, key=lambda x: (x.startswith("up"), x))
+    out = ["Solo runs (one leaf alone, one connection), Mbit/s: median of usable runs [every run; n/a = unusable].", "",
+           "| leaf | " + " | ".join(arms) + " |", "|---|" + "---:|" * len(arms)]
+    for leaf in leaves:
+        cells = []
+        for arm in arms:
+            v = rows.get((leaf, arm), [])
+            ok = [x for x in v if x == x]
+            cells.append("-" if not v else
+                         f"{fmt(st.median(ok) * 8e-6 if ok else float('nan'), '.0f')} [" +
+                         ", ".join(fmt(x * 8e-6, ".0f") for x in v) + "]")
+        out.append(f"| {leaf} | " + " | ".join(cells) + " |")
+    return out + [""]
+
+
 def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     plan, trials = read_campaign(campaign)
     if plan.get("workload") != "dc" or not plan.get("dc"):
@@ -485,15 +551,7 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     # every block.
     once = str(dc.get("calibrate")) == "first"
     for b in sorted({t.block for t in ab}):
-        rates = {}
-        for t in solo:
-            if t.block == (1 if once else b):
-                leaf = next((r["client"] for r in t.rows), None)
-                bulk = [r for r in t.rows if r["kind"] == "bulk"]
-                # A usable calibration ran backlogged for the window: a short
-                # burst that then failed would inflate the solo rate.
-                sustained = shared_window(bulk, [leaf], duration) and capped_flows(bulk, duration) == 0
-                rates[leaf] = leaf_rate(bulk) if sustained else float("nan")
+        rates = calibrated_rates([t for t in solo if t.block == (1 if once else b) and t.arm == main], "bulk", duration)
         sim = [t.m["sim_rate"] for t in ab if t.block == b and t.arm == main]
         ok = (set(loaded) <= set(rates) and all(rates[x] == rates[x] and rates[x] > 0 for x in loaded)
               and sim and all(x == x for x in sim))
@@ -513,12 +571,8 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
         up_leaves = dc["upload_leaves"]
         up_uncal: List[int] = []
         for b in sorted({t.block for t in ab}):
-            rates = {}
-            for t in upsolo:
-                if t.block == (1 if once else b):
-                    leaf = next((r["client"] for r in t.rows), None)
-                    up = [r for r in t.rows if r["kind"] == "dc-upload"]
-                    rates[leaf] = leaf_rate(up) if shared_window(up, [leaf], duration) else float("nan")
+            rates = calibrated_rates([t for t in upsolo if t.block == (1 if once else b) and t.arm == main], "dc-upload",
+                                     duration)
             sim = [t.m.get("up_sim_rate", float("nan")) for t in ab if t.block == b and t.arm == main]
             if not (set(up_leaves) <= set(rates) and all(rates[x] == rates[x] and rates[x] > 0 for x in up_leaves)
                     and sim and all(x == x for x in sim)):
@@ -625,7 +679,12 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
            "", f"Loaded leaves: {', '.join(loaded)}; control leaf: {control}.",
            f"Ancestor binding (legacy simultaneous rate / sum of solo rates, mean over {len(binding)} blocks): "
            f"{fmt(binding_mean, '.2f')} (must be <= {bounds['binding_max']:g})"
-           + ("" if bound_ok else " -- **the shared ancestor did not bind: campaign VOID**"), ""]
+           + ("" if bound_ok else " -- **the shared ancestor did not bind: campaign VOID**")]
+    if uploads:
+        out += [f"Uplink binding (legacy simultaneous upload rate / sum of upload solo rates, mean over {len(up_binding)} "
+                f"blocks): {fmt(up_mean, '.2f')} (must be <= {bounds.get('up_binding_max', bounds['binding_max']):g})"
+                + ("" if up_bound_ok else " -- **the uploader's uplink did not bind: campaign VOID**")]
+    out += [""] + solo_table(solo, upsolo, [main] + cands, duration)
     if problems:
         out += ["**No verdict: the campaign is incomplete.** " + "; ".join(problems) + ".", ""]
     arms = [main] + cands

@@ -474,10 +474,16 @@ Both run several leaves in one client process. The DC campaign
   (*w* − 1) × `request_timeout` on every leaf. A W4 client (`wlclient rpc`)
   is given the barrier's absolute time, starts at once and waits for the
   barrier after initialising, so the leaf hosts' interpreter start-up times
-  do not shift their waves. The analysis requires every
-  loaded leaf to have been in each wave together for at least 0.1 s, on
-  millisecond times; otherwise latency and spread are unmeasured. This also
-  relies on NTP-synchronised clocks.
+  do not shift their waves. The analysis requires every loaded leaf to have
+  been in each wave together, on millisecond times, for at least half of the
+  shortest leaf's time in that wave, and never less than 20 ms or more than
+  0.1 s. Otherwise latency and spread are unmeasured. The bound scales
+  because on a short path a whole warm request can take less than 0.1 s:
+  across a 53 ms hop a 300 KB request finishes in about 60 ms, and a fixed
+  0.1 s left every wave unmeasured. The control leaf's probes count under
+  the request phase in the same way: each request loses a quarter of its
+  length from each end (at least 20 ms, at most 0.1 s), and a probe counts
+  if it overlaps what remains. This relies on NTP-synchronised clocks.
 - **A shared sustained window:** every loaded leaf must have been
   transferring together for at least 90% of the window. This is measured on
   each leaf's actual transfer intervals, intersected across leaves; a leaf
@@ -493,6 +499,17 @@ Both run several leaves in one client process. The DC campaign
   a failure would inflate the solo rate. With no usable calibration at all
   (or `calibrate = false`), the binding is not measured, and the verdict is
   INCOMPLETE rather than VOID.
+  - `calibrate_repeats` (1 to 9) runs every leaf's solo that many times,
+    one round of all leaves after another. A leaf's calibrated rate is the
+    median of its usable runs, so one run that collapses or bursts cannot
+    void the binding check or decide it. On a live path a single legacy
+    solo once collapsed to 10 Mbit/s against 356 for its sibling, and that
+    one run voided the campaign. The minimal example uses 3.
+  - `calibrate_arms = all` also runs every candidate arm's solos, after the
+    main arm's in each round. They are not used for binding. The report
+    lists every arm's solo runs per leaf (median and each run): the rate one
+    leaf gets alone on one connection, which is the evidence for or against
+    fan-out (design §11.3, Q3).
 - **The temporary account** has no device or flow limit of its own, so the
   gateway's `--max-sessions` is the only admission limit. A campaign then
   measures the path rather than account admission.
@@ -522,10 +539,12 @@ sending. The upload phase is where the gate sees the tree (design §11.3,
   (355 KB up) every `control_interval`. A cut object counts the bytes the sink
   received.
 - **Calibration.** Each upload leaf also runs alone, after the download
-  calibration (the same `calibrate` rule). The legacy arm's simultaneous
-  upload rate must be at most `[upload] binding_max` (0.80) of the sum of the
-  solo rates. Otherwise the uplink did not bind and the campaign is VOID: pick
-  an uploader with a narrower uplink, or add upload load.
+  calibration (the same `calibrate`, `calibrate_repeats` and
+  `calibrate_arms` rules). The legacy arm's simultaneous upload rate must be
+  at most `[upload] binding_max` (0.80) of the sum of the solo rates. The
+  report prints this uplink binding beside the ancestor binding. Otherwise
+  the uplink did not bind and the campaign is VOID: pick an uploader with a
+  narrower uplink, or add upload load.
 - **Evidence.** In each upload window the gateway must see only QUIC flows,
   one leaf key per upload leaf plus one for the sibling (one per solo run),
   and the uploader must run `dc-long-haul` with the arm's bundle. Leaves
@@ -833,7 +852,8 @@ block per path for all four, 2.6 hours at 6 blocks and 5.2 hours at the
 12-block cap (design section 15.4). D adds no wall time. `--dry-run`
 prints the per-type block time, the campaign's estimate, the look levels,
 and the run order. DC calibrates each loaded leaf alone in its first block
-only (`calibrate = first`), and that block's solo rates stand for every
+only (`calibrate = first`), three times each (`calibrate_repeats = 3`, the
+median taken), and that block's solo rates stand for every
 block's ancestor-binding check and leaf identities; every block's carrier
 and leaf evidence is still checked. With 30 requests per arm in a trial,
 DC's request p99 is pooled over blocks and tested by resampling blocks.
