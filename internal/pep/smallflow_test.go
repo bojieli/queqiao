@@ -90,6 +90,20 @@ func TestSmallExchangesAreRepairedOnceThePathIsKnown(t *testing.T) {
 	if testing.Short() {
 		t.Skip("brings up QUIC across an emulated 300 ms path")
 	}
+	testSmallExchangesRepaired(t, "")
+}
+
+// The same gate on the default bundle (stage 10). There each authority learns
+// the erasure from its own traffic, and the coded window of a sparse lane is
+// sized from its own source rate, never below the cold-start window.
+func TestSmallExchangesAreRepairedOnTheDefaultBundle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("brings up QUIC across an emulated 300 ms path")
+	}
+	testSmallExchangesRepaired(t, DefaultBundle)
+}
+
+func testSmallExchangesRepaired(t *testing.T, bundle BundleName) {
 	requireStableImpairmentClock(t)
 	const oneWay = 150 * time.Millisecond
 	loopback := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
@@ -103,7 +117,7 @@ func TestSmallExchangesAreRepairedOnceThePathIsKnown(t *testing.T) {
 		OneWayDelay: oneWay, RateBytesPerSec: uint64(25e6 / 8),
 		PolicerRefillPeriod: 8 * time.Millisecond, LossRate: 0.42, Seed: 41,
 	}
-	socks, destination := codedPairWith(t, true, &path, requestResponse(2700))
+	socks, destination := codedPairOnBundle(t, bundle, true, &path, requestResponse(2700))
 	// A connection to a path that erases 42% of packets is sometimes simply
 	// lost, which is the path and not a defect. This measures what exchanges
 	// cost once a flow exists, so it is worth another attempt to get one.
