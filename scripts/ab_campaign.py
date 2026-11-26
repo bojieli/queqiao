@@ -273,6 +273,8 @@ class Config:
     relay: Optional[Relay] = None
     # Network impairment on the path's client host ([impair], ab_impair).
     impair: Any = None
+    # Fetch logs through this ssh host instead of directly ("" for direct).
+    fetch_via: str = ""
 
     @property
     def work_dir(self) -> str:
@@ -472,7 +474,7 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  probe_bytes=c.getint("probe_bytes", 1024), probe_interval=c.getfloat("probe_interval", 0.5),
                  snapshot_every=c.getint("snapshot_every", 4), lane_trace=_bool(c.get("lane_trace", "true")),
                  sequential=_sequential(c), host_cpu=_bool(c.get("host_cpu", "false")),
-                 relay=_relay(cp), impair=_impair(cp),
+                 relay=_relay(cp), impair=_impair(cp), fetch_via=c.get("fetch_via", "").strip(),
                  log_max_mib=c.getint("log_max_mib", 1024), ssh_options=_words(c.get("ssh_options", "-o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=3")),
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
@@ -627,7 +629,11 @@ class Host:
         # in the campaign's own directory; close() ends it.
         self.control = (["-o", "ControlMaster=auto", "-o", f"ControlPath={control_dir}/%C", "-o", "ControlPersist=300"]
                         if control_dir and dest != "local" else [])
+        self.base_options = list(ssh_options)
         self.ssh_options = list(ssh_options) + self.control
+        # Logs are fetched through this host ([campaign] fetch_via) when the
+        # direct link is slow; "" fetches directly.
+        self.fetch_via = ""
         self.dry = dry
         self.out = out or sys.stdout
         self.home = "~" if dry else ""
@@ -690,6 +696,11 @@ class Host:
         os.makedirs(os.path.dirname(local), exist_ok=True)
         if self.dest == "local":
             return subprocess.run(["cp", remote, local]).returncode == 0
+        if self.fetch_via and self.fetch_via != self.dest:
+            # Its own connection through the jump host: a shared connection
+            # would carry it over the direct link.
+            return subprocess.run(["scp", "-q", *self.base_options, "-o", f"ProxyJump={self.fetch_via}",
+                                   f"{self.dest}:{remote}", local]).returncode == 0
         return subprocess.run(["scp", "-q", *self.ssh_options, f"{self.dest}:{remote}", local]).returncode == 0
 
     def close(self) -> None:
@@ -1131,6 +1142,8 @@ class Campaign:
         self.ssh_dir = "" if dry else ssh_control_dir(self.out)
         self.hosts: Dict[str, Host] = {h: Host(h, cfg.ssh_options, dry, stream, self.ssh_dir)
                                       for h in cfg.hosts() + [p.host for p in cfg.production]}
+        for h in self.hosts.values():
+            h.fetch_via = cfg.fetch_via
         self.before: Dict[str, dict] = {}
         self.active_small: Dict[str, str] = {}   # host -> running temporary client tag
         self.fetch_failures: List[str] = []
@@ -1634,6 +1647,9 @@ rm -f "$f"''', what=f"stop {tag}")
     # may fail (with backoff) before its host counts as unreachable.
     JOB_POLL = 1.0
     JOB_SSH_TRIES = 5
+    # The CPU sampler's launch, stop and fetch: 9 sessions, about three and a
+    # half minutes of backoff, since its record decides whether a block counts.
+    SAMPLER_SSH_TRIES = 9
 
     def run_job(self, host: str, script: str, timeout: float, what: str) -> Tuple[int, str]:
         """Run a job detached on host and return (exit status, output). An ssh
@@ -1642,27 +1658,48 @@ rm -f "$f"''', what=f"stop {tag}")
         backoff. Only a host unreachable through JOB_SSH_TRIES sessions in a
         row (255), or a job that outlives `timeout` (-1), is a failed job --
         a control-plane failure, which voids its block (gates.ini [harness])."""
-        h = self.hosts[host]
-        launch, files = self.as_job(host, script)
-
-        def session(cmd: str, what_: str) -> Tuple[int, str]:
-            """One ssh session, retried with backoff while it fails to connect."""
-            for k in range(self.JOB_SSH_TRIES):
-                try:
-                    rc, out = h.run(cmd, timeout=120, what=what_)
-                except Exception as e:  # a hung ssh is a dropped session
-                    rc, out = 255, f"{type(e).__name__}: {e}"
-                if rc != 255:
-                    return rc, out
-                self.log(f"{host}: ssh session failed ({what_}); retry {k + 1} of {self.JOB_SSH_TRIES - 1}")
-                if not self.dry:
-                    time.sleep(min(30.0, 2.0 * 2 ** k))
-            return 255, out
-        rc, out = session(launch, what)
+        files, rc = self.start_job(host, script, what)
         if self.dry:
             return 0, ""
+        if files is None:
+            return rc, ""
+        return self.wait_job(host, files, timeout, what)
+
+    def session(self, host: str, cmd: str, what_: str, tries: int = 0) -> Tuple[int, str]:
+        """One ssh session, retried with backoff (2, 4, ... 30 s) while it
+        fails to connect, up to `tries` sessions (JOB_SSH_TRIES by default)."""
+        h = self.hosts[host]
+        tries = tries or self.JOB_SSH_TRIES
+        out = ""
+        for k in range(tries):
+            try:
+                rc, out = h.run(cmd, timeout=120, what=what_)
+            except Exception as e:  # a hung ssh is a dropped session
+                rc, out = 255, f"{type(e).__name__}: {e}"
+            if rc != 255:
+                return rc, out
+            self.log(f"{host}: ssh session failed ({what_}); retry {k + 1} of {tries - 1}")
+            if not self.dry:
+                time.sleep(min(30.0, 2.0 * 2 ** k))
+        return 255, out
+
+    def start_job(self, host: str, script: str, what: str, tries: int = 0) -> Tuple[Optional[Dict[str, str]], int]:
+        """Launch a detached job; (its files, 0), or (None, exit status) when
+        it could not be launched (255: its host unreachable)."""
+        launch, files = self.as_job(host, script)
+        rc, out = self.session(host, launch, what, tries)
+        if self.dry:
+            return files, 0
         if rc != 0 or "QQ_AB_LAUNCHED" not in out:
-            return (255 if rc == 255 else rc or 1), ""
+            return None, (255 if rc == 255 else rc or 1)
+        return files, 0
+
+    def wait_job(self, host: str, files: Dict[str, str], timeout: float, what: str,
+                 tries: int = 0) -> Tuple[int, str]:
+        """Follow a launched job to its end (run_job's outcomes)."""
+        if self.dry:
+            return 0, ""
+        session = lambda cmd, what_: self.session(host, cmd, what_, tries)
         deadline = time.time() + timeout
         # Done (its status is there), lost (its wrapper is gone without one:
         # killed), or still running.
@@ -1880,9 +1917,16 @@ rm -f "$f"''', what=f"stop {tag}")
         cfg = self.cfg
         for th in self.beside_threads:
             th.join(timeout=beside.phase.duration + 240)
-        if beside.impair and self.impair and self.impair.remove("w"):
-            self.beside_impair_fired = True
-            self.log(f"{beside.name}: the impairment watchdog fired before the session ended")
+        if beside.impair and self.impair:
+            fired = self.impair.remove("w")
+            ended = max((r_[1] for r_ in self.beside_results.values()), default=time.time())
+            if fired is not None and fired < ended:
+                # The session ran partly unimpaired: the harness's failure.
+                self.beside_impair_fired = utc(fired)
+                self.log(f"{beside.name}: the impairment watchdog fired at {utc(fired)}, before the session ended")
+            elif fired is not None:
+                self.log(f"{beside.name}: the impairment watchdog removed it at {utc(fired)}, after the session ended "
+                         f"({utc(ended)}): the session ran impaired throughout")
         clients = [cfg.clients[p] for p in cfg.paths()]
         for c in clients:
             for arm in cfg.beside_arms():
@@ -1893,7 +1937,10 @@ rm -f "$f"''', what=f"stop {tag}")
             return
         sub = os.path.join(self.out, beside.name)
         os.makedirs(sub, exist_ok=True)
+        before = len(self.fetch_failures)
         self.collect(beside.name, clients, cfg.beside_arms(), out=sub)
+        # Its logs are its own campaign's evidence, not the blocks'.
+        self.beside_fetch_failures = self.fetch_failures[before:]
         gen = ab_workloads.GENERATORS[beside.phase.jobs[0].kind]
         with open(os.path.join(sub, "trials.tsv"), "w") as tsv:
             tsv.write("\t".join(TRIAL_COLUMNS) + "\n")
@@ -1905,10 +1952,11 @@ rm -f "$f"''', what=f"stop {tag}")
                 res = self.beside_results.get((slot.path, real.name), (time.time(), time.time(), -1, ""))
                 self.record_job(slot, real, beside.phase, 0, job, gen, res, writer,
                                 os.path.join(sub, "measures.jsonl"), beside.phase.duration)
-            if getattr(self, "beside_impair_fired", False):
+            if getattr(self, "beside_impair_fired", ""):
                 self.job_failures.append({"failure": "control-plane", "block": 1, "path": cfg.paths()[0], "trial": "",
                                           "slot": 1, "arm": cfg.main.name, "phase": beside.phase.name,
-                                          "client": cfg.paths()[0], "kind": "impairment", "exit": JOB_KILLED_BY_RUNNER})
+                                          "client": cfg.paths()[0], "kind": "impairment", "exit": JOB_KILLED_BY_RUNNER,
+                                          "fired_utc": self.beside_impair_fired})
             self.beside_failures = self.job_failures[failures_before:]
             # Its failures are its own; the blocks' verdicts do not depend on them.
             del self.job_failures[failures_before:]
@@ -1958,7 +2006,7 @@ rm -f "$f"''', what=f"stop {tag}")
                     for phase in phases:
                         self.run_phase(s, arm, phase, writer)
                 finally:
-                    if scenario and self.impair.remove("b"):
+                    if scenario and self.impair.remove("b") is not None:
                         # Its watchdog removed the impairment before the trial
                         # ended: the harness's failure, not the arm's.
                         self.job_failures.append({"failure": "control-plane", "block": s.block, "path": s.path,
@@ -2023,36 +2071,43 @@ rm -f "$f"''', what=f"stop {tag}")
         parallel(*[(lambda host=host: self.hosts[host].run(f"rm -f {self.w(host)}/run/stop-hostcpu",
                                                             what=f"clear the host CPU sampler's stop file on {host}"))
                    for host in hosts])
-        for host in hosts:
-            h = self.hosts[host]
+        def go(host):
+            # Detached, like the jobs, and not followed while it runs: its
+            # samples stay in its output file on the host and are fetched
+            # once it is stopped, so a dropped ssh session mid-trial costs
+            # nothing. Launching is patient (SAMPLER_SSH_TRIES sessions).
             stop = f"{self.w(host)}/run/stop-hostcpu"
             units = [u for p in self.cfg.production if p.host == host for u in p.units]
-            script = host_cpu_sampler(stop, units)
-            res: Dict[str, Any] = {}
-
-            def go(h=h, script=script, res=res, host=host):
-                try:
-                    res["rc"], res["out"] = self.run_job(host, script, timeout=6 * 3600, what=f"host CPU sampler on {host} ({name})")
-                except Exception as e:  # recorded as missing evidence, not a dead campaign
-                    res["rc"], res["out"] = -1, ""
-                    self.log(f"host CPU sampler on {host} failed: {e}")
-            th = threading.Thread(target=go, daemon=True)
-            th.start()
-            out[host] = (th, stop, res)
+            try:
+                files, _ = self.start_job(host, host_cpu_sampler(stop, units), f"host CPU sampler on {host} ({name})",
+                                          self.SAMPLER_SSH_TRIES)
+            except Exception as e:  # recorded as missing evidence, not a dead campaign
+                files = None
+                self.log(f"host CPU sampler on {host} failed to start: {e}")
+            out[host] = (files, stop)
+        parallel(*[(lambda host=host: go(host)) for host in hosts])
         return out
 
     def stop_host_cpu(self, name: str, samplers: Dict[str, Any]) -> None:
-        """Stop the samplers and keep their samples as hostcpu/<name>-<host>.tsv."""
-        parallel(*[(lambda host=host, stop=stop: self.hosts[host].run(f"touch {stop}",
-                                                                       what=f"stop the host CPU sampler on {host}"))
-                   for host, (th, stop, res) in samplers.items()])
-        for host, (th, stop, res) in samplers.items():
-            th.join(timeout=60)
+        """Stop the samplers and keep their samples as hostcpu/<name>-<host>.tsv.
+        Stopping and fetching are patient (SAMPLER_SSH_TRIES sessions, about
+        three minutes of retries): a brief ssh outage delays the fetch rather
+        than losing the trial's CPU record."""
+        def go(host, files, stop):
+            if files is None:
+                return
+            self.session(host, f"touch {stop}", f"stop the host CPU sampler on {host}", self.SAMPLER_SSH_TRIES)
+            rc, text = self.wait_job(host, files, 60, f"host CPU sampler on {host} ({name})", self.SAMPLER_SSH_TRIES)
             if self.dry:
-                continue
+                return
             os.makedirs(os.path.join(self.out, "hostcpu"), exist_ok=True)
+            if rc == 255:
+                self.log(f"host CPU sampler on {host} ({name}): its samples could not be fetched")
+                return
             with open(os.path.join(self.out, "hostcpu", f"{name}-{host}.tsv"), "w") as f:
-                f.write("".join(line[2:] + "\n" for line in (res.get("out") or "").splitlines() if line.startswith("S ")))
+                f.write("".join(line[2:] + "\n" for line in (text or "").splitlines() if line.startswith("S ")))
+        parallel(*[(lambda host=host, files=files, stop=stop: go(host, files, stop))
+                   for host, (files, stop) in samplers.items()])
 
     def collect(self, tagp: str, clients: List[Client], arms: Optional[List[Arm]] = None,
                 out: Optional[str] = None) -> None:
@@ -2378,7 +2433,9 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
             with open(os.path.join(self.out, "status.json"), "w") as f:
                 json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
                            "production": production, "teardown_leftovers": leftovers, "cleanup_failures": clean_failures,
-                           "fetch_failures": self.fetch_failures, "job_failures": self.job_failures,
+                           "fetch_failures": [f for f in self.fetch_failures
+                                              if f not in getattr(self, "beside_fetch_failures", [])],
+                           "job_failures": self.job_failures,
                            "workload_failures": self.workload_failures,
                            "impairment": (None if not self.impair else
                                           "not restored" if self.impair.leftovers else "restored"),
@@ -2391,7 +2448,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 with open(os.path.join(sub, "status.json"), "w") as f:
                     json.dump({"status": "complete" if status == 0 else "aborted", "exit": status,
                                "production": production, "teardown_leftovers": leftovers,
-                               "cleanup_failures": clean_failures, "fetch_failures": self.fetch_failures,
+                               "cleanup_failures": clean_failures,
+                               "fetch_failures": getattr(self, "beside_fetch_failures", []),
                                "job_failures": getattr(self, "beside_failures", []), "blocks_run": 1,
                                "finished_utc": utc(time.time())}, f, indent=2)
         return status

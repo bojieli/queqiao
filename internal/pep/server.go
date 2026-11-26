@@ -499,6 +499,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err := validateRecovery(&cfg.Recovery, cfg.CongestionScope, cfg.CodedRetry, "", 0, true); err != nil {
 		return nil, err
 	}
+	if err := validateProfileBundle(cfg.Profile, cfg.CCAPI, cfg.Sched, cfg.CongestionScope, cfg.CodedRetry, "", cfg.Recovery, cfg.Classifier, true); err != nil {
+		return nil, err
+	}
 	if err := cfg.CarrierShadow.resolve(); err != nil {
 		return nil, err
 	}
@@ -991,6 +994,10 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 		}
 		controller = attachPathController(conn, congestionConfig{
 			kind: s.cfg.Congestion, ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched, scope: s.cfg.CongestionScope,
+			// Under a hierarchical profile the gateway's authorities sit in
+			// its own tree (its uplink, then each client endpoint pair) as
+			// knowledge only (§11.3). The legacy gateway had no tree.
+			hierarchicalPath: s.cfg.Profile.HierarchicalPath,
 		}, func() string { return gatewayPathPrincipal(principal) })
 	}
 	s.metrics.DataConnectionAccepted(wire)
@@ -1270,7 +1277,7 @@ func (s *Server) handleSession(ctx context.Context, conn streamConn, principal i
 	flow.idleTimeout = s.cfg.FlowIdleTimeout
 	flow.maxLifetime = s.cfg.FlowMaxLifetime
 	flow.reserveControlLane = open.Header.Flags&protocol.FlagReserveControl != 0
-	flow.controlLaneShared = auth.shared
+	flow.controlLaneShared = func(*mpLane) bool { return auth.shared() }
 	// A flow that fails here is gone for good: tell the client on every lane
 	// so it does not spend a JOIN discovering that (issue #159).
 	flow.resetOnFailure = true

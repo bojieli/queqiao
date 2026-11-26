@@ -402,9 +402,9 @@ fi
             self.active.pop(s, None)
             raise ImpairError(f"{self.icfg.host}: applying {scenario} failed: {out.strip()[-300:]}")
 
-    def remove(self, s: str) -> bool:
-        """Remove set `s`; True if its watchdog had already removed it (the
-        trial ran partly unimpaired). Raises ImpairError when anything of it
+    def remove(self, s: str) -> Optional[float]:
+        """Remove set `s`. Returns when its watchdog had already removed it
+        (epoch seconds, the host's clock), or None. Raises ImpairError when anything of it
         is left, or when no set is applied and the tc state differs from the
         snapshot."""
         R = self.run_dir()
@@ -416,13 +416,13 @@ if [ -f $R/impair-wd-{s}.pid ]; then
   fi
   rm -f $R/impair-wd-{s}.pid
 fi
-[ -f $R/impair-wd-{s}.fired ] && echo WATCHDOG-FIRED
+[ -f $R/impair-wd-{s}.fired ] && echo "WATCHDOG-FIRED $(stat -c %Y $R/impair-wd-{s}.fired 2>/dev/null || echo 0)"
 [ -f $R/impair-remove-{s}.sh ] || {{ echo IMPAIR-REMOVED; exit 0; }}
 bash $R/impair-remove-{s}.sh
 ''', what=f"impair: remove the {'blocks' if s == 'b' else 'beside'} set")
         self.active.pop(s, None)
         if self.c.dry:
-            return False
+            return None
         if rc != 0 or "IMPAIR-REMOVED" not in out:
             raise ImpairError(f"{self.icfg.host}: removing the impairment left state behind: {out.strip()[-300:]}")
         if not self.active:
@@ -430,7 +430,8 @@ bash $R/impair-remove-{s}.sh
             if diff:
                 raise ImpairError(f"{self.icfg.host}: the tc state differs from the snapshot after removal:\n  "
                                   + "\n  ".join(diff))
-        return "WATCHDOG-FIRED" in out
+        m = re.search(r"^WATCHDOG-FIRED (\d+)", out, re.M)
+        return float(m.group(1)) if m else None
 
     def teardown(self) -> List[str]:
         """Remove every set (applied or not: idempotent) and compare the tc

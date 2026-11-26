@@ -815,6 +815,15 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	if err := pep.ValidateRecovery(pep.RecoveryMode(opts.recovery), pep.CongestionScope(opts.congestionScope), pep.CodedRetryMode(opts.codedRetry), pep.Topology(opts.topology), opts.topologyFanOut, !client); err != nil {
 		return fmt.Errorf("--recovery: %w", err)
 	}
+	// The profile restricts the whole bundle (dc-long-haul runs the legacy
+	// bundle or its whole new-architecture bundle, design §11.3).
+	profileTopology := pep.Topology(opts.topology)
+	if !client {
+		profileTopology = ""
+	}
+	if err := pep.ValidateProfileBundle(bundleProfile, pep.CCAPIVersion(opts.ccAPI), pep.SchedMode(opts.sched), pep.CongestionScope(opts.congestionScope), pep.CodedRetryMode(opts.codedRetry), profileTopology, pep.RecoveryMode(opts.recovery), pep.ClassifierMode(opts.classifierMode), !client); err != nil {
+		return fmt.Errorf("--path-profile: %w", err)
+	}
 	if opts.recoveryKS > 64 || opts.recoveryKP > 64 {
 		return errors.New("--recovery-ks and --recovery-kp must be small probe-timeout counts")
 	}

@@ -949,6 +949,40 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 	if len(candidates) == 0 {
 		return nil, nil, fmt.Errorf("no gateway address compatible with local binding %q", listenAddress)
 	}
+	return raceAddressCandidates(dialCtx, candidates, func(ctx context.Context, addr *net.UDPAddr) (*quic.Conn, net.PacketConn, error) {
+		return dialQUICAddress(ctx, remote, addr, tlsCfg, listenAddress, composed, observeTransientWrite, windows, hop)
+	})
+}
+
+// addressRaceLimitKey carries how many address candidates of one dial may
+// handshake at once; see withAddressRaceLimit.
+type addressRaceLimitKey struct{}
+
+// defaultAddressRace is how many candidates a dial races by default: the
+// next one starts while the first is still handshaking.
+const defaultAddressRace = 2
+
+// withAddressRaceLimit bounds how many of a named gateway's addresses one
+// dial may have handshaking at once. A connection that would go over a
+// device's connection limit at the gateway counts each racing candidate,
+// since each is a connection the gateway sees (#222); 1 dials them one at a
+// time.
+func withAddressRaceLimit(ctx context.Context, limit int) context.Context {
+	return context.WithValue(ctx, addressRaceLimitKey{}, max(limit, 1))
+}
+
+func addressRaceLimit(ctx context.Context) int {
+	if limit, ok := ctx.Value(addressRaceLimitKey{}).(int); ok && limit > 0 {
+		return limit
+	}
+	return defaultAddressRace
+}
+
+// raceAddressCandidates dials a gateway's addresses in order, starting the
+// next one when a dial fails, or after a stagger while fewer than the
+// context's race limit are handshaking, and returns the first connection.
+func raceAddressCandidates(dialCtx context.Context, candidates []*net.UDPAddr, dial func(context.Context, *net.UDPAddr) (*quic.Conn, net.PacketConn, error)) (*quic.Conn, net.PacketConn, error) {
+	parallel := addressRaceLimit(dialCtx)
 	raceCtx, cancelRace := context.WithCancel(dialCtx)
 	defer cancelRace()
 	type result struct {
@@ -960,7 +994,8 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 	next, active := 0, 0
 	launch := func() {
 		addr := candidates[next]
-		waves := (len(candidates) - next + 1) / 2
+		// The rest of the time is shared by the waves still to run.
+		waves := (len(candidates) - next + parallel - 1) / parallel
 		next++
 		active++
 		go func() {
@@ -970,7 +1005,7 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 				attemptCtx, stop = context.WithTimeout(raceCtx, time.Until(deadline)/time.Duration(waves))
 				defer stop()
 			}
-			conn, packet, err := dialQUICAddress(attemptCtx, remote, addr, tlsCfg, listenAddress, composed, observeTransientWrite, windows, hop)
+			conn, packet, err := dial(attemptCtx, addr)
 			select {
 			case results <- result{conn, packet, err}:
 			case <-raceCtx.Done():
@@ -1003,7 +1038,7 @@ func dialQUICConnection(ctx context.Context, remote string, credentials identity
 				launch()
 			}
 		case <-stagger.C:
-			if active < 2 && next < len(candidates) {
+			if active < parallel && next < len(candidates) {
 				launch()
 			}
 		case <-raceCtx.Done():
@@ -1027,7 +1062,13 @@ func quicDialSocket(listenAddress string, remoteAddr *net.UDPAddr) (network, add
 		// A local binding names an address, which fixes the family.
 		return "udp", listenAddress
 	}
-	if remoteAddr.IP.To4() != nil {
+	return wildcardUDPSocket(remoteAddr.IP)
+}
+
+// wildcardUDPSocket names the unbound socket of a peer's own address family:
+// udp4 0.0.0.0:0 for an IPv4 (or IPv4-mapped) peer, udp6 [::]:0 otherwise.
+func wildcardUDPSocket(peer net.IP) (network, address string) {
+	if peer.To4() != nil {
 		return "udp4", "0.0.0.0:0"
 	}
 	return "udp6", "[::]:0"

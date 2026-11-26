@@ -319,3 +319,100 @@ func (s *Scheduler) pendingHasForTest(offset uint64) bool {
 	}
 	return false
 }
+
+// Gap evidence is dated by when its acknowledgement arrived, not by when
+// the scan that acts on it ran. An acknowledgement that arrived before a
+// coded attempt's packet left says nothing about that attempt, even if the
+// scan runs after the packet left (#178).
+func TestGapEvidenceIsDatedByItsAcknowledgement(t *testing.T) {
+	f := newCodedRetryFixture(t, true, bytes.Repeat([]byte("x"), 64), 16)
+	start := f.now
+	a := f.next(0)
+	f.sched.WroteAs(0, a, false)
+	// The acknowledgement arrives at +5 ms; the watcher's pass runs at +20.
+	f.now = start.Add(20 * time.Millisecond)
+	if n := f.sched.ReissueUnacknowledgedBelowAt(48, start.Add(5*time.Millisecond)); n != 0 {
+		t.Fatal("gap evidence retried an attempt not yet reported registered")
+	}
+	// The packet left at +10 ms, after that acknowledgement; the report
+	// arrives at +30.
+	f.now = start.Add(30 * time.Millisecond)
+	f.sched.RegisteredAgo(0, a, 20*time.Millisecond)
+	if f.sched.pendingHasForTest(a.Offset) {
+		t.Fatal("an acknowledgement older than the packet retried its coded attempt")
+	}
+	// Evidence that arrives after the packet does show it lost.
+	if n := f.sched.ReissueUnacknowledgedBelowAt(64, f.now); n != 1 {
+		t.Fatalf("fresh gap evidence retried %d attempts, want 1", n)
+	}
+}
+
+// Every gap-driven retry is accounted once, whichever of the evidence and
+// the attempt's write or registration report arrives last (#178).
+func TestGapDrivenRetriesAreCountedInEveryOrder(t *testing.T) {
+	for _, order := range []string{"evidence last", "registration last", "write last"} {
+		t.Run(order, func(t *testing.T) {
+			f := newCodedRetryFixture(t, true, bytes.Repeat([]byte("x"), 64), 16)
+			counted := uint64(0)
+			f.sched.cfg.GapReissued = func(n uint64) { counted += n }
+			a := f.next(0)
+			returned := 0
+			switch order {
+			case "evidence last":
+				f.sched.WroteAs(0, a, false)
+				f.sched.Registered(0, a)
+				f.now = f.now.Add(time.Millisecond)
+				returned = f.sched.ReissueUnacknowledgedBelow(48)
+			case "registration last":
+				f.sched.WroteAs(0, a, false)
+				f.now = f.now.Add(10 * time.Millisecond)
+				returned = f.sched.ReissueUnacknowledgedBelow(48)
+				f.now = f.now.Add(5 * time.Millisecond)
+				f.sched.RegisteredAgo(0, a, 10*time.Millisecond)
+			case "write last":
+				f.sched.Registered(0, a)
+				f.now = f.now.Add(time.Millisecond)
+				returned = f.sched.ReissueUnacknowledgedBelow(48)
+				f.sched.WroteAs(0, a, false)
+			}
+			if !f.sched.pendingHasForTest(a.Offset) {
+				t.Fatal("the chunk proven lost was not retried")
+			}
+			if counted != 1 || f.sched.Stats().GapReissued != 1 {
+				t.Fatalf("gap-driven retry counted %d (stats %d), want 1; the scan returned %d",
+					counted, f.sched.Stats().GapReissued, returned)
+			}
+		})
+	}
+}
+
+// A coded first attempt has no deadline until registration, so its dispatch
+// does not look one up: RetransmitAfter walks the flow's lanes under their
+// locks, and the scheduler mutex is held (#178).
+func TestCodedDispatchDoesNotLookUpADeadline(t *testing.T) {
+	now := time.Unix(1000, 0)
+	lookups := 0
+	s := New(bytes.NewReader(bytes.Repeat([]byte("x"), 64)), Config{
+		ChunkSize:       16,
+		Reliable:        func(uint64) bool { return false },
+		RetransmitAfter: func() time.Duration { lookups++; return codedRetryAfter },
+		CodedRetry:      true,
+		Now:             func() time.Time { return now },
+	})
+	t.Cleanup(s.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	chunk, err := s.Next(ctx, 0, 0)
+	if err != nil || chunk == nil || chunk.Reliable {
+		t.Fatalf("Next = %+v, %v; want a coded chunk", chunk, err)
+	}
+	if lookups != 0 {
+		t.Fatalf("dispatching a coded attempt looked up its deadline %d times", lookups)
+	}
+	// A registration does need it.
+	s.WroteAs(0, chunk, false)
+	s.Registered(0, chunk)
+	if lookups != 1 {
+		t.Fatalf("registration looked up the deadline %d times, want 1", lookups)
+	}
+}

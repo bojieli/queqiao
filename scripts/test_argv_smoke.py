@@ -29,7 +29,8 @@ REPO = HERE.parent
 sys.path.insert(0, str(HERE))
 ab = importlib.import_module("ab_campaign")
 
-EXAMPLES = ["minimal-campaign.example.ini", "impaired-campaign.example.ini", "campaign.example.ini", "scenario-campaign.example.ini"]
+EXAMPLES = ["minimal-campaign.example.ini", "impaired-campaign.example.ini", "campaign.example.ini", "scenario-campaign.example.ini",
+            "dc-minimal.example.ini", "dc-campaign.example.ini"]
 HOST_SPECIFIC = ("local-address", "tcp-congestion")
 
 
@@ -95,11 +96,19 @@ def local_config(example, binary, home):
     g = cp["gateway"]
     g.update(host="local", address="127.0.0.1", platform=plat, port_base=str(base), metrics_port_base=str(free_pair()),
              origin_port=str(free_port()), flags=strip_host_specific(ab._words(g.get("flags", ""))))
+    # The DC gate wants every leaf on a host of its own (a leaf is an endpoint
+    # pair); here they are all this machine, under names of their own.
+    own_hosts = cp["campaign"].get("workload", "") == "dc"
+    leaf_hosts = []
     for sec in cp.sections():
         s = cp[sec]
         if sec.startswith("client:"):
+            host = "local"
+            if own_hosts:
+                host = "leafhost-" + sec.split(":", 1)[1]
+                leaf_hosts.append(host)
             # This machine's outer source: loopback, where the gateway is.
-            s.update(host="local", small="false", platform=plat, socks_port_base=str(free_pair()),
+            s.update(host=host, small="false", platform=plat, socks_port_base=str(free_pair()),
                      metrics_port_base=str(free_pair()),
                      flags=(strip_host_specific(ab._words(s.get("flags", ""))) + " --local-address 127.0.0.1").strip())
         elif sec.startswith("arm:"):
@@ -109,6 +118,8 @@ def local_config(example, binary, home):
         elif sec.startswith(("production:", "relay")):
             cp.remove_section(sec)
     cp["production:local"] = {"host": "local"}
+    for host in leaf_hosts:
+        cp["production:" + host] = {"host": host}
     # The relay as its own host name (it is this machine too): on a real
     # campaign it shares no host, and so no port, with the gateway.
     cp["production:relayhost"] = {"host": "relayhost"}
@@ -121,6 +132,8 @@ def local_config(example, binary, home):
     camp = ab.Campaign(cfg, os.path.join(home, "out"), str(REPO), dry=False, stream=io.StringIO())
     camp.hosts["local"].home = home
     camp.hosts["relayhost"].home = home
+    for host in leaf_hosts:
+        camp.hosts[host].home = home
     return cfg, camp
 
 
@@ -217,6 +230,14 @@ class ArgvSmoke(unittest.TestCase):
     def test_impaired_example(self):
         # Three arms, the third with stage 8's carrier recovery.
         self.check("impaired-campaign.example.ini")
+
+    def test_dc_minimal_example(self):
+        # The stage 9 DC gate: dc-long-haul on both arms, the legacy bundle
+        # against the whole new-architecture bundle.
+        self.check("dc-minimal.example.ini")
+
+    def test_dc_campaign_example(self):
+        self.check("dc-campaign.example.ini")
 
     @unittest.skipUnless(os.environ.get("QQ_SMOKE_CONFIG"), "set QQ_SMOKE_CONFIG to a campaign config to check it")
     def test_a_given_campaign_config(self):

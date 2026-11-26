@@ -734,6 +734,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := validateRecovery(&cfg.Recovery, cfg.CongestionScope, cfg.CodedRetry, cfg.Topology, cfg.TopologyFanOut, false); err != nil {
 		return nil, err
 	}
+	if err := validateProfileBundle(cfg.Profile, cfg.CCAPI, cfg.Sched, cfg.CongestionScope, cfg.CodedRetry, cfg.Topology, cfg.Recovery, cfg.Classifier, false); err != nil {
+		return nil, err
+	}
 	if cfg.Recovery == RecoveryCarrier {
 		if err := cfg.CarrierRecovery.resolve(); err != nil {
 			return nil, err
@@ -1165,7 +1168,7 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	}
 	flowSession.tcpStriping.Store(flow.kind == TransportTCP && c.cfg.TCPFallbackLanes > 1)
 	flowSession.reserveControlLane = flow.reserveControl
-	flowSession.controlLaneShared = func() bool { return c.quicPoolActive.Load() > 1 }
+	flowSession.controlLaneShared = c.controlLaneShared
 	if err := flowSession.addLane(&mpLane{
 		id: flow.laneID, kind: flow.kind, fc: flow.fc,
 		control: flow.reserveControl && flow.kind == TransportQUIC,

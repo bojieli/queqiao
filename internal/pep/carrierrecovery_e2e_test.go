@@ -321,6 +321,25 @@ func TestCarrierRecoveryReplacesADeadCarrierWithinItsDeadline(t *testing.T) {
 		t.Fatalf("%d JOINs onto the new carrier, want 1", got)
 	}
 	assertNoLegacyRecovery(t, p)
+	// The manager's counters are exported to the client's metrics (#222).
+	exported := p.clientMetrics.Snapshot().CarrierRecovery
+	for _, c := range []struct {
+		event   metrics.CarrierRecoveryEvent
+		counter *atomic.Int64
+	}{
+		{metrics.CarrierSuspect, &m.suspects}, {metrics.CarrierPromotion, &m.promotions},
+		{metrics.CarrierStandbyDial, &m.standbyDials}, {metrics.CarrierStandbyFailure, &m.standbyFailures},
+		{metrics.CarrierReplacementDial, &m.replacementDials},
+		{metrics.CarrierRebindSameCarrier, &m.sameCarrierJoins}, {metrics.CarrierRebindNewCarrier, &m.newCarrierJoins},
+		{metrics.CarrierBindingDeadlineFailure, &m.deadlineFailures}, {metrics.CarrierTCPHandoff, &m.tcpHandoffs},
+	} {
+		if got, want := exported[c.event], uint64(c.counter.Load()); got != want {
+			t.Fatalf("exported carrier event %d = %d, the manager counted %d", c.event, got, want)
+		}
+	}
+	if exported[metrics.CarrierSuspect] == 0 || exported[metrics.CarrierPromotion] != 1 || exported[metrics.CarrierRebindNewCarrier] != 1 {
+		t.Fatalf("exported carrier events %v; want a suspect, one promotion and one new-carrier rebind", exported)
+	}
 	t.Logf("flow resumed %v after the blackhole; standby dials %d", took, m.standbyDials.Load())
 }
 
