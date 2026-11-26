@@ -488,3 +488,42 @@ func TestPathControllerReverseAckOnlyIsNotThrottled(t *testing.T) {
 	pooled, _ := runPCSim(path, lanes, 10*time.Second, measureFrom, false)
 	t.Logf("today's pooled connections: pacer wait p50 %v p90 %v", pcPercentile(pooled.ackWaits, 0.5), pcPercentile(pooled.ackWaits, 0.9))
 }
+
+// The reverse direction of a download again, past the ten seconds at which
+// the path's minimum RTT expires (#210). Once the step in demand is behind
+// them the connections are application-limited, so their flight builds no
+// queue of its own; a ProbeRTT would cap the window at four packets for a
+// round trip and 200 ms, holding every flow acknowledgement and datagram
+// behind it, which on a real uplink also stalls the download those
+// acknowledgements release. Under one authority the expiry renews the
+// minimum without one. The first expiry follows the tenfold step, which
+// filled the window, so it is taken; the catch-up after it is the
+// ProbeRTT's own backlog and does not count, so the next is skipped. A bulk
+// path, which fills its window, still takes its ProbeRTT.
+func TestPathControllerApplicationLimitedPathSkipsProbeRTT(t *testing.T) {
+	path := pcSimPath{rate: 2e6, rtt: 200 * time.Millisecond, erasure: 0.015, buffer: 2e6 * 0.1, seed: 1}
+	lanes := make([]pcSimLane, 4)
+	for i := range lanes {
+		lanes[i] = pcSimLane{join: time.Duration(i) * 20 * time.Millisecond, ackRate: 6e3, ackStep: 60e3,
+			stepAt: 3 * time.Second, ackSize: 200, ackOnly: 2}
+	}
+	const duration = 35 * time.Second
+	measureFrom := 12 * time.Second // after the first expiry's ProbeRTT
+	r, ctl := runPCSim(path, lanes, duration, measureFrom, true)
+	law := ctl.law.inner
+	worst := pcPercentile(r.ackWaits, 1)
+	t.Logf("application-limited path: %d ProbeRTTs, %d skipped; flow acknowledgement wait after %v p99 %v, max %v",
+		law.probeRTTs, law.probeRTTsSkipped, measureFrom, pcPercentile(r.ackWaits, 0.99), worst)
+	if law.probeRTTs > 1 || law.probeRTTsSkipped < 2 {
+		t.Errorf("application-limited path: %d ProbeRTTs, %d skipped; want at most the first taken and the later two skipped",
+			law.probeRTTs, law.probeRTTsSkipped)
+	}
+	if worst > path.rtt/4 {
+		t.Errorf("a flow acknowledgement waited %v on an application-limited path", worst)
+	}
+
+	_, bulk := runPCSim(pcErasurePath(), bulkLanes(1, 0), duration, 0, true)
+	if bulk.law.inner.probeRTTs < 2 || bulk.law.inner.probeRTTsSkipped != 0 {
+		t.Errorf("a bulk path took %d ProbeRTTs in %v and skipped %d", bulk.law.inner.probeRTTs, duration, bulk.law.inner.probeRTTsSkipped)
+	}
+}

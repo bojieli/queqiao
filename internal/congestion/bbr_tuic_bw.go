@@ -262,8 +262,13 @@ type tuicAckSample struct {
 	hasSample        bool
 	maxBandwidth     uint64
 	sampleAppLimited bool
-	minRTT           time.Duration
-	lastSendState    tuicSendState
+	// filled says some packet this event acknowledged was sent outside an
+	// application-limited phase: the sender was filling its window or its
+	// pacer when it sent it. filledPN is the largest such packet.
+	filled        bool
+	filledPN      quiccongestion.PacketNumber
+	minRTT        time.Duration
+	lastSendState tuicSendState
 }
 
 // onAckBatch consumes one congestion event. ACK packets are processed in the
@@ -290,6 +295,9 @@ func (e *tuicBandwidthEstimator) onAckBatch(eventTime monotime.Time, acked []qui
 		}
 		bytes := uint64(packet.BytesAcked)
 		e.totalAcked = satAddUint64(e.totalAcked, bytes)
+		if !state.appLimited && (!result.filled || packet.PacketNumber > result.filledPN) {
+			result.filled, result.filledPN = true, packet.PacketNumber
+		}
 		if e.appLimited && (e.endAppLimitedAt < 0 || packet.PacketNumber > e.endAppLimitedAt) {
 			e.appLimited = false
 		}

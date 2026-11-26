@@ -223,6 +223,9 @@ func NewPathController(initialPacketSize quiccongestion.ByteCount, path pathmode
 	}
 	law.SetRTTStatsProvider(&c.rtt)
 	law.inner.appLimitedBy = c.appLimited
+	// One ProbeRTT per path, and none on a path that has been
+	// application-limited since its minimum was measured (§4.2).
+	law.inner.skipAppLimitedProbeRTT = true
 	return c
 }
 
@@ -568,6 +571,7 @@ func (c *PathController) noteDemand(union quiccongestion.Demand, now monotime.Ti
 			// opportunity is consumed here, so the burst's first ACK does
 			// not mark it again and extend the phase over the burst.
 			c.law.inner.estimator.markAppLimited()
+			c.law.inner.caughtUp()
 		}
 		c.noDemandSince, c.unusedTime = 0, 0
 	case !any && c.noDemandSince.IsZero():
