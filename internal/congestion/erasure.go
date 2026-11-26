@@ -59,6 +59,11 @@ type ErasureSender struct {
 	inner *TUICBBRSender
 	pacer *pacer
 
+	// bound is the path authority's loss bound on its flight (see
+	// inflightBound). Nil on a per-connection sender, which keeps the law
+	// as it was.
+	bound *inflightBound
+
 	// estimator watches the explicit packet outcomes QUIC reports, ordered by
 	// packet number within each congestion event for the burst statistic.
 	estimator *lossmodel.Estimator
@@ -93,6 +98,10 @@ type ErasureSender struct {
 	// rate, in parts per million, so a trace can tell a path being held back
 	// by its own queue from one that simply measured less.
 	delayBrake atomic.Uint64
+
+	// boundHi is the loss bound's current value in bytes, zero while none
+	// applies, published for telemetry.
+	boundHi atomic.Int64
 
 	// arrival is the last computed arrival rate, published for the pacer and
 	// the congestion window, which run outside the callback that computes it.
@@ -233,6 +242,7 @@ func newPathLaw(initialPacketSize quiccongestion.ByteCount, path pathmodel.Model
 	e.inner.estimator.retireByFate = true
 	e.inner.estimator.maxFilter.retireAged = true
 	e.inner.estimator.staleEvidence = byteTotal(e.inner.minCwnd)
+	e.bound = &inflightBound{jitter: e.inner.probeJitter}
 	e.pacer.keepDebt = true
 	e.path = path
 	if path != nil {
@@ -587,6 +597,15 @@ func (e *ErasureSender) CanSend(bytesInFlight quiccongestion.ByteCount) bool {
 }
 
 func (e *ErasureSender) GetCongestionWindow() quiccongestion.ByteCount {
+	window := e.unboundedWindow()
+	if e.bound != nil {
+		return e.bound.limit(window)
+	}
+	return window
+}
+
+// unboundedWindow is the law's compensated window before the loss bound.
+func (e *ErasureSender) unboundedWindow() quiccongestion.ByteCount {
 	return quiccongestion.ByteCount(float64(e.inner.GetCongestionWindow()) / e.arrivalRate())
 }
 
@@ -655,6 +674,21 @@ func (e *ErasureSender) afterOutcomes(priorInFlight quiccongestion.ByteCount, ev
 	e.publishMeasurement()
 	e.passed.Add(uint64(len(lost)))
 	e.inner.OnCongestionEventEx(priorInFlight, eventTime, acked, lost)
+	if e.bound != nil {
+		queue, minRTT := e.queueDelay()
+		now := eventTime
+		if now.IsZero() {
+			now = monotime.Now()
+		}
+		if e.bound.observe(now, e.inner.round, len(acked), len(lost), queue, minRTT,
+			e.inner.bytesInFlight, e.inner.maxDatagramSize, e.unboundedWindow(),
+			quiccongestion.ByteCount(float64(e.inner.targetCwnd(1))/e.arrivalRate()), e.inner.mode == tuicBbrProbeRTT) {
+			// A queue this sender has overflowed is a pipe it has filled:
+			// startup has nothing left to find, whatever its samples say.
+			e.inner.fullBandwidth = true
+		}
+		e.boundHi.Store(int64(e.bound.hi))
+	}
 }
 
 // publishMeasurement publishes what the estimator has observed: the
@@ -715,6 +749,14 @@ func (e *ErasureSender) publishMeasurement() {
 	// Gating on the minimum being measured is not a classifier returning. It
 	// makes no judgement about what kind of loss this is; it says only that
 	// compensation may not run ahead of the brake that bounds it.
+	if e.bound != nil {
+		// The path authority makes up only for what the channel erases at a
+		// low queue; what a full queue adds is congestion, and compensating
+		// for it is sending more into the overflow (see inflightBound).
+		if base, ok := e.bound.erasure(); ok && base < erasure {
+			erasure = base
+		}
+	}
 	if _, minRTT := e.queueDelay(); minRTT > 0 {
 		e.arrival.Store(uint64(e.compensationFor(1-erasure) * partsPerMillion))
 	}
@@ -758,6 +800,7 @@ func (e *ErasureSender) Telemetry() ControllerTelemetry {
 	// diagnostic is a smaller problem than an unsynchronised read of the
 	// controller's state.
 	t.DelayBrake = float64(e.delayBrake.Load()) / partsPerMillion
+	t.InflightBound = e.boundHi.Load()
 	t.NonElicitingDebited = e.nonElicitingDebited.Load()
 	t.NonElicitingBytes = t.NonElicitingDebited + e.nonElicitingUndebited.Load()
 	arrival := e.arrivalRate()
