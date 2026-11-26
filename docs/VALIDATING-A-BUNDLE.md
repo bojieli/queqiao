@@ -869,23 +869,49 @@ direction):
 
 | trial type | scenario | trial |
 |---|---|---:|
-| `slow-lossy` | 5 Mbit/s, +250 ms, 20 ms jitter, Gilbert-Elliott bursty loss (p 1 %, r 30 %: 3.2 % average) | 90 s |
+| `slow-lossy` | 5 Mbit/s, +250 ms, 20 ms jitter, Gilbert-Elliott bursty loss (p 1 %, r 30 %: 3.2 % average) | 120 s |
 | `blackhole` | 20 Mbit/s, +150 ms; 100 % drop for 8 s at 30 s and for 25 s at 70 s | 120 s |
-| `policed` | a 4 Mbit/s token-bucket policer with a 12 KB bucket, +150 ms | 90 s |
+| `policed` | a 4 Mbit/s token-bucket policer with a 12 KB bucket, +150 ms | 120 s |
 | D, `idle-wake-lossy` | 2 % random loss, +200 ms, on D's own ports for its whole session | about 17 min, beside the blocks |
 
-Every trial runs the W5 LLM loop (5 turns), W6 keystrokes and one download
-of 4 MiB objects for the whole window; `blackhole` adds a long upload, and
-probes every 0.25 s (each its own process) that time the recovery.
+Every trial runs an LLM swarm (4 concurrent loops of 10 turns with short
+responses: 40 calls), W6 keystrokes, and 8 short downloads of 4 MiB one after
+the other across the window (one started every window/8, or when the one
+before ends; each allowed 30 s). `blackhole` adds a long download and a long
+upload with progress timelines (flows in flight across the outages), and
+probes every 0.25 s, each its own connection.
 
-**Gates** (`gates.ini [workload:impaired]` and the `[secondary]` bounds, each
-one-sided against main): flow completion, stalls per trial, LLM call
-failures, TTFT p99, keystroke echo p99, silent deaths (an LLM call or
-keystroke session that ends in the client's own timeout: none, in every
-block), and for `blackhole` the recovery time (end of each outage to the
-first probe completed after it, the worse of the two). D is judged as its own
-campaign in `<campaign>/idle-wake` by `[workload:idle-wake]`. Goodput is
-reported only.
+**Gates** (`gates.ini [workload:impaired]`, each one-sided against main):
+
+- *Pooled event rates* (`events v n`): LLM call failures over calls, and
+  silent deaths over sessions (LLM calls and keystroke sessions), pooled
+  over all blocks. Pass when an exact binomial test puts the candidate's
+  count below main's pooled rate + v (lower tail at most the look's alpha)
+  and a block-permutation check (the arms' counts swapped within blocks,
+  every assignment) does not find the candidate worse; fail when the
+  binomial upper tail does, or the permutation finds it worse by more than
+  v; otherwise undecided. Each arm needs at least n opportunities: n is the
+  fewest at which a candidate with no event can pass a main with none,
+  (1 - v)^n <= alpha, 150 for v = 0.02.
+- *Silent deaths*: none, in every block (hard), beside the pooled rate.
+- *Flow completion*: completed over attempted short downloads per trial
+  (one the window's end cut is not an attempt), `higher 0.02`.
+- *Stalls per trial* (`[secondary]`), *TTFT p99*, *keystroke echo p99*.
+- *Per blackhole*, from the path's restore, the worse of a trial's two
+  outages: the first completed probe (`recover_s`), the first byte of a
+  connection opened after it (`reopen_ttfb_s`), and the first byte again
+  of every flow in flight across it (`inflight_ttfb_s`), each `lower 1.0`.
+
+D is judged as its own campaign in `<campaign>/idle-wake` by
+`[workload:idle-wake]`; its trials are not voided for host CPU records,
+which only the blocks take. Goodput is reported only. The first impaired
+campaign (commit 42728e4) was judged by the gates of that commit.
+
+**Host CPU samplers** run detached, like the jobs, and are not followed
+while they run: their samples stay on the host and are fetched once the
+trial ends, with about three minutes of ssh retries, so a brief outage of
+the runner's link no longer voids a block. `[campaign] fetch_via = <ssh
+host>` fetches logs through that host, for a slow direct link.
 
 **Reading a rule's row.** Every rule's per-block contrast is the
 candidate's headroom inside its bound, positive when inside whichever way
