@@ -278,6 +278,13 @@ the drain rate as the path's capacity. That failure mode is what made us ask.
 
 ### Modeling the path as a chain
 
+> **Superseded at stage 11 of the path-authority migration.** The chain
+> below, its shares and seeds, and the grouping correlator were the legacy
+> bundle's and are deleted. The profile now runs one path authority per
+> endpoint pair and uses the tree only as knowledge
+> ([DESIGN-PATH-AUTHORITY.md](DESIGN-PATH-AUTHORITY.md) §11.3). The section
+> is kept as the record of what was built and measured.
+
 `PathModel` describes one endpoint pair. That's the right model when every flow
 crosses the same bad segment. It breaks down when flows go to different places.
 Give each destination its own model and they all have to relearn the shared
