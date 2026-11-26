@@ -734,6 +734,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err := validateRecovery(&cfg.Recovery, cfg.CongestionScope, cfg.CodedRetry, cfg.Topology, cfg.TopologyFanOut, false); err != nil {
 		return nil, err
 	}
+	if err := validateProfileBundle(cfg.Profile, cfg.CCAPI, cfg.Sched, cfg.CongestionScope, cfg.CodedRetry, cfg.Topology, cfg.Recovery, cfg.Classifier, false); err != nil {
+		return nil, err
+	}
 	if cfg.Recovery == RecoveryCarrier {
 		if err := cfg.CarrierRecovery.resolve(); err != nil {
 			return nil, err
