@@ -189,6 +189,23 @@ def useful(row: dict) -> int:
 # milliseconds the timestamps bracket around curl. Less is ambiguous, and an
 # ambiguous sample is unmeasured, never assumed concurrent.
 OVERLAP_MIN = 0.1
+# On a short path a whole request can take less than OVERLAP_MIN (a warm
+# 300 KB request across a 53 ms hop finishes in about 60 ms), so a fixed
+# margin would leave every such wave unmeasured. Where a caller judges short
+# intervals that started on a shared barrier (the DC gate's request waves),
+# the margin scales with the interval: SCALED_OVERLAP_FRACTION of its length,
+# never below CLOCK_ERROR_FLOOR (NTP-synchronised hosts, the campaign's own
+# precondition) and never above OVERLAP_MIN.
+CLOCK_ERROR_FLOOR = 0.02
+SCALED_OVERLAP_FRACTION = 0.5
+
+
+def scaled_overlap(length: float) -> float:
+    """Least overlap that shows two intervals of about `length` seconds ran
+    at the same time: half the interval, within [CLOCK_ERROR_FLOOR,
+    OVERLAP_MIN]. An interval longer than 2 x OVERLAP_MIN gets OVERLAP_MIN,
+    as before."""
+    return min(OVERLAP_MIN, max(CLOCK_ERROR_FLOOR, SCALED_OVERLAP_FRACTION * length))
 
 
 def tcp_evidence(rec: dict) -> bool:
@@ -221,16 +238,21 @@ def overlap(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return min(a[1], b[1]) - max(a[0], b[0])
 
 
-def under_load(probes: List[dict], load: List[dict]) -> List[dict]:
+def under_load(probes: List[dict], load: List[dict], scaled: bool = False) -> List[dict]:
     """Probes that demonstrably ran while some load transfer did. Clock
     uncertainty (OVERLAP_MIN, for NTP-level error between hosts and the
     milliseconds the timestamps bracket around curl) is taken off each load
     interval's ends, and a probe counts if it overlaps what remains: a 20 ms
     probe in the middle of a download counts, one at its edge does not. A
     probe whose overlap cannot be shown (untimed, in a gap between waves,
-    marginal) is left out, and the measure becomes unmeasured, not idle."""
-    spans = [(a + OVERLAP_MIN, b - OVERLAP_MIN) for a, b in (sp for sp in (span(r) for r in load) if sp is not None)
-             if b - a > 2 * OVERLAP_MIN]
+    marginal) is left out, and the measure becomes unmeasured, not idle.
+    With `scaled`, each load interval's margin is scaled_overlap of half its
+    length (so its middle half remains, within the clock floor): a short
+    request on a short path can still show a probe under it."""
+    def margin(a: float, b: float) -> float:
+        return scaled_overlap((b - a) / 2) if scaled else OVERLAP_MIN
+    spans = [(a + margin(a, b), b - margin(a, b)) for a, b in (sp for sp in (span(r) for r in load) if sp is not None)
+             if b - a > 2 * margin(a, b)]
     out = []
     for r in probes:
         sp = span(r)

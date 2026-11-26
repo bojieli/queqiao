@@ -33,7 +33,8 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
              profile="dc-long-haul", fail_requests=(), stagger=(), gw_args=True, nat=False, tcp_leaf=None,
              no_path_key=False, fallback_leaf=None, tcp_lane_leaf=None, empty_egress=False, calibrate=None,
              request_kind="requests", per_wave=8, tcp_at=None, cand_bundle=None, legacy_bundle="legacy",
-             no_bundle=False):
+             no_bundle=False, uploads=False, up_shares=(1.0, 1.0, 1.0), up_binding=0.5, up_control=1.0,
+             up_one_relay=False, up_drop=(), solo_factors=(1.0,), cand_solo_factor=None):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -44,15 +45,44 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
     The gateway records each leaf's QUIC flows under its own key below one
     egress; `nat` puts two leaves behind one address, `tcp_leaf` moves one
     leaf's flows to TCP, `no_path_key` drops the leaf evidence, and
-    `fallback_leaf` has one client count a TCP fallback.
+    `fallback_leaf` has one client count a TCP fallback. `solo_factors`
+    repeats every calibration once per factor, each run delivering that
+    factor of its nominal rate ([dc] calibrate_repeats); `cand_solo_factor`
+    also runs the candidate's solos (calibrate_arms = all) at that factor.
     """
     rng = random.Random(seed)
     os.makedirs(root)
+    up_leaves = ["ua", "ub", "uc"] if uploads else []
     plan = {"main": "legacy", "workload": "dc", "paths": ["dc"], "config": {"duration": 60},
             "dc": dict({"loaded": LOADED, "control": "ctl", "request_timeout": 30},
                        **({"calibrate": calibrate} if calibrate else {})),
             "arms": {"legacy": {"role": "main", "flags": []}, "cand": {"role": "candidate", "flags": ["--congestion=path"]}},
             "clients": {c: {"small": True} for c in LOADED + ["ctl"]}, "schedule": []}
+    if uploads:
+        plan["dc"].update(upload_leaves=up_leaves, upload_control="uctl", uploader="upl")
+    up_addr = {u: ("192.0.2.10" if up_one_relay else f"192.0.2.{11 + i}") for i, u in enumerate(up_leaves + ["uctl"])}
+
+    def up_record(arm, b, when, leaf):
+        srv.setdefault((arm, b), []).append({"time": iso(when), "msg": "remote flow complete", "transport": "quic",
+                                             "lane_bytes": {"1": {"Kind": "quic", "Sent": 10, "Received": 1000}},
+                                             "path_egress": egress, "path_key": f"{egress}->{up_addr[leaf]}"})
+
+    def up_rows(b, slot, base, phase, leaf, j, share, start):
+        """One upload leaf's two backlogged flows of 4 MB objects for 60 s:
+        whole objects back to back, then one cut by the window."""
+        obj, out = 4_000_000, []
+        rate = 60e6 * share / 2 / 60
+        for i in (1, 2):
+            at, k = start, 0
+            while at + obj / rate <= start + 60:
+                k += 1
+                out.append([b, "dc", slot] + base + [phase, j, leaf, "dc-upload", f"u{i}o{k}", iso(start), iso(start + 60),
+                                                      200, obj, f"{obj / rate:.3f}", 0, 1, 60, ms(at), ms(at + obj / rate)])
+                at += obj / rate
+            out.append([b, "dc", slot] + base + [phase, j, leaf, "dc-upload", f"u{i}o{k + 1}", iso(start), iso(start + 60),
+                                                  200, int(rate * (start + 60 - at)), f"{start + 60 - at:.3f}", 28, 0, 60,
+                                                  ms(at), ms(start + 60)])
+        return out
     rows, srv, mets = [], {}, {}
     egress = "203.0.113.1"
     addr = {"la": "198.51.100.1", "lb": "198.51.100.2", "lc": "198.51.100.2" if nat else "198.51.100.3",
@@ -117,16 +147,42 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
                                                           200, 307200, f"{ctl:.4f}", 0, 1, 60, ms(ep - ctl), ms(ep)])
             flow_record(arm, b, t + 30, "ctl")
             client_metrics(b, slot, arm, LOADED + ["ctl"])
+            if uploads and not (arm == "cand" and b in up_drop):
+                u0 = t + 100
+                for j, leaf in enumerate(up_leaves):
+                    share = 1.0 if arm == "legacy" else up_shares[j] / (sum(up_shares) / len(up_shares))
+                    rows.extend(up_rows(b, slot, base, "uploads", leaf, j, share * noise, u0))
+                    up_record(arm, b, u0 + 30, leaf)
+                ctl = 0.40 * (1.0 if arm == "legacy" else up_control) * noise
+                for p in range(1, 15):
+                    ep = u0 + 2 + 4 * p
+                    rows.append([b, "dc", slot] + base + ["uploads", 3, "uctl", "dc-upprobe", f"w{p}r1", iso(u0),
+                                                          iso(u0 + 60), 200, 355000, f"{ctl:.4f}", 0, 1, 60,
+                                                          ms(ep - ctl), ms(ep)])
+                up_record(arm, b, u0 + 30, "uctl")
+                t += 100
             t += 100
-        for j, leaf in enumerate(LOADED):
-            if (b, leaf) in no_solo:
-                continue
-            for i in (1, 2):
-                rows.append([b, "dc", 100 + j, "legacy", "main", 0, 0, "solo", 0, leaf, "bulk", f"b{i}o1", iso(t),
-                             iso(t + 60), 200, int(level / binding / 2), 60, 28, 0, 60, ms(t), ms(t + 60)])
-            flow_record("legacy", b, t + 30, leaf)
-            client_metrics(b, 100 + j, "legacy", [leaf])
-            t += 65
+        cal_arms = [("legacy", "main", 1.0)] + ([("cand", "candidate", cand_solo_factor)] if cand_solo_factor else [])
+        k = len(LOADED) + len(up_leaves)
+        for rnd, factor in enumerate(solo_factors):
+            for ai, (arm, role, arm_factor) in enumerate(cal_arms):
+                base_slot = 100 + (rnd * len(cal_arms) + ai) * k
+                for j, leaf in enumerate(LOADED):
+                    if (b, leaf) in no_solo:
+                        continue
+                    for i in (1, 2):
+                        rows.append([b, "dc", base_slot + j, arm, role, 0, 0, "solo", 0, leaf, "bulk", f"b{i}o1", iso(t),
+                                     iso(t + 60), 200, int(level / binding / 2 * factor * arm_factor), 60, 28, 0, 60,
+                                     ms(t), ms(t + 60)])
+                    flow_record(arm, b, t + 30, leaf)
+                    client_metrics(b, base_slot + j, arm, [leaf])
+                    t += 65
+                for j, leaf in enumerate(up_leaves):
+                    slot = base_slot + len(LOADED) + j
+                    rows.extend(up_rows(b, slot, [arm, role, 0, 0], "upsolo", leaf, 0,
+                                        1.0 / up_binding * factor * arm_factor, t))
+                    up_record(arm, b, t + 30, leaf)
+                    t += 65
     os.makedirs(os.path.join(root, "effective"), exist_ok=True)
     os.makedirs(os.path.join(root, "metrics"), exist_ok=True)
     for name, v in mets.items():
@@ -137,7 +193,7 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
             with open(os.path.join(root, "effective", f"gw-{arm}.args"), "w") as f:
                 f.write(f"server-b001-dc\t/x/gw-{arm}/queqiaod server --path-profile dc-long-haul\n")
     for arm in ("legacy", "cand"):
-        for d in [f"gw-{arm}"] + [f"cl-{c}-{arm}" for c in LOADED + ["ctl"]]:
+        for d in [f"gw-{arm}"] + [f"cl-{c}-{arm}" for c in LOADED + ["ctl"] + (["upl"] if uploads else [])]:
             os.makedirs(os.path.join(root, "logs", d), exist_ok=True)
             with open(os.path.join(root, "logs", d, "x-b001-dc.jsonl"), "w") as f:
                 rec = {"time": iso(t), "msg": "runtime configuration",
@@ -333,6 +389,49 @@ class DCGate(unittest.TestCase):
         self.assertEqual(v["cand"], "INCOMPLETE")
         self.assertIn("no bundle recorded", text)
 
+    # --- the upload phase (#235): the joint limit, through one client process
+
+    def test_an_equal_upload_phase_passes(self):
+        text, v = self.run_gate("up-equal", uploads=True)
+        self.assertEqual(v["cand"], "PASS", text)
+        self.assertIn("pass", self.criterion(text, "uploads: worst leaf's service"))
+        self.assertIn("uploads: Jain index", text)
+
+    def test_an_upload_leaf_starved_beside_its_siblings_fails(self):
+        # Aggregate kept, one leaf at a fifth of its share: the regime the
+        # hierarchy's joint limit exists to prevent.
+        text, v = self.run_gate("up-starved", uploads=True, up_shares=(0.2, 1.4, 1.4))
+        self.assertEqual(v["cand"], "FAIL")
+        self.assertIn("**FAIL**", self.criterion(text, "uploads: worst leaf's service"))
+        self.assertIn("**FAIL**", self.criterion(text, "uploads: cross-leaf fairness (Jain)"))
+        self.assertIn("**FAIL**", self.criterion(text, "uploads: completion spread"))
+        self.assertIn("pass", self.criterion(text, "uploads: aggregate goodput"))
+
+    def test_a_throttled_upload_sibling_fails(self):
+        text, v = self.run_gate("up-sibling", uploads=True, up_control=1.5)
+        self.assertEqual(v["cand"], "FAIL")
+        self.assertIn("**FAIL**", self.criterion(text, "uploads: sibling request p50"))
+
+    def test_an_uplink_that_did_not_bind_voids_the_campaign(self):
+        text, v = self.run_gate("up-unbound", uploads=True, up_binding=0.95)
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("uploader's uplink did not bind", text)
+
+    def test_upload_leaves_behind_one_relay_void_the_campaign(self):
+        text, v = self.run_gate("up-onerelay", uploads=True, up_one_relay=True)
+        self.assertEqual(v["cand"], "VOID")
+        self.assertIn("one relay host per leaf", text)
+
+    def test_a_missing_upload_phase_leaves_no_verdict(self):
+        text, v = self.run_gate("up-missing", uploads=True, up_drop=(2,))
+        self.assertEqual(v["cand"], "INCOMPLETE")
+        self.assertIn("no upload rows", text)
+
+    def test_without_an_upload_phase_the_download_gate_is_unchanged(self):
+        text, v = self.run_gate("up-none")
+        self.assertEqual(v["cand"], "PASS")
+        self.assertNotIn("uploads:", text)
+
     def test_gateway_profile_needs_its_own_evidence(self):
         text, v = self.run_gate("nogw", gw_args=False)
         self.assertEqual(v["cand"], "INCOMPLETE")
@@ -453,6 +552,83 @@ class DCGate(unittest.TestCase):
         self.assertEqual(v["cand"], "INCOMPLETE")
         self.assertIn("binding was not measured", text)
         self.assertNotIn("add load", text)
+
+    # --- short paths: request overlap scales with the requests (gap 1)
+
+    def test_overlap_scales_with_the_interval(self):
+        self.assertEqual(dc.scaled_overlap(0.06), 0.03)
+        self.assertEqual(dc.scaled_overlap(0.01), 0.02)      # never below the clock floor
+        self.assertEqual(dc.scaled_overlap(0.30), 0.1)       # long requests: the old fixed rule
+
+    def short_wave_trial(self, lb_shift, dur=0.060):
+        """A legacy trial whose requests are 60 ms (a warm request on a 53 ms
+        path), every leaf starting each wave on the same barrier, lb's clock
+        shifted by lb_shift seconds."""
+        root = os.path.join(self.tmp.name, f"short{lb_shift}")
+        write_dc(root, blocks=2, per_wave=1, request_kind="dc-rpc")
+        plan, trials = dc.read_campaign(root)
+        t = next(t for t in trials.values() if t.arm == "legacy" and t.slot < 100)
+        for r in t.rows:
+            if r["phase"] == "requests" and r["kind"] == "dc-rpc":
+                end = float(r["t_end"])
+                shift = lb_shift if r["client"] == "lb" else 0.0
+                r["t_start"], r["t_end"] = ms(end - 0.3 + shift), ms(end - 0.3 + dur + shift)
+                r["seconds"] = f"{dur:.4f}"
+        return t
+
+    def test_short_requests_on_a_short_path_are_measured(self):
+        # Before: a 60 ms wave could never overlap for 0.1 s, so latency and
+        # spread were never measured on a 53 ms path.
+        m = dc.dc_measures(self.short_wave_trial(0.005), LOADED, "ctl", 30, 60)
+        self.assertEqual(m["waves_overlap"], 1.0)
+        self.assertAlmostEqual(m["latency_p50"], 0.06, places=3)
+        self.assertEqual(m["spread"], m["spread"])
+
+    def test_short_requests_still_need_to_overlap(self):
+        # 40 ms apart, 60 ms each: 20 ms in common, less than half of either.
+        m = dc.dc_measures(self.short_wave_trial(0.040), LOADED, "ctl", 30, 60)
+        self.assertEqual(m["waves_overlap"], 0.0)
+        self.assertNotEqual(m["latency_p50"], m["latency_p50"])
+
+    def test_a_probe_can_be_under_a_short_request(self):
+        import ab_analyze as an
+        load = [{"t_start": "10.000", "t_end": "10.060"}]
+        probe = [{"t_start": "10.010", "t_end": "10.080"}]
+        self.assertEqual(an.under_load(probe, load), [])               # the fixed 0.1 s margin swallows it
+        self.assertEqual(an.under_load(probe, load, scaled=True), probe)
+        # A probe that only touches the request's edge still does not count.
+        edge = [{"t_start": "10.050", "t_end": "10.120"}]
+        self.assertEqual(an.under_load(edge, load, scaled=True), [])
+
+    # --- repeated calibration (gap 2) and the uplink's binding (gap 3)
+
+    def test_one_collapsed_solo_cannot_decide_the_binding(self):
+        # One solo run collapsing to 3 % of its rate made the ancestor look
+        # unbound and voided the campaign ...
+        text, v = self.run_gate("collapse1", calibrate="first", solo_factors=(0.03,),
+                                no_solo=tuple((b, leaf) for b in range(2, 13) for leaf in LOADED))
+        self.assertEqual(v["cand"], "VOID")
+        # ... with three runs the median stands.
+        text, v = self.run_gate("collapse3", calibrate="first", solo_factors=(1.0, 1.0, 0.03),
+                                no_solo=tuple((b, leaf) for b in range(2, 13) for leaf in LOADED))
+        self.assertEqual(v["cand"], "PASS", text)
+        self.assertRegex(text, r"sum of solo rates, mean over 12 blocks\): 0\.(49|50|51) ")
+
+    def test_candidate_solos_are_reported_not_used_for_binding(self):
+        text, v = self.run_gate("candsolo", cand_solo_factor=4.0, solo_factors=(1.0, 1.0))
+        self.assertEqual(v["cand"], "PASS", text)
+        self.assertRegex(text, r"sum of solo rates, mean over 12 blocks\): 0\.(49|50|51) ")
+        row = next(l for l in text.splitlines() if l.startswith("| la |"))
+        legacy, cand = row.split("|")[2:4]
+        # Each arm's median and every run (12 blocks x 2 repeats).
+        self.assertEqual(legacy.count(",") + 1, 24)
+        self.assertGreater(float(cand.split()[0]), 3.5 * float(legacy.split()[0]))
+
+    def test_the_uplink_binding_is_printed(self):
+        text, v = self.run_gate("upbind", uploads=True, up_binding=0.5)
+        self.assertRegex(text, r"Uplink binding \(legacy simultaneous upload rate / sum of upload solo rates, mean over "
+                               r"12 blocks\): 0\.(49|50|51) ")
+        self.assertIn("| ua |", text)
 
     def test_unfinished_campaign_gets_no_verdict(self):
         root = os.path.join(self.tmp.name, "unfinished")

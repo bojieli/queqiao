@@ -260,3 +260,20 @@ class SshReuse(unittest.TestCase):
         self.assertLess(time.monotonic() - t, 0.8)
         with self.assertRaises(ValueError):
             ab.parallel(lambda: None, lambda: (_ for _ in ()).throw(ValueError("x")))
+
+
+class PatientTeardown(unittest.TestCase):
+    def test_a_session_that_fails_to_connect_is_retried_while_tearing_down(self):
+        h = ab.Host("gw", [], False, out=io.StringIO())
+        results = [255, 255, 0]
+        calls = []
+
+        def fake(argv, **kw):
+            calls.append(argv)
+            return mock.Mock(returncode=results[len(calls) - 1], stdout="ok", stderr="")
+        with mock.patch.object(ab.subprocess, "run", side_effect=fake), mock.patch.object(ab.time, "sleep"):
+            self.assertEqual(h.run("true")[0], 255)          # by default: one session
+            calls.clear()
+            h.retry_255 = 5
+            self.assertEqual(h.run("true")[0], 0)            # tearing down: retried until it connects
+        self.assertEqual(len(calls), 3)

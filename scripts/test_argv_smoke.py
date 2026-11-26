@@ -10,6 +10,7 @@ QQ_SMOKE_CONFIG=<path>, a campaign's own config before it starts. Host-specific 
 depend on the host, not on the build: clients use loopback as their outer
 source."""
 import configparser
+import json
 import importlib
 import io
 import os
@@ -63,9 +64,21 @@ def free_port(n=1):
     raise RuntimeError("no free port")
 
 
+def _bindable_host(host):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind((host, 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def free_pair():
-    """A port p with p and p + 1 free (one per arm)."""
-    return free_port(2)
+    """A port p with p .. p + 7 free: one per arm and per D copy of an arm
+    (three arms and D take six), so no two port bases' runs overlap."""
+    return free_port(8)
 
 
 def go_platform():
@@ -117,6 +130,19 @@ def local_config(example, binary, home):
             s["binary_" + plat.replace("/", "_")] = binary
         elif sec.startswith(("production:", "relay")):
             cp.remove_section(sec)
+    # The DC upload phase's relays: each on a host of its own, at an address
+    # of its own (a leaf is the remote host): 127.0.0.31... Where those
+    # loopback addresses do not exist (macOS), the relays are reached at
+    # 127.0.0.1 after the config is validated; their ports differ, which is
+    # all a command-line check needs.
+    upleafs = [sec for sec in cp.sections() if sec.startswith("upleaf:")]
+    spare_loopback = all(_bindable_host(f"127.0.0.{31 + i}") for i in range(len(upleafs)))
+    for i, sec in enumerate(upleafs):
+        host = "relayleaf-" + sec.split(":", 1)[1]
+        cp[sec].update(host=host, address=f"127.0.0.{31 + i}", platform=plat)
+        leaf_hosts.append(host)
+    if upleafs:
+        cp["dc"]["upload_port_base"] = str(free_port(20 * len(upleafs)))
     cp["production:local"] = {"host": "local"}
     for host in leaf_hosts:
         cp["production:" + host] = {"host": host}
@@ -129,6 +155,11 @@ def local_config(example, binary, home):
         # The impairment is tc on the client host, not a binary role.
         cp["impair"]["host"] = "local"
     cfg = ab.parse_config(cp)
+    if upleafs and not spare_loopback:
+        for r in cfg.aux_relays:
+            r.address = "127.0.0.1"
+        for c in cfg.clients.values():
+            c.providers = [(leaf, "127.0.0.1", rb, b) for leaf, _, rb, b in c.providers]
     camp = ab.Campaign(cfg, os.path.join(home, "out"), str(REPO), dry=False, stream=io.StringIO())
     camp.hosts["local"].home = home
     camp.hosts["relayhost"].home = home
@@ -192,7 +223,42 @@ class ArgvSmoke(unittest.TestCase):
               f"{cfg.endpoint_address}:{g.port_base + arm.index}")
             q("provider", "add-user", "--state", "./state", "--name", "ab", "--max-flows", "0", "--max-clients", "0")
             gw = self.start(camp.gw_cmd(arm, "smoke"), d, g.metrics_port_base + arm.index, f"{example}: gateway {arm.name}")
+            relays = []
+            for r in cfg.aux_relays:
+                # The DC upload leaves' relays, which the uploader enrolls
+                # and runs through.
+                rd = os.path.join(camp.w(r.host), "relay")
+                os.makedirs(rd, exist_ok=True)
+                if not os.path.exists(os.path.join(rd, "queqiaod")):
+                    # Every relay host is this machine with one home: never
+                    # overwrite a binary a running relay was started from.
+                    shutil.copy(self.bin, os.path.join(rd, "queqiaod"))
+                relays.append(self.start(camp.aux_relay_cmd(r, arm), rd, r.port_base + arm.index,
+                                         f"{example}: relay {r.name} {arm.name}"))
             for client in cfg.clients.values():
+                if client.providers:
+                    cd = camp.cl_dir(client, arm)
+                    os.makedirs(os.path.join(cd, "logs"))
+                    shutil.copy(self.bin, os.path.join(cd, "queqiaod"))
+                    entries = []
+                    for leaf, address, relay_base, base in client.providers:
+                        invite = re.search(r"queqiao://\S+", q("provider", "invite", "--state", "./state", "--user", "ab",
+                                                               "--expires-in", "1h", "--path",
+                                                               f"{leaf}={address}:{relay_base + arm.index}")).group(0)
+                        prof = os.path.join(cd, f"profile-{leaf}.json")
+                        e = subprocess.run([os.path.join(cd, "queqiaod"), "enroll", "--invite", invite, "--profile", prof,
+                                            "--device-name", f"smoke-{leaf}",
+                                            *ab.local_address_args(camp.client_flags(client, arm))], cwd=cd,
+                                           capture_output=True, text=True, timeout=60)
+                        self.assertEqual(e.returncode, 0, f"{example}: enroll {client.name}/{leaf}: {e.stderr[-600:]}")
+                        entries.append({"name": leaf, "profile": prof, "listen": f"127.0.0.1:{base + arm.index}"})
+                    with open(os.path.join(cd, "providers.json"), "w") as f:
+                        json.dump({"version": 1, "providers": entries}, f)
+                    cl = self.start(camp.cl_cmd(client, arm, "smoke"), cd, client.socks_port_base + arm.index,
+                                    f"{example}: client {client.name} {arm.name} (one process, {len(entries)} providers)")
+                    cl.kill()
+                    cl.wait()
+                    continue
                 # One invitation per client, as the runner does: each is single-use.
                 invite = re.search(r"queqiao://\S+", q("provider", "invite", "--state", "./state", "--user", "ab",
                                                        "--expires-in", "1h")).group(0)
@@ -208,6 +274,9 @@ class ArgvSmoke(unittest.TestCase):
                                 f"{example}: client {client.name} {arm.name}")
                 cl.kill()
                 cl.wait()
+            for rl in relays:
+                rl.kill()
+                rl.wait()
             gw.kill()
             gw.wait()
             # The relay hop, on the gateway's port (the gateway is gone).

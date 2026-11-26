@@ -332,6 +332,12 @@ type Client struct {
 	// that pin exact dial counts see only the recovery they injected, not
 	// rescue rounds the watchdog starts on a slow runner.
 	disableStallWatchdogForTest bool
+	// flowClockForTest, when set, is every flow's clock: its idle limit and
+	// its classification read it instead of time.Now, so a test can move a
+	// flow through an hour of idleness without waiting one.
+	flowClockForTest func() time.Time
+	// flowLimitTickerForTest, when set, is every flow's limitTicker.
+	flowLimitTickerForTest func() (<-chan time.Time, func(), func())
 	// flowStartedForTest, if set, is handed every flow the client starts,
 	// so a test can act on its lanes as the transport would.
 	flowStartedForTest func(*multipathFlow)
@@ -1149,6 +1155,8 @@ func (c *Client) handleLocal(ctx context.Context, inner net.Conn) {
 	c.cfg.Logger.Debug("local flow opened", "transport", flow.kind, "duration", time.Since(flowOpenStarted))
 	flowSession := newMultipathFlowWithMemory(ctx, inner, flow.sessionID, flow.flowID, c.cfg.ChunkSize, protocol.FlagAckUp, protocol.FlagAckDown, c.budget, c.metrics, c.cfg.Logger, c.memoryLimits, c.sendMemory, c.receiveMemory, c.classifierConfig())
 	flowSession.stallWatchdogDisabled = c.disableStallWatchdogForTest
+	flowSession.clock = c.flowClockForTest
+	flowSession.limitTicker = c.flowLimitTickerForTest
 	flowSession.memOwned = c.cfg.Memory == MemoryOwned
 	flowSession.codedRetrySticky = c.cfg.CodedRetry == CodedRetrySticky
 	flowSession.carrierShadow = c.carrierShadow

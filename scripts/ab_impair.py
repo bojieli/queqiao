@@ -360,7 +360,7 @@ fi
 {filt}echo IMPAIR-APPLIED
 '''
 
-    def outage_script(self, scenario: str) -> str:
+    def outage_script(self, scenario: str, outages: Optional[Sequence[Sequence[float]]] = None) -> str:
         """The blocks' set's outages, timed from the job's start: netem's loss
         to 100 % both ways and back, each change's time printed (this host's
         clock, as the probes'). A trap restores the base on any exit."""
@@ -371,7 +371,9 @@ fi
                 f"tc qdisc change dev {d} root netem {scen.down.netem(drop=True)}")
         import ab_campaign as ab
         loop = ""
-        for at, dur in scen.outages:
+        # The trial's own outages (start offsets drawn per trial) or the
+        # scenario's nominal ones.
+        for at, dur in (outages or scen.outages):
             loop += (f"sleep $(awk -v t0=$t0 -v n=$(now) 'BEGIN{{x = t0 + {at} - n; if (x < 0) x = 0; printf \"%.3f\", x}}')\n"
                      f"drop || {{ echo 'impairment: the outage could not be applied'; exit 1; }}\n"
                      f"s=$(now); sleep {dur}; base || exit 1; e=$(now); ev=\"$ev[$s,$e],\"\n")
