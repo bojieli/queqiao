@@ -368,8 +368,9 @@ def parse_rows(out: str, job: w.Job, duration: float) -> List[Tuple[str, ...]]:
     return rows
 
 
-for name, fn in (("wl-llm", llm_script), ("wl-term", term_script), ("wl-bgdown", bgdown_script), ("wl-bgup", bgup_script)):
-    w.generator(name, w.Generator(fn, parse_rows, lambda job: 0, w.json_records))
+for name, fn, kind in (("wl-llm", llm_script, "llm"), ("wl-term", term_script, "term"),
+                       ("wl-bgdown", bgdown_script, None), ("wl-bgup", bgup_script, None)):
+    w.generator(name, w.Generator(fn, parse_rows, lambda job: 0, w.json_records, kind))
 
 
 # --- workloads --------------------------------------------------------------------

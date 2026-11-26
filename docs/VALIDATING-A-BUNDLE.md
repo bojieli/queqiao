@@ -131,9 +131,33 @@ built to refuse rather than to trust:
   teardown is reported as unverified, for manual cleanup. A record whose
   fields do not each check out is left alone; a `run/` directory that
   cannot be read and searched, or a failed check, is unverified, never
-  clean. A job that does not run to its end (ssh dropped, timed out, the
-  generator crashed) is a harness failure, not the arm's, and its block gets
-  no verdict.
+  clean.
+- **Jobs are detached, and survive ssh drops.** A job is started under
+  `setsid nohup`, keeps its output and exit status in `run/job-N.out` and
+  `run/job-N.rc`, and the runner polls for them and fetches them over fresh
+  ssh sessions (`ServerAliveInterval=10`), retrying a dropped session with
+  backoff (5 tries). A dropped session costs nothing.
+- **Control-plane failures void the block; workload failures are evidence.**
+  Only two things are the harness rather than the arm: a job host that stays
+  unreachable over ssh through every retry, and a job the runner itself
+  killed for a reason it records (tearing down after an abort). Either voids
+  the whole block for both arms (not evidence; it still counts toward the
+  cap), and a trial type with more than `control_plane_void_max` (2) such
+  blocks in a campaign has no verdict (`gates.ini [harness]`). Everything
+  else is the arm's failure and stays evidence: a job that outlives its
+  window (the runner stops it at the deadline and records a `timeout`), a job
+  lost or silent while its host stays reachable, and the failures a job
+  records itself -- a transfer cut or reset inside the tunnel (curl exit 18,
+  56, ...), a failed session. Such a job's flows are failed rows and a
+  measuring job without a record of its own gets a failed session, so the
+  failure lowers that arm's completion and session measures. The report
+  lists both kinds per block.
+- **Overhead.** Every ssh session to a host shares one connection
+  (ControlMaster, sockets under the campaign directory), the arms' gateways
+  restart together, scrapes and CPU samplers run in parallel, jobs are
+  polled every second, and a binary already on a host with the same SHA-256
+  is not copied again. `timing.tsv` in the campaign directory records every
+  session's wall time, for profiling the overhead between windows.
 - **A relay hop is declared, and temporary.** Where production clients
   reach their gateway through a relay, a `[relay]` section (`host`,
   `address`, optional `platform` and `flags`) puts the same hop in the

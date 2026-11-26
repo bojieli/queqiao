@@ -88,6 +88,8 @@ def load_gates(path: str = GATES) -> dict:
             "resamples": p.getint("bootstrap_resamples"), "seed": p.getint("bootstrap_seed"),
             "max_zero_main_fraction": p.getfloat("max_zero_main_fraction"),
             "secondary_min_coverage": p.getfloat("secondary_min_coverage", fallback=1.0),
+            "harness": ({"control_plane_void_max": cp["harness"].getint("control_plane_void_max")}
+                        if cp.has_section("harness") else None),
             "contention": ({k: cp["contention"].getfloat(k) for k in ("busy_threshold", "production_share_max",
                                                                        "steal_max_fraction")}
                            if cp.has_section("contention") else None),
@@ -448,9 +450,22 @@ def pooled_generic(trials: Sequence["Trial"], key: str) -> Optional[float]:
     return None
 
 
+# The runner's exits that are the control plane, not the arm: the host
+# unreachable through every ssh retry, and the runner's own kill when it tore
+# down (ab_campaign.CONTROL_PLANE). A job past its window, lost or silent on a
+# reachable host is the arm's failure, recorded in its rows, never void.
+CONTROL_PLANE_EXITS = (255, -4)
+
+
+def control_plane(job_failures: Optional[Sequence[dict]]) -> List[dict]:
+    return [j for j in job_failures or [] if j.get("exit") in CONTROL_PLANE_EXITS]
+
+
 def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], Trial],
                  interim: bool = False, units_run: Optional[Sequence[Sequence[Any]]] = None,
-                 failures: Optional[dict] = None) -> Tuple[List[str], Dict[Tuple[int, str, int], Trial]]:
+                 failures: Optional[dict] = None, control_plane_max: Optional[int] = None,
+                 voids: Optional[Dict[Tuple[int, str, str], str]] = None
+                 ) -> Tuple[List[str], Dict[Tuple[int, str, int], Trial]]:
     """Problems that forbid a verdict, and the trials of complete blocks only.
 
     A verdict needs a campaign that finished (status.json from the runner)
@@ -478,7 +493,7 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
             last_block = max((b for b, _, s_ in trials if s_ < 100), default=0)
             # The runner's failures so far: a look applies the same evidence
             # rules as the final analysis.
-            failed_jobs = list((failures or {}).get("job_failures") or [])
+            failed_jobs = control_plane((failures or {}).get("job_failures"))
             if (failures or {}).get("fetch_failures"):
                 problems.append(f"{len(failures['fetch_failures'])} log file(s) could not be fetched")
         else:
@@ -496,7 +511,7 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
         if status.get("fetch_failures"):
             problems.append(f"{len(status['fetch_failures'])} log file(s) could not be fetched; the log-derived "
                             "measures of the affected trials are withheld")
-        failed_jobs = status.get("job_failures") or []
+        failed_jobs = control_plane(status.get("job_failures"))
     planned: Dict[Tuple[int, str, str], set] = collections.defaultdict(set)
     for sl in plan.get("schedule", []):
         u = (sl["block"], sl["path"], sl.get("trial") or "")
@@ -507,17 +522,35 @@ def completeness(campaign: str, plan: dict, trials: Dict[Tuple[int, str, int], T
         if slot < 100:
             have[t.unit].add(slot)
     bad = sorted(k for k, slots in planned.items() if not slots <= have.get(k, set()))
-    # A block in which a generator did not run to its end has harness
+    # A block in which the runner lost a job to the control plane has harness
     # evidence, not the arm's: left out like a missing trial.
     broken = sorted({(j["block"], j["path"], j.get("trial") or "") for j in failed_jobs})
-    if broken:
+    if broken and control_plane_max is not None and voids is not None:
+        # A control-plane failure (the runner lost a job: its host unreachable
+        # through every retry, or the runner killing it tearing down) voids
+        # its whole block, both arms: not evidence, though it
+        # counted toward the cap. Up to control_plane_max per trial type;
+        # more, and the type has no verdict.
+        per: Dict[Tuple[str, str], List[Tuple[int, str, str]]] = collections.defaultdict(list)
+        for u in broken:
+            per[(u[1], u[2])].append(u)
+            why = next(j for j in failed_jobs if (j["block"], j["path"], j.get("trial") or "") == u)
+            voids.setdefault(u, f"control plane: job {why.get('kind')} on "
+                                f"{why.get('client')} (slot {why.get('slot')}) exited {why.get('exit')}")
+        for (p_, ty), us in sorted(per.items()):
+            if len(us) > control_plane_max:
+                problems.append(f"{len(us)} block(s) of {ty or 'the workload'} on {p_} lost a job to the control plane, "
+                                f"more than the {control_plane_max} allowed")
+        bad = sorted(set(bad) - set(broken))
+    elif broken:
         problems.append(f"{len(broken)} block(s) had a job that did not run to its end "
                         f"(first: block {broken[0][0]} on {broken[0][1]}); they are left out")
         bad = sorted(set(bad) | set(broken))
     if bad:
         problems.append(f"{len(bad)} of {len(planned)} planned blocks are missing trials "
                         f"(first: block {bad[0][0]} on {bad[0][1]}); they are left out")
-    keep = {k: t for k, t in trials.items() if t.unit not in set(bad) and (k[2] >= 100 or t.unit in planned or not planned)}
+    gone = set(bad) | (set(broken) if voids is not None and control_plane_max is not None else set())
+    keep = {k: t for k, t in trials.items() if t.unit not in gone and (k[2] >= 100 or t.unit in planned or not planned)}
     return problems, keep
 
 
@@ -846,11 +879,17 @@ def report(campaign: str, gates: dict, interim: bool = False,
     EFFECTIVE.clear()
     SHADOW.clear()
     sq = sequential_of(plan)
-    problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run, failures=failures)
+    cp_voids: Dict[Tuple[int, str, str], str] = {}
+    all_rows = dict(trials)
+    problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run, failures=failures,
+                                    control_plane_max=(gates.get("harness") or {}).get("control_plane_void_max"),
+                                    voids=cp_voids)
     # Contention: units void under host CPU contention are not evidence (they
     # still counted toward the cap when they ran).
     void_units, cpu_of = contention_void(campaign, plan, trials, gates.get("contention"))
     all_trials = dict(trials)
+    for u, why in cp_voids.items():
+        void_units.setdefault(u, why)
     if void_units:
         trials = {k: t for k, t in trials.items() if t.unit not in void_units}
     frozen = plan.get("gates_sha256")
@@ -938,9 +977,33 @@ def report(campaign: str, gates: dict, interim: bool = False,
         out += ["", "**No verdict: the campaign is incomplete.** " + "; ".join(problems) + ". "
                 "The numbers below are for diagnosis only."]
     if void_units:
-        out += ["", f"**{len(void_units)} block(s) void under contention** (not evidence; they counted toward the "
-                "cap): " + "; ".join(f"block {b} on {p}{' ' + ty if ty else ''}: {why}"
-                                     for (b, p, ty), why in sorted(void_units.items()))]
+        out += ["", f"**{len(void_units)} block(s) void** (under contention or lost to the control plane: not "
+                "evidence; they counted toward the cap): " + "; ".join(f"block {b} on {p}{' ' + ty if ty else ''}: {why}"
+                                                                     for (b, p, ty), why in sorted(void_units.items()))]
+    # Workload failures, per block and arm: transfers the job itself recorded
+    # as failed (curl exit other than 0, and 28 at a bulk window's end; a
+    # generator's failed session). They are the arm's evidence, never voided.
+    wf: Dict[Tuple[int, str, str], Dict[str, int]] = collections.defaultdict(lambda: collections.Counter())
+    for t in all_rows.values():
+        for r in t.rows:
+            ex = str(r.get("curl_exit") or "")
+            if ex not in ("", "0") and not (ex == "28" and r.get("kind") in ("bulk", "wl-bgdown", "wl-bgup")):
+                wf[t.unit][t.arm] += 1
+    try:
+        with open(os.path.join(campaign, "status.json")) as f:
+            jobs_failed = json.load(f).get("workload_failures") or []
+    except (OSError, ValueError):
+        jobs_failed = []
+    if jobs_failed:
+        # Jobs the runner saw fail on a reachable host (past their window,
+        # lost, silent): their rows and sessions count as the arm's failures.
+        out += ["", "Failed jobs (the arm's evidence, not void): " + "; ".join(
+            f"block {j['block']} on {j['path']}{' ' + j['trial'] if j.get('trial') else ''}: {j['kind']} on "
+            f"{j['client']} ({j['arm']}) {j['reason']}" for j in jobs_failed)]
+    if wf:
+        out += ["", "Workload failures (recorded by the jobs; evidence against the arm): " + "; ".join(
+            f"block {b} on {p}{' ' + ty if ty else ''}: " + ", ".join(f"{arm} {n}" for arm, n in sorted(c.items()))
+            for (b, p, ty), c in sorted(wf.items()))]
     if EFFECTIVE:
         out.append("")
         out.append("Effective configuration, from each endpoint's runtime configuration record:")

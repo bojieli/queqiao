@@ -123,7 +123,7 @@ class ContentionVoid(unittest.TestCase):
     def test_calm_hosts_void_nothing_and_cpu_is_reported_per_arm(self):
         with tempfile.TemporaryDirectory() as d:
             text, v = an.report(self.campaign(d), self.gates())
-        self.assertNotIn("void under contention", text)
+        self.assertNotIn("block(s) void", text)
         self.assertEqual(v[("a", "cand", "rule:bulk.goodput_bps")], "pass")
         line = next(l for l in text.splitlines() if l.startswith("| gateway host CPU busy, mean"))
         self.assertEqual(line, "| gateway host CPU busy, mean | 30% | 50% |")      # main, cand
@@ -134,7 +134,7 @@ class ContentionVoid(unittest.TestCase):
         # production: no block is void, and the busy share is reported.
         with tempfile.TemporaryDirectory() as d:
             text, v = an.report(self.campaign(d, hot={(3, "gw")}), self.gates())
-        self.assertNotIn("void under contention", text)
+        self.assertNotIn("block(s) void", text)
         self.assertIn("| gateway host share of the window at or above 90% CPU, mean |", text)
         self.assertEqual(v[("a", "cand", "rule:bulk.goodput_bps")], "pass")
 
@@ -143,12 +143,12 @@ class ContentionVoid(unittest.TestCase):
             text, _ = an.report(self.campaign(d, cand_busy=0.97), self.gates())
         self.assertIn("**CPU-bound:** `cand` on the gateway host (14 of 14 trials", text)
         self.assertNotIn("`main` on the", text)
-        self.assertNotIn("void under contention", text)
+        self.assertNotIn("block(s) void", text)
 
     def test_hypervisor_steal_voids_the_block_which_is_not_evidence(self):
         with tempfile.TemporaryDirectory() as d:
             text, v = an.report(self.campaign(d, stolen={(3, "gw")}), self.gates())
-        self.assertIn("1 block(s) void under contention", text)
+        self.assertIn("1 block(s) void", text)
         self.assertIn("block 3 on a bulk: 15% of gw's CPU stolen by the hypervisor", text)
         row = next(l for l in text.splitlines() if l.startswith("| bulk.goodput_bps | atleast"))
         self.assertIn("| cand | 6 |", row)                 # 7 blocks ran, 6 are evidence

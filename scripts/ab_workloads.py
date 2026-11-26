@@ -97,6 +97,10 @@ class Generator:
     # The job's raw records for the extractor; by default its
     # "J<TAB>{json}" lines. None: the generator has none.
     records: Optional[Callable[[str], List[dict]]] = None
+    # The kind of record a measuring job writes (e.g. "llm"): a failed job
+    # with none gets a failed record of this kind, so the arm's failure is
+    # measured rather than lost. None: rows only.
+    record_kind: Optional[str] = None
 
 
 def json_records(out: str) -> List[dict]:

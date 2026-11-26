@@ -297,8 +297,9 @@ def wake_script(campaign, job, arm, duration, start_at=0):
                       f"--follow {p['follow']} --duration {int(duration)}{ready}")
 
 
-for _name, _fn in (("wl-call", call_script), ("wl-browse", browse_script), ("wl-wake", wake_script)):
-    w.generator(_name, w.Generator(_fn, pa.parse_rows, lambda job: 0, w.json_records))
+for _name, _fn, _kind in (("wl-call", call_script, "call"), ("wl-browse", browse_script, "browse"),
+                          ("wl-wake", wake_script, None)):
+    w.generator(_name, w.Generator(_fn, pa.parse_rows, lambda job: 0, w.json_records, _kind))
 
 
 # --- workloads --------------------------------------------------------------------
@@ -483,7 +484,8 @@ class Minimal(pa._Scenario):
         dc = 4 * DC_TRIAL_SECONDS + ab.BLOCK_OVERHEAD
         every = sum(4 * s + ab.BLOCK_OVERHEAD for s in TRIAL_SECONDS.values()) + dc
         notes = [f"DC (stage 9) is its own campaign (dc-minimal.example.ini): about {dc / 60:.0f} min a block; "
-                 f"one block each of A, B, C and DC is about {every / 60:.0f} min a path (design section 15.4), "
+                 f"one block each of A, B, C and DC is about {every / 60:.0f} min a path (as measured; the design "
+                 f"budgets about 26), "
                  f"{6 * every / 3600:.1f} h at 6 blocks, {12 * every / 3600:.1f} h at the 12-block cap"]
         if cfg.minimal_wake:
             notes.append(f"D (idle-wake) runs beside the blocks on its own instances: one {wake_session_seconds() / 60:.0f}-minute "
