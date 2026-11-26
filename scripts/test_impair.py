@@ -143,7 +143,7 @@ class Scenarios(unittest.TestCase):
         self.assertNotIn("loss", s["blackhole"].down.netem())
         self.assertEqual(s["blackhole"].outages, ((30, 8), (70, 25)))
         self.assertEqual((s["policed"].police_kbit, s["policed"].police_burst), (4000, 12000))
-        self.assertEqual(s["idle-wake-lossy"].up.netem(), "delay 100ms loss random 2% limit 1000")
+        self.assertEqual(s["idle-wake-lossy"].up.netem(), "delay 100ms loss random 2% limit 10000")
 
     def test_filters_match_only_the_remote_and_its_ports(self):
         cfg = parse(BASE)

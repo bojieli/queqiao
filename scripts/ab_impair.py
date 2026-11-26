@@ -66,9 +66,12 @@ class Direction:
 
     def limit(self) -> int:
         """netem's queue in packets: what is in the delay line plus about
-        100 ms of queue at the rate (1500-byte packets); 1000 without one."""
+        100 ms of queue at the rate (1500-byte packets). Without a rate the
+        line alone must hold a fast burst (about 1 Gbit/s over the delay),
+        or the queue's own drops would add loss the scenario does not
+        specify: 10000."""
         if not self.rate_kbit:
-            return 1000
+            return 10000
         per_s = self.rate_kbit * 1000 / 8 / 1500
         return int(per_s * (self.delay_ms + 3 * self.jitter_ms) / 1000 + per_s * 0.1) + 20
 
