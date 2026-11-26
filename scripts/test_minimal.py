@@ -1606,9 +1606,43 @@ class DCAtMinimalSize(unittest.TestCase):
         for b in (1, 2, 3):
             cfg.wl.after_block(camp, b, "dc", f"b{b:03d}-dc", None)
         self.assertEqual({c.args[0].block for c in camp.run_phase.call_args_list}, {1})
-        # One solo run per loaded leaf, then one per upload leaf.
-        self.assertEqual(camp.run_phase.call_count, 6)
-        self.assertEqual([c.args[2].name for c in camp.run_phase.call_args_list], ["solo"] * 3 + ["upsolo"] * 3)
+        # Three rounds (calibrate_repeats): in each, one solo run per loaded
+        # leaf, then one per upload leaf, all on the main arm.
+        self.assertEqual(camp.run_phase.call_count, 18)
+        self.assertEqual([c.args[2].name for c in camp.run_phase.call_args_list], (["solo"] * 3 + ["upsolo"] * 3) * 3)
+        self.assertEqual({c.args[1].name for c in camp.run_phase.call_args_list}, {cfg.main.name})
+
+    def test_repeated_calibration_on_every_arm(self):
+        text = (HERE / "validation" / "dc-minimal.example.ini").read_text()
+        text = text.replace("calibrate_repeats = 3", "calibrate_repeats = 2").replace("calibrate_arms = main",
+                                                                                      "calibrate_arms = all")
+        import configparser
+        cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+        cp.read_string(text)
+        cfg = ab.parse_config(cp)
+        camp = mock.Mock(cfg=cfg)
+        cfg.wl.after_block(camp, 1, "dc", "b001-dc", None)
+        calls = [(c.args[0].slot, c.args[1].name, c.args[2].name, c.args[2].jobs[0].client.name)
+                 for c in camp.run_phase.call_args_list]
+        # 2 rounds x 2 arms x (3 download + 3 upload leaves), each slot its own.
+        self.assertEqual(len(calls), 24)
+        self.assertEqual([c[0] for c in calls], list(range(100, 124)))
+        # The main arm first in every round, then the candidate; a leaf's
+        # repeats are spread over the calibration, not back to back.
+        self.assertEqual([c[1] for c in calls[::6]], ["legacy", "pathauth", "legacy", "pathauth"])
+        self.assertEqual([c[3] for c in calls[:6]], ["leaf-a", "leaf-b", "leaf-c", "up-a", "up-b", "up-c"])
+        # The estimate counts every solo run.
+        self.assertEqual(cfg.wl.extra_once_seconds(cfg, "dc"), 24 * (cfg.duration + 15))
+
+    def test_calibration_settings_are_checked(self):
+        import configparser
+        text = (HERE / "validation" / "dc-minimal.example.ini").read_text()
+        for bad, why in (("calibrate_repeats = 0", "calibrate_repeats"), ("calibrate_arms = some", "calibrate_arms")):
+            key = bad.split(" = ")[0]
+            cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+            cp.read_string("\n".join(bad if l.startswith(key + " =") else l for l in text.splitlines()))
+            with self.assertRaisesRegex(ab.ConfigError, why):
+                ab.parse_config(cp)
 
     # --- the upload phase (#235)
 

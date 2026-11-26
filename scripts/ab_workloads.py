@@ -456,6 +456,14 @@ class DCParams:
     # Solo calibration of each loaded leaf: "every" block, the "first" block
     # only (the minimal profile), or "false".
     calibrate: str = "every"
+    # Each calibration runs every leaf's solo this many times, interleaved
+    # (leaf a, leaf b, ..., then again); dc_gate.py takes each leaf's median
+    # usable rate, so one run that collapses or bursts cannot void or skew a
+    # phase's binding check.
+    calibrate_repeats: int = 1
+    # Whose solos run: "main" (the binding check's) or "all" arms, which also
+    # records each arm's single-connection solo rate (reported, not gated).
+    calibrate_arms: str = "main"
     # "waves": request waves of downloads after the sustained phase (the full
     # gate); "rpc": the model's W4 at minimal size before it -- `rpc_requests`
     # requests one at a time, `rpc_spacing` s apart, ASR (355 KB up, 200 B
@@ -590,13 +598,19 @@ class DC(Workload):
                       bulk_flows_per_leaf=d.getint("bulk_flows_per_leaf", 2), request_bytes=d.getint("request_bytes", 307200),
                       requests_per_leaf=d.getint("requests_per_leaf", 8), waves=d.getint("waves", 3),
                       request_timeout=d.getint("request_timeout", 30), control_interval=d.getfloat("control_interval", 1.0),
-                      calibrate=_calibrate(d.get("calibrate", "true")), request_mode=d.get("request_mode", "waves"),
+                      calibrate=_calibrate(d.get("calibrate", "true")), calibrate_repeats=d.getint("calibrate_repeats", 1),
+                      calibrate_arms=d.get("calibrate_arms", "main").strip().lower(),
+                      request_mode=d.get("request_mode", "waves"),
                       rpc_requests=d.getint("rpc_requests", 10), rpc_spacing=d.getfloat("rpc_spacing", 2.0),
                       rpc_port=d.getint("rpc_port", 23485), uploader=d.get("uploader", ""),
                       upload_leaves=ab._words(d.get("upload_leaves", "")), upload_control=d.get("upload_control", ""),
                       upload_flows_per_leaf=d.getint("upload_flows_per_leaf", 2),
                       upload_object_bytes=d.getint("upload_object_bytes", 4 << 20),
                       upload_port_base=d.getint("upload_port_base", 23700))
+        if dc.calibrate_repeats < 1 or dc.calibrate_repeats > 9:
+            raise ab.ConfigError("[dc] calibrate_repeats must be 1 to 9")
+        if dc.calibrate_arms not in ("main", "all"):
+            raise ab.ConfigError("[dc] calibrate_arms must be main or all")
         if dc.request_mode not in ("waves", "rpc"):
             raise ab.ConfigError("[dc] request_mode must be waves or rpc")
         if len(dc.loaded) < 2:
@@ -744,7 +758,19 @@ class DC(Workload):
                       + [Job(control, "probe", 1, load=False, params=probe)], barrier=True)]
 
     def calibrations(self, cfg: Any) -> int:
+        """Solo runs per calibration: every leaf, on every calibrated arm,
+        calibrate_repeats times."""
+        return self.leaves_per_round(cfg) * len(self.calibration_arms(cfg)) * cfg.dc.calibrate_repeats
+
+    @staticmethod
+    def leaves_per_round(cfg: Any) -> int:
         return len(cfg.dc.loaded) + len(cfg.dc.upload_leaves)
+
+    @staticmethod
+    def calibration_arms(cfg: Any) -> List[Any]:
+        """The main arm first (its solos are the binding check's), then the
+        candidates when calibrate_arms = all."""
+        return [cfg.main] + ([a for a in cfg.arms if a is not cfg.main] if cfg.dc.calibrate_arms == "all" else [])
 
     def extra_block_seconds(self, cfg: Any, path: str) -> float:
         return float(self.calibrations(cfg) * (cfg.duration + 15)) if cfg.dc.calibrate == "every" else 0.0
@@ -753,44 +779,46 @@ class DC(Workload):
         return float(self.calibrations(cfg) * (cfg.duration + 15)) if cfg.dc.calibrate == "first" else 0.0
 
     def after_block(self, campaign: Any, block: int, path: str, tagp: str, writer: Any) -> None:
-        """Each loaded leaf alone on the main arm: the common ancestor binds
-        only if the leaves together deliver clearly less than the sum of what
-        each delivers alone (dc_gate.ini)."""
+        """Each loaded leaf alone, then each upload leaf alone: the common
+        ancestor binds only if the leaves together deliver clearly less than
+        the sum of what each delivers alone (dc_gate.ini). The main arm's
+        solos are that check's; with calibrate_arms = all every arm runs
+        them too, for its single-connection rate. Each round runs every leaf
+        once and there are calibrate_repeats rounds, so a leaf's repeats are
+        spread over the calibration. Slots: 100 + (round x arms + arm) x
+        leaves + leaf, the download leaves before the upload leaves."""
         cfg = campaign.cfg
         if cfg.dc.calibrate == "false" or (cfg.dc.calibrate == "first" and block != 1):
             return
-        arm = cfg.main
-        for i, name in enumerate(cfg.dc.loaded):
-            leaf = cfg.clients[name]
-            slot = ab.Slot(block, path, 100 + i, arm.name, 0, False)
-            if leaf.small:
-                campaign.start_client(leaf, arm, f"client-{tagp}-s{slot.slot}")
-            campaign.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
-            campaign.scrape_client(leaf, arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
-            campaign.run_phase(slot, arm, Phase("solo", cfg.duration,
-                                                [Job(leaf, "bulk", cfg.dc.bulk_flows_per_leaf,
-                                                     params={"expected": cfg.object_bytes})]), writer)
-            campaign.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
-            campaign.scrape_client(leaf, arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
-            if leaf.small:
-                campaign.stop_client(leaf, arm)
-            campaign.pause(cfg.gap)
-        # The upload leaves alone, one at a time, through the uploader (slots
-        # after the download leaves'): whether the uploader's uplink binds.
-        if not cfg.dc.upload_leaves:
-            return
-        uploader = cfg.clients[cfg.dc.uploader]
-        for i, name in enumerate(cfg.dc.upload_leaves):
-            slot = ab.Slot(block, path, 100 + len(cfg.dc.loaded) + i, arm.name, 0, False)
-            if uploader.small:
-                campaign.start_client(uploader, arm, f"client-{tagp}-s{slot.slot}")
-            campaign.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
-            campaign.scrape_client(uploader, arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
-            campaign.run_phase(slot, arm, Phase("upsolo", cfg.duration,
-                                                [Job(upload_leaf_client(cfg, name), "dc-upload", cfg.dc.upload_flows_per_leaf,
-                                                     params={"object_bytes": cfg.dc.upload_object_bytes})]), writer)
-            campaign.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
-            campaign.scrape_client(uploader, arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
-            if uploader.small:
-                campaign.stop_client(uploader, arm)
-            campaign.pause(cfg.gap)
+        arms = self.calibration_arms(cfg)
+        k = self.leaves_per_round(cfg)
+        for rnd in range(cfg.dc.calibrate_repeats):
+            for ai, arm in enumerate(arms):
+                base = 100 + (rnd * len(arms) + ai) * k
+                for i, name in enumerate(cfg.dc.loaded):
+                    self._solo(campaign, cfg.clients[name], arm, ab.Slot(block, path, base + i, arm.name, 0, False), tagp,
+                               Phase("solo", cfg.duration, [Job(cfg.clients[name], "bulk", cfg.dc.bulk_flows_per_leaf,
+                                                                params={"expected": cfg.object_bytes})]), writer)
+                # The upload leaves alone, one at a time, through the
+                # uploader: whether the uploader's uplink binds.
+                if not cfg.dc.upload_leaves:
+                    continue
+                uploader = cfg.clients[cfg.dc.uploader]
+                for i, name in enumerate(cfg.dc.upload_leaves):
+                    self._solo(campaign, uploader, arm, ab.Slot(block, path, base + len(cfg.dc.loaded) + i, arm.name, 0, False),
+                               tagp, Phase("upsolo", cfg.duration,
+                                           [Job(upload_leaf_client(cfg, name), "dc-upload", cfg.dc.upload_flows_per_leaf,
+                                                params={"object_bytes": cfg.dc.upload_object_bytes})]), writer)
+
+    @staticmethod
+    def _solo(campaign: Any, client: Any, arm: Any, slot: Any, tagp: str, phase: Phase, writer: Any) -> None:
+        if client.small:
+            campaign.start_client(client, arm, f"client-{tagp}-s{slot.slot}")
+        campaign.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
+        campaign.scrape_client(client, arm, f"{tagp}-s{slot.slot}-{arm.name}-pre")
+        campaign.run_phase(slot, arm, phase, writer)
+        campaign.scrape(arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
+        campaign.scrape_client(client, arm, f"{tagp}-s{slot.slot}-{arm.name}-post")
+        if client.small:
+            campaign.stop_client(client, arm)
+        campaign.pause(campaign.cfg.gap)
