@@ -401,3 +401,86 @@ func TestCongestionScopeValidatorRequiresStagesOneAndTwo(t *testing.T) {
 		t.Fatalf("server rejected the congestion=path bundle: %v", err)
 	}
 }
+
+// Both named bundles are supported combinations for every profile and both
+// roles (design §14 stage 10, §11.3): the default path-authority bundle is
+// dc-long-haul's whole new-architecture bundle, and the legacy bundle is
+// every switch off.
+func TestNamedBundlesAreSupportedOnEveryProfile(t *testing.T) {
+	for _, name := range profile.Names() {
+		p, err := profile.ByName(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, bundle := range []BundleName{BundlePathAuthority, BundleLegacy} {
+			for _, gateway := range []bool{false, true} {
+				s, err := SwitchesOf(bundle, gateway)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if gateway && s.Topology != "" || !gateway && s.GatewayAdmission != "" {
+					t.Fatalf("%s gateway=%v: role-foreign switch set: %+v", bundle, gateway, s)
+				}
+				check := func(what string, err error) {
+					if err != nil {
+						t.Errorf("%s/%s gateway=%v: %s: %v", name, bundle, gateway, what, err)
+					}
+				}
+				check("bundle", ValidateBundle(s.CCAPI, CongestionErasure, p))
+				check("sched", ValidateSched(s.Sched, s.CCAPI))
+				check("scope", ValidateCongestionScope(s.CongestionScope, s.CCAPI, s.Sched))
+				check("coded-retry", ValidateCodedRetry(s.CodedRetry, s.CCAPI))
+				check("classifier", ValidateClassifier(s.Classifier, p))
+				if !gateway {
+					check("topology", ValidateTopology(s.Topology, s.CongestionScope, 0))
+				}
+				check("recovery", ValidateRecovery(s.Recovery, s.CongestionScope, s.CodedRetry, s.Topology, 0, gateway))
+				check("profile", ValidateProfileBundle(p, s.CCAPI, s.Sched, s.CongestionScope, s.CodedRetry, s.Topology, s.Recovery, s.Classifier, gateway))
+				if _, err := ParseMemoryMode(string(s.Memory)); err != nil {
+					t.Errorf("%s/%s: memory %v", name, bundle, err)
+				}
+			}
+		}
+	}
+	if DefaultBundle != BundlePathAuthority {
+		t.Fatalf("default bundle %q", DefaultBundle)
+	}
+	for _, in := range []string{"", " Path-Authority ", "legacy"} {
+		if _, err := ParseBundleName(in); err != nil {
+			t.Errorf("%q: %v", in, err)
+		}
+	}
+	if _, err := ParseBundleName("v2"); err == nil {
+		t.Error("unknown bundle name accepted")
+	}
+	if _, err := SwitchesOf("v2", false); err == nil {
+		t.Error("unknown bundle has switches")
+	}
+}
+
+// ApplyToClient and ApplyToServer set every switch, so a configuration does
+// not depend on what an empty value means.
+func TestBundleSwitchesApplyEverySwitch(t *testing.T) {
+	c, _ := SwitchesOf(BundlePathAuthority, false)
+	var cc ClientConfig
+	c.ApplyToClient(&cc)
+	if cc.CCAPI != CCAPIV2 || cc.Sched != SchedClass || cc.CongestionScope != CongestionScopePath || cc.CodedRetry != CodedRetrySticky ||
+		cc.Memory != MemoryOwned || cc.Classifier != ClassifierPhased || cc.Recovery != RecoveryCarrier || cc.Topology != TopologySingle {
+		t.Fatalf("client config %+v", cc)
+	}
+	g, _ := SwitchesOf(BundlePathAuthority, true)
+	var sc ServerConfig
+	g.ApplyToServer(&sc)
+	if sc.CCAPI != CCAPIV2 || sc.Sched != SchedClass || sc.CongestionScope != CongestionScopePath || sc.CodedRetry != CodedRetrySticky ||
+		sc.Memory != MemoryOwned || sc.Classifier != ClassifierPhased || sc.Recovery != RecoveryCarrier || sc.GatewayAdmission != GatewayAdmissionOwned {
+		t.Fatalf("server config %+v", sc)
+	}
+	if got := Bundle(cc.CCAPI, cc.Memory, cc.CodedRetry, "", cc.Sched, cc.Classifier, cc.CongestionScope, cc.Topology, cc.Recovery); got == "legacy" {
+		t.Fatal("the default bundle reads as legacy")
+	}
+	l, _ := SwitchesOf(BundleLegacy, true)
+	l.ApplyToServer(&sc)
+	if got := Bundle(sc.CCAPI, sc.Memory, sc.CodedRetry, sc.GatewayAdmission, sc.Sched, sc.Classifier, sc.CongestionScope, "", sc.Recovery); got != "legacy" {
+		t.Fatalf("the legacy bundle reads as %q", got)
+	}
+}

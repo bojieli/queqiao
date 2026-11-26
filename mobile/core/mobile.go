@@ -256,7 +256,8 @@ func (s *Session) SetRoutingRules(text string) string {
 }
 
 // SetMemoryBundle selects the memory-ownership bundle the next Start uses:
-// "legacy" (the default) or "owned", which grants the shared send budget to
+// "owned" (the default since stage 10, part of the path-authority bundle the
+// tunnel runs) or "legacy". Owned grants the shared send budget to
 // waiting flows in turn and tunes each flow's retention
 // from its own flow credit. Any other value is refused and changes nothing.
 // A running tunnel keeps the bundle it started with.
@@ -273,7 +274,42 @@ func (s *Session) memoryBundle() pep.MemoryMode {
 	if mode, ok := s.memoryMode.Load().(pep.MemoryMode); ok {
 		return mode
 	}
-	return pep.MemoryLegacy
+	return mobileBundle().Memory
+}
+
+// tunnelClientConfig is the tunnel's client configuration for a resource
+// profile, without the parts that come from the running session (listener,
+// endpoint, socket protection, credentials, metrics and logger).
+func tunnelClientConfig(limits mobileResourceLimits, memory pep.MemoryMode) pep.ClientConfig {
+	cfg := pep.ClientConfig{
+		ChunkSize:   limits.chunkSize,
+		DialTimeout: 10 * time.Second, HandshakeTimeout: 30 * time.Second,
+		FlowIdleTimeout: 10 * time.Minute, FlowMaxLifetime: 6 * time.Hour,
+		MaxSessions: limits.maxSessions, MaxPendingOpens: limits.maxPendingOpens, Transport: pep.TransportAuto,
+		TCPFallbackLanes: 0, EnableQUICPool: true, WaitForOpenAcknowledgement: false,
+		UDPOnStream: false, Congestion: pep.CongestionErasure,
+		AdaptiveMinBytesSec: 64 * 1024, AdaptiveMaxBytesSec: 200 * 1024 * 1024,
+		FallbackDelay: 300 * time.Millisecond, FallbackGrace: 2 * time.Second,
+		UDPFailureThreshold: 3, UDPCooldown: 30 * time.Second,
+		StreamReceiveWindow: limits.streamWindow, ConnectionReceiveWindow: limits.connectionWindow,
+		MaxStreamReceiveWindow: limits.streamWindow, MaxConnectionReceiveWindow: limits.connectionWindow,
+		MaxIncomingStreams: limits.maxIncomingStreams, MemoryLimits: &limits.memory,
+	}
+	mobileBundle().ApplyToClient(&cfg)
+	cfg.Memory = memory
+	return cfg
+}
+
+// mobileBundle is the migration bundle a tunnel runs: the default
+// path-authority bundle since stage 10 (design §14), with the one pooled
+// connection per path that topology=single and recovery=carrier need, and
+// the profile's windows grown by the single topology's credit (§11.5).
+func mobileBundle() pep.BundleSwitches {
+	s, err := pep.SwitchesOf(pep.DefaultBundle, false)
+	if err != nil {
+		panic(err) // the default bundle is always defined
+	}
+	return s
 }
 
 // SetCountrySet hands the core a packed country set for GEOIP rules to consult.
@@ -403,29 +439,16 @@ func (s *Session) start(opts sessionOptions) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	registry := metrics.New()
 	logger := slog.New(newObserverHandler(s.observer, slog.LevelInfo))
-	client, err := pep.NewClient(pep.ClientConfig{
-		// Leave source-address selection to the platform. Android's socket
-		// protector must run before bind/connect; resolving and binding an
-		// "auto" interface here would bypass that contract and can select the
-		// VPN itself after its default route is installed.
-		ListenAddr: listener.Addr().String(), RemoteAddr: profile.Endpoint, LocalAddress: "",
-		SocketControl: s.socketControl(opts.requireSocketProtection), SOCKSAuth: opts.auth,
-		Credentials: credentials,
-		ChunkSize:   limits.chunkSize,
-		DialTimeout: 10 * time.Second, HandshakeTimeout: 30 * time.Second,
-		FlowIdleTimeout: 10 * time.Minute, FlowMaxLifetime: 6 * time.Hour,
-		MaxSessions: limits.maxSessions, MaxPendingOpens: limits.maxPendingOpens, Transport: pep.TransportAuto,
-		TCPFallbackLanes: 0, EnableQUICPool: true, WaitForOpenAcknowledgement: false,
-		UDPOnStream: false, Congestion: pep.CongestionErasure,
-		AdaptiveMinBytesSec: 64 * 1024, AdaptiveMaxBytesSec: 200 * 1024 * 1024,
-		FallbackDelay: 300 * time.Millisecond, FallbackGrace: 2 * time.Second,
-		UDPFailureThreshold: 3, UDPCooldown: 30 * time.Second,
-		StreamReceiveWindow: limits.streamWindow, ConnectionReceiveWindow: limits.connectionWindow,
-		MaxStreamReceiveWindow: limits.streamWindow, MaxConnectionReceiveWindow: limits.connectionWindow,
-		MaxIncomingStreams: limits.maxIncomingStreams, MemoryLimits: &limits.memory,
-		Memory:  s.memoryBundle(),
-		Metrics: registry, Logger: logger,
-	})
+	clientConfig := tunnelClientConfig(limits, s.memoryBundle())
+	// Leave source-address selection to the platform. Android's socket
+	// protector must run before bind/connect; resolving and binding an
+	// "auto" interface here would bypass that contract and can select the
+	// VPN itself after its default route is installed.
+	clientConfig.ListenAddr, clientConfig.RemoteAddr, clientConfig.LocalAddress = listener.Addr().String(), profile.Endpoint, ""
+	clientConfig.SocketControl, clientConfig.SOCKSAuth = s.socketControl(opts.requireSocketProtection), opts.auth
+	clientConfig.Credentials = credentials
+	clientConfig.Metrics, clientConfig.Logger = registry, logger
+	client, err := pep.NewClient(clientConfig)
 	if err != nil {
 		cancel()
 		_ = listener.Close()
