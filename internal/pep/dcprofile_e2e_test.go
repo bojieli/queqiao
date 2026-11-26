@@ -67,7 +67,7 @@ type dcArm struct {
 }
 
 var (
-	dcLegacyArm = dcArm{name: "legacy"}
+	dcLegacyArm = dcArm{name: "legacy", legacy: true}
 	dcNewArm    = dcArm{name: "path-authority"}
 )
 
