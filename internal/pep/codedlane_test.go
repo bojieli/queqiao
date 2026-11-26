@@ -29,6 +29,13 @@ func codedPair(t *testing.T, pooled bool, path *pathsim.Config) (socks string, d
 // codedPairWith lets a test choose what the destination does with the bytes.
 func codedPairWith(t *testing.T, pooled bool, path *pathsim.Config, serve func(net.Listener)) (socks string, destination net.Listener) {
 	t.Helper()
+	return codedPairOnBundle(t, "", pooled, path, serve)
+}
+
+// codedPairOnBundle is codedPairWith with both endpoints on a named bundle;
+// the empty name keeps the library's zero values (the legacy bundle).
+func codedPairOnBundle(t *testing.T, bundle BundleName, pooled bool, path *pathsim.Config, serve func(net.Listener)) (socks string, destination net.Listener) {
+	t.Helper()
 	// Every endpoint in this process is loopback, so every test shares one
 	// path model and would otherwise size its code from what the test before
 	// it measured on a different channel.
@@ -50,14 +57,22 @@ func codedPairWith(t *testing.T, pooled bool, path *pathsim.Config, serve func(n
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := NewServer(ServerConfig{
+	serverCfg := ServerConfig{
 		ListenAddr: "127.0.0.1:0", Credentials: certificate,
 		DestinationPolicy: DestinationPolicy{AllowPrivate: true}, EnableQUIC: true, Logger: logger,
 		Metrics: metrics.New(),
 		// The first connection to an erasing path spends about five seconds
 		// on the QUIC handshake alone, so a bound of five is a coin flip.
 		HandshakeTimeout: 30 * time.Second,
-	})
+	}
+	if bundle != "" {
+		s, err := SwitchesOf(bundle, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.ApplyToServer(&serverCfg)
+	}
+	server, err := NewServer(serverCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,10 +94,18 @@ func codedPairWith(t *testing.T, pooled bool, path *pathsim.Config, serve func(n
 	}
 	clientMetrics := metrics.New()
 	lastClientMetrics = clientMetrics
-	client, err := NewClient(ClientConfig{
+	clientCfg := ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: remote, Credentials: roots, Transport: TransportQUIC,
 		EnableQUICPool: pooled, Logger: logger, Metrics: clientMetrics,
-	})
+	}
+	if bundle != "" {
+		s, err := SwitchesOf(bundle, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.ApplyToClient(&clientCfg)
+	}
+	client, err := NewClient(clientCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
