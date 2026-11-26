@@ -1872,3 +1872,35 @@ func TestADemotionFromProgressSettlesAtItsOwnTime(t *testing.T) {
 		t.Fatalf("the demotion's publication settled the balance at %v, not at the demotion (%v)", settled, clock)
 	}
 }
+
+// A PTO probe that demotes its attachment, with the clock already past the
+// probe's send time: the publication the demotion causes settles the
+// balance at the probe's own time, so the probe's debit applies to the
+// balance as of then and the interval to the clock is not credited twice.
+func TestAProbeDemotionSettlesAtTheProbesTime(t *testing.T) {
+	c := NewPathController(1200, pathmodel.NewPathModel(), DefaultClassWeights)
+	now := base()
+	clock := now
+	c.clock = func() monotime.Time { return clock }
+	a, b := attachPC(t, c, now), attachPC(t, c, now)
+	a.send(now, 1200) // holds the head of the send order
+	for range 40 {
+		b.send(now, 1200) // and puts the balance in debt
+	}
+	b.event(now.Add(50*time.Millisecond), numbers(0, 20), numbers(20, 40))
+	probeAt := now.Add(60 * time.Millisecond)
+	for range pathProbingPTOProbes - 1 {
+		a.sendKind(probeAt, 1200, quiccongestion.KindPTOProbe, true)
+	}
+	clock = now.Add(90 * time.Millisecond) // the clock runs ahead of the probe
+	c.mu.Lock()
+	want := c.law.pacer.budget(probeAt) - 1200
+	c.mu.Unlock()
+	a.sendKind(probeAt, 1200, quiccongestion.KindPTOProbe, true) // demotes
+	c.mu.Lock()
+	got, last := c.law.pacer.budgetAtLastSent, c.law.pacer.lastSentTime
+	c.mu.Unlock()
+	if last != probeAt || got != want {
+		t.Fatalf("after the demoting probe the balance is %d at %v; want %d at the probe's time %v", got, last, want, probeAt)
+	}
+}
