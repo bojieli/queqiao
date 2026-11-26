@@ -63,6 +63,10 @@ type ErasureSender struct {
 	// inflightBound). Nil on a per-connection sender, which keeps the law
 	// as it was.
 	bound *inflightBound
+	// unansweredSince is, under the path authority's law, when the first
+	// sample packet since the last acknowledgement was sent; zero while
+	// none is outstanding (see noteAnswered).
+	unansweredSince monotime.Time
 
 	// estimator watches the explicit packet outcomes QUIC reports, ordered by
 	// packet number within each congestion event for the burst statistic.
@@ -102,6 +106,8 @@ type ErasureSender struct {
 	// boundHi is the loss bound's current value in bytes, zero while none
 	// applies, published for telemetry.
 	boundHi atomic.Int64
+	// outages counts the silences judged outages (noteAnswered).
+	outages atomic.Uint64
 
 	// arrival is the last computed arrival rate, published for the pacer and
 	// the congestion window, which run outside the callback that computes it.
@@ -230,6 +236,10 @@ func NewErasureSenderOn(initialPacketSize quiccongestion.ByteCount, path pathmod
 	return e
 }
 
+// pathProbeRTTGain is the path authority's ProbeRTT window in bandwidth-delay
+// products: BBRv2's and v3's BBRProbeRTTCwndGain.
+const pathProbeRTTGain = 0.5
+
 // newPathLaw returns the erasure control law a PathController hosts. It
 // reports what it measures to path, which the coded path's FEC and the
 // prewarm read, and reads back only the path's knowledge of its erasure as a
@@ -241,7 +251,10 @@ func newPathLaw(initialPacketSize quiccongestion.ByteCount, path pathmodel.Model
 	e.authority = true
 	e.inner.estimator.retireByFate = true
 	e.inner.estimator.maxFilter.retireAged = true
+	e.inner.estimator.staleEvidence = byteTotal(e.inner.minCwnd)
 	e.bound = &inflightBound{jitter: e.inner.probeJitter}
+	e.inner.probeRTTGain = pathProbeRTTGain
+	e.inner.flightScale = func() float64 { return 1 / e.arrivalRate() }
 	e.pacer.keepDebt = true
 	e.path = path
 	if path != nil {
@@ -567,6 +580,44 @@ func (e *ErasureSender) OnPacketSent(sentTime monotime.Time, bytesInFlight quicc
 	}
 	e.pacer.sentPacket(sentTime, bytes)
 	e.inner.OnPacketSent(sentTime, bytesInFlight, number, bytes, retransmittable)
+	if e.authority && retransmittable && e.unansweredSince.IsZero() {
+		e.unansweredSince = sentTime
+	}
+}
+
+// pathOutageRTTs is how many smoothed round trips a sample packet must have
+// gone without any acknowledgement arriving for the silence to be an outage.
+// It is the fate horizon's figure (pathFateHorizonRTTs): past it nothing sent
+// before the silence is still expected.
+const pathOutageRTTs = 4
+
+// noteAnswered is called, under the path authority's law, before an event
+// that acknowledges something is processed. If packets had been going
+// unanswered for pathOutageRTTs round trips, the path was away and has
+// returned: an outage, which is neither congestion nor a measurement. The
+// sender's clocks do not run through it (TUICBBRSender.outage) and the loss
+// bound does not hold its probe wait across it (inflightBound.restored).
+func (e *ErasureSender) noteAnswered(now monotime.Time) {
+	since := e.unansweredSince
+	e.unansweredSince = 0
+	if since.IsZero() || now.IsZero() {
+		return
+	}
+	rtt := e.inner.rtt()
+	if e.rttStats != nil {
+		if smoothed := e.rttStats.SmoothedRTT(); smoothed > 0 {
+			rtt = smoothed
+		}
+	}
+	silence := now.Sub(since)
+	if rtt <= 0 || silence < pathOutageRTTs*rtt {
+		return
+	}
+	e.inner.outage(silence)
+	if e.bound != nil {
+		e.bound.restored()
+	}
+	e.outages.Add(1)
 }
 
 // byteTotal converts a packet size for a byte counter; a negative size
@@ -672,6 +723,13 @@ func (e *ErasureSender) OnCongestionEventEx(priorInFlight quiccongestion.ByteCou
 func (e *ErasureSender) afterOutcomes(priorInFlight quiccongestion.ByteCount, eventTime monotime.Time, acked []quiccongestion.AckedPacketInfo, lost []quiccongestion.LostPacketInfo) {
 	e.publishMeasurement()
 	e.passed.Add(uint64(len(lost)))
+	if e.authority && len(acked) > 0 {
+		at := eventTime
+		if at.IsZero() {
+			at = monotime.Now()
+		}
+		e.noteAnswered(at)
+	}
 	e.inner.OnCongestionEventEx(priorInFlight, eventTime, acked, lost)
 	if e.bound != nil {
 		queue, minRTT := e.queueDelay()

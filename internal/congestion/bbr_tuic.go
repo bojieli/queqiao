@@ -114,9 +114,15 @@ type TUICBBRSender struct {
 	// filling on its own account: an expiry that finds it still catching up
 	// is taken.
 	skipAppLimitedProbeRTT bool
-	filledSinceMinRTT      bool
-	rttSinceMinRTT         time.Duration
-	rttSinceMinRTTAt       monotime.Time
+	// probeRTTGain, if set, is ProbeRTT's window as a fraction of one
+	// bandwidth-delay product, in place of four packets (see probeRTTCwnd).
+	probeRTTGain float64
+	// flightScale, if set, is how many bytes the law built on this sender
+	// keeps in flight for each byte of this sender's window.
+	flightScale       func() float64
+	filledSinceMinRTT bool
+	rttSinceMinRTT    time.Duration
+	rttSinceMinRTTAt  monotime.Time
 	// roundsSinceMinRTT counts the rounds since the minimum was measured,
 	// and pacedRounds those in which the pacer refused an admission
 	// (notePacingLimited) outside a ProbeRTT and its catch-up. A sender
@@ -924,7 +930,7 @@ func (b *TUICBBRSender) maybeProbeRTT(now monotime.Time, roundStart bool, inFlig
 	// forced four-packet window can replace a valid bandwidth peak with the
 	// artificial ProbeRTT delivery rate.
 	b.estimator.markAppLimited()
-	if b.exitProbeRTT.IsZero() && inFlight < b.probeRTTCwnd()+b.maxDatagramSize {
+	if b.exitProbeRTT.IsZero() && inFlight < b.probeRTTFloor() {
 		b.exitProbeRTT = now.Add(tuicProbeRTTDuration)
 		b.probeRTTRoundPassed = false
 	}
@@ -974,8 +980,62 @@ func (b *TUICBBRSender) targetCwnd(gain float64) quiccongestion.ByteCount {
 	return quiccongestion.ByteCount(bdp)
 }
 
+// outage is told that the path delivered nothing for d and has now returned.
+// The clocks that age what the sender knows of the path -- the bandwidth
+// estimate's window, the remembered peak, the minimum round trip's -- stop
+// for it: an estimate is aged out so that a path which changed is believed,
+// and a path that was away has not shown what it is now. Without this an
+// outage longer than the estimate's window (ten minimum round trips) left it
+// expired at the restore, and the first trickle acknowledged replaced it.
+func (b *TUICBBRSender) outage(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	b.estimator.maxFilter.suspend(d)
+	if !b.peakBandwidthAt.IsZero() {
+		b.peakBandwidthAt = b.peakBandwidthAt.Add(d)
+	}
+	if !b.minRTTAt.IsZero() {
+		b.minRTTAt = b.minRTTAt.Add(d)
+	}
+	if !b.rttSinceMinRTTAt.IsZero() {
+		b.rttSinceMinRTTAt = b.rttSinceMinRTTAt.Add(d)
+	}
+}
+
+// probeRTTCwnd is the window ProbeRTT holds the flight to.
+//
+// BBRv1's, and the per-connection senders', is four packets: the path carries
+// nothing for 200 ms and a round trip, and whatever arrives meanwhile waits
+// behind it. BBRv2 and v3 hold half a bandwidth-delay product instead
+// (BBRProbeRTTCwndGain), which the path authority's law takes
+// (probeRTTGain): a flight of half what the pipe holds leaves no queue of the
+// sender's own, so the round trip it samples is the path's, and the path
+// still carries about half its rate. On an emulated 20 Mbit/s, 120 ms path a
+// call's audio beside a tunnelled download waited up to 440 ms behind one
+// four-packet ProbeRTT, for half a second.
 func (b *TUICBBRSender) probeRTTCwnd() quiccongestion.ByteCount {
+	if b.probeRTTGain > 0 && b.estimator.estimate() > 0 {
+		return maxByteCount(b.minCwnd, quiccongestion.ByteCount(b.probeRTTGain*float64(b.targetCwnd(1))))
+	}
 	return b.minCwnd
+}
+
+// probeRTTFloor is the flight below which ProbeRTT's window has taken hold
+// and its 200 ms begin. A law that sends more than this window to make up for
+// erasure (flightScale) holds a flight that much larger, and a window of half
+// a product, unlike one of four packets, is large enough for the difference
+// to exceed the one packet of slack: without the scale the flight never got
+// under the floor on a 15% erasure path, and ProbeRTT ran for seconds while
+// the bandwidth estimate aged out beneath it.
+func (b *TUICBBRSender) probeRTTFloor() quiccongestion.ByteCount {
+	window := b.probeRTTCwnd()
+	if b.probeRTTGain > 0 && b.flightScale != nil {
+		if scale := b.flightScale(); scale > 1 {
+			window = quiccongestion.ByteCount(float64(window) * scale)
+		}
+	}
+	return window + b.maxDatagramSize
 }
 
 func (b *TUICBBRSender) calculatePacingRate() {

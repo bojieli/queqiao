@@ -15,7 +15,7 @@ jobs:
   # The full suite, including everything -short skips.
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -23,7 +23,7 @@ jobs:
           go-version-file: go.mod
       # Keep the wall-clock path emulators isolated from CPU-bound FEC tests,
       # just as in the native and race jobs below. This matters on Linux too.
-      - run: go test -p=1 -timeout 50m ./...
+      - run: go test -p=1 -timeout 90m ./...
       - run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 -checks=all,-U1000 ./...
       - name: Gosec reviewed baseline
         run: |
@@ -40,7 +40,7 @@ jobs:
   # hosted Windows timer stretches their configured path instead of preserving
   # it, so Windows covers the coded path without claiming that timing evidence.
   native-test:
-    timeout-minutes: 70
+    timeout-minutes: 110
     strategy:
       fail-fast: false
       matrix:
@@ -60,7 +60,7 @@ jobs:
       # -p=1 for the same reason the race job below uses it: parallel packages
       # let CPU-bound erasure coding starve the wall-clock network emulators,
       # and a starved emulator reports a healthy path as a transport fault.
-      - run: go test -p=1 -count=1 -timeout 50m ./...
+      - run: go test -p=1 -count=1 -timeout 90m ./...
 
   # The race detector costs this tree roughly an order of magnitude in the
   # erasure code -- internal/fec alone takes seven minutes on a 32-core

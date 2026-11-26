@@ -182,3 +182,57 @@ func TestSegmentFetchOnAnEmulatedPath(t *testing.T) {
 			100*flip.rebuffer, 100*legacy.rebuffer)
 	}
 }
+
+// W10's player under recovery=carrier, which the flip arm above does not yet
+// carry. An idle carrier still carries the odd small frame, and the pause
+// between segments (3 s) outlives the bandwidth estimate's window (ten round
+// trips, 1.2 s). A lone small packet acknowledged in the pause used to
+// replace the aged-out estimate with its own few hundred bytes a second, and
+// the next segment was paced from that: it took 2.4 to 4.8 s instead of 1 s,
+// in 9 sessions of 21. With the evidence rule (congestion's
+// TestALonePacketInAPauseDoesNotBecomeTheEstimate) none of 20 did.
+func TestSegmentFetchAfterAPauseUnderCarrierRecovery(t *testing.T) {
+	requireStableImpairmentClock(t)
+	if testing.Short() {
+		t.Skip("a minute of wall-clock playback; the full suite runs it")
+	}
+	const size, period, segments = 1500 * 1000, 4 * time.Second, 15
+	path := pathsim.Config{
+		OneWayDelay: 60 * time.Millisecond, LossRate: 0.01, Seed: 10,
+		RateBytesPerSec: 20e6 / 8, PolicerRefillPeriod: 8 * time.Millisecond,
+	}
+	arm := workloadArm{
+		name:   "flip with recovery=carrier",
+		client: func(c *ClientConfig) { flipArm.client(c); c.Recovery = RecoveryCarrier },
+		server: func(s *ServerConfig) { flipArm.server(s); s.Recovery = RecoveryCarrier },
+	}
+	rig := newWorkloadRig(t, path, arm, nil)
+	conn := rig.dial(segmentServer(t))
+	_ = conn.SetDeadline(time.Now().Add(segments*period + time.Minute))
+	if _, err := fetchSegment(conn, 4096); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	var times []time.Duration
+	for k := range segments {
+		if wait := time.Until(start.Add(time.Duration(k) * period)); wait > 0 {
+			time.Sleep(wait)
+		}
+		d, err := fetchSegment(conn, size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		times = append(times, d.Round(time.Millisecond))
+	}
+	t.Logf("segment times %v", times)
+	if !judgeComparisons(t) {
+		return
+	}
+	// A segment is 0.6 s of the path's rate and takes about 1 s; one that
+	// restarted from a collapsed estimate took at least 2.4 s.
+	for k, d := range times {
+		if d > 2*time.Second {
+			t.Errorf("segment %d took %v after its pause; the others take about 1 s", k, d)
+		}
+	}
+}

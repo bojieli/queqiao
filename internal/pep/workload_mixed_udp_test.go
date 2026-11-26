@@ -7,6 +7,8 @@ import (
 	"io"
 	"math"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -184,6 +186,39 @@ type m5Direction struct {
 	sent     int
 	late     int
 	lateness []time.Duration
+	// series is each packet's lateness in send order, negative for one
+	// that never arrived.
+	series []time.Duration
+}
+
+// latenessEpisodes lists the runs of packets later than over (or lost) as
+// "start+length(peak)", in seconds and milliseconds.
+func latenessEpisodes(series []time.Duration, over time.Duration) string {
+	var b strings.Builder
+	start, peak, lost := -1, time.Duration(0), 0
+	flush := func(end int) {
+		if start < 0 {
+			return
+		}
+		fmt.Fprintf(&b, " %.1fs+%dms(%dms,%d lost)", (time.Duration(start) * audioInterval).Seconds(),
+			(time.Duration(end-start) * audioInterval).Milliseconds(), peak.Milliseconds(), lost)
+		start, peak, lost = -1, 0, 0
+	}
+	for i, l := range series {
+		if l >= 0 && l <= over {
+			flush(i)
+			continue
+		}
+		if start < 0 {
+			start = i
+		}
+		if l < 0 {
+			lost++
+		}
+		peak = max(peak, l)
+	}
+	flush(len(series))
+	return b.String()
 }
 
 // m5Outcome is one arm's M5 measures.
@@ -226,7 +261,9 @@ type m5Outcome struct {
 // 6 blocks, then one at a time to 12, passing when every lower bound clears
 // zero, failing when any upper bound falls below it, and failing as
 // inconclusive at the cap. -short runs one 8 s block as a smoke test: every keystroke echoed,
-// audio measured both ways, the heavy flow moving.
+// audio measured both ways, the heavy flow moving. QQ_M5_TRACE=1 logs each
+// block's lateness distribution and its episodes over 100 ms, by arm and
+// direction: when they start, how long they last and how late they peak.
 func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 	requireStableImpairmentClock(t)
 	const playout = 150 * time.Millisecond
@@ -268,6 +305,12 @@ func TestHeavyUDPDoesNotDelayThinUDPOrCodedChunks(t *testing.T) {
 			o := outcomes[i]
 			for d, name := range []string{"uplink", "downlink"} {
 				a := o.audio[d]
+				if os.Getenv("QQ_M5_TRACE") != "" {
+					t.Logf("TRACE block %d %s %s: lateness p50 %v p90 %v p99 %v max %v; episodes over 100 ms: %s", block, arm.name, name,
+						durationQuantile(a.lateness, 0.5).Round(time.Millisecond), durationQuantile(a.lateness, 0.9).Round(time.Millisecond),
+						durationQuantile(a.lateness, 0.99).Round(time.Millisecond), durationQuantile(a.lateness, 1).Round(time.Millisecond),
+						latenessEpisodes(a.series, 100*time.Millisecond))
+				}
 				t.Logf("block %d, %s %s audio: %d of %d late or lost, lateness p99 %v", block, arm.name, name, a.late, a.sent,
 					durationQuantile(a.lateness, 0.99).Round(time.Millisecond))
 				if len(a.lateness) == 0 {
@@ -537,7 +580,20 @@ func runM5Arm(t *testing.T, rig *workloadRig, server *innerQUICServer, far *audi
 
 func summarizeAudio(a audioDirection, playout time.Duration) m5Direction {
 	late, lateness := a.judge(playout)
-	return m5Direction{sent: len(a.delays), late: late, lateness: lateness}
+	var best time.Duration
+	for _, d := range a.delays {
+		if d > 0 && (best == 0 || d < best) {
+			best = d
+		}
+	}
+	series := make([]time.Duration, len(a.delays))
+	for i, d := range a.delays {
+		series[i] = d - best
+		if d == 0 {
+			series[i] = -1
+		}
+	}
+	return m5Direction{sent: len(a.delays), late: late, lateness: lateness, series: series}
 }
 
 // runKeystrokes types a 36-byte keystroke every 50 ms for d on conn, which

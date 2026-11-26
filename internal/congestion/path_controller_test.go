@@ -44,6 +44,14 @@ func attachPC(t *testing.T, c *PathController, now monotime.Time) *pcConn {
 	return p
 }
 
+// spendProbeAllowance leaves a PROBING attachment with nothing of its probe
+// allowance for the interval that starts at now.
+func spendProbeAllowance(c *PathController, p *pcConn, now monotime.Time) {
+	c.mu.Lock()
+	p.a.probeAt, p.a.probeSent = now, pathProbeWindowPackets*c.maxPacket
+	c.mu.Unlock()
+}
+
 // send registers one ordinary bulk packet and returns its number.
 func (p *pcConn) send(now monotime.Time, bytes quiccongestion.ByteCount) quiccongestion.PacketNumber {
 	return p.sendKind(now, bytes, quiccongestion.KindOrdinary, true)
@@ -765,6 +773,7 @@ func TestAStalledClaimantDoesNotThrottleItsSibling(t *testing.T) {
 	for range pathProbingPTOProbes {
 		stuck.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
 	}
+	spendProbeAllowance(c, stuck, now)
 	stuck.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
 	healthy.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
 	if p := stuck.a.Admit(now, 1200); p.OK {
@@ -1517,6 +1526,7 @@ func TestABypassIsChargedOnlyWhenGranted(t *testing.T) {
 	}
 	now = now.Add(time.Second)
 	c.arb.OnSent([4]quiccongestion.ByteCount{quiccongestion.ClassControl: 1 << 20})
+	spendProbeAllowance(c, stuck, now)
 	stuck.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassControl: true}})
 	if p := stuck.a.Admit(now, 1200); p.OK {
 		t.Fatalf("a PROBING attachment with a full probe window was admitted: %+v", p)
@@ -1937,5 +1947,101 @@ func TestAProbeDemotionSettlesAtTheProbesTime(t *testing.T) {
 	c.mu.Unlock()
 	if last != probeAt || got != want {
 		t.Fatalf("after the demoting probe the balance is %d at %v; want %d at the probe's time %v", got, last, want, probeAt)
+	}
+}
+
+// A packet that measured the sender, not the path, does not replace an
+// estimate the wall clock has aged out. An application-limited sample may
+// replace such an estimate, since nothing else brings it down on a connection
+// that is always application limited, but a lone small packet acknowledged a
+// round trip later reads as a few hundred bytes a second on any path. Sent
+// 1.7 s into a pause between bursts, one replaced a 20 Mbit/s estimate and the
+// next burst was paced from it: a segment that took 1 s took 4.5 s (W10 under
+// recovery=carrier, whose idle carrier still carries the odd small frame).
+func TestALonePacketInAPauseDoesNotBecomeTheEstimate(t *testing.T) {
+	const rtt = 100 * time.Millisecond
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	// 1.2 MB/s for a second: a packet a millisecond, each acknowledged one
+	// round trip after it was sent.
+	var sent []quiccongestion.PacketNumber
+	for ms := range 1100 {
+		at := now.Add(time.Duration(ms) * time.Millisecond)
+		if ms >= 100 {
+			a.event(at, sent[ms-100:ms-99], nil)
+		}
+		if ms < 1000 {
+			sent = append(sent, a.send(at, 1200))
+		}
+	}
+	peak := c.Telemetry().MaxBandwidth
+	if peak < 1_000_000 {
+		t.Fatalf("the burst measured %d B/s, want about 1.2 MB/s", peak)
+	}
+	// 1.7 s into the pause, past the estimate's window, one 21-byte frame.
+	now = now.Add(1100*time.Millisecond + 1700*time.Millisecond)
+	lone := a.send(now, 21)
+	a.event(now.Add(rtt), []quiccongestion.PacketNumber{lone}, nil)
+	if got := c.Telemetry().MaxBandwidth; got < peak/2 {
+		t.Fatalf("estimate %d B/s after a lone 21-byte packet in a pause, %d B/s before it", got, peak)
+	}
+	// A burst that does load the path still brings the estimate down to
+	// what it measures: a quarter of the rate, for longer than the window.
+	now = now.Add(time.Second)
+	sent = sent[:0]
+	for ms := range 2100 {
+		at := now.Add(time.Duration(ms) * time.Millisecond)
+		if ms >= 100 && ms%4 == 0 {
+			a.event(at, sent[(ms-100)/4:(ms-100)/4+1], nil)
+		}
+		if ms < 2000 && ms%4 == 0 {
+			sent = append(sent, a.send(at, 1200))
+		}
+	}
+	if got := c.Telemetry().MaxBandwidth; got > peak/2 || got < peak/8 {
+		t.Fatalf("estimate %d B/s after two seconds at 0.3 MB/s, %d B/s before: a narrowed path was not believed", got, peak)
+	}
+}
+
+// An attachment demoted to PROBING in the middle of a transfer carries a
+// gauge far over the probe window, and nothing acknowledges or loses it while
+// the path is away. It may still send a probe window of ordinary packets in
+// each probe interval: they are what an acknowledgement can answer when the
+// path returns, sooner than the transport's backed-off probe timeout.
+func TestALoadedProbingAttachmentKeepsAProbeAllowance(t *testing.T) {
+	c := newPCController()
+	now := base()
+	a := attachPC(t, c, now)
+	a.a.OnDemand(quiccongestion.Demand{Eligible: [4]bool{quiccongestion.ClassBulk: true}})
+	for range 20 {
+		a.send(now, 1200)
+	}
+	for range pathProbingPTOProbes {
+		a.sendKind(now, 1200, quiccongestion.KindPTOProbe, true)
+	}
+	c.mu.Lock()
+	probing, gauge := a.a.probing, a.a.gauge
+	c.mu.Unlock()
+	if !probing || gauge <= pathProbeWindowPackets*1200 {
+		t.Fatalf("the attachment is probing=%v with a gauge of %d; the test needs it PROBING and loaded", probing, gauge)
+	}
+	now = now.Add(time.Second)
+	for i := range pathProbeWindowPackets {
+		if p := a.a.Admit(now, 1200); !p.OK {
+			t.Fatalf("ordinary packet %d of the probe allowance was refused: %+v", i+1, p)
+		}
+		a.send(now, 1200)
+	}
+	if p := a.a.Admit(now, 1200); p.OK {
+		t.Fatal("a PROBING attachment was admitted past its probe allowance")
+	}
+	// Still spent just short of the interval, renewed at it.
+	interval := c.probeInterval()
+	if p := a.a.Admit(now.Add(interval-time.Millisecond), 1200); p.OK {
+		t.Fatal("the probe allowance was renewed before its interval had passed")
+	}
+	if p := a.a.Admit(now.Add(interval), 1200); !p.OK {
+		t.Fatalf("the probe allowance was not renewed after %v: %+v", interval, p)
 	}
 }

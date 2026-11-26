@@ -37,36 +37,11 @@ type workloadArm struct {
 // legacyArm is every switch off: today's behaviour and the registered
 // control of the stage-10 gate. Each switch is set explicitly, so the control
 // stays the legacy bundle on a build whose defaults have flipped.
-var legacyArm = workloadArm{
-	name: "legacy",
-	client: func(c *ClientConfig) {
-		c.CCAPI, c.Sched, c.CongestionScope = CCAPIV1, SchedLegacy, CongestionScopeConnection
-		c.Topology, c.Classifier = TopologyIsolated, ClassifierLegacy
-		c.CodedRetry, c.Memory = CodedRetryLegacy, MemoryLegacy
-	},
-	server: func(s *ServerConfig) {
-		s.CCAPI, s.Sched, s.CongestionScope = CCAPIV1, SchedLegacy, CongestionScopeConnection
-		s.Classifier, s.CodedRetry, s.Memory = ClassifierLegacy, CodedRetryLegacy, MemoryLegacy
-		s.GatewayAdmission = GatewayAdmissionLegacy
-	},
-}
+var legacyArm = workloadArm{name: "legacy", client: applyLegacyBundleToClient, server: applyLegacyBundleToServer}
 
-// flipArm is every switch of the path-authority migration that is merged,
-// on: what the default flip measures. A stage that adds a switch adds it
-// here.
-var flipArm = workloadArm{
-	name: "flip",
-	client: func(c *ClientConfig) {
-		c.CCAPI, c.Sched, c.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
-		c.Topology, c.Classifier = TopologySingle, ClassifierPhased
-		c.CodedRetry, c.Memory = CodedRetrySticky, MemoryOwned
-	},
-	server: func(s *ServerConfig) {
-		s.CCAPI, s.Sched, s.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
-		s.Classifier, s.CodedRetry, s.Memory = ClassifierPhased, CodedRetrySticky, MemoryOwned
-		s.GatewayAdmission = GatewayAdmissionOwned
-	},
-}
+// flipArm is the bundle the default flip ships, recovery=carrier included:
+// the one shared definition in flipbundle_test.go.
+var flipArm = workloadArm{name: "flip", client: applyFlipBundleToClient, server: applyFlipBundleToServer}
 
 // workloadArms are the two arms, control first.
 func workloadArms() []workloadArm { return []workloadArm{legacyArm, flipArm} }

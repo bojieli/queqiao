@@ -218,9 +218,7 @@ func (b *dcBed) leafAs(i int, arm dcArm, relay func(listen, target string) (*pat
 	}
 	scfg.Congestion = arm.congestion
 	if !arm.legacy {
-		scfg.CCAPI, scfg.Sched, scfg.CongestionScope = CCAPIV2, SchedClass, CongestionScopePath
-		scfg.CodedRetry, scfg.Memory, scfg.Classifier = CodedRetrySticky, MemoryOwned, ClassifierPhased
-		scfg.GatewayAdmission, scfg.Recovery = GatewayAdmissionOwned, RecoveryCarrier
+		applyFlipBundleToServer(&scfg)
 	}
 	server, err := NewServer(scfg)
 	if err != nil {
@@ -241,9 +239,7 @@ func (b *dcBed) leafAs(i int, arm dcArm, relay func(listen, target string) (*pat
 	}
 	ccfg.Congestion = arm.congestion
 	if !arm.legacy {
-		ccfg.CCAPI, ccfg.Sched, ccfg.CongestionScope, ccfg.Topology = CCAPIV2, SchedClass, CongestionScopePath, TopologySingle
-		ccfg.CodedRetry, ccfg.Memory, ccfg.Classifier = CodedRetrySticky, MemoryOwned, ClassifierPhased
-		ccfg.Recovery = RecoveryCarrier
+		applyFlipBundleToClient(&ccfg)
 	}
 	client, err := NewClient(ccfg)
 	if err != nil {

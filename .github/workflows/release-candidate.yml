@@ -45,7 +45,7 @@ jobs:
 
   full:
     runs-on: ubuntu-24.04
-    timeout-minutes: 70
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -53,7 +53,7 @@ jobs:
           go-version-file: go.mod
       # Match the native/race jobs: CPU-bound FEC tests must not starve the
       # wall-clock network emulators, including on Linux runners.
-      - run: go test -p=1 -timeout 50m ./...
+      - run: go test -p=1 -timeout 90m ./...
       - run: go vet ./...
       - run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 -checks=all,-U1000 ./...
       - name: Gosec reviewed baseline
@@ -72,7 +72,7 @@ jobs:
       - name: Python helper tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
   native-test:
-    timeout-minutes: 70
+    timeout-minutes: 110
     strategy:
       fail-fast: false
       matrix:
@@ -97,12 +97,12 @@ jobs:
       # including coded-path correctness, and executes its packaged binary.
       - name: Native tests
         if: runner.os != 'macOS'
-        run: go test -p=1 -count=1 -timeout 50m ./...
+        run: go test -p=1 -count=1 -timeout 90m ./...
       # These three absolute-rate/queue/loss measurements require stable
       # scheduling. Linux still gates all three at the original thresholds.
       - name: Native macOS tests
         if: runner.os == 'macOS'
-        run: go test -p=1 -count=1 -timeout 50m -skip "$MEASUREMENTS" ./...
+        run: go test -p=1 -count=1 -timeout 90m -skip "$MEASUREMENTS" ./...
       - name: Record hosted macOS timing measurements
         if: runner.os == 'macOS'
         continue-on-error: true
