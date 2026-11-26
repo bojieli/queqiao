@@ -207,6 +207,7 @@ func TestJoinRefusalBeforeOpenOKIsItsOwnKind(t *testing.T) {
 
 func TestCompleteLaneJoinMapsDestinationResetToOpenFailed(t *testing.T) {
 	client := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), HandshakeTimeout: time.Second}}
+	attachTestCarriers(client)
 	local, remote := net.Pipe()
 	defer remote.Close()
 	sessionID := [16]byte{5}
@@ -612,6 +613,7 @@ func TestOpenRefusalsKeepTheirMeaning(t *testing.T) {
 // "session pending" is not the lane ceiling: a client must not stop trying.
 func TestCompleteLaneJoinMapsSessionPendingApartFromCapacity(t *testing.T) {
 	client := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), HandshakeTimeout: time.Second}}
+	attachTestCarriers(client)
 	local, remote := net.Pipe()
 	defer remote.Close()
 	sessionID := [16]byte{6}

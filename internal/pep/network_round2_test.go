@@ -72,6 +72,7 @@ func TestRound2HandshakeCancellation(t *testing.T) {
 			received := make(chan struct{})
 			go func() { _, _ = newFrameConn(peer).Read(); close(received) }()
 			client := &Client{cfg: ClientConfig{Transport: TransportTCP, HandshakeTimeout: time.Second}}
+			attachTestCarriers(client)
 			lane := &authenticatedLane{fc: newFrameConn(local), outer: local, kind: TransportTCP, sessionID: [16]byte{1}, laneID: 1}
 			client.dialAuthenticatedLaneForTest = func(context.Context, TransportKind) (*authenticatedLane, error) { return lane, nil }
 			done := make(chan error, 1)

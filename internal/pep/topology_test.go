@@ -54,6 +54,7 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 				ConnectionReceiveWindow: p.windows.connection, MaxConnectionReceiveWindow: p.windows.maxConnection,
 				MaxIncomingStreams: p.windows.maxStreams,
 			}}
+			attachTestCarriers(client)
 			client.memoryLimits.maxBulkConnections = p.maxBulk
 			single, hold := client.reservePreferredWindows()
 			defer hold.release()
@@ -86,6 +87,7 @@ func TestSingleConnectionWindowsKeepIsolatedCapacity(t *testing.T) {
 		})
 	}
 	desktop := &Client{cfg: ClientConfig{}}
+	attachTestCarriers(desktop)
 	desktop.memoryLimits.maxBulkConnections = maxWindowCreditConnections
 	if w, hold := desktop.reservePreferredWindows(); w != desktop.windows() {
 		t.Fatalf("desktop windows changed: %+v", w)
@@ -571,6 +573,7 @@ func TestEndedConnectionHoldsNoWindowCredit(t *testing.T) {
 		StreamReceiveWindow: mib, MaxStreamReceiveWindow: mib,
 		ConnectionReceiveWindow: mib, MaxConnectionReceiveWindow: mib,
 	}}
+	attachTestCarriers(client)
 	client.memoryLimits.maxBulkConnections = 1
 	first, hold := client.reservePreferredWindows()
 	if first.maxConnection != 2*mib || hold == nil {

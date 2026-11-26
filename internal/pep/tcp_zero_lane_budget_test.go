@@ -43,6 +43,7 @@ func TestTCPStallRescuesDoNotSpendZeroLaneRecovery(t *testing.T) {
 			return isolationLaneKind(t, id, TransportTCP), nil
 		},
 	}
+	attachTestCarriers(client)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	done := make(chan struct{})
 	go func() {
@@ -114,6 +115,7 @@ func TestTCPZeroLaneRecoveryExhaustionAbandonsTheFlow(t *testing.T) {
 			return lane, nil
 		},
 	}
+	attachTestCarriers(client)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})

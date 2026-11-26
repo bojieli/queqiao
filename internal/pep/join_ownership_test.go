@@ -25,6 +25,7 @@ func TestLaneManagerClosesJoinCompletedAfterExit(t *testing.T) {
 					flow.lanes[0] = isolationLaneKind(t, 0, kind)
 				}
 				c := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, metrics: metrics.New()}
+				attachTestCarriers(c)
 				c.quicPoolActive.Store(2)
 				local, peer := net.Pipe()
 				started := make(chan struct{})

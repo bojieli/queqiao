@@ -35,6 +35,7 @@ func TestCancelledLaneJoinIsCanceledAndNotLogged(t *testing.T) {
 				HandshakeTimeout: 10 * time.Second,
 				Logger:           slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 			}}
+			attachTestCarriers(client)
 			done := make(chan error, 1)
 			go func() {
 				_, err := client.completeLaneJoin(manageCtx, &authenticatedLane{
@@ -78,6 +79,7 @@ func TestExpiredLaneJoinOnLiveContextStaysTimeout(t *testing.T) {
 		HandshakeTimeout: 50 * time.Millisecond,
 		Logger:           slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}}
+	attachTestCarriers(client)
 	manageCtx := context.Background()
 	_, err := client.completeLaneJoin(manageCtx, &authenticatedLane{
 		fc: newFrameConn(local), outer: local, sessionID: [16]byte{1}, kind: TransportTCP, laneID: 1,

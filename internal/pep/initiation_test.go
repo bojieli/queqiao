@@ -178,6 +178,7 @@ func TestTheUplinkIsWhicheverAddressReachesTheServer(t *testing.T) {
 	}
 	defer listener.Close()
 	client := &Client{cfg: ClientConfig{RemoteAddr: listener.LocalAddr().String()}}
+	attachTestCarriers(client)
 
 	uplink := client.currentUplink()
 	if uplink != "127.0.0.1" {
@@ -195,6 +196,7 @@ func TestTheUplinkIsWhicheverAddressReachesTheServer(t *testing.T) {
 	// because a resolver that answers everything -- this machine's does, with
 	// a fake address in 198.18.0.0/15 -- would otherwise give it an uplink.
 	unreachable := &Client{cfg: ClientConfig{RemoteAddr: "127.0.0.1:not-a-port"}}
+	attachTestCarriers(unreachable)
 	if got := unreachable.currentUplink(); got != "" {
 		t.Fatalf("unreachable server reported uplink %q", got)
 	}
@@ -209,6 +211,7 @@ func TestTheConfiguredUplinkMatchesTheBoundOuterAddress(t *testing.T) {
 		RemoteAddr:   "127.0.0.1:not-a-port",
 		LocalAddress: "192.0.2.10",
 	}}
+	attachTestCarriers(client)
 	if got := client.currentUplink(); got != "192.0.2.10" {
 		t.Fatalf("configured uplink = %q, want 192.0.2.10", got)
 	}
@@ -367,6 +370,7 @@ func TestPathProbeEchoFailuresAreDistinguishedFromASlowPath(t *testing.T) {
 			}()
 
 			client := &Client{}
+			attachTestCarriers(client)
 			lane := &authenticatedLane{fc: clientFrames, sessionID: sessionID}
 			err := client.readPathProbeEchoes(lane, 3)
 			var violation probeEchoViolation
@@ -391,6 +395,7 @@ func TestPathProbeEchoFailuresAreDistinguishedFromASlowPath(t *testing.T) {
 			t.Fatal(err)
 		}
 		client := &Client{}
+		attachTestCarriers(client)
 		lane := &authenticatedLane{fc: clientFrames, sessionID: sessionID}
 		if err := client.readPathProbeEchoes(lane, 3); err != nil {
 			t.Fatalf("expired probe budget reported as a peer violation: %v", err)

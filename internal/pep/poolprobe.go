@@ -43,9 +43,8 @@ func (g *controlQUICGeneration) invalidatePathProof() {
 	g.probeMu.Unlock()
 }
 
-// Borrowers share one round-trip check when the last real proof is stale.
-// Failure drains this generation: new borrowers get a fresh connection,
-// while existing siblings keep their transport until they finish.
+// Borrowers share one round-trip check when the last real proof is stale. A
+// failure fails the borrows that waited on it and nothing else.
 type controlPathProbe struct {
 	done chan struct{}
 	err  error
@@ -69,12 +68,9 @@ func (c *Client) verifyControlPath(ctx context.Context, g *controlQUICGeneration
 				probe = c.probeControlGenerationForTest
 			}
 			pending.err = probe(probeCtx, g, c.cfg.HandshakeTimeout)
-			if pending.err != nil && c.carriers == nil {
-				// Under recovery=carrier a failed borrow fails only that
-				// borrow: replacing the carrier is the carrier manager's
-				// decision, on transport evidence (§10.2).
-				c.drainControlQUICGeneration(g)
-			}
+			// A failed proof fails only that borrow: replacing the carrier
+			// is the carrier manager's decision, on transport evidence
+			// (§10.2).
 			g.probeMu.Lock()
 			if pending.err == nil {
 				g.verified = time.Now()

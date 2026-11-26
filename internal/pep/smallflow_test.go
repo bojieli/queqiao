@@ -206,6 +206,7 @@ func TestSmallExchangesAreRepairedOnceThePathIsKnown(t *testing.T) {
 // tried again itself.
 func TestOnlyALostAttemptIsRetried(t *testing.T) {
 	client := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	attachTestCarriers(client)
 	client.flowOpenRetryDelayForTest = func(int) time.Duration { return 0 }
 
 	attempts := 0
@@ -274,6 +275,7 @@ func TestFlowOpenRetryUsesJitteredExponentialWindows(t *testing.T) {
 
 func TestFlowOpenRetryBackoffHonorsCancellation(t *testing.T) {
 	client := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	attachTestCarriers(client)
 	waiting := make(chan struct{})
 	client.flowOpenRetryDelayForTest = func(int) time.Duration {
 		close(waiting)
@@ -308,6 +310,7 @@ func TestReadyTCPDoesNotDisplaceSlowWorkingPooledQUIC(t *testing.T) {
 		},
 		udpHealth: newUDPHealth(3, time.Minute), metrics: metrics.New(),
 	}
+	attachTestCarriers(client)
 	quicRelease := make(chan struct{})
 	tcpReady := make(chan struct{})
 	client.dialAuthenticatedLaneForTest = func(_ context.Context, kind TransportKind) (*authenticatedLane, error) {
@@ -353,6 +356,7 @@ func TestPreferenceGraceUsesTCPWithoutPoisoningUDPAndLatePoolRecovers(t *testing
 		},
 		udpHealth: newUDPHealth(1, time.Minute), metrics: metrics.New(),
 	}
+	attachTestCarriers(client)
 	// Begin in cooldown to prove that a late successful QUIC pool attempt
 	// positively restores health after this request has already used TCP.
 	client.udpHealth.failure(time.Now())
@@ -390,6 +394,7 @@ func TestLatePooledQUICFailureIsRecordedOnlyWhenItBecomesExplicit(t *testing.T) 
 		},
 		udpHealth: newUDPHealth(1, time.Minute), metrics: metrics.New(),
 	}
+	attachTestCarriers(client)
 	quicRelease := make(chan struct{})
 	client.dialAuthenticatedLaneForTest = func(_ context.Context, kind TransportKind) (*authenticatedLane, error) {
 		if kind == TransportQUIC {
@@ -428,6 +433,7 @@ func TestPooledFlowReportsBothEndpointTransportsFailing(t *testing.T) {
 		},
 		udpHealth: newUDPHealth(1, time.Minute), metrics: metrics.New(),
 	}
+	attachTestCarriers(client)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

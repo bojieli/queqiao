@@ -454,11 +454,14 @@ func TestRotationWhileWaitingForStreamCreditReborrowsBeforeOPEN(t *testing.T) {
 			}()
 		}
 	}()
-	c, err := NewClient(ClientConfig{ListenAddr: "127.0.0.1:0", RemoteAddr: listener.Addr().String(), Credentials: clientCred, Transport: TransportQUIC, DialTimeout: time.Second, HandshakeTimeout: time.Second, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	c, err := NewClient(ClientConfig{ListenAddr: "127.0.0.1:0", RemoteAddr: listener.Addr().String(), Credentials: clientCred, Transport: TransportQUIC, DialTimeout: 3 * time.Second, HandshakeTimeout: time.Second, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(c.closeQUICPool)
+	// The dial bound leaves room for the carrier manager's attempt history:
+	// the replacement for a generation retired without a standby is dialled
+	// no sooner than a second after the dial before it (§10.2).
 	// The bound starts after the setup above: building the test PKI writes
 	// and syncs its store, which takes seconds on a loaded machine and used
 	// to spend most of a bound that was meant for the borrows below.

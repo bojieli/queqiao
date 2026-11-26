@@ -182,12 +182,15 @@ func (c *Client) manageCarrierBoundLanes(ctx context.Context, flow *multipathFlo
 			flow.failBinding(errBindingDeadline)
 			return
 		}
-		if superseded && flow.openConfirmationRequired.Load() {
-			// A JOIN can overtake an OPEN the gateway has not admitted; the
-			// old carrier's probes keep retransmitting it (§10.3 step 7).
-			// Its binding deadline still runs.
-			continue
-		}
+		// An unconfirmed OPEN is not rebound while its carrier is only
+		// SUSPECT (§10.3 step 7): the binding is not lost then, so this point
+		// is not reached. Once the carrier has been superseded, it was
+		// promoted away from for making no progress through k_p probe
+		// timeouts, which is the carrier manager's own evidence that the lane
+		// has failed, so the failed-lane rule applies now: the JOIN is
+		// attempted on the new carrier, and the gateway holds it for a
+		// pending OPEN or refuses it, ending the flow at once rather than at
+		// the dead carrier's idle timeout.
 		target := m.eligible()
 		if c.cfg.Transport == TransportAuto && !tcpTried {
 			// AUTO's TCP handoff starts no later than the latest handoff

@@ -35,6 +35,7 @@ func TestCompletedLaneJoinCarriesReplacementHint(t *testing.T) {
 	}()
 	ctx := context.WithValue(context.Background(), laneReplacementContextKey{}, laneReplacementHint{id: 0})
 	client := &Client{cfg: ClientConfig{HandshakeTimeout: time.Second}}
+	attachTestCarriers(client)
 	if _, err := client.completeLaneJoin(ctx, &authenticatedLane{
 		fc: newFrameConn(local), outer: local, sessionID: [16]byte{1}, kind: TransportQUIC, laneID: 9,
 	}, 7, 0); err != nil {
@@ -80,6 +81,7 @@ func TestCompleteLaneJoinMapsResetCodesToRetryPolicy(t *testing.T) {
 				}, Payload: session.ResetPayload(test.code, "refused")})
 			}()
 			client := &Client{cfg: ClientConfig{Logger: logger, HandshakeTimeout: 2 * time.Second}}
+			attachTestCarriers(client)
 			_, err := client.completeLaneJoin(context.Background(), &authenticatedLane{
 				fc: newFrameConn(local), outer: local, sessionID: [16]byte{1}, kind: TransportQUIC, laneID: 1,
 			}, 7, 0)

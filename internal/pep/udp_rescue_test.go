@@ -36,6 +36,7 @@ func TestUDPAssociationOpenTimeoutRetiresLaneAndFastRetriesOnTCP(t *testing.T) {
 		udpHealth: newUDPHealth(1, time.Minute),
 		metrics:   metrics.New(),
 	}
+	attachTestCarriers(client)
 
 	var dialMu sync.Mutex
 	var dialed []TransportKind

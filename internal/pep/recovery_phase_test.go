@@ -25,6 +25,7 @@ func TestLaneJoinCancellationInterruptsHandshake(t *testing.T) {
 				cancel()
 			}
 			client := &Client{cfg: ClientConfig{HandshakeTimeout: 10 * time.Second}}
+			attachTestCarriers(client)
 			done := make(chan error, 1)
 			go func() {
 				_, err := client.completeLaneJoin(ctx, &authenticatedLane{fc: newFrameConn(local), outer: local, kind: TransportQUIC}, 7, 0)
@@ -61,6 +62,7 @@ func TestLaneJoinSuccessSurvivesDialCancellation(t *testing.T) {
 		_, _ = remote.Write([]byte{42})
 	}()
 	client := &Client{cfg: ClientConfig{HandshakeTimeout: time.Second}}
+	attachTestCarriers(client)
 	_, err := client.completeLaneJoin(ctx, &authenticatedLane{fc: newFrameConn(local), outer: local, kind: TransportQUIC}, 7, 0)
 	if err != nil {
 		t.Fatal(err)

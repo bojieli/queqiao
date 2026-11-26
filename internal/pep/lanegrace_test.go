@@ -317,8 +317,10 @@ func TestAFlowRecordsWhetherAReplacementWasEvenAttempted(t *testing.T) {
 	}
 }
 
+// A TCP flow's bundle manager replaces its last lane itself. (A QUIC flow is
+// rebound by the carrier manager, whose refusals have their own tests.)
 func TestZeroLaneRecoveryLogsReturnedRefusal(t *testing.T) {
-	for _, transport := range []TransportKind{TransportQUIC, TransportTCP} {
+	for _, transport := range []TransportKind{TransportTCP} {
 		t.Run(string(transport), func(t *testing.T) {
 			rig := newJoinTestRig(t, transport, transport, 1)
 			// The client is not serving yet, so nothing else reads its
@@ -525,6 +527,7 @@ func (r *lockedRecords) records(t *testing.T, msg string) []map[string]any {
 func TestLaneRecoveryFailureLogLevels(t *testing.T) {
 	records := &lockedRecords{}
 	client := &Client{cfg: ClientConfig{Logger: slog.New(slog.NewJSONHandler(records, &slog.HandlerOptions{Level: slog.LevelDebug}))}}
+	attachTestCarriers(client)
 	live := context.Background()
 	ended, cancel := context.WithCancel(context.Background())
 	cancel()
