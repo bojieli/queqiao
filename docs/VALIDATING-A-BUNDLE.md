@@ -482,7 +482,18 @@ Both run several leaves in one client process. The DC campaign
   (*w* − 1) × `request_timeout` on every leaf. A W4 client (`wlclient rpc`)
   is given the barrier's absolute time, starts at once and waits for the
   barrier after initialising, so the leaf hosts' interpreter start-up times
-  do not shift their waves. The analysis requires every loaded leaf to have
+  do not shift their waves. Each W4 request has an absolute slot, the
+  barrier plus (*i* − 1) × `rpc_spacing`, and is measured from that slot.
+  W4 sends one request at a time on one connection, so a request whose slot
+  comes while the previous one is still running waits for the connection.
+  It is late, not concurrent: its row starts at its slot, its seconds
+  include the wait, and its `request_timeout` budget runs from the slot (one
+  whose budget is gone before it can start fails at the timeout). A slow
+  request therefore counts against its arm, and every leaf's wave *i* still
+  starts at the same instant, so one slow leaf cannot make the trial
+  unmeasured. Before, each request started only when the previous one
+  ended: a leaf with one slow request drifted out of step and every later
+  wave lost its overlap. The upload phase's sibling uses the same rule. The analysis requires every loaded leaf to have
   been in each wave together, on millisecond times, for at least half of the
   shortest leaf's time in that wave, and never less than 20 ms or more than
   0.1 s. Otherwise latency and spread are unmeasured. The bound scales
@@ -513,8 +524,16 @@ Both run several leaves in one client process. The DC campaign
     void the binding check or decide it. On a live path a single legacy
     solo once collapsed to 10 Mbit/s against 356 for its sibling, and that
     one run voided the campaign. The minimal example uses 3.
+  - **A leaf's capacity** in the binding check is the larger of the arms'
+    median solo rates for that leaf (`dc_gate.ini [validity]
+    binding_reference = max_arm_median`, frozen). Capacity belongs to the
+    path, not to an arm: a legacy arm that cannot fill a lone leaf (medians
+    of 286 and 133 Mbit/s against the candidate's 324 and 377 on one run)
+    would otherwise make a binding ancestor look unbound. With
+    `calibrate_arms = main` only the main arm's solos exist, and they are
+    the reference.
   - `calibrate_arms = all` also runs every candidate arm's solos, after the
-    main arm's in each round. They are not used for binding. The report
+    main arm's in each round. Besides the capacity rule above, the report
     lists every arm's solo runs per leaf (median and each run): the rate one
     leaf gets alone on one connection, which is the evidence for or against
     fan-out (design §11.3, Q3).
@@ -903,8 +922,8 @@ direction):
 | D, `idle-wake-lossy` | 2 % random loss, +200 ms, on D's own ports for its whole session | about 17 min, beside the blocks |
 
 Every trial runs an LLM swarm (4 concurrent loops of 10 turns with short
-responses: 40 calls), W6 keystrokes, and 8 short downloads of 4 MiB one after
-the other across the window (one started every window/8, or when the one
+responses: 40 calls), W6 keystrokes, and 30 short downloads of 1 MiB one after
+the other across the window (one started every window/30, or when the one
 before ends; each allowed 30 s). `blackhole` adds a long download and a long
 upload with progress timelines (flows in flight across the outages), and
 probes every 0.25 s, each its own connection.
@@ -922,8 +941,14 @@ probes every 0.25 s, each its own connection.
   fewest at which a candidate with no event can pass a main with none,
   (1 - v)^n <= alpha, 150 for v = 0.02.
 - *Silent deaths*: none, in every block (hard), beside the pooled rate.
-- *Flow completion*: completed over attempted short downloads per trial
-  (one the window's end cut is not an attempt), `higher 0.02`.
+- *Flow completion*: failed over attempted short downloads (one the
+  window's end cut is not an attempt), pooled over all blocks, as an
+  `events 0.02 149` rate (v3, adopted after imp4; imp3 and imp4 were
+  judged by the per-block `higher 0.02` rule and are not re-judged).
+  Completion itself is reported. 149 attempts is the fewest at which two
+  arms that never fail can be shown equal at this margin; a trial makes 30
+  downloads of 1 MiB, so 6 blocks give about 180 (a void block or a few
+  cut-off downloads still leave 149).
 - *Stalls per trial* (`[secondary]`), *TTFT p99*, *keystroke echo p99*.
 - *Per blackhole*, from the path's restore, the worse of a trial's two
   outages: the first completed probe (`recover_s`), the first byte of a
@@ -937,6 +962,46 @@ probes every 0.25 s, each its own connection.
   outage), `lower 1.0`. The p99 over all calls is reported only: with fixed
   timing an LLM turn lined up with the 25 s outage, and that p99 reported
   which arm had a call in flight.
+- *Blackhole backgrounds* (v4, adopted after imp5; imp5 is not
+  re-judged): a download of 4 MiB objects and an upload of 2 MiB objects,
+  one after the other, a failed object followed by the next, with a socket
+  timeout of 60 s (above the longest outage), so each arm has a transfer in
+  flight at each outage and a transfer fails only when the tunnel does not
+  resume. `resume_download_s` and `resume_upload_s` time each kind from the
+  outage's end to its next byte (the worse outage), compared only in the
+  blocks where that flow was alive at the outage's start in both arms
+  (`Workload.paired_only`: two such blocks suffice); one that never resumed
+  is censored at the next outage or the trial's end and also counts as a
+  failure. `bg_transfer_failures` (`events 0.02 149`) pools failed over
+  attempted background objects; a flow that died before an outage counts
+  against its own arm. The worst over all flows (`inflight_ttfb_s`) is
+  reported.
+- *Credit delay, sampled* (v6, adopted after imp6, not re-judged):
+  during every impaired trial each endpoint's credit-delay histogram is
+  sampled about once a second (its /metrics on the host's loopback, a
+  detached job like the CPU sampler) and kept as a `credit_ts` record. In
+  blackhole, `credit_delay_clear_p95_s` is gated (`lower 0.05`): each
+  interval's increments go to the window its end falls in, and each outage
+  and the 5 s after it are left out, as for TTFT clear. The p95 within the
+  outages, in the 5 s after them, and over the whole trial are reported.
+- *Blackhole v5* (adopted after imp6, not re-judged): one pooled
+  `transfer_failures` rule (`events 0.02 149`) over the short downloads
+  and the background objects, since in blackhole a short download can wait
+  out an outage and they alone fell under 149; `fetch_failures` and
+  `bg_transfer_failures` are reported there (`fetch_failures` stays a rule
+  for slow-lossy and policed). Blackhole has its own sequential design
+  (`Workload.type_sequential`): looks after blocks 6..12 at the campaign's
+  alpha spending, frozen in the plan as `sequential_by_type`; the other
+  types keep the campaign's.
+- *Keystroke echo* counts a broken session: a keystroke the session did
+  not echo is censored at the trial window's end (its echo time is from
+  when it was sent to then), so a session that broke during an outage is
+  evidence against its arm, not a missing measure.
+- *Wildcard rules* skip a trial type that declares they do not apply
+  (`Workload.rule_exempt`): blackhole has no `ttft_net_p99_s`.
+- *Stage 10* (`[workload:impaired] stage = 10`): sender-side credit delay
+  p95 is also a rule of every trial type (its `[secondary]` bound, pooled
+  over blocks when sparse); the shadow false-promotion rate is reported.
 - *Offsets*: each trial's LLM start (+0 to 6 s) and outage starts (+0 to
   10 s and +0 to 5 s) are drawn from the frozen seed, independently per
   block, slot and arm.
@@ -956,6 +1021,12 @@ host>` fetches logs through that host, for a slow direct link.
 other for every session and copy (ssh ProxyJump, this machine's own keys
 end to end). Binaries are uploaded gzipped, unpacked on the host and
 checked against the local SHA-256 before they replace anything.
+
+**Several candidates.** Each candidate is decided on each trial type on
+its own: once any of its rules fails, or all pass, at a look, it is judged
+on the blocks up to that look (`status.json` `stopped_candidates`); the
+type stops when every candidate is decided. One candidate's failure does
+not leave another undecided.
 
 **Reading a rule's row.** Every rule's per-block contrast is the
 candidate's headroom inside its bound, positive when inside whichever way

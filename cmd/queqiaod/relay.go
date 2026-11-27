@@ -26,7 +26,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -35,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -228,6 +228,12 @@ func relayTCP(ctx context.Context, listenAddr, upstream string, dialTimeout, idl
 		return fmt.Errorf("tcp listen %s: %w", listenAddr, err)
 	}
 	defer func() { _ = ln.Close() }()
+	return serveRelayTCP(ctx, ln, upstream, dialTimeout, idleTimeout, maxConns)
+}
+
+// serveRelayTCP forwards every connection ln accepts to upstream until ln
+// fails or ctx ends.
+func serveRelayTCP(ctx context.Context, ln net.Listener, upstream string, dialTimeout, idleTimeout time.Duration, maxConns int) error {
 	sem := make(chan struct{}, maxConns)
 	for {
 		conn, err := ln.Accept()
@@ -265,10 +271,45 @@ func relayTCP(ctx context.Context, listenAddr, upstream string, dialTimeout, idl
 	}
 }
 
+// relayCopyBuffer is one direction's copy buffer.
+const relayCopyBuffer = 64 << 10
+
+var relayCopyBuffers = sync.Pool{New: func() any { b := make([]byte, relayCopyBuffer); return &b }}
+
+// relayCopy copies both ways between a and b until both directions have
+// ended, or until no byte has crossed in either direction for idle, when it
+// closes both.
+//
+// The timeout is an idle timeout, as the UDP side's is: every read that
+// returns bytes, in either direction, stamps the pair as active, and the
+// watchdog below closes it only when the stamp is idle old. (It used to be
+// one timer started with the copy and never reset, so every connection was
+// cut at that age however busy it was: #253.) The stamp is one atomic store
+// per read; the watchdog sleeps until the stamp could next be that old rather
+// than being reset per read.
+//
+// The copy is a plain read and write loop, not io.Copy: between two TCP
+// connections io.Copy splices in the kernel on Linux, and bytes that never
+// reach this process cannot stamp anything.
 func relayCopy(a, b net.Conn, idle time.Duration) {
+	var active atomic.Int64 // UnixNano of the last byte seen
+	active.Store(time.Now().UnixNano())
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
-		_, _ = io.Copy(dst, src)
+		buf := relayCopyBuffers.Get().(*[]byte)
+		defer relayCopyBuffers.Put(buf)
+		for {
+			n, err := src.Read(*buf)
+			if n > 0 {
+				active.Store(time.Now().UnixNano())
+				if _, werr := dst.Write((*buf)[:n]); werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
 		if t, ok := dst.(*net.TCPConn); ok {
 			_ = t.CloseWrite()
 		}
@@ -278,13 +319,18 @@ func relayCopy(a, b net.Conn, idle time.Duration) {
 	go cp(b, a)
 	timer := time.NewTimer(idle)
 	defer timer.Stop()
-	for i := 0; i < 2; i++ {
+	for ended := 0; ended < 2; {
 		select {
 		case <-done:
+			ended++
 		case <-timer.C:
-			_ = a.Close()
-			_ = b.Close()
-			return
+			quiet := time.Since(time.Unix(0, active.Load()))
+			if quiet >= idle {
+				_ = a.Close()
+				_ = b.Close()
+				return
+			}
+			timer.Reset(idle - quiet)
 		}
 	}
 }

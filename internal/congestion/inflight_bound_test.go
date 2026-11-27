@@ -262,7 +262,109 @@ func TestPathControllerHeldAtTheLossBoundStillTakesProbeRTT(t *testing.T) {
 		t.Errorf("a bulk sender held at the loss bound took %d ProbeRTTs in %v and skipped %d",
 			law.probeRTTs, duration, law.probeRTTsSkipped)
 	}
+	// ProbeRTT at half a product must still find the path's round trip.
+	if law.minRTT > path.rtt*11/10 {
+		t.Errorf("minimum round trip %v after three ProbeRTTs on a %v path", law.minRTT, path.rtt)
+	}
 	if rate < 0.8*path.rate {
 		t.Errorf("the bounded sender delivered %.2f of the path's rate", rate/path.rate)
+	}
+}
+
+// An outage is not congestion. Rounds in which nothing at all arrived do not
+// cut the bound, however deep the queue last stood, and do not teach the
+// erasure base that the channel loses everything; and when the path returns
+// the bound does not sit out a probe wait.
+func TestInflightBoundTreatsRoundsWithNoAcknowledgementAsAnOutage(t *testing.T) {
+	b := &inflightBound{}
+	now, round := base(), uint64(0)
+	boundWarm(b, &now, &round, 2000, 0)
+	// A standing full queue with loss cuts and starts a probe wait.
+	for range inflightStandingRounds + 1 {
+		round++
+		now = now.Add(2 * boundMinRTT)
+		boundRound(b, now, round, 2000, 10, 55*time.Millisecond, 2*boundBDP)
+	}
+	if b.congestionRounds != 1 || !now.Before(b.holdUntil) {
+		t.Fatalf("setup: %d congestion rounds, hold until %v at %v", b.congestionRounds, b.holdUntil, now)
+	}
+	hi, base0, baseRounds := b.hi, b.base, b.baseRounds
+	// The path goes away: twenty rounds of loss and no acknowledgement, at
+	// the queue depth last seen and then at none.
+	for i := range 20 {
+		round++
+		now = now.Add(2 * boundMinRTT)
+		queue := 55 * time.Millisecond
+		if i >= 10 {
+			queue = 0
+		}
+		if boundRound(b, now, round, 400, 400, queue, 2*boundBDP) {
+			t.Fatalf("outage round %d was judged congestion", i+1)
+		}
+	}
+	round++
+	if boundRound(b, now.Add(boundMinRTT), round, 2000, 0, time.Millisecond, boundBDP) {
+		t.Fatal("the round after the outage was judged congestion")
+	}
+	if b.congestionRounds != 1 || b.hi != hi {
+		t.Fatalf("the outage moved the bound from %d to %d (%d congestion rounds)", hi, b.hi, b.congestionRounds)
+	}
+	if b.base != base0 || b.baseRounds != baseRounds {
+		t.Fatalf("the outage taught the erasure base %.3f over %d rounds; it was %.3f over %d", b.base, b.baseRounds, base0, baseRounds)
+	}
+	b.restored()
+	if now.Before(b.holdUntil) {
+		t.Fatal("the bound is still in its probe wait after the path returned")
+	}
+}
+
+// The path authority's law does not age what it knows of the path through an
+// outage: packets unanswered for four round trips, then an acknowledgement.
+// Its bandwidth estimate, which stands for ten minimum round trips, is still
+// current when the path returns, so the first trickle acknowledged does not
+// replace it. A pause with nothing outstanding is not an outage, and a
+// per-connection sender keeps the behaviour it had.
+func TestPathLawDoesNotAgeItsEstimateThroughAnOutage(t *testing.T) {
+	const rtt = 360 * time.Millisecond
+	newLaw := func() *ErasureSender {
+		e := newPathLaw(1200, nil)
+		e.SetRTTStatsProvider(&fixedRTT{min: rtt, smoothed: rtt})
+		e.inner.estimator.maxFilter.setRoundTrip(rtt)
+		return e
+	}
+	start := base()
+	// An 8 s outage: sample packets sent, nothing acknowledged until 8 s on.
+	e := newLaw()
+	e.inner.estimator.maxFilter.updateMax(1, start, 2_500_000)
+	e.OnPacketSent(start.Add(10*time.Millisecond), 1200, 1, 1200, true)
+	e.OnPacketSent(start.Add(900*time.Millisecond), 2400, 2, 1200, true)
+	at := start.Add(8 * time.Second)
+	if !e.inner.estimator.maxFilter.stale(at) {
+		t.Fatal("setup: the estimate should have aged out over 8 s without the outage rule")
+	}
+	e.noteAnswered(at)
+	if e.inner.estimator.maxFilter.stale(at) {
+		t.Fatal("the estimate aged out through an outage")
+	}
+	if e.outages.Load() != 1 {
+		t.Fatalf("%d outages counted, want 1", e.outages.Load())
+	}
+	// It still ages afterwards, from where it stood.
+	if !e.inner.estimator.maxFilter.stale(at.Add(e.inner.estimator.maxFilter.timeWindow + time.Second)) {
+		t.Fatal("the estimate no longer ages after an outage")
+	}
+	// A pause: the packet that ends it is answered within a round trip.
+	e = newLaw()
+	e.inner.estimator.maxFilter.updateMax(1, start, 2_500_000)
+	e.OnPacketSent(at.Add(-rtt), 1200, 1, 1200, true)
+	e.noteAnswered(at)
+	if !e.inner.estimator.maxFilter.stale(at) || e.outages.Load() != 0 {
+		t.Fatal("a pause with nothing outstanding was taken for an outage")
+	}
+	// A per-connection sender does not track it.
+	conn := NewErasureSender(1200)
+	conn.OnPacketSent(start, 1200, 1, 1200, true)
+	if !conn.unansweredSince.IsZero() {
+		t.Fatal("a per-connection sender tracks unanswered packets")
 	}
 }

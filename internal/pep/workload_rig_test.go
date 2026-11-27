@@ -65,9 +65,11 @@ func workloadArms() []workloadArm { return []workloadArm{legacyArm, flipArm} }
 
 // workloadRig is a client and a gateway with an emulated path between them.
 type workloadRig struct {
-	t             *testing.T
-	socks         string
-	relay         *pathsim.Relay
+	t     *testing.T
+	socks string
+	relay *pathsim.Relay
+	// tcpRelay is the TCP path beside relay, under TransportAuto.
+	tcpRelay      *pathsim.TCPRelay
 	client        *Client
 	server        *Server
 	clientMetrics *metrics.Registry
@@ -77,6 +79,16 @@ type workloadRig struct {
 // newWorkloadRig starts a client and a gateway for arm across path. setup,
 // when given, runs on the client and the gateway before they serve.
 func newWorkloadRig(t *testing.T, path pathsim.Config, arm workloadArm, setup func(*Client, *Server)) *workloadRig {
+	t.Helper()
+	return newWorkloadRigOn(t, path, arm, TransportQUIC, setup)
+}
+
+// newWorkloadRigOn is newWorkloadRig with the client's transport chosen.
+// With TransportAuto the gateway also serves TCP, and a TCP relay stands
+// beside the UDP one on the same address and port, as a deployment's gateway
+// is reachable both ways at one address: the client's TCP fallback then has
+// somewhere to go, and blackhole drops both.
+func newWorkloadRigOn(t *testing.T, path pathsim.Config, arm workloadArm, transport TransportKind, setup func(*Client, *Server)) *workloadRig {
 	t.Helper()
 	pathmodel.Reset()
 	t.Cleanup(pathmodel.Reset)
@@ -108,6 +120,21 @@ func newWorkloadRig(t *testing.T, path pathsim.Config, arm workloadArm, setup fu
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = relay.Close() })
+	var tcpRelay *pathsim.TCPRelay
+	var gatewayTCP net.Listener
+	if transport == TransportAuto {
+		gatewayTCP, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tcpPath := path
+		tcpPath.LossRate, tcpPath.UpstreamLossRate = 0, 0
+		tcpRelay, err = pathsim.NewTCP(relay.LocalAddr(), gatewayTCP.Addr().String(), tcpPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = tcpRelay.Close() })
+	}
 
 	clientListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -115,7 +142,7 @@ func newWorkloadRig(t *testing.T, path pathsim.Config, arm workloadArm, setup fu
 	}
 	clientCfg := ClientConfig{
 		ListenAddr: clientListener.Addr().String(), RemoteAddr: relay.LocalAddr(),
-		Credentials: roots, Transport: TransportQUIC, EnableQUICPool: true,
+		Credentials: roots, Transport: transport, EnableQUICPool: true,
 		Logger: logger, Metrics: clientMetrics,
 	}
 	arm.client(&clientCfg)
@@ -128,6 +155,9 @@ func newWorkloadRig(t *testing.T, path pathsim.Config, arm workloadArm, setup fu
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{}, 2)
+	if gatewayTCP != nil {
+		go func() { _ = server.ServeListener(ctx, gatewayTCP) }()
+	}
 	go func() { _ = server.ServePacketConn(ctx, packetConn); done <- struct{}{} }()
 	go func() { _ = client.ServeListener(ctx, clientListener); done <- struct{}{} }()
 	t.Cleanup(func() {
@@ -142,7 +172,7 @@ func newWorkloadRig(t *testing.T, path pathsim.Config, arm workloadArm, setup fu
 		}
 	})
 	return &workloadRig{
-		t: t, socks: clientListener.Addr().String(), relay: relay,
+		t: t, socks: clientListener.Addr().String(), relay: relay, tcpRelay: tcpRelay,
 		client: client, server: server, clientMetrics: clientMetrics, serverMetrics: serverMetrics,
 	}
 }
@@ -185,6 +215,19 @@ func (r *workloadRig) dial(destination string) net.Conn {
 	conn := dialTestSOCKS(r.t, r.socks, destination)
 	r.t.Cleanup(func() { _ = conn.Close() })
 	return conn
+}
+
+// blackhole drops the path, or restores it: both directions, and TCP as well
+// as QUIC where the rig has both.
+func (r *workloadRig) blackhole(on bool) {
+	rate := 0.0
+	if on {
+		rate = 1
+	}
+	r.relay.SetLossRate(rate, rate)
+	if r.tcpRelay != nil {
+		r.tcpRelay.SetBlackhole(on)
+	}
 }
 
 // wireBytes is every byte the emulated path carried, both directions.

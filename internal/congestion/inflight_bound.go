@@ -176,6 +176,15 @@ func (b *inflightBound) observe(now monotime.Time, round uint64, acked, lost int
 func (b *inflightBound) closeRound(now monotime.Time, minRTT time.Duration, mss, window, bdp quiccongestion.ByteCount) bool {
 	b.deepest = max(time.Duration(float64(b.deepest)*inflightDeepestDecay), b.peakQueue)
 	n := b.acked + b.lost
+	if b.acked == 0 && b.lost > 0 {
+		// Nothing of the round arrived: the path was away, which is not a
+		// queue overflowing -- that still delivers what it does not drop --
+		// and not the channel's erasure either. The round teaches nothing,
+		// and what is reported lost after it was sent into the same hole.
+		b.settle = inflightSettleRounds
+		b.endRun()
+		return false
+	}
 	if b.settle > 0 {
 		b.settle--
 		b.endRun()
@@ -290,6 +299,19 @@ func (b *inflightBound) grow(now monotime.Time, mss, window quiccongestion.ByteC
 	// Doubling each round, but never more than a quarter of the bound in one:
 	// the next round must be able to show whether the last step overflowed.
 	b.step = min(2*b.step, max(mss, b.hi/4))
+}
+
+// restored is told that the path has returned from an outage. The probe wait
+// is there to give a queue-sharing competitor back what a cut took from it;
+// after an outage there is no such queue, everyone sharing the path restarts
+// together, and a bound still waiting would hold the sender under a path
+// that has just come back empty. The bound itself stands -- it is what the
+// path last showed it could hold -- and growth resumes at once; the rounds
+// that follow carry the outage's late losses and are not judged.
+func (b *inflightBound) restored() {
+	b.holdUntil = 0
+	b.settle = inflightSettleRounds
+	b.endRun()
 }
 
 // limit is the window the bound allows, or window itself while none applies.

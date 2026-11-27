@@ -1,6 +1,13 @@
 # What every push has to satisfy. Kept cheap on purpose: this repository is
 # intentionally small; the expensive campaigns live in deep.yml where they run
 # on a schedule instead of on every commit.
+#
+# Hosted minutes are billed by the minute and multiplied by the runner (macOS
+# and Windows cost several times Linux), so what runs here follows what the
+# change touched (the `changes` job) and what the event is worth. A pull
+# request gets the platforms whose platform-specific code it could break, and
+# the merged commit on main re-checks all of them; the weekly deep run covers
+# the rest.
 name: ci
 
 on:
@@ -17,33 +24,95 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # What changed decides what runs. A failure to work that out runs everything
+  # rather than nothing: a diff it cannot compute is not evidence that the
+  # change is harmless.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.pick.outputs.core }}
+      mobile: ${{ steps.pick.outputs.mobile }}
+      harness: ${{ steps.pick.outputs.harness }}
+      test-matrix: ${{ steps.pick.outputs.test-matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          base=""
+          if [ "$EVENT" = "pull_request" ]; then
+            base="$BASE_SHA"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            base="$BEFORE"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "no base to diff against; running everything"
+            files=""
+          else
+            files=$(git diff --name-only "$base" "$GITHUB_SHA")
+          fi
+          core=false; mobile=false; harness=false
+          if [ -z "$base" ]; then
+            core=true; mobile=true; harness=true
+          else
+            for f in $files; do
+              case "$f" in
+                # A change to the apps is covered by the app jobs; the Go core
+                # they bind is checked when the core itself changes, by the
+                # mobile-core job below.
+                mobile/*) mobile=true ;;
+                docs/*|*.md|changelog.d/*|LICENSE*|*.png|*.svg|*.gif) ;;
+                scripts/*) harness=true ;;
+                # A workflow edit is checked by everything it can change.
+                .github/*) core=true; mobile=true; harness=true ;;
+                *) core=true ;;
+              esac
+            done
+            [ "$core" = true ] && harness=true
+          fi
+          # A pull request gets the platforms whose platform-specific code it
+          # could break (Linux is the server, Windows the one with its own
+          # clock and service code); the merged commit on main re-checks all
+          # six, and deep.yml runs the long suite on all of them weekly.
+          if [ "$EVENT" = "pull_request" ]; then
+            matrix='[{"runner":"ubuntu-24.04","os":"linux","arch":"amd64"},{"runner":"windows-2025","os":"windows","arch":"amd64"}]'
+          else
+            matrix='[{"runner":"ubuntu-24.04","os":"linux","arch":"amd64"},{"runner":"ubuntu-24.04-arm","os":"linux","arch":"arm64"},{"runner":"macos-15-intel","os":"darwin","arch":"amd64"},{"runner":"macos-15","os":"darwin","arch":"arm64"},{"runner":"windows-2025","os":"windows","arch":"amd64"},{"runner":"windows-11-arm","os":"windows","arch":"arm64"}]'
+          fi
+          echo "core=$core" >> "$GITHUB_OUTPUT"
+          echo "mobile=$mobile" >> "$GITHUB_OUTPUT"
+          echo "harness=$harness" >> "$GITHUB_OUTPUT"
+          echo "test-matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   # The build matrix exists because it has already caught something: the
   # external-proxy harness used Setpgid, Getpgid and Kill directly and did not
   # compile for Windows at all, on a tree whose tests were entirely green.
   # Nothing but a cross-build finds that.
   build:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - {os: linux, arch: amd64}
-          - {os: linux, arch: arm64}
-          - {os: darwin, arch: amd64}
-          - {os: darwin, arch: arm64}
-          - {os: windows, arch: amd64}
-          - {os: windows, arch: arm64}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - run: go build ./...
-        env:
-          GOOS: ${{ matrix.target.os }}
-          GOARCH: ${{ matrix.target.arch }}
+      - name: every advertised target compiles
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "--- $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build ./... || exit 1
+          done
 
   vet:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -62,6 +131,8 @@ jobs:
   # CHANGELOG.md only at release time. Nothing else writes that file, which is
   # what stops two branches conflicting over the same list every time both of
   # them describe a user-visible change.
+  # Every change, whatever it touched: a fragment is one file and the check is
+  # seconds of one runner.
   changelog:
     runs-on: ubuntu-latest
     permissions:
@@ -118,6 +189,8 @@ jobs:
           exit 1
 
   analysis:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -136,23 +209,20 @@ jobs:
           test "$scanner_status" -eq 0 || test "$scanner_status" -eq 1
           ./scripts/check_gosec.py gosec.json .
 
-  # Run the portable suite on every advertised native OS and architecture.
-  # -short skips the tests that bring QUIC up across an emulated 300 ms
+  # Run the portable suite on the platforms this event is worth: two for a
+  # pull request, every advertised native OS and architecture for the merged
+  # commit. -short skips the tests that bring QUIC up across an emulated 300 ms
   # erasure path, and the emulator calibrations that need an uncontended host
   # to measure anything. Those run natively in deep.yml and
   # release-candidate.yml.
   test:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {runner: ubuntu-24.04, os: linux, arch: amd64}
-          - {runner: ubuntu-24.04-arm, os: linux, arch: arm64}
-          - {runner: macos-15-intel, os: darwin, arch: amd64}
-          - {runner: macos-15, os: darwin, arch: arm64}
-          - {runner: windows-2025, os: windows, arch: amd64}
-          - {runner: windows-11-arm, os: windows, arch: arm64}
+        include: ${{ fromJSON(needs.changes.outputs.test-matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -160,11 +230,22 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test -short -timeout 20m ./...
-      - name: live probe helper tests
-        if: matrix.os == 'linux' && matrix.arch == 'amd64'
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  # The validation harness and the repository's own house rules (changelog
+  # shape, download links, release metadata): stdlib Python, one cheap runner.
+  harness:
+    needs: changes
+    if: needs.changes.outputs.harness == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
   mobile-core:
+    needs: changes
+    # The binding compiles against the Go core, so a core change is checked
+    # here too; the apps themselves (Android, iOS) are not.
+    if: needs.changes.outputs.mobile == 'true' || needs.changes.outputs.core == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -196,6 +277,8 @@ jobs:
           git diff --exit-code -- mobile/legal/THIRD_PARTY_NOTICES.txt
 
   android:
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -301,6 +384,8 @@ jobs:
 
   android-instrumentation:
     name: Android Keystore API ${{ matrix.api }}
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -414,6 +499,8 @@ jobs:
           connectedDebugAndroidTest
 
   ios:
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
     runs-on: macos-26
     timeout-minutes: 45
     steps:
@@ -467,6 +554,8 @@ jobs:
   # deterministic archive creation. One target is enough here; release.yml
   # packages the complete six-target matrix.
   package:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

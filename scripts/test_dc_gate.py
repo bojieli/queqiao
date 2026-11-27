@@ -34,7 +34,7 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
              no_path_key=False, fallback_leaf=None, tcp_lane_leaf=None, empty_egress=False, calibrate=None,
              request_kind="requests", per_wave=8, tcp_at=None, cand_bundle=None, legacy_bundle="legacy",
              no_bundle=False, uploads=False, up_shares=(1.0, 1.0, 1.0), up_binding=0.5, up_control=1.0,
-             up_one_relay=False, up_drop=(), solo_factors=(1.0,), cand_solo_factor=None):
+             up_one_relay=False, up_drop=(), solo_factors=(1.0,), cand_solo_factor=None, upsolo_stray=None):
     """A DC campaign with known shape.
 
     Legacy: the three loaded leaves share the ancestor evenly (Jain 1, spread
@@ -62,9 +62,9 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
         plan["dc"].update(upload_leaves=up_leaves, upload_control="uctl", uploader="upl")
     up_addr = {u: ("192.0.2.10" if up_one_relay else f"192.0.2.{11 + i}") for i, u in enumerate(up_leaves + ["uctl"])}
 
-    def up_record(arm, b, when, leaf):
+    def up_record(arm, b, when, leaf, sent=10, received=1000):
         srv.setdefault((arm, b), []).append({"time": iso(when), "msg": "remote flow complete", "transport": "quic",
-                                             "lane_bytes": {"1": {"Kind": "quic", "Sent": 10, "Received": 1000}},
+                                             "lane_bytes": {"1": {"Kind": "quic", "Sent": sent, "Received": received}},
                                              "path_egress": egress, "path_key": f"{egress}->{up_addr[leaf]}"})
 
     def up_rows(b, slot, base, phase, leaf, j, share, start):
@@ -181,7 +181,13 @@ def write_dc(root, cand_shares=(1.0, 1.0, 1.0), cand_total=1.0, binding=0.5, blo
                     slot = base_slot + len(LOADED) + j
                     rows.extend(up_rows(b, slot, [arm, role, 0, 0], "upsolo", leaf, 0,
                                         1.0 / up_binding * factor * arm_factor, t))
-                    up_record(arm, b, t + 30, leaf)
+                    for _ in range(50):
+                        up_record(arm, b, t + 30, leaf)
+                    if upsolo_stray and b == 1 and j == 0:
+                        # Another upload leaf's flow completing in this solo's
+                        # window: a keepalive-sized one, or real load.
+                        other = up_leaves[1]
+                        up_record(arm, b, t + 31, other, *({"tiny": (1, 91), "load": (10, 50_000)}[upsolo_stray]))
                     t += 65
     os.makedirs(os.path.join(root, "effective"), exist_ok=True)
     os.makedirs(os.path.join(root, "metrics"), exist_ok=True)
@@ -304,7 +310,7 @@ class DCGate(unittest.TestCase):
             out.append("\t".join(f))
         pathlib.Path(path).write_text("\n".join(out) + "\n")
         text, v = dc.evaluate(root, self.bounds)
-        self.assertIn("sum of solo rates, mean over 12 blocks): 0.33", text)
+        self.assertIn("sum of solo rates, each leaf's the larger arm median, mean over 12 blocks): 0.33", text)
         self.assertNotEqual(v["cand"], "VOID")
 
     def test_every_judged_block_needs_its_own_calibration(self):
@@ -421,6 +427,18 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("up-onerelay", uploads=True, up_one_relay=True)
         self.assertEqual(v["cand"], "VOID")
         self.assertIn("one relay host per leaf", text)
+
+    def test_a_stray_keepalive_flow_in_an_upload_solo_does_not_void(self):
+        # The uploader's one process keeps every provider's carrier: a 92-byte
+        # flow of another leaf can complete in a solo's window (dcg6). It is
+        # not that leaf's load.
+        text, v = self.run_gate("stray", uploads=True, upsolo_stray="tiny")
+        self.assertEqual(v["cand"], "PASS", text)
+
+    def test_another_leaf_loading_an_upload_solo_still_voids(self):
+        text, v = self.run_gate("strayload", uploads=True, upsolo_stray="load")
+        self.assertEqual(v["cand"], "VOID", text)
+        self.assertIn("leaf key(s), expected 1", text)
 
     def test_a_missing_upload_phase_leaves_no_verdict(self):
         text, v = self.run_gate("up-missing", uploads=True, up_drop=(2,))
@@ -612,17 +630,41 @@ class DCGate(unittest.TestCase):
         text, v = self.run_gate("collapse3", calibrate="first", solo_factors=(1.0, 1.0, 0.03),
                                 no_solo=tuple((b, leaf) for b in range(2, 13) for leaf in LOADED))
         self.assertEqual(v["cand"], "PASS", text)
-        self.assertRegex(text, r"sum of solo rates, mean over 12 blocks\): 0\.(49|50|51) ")
+        self.assertRegex(text, r"sum of solo rates, each leaf.s the larger arm median, mean over 12 blocks\): 0\.(49|50|51) ")
 
-    def test_candidate_solos_are_reported_not_used_for_binding(self):
-        text, v = self.run_gate("candsolo", cand_solo_factor=4.0, solo_factors=(1.0, 1.0))
-        self.assertEqual(v["cand"], "PASS", text)
-        self.assertRegex(text, r"sum of solo rates, mean over 12 blocks\): 0\.(49|50|51) ")
+    def test_every_arms_solos_are_reported(self):
+        text, v = self.run_gate("candsolo", cand_solo_factor=1.2, solo_factors=(1.0, 1.0))
         row = next(l for l in text.splitlines() if l.startswith("| la |"))
         legacy, cand = row.split("|")[2:4]
         # Each arm's median and every run (12 blocks x 2 repeats).
         self.assertEqual(legacy.count(",") + 1, 24)
-        self.assertGreater(float(cand.split()[0]), 3.5 * float(legacy.split()[0]))
+        self.assertEqual(cand.count(",") + 1, 24)
+        self.assertAlmostEqual(float(cand.split()[0]) / float(legacy.split()[0]), 1.2, delta=0.1)
+
+    def test_capacity_is_the_larger_arms_median(self):
+        # The legacy arm cannot fill a lone leaf (its solos deliver 40 % of
+        # the path): measured against its own solos the ancestor looks
+        # unbound (ratio about 1.25) and the campaign is void. The
+        # candidate's solos show the path's capacity, and the ancestor binds.
+        weak = dict(binding=0.5, solo_factors=(0.4, 0.4, 0.4), cand_solo_factor=2.5)
+        b = dict(self.bounds, binding_reference="main_median")
+        root = os.path.join(self.tmp.name, "weak-main")
+        write_dc(root, **weak)
+        text, v = dc.evaluate(root, b)
+        self.assertEqual(v["cand"], "VOID", text)
+        self.assertIn("main arm median", text)
+        text, v = self.run_gate("weak-max", **weak)
+        self.assertRegex(text, r"each leaf's the larger arm median, mean over 12 blocks\): 0\.(49|50|51) ")
+        self.assertEqual(v["cand"], "PASS", text)
+
+    def test_capacity_rule_is_frozen_in_the_bounds(self):
+        self.assertEqual(dc.load_bounds()["binding_reference"], "max_arm_median")
+        bad = os.path.join(self.tmp.name, "bad.ini")
+        text = (HERE / "validation" / "dc_gate.ini").read_text().replace("binding_reference = max_arm_median",
+                                                                         "binding_reference = whatever")
+        pathlib.Path(bad).write_text(text)
+        with self.assertRaises(SystemExit):
+            dc.load_bounds(bad)
 
     def test_the_uplink_binding_is_printed(self):
         text, v = self.run_gate("upbind", uploads=True, up_binding=0.5)

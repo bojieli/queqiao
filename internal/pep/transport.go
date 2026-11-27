@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -176,6 +177,9 @@ type congestionConfig struct {
 	// scope selects what one controller governs; see CongestionScope. It
 	// applies only with ccAPI v2 and the erasure law.
 	scope CongestionScope
+	// egress, on a gateway, is its --egress-capacity: its path authorities
+	// join the joint limit of their interface (egress.go). Nil on a client.
+	egress *EgressCapacity
 	// provisional says the connection's peer is not yet known to be an
 	// authorised data connection (a gateway installs a controller before it
 	// knows the ALPN or the principal). Under congestion=path such a
@@ -734,7 +738,26 @@ func (w flowWindows) validate() error {
 	return nil
 }
 
+// quicTimers are a connection's keep-alive period and idle timeout.
+type quicTimers struct{ keepAlive, idle time.Duration }
+
+// quicTimersForTest, when a test sets it, replaces both on every connection
+// made after. The transport stretches both with its probe timeout -- the
+// keep-alive goes out every max(KeepAlivePeriod, 1.5 PTO) and the idle
+// timeout is max(MaxIdleTimeout, 3 PTO) -- so this is how a test gives a
+// connection, at once and exactly, the timers a stale round-trip estimate
+// leaves it with. It is nil in production.
+var quicTimersForTest atomic.Pointer[quicTimers]
+
 func quicConfig(windows flowWindows) *quic.Config {
+	cfg := baseQUICConfig(windows)
+	if timers := quicTimersForTest.Load(); timers != nil {
+		cfg.KeepAlivePeriod, cfg.MaxIdleTimeout = timers.keepAlive, timers.idle
+	}
+	return cfg
+}
+
+func baseQUICConfig(windows flowWindows) *quic.Config {
 	streamWindow, connectionWindow, streamMax, connectionMax, incomingStreams := windows.resolved()
 	return &quic.Config{
 		// The handshake gets as long as an erasing path needs.

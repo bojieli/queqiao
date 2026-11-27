@@ -482,7 +482,7 @@ class Runner(unittest.TestCase):
             def looks(campaign, gates, units_run, failures=None):
                 out = {}
                 for b, p, ty in units_run:
-                    out[(p, ty)] = decide(p, ty, sum(1 for u in units_run if (u[1], u[2]) == (p, ty)))
+                    out[(p, ty, "cand")] = decide(p, ty, sum(1 for u in units_run if (u[1], u[2]) == (p, ty)))
                 return out
             with mock.patch.object(ab.Campaign, "snapshot_all", return_value=ok), \
                     mock.patch.object(ab.Campaign, "reserve"), mock.patch.object(ab.Campaign, "build", return_value={}), \
@@ -494,7 +494,7 @@ class Runner(unittest.TestCase):
                     mock.patch.object(ab.Campaign, "teardown"), mock.patch.object(ab.Campaign, "verify_teardown", return_value=[]), \
                     mock.patch.object(ab.Campaign, "clean", return_value=[]), \
                     mock.patch.object(ab.Host, "run", return_value=(0, "/home/u")), mock.patch.object(ab.time, "sleep"), \
-                    mock.patch.object(an, "interim_decisions", side_effect=looks):
+                    mock.patch.object(an, "interim_decisions_by_candidate", side_effect=looks):
                 rc = camp.run()
             status = json.loads(pathlib.Path(tmp, "out", "status.json").read_text())
             plan = json.loads(pathlib.Path(tmp, "out", "plan.json").read_text())
@@ -1215,10 +1215,10 @@ class RoundFourFixes(unittest.TestCase):
         camp = ab.Campaign(cfg, "/nonexistent", ".", dry=False, stream=io.StringIO())
         camp.job_failures.append({"block": 1, "path": "a", "trial": "bulk"})
         camp.fetch_failures.append("f")
-        with mock.patch.object(an, "interim_decisions", return_value={}) as look:
+        with mock.patch.object(an, "interim_decisions_by_candidate", return_value={}) as look:
             camp.interim("a", "bulk")
         self.assertEqual(look.call_args[0][3], {"job_failures": [{"block": 1, "path": "a", "trial": "bulk"}],
-                                                "fetch_failures": ["f"]})
+                                                "fetch_failures": ["f"], "stopped_candidates": {}})
 
     def test_the_rpc_deadline_covers_socks_and_tls_setup(self):
         # A SOCKS proxy that answers each step just under the timeout: each
@@ -1526,6 +1526,75 @@ class MeasuredProgress(unittest.TestCase):
         pa = sys.modules["ab_workload_phase_a"]
         self.assertFalse(pa.progress_covered((prog[0]["samples"][0][0], prog[0]["samples"][-1][0]),
                                              [prog[0]["samples"]], 1))
+
+
+class W4Slots(unittest.TestCase):
+    def test_a_slow_request_makes_the_next_one_late_not_unscheduled(self):
+        # The first answer takes 1.2 s; requests are due every 0.3 s. Each
+        # row starts at its slot (barrier + i x spacing), and a request that
+        # had to wait for the connection carries the wait in its seconds:
+        # the slow request counts against its arm, and every leaf's wave i
+        # still starts at the same instant.
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        port = srv.getsockname()[1]
+        served = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                with c:
+                    buf = b""
+                    try:
+                        while True:
+                            while b"\r\n\r\n" not in buf:
+                                x = c.recv(65536)
+                                if not x:
+                                    raise EOFError
+                                buf += x
+                            head, buf = buf.split(b"\r\n\r\n", 1)
+                            n = int(next((l.split(b":")[1] for l in head.split(b"\r\n")
+                                          if l.lower().startswith(b"content-length")), b"0"))
+                            while len(buf) < n:
+                                buf += c.recv(65536)
+                            buf = buf[n:]
+                            if not served:
+                                time.sleep(1.2)
+                            served.append(time.time())
+                            want = 200 if head.startswith(b"POST") else 300
+                            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % want + b"x" * want)
+                    except (EOFError, OSError):
+                        pass
+        threading.Thread(target=serve, daemon=True).start()
+        socks = Socks5UDP()
+        socks.start()
+        start = int(time.time()) + 2
+        try:
+            p = subprocess.run([sys.executable, str(CLIENT), "rpc", "--socks", f"127.0.0.1:{socks.port}", "--no-tls",
+                                "--target", f"127.0.0.1:{port}", "--count", "4", "--spacing", "0.3",
+                                "--timeout", "5", "--start-at", str(start), "--asr-up", "1000", "--asr-down", "200",
+                                "--tts-up", "300", "--tts-down", "300"],
+                               capture_output=True, text=True, timeout=60)
+        finally:
+            srv.close()
+            socks.srv.close()
+        rows = [l.split("\t") for l in p.stdout.splitlines() if not l.startswith("J")]
+        self.assertEqual(len(rows), 4, p.stdout + p.stderr)
+        self.assertEqual([r[6] for r in rows], ["0"] * 4)
+        for i, r in enumerate(rows):
+            self.assertAlmostEqual(float(r[0]), start + 0.3 * i, delta=0.005)
+        secs = [float(r[5]) for r in rows]
+        self.assertGreater(secs[0], 1.15)
+        # Request 2 was due at 0.3 s but could start only at about 1.2 s.
+        self.assertGreater(secs[1], 0.85)
+        self.assertGreater(secs[2], 0.55)
+        # Each row's end is its slot plus its seconds.
+        for r in rows:
+            self.assertAlmostEqual(float(r[1]) - float(r[0]), float(r[5]), delta=0.002)
 
 
 class ShortAnswers(unittest.TestCase):

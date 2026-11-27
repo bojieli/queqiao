@@ -39,7 +39,7 @@ def frozen_rules():
         parts = v.split()
         if parts[0] in an.RULES:
             out[k.split(".", 1)[1]] = (parts[0], tuple(float(x) for x in parts[1:]))
-    for k in ("completion", "stalls_per_trial"):
+    for k in ("stalls_per_trial",):
         better, margin = cp["secondary"][k].split()
         out[k] = (better, (float(margin),))
     return out
@@ -51,11 +51,12 @@ MAIN = {
     "echo_p99_s": ([12.0, 9.5, 14.2, 11.1, 10.0, 13.3], "lower"),
     "recover_s": ([6.0, 7.5, 5.2, 8.1, 6.6, 7.0], "lower"),
     "reopen_ttfb_s": ([4.0, 5.5, 3.2, 6.1, 4.6, 5.0], "lower"),
-    "inflight_ttfb_s": ([5.0, 6.5, 4.2, 7.1, 5.6, 6.0], "lower"),
+    "resume_download_s": ([5.0, 6.5, 4.2, 7.1, 5.6, 6.0], "lower"),
+    "resume_upload_s": ([3.0, 4.5, 2.2, 5.1, 3.6, 4.0], "lower"),
     "ttft_clear_p99_s": ([2.0, 2.4, 1.9, 2.6, 2.2, 2.1], "lower"),
     "ttft_after_restore_s": ([3.0, 4.5, 2.2, 5.1, 3.6, 4.0], "lower"),
+    "credit_delay_clear_p95_s": ([0.30, 0.42, 0.28, 0.51, 0.36, 0.40], "lower"),
     "stalls_per_trial": ([36, 28, 40, 31, 25, 33], "lower"),
-    "completion": ([0.5, 0.75, 0.5, 0.25, 0.5, 0.75], "higher"),
 }
 
 
@@ -168,3 +169,65 @@ class Rendering(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PooledCompletion(unittest.TestCase):
+    """Flow completion as a pooled event rate (v3): failed over attempted
+    short downloads, `events 0.02 149`: 30 a trial, so 6 blocks give 180."""
+
+    def rule(self):
+        cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+        cp.read(os.path.join(HERE, "validation", "gates.ini"))
+        kind, v, n = cp["workload:impaired"]["*.fetch_failures"].split()
+        self.assertEqual(kind, "events")
+        self.assertNotIn("*.completion", cp["workload:impaired"])
+        return float(v), int(n)
+
+    def test_every_block_favouring_the_candidate_passes(self):
+        v, n = self.rule()
+        # imp4 slow-lossy's shape: the candidate completed all 8 every block,
+        # main about 7 of 8.
+        blocks = [((0, 30), (m, 30)) for m in (3, 4, 2, 1, 3, 2)]
+        self.assertEqual(st.events_decision(blocks, v, n, ALPHA, final=True)[0], "pass")
+
+    def test_clearly_worse_fails_and_too_few_attempts_is_unmeasured(self):
+        v, n = self.rule()
+        self.assertEqual(st.events_decision([((3, 30), (0, 30))] * 6, v, n, ALPHA, final=True)[0], "fail")
+        self.assertEqual(st.events_decision([((0, 30), (1, 30))] * 4, v, n, ALPHA, final=True)[0], "n/a")
+
+    def test_two_perfect_arms_pass_in_six_blocks(self):
+        v, n = self.rule()
+        self.assertLessEqual((1 - v) ** n, ALPHA)
+        self.assertEqual(st.events_decision([((0, 30), (0, 30))] * 6, v, n, ALPHA, final=True)[0], "pass")
+        # Slack: one block void, or a few downloads cut at the window's end,
+        # still leaves 149 attempts.
+        self.assertEqual(st.events_decision([((0, 30), (0, 30))] * 5, v, n, ALPHA, final=True)[0], "pass")
+        cut = [((0, 29), (0, 28))] + [((0, 30), (0, 30))] * 4
+        # 149 / 148: the candidate is what the rule tests, so its 149 attempts
+        # are the sample size that matters. Main's shorter count (it is the
+        # slower arm; trial windows cut its downloads) used to leave the rule
+        # unmeasured for good, which is how imp7's completion gate went
+        # unmeasured at 0/150 against 0/109.
+        self.assertEqual(st.events_decision(cut, v, n, ALPHA, final=True)[0], "pass")
+        thin = [((0, 2), (0, 30))] + [((0, 30), (0, 30))] * 4
+        self.assertEqual(st.events_decision(thin, v, n, ALPHA, final=True)[0], "n/a")   # 122 attempts: short
+        cut6 = [((0, 27), (0, 28))] + [((0, 30), (0, 30))] * 5
+        self.assertEqual(st.events_decision(cut6, v, n, ALPHA, final=True)[0], "pass")   # 177 / 178
+
+    def test_a_trial_has_30_downloads_of_1_mib(self):
+        import ab_workloads as w
+        w.load_plugins()
+        imp = sys.modules["ab_workload_impaired"]
+        self.assertEqual((imp.FETCHES, imp.BULK_OBJECT), (30, 1 << 20))
+
+    def test_attempts_leave_out_the_windows_cut(self):
+        import types
+        import ab_workloads as w
+        w.load_plugins()
+        imp = sys.modules["ab_workload_impaired"]
+        rows = [{"phase": "policed", "kind": "imp-fetch", "flow": f"w1r{k}", "complete": c, "curl_exit": e}
+                for k, c, e in ((1, "1", "0"), (2, "1", "0"), (3, "0", "56"), (4, "0", "28"))]
+        recs = [{"_phase": "policed", "kind": "fetch", "k": 4, "window_cut": 1}]
+        t_ = types.SimpleNamespace(rows=rows, records=recs, trial="policed")
+        self.assertEqual(imp.fetch_attempts([t_], "policed"), (1, 3))
+        self.assertEqual(imp.Impaired().block_events([t_], {})["policed.fetch_failures"], (1, 3))

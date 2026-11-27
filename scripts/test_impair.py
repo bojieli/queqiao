@@ -515,3 +515,32 @@ class ProxyJump(unittest.TestCase):
                     mock.patch.object(h, "run", return_value=(1, "")):
                 with self.assertRaisesRegex(RuntimeError, "SHA-256 differs"):
                     h.put(f, "/r/queqiaod", compress=True)
+
+
+class Stage10(unittest.TestCase):
+    def test_stage_10_gates_credit_delay_and_reports_false_promotions(self):
+        cfg = parse(BASE.replace("[workload:impaired]", "[workload:impaired]\nstage = 10"))
+        self.assertEqual(cfg.minimal_stage, 10)
+        plan = {"config": {"minimal_stage": 10}}
+        wl = cfg.wl
+        self.assertEqual(set(wl.generics(plan)["policed"]), {"stalls_per_trial", "credit_delay_p95_s"})
+        # Blackhole judges credit delay clear of its outages instead, and
+        # reports the whole-trial p95.
+        self.assertEqual(set(wl.generics(plan)["blackhole"]), {"stalls_per_trial"})
+        self.assertIn("credit_delay_p95_s", wl.reported(plan)["blackhole"])
+        self.assertEqual(wl.reported(plan)["policed"], ("false_promotion_rate",))
+        self.assertIn("false_promotion_rate", wl.report_only_for(plan))
+        # Stage 7 (the default) is unchanged.
+        p7 = {"config": {"minimal_stage": 7}}
+        self.assertEqual(wl.generics(p7)["blackhole"], ("stalls_per_trial",))
+        self.assertEqual(wl.reported(p7), {})
+        with self.assertRaisesRegex(ab.ConfigError, "stage: 7 or 10"):
+            parse(BASE.replace("[workload:impaired]", "[workload:impaired]\nstage = 9"))
+
+    def test_the_credit_delay_tail_is_pooled_per_type(self):
+        wl = imp.Impaired()
+        t = types.SimpleNamespace(trial="policed", rows=[], records=[], m={})
+        with mock.patch.object(imp.mn.Minimal, "block_tails", return_value={"policed.credit_delay_p95_s": (0.95, [1])}):
+            tails = wl.block_tails([t], {"config": {"minimal_stage": 10}})
+        self.assertEqual(tails["policed.credit_delay_p95_s"], (0.95, [1]))   # the generic pooled tail is kept
+        self.assertIn("policed.echo_p99_s", tails)

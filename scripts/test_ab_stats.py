@@ -264,6 +264,29 @@ class SequentialStopping(unittest.TestCase):
         self.assertFalse(st.overall_stop(["pass", "continue"]))
         self.assertFalse(st.overall_stop([]))
 
+class EventsDecision(unittest.TestCase):
+    def test_zero_events_judged_when_the_slow_arm_has_the_fewer_opportunities(self):
+        # imp7's completion rule, "events 0.02 min 149": 0 failures in 150
+        # candidate opportunities and in 109 of main's. The slower arm's
+        # count used to leave the rule unmeasured for good.
+        blocks = [((0, 25), (0, 18)), ((0, 25), (0, 18)), ((0, 25), (0, 18)),
+                  ((0, 25), (0, 18)), ((0, 25), (0, 18)), ((0, 25), (0, 19))]
+        dec, info = st.events_decision(blocks, 0.02, 149, 0.05, True)
+        self.assertEqual((dec, info["ec"], info["em"]), ("pass", 0, 0))
+
+    def test_a_thin_candidate_is_unmeasured_not_judged(self):
+        blocks = [((0, 2), (0, 200))]
+        self.assertEqual(st.events_decision(blocks, 0.02, 149, 0.05, True)[0], "n/a")
+        self.assertEqual(st.events_decision(blocks, 0.02, 149, 0.05, False)[0], "continue")
+
+    def test_no_opportunity_in_main_is_unmeasured(self):
+        blocks = [((0, 200), (0, 0))]
+        self.assertEqual(st.events_decision(blocks, 0.02, 149, 0.05, True)[0], "n/a")
+
+    def test_an_excess_of_events_fails(self):
+        blocks = [((30, 100), (0, 100)), ((30, 100), (0, 100))]
+        self.assertEqual(st.events_decision(blocks, 0.02, 149, 0.05, True)[0], "fail")
+
 
 if __name__ == "__main__":
     unittest.main()

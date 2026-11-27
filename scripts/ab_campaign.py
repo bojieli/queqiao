@@ -297,9 +297,20 @@ class Config:
     aux_relays: List[Any] = field(default_factory=list)
     # Fetch logs through this ssh host instead of directly ("" for direct).
     fetch_via: str = ""
+    # Per trial type, its own sequential design (Workload.type_sequential).
+    sequential_by_type: Dict[str, Any] = field(default_factory=dict)
     # Per host: reach it through this ssh host (ProxyJump), from the
     # ssh_proxy_jump setting of a section naming the host.
     proxy_jumps: Dict[str, str] = field(default_factory=dict)
+
+    def type_sequential(self, trial: str) -> Any:
+        """The sequential design a trial type is judged by."""
+        return self.sequential_by_type.get(trial) or self.sequential
+
+    def type_cap(self, trial: str) -> int:
+        """The last block a trial type runs."""
+        s = self.sequential_by_type.get(trial)
+        return s.cap if s else (self.sequential.cap if self.sequential else self.blocks)
 
     @property
     def work_dir(self) -> str:
@@ -537,6 +548,17 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
     cfg.proxy_jumps = _proxy_jumps(cp)
+    # A trial type may have its own looks and cap (Workload.type_sequential),
+    # at the campaign's alpha and spending; the schedule runs to the largest.
+    cfg.sequential_by_type = {}
+    if cfg.sequential:
+        import ab_stats
+        for t in wl.trial_types(cfg):
+            fc = wl.type_sequential(cfg, t)
+            if fc:
+                cfg.sequential_by_type[t] = ab_stats.Sequential(first=fc[0], cap=fc[1], alpha=cfg.sequential.alpha,
+                                                                spending=cfg.sequential.spending)
+        cfg.blocks = max([cfg.blocks] + [s.cap for s in cfg.sequential_by_type.values()])
     if wl.impairs and not cfg.impair:
         raise ConfigError(f"workload {cfg.workload} runs under network impairment: it needs an [impair] section")
     if cfg.impair and not wl.impairs:
@@ -646,6 +668,8 @@ def schedule(cfg: Config) -> List[Slot]:
         for path in paths[k:] + paths[:k]:
             n = 0
             for trial in types:
+                if b > cfg.type_cap(trial):
+                    continue                        # this type's cap is lower
                 seen: Dict[int, int] = {}
                 for ai in block_order(len(cfg.arms), b, rng, cfg.wl.trials_per_arm):
                     n += 1
@@ -1259,6 +1283,7 @@ class Campaign:
         self.reserved: List[str] = []
         self.production_changed = False
         self.measures_path = None if dry else os.path.join(self.out, "measures.jsonl")
+        self.records_lock = threading.Lock()
         self.job_seq = 0
         self.blocks_run = 0
         self.units_run: List[List[Any]] = []
@@ -1272,6 +1297,9 @@ class Campaign:
         self.impair = ab_impair.Impairer(self, cfg.impair) if cfg.impair else None
         self.stopped = ""
         self.stopped_types: Dict[str, str] = {}
+        # "<path>/<type>/<candidate>" -> the block after which that candidate
+        # was decided on that type.
+        self.stopped_candidates: Dict[str, int] = {}
         self.beside_threads: List[threading.Thread] = []
         self.t_start = time.time()
         self.job_failures: List[dict] = []
@@ -1907,20 +1935,38 @@ rm -f "$f"''', what=f"stop {tag}")
                 return JOB_TIMEOUT, ""
             time.sleep(self.JOB_POLL)
 
-    def interim(self, path: str, trial: str = "") -> Tuple[bool, str]:
+    def interim(self, path: str, trial: str = "", block: int = 0) -> Tuple[bool, str]:
         """(stop?, summary) for one path x trial type's sequential gate on
-        the blocks run so far. Each type stops on its own; the others go on."""
+        the blocks run so far. Each type stops on its own; the others go on.
+        Each candidate is decided on its own: one decided (any rule failed,
+        or every rule passed) is judged on the blocks up to this look
+        (stopped_candidates), and the type stops once every candidate is."""
         import ab_analyze
         try:
-            by_cell = ab_analyze.interim_decisions(self.out, ab_analyze.load_gates(), self.units_run,
-                                                   {"job_failures": list(self.job_failures),
-                                                    "fetch_failures": list(self.fetch_failures)})
+            by = ab_analyze.interim_decisions_by_candidate(
+                self.out, ab_analyze.load_gates(), self.units_run,
+                {"job_failures": list(self.job_failures), "fetch_failures": list(self.fetch_failures),
+                 "stopped_candidates": dict(self.stopped_candidates)})
         except Exception as e:  # an analysis error must not end the campaign
             return False, f"interim analysis failed ({type(e).__name__}: {e}); continuing"
         import ab_stats
-        decisions = [d for (p_, cell), ds in by_cell.items() if p_ == path and (not trial or cell == trial) for d in ds]
-        counts = {d: decisions.count(d) for d in sorted(set(decisions))}
-        return ab_stats.overall_stop(decisions), ", ".join(f"{v} {k}" for k, v in counts.items()) or "nothing to judge"
+        cands = sorted({c_ for (p_, cell, c_) in by if p_ == path and (not trial or cell == trial)})
+        parts, all_decided = [], bool(cands)
+        for cand in cands:
+            key = f"{path}/{trial}/{cand}"
+            ds = [d for (p_, cell, c_), xs in by.items() if p_ == path and c_ == cand and (not trial or cell == trial)
+                  for d in xs]
+            counts = ", ".join(f"{ds.count(d)} {d}" for d in sorted(set(ds))) or "nothing to judge"
+            if key in self.stopped_candidates:
+                parts.append(f"{cand}: decided after block {self.stopped_candidates[key]}")
+                continue
+            if ab_stats.overall_stop(ds):
+                self.stopped_candidates[key] = block
+                parts.append(f"{cand}: {counts} (decided)")
+            else:
+                all_decided = False
+                parts.append(f"{cand}: {counts}")
+        return all_decided, "; ".join(parts) or "nothing to judge"
 
     def pause(self, seconds: float) -> None:
         if not self.dry:
@@ -2165,6 +2211,8 @@ rm -f "$f"''', what=f"stop {tag}")
             parallel(lambda: self.scrape(arm, name + "-pre"), *[(lambda c=c: self.scrape_client(c, arm, name + "-pre"))
                                                                  for c in clients])
             samplers = self.start_host_cpu(name, path) if cfg.host_cpu else None
+            credit = (self.start_credit_sampler(name, arm, clients)
+                      if getattr(cfg.wl, "credit_sampling", False) else None)
             phases = cfg.wl.type_phases(cfg, path, trial)
             scenario = cfg.wl.impairment(cfg, trial) if self.impair else ""
             try:
@@ -2186,6 +2234,8 @@ rm -f "$f"''', what=f"stop {tag}")
             finally:
                 if samplers is not None:
                     self.stop_host_cpu(name, samplers)
+                if credit is not None:
+                    self.stop_credit_sampler(s, arm, trial, credit)
             parallel(lambda: self.scrape(arm, name + "-post"),
                      *[(lambda c=c: self.scrape_client(c, arm, name + "-post")) for c in clients])
             for c in clients:
@@ -2256,6 +2306,58 @@ rm -f "$f"''', what=f"stop {tag}")
             out[host] = (files, stop)
         parallel(*[(lambda host=host: go(host)) for host in hosts])
         return out
+
+    def start_credit_sampler(self, name: str, arm: Arm, clients: List[Client]) -> Dict[str, Any]:
+        """Sample each endpoint's credit-delay histogram (its /metrics on the
+        host's loopback) about once a second through the trial, detached like
+        the CPU sampler: the gateway's and each client's. Returns what
+        stop_credit_sampler needs."""
+        g = self.cfg.gateway
+        ends = [("gateway", g.host, g.metrics_port_base + arm.index)] + \
+               [(f"client-{c.name}", c.host, c.metrics_port_base + arm.index) for c in clients]
+        out: Dict[str, Any] = {}
+
+        def go(end, host, port):
+            stop = f"{self.w(host)}/run/stop-credit-{end}"
+            script = (NOW_SH + f"rm -f {stop}; while [ ! -e {stop} ]; do t=$(now); "
+                      f"curl -s --max-time 1 http://127.0.0.1:{port}/metrics 2>/dev/null | awk -v t=\"$t\" "
+                      "'/^queqiao_credit_delay_seconds_bucket/ {match($0, /le=\"[^\"]+\"/); "
+                      "le = substr($0, RSTART + 4, RLENGTH - 5); s[le] += $NF} "
+                      "END {for (k in s) printf \"C\\t%s\\t%s\\t%s\\n\", t, k, s[k]}'; sleep 1; done")
+            try:
+                files, _ = self.start_job(host, script, f"credit sampler {end} ({name})", self.SAMPLER_SSH_TRIES)
+            except Exception as e:  # missing evidence, not a dead campaign
+                files = None
+                self.log(f"credit sampler {end} failed to start: {e}")
+            out[end] = (host, files, stop)
+        parallel(*[(lambda e=e, h=h, p=p: go(e, h, p)) for e, h, p in ends])
+        return out
+
+    def stop_credit_sampler(self, slot: Slot, arm: Arm, trial: str, samplers: Dict[str, Any]) -> None:
+        """Stop the credit samplers and keep each endpoint's samples as one
+        measures.jsonl record: {"kind": "credit_ts", "end": ..., "samples":
+        [[t, {le: cumulative count}], ...]} (t on that host's clock)."""
+        def go(end, host, files, stop):
+            if files is None:
+                return
+            self.session(host, f"touch {stop}", f"stop the credit sampler {end}", self.SAMPLER_SSH_TRIES)
+            rc, text = self.wait_job(host, files, 60, f"credit sampler {end}", self.SAMPLER_SSH_TRIES)
+            if self.dry or rc == 255 or not self.measures_path:
+                return
+            by_t: Dict[str, Dict[str, float]] = {}
+            for line in (text or "").splitlines():
+                p_ = line.split("\t")
+                if len(p_) == 4 and p_[0] == "C":
+                    try:
+                        by_t.setdefault(p_[1], {})[p_[2]] = float(p_[3])
+                    except ValueError:
+                        continue
+            rec = {"kind": "credit_ts", "end": end, "samples": [[float(t), h] for t, h in sorted(by_t.items())],
+                   "_block": slot.block, "_path": slot.path, "_slot": slot.slot, "_arm": arm.name, "_phase": trial,
+                   "_client": slot.path, "_job": -1}
+            with self.records_lock, open(self.measures_path, "a") as f:
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        parallel(*[(lambda e=e, h=h, f=f, s_=s_: go(e, h, f, s_)) for e, (h, f, s_) in samplers.items()])
 
     def stop_host_cpu(self, name: str, samplers: Dict[str, Any]) -> None:
         """Stop the samplers and keep their samples as hostcpu/<name>-<host>.tsv.
@@ -2459,6 +2561,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                     "workload": cfg.workload, "analyzer": cfg.wl.analyzer, "paths": cfg.paths(),
                     "dc": cfg.dc.__dict__ if cfg.dc else None,
                     "sequential": cfg.sequential.__dict__ if cfg.sequential else None,
+                    "sequential_by_type": {t: s.__dict__ for t, s in cfg.sequential_by_type.items()} or None,
                     "arms": manifest, "schedule": [s.__dict__ for s in slots], "main": cfg.main.name,
                     "clients": {c.name: {"small": c.small, "platform": c.platform, "flags": c.flags}
                                 for c in cfg.clients.values()},
@@ -2532,12 +2635,13 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 self.blocks_run = max(self.blocks_run, block)
                 if not self.dry:
                     time.sleep(cfg.block_gap)
-                if cfg.sequential and not self.dry and block >= cfg.sequential.first and block < cfg.blocks:
+                sq_t = cfg.type_sequential(trial)
+                if sq_t and not self.dry and block >= sq_t.first and block < sq_t.cap:
                     # Recompute this type's gate on its blocks so far; stop it
                     # once its verdict is determined (ab_stats.Sequential).
                     if tsv:
                         tsv.flush()
-                    stop, why = self.interim(path, trial)
+                    stop, why = self.interim(path, trial, block)
                     self.log(f"look after block {block} on {path}{' ' + trial if trial else ''}: {why}")
                     if stop:
                         done_types[(path, trial)] = f"after block {block}: {why}"
@@ -2611,7 +2715,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                            "impairment": (None if not self.impair else
                                           "not restored" if self.impair.leftovers else "restored"),
                            "blocks_run": self.blocks_run, "units_run": self.units_run, "stopped": self.stopped,
-                           "stopped_types": self.stopped_types,
+                           "stopped_types": self.stopped_types, "stopped_candidates": self.stopped_candidates,
                            "wall_seconds": round(time.time() - self.t_start, 1),
                            "finished_utc": utc(time.time())}, f, indent=2)
             sub = os.path.join(self.out, cfg.wl.beside(cfg).name) if cfg.wl.beside(cfg) else None
@@ -2673,11 +2777,15 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         look, at the cap), set-up plus one block of each trial type per round."""
         cfg = self.cfg
         out = {}
-        first = cfg.sequential.first if cfg.sequential else cfg.blocks
         for path in cfg.paths():
-            block = sum(self.block_seconds(path, t) for t in cfg.wl.trial_types(cfg))
             once = SETUP_SECONDS + cfg.wl.extra_once_seconds(cfg, path)
-            out[path] = (once + first * block, once + cfg.blocks * block)
+            lo = hi = once
+            for t in cfg.wl.trial_types(cfg):
+                sq_t = cfg.type_sequential(t)
+                blk = self.block_seconds(path, t)
+                lo += (sq_t.first if sq_t else cfg.blocks) * blk
+                hi += cfg.type_cap(t) * blk
+            out[path] = (lo, hi)
         return out
 
     def print_plan(self, slots: List[Slot]) -> None:

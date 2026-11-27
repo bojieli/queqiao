@@ -20,6 +20,10 @@ BASELINE = {
     # The relay installer shells out to systemctl with a fixed argv slice (no
     # shell), reads the operator-supplied manifest path it was given, and writes
     # systemd units at the standard 0644 public-readable unit mode.
+    # The gateway reads an interface's link speed from
+    # /sys/class/net/<name>/speed. The name comes from net.Interfaces and is
+    # refused if it holds a path separator, so the path stays under sysfs.
+    ("G304", "internal/pep/egress.go"): 1,
     ("G204", "cmd/queqiaod/relay.go"): 2,
     ("G304", "cmd/queqiaod/relay.go"): 1,
     ("G306", "cmd/queqiaod/relay.go"): 1,

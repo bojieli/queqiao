@@ -44,7 +44,10 @@ def load_bounds(path: str = BOUNDS) -> dict:
         out.update({"up_" + k: cp["upload"].getfloat(k) for k in cp["upload"]})
     out.update(alpha=s.getfloat("alpha"), resamples=s.getint("bootstrap_resamples"), seed=s.getint("bootstrap_seed"),
                max_zero_main_fraction=s.getfloat("max_zero_main_fraction"), binding_max=v.getfloat("binding_max"),
-               min_legacy_completion=v.getfloat("min_legacy_completion"))
+               min_legacy_completion=v.getfloat("min_legacy_completion"),
+               binding_reference=v.get("binding_reference", "main_median"))
+    if out["binding_reference"] not in ("main_median", "max_arm_median"):
+        raise SystemExit(f"{path}: [validity] binding_reference must be main_median or max_arm_median")
     with open(path, "rb") as f:
         out["sha256"] = hashlib.sha256(f.read()).hexdigest()
     return out
@@ -280,7 +283,7 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
         a, b = metrics(campaign, f"{name}-pre-client-{leaf}"), metrics(campaign, f"{name}-post-client-{leaf}")
         return b.get("queqiao_fallbacks_total", float("nan")) - a.get("queqiao_fallbacks_total", float("nan"))
 
-    def check(t: Trial, leaves: List[str], what: str) -> Optional[set]:
+    def check(t: Trial, leaves: List[str], what: str, solo: bool = False) -> Optional[set]:
         rs = in_trial(t)
         if not rs:
             missing.append(f"{what}: no gateway record of its flows")
@@ -309,7 +312,7 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
             return None
         if len(egress) != 1:
             wrong.append(f"{what}: flows under {len(egress)} egresses, not one common ancestor")
-        return {r["path_key"] for r in rs}
+        return load_keys(rs) if solo else {r["path_key"] for r in rs}
 
     egress_seen = set()
     # calibrate = first: block 1's solo runs name the leaves for every block;
@@ -322,7 +325,7 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
             keys = dict(first_keys)
         for t in [t for t in solo if t.block == b]:
             leaf = next((r["client"] for r in t.rows), "")
-            got = check(t, [leaf], f"block {b} solo {leaf} (slot {t.slot}, {t.arm})")
+            got = check(t, [leaf], f"block {b} solo {leaf} (slot {t.slot}, {t.arm})", solo=True)
             if got is None:
                 continue
             if len(got) != 1:
@@ -392,6 +395,33 @@ def bundle_evidence(campaign: str, plan: dict, loaded: List[str], control: str) 
     return missing, wrong
 
 
+# A solo calibration ran through one leaf. A stray flow of another leaf (the
+# uploader's single --providers process keeps every provider's carrier, so a
+# keepalive-sized flow can complete in another leaf's solo window) is not that
+# leaf's load: only leaves carrying at least SOLO_KEY_SHARE of the window's
+# bytes count. dcg6 voided on one 92-byte flow beside 132 flows of the solo
+# leaf. Simultaneous phases still count every key.
+SOLO_KEY_SHARE = 0.01
+
+
+def record_bytes(r: dict) -> int:
+    """Bytes a gateway flow record moved, both directions."""
+    if "bytes_from_client" in r or "bytes_to_client" in r:
+        return int(r.get("bytes_from_client", 0)) + int(r.get("bytes_to_client", 0))
+    return sum(int(v.get("Sent", 0)) + int(v.get("Received", 0)) for v in (r.get("lane_bytes") or {}).values())
+
+
+def load_keys(rs: List[dict]) -> set:
+    """The leaf keys that carried at least SOLO_KEY_SHARE of the bytes."""
+    per: Dict[str, int] = {}
+    for r in rs:
+        per[r["path_key"]] = per.get(r["path_key"], 0) + record_bytes(r)
+    total = sum(per.values())
+    if total <= 0:
+        return set(per)
+    return {k for k, v in per.items() if v >= SOLO_KEY_SHARE * total}
+
+
 def upload_evidence(campaign: str, plan: dict, ab: List[Trial], upsolo: List[Trial]) -> Tuple[List[str], List[str]]:
     """Did the upload phase run through the leaves it is about? From the
     gateway's flow records in each upload window: every flow QUIC; each solo
@@ -436,7 +466,7 @@ def upload_evidence(campaign: str, plan: dict, ab: List[Trial], upsolo: List[Tri
         if any("path_key" not in r for r in rs):
             missing.append(f"{what}: no gateway record of its leaves (needs QUEQIAO_LANE_TRACE=1)")
             continue
-        keys = {r["path_key"] for r in rs}
+        keys = load_keys(rs) if phase == "upsolo" else {r["path_key"] for r in rs}
         if len(keys) != n:
             wrong.append(f"{what}: gateway saw {len(keys)} leaf key(s), expected {n} (one relay host per leaf)")
     return missing, wrong
@@ -463,6 +493,25 @@ def calibrated_rates(solos: List[Trial], kind: str, duration: float) -> Dict[str
             by_leaf.setdefault(leaf, []).append(solo_rate(t, kind, duration))
     return {leaf: (st.median([x for x in v if x == x]) if any(x == x for x in v) else float("nan"))
             for leaf, v in by_leaf.items()}
+
+
+def capacity_rates(solos: List[Trial], kind: str, duration: float, main: str, reference: str) -> Dict[str, float]:
+    """Each leaf's capacity for the binding check. `main_median`: the main
+    arm's median usable solo rate. `max_arm_median` (dc_gate.ini [validity]
+    binding_reference): the larger of the arms' medians -- capacity belongs
+    to the path, so an arm that cannot fill a lone leaf does not lower it.
+    An arm whose median is unmeasured contributes nothing; a leaf no arm
+    measured is NaN."""
+    if reference == "main_median":
+        return calibrated_rates([t for t in solos if t.arm == main], kind, duration)
+    per_arm = [calibrated_rates([t for t in solos if t.arm == a], kind, duration) for a in sorted({t.arm for t in solos})]
+    out: Dict[str, float] = {}
+    for rates in per_arm:
+        for leaf, x in rates.items():
+            if x == x and not (out.get(leaf, float("nan")) >= x):
+                out[leaf] = x
+            out.setdefault(leaf, float("nan"))
+    return out
 
 
 def solo_table(solo: List[Trial], upsolo: List[Trial], arms: List[str], duration: float) -> List[str]:
@@ -551,7 +600,8 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
     # every block.
     once = str(dc.get("calibrate")) == "first"
     for b in sorted({t.block for t in ab}):
-        rates = calibrated_rates([t for t in solo if t.block == (1 if once else b) and t.arm == main], "bulk", duration)
+        rates = capacity_rates([t for t in solo if t.block == (1 if once else b)], "bulk", duration, main,
+                               bounds["binding_reference"])
         sim = [t.m["sim_rate"] for t in ab if t.block == b and t.arm == main]
         ok = (set(loaded) <= set(rates) and all(rates[x] == rates[x] and rates[x] > 0 for x in loaded)
               and sim and all(x == x for x in sim))
@@ -571,8 +621,8 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
         up_leaves = dc["upload_leaves"]
         up_uncal: List[int] = []
         for b in sorted({t.block for t in ab}):
-            rates = calibrated_rates([t for t in upsolo if t.block == (1 if once else b) and t.arm == main], "dc-upload",
-                                     duration)
+            rates = capacity_rates([t for t in upsolo if t.block == (1 if once else b)], "dc-upload", duration, main,
+                                   bounds["binding_reference"])
             sim = [t.m.get("up_sim_rate", float("nan")) for t in ab if t.block == b and t.arm == main]
             if not (set(up_leaves) <= set(rates) and all(rates[x] == rates[x] and rates[x] > 0 for x in up_leaves)
                     and sim and all(x == x for x in sim)):
@@ -677,7 +727,9 @@ def evaluate(campaign: str, bounds: dict) -> Tuple[str, dict]:
            "Bounds frozen in `scripts/validation/dc_gate.ini` (DESIGN-PATH-AUTHORITY.md section 11.3). Each row is a "
            f"paired per-block contrast that must be positive: one-sided {1 - a:.0%} t and bootstrap lower bounds both above zero.",
            "", f"Loaded leaves: {', '.join(loaded)}; control leaf: {control}.",
-           f"Ancestor binding (legacy simultaneous rate / sum of solo rates, mean over {len(binding)} blocks): "
+           f"Ancestor binding (legacy simultaneous rate / sum of solo rates, each leaf's the "
+           f"{'larger arm median' if bounds['binding_reference'] == 'max_arm_median' else 'main arm median'}, "
+           f"mean over {len(binding)} blocks): "
            f"{fmt(binding_mean, '.2f')} (must be <= {bounds['binding_max']:g})"
            + ("" if bound_ok else " -- **the shared ancestor did not bind: campaign VOID**")]
     if uploads:

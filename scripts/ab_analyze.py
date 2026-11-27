@@ -919,13 +919,47 @@ SECONDARY_LABELS = {
 }
 
 
-def sequential_of(plan: dict) -> "Optional[st.Sequential]":
-    s = plan.get("sequential")
+def sequential_of(plan: dict, trial: str = "") -> "Optional[st.Sequential]":
+    """The campaign's sequential design, or a trial type's own (its frozen
+    `sequential_by_type` entry) when it has one."""
+    s = ((plan.get("sequential_by_type") or {}).get(trial) if trial else None) or plan.get("sequential")
     return st.Sequential(**s) if s else None
 
 
 def decision_verdict(dec: str, interim: bool) -> str:
     return {"pass": "pass", "fail": "**FAIL**"}.get(dec, "undecided" if interim else "**FAIL**")
+
+
+def expand_rules(keys: Sequence[str], rules: Dict[str, Tuple[str, Tuple[float, ...]]], phases_here: Sequence[str],
+                 wl: Any, plan: dict) -> Tuple[Dict[str, Tuple[str, Tuple[float, ...]]], List[str]]:
+    """The rules judged on a path, and its measures without one.
+
+    "*.m" applies to measure m of every phase that ran, except the trial
+    types that declare it does not apply to them (Workload.rule_exempt: by
+    design they have no such measure). A reported measure without a rule
+    (and not report-only) leaves the workload INCOMPLETE; a configured rule
+    whose measure the extractor never produced is unmeasured, not absent
+    from the verdict."""
+    exempt = getattr(wl, "rule_exempt", {}) or {}
+    report_only = wl.report_only_for(plan) if hasattr(wl, "report_only_for") else wl.report_only
+    judged: Dict[str, Tuple[str, Tuple[float, ...]]] = {}
+    unruled: List[str] = []
+    for k in keys:
+        ph, _, metric = k.partition(".") if "." in k else ("", "", k)
+        # gates.ini keys are lowercased by configparser; match likewise.
+        rule = rules.get(k.lower()) or (rules.get(f"*.{metric.lower()}") if metric not in exempt.get(ph, ()) else None)
+        if rule:
+            judged[k] = rule
+        elif metric not in report_only:
+            unruled.append(k)
+    for rk, rule in rules.items():
+        wanted = ([f"{ph}.{rk[2:]}" for ph in phases_here if rk[2:] not in exempt.get(ph, ())]
+                  if rk.startswith("*.") else [rk])
+        have = {k.lower() for k in judged}
+        for k in wanted:
+            if k.lower() not in have and (rk.startswith("*.") or k.split(".", 1)[0] in phases_here):
+                judged[k] = rule
+    return judged, unruled
 
 
 def report(campaign: str, gates: dict, interim: bool = False,
@@ -936,11 +970,25 @@ def report(campaign: str, gates: dict, interim: bool = False,
     EFFECTIVE.clear()
     SHADOW.clear()
     sq = sequential_of(plan)
+    sq_all = sq
     cp_voids: Dict[Tuple[int, str, str], str] = {}
     all_rows = dict(trials)
     problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run, failures=failures,
                                     control_plane_max=(gates.get("harness") or {}).get("control_plane_void_max"),
                                     voids=cp_voids)
+    # A candidate decided on a trial type at a look is judged on the blocks up
+    # to that look; the type ran on for the other candidates.
+    stopped_c = dict((failures or {}).get("stopped_candidates") or {})
+    if not interim:
+        try:
+            with open(os.path.join(campaign, "status.json")) as f:
+                stopped_c.update(json.load(f).get("stopped_candidates") or {})
+        except (OSError, ValueError):
+            pass
+    for k_, n_ in stopped_c.items():
+        p_, ty, cand_ = k_.split("/", 2) if k_.count("/") >= 2 else ("", "", "")
+        trials = {k: t for k, t in trials.items()
+                  if not (t.path == p_ and getattr(t, "trial", "") == ty and t.arm == cand_ and t.block > int(n_))}
     # Contention: units void under host CPU contention are not evidence (they
     # still counted toward the cap when they ran).
     void_units, cpu_of = contention_void(campaign, plan, trials, gates.get("contention"))
@@ -1239,26 +1287,8 @@ def report(campaign: str, gates: dict, interim: bool = False,
         # rule (and not report-only) leaves the workload INCOMPLETE.
         blocks_here = sorted({t.block for t in trials.values() if t.path == path})
         keys = sorted({k for b in blocks_here for a_ in arms for k in block_measures(path, b, a_)})
-        judged_rules: Dict[str, Tuple[str, Tuple[float, ...]]] = {}
-        unruled: List[str] = []
-        for k in keys:
-            metric = k.split(".", 1)[-1]
-            # gates.ini keys are lowercased by configparser; match likewise.
-            rule = rules.get(k.lower()) or rules.get(f"*.{metric.lower()}")
-            if rule:
-                judged_rules[k] = rule
-            elif metric not in (wl.report_only_for(plan) if hasattr(wl, "report_only_for") else wl.report_only):
-                unruled.append(k)
-        # And every configured rule must find its measure: in each phase that
-        # ran on this path for a wildcard, by name otherwise. A measure the
-        # extractor never produced is unmeasured, not absent from the verdict.
         phases_here = sorted({r["phase"] for t in trials.values() if t.path == path for r in t.rows})
-        for rk, rule in rules.items():
-            wanted = [f"{ph}.{rk[2:]}" for ph in phases_here] if rk.startswith("*.") else [rk]
-            have = {k.lower() for k in judged_rules}
-            for k in wanted:
-                if k.lower() not in have and (rk.startswith("*.") or k.split(".", 1)[0] in phases_here):
-                    judged_rules[k] = rule
+        judged_rules, unruled = expand_rules(keys, rules, phases_here, wl, plan)
         if keys:
             out += ["", f"**{wl.name} measures, per block (mean over blocks), {path}**", "",
                     "| measure | " + " | ".join(arms) + " |", "|---|" + "---:|" * len(arms)]
@@ -1273,6 +1303,8 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     "| measure | rule | candidate | blocks | mean contrast | t lower bound | bootstrap lower bound | verdict |",
                     "|---|---|---|---:|---:|---:|---:|---|"]
             for key, (kind, values) in judged_rules.items():
+                # Each rule by its trial type's own design.
+                sq = sequential_of(plan, key.split(".", 1)[0]) if sq_all else None
                 for cand in arms[1:]:
                     # Every block in which this measure's trial type (its phase)
                     # ran in both arms -- a type stopped early has fewer -- the
@@ -1285,6 +1317,9 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     # evidence present or not), not every block on the path.
                     need = math.ceil(gates["secondary_min_coverage"] *
                                      (judged.get(cand, len(common)) if wl.primary else len(common)) - 1e-9)
+                    if key.split(".", 1)[-1] in getattr(wl, "paired_only", ()):
+                        # Compared only where both arms have it (Workload.paired_only).
+                        need = 2
                     measured = [(x, y) for x, y in zip(c, m) if x == x and (y == y or kind in HARD)]
                     if key in getattr(wl, "primaries", ()) and kind in RULES and m:
                         # A primary outcome: void, not judged, when too many
@@ -1381,6 +1416,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     verdicts[(path, cand, f"rule:{key}")] = verdict
                     out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {len(measured)} | "
                                f"{fmt(mean_d, '.4g')} | {fmt(tl, '.4g')} | {fmt(bl, '.4g')} | {verdict} |")
+        sq = sq_all
         for k in unruled:
             for cand in arms[1:]:
                 verdicts[(path, cand, f"rule:{k}")] = "n/a"
@@ -1492,6 +1528,28 @@ def _sample_stat(xs, stat) -> float:
     if stat == "sum":
         return float(sum(xs))
     return st.quantile(xs, stat)
+
+
+def interim_decisions_by_candidate(campaign: str, gates: dict, units_run: Optional[Sequence[Sequence[Any]]] = None,
+                                   failures: Optional[dict] = None) -> Dict[Tuple[str, str, str], List[str]]:
+    """interim_decisions, by (path, cell, candidate): each candidate's gate on a
+    trial type is decided on its own (a fail of one does not stop the type
+    for the others)."""
+    with open(os.path.join(campaign, "plan.json")) as f:
+        plan = json.load(f)
+    wl = ab_workloads.get(plan.get("workload", "bulk"))
+    _, v = report(campaign, gates, interim=True, units_run=units_run, failures=failures)
+    out: Dict[Tuple[str, str, str], List[str]] = collections.defaultdict(list)
+    incomplete = {p_ for (p_, _, k), x in v.items() if k == "primary" and x == "INCOMPLETE"}
+    for (path, cand, key), verdict in v.items():
+        if path in incomplete:
+            verdict = "INCOMPLETE"
+        if verdict == "reported":
+            continue
+        if (key == "primary" and wl.primary) or key.startswith("rule:"):
+            cell = key[5:].split(".", 1)[0] if key.startswith("rule:") and "." in key else ""
+            out[(path, cell, cand)].append({"**PASS**": "pass", "pass": "pass", "**FAIL**": "fail"}.get(verdict, "continue"))
+    return dict(out)
 
 
 def interim_decisions(campaign: str, gates: dict, units_run: Optional[Sequence[Sequence[Any]]] = None,

@@ -194,7 +194,7 @@ Adds to W1: the client is the data sender, so `mem=owned` reservations, retentio
 
 ### W4 Transactional burst, the DC gate (existing)
 
-`rpc`, one request at a time. ASR: 355 KB up, 200 B down. TTS: 300 B up, 300 KB down. Cold tunnel and warm tunnel, 20 requests per trial with 2 s spacing. Metrics and thresholds are those already fixed in design §11.3 (request latency within 10 % of legacy at median and p99). On the access-link profile the same generator is run with `BG-none` only, as a report.
+`rpc`, one request at a time, each on an absolute slot from the phase's barrier; a request whose slot comes while the previous one runs is late, and its latency is measured from its slot. ASR: 355 KB up, 200 B down. TTS: 300 B up, 300 KB down. Cold tunnel and warm tunnel, 20 requests per trial with 2 s spacing. Metrics and thresholds are those already fixed in design §11.3 (request latency within 10 % of legacy at median and p99). On the access-link profile the same generator is run with `BG-none` only, as a report.
 
 Stresses: start-up from knowledge, burst allowance, coded versus stream choice at 256 KiB, and on `dc-long-haul` the 32 MiB bulk threshold and idle veto.
 

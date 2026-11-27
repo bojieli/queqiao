@@ -10,4 +10,8 @@ import "github.com/apernet/quic-go/monotime"
 // dropped, and the pacing budget refilled once per step. On loopback the
 // path controller then settled at three packets per step (230 kB/s) and
 // stayed there. Elsewhere the call does nothing.
+//
+// It is made here, not in queqiaod's main, so that everything that links a
+// controller gets it: the daemon, the mobile core, the benchmark and the
+// tests that run on the hosted Windows runners.
 var _ = monotime.UseHighResolutionClock()

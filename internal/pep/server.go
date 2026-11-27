@@ -67,6 +67,11 @@ type ServerConfig struct {
 	// CongestionScope. Empty is connection. Path requires CCAPI v2 and
 	// Sched class.
 	CongestionScope CongestionScope
+	// EgressCapacity is the gateway's ceiling on what its path authorities
+	// send out of one interface together (docs/DESIGN-EGRESS-JOINT-LIMIT.md).
+	// The zero value is auto. A configured rate requires CongestionScope
+	// path; the limit does nothing under connection.
+	EgressCapacity EgressCapacity
 	// CodedRetry selects the coded-retry bundle; see CodedRetryMode. Empty
 	// is legacy.
 	CodedRetry CodedRetryMode
@@ -493,6 +498,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, err
 	}
 	if err := validateCongestionScope(&cfg.CongestionScope, cfg.CCAPI, cfg.Sched); err != nil {
+		return nil, err
+	}
+	if err := validateEgressCapacity(cfg.EgressCapacity, cfg.CongestionScope); err != nil {
 		return nil, err
 	}
 	if err := resolveCodedRetry(&cfg.CodedRetry, cfg.CCAPI); err != nil {
@@ -999,6 +1007,8 @@ func (s *Server) handleQUIC(ctx context.Context, conn *quic.Conn) {
 		}
 		controller = attachPathController(conn, congestionConfig{
 			kind: s.cfg.Congestion, ccAPI: s.cfg.CCAPI, sched: s.cfg.Sched, scope: s.cfg.CongestionScope,
+			// A gateway's authorities share their interface's joint limit.
+			egress: &s.cfg.EgressCapacity,
 			// No hierarchicalPath: the tree is a client's (§11.3). The
 			// gateway's authorities take no tree view, as the legacy gateway
 			// had no tree; no gate judges one (#235).

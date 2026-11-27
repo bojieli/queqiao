@@ -774,3 +774,29 @@ func TestTUICProbeRTTSkipEvidence(t *testing.T) {
 		t.Fatal("a window met after the catch-up did not count as filling")
 	}
 }
+
+// The path authority's law holds half a bandwidth-delay product through
+// ProbeRTT, as BBRv2 and v3 do; a per-connection sender keeps four packets.
+func TestProbeRTTWindowIsHalfAProductUnderThePathLawOnly(t *testing.T) {
+	const bw, rtt = 2_500_000, 120 * time.Millisecond // 20 Mbit/s
+	for _, c := range []struct {
+		name   string
+		sender *TUICBBRSender
+		want   quiccongestion.ByteCount
+	}{
+		{"path law", newPathLaw(1200, nil).inner, bw * 120 / 1000 / 2},
+		{"per-connection", NewTUICBBRSender(1200), 4 * 1200},
+	} {
+		b := c.sender
+		b.estimator.maxFilter.updateMax(1, base(), bw)
+		b.minRTT = rtt
+		b.mode = tuicBbrProbeRTT
+		if got := b.GetCongestionWindow(); got != c.want {
+			t.Errorf("%s: ProbeRTT window %d, want %d", c.name, got, c.want)
+		}
+	}
+	// With no estimate there is no product to take half of.
+	if got := newPathLaw(1200, nil).inner.probeRTTCwnd(); got != 4*1200 {
+		t.Errorf("path law without an estimate: ProbeRTT window %d, want four packets", got)
+	}
+}

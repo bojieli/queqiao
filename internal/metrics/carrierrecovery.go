@@ -38,6 +38,9 @@ const (
 	CarrierTCPHandoff
 	// CarrierPathProbe: a path-return probe was sent on a silent carrier.
 	CarrierPathProbe
+	// CarrierSilentDeath: a carrier with flows was ended by the manager's
+	// wall-clock silence bound rather than by its transport's idle timeout.
+	CarrierSilentDeath
 	// CarrierRecoveryEvents is how many events there are.
 	CarrierRecoveryEvents
 )
@@ -55,6 +58,7 @@ var carrierRecoveryMetrics = [CarrierRecoveryEvents]string{
 	"queqiao_carrier_binding_deadline_failures_total",
 	"queqiao_carrier_tcp_handoffs_total",
 	"queqiao_carrier_path_probes_total",
+	"queqiao_carrier_silent_deaths_total",
 }
 
 // CarrierRecovery records one carrier-manager event.

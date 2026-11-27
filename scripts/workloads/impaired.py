@@ -15,8 +15,8 @@ impairment, one trial per arm per block in random order:
   +200 ms RTT; judged as the campaign in `<campaign>/idle-wake` by
   [workload:idle-wake].
 
-Each trial: the W5 LLM loop (5 turns), W6 keystrokes without bursts, and one
-bulk download of 4 MiB objects for the whole window.
+Each trial: the LLM swarm (4 x 10 turns), W6 keystrokes without bursts, and 30
+short downloads of 1 MiB across the window.
 
 Gated on reliability, each pre-registered and one-sided ([workload:impaired]
 in gates.ini, plus the [secondary] bounds of flow completion and stalls):
@@ -55,8 +55,8 @@ TRIAL_SECONDS = {"slow-lossy": 120, "blackhole": 120, "policed": 120}
 TRIAL_TYPES = tuple(TRIAL_SECONDS)
 WAKE_SCENARIO = "idle-wake-lossy"
 LEAD = 5                    # the foreground starts this long after the download
-BULK_OBJECT = 4 << 20       # each short download's object
-FETCHES = 8                 # short downloads per trial, sequential, one started every window/8 (or after the last)
+BULK_OBJECT = 1 << 20       # each short download's object
+FETCHES = 30                # short downloads per trial, sequential, one started every window/30 (or after the last)
 FETCH_TIMEOUT = 30          # a download not done in this long failed (a 25 s outage fits inside)
 # The LLM swarm: AGENTS concurrent loops of TURNS turns, short responses, so
 # a trial has AGENTS x TURNS calls: enough opportunities for the pooled
@@ -71,6 +71,14 @@ OUTAGE_JITTER = (10.0, 5.0)
 # A call is clear of the outages when it neither starts nor runs within an
 # outage or the CLEAR_AFTER seconds after it ends.
 CLEAR_AFTER = 5.0
+# Background transfers in flight across the outages (blackhole): a download
+# and an upload, each object after object, a failed object followed by the
+# next one (each failure recorded), with a socket timeout per scenario well
+# above its longest scripted outage (25 s), so a transfer fails only when
+# the tunnel does not resume, not because the outage outlasted the client.
+BG_DOWN_OBJECT = 4 << 20
+BG_UP_OBJECT = 2 << 20
+BG_IO_TIMEOUT = {"blackhole": 60.0}
 AGENTS = 4
 TURNS = 10
 DELTAS = 100
@@ -250,6 +258,148 @@ def after_restore(outages, recs, end) -> List[float]:
     return out
 
 
+def window_end(trial, ph) -> Optional[float]:
+    """The trial window's end on the client host's clock: the first short
+    download starts with the window, which lasts TRIAL_SECONDS[ph]."""
+    starts = [float(r["t_start"]) for r in trial.rows
+              if r["phase"] == ph and r["kind"] == "imp-fetch" and r.get("flow") == "w1r1" and r.get("t_start")]
+    return min(starts) + TRIAL_SECONDS[ph] if starts else None
+
+
+def echo_samples(trial, ph) -> List[float]:
+    """Keystroke echo times, a broken session included: a keystroke the
+    session did not echo (wlclient lists them last, `unanswered` of them,
+    censored at the session's end) is censored instead at the trial
+    window's end -- its echo time is from when it was sent to then -- so a
+    session that broke counts against its arm rather than leaving the
+    measure unmeasured. Adopted before imp3's first look, outcome-blind."""
+    out: List[float] = []
+    end = window_end(trial, ph)
+    for s in getattr(trial, "records", []):
+        if s.get("_phase") != ph or s.get("kind") != "term":
+            continue
+        keys = s.get("keys") or []
+        n_open = int(s.get("unanswered") or 0)
+        answered = keys[:len(keys) - n_open] if n_open else keys
+        out += [float(e) for _, e in answered]
+        if n_open and end is not None and s.get("t0") is not None:
+            # Key send times are seconds from the session's start (t0).
+            out += [max(float(e), end - float(s["t0"]) - float(sent)) for sent, e in keys[len(keys) - n_open:]]
+        elif n_open:
+            out += [float(e) for _, e in keys[len(keys) - n_open:]]
+    return out
+
+
+def resume_by_kind(outages, recs, end, direction) -> List[Optional[float]]:
+    """Per outage: seconds from its end until the background flow of this
+    direction ("down", "up") moved a byte again, if that flow was alive when
+    the outage began (its timeline started before it and had not ended);
+    None when it was not. One that never moved again before the next outage
+    or the trial's end is censored there."""
+    flows = [[(float(a), float(b)) for a, b in r["samples"]] for r in recs
+             if r.get("kind") == "bgprog" and r.get("dir") == direction and r.get("samples")]
+    out: List[Optional[float]] = []
+    for k, (s, e) in enumerate(outages):
+        nxt = outages[k + 1][0] if k + 1 < len(outages) else end
+        worst: Optional[float] = None
+        for smp in flows:
+            if smp[0][0] > s or smp[-1][0] < s:
+                continue                         # not alive when the outage began
+            at_end = max((b for a, b in smp if a <= e), default=0.0)
+            moved = next((a for a, b in smp if a > e and b > at_end), None)
+            x = (min(moved, nxt) if moved is not None else nxt) - e
+            worst = x if worst is None else max(worst, x)
+        out.append(worst)
+    return out
+
+
+def never_resumed(outages, recs, end) -> int:
+    """Background flows alive at an outage's start that never moved a byte
+    again before the next outage or the trial's end (each a failure)."""
+    n = 0
+    for direction in ("down", "up"):
+        for k, x in enumerate(resume_by_kind(outages, recs, end, direction)):
+            nxt = outages[k + 1][0] if k + 1 < len(outages) else end
+            if x is not None and x >= nxt - outages[k][1] - 1e-9:
+                n += 1
+    return n
+
+
+def bg_transfers(trial, ph) -> Tuple[int, int]:
+    """(failed, attempted) background transfers in a trial: every object a
+    background download or upload attempted, the one the window's end cut
+    left out; a failure is a send or receive error or socket timeout, or a
+    non-200 answer. Each flow that never resumed after an outage adds a
+    failure (and an attempt)."""
+    rows = [r for r in trial.rows if r["phase"] == ph and r["kind"] in ("wl-bgdown", "wl-bgup")]
+    tried = [r for r in rows if r.get("curl_exit") != "28"]
+    failed = sum(1 for r in tried if r.get("curl_exit") != "0" or r.get("http") != "200")
+    ev = next((r for r in getattr(trial, "records", []) if r.get("_phase") == ph and r.get("kind") == "impair"
+               and not r.get("fail")), None)
+    stuck = 0
+    if ev and ev.get("outages"):
+        trecs = [r for r in getattr(trial, "records", []) if r.get("_phase") == ph]
+        stuck = never_resumed(ev["outages"], trecs, trial_end(ev["outages"], trecs))
+    return failed + stuck, len(tried) + stuck
+
+
+CREDIT_AFTER = 5.0          # seconds after an outage's end that count as its restore window
+
+
+def credit_windows(trial, ph) -> Dict[str, Any]:
+    """The trial's credit-delay histogram per window, pooled over its
+    endpoints, from the per-second samples (credit_ts records): each
+    interval's increments go to the window its end falls in -- "outage"
+    (within an outage), "after" (the CREDIT_AFTER s after one) or "clear".
+    A credit wait is counted when it ends, so one spanning an outage lands
+    at the restore. Times are each host's clock; the outages are the client
+    host's (hosts keep NTP time). None per window without samples."""
+    import generic_metrics as gm
+    ev = next((r for r in getattr(trial, "records", []) if r.get("_phase") == ph and r.get("kind") == "impair"
+               and not r.get("fail")), None)
+    outs = (ev or {}).get("outages") or []
+
+    def window(t):
+        for s, e in outs:
+            if s <= t <= e:
+                return "outage"
+            if e < t <= e + CREDIT_AFTER:
+                return "after"
+        return "clear"
+    hists: Dict[str, List[Any]] = {"clear": [], "outage": [], "after": []}
+    recs = [r for r in getattr(trial, "records", []) if r.get("_phase") == ph and r.get("kind") == "credit_ts"]
+    if not recs:
+        return {k: None for k in hists}
+    for r in recs:
+        smp = r.get("samples") or []
+        for (t0, h0), (t1, h1) in zip(smp, smp[1:]):
+            les = sorted(h1, key=lambda le: float("inf") if le == "+Inf" else float(le))
+            inc = [(float("inf") if le == "+Inf" else float(le), max(0.0, h1[le] - h0.get(le, 0.0))) for le in les]
+            hists[window(float(t1))].append(inc)
+    out: Dict[str, Any] = {}
+    for k, hs in hists.items():
+        if not hs:
+            # Samples, but none in this window: an empty histogram.
+            out[k] = [(le, 0.0) for le, _ in (hists["clear"] or hists["outage"] or hists["after"])[0]]
+            continue
+        out[k] = gm.pool(hs)
+    return out
+
+
+def fetch_attempts(trials, ph) -> Tuple[int, int]:
+    """(failed, attempted) short downloads over the trials, pooled: a download
+    the window's end cut was not a fair attempt and is left out."""
+    failed = tried_n = 0
+    for t in trials:
+        rows = [r for r in t.rows if r["phase"] == ph and r["kind"] == "imp-fetch"]
+        cut = {f"w1r{r.get('k')}" for r in getattr(t, "records", [])
+               if r.get("_phase") == ph and r.get("kind") == "fetch" and r.get("window_cut")}
+        tried = [r for r in rows if not (r["flow"] in cut and r.get("curl_exit") == "28")]
+        tried_n += len(tried)
+        failed += sum(1 for r in tried if r.get("complete") != "1")
+    return failed, tried_n
+
+
 def fetch_completion(trials, ph) -> float:
     """Completed over attempted short downloads, per trial, averaged: a
     download the window's end cut (curl's timeout while its limit was the
@@ -279,22 +429,45 @@ class Impaired(mn.Minimal):
     under its scenario; D (idle-wake-lossy) beside them."""
     name = "impaired"
     impairs = True
+    # Each endpoint's credit-delay histogram sampled about once a second
+    # through every trial (Campaign.start_credit_sampler).
+    credit_sampling = True
+    # Wildcard rules that do not apply to a type: blackhole judges TTFT as
+    # ttft_clear_p99_s and ttft_after_restore_s instead (#239).
+    rule_exempt = {"blackhole": ("ttft_net_p99_s", "fetch_failures")}
     trials_per_arm = 1
     primaries: Tuple[str, ...] = ()
     # Flow completion is the trial's own (completed / attempted short
     # downloads), not the generic single-flow one.
     generic = {t: ("stalls_per_trial",) for t in TRIAL_TYPES}
-    report_only = ("goodput_bps", "ttft_net_p50_s", "ttft_all_p99_s", "echo_p50_s", "recover_8s_s", "recover_25s_s",
-                   "reopen_ttfb_8s_s", "reopen_ttfb_25s_s", "inflight_ttfb_8s_s", "inflight_ttfb_25s_s")
+    report_only = ("completion", "goodput_bps", "ttft_net_p50_s", "ttft_all_p99_s", "echo_p50_s", "recover_8s_s", "recover_25s_s",
+                   "reopen_ttfb_8s_s", "reopen_ttfb_25s_s", "inflight_ttfb_8s_s", "inflight_ttfb_25s_s",
+                   "inflight_ttfb_s", "bg_transfer_failures", "fetch_failures",
+                   "credit_delay_outage_p95_s", "credit_delay_after_p95_s")
+    # Measures compared only in the blocks where both arms have them (a flow
+    # kind alive at an outage's start in both): the coverage rule asks for
+    # two such blocks, not every block.
+    paired_only = ("resume_download_s", "resume_upload_s")
 
     def generics(self, plan):
-        return dict(self.generic)
+        """At stage 10 (`[workload:impaired] stage = 10`) sender-side credit
+        delay p95 is also a rule of every trial type ([secondary] bound)."""
+        if mn.campaign_stage(plan) < 10:
+            return dict(self.generic)
+        # Blackhole judges credit delay clear of its outages instead
+        # (credit_delay_clear_p95_s, from the per-second samples).
+        return {ph: ks + (() if ph == "blackhole" else ("credit_delay_p95_s",)) for ph, ks in self.generic.items()}
 
     def report_only_for(self, plan):
-        return self.report_only
+        return self.report_only + (("false_promotion_rate",) if mn.campaign_stage(plan) >= 10 else ())
 
     def reported(self, plan):
-        return {}
+        # The shadow false-promotion rate is reported at stage 10 (it needs
+        # --carrier-shadow on every endpoint), never gated here.
+        if mn.campaign_stage(plan) < 10:
+            return {}
+        return {ph: ("false_promotion_rate",) + (("credit_delay_p95_s",) if ph == "blackhole" else ())
+                for ph in self.generic}
 
     def read(self, cfg, p):
         cfg.scenario_udp_port = int(p.get("udp_port", "23487"))
@@ -304,7 +477,10 @@ class Impaired(mn.Minimal):
         if bad or not trials or len(set(trials)) != len(trials):
             raise ab.ConfigError(f"[workload:impaired] trials: want some of {', '.join(TRIAL_TYPES)}, each once")
         cfg.minimal_trials = [t for t in TRIAL_TYPES if t in trials]
-        cfg.minimal_stage = 7
+        stage = p.get("stage", "7").strip()
+        if stage not in ("7", "10"):
+            raise ab.ConfigError("[workload:impaired] stage: 7 or 10 (10 adds credit delay to the rules)")
+        cfg.minimal_stage = int(stage)
         iw = p.get("idle_wake", "true").strip().lower()
         if iw not in ("true", "false"):
             raise ab.ConfigError("[workload:impaired] idle_wake: true or false")
@@ -323,6 +499,11 @@ class Impaired(mn.Minimal):
 
     def trial_seconds(self, cfg, path, trial):
         return float(TRIAL_SECONDS[trial])
+
+    def type_sequential(self, cfg, trial):
+        # Blackhole's restore measures need more blocks to decide: looks
+        # after blocks 6..12 at the campaign's alpha spending (v5).
+        return (6, 12) if trial == "blackhole" else None
 
     def impairment(self, cfg, trial):
         return trial if trial in TRIAL_SECONDS else ""
@@ -345,7 +526,7 @@ class Impaired(mn.Minimal):
 
     def objects(self, cfg):
         return [(f"obj-{BULK_OBJECT}", BULK_OBJECT), (f"obj-{PROBE_BYTES}", PROBE_BYTES),
-                (f"obj-{cfg.object_bytes}", cfg.object_bytes)]
+                (f"obj-{BG_DOWN_OBJECT}", BG_DOWN_OBJECT), (f"obj-{cfg.object_bytes}", cfg.object_bytes)]
 
     def llm_swarm(self) -> dict:
         # W5's call shape with short responses (100 deltas, 25 ms apart):
@@ -366,8 +547,9 @@ class Impaired(mn.Minimal):
                 # Flows in flight across the outages (a download and a long
                 # upload, each with a progress timeline), probes for the
                 # recovery and for new connections, and the outages.
-                jobs += [w.Job(c, "wl-bgdown", 1, load=False),
-                         w.Job(c, "wl-bgup", 1, load=False, params={"object_bytes": cfg.scenario_upload_object}),
+                bg = {"io_timeout": BG_IO_TIMEOUT[t], "continue_after_failure": True}
+                jobs += [w.Job(c, "wl-bgdown", 1, load=False, params=dict(bg, object_bytes=BG_DOWN_OBJECT)),
+                         w.Job(c, "wl-bgup", 1, load=False, params=dict(bg, object_bytes=BG_UP_OBJECT)),
                          w.Job(c, "imp-probe", 1, load=False),
                          w.Job(c, "impair-outages", 1, params={"scenario": t})]
             out.append(w.Phase(t, secs, jobs))
@@ -401,7 +583,17 @@ class Impaired(mn.Minimal):
         return True
 
     def block_tails(self, trials, plan):
-        out: Dict[str, Tuple[Optional[float], List[float]]] = {}
+        # The generic secondaries' pooled evidence (credit delay histograms,
+        # promotion counts), then this workload's own tails.
+        out: Dict[str, Tuple[Optional[float], List[float]]] = dict(mn.Minimal.block_tails(self, trials, plan))
+        # Blackhole's credit delay clear of the outages, pooled over blocks
+        # when sparse.
+        bt = [t for t in trials if getattr(t, "trial", "") == "blackhole"]
+        if bt:
+            import generic_metrics as gm
+            h = gm.pool([credit_windows(t, "blackhole")["clear"] for t in bt])
+            if h is not None:
+                out["blackhole.credit_delay_clear_p95_s"] = (0.95, gm.Tail(h))
         for ph in TRIAL_TYPES:
             pt = [t for t in trials if getattr(t, "trial", "") == ph]
             if not pt:
@@ -416,7 +608,7 @@ class Impaired(mn.Minimal):
                 out[f"{ph}.ttft_clear_p99_s"] = (0.99, [c["ttft"] - c["T"] for c in clear_calls(pt, ph)])
             else:
                 out[f"{ph}.ttft_net_p99_s"] = (0.99, ttft)
-            out[f"{ph}.echo_p99_s"] = (0.99, pa.term_samples([r for r in recs if r.get("kind") == "term"])["a"])
+            out[f"{ph}.echo_p99_s"] = (0.99, [x for t in pt for x in echo_samples(t, ph)])
         return out
 
     def block_events(self, trials, plan) -> Dict[str, Tuple[int, int]]:
@@ -433,6 +625,15 @@ class Impaired(mn.Minimal):
             sessions = [r for r in recs if r.get("kind") in ("llm", "term")]
             out[f"{ph}.call_failures"] = (sum(1 for r in llm if r.get("fail")), len(llm))
             out[f"{ph}.silent_rate"] = (silent_deaths(recs), len(sessions))
+            out[f"{ph}.fetch_failures"] = fetch_attempts(pt, ph)
+            if ph == "blackhole":
+                bg = [bg_transfers(t, ph) for t in pt]
+                out[f"{ph}.bg_transfer_failures"] = (sum(f for f, _ in bg), sum(n for _, n in bg))
+                # Blackhole judges every transfer together (v5): the short
+                # downloads and the background objects, pooled.
+                ff, fn = fetch_attempts(pt, ph)
+                out[f"{ph}.transfer_failures"] = (ff + out[f"{ph}.bg_transfer_failures"][0],
+                                                  fn + out[f"{ph}.bg_transfer_failures"][1])
         return out
 
     def phase_measures(self, ph, recs, rows, trials):
@@ -441,12 +642,15 @@ class Impaired(mn.Minimal):
         lm = pa.llm_metrics(llm)
         ok = [c for c in llm if not c.get("fail")]
         ttft = [c["ttft"] - c["T"] for c in ok if c.get("ttft") is not None]
-        echo = pa.term_samples([r for r in recs if r.get("kind") == "term"])["a"]
+        echo = [x for t in trials for x in echo_samples(t, ph)]
         secs = TRIAL_SECONDS.get(ph, 0)
         got = sum(int(r["bytes"] or 0) for r in rows if r["kind"] == "imp-fetch" and r.get("http") == "200")
         sessions = [r for r in recs if r.get("kind") in ("llm", "term")]
         m: Dict[str, float] = {
             "completion": fetch_completion(trials, ph),
+            # Judged as a pooled event rate (gates.ini `events`); completion
+            # itself is reported.
+            "fetch_failures": (lambda f, n: f / n if n else nan)(*fetch_attempts(trials, ph)),
             "call_failures": lm.get("call_failures", nan),
             "silent_rate": silent_deaths(recs) / len(sessions) if sessions else nan,
             "ttft_net_p50_s": st.quantile(ttft, 0.5),
@@ -503,4 +707,27 @@ class Impaired(mn.Minimal):
                 for k, label in ((0, "8s"), (1, "25s")):
                     xs = [x[k] for x in per if len(x) > k]
                     m[f"{name}_{label}_s"] = sum(xs) / len(xs) if xs else nan
+            # Resume per flow kind, the worse outage: a block's value only
+            # when that flow was alive at an outage's start (the analyzer
+            # compares a kind only in blocks where both arms have it).
+            for direction, key in (("down", "resume_download_s"), ("up", "resume_upload_s")):
+                per_k = []
+                for t in trials:
+                    ev = next((r for r in getattr(t, "records", []) if r.get("_phase") == ph and
+                               r.get("kind") == "impair" and not r.get("fail")), None)
+                    trecs = [r for r in getattr(t, "records", []) if r.get("_phase") == ph]
+                    xs = ([x for x in resume_by_kind(ev["outages"], trecs, trial_end(ev["outages"], trecs), direction)
+                           if x is not None] if ev and ev.get("outages") else [])
+                    per_k.append(max(xs) if xs else nan)
+                m[key] = sum(per_k) / len(per_k) if per_k and all(x == x for x in per_k) else nan
+            bg = [bg_transfers(t, ph) for t in trials]
+            m["bg_transfer_failures"] = (sum(f for f, _ in bg) / sum(n for _, n in bg)
+                                         if sum(n for _, n in bg) else nan)
+            import generic_metrics as gm
+            for win in ("clear", "outage", "after"):
+                h = gm.pool([credit_windows(t, ph)[win] for t in trials])
+                m[f"credit_delay_{win}_p95_s"] = gm.quantile(0.95, h)
+            ff, fn = fetch_attempts(trials, ph)
+            bf, bn = sum(f for f, _ in bg), sum(n for _, n in bg)
+            m["transfer_failures"] = (ff + bf) / (fn + bn) if fn + bn else nan
         return m

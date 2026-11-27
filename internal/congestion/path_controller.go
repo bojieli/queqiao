@@ -103,6 +103,11 @@ type PathController struct {
 	// unpublished says the estimator observed fates since its figures were
 	// last published.
 	unpublished bool
+	// egress is the controller's seat in its gateway's joint egress limit
+	// (docs/DESIGN-EGRESS-JOINT-LIMIT.md §3), nil when it has none.
+	// appLimitedTotal is the unused-opportunity time, cumulative.
+	egress          *EgressMember
+	appLimitedTotal time.Duration
 	// flightGauge mirrors flight for telemetry readers.
 	flightGauge atomic.Int64
 	// datagrams is the loss estimator over datagram-bearing samples only,
@@ -148,6 +153,10 @@ type fateRecord struct {
 	fate fate
 	// datagram says the packet carried a DATAGRAM frame.
 	datagram bool
+	// epoch and class are the law's rate epoch the packet was sent in
+	// (rateCorrelation).
+	epoch uint64
+	class lossClass
 }
 
 type heldLoss struct {
@@ -196,6 +205,9 @@ const (
 	// pathProbeWindowPackets is a PROBING attachment's own window for
 	// ordinary packets (§4.4).
 	pathProbeWindowPackets = 2
+	// pathProbeIntervalFloor is the least time between renewals of a
+	// PROBING attachment's probe allowance (probeFits).
+	pathProbeIntervalFloor = 250 * time.Millisecond
 	// pathProbingPTOProbes is how many PTO probes an attachment may send
 	// without transport progress before it is PROBING: its flight then
 	// leaves the sum, so a connection whose packets are no longer being
@@ -263,6 +275,7 @@ func (c *PathController) accrue(now monotime.Time) {
 		}
 		if now.After(start) {
 			c.unusedTime += now.Sub(start)
+			c.appLimitedTotal += now.Sub(start)
 		}
 	}
 	if now.After(c.accruedAt) {
@@ -313,6 +326,32 @@ func (c *PathController) Attach(rekey func(oldLocal, newLocal, oldRemote, newRem
 	return a
 }
 
+// JoinEgress seats the controller in g, the joint limit of the interface it
+// sends out of, or takes it out of every group when g is nil. A gateway's
+// controllers join; a client's never do.
+func (c *PathController) JoinEgress(g *EgressLimit) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.egress != nil && (g == nil || c.egress.g != g) {
+		c.egress.Leave()
+		c.egress = nil
+		c.law.egress.Store(nil)
+	}
+	if g != nil && c.egress == nil {
+		c.egress = g.Join()
+		c.law.egress.Store(c.egress)
+	}
+}
+
+// reportEgress publishes the law's figures to the group, which ticks when a
+// window has passed.
+func (c *PathController) reportEgress(now monotime.Time) {
+	if c.egress == nil {
+		return
+	}
+	c.egress.report(now, int64(max(c.law.uncappedBandwidth(), 0)), c.law.inner.minRoundTrip(), c.appLimitedTotal)
+}
+
 // Attachments is the number of attachments currently attached.
 func (c *PathController) Attachments() int { return int(c.attached.Load()) }
 
@@ -346,6 +385,10 @@ func (c *PathController) Telemetry() ControllerTelemetry {
 	t.Authority = c.id
 	// The counted flight, not the sampler's last view of it.
 	t.BytesInFlight = uint64(max(c.flightGauge.Load(), 0))
+	if m := c.law.egress.Load(); m != nil {
+		t.EgressShare = m.Share()
+		t.EgressCeiling, _ = m.g.Ceiling()
+	}
 	return t
 }
 
@@ -528,9 +571,18 @@ func (c *PathController) advance(now monotime.Time) {
 		switch r.fate {
 		case fateDelivered:
 			c.law.estimator.ObserveOutcome(true)
+			c.law.corr.observe(r.epoch, r.class, r.sent, false)
+			if c.egress != nil {
+				c.egress.decided.Add(1)
+			}
 			c.unpublished = true
 		case fateLost:
 			c.law.estimator.ObserveOutcome(false)
+			c.law.corr.observe(r.epoch, r.class, r.sent, true)
+			if c.egress != nil {
+				c.egress.decided.Add(1)
+				c.egress.lost.Add(1)
+			}
 			c.unpublished = true
 		default:
 			c.law.estimator.Break()
@@ -1065,7 +1117,7 @@ func (c *PathController) claimantCanSend(o *PathAttachment, now monotime.Time, t
 		debt = pathControlDebtPackets * c.maxPacket
 	}
 	if o.probing {
-		if o.gauge+size > pathProbeWindowPackets*c.maxPacket {
+		if !c.probeFits(o, now, size) {
 			return false
 		}
 	} else if c.flight+size > c.law.GetCongestionWindow()+debt {
@@ -1099,7 +1151,7 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 	// The packet must fit: refused if the flight after it would exceed the
 	// window (§4.3), or, on a CONTROL turn, the window plus the debt.
 	if a.probing {
-		if a.gauge+maxBytes > pathProbeWindowPackets*c.maxPacket {
+		if !c.probeFits(a, now, maxBytes) {
 			c.markWindow(a, true)
 			a.unable = true
 			c.stats.refusedWindow.Add(1)
@@ -1129,7 +1181,47 @@ func (c *PathController) admissible(a *PathAttachment, now monotime.Time, turn q
 		}
 		borrowed = true
 	}
+	if a.probing && a.gauge+maxBytes > pathProbeWindowPackets*c.maxPacket {
+		// Admitted on the probe allowance (probeFits): it is spent.
+		if a.probeAt.IsZero() || now.Sub(a.probeAt) >= c.probeInterval() {
+			a.probeAt, a.probeSent = now, 0
+		}
+		a.probeSent += maxBytes
+	}
 	return borrowed, nil
+}
+
+// probeInterval is how often a PROBING attachment's probe allowance is
+// renewed: a smoothed round trip, and no less than pathProbeIntervalFloor.
+func (c *PathController) probeInterval() time.Duration {
+	return max(c.rtt.SmoothedRTT(), pathProbeIntervalFloor)
+}
+
+// probeFits says whether a PROBING attachment may send an ordinary packet of
+// size now (§4.4): while its own gauge is under the probe window, or else
+// within an allowance of one probe window per probe interval.
+//
+// The gauge alone is not enough. An attachment demoted in the middle of a
+// transfer carries everything it had outstanding, far more than the probe
+// window, and none of it is acknowledged or declared lost while the path is
+// away, so by its gauge it could never send an ordinary packet again. Its
+// only ack-eliciting packets were then the transport's own probe timeouts,
+// which back off: after an 8 s outage a gateway serving downloads sent
+// nothing of its own for another 5.5 s, until its 13.5 s timeout, while it
+// answered the client's path-return probes with bare acknowledgements once a
+// second. With the allowance, the first packet the returning path delivers
+// to it prompts a send, that packet is acknowledged a round trip later, and
+// the attachment is COUNTED again.
+func (c *PathController) probeFits(a *PathAttachment, now monotime.Time, size quiccongestion.ByteCount) bool {
+	window := pathProbeWindowPackets * c.maxPacket
+	if a.gauge+size <= window {
+		return true
+	}
+	sent := a.probeSent
+	if a.probeAt.IsZero() || now.Sub(a.probeAt) >= c.probeInterval() {
+		sent = 0
+	}
+	return sent+size <= window
 }
 
 func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []func() {
@@ -1163,6 +1255,9 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 		}
 	}
 	c.law.recordInFlight(c.flight)
+	if c.egress != nil && s.AckEliciting {
+		c.egress.sent.Add(byteTotal(s.Bytes))
+	}
 	sample := !a.probing && s.Space == quiccongestion.SpaceApplication && s.AckEliciting && s.InFlightCounted &&
 		(s.Kind == quiccongestion.KindOrdinary || s.Kind == quiccongestion.KindPTOProbe)
 	switch {
@@ -1170,7 +1265,8 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 		pseq := c.nextPseq
 		c.nextPseq++
 		key := packetKey{space: s.Space, number: s.Number}
-		c.ring = append(c.ring, fateRecord{att: a, key: key, sent: now, datagram: s.HasDatagram})
+		epoch, class := c.law.sendEpoch(now)
+		c.ring = append(c.ring, fateRecord{att: a, key: key, sent: now, datagram: s.HasDatagram, epoch: epoch, class: class})
 		a.pkts[key] = sampleRef{pseq: pseq, bytes: s.Bytes}
 		c.stats.samples.Add(1)
 		// The sampler's pre-send flight is the path's before this packet.
@@ -1374,6 +1470,7 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		after := c.law.Telemetry()
 		a.bankCounters(&after, &before)
 	}
+	c.reportEgress(now)
 	var wakes []func()
 	if c.flight < before || c.law.GetCongestionWindow() > windowBefore {
 		wakes = c.collectBlocked(a, wakes)
@@ -1443,6 +1540,10 @@ type PathAttachment struct {
 	epoch   uint64
 	gauge   quiccongestion.ByteCount
 	probing bool
+	// probeSent is what a PROBING attachment has been admitted on its probe
+	// allowance since probeAt (probeFits).
+	probeSent quiccongestion.ByteCount
+	probeAt   monotime.Time
 	// drained says the client promoted a replacement over this attachment's
 	// connection (§10.2): it is PROBING for good, and transport progress no
 	// longer returns it to COUNTED (§4.4).

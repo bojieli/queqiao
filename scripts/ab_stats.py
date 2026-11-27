@@ -611,14 +611,18 @@ def events_decision(blocks: Sequence[Tuple[Tuple[int, int], Tuple[int, int]]], m
     fail: the candidate's count is significantly above main's rate plus the
           margin (exact binomial, upper tail <= alpha), or the permutation
           check finds it worse (p <= alpha) by more than the margin;
-    otherwise undecided ("continue"; at the cap, "fail"). Fewer opportunities
-    than min_opps in either arm: unmeasured ("n/a"; "continue" before the
-    cap)."""
+    otherwise undecided ("continue"; at the cap, "fail"). Fewer candidate
+    opportunities than min_opps, or no opportunity in main at all: unmeasured
+    ("n/a"; "continue" before the cap). The minimum is judged on the
+    candidate's count because it is the candidate's rate the rule tests;
+    sequential stopping gives the two arms different opportunity counts, and
+    holding the slower arm to the same minimum would leave the rule unmeasured
+    for good whenever the arms run at different speeds."""
     ec = sum(c[0] for c, _ in blocks); nc = sum(c[1] for c, _ in blocks)
     em = sum(m[0] for _, m in blocks); nm = sum(m[1] for _, m in blocks)
     info = {"ec": ec, "nc": nc, "em": em, "nm": nm, "diff": float("nan"), "p_ni": float("nan"),
             "p_inf": float("nan"), "p_worse": float("nan")}
-    if nc < min_opps or nm < min_opps:
+    if nc < min_opps or nm == 0:
         return ("n/a" if final else "continue"), info
     pm = em / nm
     p0 = min(1.0, pm + margin)

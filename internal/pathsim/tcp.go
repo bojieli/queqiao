@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +32,10 @@ type TCPRelay struct {
 
 	upstream   direction
 	downstream direction
+
+	// blackhole holds every byte and every new connection while it is set
+	// (SetBlackhole).
+	blackhole atomic.Bool
 
 	mu     sync.Mutex
 	closed bool
@@ -63,6 +68,43 @@ func NewTCP(listen, target string, cfg Config) (*TCPRelay, error) {
 
 func (r *TCPRelay) LocalAddr() string { return r.listener.Addr().String() }
 
+// SetBlackhole drops the path, or restores it, for everything crossing the
+// relay in both directions.
+//
+// A blackhole is the one loss a stream relay can emulate honestly, because
+// nothing has to be removed from the stream: while it is set no byte is
+// forwarded and no new connection reaches the target, and what was held is
+// delivered, in order, when the path returns. That is what the kernel's TCP
+// makes of a path that drops everything and comes back, with one difference:
+// the kernel retransmits on a timer that backs off, so on a real path a
+// connection moves again some time after the restore, where here it moves at
+// once. A connection opened into the blackhole is accepted by the relay's
+// own kernel, so the caller's connect succeeds and whatever it does next
+// (a TLS handshake, a JOIN) times out, as a dial into a dropped path does.
+//
+// It exists so that a client with a TCP fallback can be tested across an
+// outage beside a UDP relay on the same address and port (the two port
+// spaces are separate): on a real deployment the gateway is reachable both
+// ways, and an outage takes both.
+func (r *TCPRelay) SetBlackhole(on bool) { r.blackhole.Store(on) }
+
+// tcpBlackholePoll is how often something held by a blackhole looks for the
+// path's return.
+const tcpBlackholePoll = 5 * time.Millisecond
+
+// waitPath blocks while the relay is a blackhole; it reports false if the
+// relay closed first.
+func (r *TCPRelay) waitPath() bool {
+	for r.blackhole.Load() {
+		select {
+		case <-r.done:
+			return false
+		case <-time.After(tcpBlackholePoll):
+		}
+	}
+	return true
+}
+
 func (r *TCPRelay) Stats() (up, down Stats) { return r.upstream.stats(), r.downstream.stats() }
 
 func (r *TCPRelay) Close() error {
@@ -94,30 +136,44 @@ func (r *TCPRelay) accept() {
 		if err != nil {
 			return
 		}
-		server, err := net.DialTimeout("tcp", r.target, 10*time.Second)
-		if err != nil {
-			_ = client.Close()
-			continue
-		}
 		r.track(client)
-		r.track(server)
-		// Close the sockets only once both directions have finished. Closing
-		// them when the first direction ends truncates the other: a tunnelled
-		// protocol commonly half-closes its request side long before the
-		// response has finished arriving, and hard-closing there cost a 4 MiB
-		// transfer all but its first megabyte.
-		var pair sync.WaitGroup
-		pair.Add(2)
-		r.wg.Add(3)
-		go func() { defer r.wg.Done(); defer pair.Done(); r.pump(client, server, &r.upstream) }()
-		go func() { defer r.wg.Done(); defer pair.Done(); r.pump(server, client, &r.downstream) }()
+		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
-			pair.Wait()
-			r.release(client)
-			r.release(server)
+			r.serve(client)
 		}()
 	}
+}
+
+// serve relays one accepted connection. A connection opened into a blackhole
+// reaches nothing until the path returns.
+func (r *TCPRelay) serve(client net.Conn) {
+	if !r.waitPath() {
+		r.release(client)
+		return
+	}
+	server, err := net.DialTimeout("tcp", r.target, 10*time.Second)
+	if err != nil {
+		r.release(client)
+		return
+	}
+	r.track(server)
+	// Close the sockets only once both directions have finished. Closing
+	// them when the first direction ends truncates the other: a tunnelled
+	// protocol commonly half-closes its request side long before the
+	// response has finished arriving, and hard-closing there cost a 4 MiB
+	// transfer all but its first megabyte.
+	var pair sync.WaitGroup
+	pair.Add(2)
+	r.wg.Add(3)
+	go func() { defer r.wg.Done(); defer pair.Done(); r.pump(client, server, &r.upstream) }()
+	go func() { defer r.wg.Done(); defer pair.Done(); r.pump(server, client, &r.downstream) }()
+	go func() {
+		defer r.wg.Done()
+		pair.Wait()
+		r.release(client)
+		r.release(server)
+	}()
 }
 
 func (r *TCPRelay) track(conn net.Conn) {
@@ -166,6 +222,9 @@ func (r *TCPRelay) pump(from, to net.Conn, d *direction) {
 					timer.Stop()
 					return
 				}
+			}
+			if !r.waitPath() {
+				return
 			}
 			if _, err := to.Write(held.data); err != nil {
 				return
