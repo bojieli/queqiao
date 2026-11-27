@@ -55,14 +55,15 @@ func TestKeystrokeEchoBehindAPolicerBesideABulkDownload(t *testing.T) {
 
 	arms := workloadArms()
 	echoes := make([][]time.Duration, len(arms))
+	drops := make([]uint64, len(arms))
 	errs := make(chan error, len(arms))
 	var wg sync.WaitGroup
 	for i := range arms {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e, err := policedKeystrokeArm(t, path, arms[i], echoListener.Addr().String(), bulk, measure)
-			echoes[i] = e
+			e, d, err := policedKeystrokeArm(t, path, arms[i], echoListener.Addr().String(), bulk, measure)
+			echoes[i], drops[i] = e, d
 			if err != nil {
 				errs <- err
 			}
@@ -87,10 +88,10 @@ func TestKeystrokeEchoBehindAPolicerBesideABulkDownload(t *testing.T) {
 			t.Fatalf("%s: no keystroke echoed", arm.name)
 		}
 		frac := float64(over(e, time.Second)) / float64(len(e))
-		t.Logf("%s: keystrokes %d, echo p50 %v p95 %v p99 %v max %v; over 1 s: %.1f %%",
+		t.Logf("%s: keystrokes %d, echo p50 %v p95 %v p99 %v max %v; over 1 s: %.1f %%; path drops %d",
 			arm.name, len(e), durationQuantile(e, 0.50).Round(time.Millisecond),
 			durationQuantile(e, 0.95).Round(time.Millisecond), durationQuantile(e, 0.99).Round(time.Millisecond),
-			durationQuantile(e, 1).Round(time.Millisecond), 100*frac)
+			durationQuantile(e, 1).Round(time.Millisecond), 100*frac, drops[i])
 	}
 	legacy, flip := durationQuantile(echoes[0], 0.99), durationQuantile(echoes[1], 0.99)
 	if bound := time.Duration(float64(legacy)*1.10) + 20*time.Millisecond; flip > bound {
@@ -109,7 +110,7 @@ func TestKeystrokeEchoBehindAPolicerBesideABulkDownload(t *testing.T) {
 // keystrokes type at W6's cadence while it does. The echoes are returned as
 // measured.
 func policedKeystrokeArm(t *testing.T, path pathsim.Config, arm workloadArm, echo, bulk string,
-	measure time.Duration) ([]time.Duration, error) {
+	measure time.Duration) ([]time.Duration, uint64, error) {
 	t.Helper()
 	rig := newWorkloadRig(t, path, arm, nil)
 	keys := rig.dial(echo)
@@ -120,7 +121,7 @@ func policedKeystrokeArm(t *testing.T, path pathsim.Config, arm workloadArm, ech
 		var request [4]byte
 		binary.BigEndian.PutUint32(request[:], 1<<30) // outlasts the block
 		if _, err := conn.Write(request[:]); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		go func() {
 			defer close(done)
@@ -141,12 +142,15 @@ func policedKeystrokeArm(t *testing.T, path pathsim.Config, arm workloadArm, ech
 	} else {
 		close(done)
 	}
+	upBefore, downBefore := rig.relay.Stats()
 	echoes, err := runKeystrokes(keys, measure)
+	upAfter, downAfter := rig.relay.Stats()
+	drops := upAfter.PacketsDropped - upBefore.PacketsDropped + downAfter.PacketsDropped - downBefore.PacketsDropped
 	if err != nil {
-		return nil, err
+		return nil, drops, err
 	}
 	if bulk != "" && moved < 250*1024 {
 		t.Errorf("%s: the bulk download moved only %d bytes beside the keystrokes", arm.name, moved)
 	}
-	return echoes, nil
+	return echoes, drops, nil
 }

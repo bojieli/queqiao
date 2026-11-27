@@ -582,7 +582,7 @@ func TestNegotiatedTCPFlowStripesOnlyAcrossPureTCPBundle(t *testing.T) {
 func TestTCPStripingDoesNotUseTheUnknownRTTFloorForReinjection(t *testing.T) {
 	flow := &multipathFlow{}
 	flow.tcpStriping.Store(true)
-	if got := flow.reissueDelay(); got != tcpStripingReissueDelay {
+	if got := flow.reissueDelay(false); got != tcpStripingReissueDelay {
 		t.Fatalf("TCP striping reissue delay = %v, want %v", got, tcpStripingReissueDelay)
 	}
 }
