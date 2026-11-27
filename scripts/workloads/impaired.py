@@ -388,7 +388,7 @@ class Impaired(mn.Minimal):
     impairs = True
     # Wildcard rules that do not apply to a type: blackhole judges TTFT as
     # ttft_clear_p99_s and ttft_after_restore_s instead (#239).
-    rule_exempt = {"blackhole": ("ttft_net_p99_s",)}
+    rule_exempt = {"blackhole": ("ttft_net_p99_s", "fetch_failures")}
     trials_per_arm = 1
     primaries: Tuple[str, ...] = ()
     # Flow completion is the trial's own (completed / attempted short
@@ -396,7 +396,7 @@ class Impaired(mn.Minimal):
     generic = {t: ("stalls_per_trial",) for t in TRIAL_TYPES}
     report_only = ("completion", "goodput_bps", "ttft_net_p50_s", "ttft_all_p99_s", "echo_p50_s", "recover_8s_s", "recover_25s_s",
                    "reopen_ttfb_8s_s", "reopen_ttfb_25s_s", "inflight_ttfb_8s_s", "inflight_ttfb_25s_s",
-                   "inflight_ttfb_s")
+                   "inflight_ttfb_s", "bg_transfer_failures", "fetch_failures")
     # Measures compared only in the blocks where both arms have them (a flow
     # kind alive at an outage's start in both): the coverage rule asks for
     # two such blocks, not every block.
@@ -449,6 +449,11 @@ class Impaired(mn.Minimal):
 
     def trial_seconds(self, cfg, path, trial):
         return float(TRIAL_SECONDS[trial])
+
+    def type_sequential(self, cfg, trial):
+        # Blackhole's restore measures need more blocks to decide: looks
+        # after blocks 6..12 at the campaign's alpha spending (v5).
+        return (6, 12) if trial == "blackhole" else None
 
     def impairment(self, cfg, trial):
         return trial if trial in TRIAL_SECONDS else ""
@@ -566,6 +571,11 @@ class Impaired(mn.Minimal):
             if ph == "blackhole":
                 bg = [bg_transfers(t, ph) for t in pt]
                 out[f"{ph}.bg_transfer_failures"] = (sum(f for f, _ in bg), sum(n for _, n in bg))
+                # Blackhole judges every transfer together (v5): the short
+                # downloads and the background objects, pooled.
+                ff, fn = fetch_attempts(pt, ph)
+                out[f"{ph}.transfer_failures"] = (ff + out[f"{ph}.bg_transfer_failures"][0],
+                                                  fn + out[f"{ph}.bg_transfer_failures"][1])
         return out
 
     def phase_measures(self, ph, recs, rows, trials):
@@ -655,4 +665,7 @@ class Impaired(mn.Minimal):
             bg = [bg_transfers(t, ph) for t in trials]
             m["bg_transfer_failures"] = (sum(f for f, _ in bg) / sum(n for _, n in bg)
                                          if sum(n for _, n in bg) else nan)
+            ff, fn = fetch_attempts(trials, ph)
+            bf, bn = sum(f for f, _ in bg), sum(n for _, n in bg)
+            m["transfer_failures"] = (ff + bf) / (fn + bn) if fn + bn else nan
         return m
