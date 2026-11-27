@@ -101,7 +101,7 @@ type ControllerTelemetry struct {
 	// EgressCeiling the group's ceiling, zero while none applies.
 	RateCorrelated  bool
 	RateCorrelation float64
-	EgressShare     uint64
+	EgressShare     int64
 	EgressCeiling   uint64
 }
 

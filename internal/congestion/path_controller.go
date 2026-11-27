@@ -349,7 +349,7 @@ func (c *PathController) reportEgress(now monotime.Time) {
 	if c.egress == nil {
 		return
 	}
-	c.egress.report(now, uint64(max(c.law.uncappedBandwidth(), 0)), c.law.inner.minRoundTrip(), c.appLimitedTotal)
+	c.egress.report(now, int64(max(c.law.uncappedBandwidth(), 0)), c.law.inner.minRoundTrip(), c.appLimitedTotal)
 }
 
 // Attachments is the number of attachments currently attached.

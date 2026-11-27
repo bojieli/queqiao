@@ -149,7 +149,12 @@ func interfaceName(host string) string {
 // second, zero where it cannot be read: not Linux, a virtual or wireless
 // interface (the file is absent or holds -1), or a read error.
 func linkSpeedBytesPerSecond(iface string) uint64 {
-	data, err := os.ReadFile(filepath.Join("/sys/class/net", iface, "speed"))
+	if iface == "" || strings.ContainsAny(iface, "/\\") || iface == "." || iface == ".." {
+		return 0
+	}
+	// The name came from net.Interfaces and holds no separator, so the path
+	// stays under /sys/class/net.
+	data, err := os.ReadFile(filepath.Join("/sys/class/net", iface, "speed")) // #nosec G304 -- see above.
 	if err != nil {
 		return 0
 	}
@@ -158,9 +163,10 @@ func linkSpeedBytesPerSecond(iface string) uint64 {
 
 // parseLinkSpeed reads sysfs's speed file, which is in Mbit/s.
 func parseLinkSpeed(s string) uint64 {
-	mbit, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-	if err != nil || mbit <= 0 {
+	mbit, err := strconv.ParseUint(strings.TrimSpace(s), 10, 32)
+	if err != nil || mbit == 0 {
+		// A negative speed (-1) does not parse.
 		return 0
 	}
-	return uint64(mbit) * 1_000_000 / 8
+	return mbit * 1_000_000 / 8
 }

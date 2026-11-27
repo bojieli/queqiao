@@ -135,7 +135,7 @@ type EgressMember struct {
 	g *EgressLimit
 
 	// Published by the controller on its own events.
-	want    atomic.Uint64 // pacing rate before the share, bytes per second
+	want    atomic.Int64 // pacing rate before the share, bytes per second
 	rtt     atomic.Int64  // minimum round trip, ns
 	sent    atomic.Uint64 // wire bytes debited, cumulative
 	decided atomic.Uint64 // sample packets with a fate, cumulative
@@ -143,7 +143,7 @@ type EgressMember struct {
 	unused  atomic.Int64 // application-limited time, cumulative ns
 
 	// share is the cap in bytes per second, zero while uncapped.
-	share atomic.Uint64
+	share atomic.Int64
 
 	// The cumulative values at the last tick, owned by the tick.
 	lastSent, lastDecided, lastLost uint64
@@ -168,7 +168,7 @@ func (m *EgressMember) Leave() {
 }
 
 // Share is the member's cap in bytes per second, zero while uncapped.
-func (m *EgressMember) Share() uint64 { return m.share.Load() }
+func (m *EgressMember) Share() int64 { return m.share.Load() }
 
 // Ceiling is the group's ceiling in bytes per second and its source.
 func (g *EgressLimit) Ceiling() (uint64, uint32) { return g.ceiling.Load(), g.source.Load() }
@@ -198,7 +198,7 @@ func (g *EgressLimit) publish() {
 }
 
 // report is called by a member's controller after an acknowledgement event.
-func (m *EgressMember) report(now monotime.Time, want uint64, rtt time.Duration, unused time.Duration) {
+func (m *EgressMember) report(now monotime.Time, want int64, rtt time.Duration, unused time.Duration) {
 	m.want.Store(want)
 	m.rtt.Store(int64(rtt))
 	m.unused.Store(int64(unused))
@@ -408,7 +408,7 @@ func (g *EgressLimit) tick(now monotime.Time) {
 	if !math.IsInf(level, 1) {
 		for _, s := range demands {
 			if s.demand > level {
-				s.m.share.Store(uint64(level))
+				s.m.share.Store(int64(level))
 				g.binding = true
 			}
 		}

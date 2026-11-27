@@ -39,14 +39,14 @@ func (r *egressRig) window(loads ...egressLoad) {
 		decided := uint64(l.rate * egressWindow.Seconds() / 1200)
 		m.decided.Add(decided)
 		m.lost.Add(uint64(float64(decided) * l.loss))
-		m.want.Store(uint64(l.want))
+		m.want.Store(int64(l.want))
 		if l.idle {
 			m.unused.Add(int64(egressWindow) * 9 / 10)
 		}
 	}
 	for i, l := range loads {
 		m := r.members[i]
-		m.report(r.now, uint64(l.want), 50*time.Millisecond, time.Duration(m.unused.Load()))
+		m.report(r.now, int64(l.want), 50*time.Millisecond, time.Duration(m.unused.Load()))
 	}
 	r.now = r.now.Add(egressWindow)
 }
