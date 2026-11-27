@@ -722,16 +722,19 @@ func TestEgressCapacityIsAGatewayFlagUnderPathScope(t *testing.T) {
 		}
 	}
 	// A configured rate does nothing under connection scope, so it is refused
-	// rather than ignored; auto and off are inert there.
+	// rather than ignored; auto and off are inert there. The scope is named
+	// explicitly: these lines are parsed without the bundle resolution, and
+	// since stage 10 the flags' own defaults are the path-authority bundle.
 	for _, tc := range []struct {
 		args []string
 		ok   bool
 	}{
-		{[]string{"--egress-capacity=1g"}, false},
-		{[]string{"--egress-capacity=fast"}, false},
+		{[]string{"--egress-capacity=1g"}, true},
+		{[]string{"--egress-capacity=1g", "--congestion-scope=connection", "--recovery=flow"}, false},
+		{[]string{"--egress-capacity=fast", "--congestion-scope=connection", "--recovery=flow"}, false},
 		{append([]string{"--egress-capacity=fast"}, path...), false},
-		{[]string{"--egress-capacity=off"}, true},
-		{[]string{"--egress-capacity=auto"}, true},
+		{[]string{"--egress-capacity=off", "--congestion-scope=connection", "--recovery=flow"}, true},
+		{[]string{"--egress-capacity=auto", "--congestion-scope=connection", "--recovery=flow"}, true},
 	} {
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)
 		fs.SetOutput(io.Discard)
