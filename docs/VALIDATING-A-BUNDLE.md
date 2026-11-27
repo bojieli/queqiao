@@ -968,6 +968,15 @@ probes every 0.25 s, each its own connection.
   attempted background objects; a flow that died before an outage counts
   against its own arm. The worst over all flows (`inflight_ttfb_s`) is
   reported.
+- *Blackhole v5* (adopted after imp6, not re-judged): one pooled
+  `transfer_failures` rule (`events 0.02 149`) over the short downloads
+  and the background objects, since in blackhole a short download can wait
+  out an outage and they alone fell under 149; `fetch_failures` and
+  `bg_transfer_failures` are reported there (`fetch_failures` stays a rule
+  for slow-lossy and policed). Blackhole has its own sequential design
+  (`Workload.type_sequential`): looks after blocks 6..12 at the campaign's
+  alpha spending, frozen in the plan as `sequential_by_type`; the other
+  types keep the campaign's.
 - *Keystroke echo* counts a broken session: a keystroke the session did
   not echo is censored at the trial window's end (its echo time is from
   when it was sent to then), so a session that broke during an outage is

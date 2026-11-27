@@ -919,8 +919,10 @@ SECONDARY_LABELS = {
 }
 
 
-def sequential_of(plan: dict) -> "Optional[st.Sequential]":
-    s = plan.get("sequential")
+def sequential_of(plan: dict, trial: str = "") -> "Optional[st.Sequential]":
+    """The campaign's sequential design, or a trial type's own (its frozen
+    `sequential_by_type` entry) when it has one."""
+    s = ((plan.get("sequential_by_type") or {}).get(trial) if trial else None) or plan.get("sequential")
     return st.Sequential(**s) if s else None
 
 
@@ -968,6 +970,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
     EFFECTIVE.clear()
     SHADOW.clear()
     sq = sequential_of(plan)
+    sq_all = sq
     cp_voids: Dict[Tuple[int, str, str], str] = {}
     all_rows = dict(trials)
     problems, trials = completeness(campaign, plan, trials, interim=interim, units_run=units_run, failures=failures,
@@ -1300,6 +1303,8 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     "| measure | rule | candidate | blocks | mean contrast | t lower bound | bootstrap lower bound | verdict |",
                     "|---|---|---|---:|---:|---:|---:|---|"]
             for key, (kind, values) in judged_rules.items():
+                # Each rule by its trial type's own design.
+                sq = sequential_of(plan, key.split(".", 1)[0]) if sq_all else None
                 for cand in arms[1:]:
                     # Every block in which this measure's trial type (its phase)
                     # ran in both arms -- a type stopped early has fewer -- the
@@ -1411,6 +1416,7 @@ def report(campaign: str, gates: dict, interim: bool = False,
                     verdicts[(path, cand, f"rule:{key}")] = verdict
                     out.append(f"| {key} | {kind} {' '.join(f'{v:g}' for v in values)} | {cand} | {len(measured)} | "
                                f"{fmt(mean_d, '.4g')} | {fmt(tl, '.4g')} | {fmt(bl, '.4g')} | {verdict} |")
+        sq = sq_all
         for k in unruled:
             for cand in arms[1:]:
                 verdicts[(path, cand, f"rule:{k}")] = "n/a"

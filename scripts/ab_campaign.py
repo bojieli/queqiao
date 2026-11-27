@@ -297,9 +297,20 @@ class Config:
     aux_relays: List[Any] = field(default_factory=list)
     # Fetch logs through this ssh host instead of directly ("" for direct).
     fetch_via: str = ""
+    # Per trial type, its own sequential design (Workload.type_sequential).
+    sequential_by_type: Dict[str, Any] = field(default_factory=dict)
     # Per host: reach it through this ssh host (ProxyJump), from the
     # ssh_proxy_jump setting of a section naming the host.
     proxy_jumps: Dict[str, str] = field(default_factory=dict)
+
+    def type_sequential(self, trial: str) -> Any:
+        """The sequential design a trial type is judged by."""
+        return self.sequential_by_type.get(trial) or self.sequential
+
+    def type_cap(self, trial: str) -> int:
+        """The last block a trial type runs."""
+        s = self.sequential_by_type.get(trial)
+        return s.cap if s else (self.sequential.cap if self.sequential else self.blocks)
 
     @property
     def work_dir(self) -> str:
@@ -537,6 +548,17 @@ def parse_config(cp: configparser.ConfigParser) -> Config:
                  gateway=gw, clients=clients, arms=arms, production=prod, wl=wl)
     wl.configure(cfg, cp)
     cfg.proxy_jumps = _proxy_jumps(cp)
+    # A trial type may have its own looks and cap (Workload.type_sequential),
+    # at the campaign's alpha and spending; the schedule runs to the largest.
+    cfg.sequential_by_type = {}
+    if cfg.sequential:
+        import ab_stats
+        for t in wl.trial_types(cfg):
+            fc = wl.type_sequential(cfg, t)
+            if fc:
+                cfg.sequential_by_type[t] = ab_stats.Sequential(first=fc[0], cap=fc[1], alpha=cfg.sequential.alpha,
+                                                                spending=cfg.sequential.spending)
+        cfg.blocks = max([cfg.blocks] + [s.cap for s in cfg.sequential_by_type.values()])
     if wl.impairs and not cfg.impair:
         raise ConfigError(f"workload {cfg.workload} runs under network impairment: it needs an [impair] section")
     if cfg.impair and not wl.impairs:
@@ -646,6 +668,8 @@ def schedule(cfg: Config) -> List[Slot]:
         for path in paths[k:] + paths[:k]:
             n = 0
             for trial in types:
+                if b > cfg.type_cap(trial):
+                    continue                        # this type's cap is lower
                 seen: Dict[int, int] = {}
                 for ai in block_order(len(cfg.arms), b, rng, cfg.wl.trials_per_arm):
                     n += 1
@@ -2480,6 +2504,7 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                     "workload": cfg.workload, "analyzer": cfg.wl.analyzer, "paths": cfg.paths(),
                     "dc": cfg.dc.__dict__ if cfg.dc else None,
                     "sequential": cfg.sequential.__dict__ if cfg.sequential else None,
+                    "sequential_by_type": {t: s.__dict__ for t, s in cfg.sequential_by_type.items()} or None,
                     "arms": manifest, "schedule": [s.__dict__ for s in slots], "main": cfg.main.name,
                     "clients": {c.name: {"small": c.small, "platform": c.platform, "flags": c.flags}
                                 for c in cfg.clients.values()},
@@ -2553,7 +2578,8 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
                 self.blocks_run = max(self.blocks_run, block)
                 if not self.dry:
                     time.sleep(cfg.block_gap)
-                if cfg.sequential and not self.dry and block >= cfg.sequential.first and block < cfg.blocks:
+                sq_t = cfg.type_sequential(trial)
+                if sq_t and not self.dry and block >= sq_t.first and block < sq_t.cap:
                     # Recompute this type's gate on its blocks so far; stop it
                     # once its verdict is determined (ab_stats.Sequential).
                     if tsv:
@@ -2694,11 +2720,15 @@ rm -f {W}/run/*.pid''', what="stop every process this campaign started")
         look, at the cap), set-up plus one block of each trial type per round."""
         cfg = self.cfg
         out = {}
-        first = cfg.sequential.first if cfg.sequential else cfg.blocks
         for path in cfg.paths():
-            block = sum(self.block_seconds(path, t) for t in cfg.wl.trial_types(cfg))
             once = SETUP_SECONDS + cfg.wl.extra_once_seconds(cfg, path)
-            out[path] = (once + first * block, once + cfg.blocks * block)
+            lo = hi = once
+            for t in cfg.wl.trial_types(cfg):
+                sq_t = cfg.type_sequential(t)
+                blk = self.block_seconds(path, t)
+                lo += (sq_t.first if sq_t else cfg.blocks) * blk
+                hi += cfg.type_cap(t) * blk
+            out[path] = (lo, hi)
         return out
 
     def print_plan(self, slots: List[Slot]) -> None:

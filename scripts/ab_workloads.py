@@ -266,6 +266,11 @@ class Workload:
         seed)."""
         return phase
 
+    def type_sequential(self, cfg: Any, trial: str) -> Optional[Tuple[int, int]]:
+        """A trial type's own (first look, cap) in blocks, overriding the
+        campaign's [campaign] first_blocks and blocks; None for those."""
+        return None
+
     def impairment(self, cfg: Any, trial: str) -> str:
         """The frozen ab_impair scenario a trial of this type runs under
         ("" for none): applied to the blocks' arm ports just before the

@@ -71,7 +71,8 @@ class BgTransfers(unittest.TestCase):
         cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
         cp.read(os.path.join(HERE, "validation", "gates.ini"))
         sec = cp["workload:impaired"]
-        self.assertEqual(sec["blackhole.bg_transfer_failures"].split(), ["events", "0.02", "149"])
+        self.assertEqual(sec["blackhole.transfer_failures"].split(), ["events", "0.02", "149"])
+        self.assertNotIn("blackhole.bg_transfer_failures", sec)
         self.assertEqual(sec["blackhole.resume_download_s"], "lower 1.0")
         self.assertEqual(sec["blackhole.resume_upload_s"], "lower 1.0")
         self.assertNotIn("blackhole.inflight_ttfb_s", sec)
