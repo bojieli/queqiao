@@ -135,7 +135,7 @@ type EgressMember struct {
 	g *EgressLimit
 
 	// Published by the controller on its own events.
-	want    atomic.Int64 // pacing rate before the share, bytes per second
+	want    atomic.Int64  // pacing rate before the share, bytes per second
 	rtt     atomic.Int64  // minimum round trip, ns
 	sent    atomic.Uint64 // wire bytes debited, cumulative
 	decided atomic.Uint64 // sample packets with a fate, cumulative
