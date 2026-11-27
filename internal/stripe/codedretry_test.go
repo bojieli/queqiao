@@ -28,7 +28,7 @@ func newCodedRetryFixture(t *testing.T, sticky bool, payload []byte, chunk int) 
 	f.sched = New(bytes.NewReader(payload), Config{
 		ChunkSize:       chunk,
 		Reliable:        func(uint64) bool { return false },
-		RetransmitAfter: func(bool) time.Duration { return codedRetryAfter },
+		RetransmitAfter: func(bool, int) time.Duration { return codedRetryAfter },
 		CodedRetry:      sticky,
 		Now:             func() time.Time { return f.now },
 	})
@@ -395,7 +395,7 @@ func TestCodedDispatchDoesNotLookUpADeadline(t *testing.T) {
 	s := New(bytes.NewReader(bytes.Repeat([]byte("x"), 64)), Config{
 		ChunkSize:       16,
 		Reliable:        func(uint64) bool { return false },
-		RetransmitAfter: func(bool) time.Duration { lookups++; return codedRetryAfter },
+		RetransmitAfter: func(bool, int) time.Duration { lookups++; return codedRetryAfter },
 		CodedRetry:      true,
 		Now:             func() time.Time { return now },
 	})

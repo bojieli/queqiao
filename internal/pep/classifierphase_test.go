@@ -558,7 +558,7 @@ func TestAStalledSparseWriteOfABulkFlowEscapesToTheStream(t *testing.T) {
 		Reliable: f.laneRetransmits, ReliableSparse: f.laneRetransmitsSparse,
 		SparseBytes: f.sparseBytes(), Sparse: f.admitSparse,
 		ForceReliable:   f.recoverChunkReliably,
-		RetransmitAfter: func(bool) time.Duration { return time.Millisecond }, Now: func() time.Time { return now },
+		RetransmitAfter: func(bool, int) time.Duration { return time.Millisecond }, Now: func() time.Time { return now },
 	})
 	defer sched.Close()
 	f.scheduler.Store(sched)

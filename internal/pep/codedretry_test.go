@@ -201,7 +201,7 @@ func TestCodedTailLostAloneIsRecoveredWithoutTheWatchdog(t *testing.T) {
 			}
 		}
 	}()
-	deadline := x.flow.reissueDelay(false)
+	deadline := x.flow.reissueDelay(false, 0)
 	frame := waitFrameWithin(t, x.capture, deadline+chunkReissueInterval+time.Second)
 	elapsed := time.Since(start)
 	if frame.Header.Type != protocol.TypeData || string(frame.Payload) != "response" {
@@ -268,7 +268,7 @@ func TestCodedChunkDelayedInTheQueueIsNotRetriedEarly(t *testing.T) {
 	}
 	queued.onWritten(reliable)
 	waitHeld(t, x.carrier)
-	deadline := x.flow.reissueDelay(false)
+	deadline := x.flow.reissueDelay(false, 0)
 	advance(10 * deadline)
 	if n := sched.ReissueExpired(); n != 0 {
 		t.Fatal("a chunk still queued below the path was retried")
@@ -391,7 +391,7 @@ func TestCodedRetryOffIsTodaysBehaviour(t *testing.T) {
 	if tagged, _, _ := x.carrier.counts(); tagged != 0 {
 		t.Fatal("the legacy bundle tagged a datagram")
 	}
-	now = now.Add(x.flow.reissueDelay(false))
+	now = now.Add(x.flow.reissueDelay(false, 0))
 	if n := sched.ReissueExpired(); n != 1 {
 		t.Fatalf("legacy ReissueExpired = %d at the dispatch deadline, want 1", n)
 	}
@@ -482,7 +482,7 @@ func TestOpenSafetyCopyIsKeptUnderCodedRetry(t *testing.T) {
 		x.carrier.release(registered)
 		<-settled
 		// The stream attempt keeps the deadline any stream attempt has.
-		now = now.Add(x.flow.reissueDelay(false) - time.Millisecond)
+		now = now.Add(x.flow.reissueDelay(false, 0) - time.Millisecond)
 		if n := sched.ReissueExpired(); n != 0 {
 			t.Fatalf("registered=%v: a chunk the stream carried was retried by the code's deadline", registered)
 		}

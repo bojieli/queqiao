@@ -138,7 +138,7 @@ type Config struct {
 	// measured live, one small flow in five cost 1.79 s instead of 0.29
 	// because it spent that constant waiting for a chunk the code had failed
 	// to repair.
-	RetransmitAfter func(sparse bool) time.Duration
+	RetransmitAfter func(sparse bool, size int) time.Duration
 	// ReliableReissueBurst bounds how many chunks already carried by reliable
 	// lanes a single timer sweep may copy. Zero keeps the unbounded legacy
 	// behavior. TCP striping sets one: the oldest missing byte is what blocks
@@ -293,7 +293,7 @@ func DefaultConfig() Config {
 		LaneWindow:          4,
 		MaxOutstanding:      64,
 		MaxOutstandingBytes: 16 * 1024 * 1024,
-		RetransmitAfter:     func(bool) time.Duration { return 2 * time.Second },
+		RetransmitAfter:     func(bool, int) time.Duration { return 2 * time.Second },
 	}
 }
 
@@ -376,6 +376,9 @@ type attempt struct {
 	// sparse is the chunk's mark at dispatch (Chunk.Sparse): it arrived to an
 	// empty send queue, so nothing can prove it lost but its own deadline.
 	sparse bool
+	// size is the chunk's length at dispatch, kept with the mark because the
+	// two answer the same question: is this a message or content.
+	size int
 	// reliable records whether the lane retransmitted for itself at the moment
 	// this chunk was handed to it.
 	//
@@ -1140,12 +1143,13 @@ func (s *Scheduler) takeReadyLocked(laneID uint64, windowBytes int) *Chunk {
 		// would discard (RetransmitAfter walks the lanes).
 		var deadline time.Time
 		if !s.cfg.CodedRetry || reliable {
-			if after := s.retransmitAfter(chunk.Sparse); after > 0 {
+			if after := s.retransmitAfter(chunk.Sparse, len(chunk.Data)); after > 0 {
 				deadline = s.cfg.Now().Add(after)
 			}
 		}
 		out.attempts = append(out.attempts, attempt{
-			id: id, lane: laneID, deadline: deadline, reliable: reliable, sparse: chunk.Sparse,
+			id: id, lane: laneID, deadline: deadline, reliable: reliable,
+			sparse: chunk.Sparse, size: len(chunk.Data),
 		})
 		chunk.urgent = false
 		s.laneLoad[laneID]++
@@ -1450,11 +1454,11 @@ func (s *Scheduler) hasRoomLocked(laneID uint64, windowBytes int, chunk uint64) 
 // anything was queued behind it when it was read (Config.Sparse): a chunk
 // that arrived alone can never be proved lost by the data behind it, so this
 // delay is all it waits.
-func (s *Scheduler) retransmitAfter(sparse bool) time.Duration {
+func (s *Scheduler) retransmitAfter(sparse bool, size int) time.Duration {
 	if s.cfg.RetransmitAfter == nil {
 		return 0
 	}
-	return s.cfg.RetransmitAfter(sparse)
+	return s.cfg.RetransmitAfter(sparse, size)
 }
 
 // NextDeadline reports when the earliest outstanding attempt's deadline
@@ -1601,7 +1605,7 @@ func (s *Scheduler) noteGapReissuedLocked(n uint64) {
 // erases. Each dispatch has its own identity, so a late callback from the
 // retired attempt cannot mutate the replacement.
 func (s *Scheduler) ReissueExpired() int {
-	after := s.retransmitAfter(false)
+	after := s.retransmitAfter(false, 0)
 	if after <= 0 {
 		return 0
 	}
@@ -1846,7 +1850,7 @@ func (s *Scheduler) substrateChangedLocked(a *attempt, reliable bool) {
 	case reliable:
 		// Whatever deadline the code had, the stream's own starts now.
 		a.deadline = time.Time{}
-		if after := s.retransmitAfter(a.sparse); after > 0 {
+		if after := s.retransmitAfter(a.sparse, a.size); after > 0 {
 			a.deadline = s.cfg.Now().Add(after)
 		}
 	case !a.registered:
@@ -1883,7 +1887,7 @@ func (s *Scheduler) RegisteredAgo(laneID uint64, chunk *Chunk, age time.Duration
 		return
 	}
 	a.deadline = time.Time{}
-	if after := s.retransmitAfter(a.sparse); after > 0 {
+	if after := s.retransmitAfter(a.sparse, a.size); after > 0 {
 		a.deadline = registeredAt.Add(after)
 	}
 	// Gap evidence that arrived after the packet left, but before this

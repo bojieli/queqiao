@@ -35,7 +35,7 @@ func TestCodedSendStallRecoversOnExistingStream(t *testing.T) {
 	sched := stripe.New(bytes.NewReader([]byte("response")), stripe.Config{
 		Reliable:        func(uint64) bool { return !fc.codesData() },
 		ForceReliable:   flow.recoverChunkReliably,
-		RetransmitAfter: func(bool) time.Duration { return time.Millisecond }, Now: func() time.Time { return now },
+		RetransmitAfter: func(bool, int) time.Duration { return time.Millisecond }, Now: func() time.Time { return now },
 	})
 	defer sched.Close()
 	flow.scheduler.Store(sched)

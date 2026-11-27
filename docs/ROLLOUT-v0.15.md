@@ -15,9 +15,10 @@ The new bundle is markedly better at surviving an impaired path — outages,
 policers, slow lossy links — and better at throughput and fairness on a
 datacentre path. Its one measured regression is the **tail of interactive echo
 under a policer**: the median keystroke echo is unchanged, the p99 is about
-twice main's. The design's own rule says one failing gate blocks the flip, so
-that tail is the decision: fix it first, or ship with it as a known limitation
-and watch it.
+twice main's. The design's own rule says one failing gate blocks the flip, and
+it has now failed twice, on independent campaigns (imp7 and imp8), so the flip
+is held at that gate: stage 10 does not merge and nothing deploys until the
+tail is fixed or the owner waives the rule in writing.
 
 ## Impaired-path A/B (imp7, 12 blocks, bj → HK relay → gateway)
 
@@ -169,7 +170,7 @@ which are unchanged.
 
 | item | state |
 | --- | --- |
-| interactive echo tail under a policer (p99 ~2×, p50 unchanged) | open, #282; the one gate that says the flip is blocked |
+| interactive echo tail under a policer (p99 ~2×, p50 unchanged) | **open, #282; the gate has failed twice (imp7 3.76 s vs 1.92 s, imp8 4.71 s vs 2.29 s) and the flip is held** |
 | `blackhole.stalls_per_trial`, `slow-lossy.echo_p99_s` | better but unproven at the block cap |
 | `policed.fetch_failures` | judged pass under the corrected minimum (#277) |
 | label races in failure attribution | open, #274 |

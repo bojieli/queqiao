@@ -158,14 +158,18 @@ func TestTheRetransmitDelayIsAskedPerChunk(t *testing.T) {
 	src := &writesReader{writes: make(chan []byte, 2)}
 	defer close(src.writes)
 	now := time.Now()
-	var asked []bool
+	type asked struct {
+		sparse bool
+		size   int
+	}
+	var calls []asked
 	s := New(src, Config{
 		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
 		Reliable:    func(uint64) bool { return false },
 		SparseBytes: 512, Sparse: func(int) bool { return true },
-		RetransmitAfter: func(sparse bool) time.Duration {
-			asked = append(asked, sparse)
-			if sparse {
+		RetransmitAfter: func(sparse bool, size int) time.Duration {
+			calls = append(calls, asked{sparse: sparse, size: size})
+			if sparse || size <= 512 {
 				return time.Millisecond
 			}
 			return time.Second
@@ -187,8 +191,11 @@ func TestTheRetransmitDelayIsAskedPerChunk(t *testing.T) {
 	}
 	s.WroteAs(1, full, false)
 	s.WroteAs(1, short, false)
-	if len(asked) != 2 || asked[0] || !asked[1] {
-		t.Fatalf("the delay was asked with sparse=%v; want false for the full read and true for the short one", asked)
+	// The caller is told what the chunk is: its mark and its size. Size is
+	// the load-independent half of the answer, which is why it is asked for
+	// beside the mark (#282).
+	if len(calls) != 2 || calls[0] != (asked{size: 1 << 10}) || calls[1] != (asked{sparse: true, size: 36}) {
+		t.Fatalf("the delay was asked with %v; want the full read's size and the short read's mark and size", calls)
 	}
 	// The short chunk's deadline is the one that comes first, so a supervisor
 	// waking on NextDeadline catches it without polling at its interval.
@@ -207,7 +214,7 @@ func TestCodedLossIsRememberedWhileTheRetryWaits(t *testing.T) {
 	s := New(src, Config{
 		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
 		Reliable:        func(uint64) bool { return false },
-		RetransmitAfter: func(bool) time.Duration { return time.Millisecond },
+		RetransmitAfter: func(bool, int) time.Duration { return time.Millisecond },
 		Now:             func() time.Time { return now },
 	})
 	defer s.Close()

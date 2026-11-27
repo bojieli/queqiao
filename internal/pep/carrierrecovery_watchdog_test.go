@@ -119,7 +119,7 @@ func TestCarrierRecoveryCodedTailMovesToTheExistingStream(t *testing.T) {
 			}
 		}
 	}()
-	frame := waitFrameWithin(t, x.capture, x.flow.reissueDelay(false)+chunkReissueInterval+time.Second)
+	frame := waitFrameWithin(t, x.capture, x.flow.reissueDelay(false, 0)+chunkReissueInterval+time.Second)
 	if frame.Header.Type != protocol.TypeData || string(frame.Payload) != "response" {
 		t.Fatalf("stream carried type %d %q, want the response", frame.Header.Type, frame.Payload)
 	}

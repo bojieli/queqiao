@@ -213,7 +213,7 @@ func (f *multipathFlow) readyLimit() int {
 // transport's own probe timeout waits for the same reason, and a fixed second
 // and a half was six of them on the path this targets: measured live, one
 // small flow in five cost 1.79 s instead of 0.29 waiting out that constant.
-func (f *multipathFlow) reissueDelay(sparse bool) time.Duration {
+func (f *multipathFlow) reissueDelay(sparse bool, size int) time.Duration {
 	if f.tcpStriping.Load() {
 		return tcpStripingReissueDelay
 	}
@@ -223,19 +223,23 @@ func (f *multipathFlow) reissueDelay(sparse bool) time.Duration {
 			longest = rtt
 		}
 	}
-	// How long to wait depends on whether anything followed the chunk. One
-	// that arrived with the queue empty behind it -- a small write, the
-	// chunk's own Sparse mark -- can never be proved lost by the data behind
-	// it, so gap evidence never comes and this delay is all it ever waits
-	// (§8.1). Against a policer that drops its record it is the whole of the
-	// added latency: measured at two round trips and 200 ms it was about 500
-	// ms of a keystroke echo (#282). Half a round trip is evidence enough
-	// there -- the retry is a duplicate the receiver dedups by offset -- while
-	// a chunk with data behind it keeps the two, which is all that governs its
-	// tail.
+	// How long to wait depends on what the chunk is. A message -- a
+	// keystroke, an SSE delta, a request: at most sparseWriteBytes, the
+	// scheduler's own message/content line -- can never be proved lost by the
+	// data behind it (§8.1), so this delay is all it ever waits. Against a
+	// policer that drops its record it is the whole of the added latency:
+	// measured at two round trips and 200 ms it was about 500 ms of a
+	// keystroke echo (#282). Half a round trip is evidence enough there --
+	// the retry is a duplicate the receiver dedups by offset -- while content
+	// keeps the two, which is all that governs its tail.
+	//
+	// The chunk's Sparse mark alone was not enough: it is set only when the
+	// send queue was empty at dispatch, which is least true when loss is
+	// piling chunks up -- exactly when the short delay is needed. Size says
+	// the same thing about the chunk and does not depend on the load.
 	floor := minChunkReissueDelay
 	delay := 2 * longest
-	if sparse {
+	if sparse || size > 0 && size <= sparseWriteBytes {
 		floor = minInteractiveReissueDelay
 		delay = longest / 2
 	}
