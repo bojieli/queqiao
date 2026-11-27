@@ -63,6 +63,17 @@ type ErasureSender struct {
 	// inflightBound). Nil on a per-connection sender, which keeps the law
 	// as it was.
 	bound *inflightBound
+	// corr says whether the loss rises with this sender's own rate (see
+	// rateCorrelation). Nil on a per-connection sender. The epoch fields are
+	// the send side of it: the epoch and class the next sample packet is
+	// registered in.
+	corr *rateCorrelation
+	// egress is the seat in the gateway's joint egress limit, nil when
+	// there is none. Its share caps the pacing rate and the window.
+	egress     atomic.Pointer[EgressMember]
+	epochID    uint64
+	epochClass lossClass
+	epochSince monotime.Time
 	// unansweredSince is, under the path authority's law, when the first
 	// sample packet since the last acknowledgement was sent; zero while
 	// none is outstanding (see noteAnswered).
@@ -253,6 +264,7 @@ func newPathLaw(initialPacketSize quiccongestion.ByteCount, path pathmodel.Model
 	e.inner.estimator.maxFilter.retireAged = true
 	e.inner.estimator.staleEvidence = byteTotal(e.inner.minCwnd)
 	e.bound = &inflightBound{jitter: e.inner.probeJitter}
+	e.corr = &rateCorrelation{}
 	e.inner.probeRTTGain = pathProbeRTTGain
 	e.inner.flightScale = func() float64 { return 1 / e.arrivalRate() }
 	e.pacer.keepDebt = true
@@ -306,9 +318,28 @@ func (e *ErasureSender) deliveredRate() float64 {
 // bandwidth is the rate to put on the wire: what arrives, divided by the
 // fraction that arrives.
 func (e *ErasureSender) bandwidth() quiccongestion.ByteCount {
+	rate := e.uncappedBandwidth()
+	if share := e.egressShare(); share > 0 && rate > share {
+		rate = share
+	}
+	return rate
+}
+
+// uncappedBandwidth is the rate the law wants before the gateway's egress
+// share is applied.
+func (e *ErasureSender) uncappedBandwidth() quiccongestion.ByteCount {
 	// The delay bound is applied after the erasure compensation rather than
 	// before it, because the queue holds what was sent and not what arrived.
 	return quiccongestion.ByteCount(e.delayBounded(e.deliveredRate() / e.arrivalRate()))
+}
+
+// egressShare is the cap the gateway's joint egress limit puts on this
+// sender in bytes per second, zero while there is none.
+func (e *ErasureSender) egressShare() quiccongestion.ByteCount {
+	if m := e.egress.Load(); m != nil {
+		return quiccongestion.ByteCount(m.Share())
+	}
+	return 0
 }
 
 // compensationFor decides how much of a proposed compensation to apply, by
@@ -378,6 +409,29 @@ func (e *ErasureSender) compensationFor(want float64) float64 {
 	}
 	e.appliedArrival, e.deliveredAtCompensation, e.compensationRound = next, delivered, round
 	return next
+}
+
+// sendEpoch is the epoch and rate class a sample packet sent now belongs to
+// (rateCorrelation). An epoch ends at a change of class or after a round
+// trip, at least corrEpochFloor.
+func (e *ErasureSender) sendEpoch(now monotime.Time) (uint64, lossClass) {
+	class := classNone
+	if e.inner.mode == tuicBbrProbeBW {
+		switch g := e.inner.pacingGain; {
+		case g > 1:
+			class = classUp
+		case g < 1:
+			class = classDown
+		default:
+			class = classCruise
+		}
+	}
+	span := max(e.inner.minRoundTrip(), corrEpochFloor)
+	if e.epochSince.IsZero() || class != e.epochClass || now.Sub(e.epochSince) >= span {
+		e.epochID++
+		e.epochClass, e.epochSince = class, now
+	}
+	return e.epochID, class
 }
 
 func (e *ErasureSender) arrivalRate() float64 {
@@ -614,6 +668,12 @@ func (e *ErasureSender) noteAnswered(now monotime.Time) {
 		return
 	}
 	e.inner.outage(silence)
+	if e.corr != nil {
+		// Whatever was sent into the silence was lost at every rate: not
+		// evidence of correlation with the rate (§2.2).
+		lookback := corrOutageLookback * rtt
+		e.corr.discardSince(since.Add(-lookback))
+	}
 	if e.bound != nil {
 		e.bound.restored()
 	}
@@ -649,7 +709,15 @@ func (e *ErasureSender) CanSend(bytesInFlight quiccongestion.ByteCount) bool {
 func (e *ErasureSender) GetCongestionWindow() quiccongestion.ByteCount {
 	window := e.unboundedWindow()
 	if e.bound != nil {
-		return e.bound.limit(window)
+		window = e.bound.limit(window)
+	}
+	if share := e.egressShare(); share > 0 {
+		// The share's own flight: two products of it, as the law's window
+		// gain, and a few packets so a slow share can still send.
+		if minRTT := e.inner.minRoundTrip(); minRTT > 0 {
+			capped := quiccongestion.ByteCount(2*float64(share)*minRTT.Seconds()) + 4*e.inner.maxDatagramSize
+			window = min(window, capped)
+		}
 	}
 	return window
 }
@@ -814,6 +882,15 @@ func (e *ErasureSender) publishMeasurement() {
 			erasure = base
 		}
 	}
+	if e.corr != nil {
+		// Loss that rises with this sender's own rate is not the channel's:
+		// what the law makes up for is the loss at the lowest rates it
+		// offers (docs/DESIGN-EGRESS-JOINT-LIMIT.md §2.4). It lowers the
+		// erasure, never raises it.
+		if floor, ok := e.corr.compensable(); ok && floor < erasure {
+			erasure = floor
+		}
+	}
 	if _, minRTT := e.queueDelay(); minRTT > 0 {
 		e.arrival.Store(uint64(e.compensationFor(1-erasure) * partsPerMillion))
 	}
@@ -845,6 +922,10 @@ func (e *ErasureSender) Telemetry() ControllerTelemetry {
 	// two independently derived, which is what lets a test assert they agree.
 	t.PacketsLostObserved = e.passed.Load()
 	t.Erasure = float64(e.erasure.Load()) / partsPerMillion
+	if e.corr != nil {
+		t.RateCorrelated = e.corr.flaggedBit.Load()
+		t.RateCorrelation = float64(e.corr.deltaPPM.Load()) / partsPerMillion
+	}
 	// Read, never recomputed. This method runs on the flow telemetry goroutine
 	// while quic-go invokes the controller on its packet goroutine, which is
 	// why everything else here comes from an atomic. Recomputing the brake

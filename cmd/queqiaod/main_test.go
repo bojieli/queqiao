@@ -568,3 +568,46 @@ func TestTopologyIsValidatedAtStartup(t *testing.T) {
 		t.Fatal("the gateway accepted --topology")
 	}
 }
+
+func TestEgressCapacityIsAGatewayFlagUnderPathScope(t *testing.T) {
+	path := []string{"--cc-api=v2", "--sched=class", "--congestion-scope=path"}
+	if opts := parseRuntimeForTest(t, false); opts.egressCapacity != "auto" {
+		t.Fatalf("the default egress capacity is %q, want auto", opts.egressCapacity)
+	}
+	for _, v := range []string{"auto", "off", "1g", "940m"} {
+		if opts := parseRuntimeForTest(t, false, append([]string{"--egress-capacity=" + v}, path...)...); opts.egressCapacity != v {
+			t.Fatalf("egress-capacity=%s parsed as %q", v, opts.egressCapacity)
+		}
+	}
+	// A configured rate does nothing under connection scope, so it is refused
+	// rather than ignored; auto and off are inert there.
+	for _, tc := range []struct {
+		args []string
+		ok   bool
+	}{
+		{[]string{"--egress-capacity=1g"}, false},
+		{[]string{"--egress-capacity=fast"}, false},
+		{append([]string{"--egress-capacity=fast"}, path...), false},
+		{[]string{"--egress-capacity=off"}, true},
+		{[]string{"--egress-capacity=auto"}, true},
+	} {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		var opts runtimeOptions
+		bindRuntimeFlags(fs, &opts, false)
+		if err := fs.Parse(tc.args); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateRuntime(opts, false); (err == nil) != tc.ok {
+			t.Errorf("%v: validation error %v, want ok=%v", tc.args, err, tc.ok)
+		}
+	}
+	// A client has no egress to share.
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var opts runtimeOptions
+	bindRuntimeFlags(fs, &opts, true)
+	if err := fs.Parse([]string{"--egress-capacity=1g"}); err == nil {
+		t.Error("a client accepted --egress-capacity")
+	}
+}

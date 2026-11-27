@@ -177,6 +177,9 @@ type congestionConfig struct {
 	// scope selects what one controller governs; see CongestionScope. It
 	// applies only with ccAPI v2 and the erasure law.
 	scope CongestionScope
+	// egress, on a gateway, is its --egress-capacity: its path authorities
+	// join the joint limit of their interface (egress.go). Nil on a client.
+	egress *EgressCapacity
 	// provisional says the connection's peer is not yet known to be an
 	// authorised data connection (a gateway installs a controller before it
 	// knows the ALPN or the principal). Under congestion=path such a

@@ -93,6 +93,16 @@ type ControllerTelemetry struct {
 	// connection, so it keeps what a clean window established while this
 	// follows the path. On the live incident the two read 1.76% and 19.9%.
 	Erasure float64
+	// RateCorrelated says the path authority's loss rises with its own
+	// sending rate, so the compensation withholds the part that does, and
+	// RateCorrelation is the up-phase loss minus the lower phases' (see
+	// rateCorrelation). EgressShare is the member's cap from its gateway's
+	// joint egress limit in bytes per second, zero while uncapped, and
+	// EgressCeiling the group's ceiling, zero while none applies.
+	RateCorrelated  bool
+	RateCorrelation float64
+	EgressShare     int64
+	EgressCeiling   uint64
 }
 
 const (
