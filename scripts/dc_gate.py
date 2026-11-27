@@ -283,7 +283,7 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
         a, b = metrics(campaign, f"{name}-pre-client-{leaf}"), metrics(campaign, f"{name}-post-client-{leaf}")
         return b.get("queqiao_fallbacks_total", float("nan")) - a.get("queqiao_fallbacks_total", float("nan"))
 
-    def check(t: Trial, leaves: List[str], what: str) -> Optional[set]:
+    def check(t: Trial, leaves: List[str], what: str, solo: bool = False) -> Optional[set]:
         rs = in_trial(t)
         if not rs:
             missing.append(f"{what}: no gateway record of its flows")
@@ -312,7 +312,7 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
             return None
         if len(egress) != 1:
             wrong.append(f"{what}: flows under {len(egress)} egresses, not one common ancestor")
-        return {r["path_key"] for r in rs}
+        return load_keys(rs) if solo else {r["path_key"] for r in rs}
 
     egress_seen = set()
     # calibrate = first: block 1's solo runs name the leaves for every block;
@@ -325,7 +325,7 @@ def carrier_evidence(campaign: str, plan: dict, ab: List[Trial], solo: List[Tria
             keys = dict(first_keys)
         for t in [t for t in solo if t.block == b]:
             leaf = next((r["client"] for r in t.rows), "")
-            got = check(t, [leaf], f"block {b} solo {leaf} (slot {t.slot}, {t.arm})")
+            got = check(t, [leaf], f"block {b} solo {leaf} (slot {t.slot}, {t.arm})", solo=True)
             if got is None:
                 continue
             if len(got) != 1:
@@ -395,6 +395,33 @@ def bundle_evidence(campaign: str, plan: dict, loaded: List[str], control: str) 
     return missing, wrong
 
 
+# A solo calibration ran through one leaf. A stray flow of another leaf (the
+# uploader's single --providers process keeps every provider's carrier, so a
+# keepalive-sized flow can complete in another leaf's solo window) is not that
+# leaf's load: only leaves carrying at least SOLO_KEY_SHARE of the window's
+# bytes count. dcg6 voided on one 92-byte flow beside 132 flows of the solo
+# leaf. Simultaneous phases still count every key.
+SOLO_KEY_SHARE = 0.01
+
+
+def record_bytes(r: dict) -> int:
+    """Bytes a gateway flow record moved, both directions."""
+    if "bytes_from_client" in r or "bytes_to_client" in r:
+        return int(r.get("bytes_from_client", 0)) + int(r.get("bytes_to_client", 0))
+    return sum(int(v.get("Sent", 0)) + int(v.get("Received", 0)) for v in (r.get("lane_bytes") or {}).values())
+
+
+def load_keys(rs: List[dict]) -> set:
+    """The leaf keys that carried at least SOLO_KEY_SHARE of the bytes."""
+    per: Dict[str, int] = {}
+    for r in rs:
+        per[r["path_key"]] = per.get(r["path_key"], 0) + record_bytes(r)
+    total = sum(per.values())
+    if total <= 0:
+        return set(per)
+    return {k for k, v in per.items() if v >= SOLO_KEY_SHARE * total}
+
+
 def upload_evidence(campaign: str, plan: dict, ab: List[Trial], upsolo: List[Trial]) -> Tuple[List[str], List[str]]:
     """Did the upload phase run through the leaves it is about? From the
     gateway's flow records in each upload window: every flow QUIC; each solo
@@ -439,7 +466,7 @@ def upload_evidence(campaign: str, plan: dict, ab: List[Trial], upsolo: List[Tri
         if any("path_key" not in r for r in rs):
             missing.append(f"{what}: no gateway record of its leaves (needs QUEQIAO_LANE_TRACE=1)")
             continue
-        keys = {r["path_key"] for r in rs}
+        keys = load_keys(rs) if phase == "upsolo" else {r["path_key"] for r in rs}
         if len(keys) != n:
             wrong.append(f"{what}: gateway saw {len(keys)} leaf key(s), expected {n} (one relay host per leaf)")
     return missing, wrong
