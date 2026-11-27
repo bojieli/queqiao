@@ -968,6 +968,14 @@ probes every 0.25 s, each its own connection.
   attempted background objects; a flow that died before an outage counts
   against its own arm. The worst over all flows (`inflight_ttfb_s`) is
   reported.
+- *Credit delay, sampled* (v6, adopted after imp6, not re-judged):
+  during every impaired trial each endpoint's credit-delay histogram is
+  sampled about once a second (its /metrics on the host's loopback, a
+  detached job like the CPU sampler) and kept as a `credit_ts` record. In
+  blackhole, `credit_delay_clear_p95_s` is gated (`lower 0.05`): each
+  interval's increments go to the window its end falls in, and each outage
+  and the 5 s after it are left out, as for TTFT clear. The p95 within the
+  outages, in the 5 s after them, and over the whole trial are reported.
 - *Blackhole v5* (adopted after imp6, not re-judged): one pooled
   `transfer_failures` rule (`events 0.02 149`) over the short downloads
   and the background objects, since in blackhole a short download can wait
