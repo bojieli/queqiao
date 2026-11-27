@@ -1159,7 +1159,12 @@ tok_ok() { [ ${#1} -eq 32 ] || return 1; case "$1" in *[!0-9a-f]*) return 1;; es
 def wait_owned_script(pid_file: str, port: int) -> str:
     """Exit 0 once the pid in pid_file is alive and owns a TCP listener on
     port (ss -p on Linux, lsof elsewhere); 1 if it dies or never does."""
-    return f'''p=$(cat {pid_file} 2>/dev/null)
+    return f'''p=""
+for i in $(seq 1 40); do
+  p=$(cat {pid_file} 2>/dev/null)
+  [ -n "$p" ] && break
+  sleep 0.25
+done
 [ -n "$p" ] || {{ echo "no pid file"; exit 1; }}
 for i in $(seq 1 80); do
   kill -0 "$p" 2>/dev/null || {{ echo "process $p exited"; exit 1; }}
@@ -1681,9 +1686,27 @@ class Campaign:
     # -- processes
     def spawn(self, host: Host, tag: str, cwd: str, cmd: str, env: str = "") -> None:
         W = self.w(host.dest)
-        host.run(f"cd {cwd} && {{ if command -v setsid >/dev/null; then {env} setsid nohup {cmd} > {W}/run/{tag}.out 2>&1 < /dev/null & "
-                 f"else {env} nohup {cmd} > {W}/run/{tag}.out 2>&1 < /dev/null & fi; echo $! > {W}/run/{tag}.pid; }}",
-                 what=f"start {tag}")
+        pid = f"{W}/run/{tag}.pid"
+        # The pid file is what every later step signals and waits on, so its
+        # absence here is a failed start, not a slow one: say so, with the
+        # command's own output, instead of leaving the next wait to report
+        # "no pid file". A session that dropped (exit 255, already retried in
+        # Host.run) or a directory that was not there cost a whole overnight
+        # campaign that way.
+        script = (f"rm -f {pid}\n"
+                  f"cd {cwd} && {{ if command -v setsid >/dev/null; then {env} setsid nohup {cmd} > {W}/run/{tag}.out 2>&1 < /dev/null & "
+                  f"else {env} nohup {cmd} > {W}/run/{tag}.out 2>&1 < /dev/null & fi; echo $! > {pid}; }}\n"
+                  f"test -s {pid}")
+        for attempt in range(3):
+            rc, out = host.run(script, what=f"start {tag}")
+            if rc == 0:
+                return
+            if attempt < 2 and "cd:" not in out:
+                time.sleep(2.0)          # a session that dropped: try again
+                continue
+            break
+        if not self.dry:
+            raise RuntimeError(f"{host.dest}: start {tag} left no pid file ({out.strip()[:300]})")
 
     def stop(self, host: Host, tag: str) -> None:
         W = self.w(host.dest)

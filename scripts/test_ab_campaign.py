@@ -697,6 +697,27 @@ class LocalProcesses(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("exited", out)
 
+    def test_a_start_that_leaves_no_pid_file_says_so_at_the_start(self):
+        # It used to be the next wait that noticed ("no pid file"), with no
+        # word of which command had failed or why.
+        with self.assertRaises(RuntimeError) as c:
+            self.camp.spawn(self.host, "ghost", os.path.join(self.W, "absent"), "sleep 30")
+        self.assertIn("left no pid file", str(c.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.W, "run", "ghost.pid")))
+
+    def test_the_wait_for_a_port_waits_for_the_pid_file(self):
+        listener = subprocess.Popen([sys.executable, "-c",
+                                     "import socket,sys,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen();"
+                                     "print(s.getsockname()[1], flush=True); time.sleep(30)", f"{self.W}/marker"],
+                                    stdout=subprocess.PIPE, text=True)
+        self.procs.append(listener)
+        port = int(listener.stdout.readline())
+        own = pathlib.Path(self.W, "run", "late.pid")
+        script = ab.wait_owned_script(str(own), port).replace("seq 1 40", "seq 1 40")
+        threading.Timer(1.0, lambda: own.write_text(str(listener.pid))).start()
+        rc, out = self.host.run(script.replace("seq 1 80", "seq 1 80"))
+        self.assertEqual(rc, 0, out)
+
     def test_teardown_kills_only_what_it_started(self):
         # An operator's process that merely mentions the work directory (a
         # `tail -f` on a log) survives teardown, and verification reports it.
