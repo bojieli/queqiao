@@ -64,10 +64,18 @@ scenario in the suite to a real shaper):
 | worst session's p99, s | 2.3 | 5.8 |
 
 The median key is unaffected and the frequency of slow keys is close; what is
-worse is how deep the slow bursts go. Both arms show the same shape — slow keys
-arrive in bursts while a policer queue drains — so this is the new congestion
-law holding less back behind a policer, which is what issue #238 describes on
-another path. Three other rules fail in the same mechanical way, without the
+worse is how deep the slow bursts go. A deterministic reproduction (a 20 s
+test over the emulated path, issue #282) locates it: the delay is not
+queueing. On a queueing shaper of the same rate the bundles swap places — the
+new bundle's echo p99 is 213 ms against main's 488 — and with no bulk on the
+path both are clean. What a policer changes is that a small record can be
+dropped at the bucket, and the new bundle brings a dropped interactive record
+back later than main does (about 500 ms, on the leg the bulk runs on). The
+mechanism is `coded-retry=sticky`'s recovery of a coded interactive record
+(design §8.1), not the pacing runaway of #238: on this path the new bundle's
+pacing stays near the policer's while main's runs away.
+
+Three other rules fail in the same mechanical way, without the
 candidate being worse: `blackhole.stalls_per_trial` (82 vs 107 stalls) and
 `slow-lossy.echo_p99_s` (2.29 vs 3.20 s) are better but do not clear the
 t-bound at the block cap, and `policed.fetch_failures` was left unmeasured
@@ -161,7 +169,7 @@ which are unchanged.
 
 | item | state |
 | --- | --- |
-| interactive echo tail under a policer (p99 ~2×, p50 unchanged) | open, #238; the one gate that says the flip is blocked |
+| interactive echo tail under a policer (p99 ~2×, p50 unchanged) | open, #282; the one gate that says the flip is blocked |
 | `blackhole.stalls_per_trial`, `slow-lossy.echo_p99_s` | better but unproven at the block cap |
 | `policed.fetch_failures` | judged pass under the corrected minimum (#277) |
 | label races in failure attribution | open, #274 |
