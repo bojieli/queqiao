@@ -107,7 +107,7 @@ func drainLanes(t *testing.T, s *Scheduler, rates []time.Duration) (map[uint64]u
 	return carried, out
 }
 
-func after(d time.Duration) func() time.Duration { return func() time.Duration { return d } }
+func after(d time.Duration) func(bool) time.Duration { return func(bool) time.Duration { return d } }
 
 func TestSchedulerDeliversEveryByteInOrder(t *testing.T) {
 	payload := make([]byte, 512*1024)

@@ -71,6 +71,11 @@ const (
 	// absurd round trip from restoring the constant this replaced.
 	minChunkReissueDelay = 200 * time.Millisecond
 	maxChunkReissueDelay = 1500 * time.Millisecond
+	// minInteractiveReissueDelay is the floor for a flow that carries no bulk:
+	// its writes are small and have nothing behind them, so the floor that
+	// keeps a fast path from re-sending what is in flight is measured against
+	// a round trip the path has already reported, not a constant (#282).
+	minInteractiveReissueDelay = 50 * time.Millisecond
 	// chunkReissueInterval is how often the supervisor looks for chunks to
 	// re-offer.
 	chunkReissueInterval = 250 * time.Millisecond
@@ -208,7 +213,7 @@ func (f *multipathFlow) readyLimit() int {
 // transport's own probe timeout waits for the same reason, and a fixed second
 // and a half was six of them on the path this targets: measured live, one
 // small flow in five cost 1.79 s instead of 0.29 waiting out that constant.
-func (f *multipathFlow) reissueDelay() time.Duration {
+func (f *multipathFlow) reissueDelay(sparse bool) time.Duration {
 	if f.tcpStriping.Load() {
 		return tcpStripingReissueDelay
 	}
@@ -218,9 +223,24 @@ func (f *multipathFlow) reissueDelay() time.Duration {
 			longest = rtt
 		}
 	}
+	// How long to wait depends on whether anything followed the chunk. One
+	// that arrived with the queue empty behind it -- a small write, the
+	// chunk's own Sparse mark -- can never be proved lost by the data behind
+	// it, so gap evidence never comes and this delay is all it ever waits
+	// (§8.1). Against a policer that drops its record it is the whole of the
+	// added latency: measured at two round trips and 200 ms it was about 500
+	// ms of a keystroke echo (#282). Half a round trip is evidence enough
+	// there -- the retry is a duplicate the receiver dedups by offset -- while
+	// a chunk with data behind it keeps the two, which is all that governs its
+	// tail.
+	floor := minChunkReissueDelay
 	delay := 2 * longest
-	if delay < minChunkReissueDelay {
-		return minChunkReissueDelay
+	if sparse {
+		floor = minInteractiveReissueDelay
+		delay = longest / 2
+	}
+	if delay < floor {
+		return floor
 	}
 	if delay > maxChunkReissueDelay {
 		return maxChunkReissueDelay
@@ -469,9 +489,17 @@ func (f *multipathFlow) reliableReissueBurst() int {
 // stops a slow lane being handed more work, but a chunk already on it needs
 // somebody to notice, and the receiver cannot deliver past it meanwhile.
 func (f *multipathFlow) superviseChunks(ctx context.Context, sched *stripe.Scheduler) {
-	ticker := time.NewTicker(chunkReissueInterval)
-	defer ticker.Stop()
 	for {
+		// Wake on the earliest chunk deadline, and on the interval as a
+		// fallback for anything that arrives without one. A chunk that expires
+		// between ticks waits out the rest of the interval otherwise, which for
+		// a chunk with nothing behind it is added to every retry (#282).
+		wait := chunkReissueInterval
+		if next := sched.NextDeadline(); !next.IsZero() {
+			if until := time.Until(next); until < wait {
+				wait = max(until, time.Millisecond)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -479,7 +507,7 @@ func (f *multipathFlow) superviseChunks(ctx context.Context, sched *stripe.Sched
 			return
 		case <-f.done:
 			return
-		case <-ticker.C:
+		case <-time.After(wait):
 			if n := sched.ReissueExpired(); n > 0 && f.metrics != nil {
 				for i := 0; i < n; i++ {
 					f.metrics.Reinjected()

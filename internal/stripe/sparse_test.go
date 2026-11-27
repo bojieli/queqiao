@@ -151,6 +151,52 @@ func TestAFullReadIsNotSparse(t *testing.T) {
 	}
 }
 
+// The retransmit delay is asked for with the chunk's own mark, so a caller can
+// give a chunk that arrived alone the short deadline it needs while one with
+// data behind it keeps the long one (#282).
+func TestTheRetransmitDelayIsAskedPerChunk(t *testing.T) {
+	src := &writesReader{writes: make(chan []byte, 2)}
+	defer close(src.writes)
+	now := time.Now()
+	var asked []bool
+	s := New(src, Config{
+		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
+		Reliable:    func(uint64) bool { return false },
+		SparseBytes: 512, Sparse: func(int) bool { return true },
+		RetransmitAfter: func(sparse bool) time.Duration {
+			asked = append(asked, sparse)
+			if sparse {
+				return time.Millisecond
+			}
+			return time.Second
+		},
+		Now: func() time.Time { return now },
+	})
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	src.writes <- make([]byte, 1<<10)
+	full, err := s.Next(ctx, 1, 0)
+	if err != nil || full == nil {
+		t.Fatal(err)
+	}
+	src.writes <- make([]byte, 36)
+	short, err := s.Next(ctx, 1, 0)
+	if err != nil || short == nil {
+		t.Fatal(err)
+	}
+	s.WroteAs(1, full, false)
+	s.WroteAs(1, short, false)
+	if len(asked) != 2 || asked[0] || !asked[1] {
+		t.Fatalf("the delay was asked with sparse=%v; want false for the full read and true for the short one", asked)
+	}
+	// The short chunk's deadline is the one that comes first, so a supervisor
+	// waking on NextDeadline catches it without polling at its interval.
+	if want := now.Add(time.Millisecond); !s.NextDeadline().Equal(want) {
+		t.Fatalf("NextDeadline %v, want %v (the short chunk's)", s.NextDeadline(), want)
+	}
+}
+
 // A chunk whose coded attempt expired and is waiting for its retry is still
 // outstanding coded work: the stall watchdog samples once per episode and
 // must not miss it in that gap.
@@ -161,7 +207,7 @@ func TestCodedLossIsRememberedWhileTheRetryWaits(t *testing.T) {
 	s := New(src, Config{
 		ChunkSize: 32 << 10, LaneWindow: 64, MaxOutstanding: 64, MaxOutstandingBytes: 1 << 20,
 		Reliable:        func(uint64) bool { return false },
-		RetransmitAfter: func() time.Duration { return time.Millisecond },
+		RetransmitAfter: func(bool) time.Duration { return time.Millisecond },
 		Now:             func() time.Time { return now },
 	})
 	defer s.Close()

@@ -14,7 +14,7 @@ func TestByteScopedRecoveryKeepsFreshChunksUnreliable(t *testing.T) {
 		ChunkSize:       8,
 		Reliable:        func(uint64) bool { return false },
 		ForceReliable:   func(offset uint64) bool { return offset < recoveryEnd },
-		RetransmitAfter: func() time.Duration { return time.Second },
+		RetransmitAfter: func(bool) time.Duration { return time.Second },
 		Now:             func() time.Time { return now },
 	})
 	defer sched.Close()
