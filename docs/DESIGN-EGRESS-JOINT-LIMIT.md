@@ -28,7 +28,7 @@ Two defects, two remedies, in this order of cause:
 - **A (per controller).** The law cannot tell loss that rises with its own rate from loss that does not. It must, and compensate only the second kind.
 - **B (per gateway egress).** Even a controller that classifies correctly cannot see its siblings. Independent leaves need a joint ceiling and a fair division of it.
 
-A is necessary because B's ceiling is not always known and learning needs A's classification. B is necessary because A is a statement about one sender: the aggregate of N senders each correct about itself can still overload a shared port, and a port-level loss does not distinguish its senders.
+A is necessary because a single sender behind a limiter (no siblings, so no joint limit) compensates its own policer loss the same way. B is necessary because A is a statement about one sender: the aggregate of N senders each correct about itself can still overload a shared port, and a port-level loss does not distinguish its senders.
 
 ## 2. Part A: correlation-aware erasure
 
@@ -102,19 +102,22 @@ The *egress group* of a gateway is the set of its path controllers that send out
 
 1. **Configured.** `--egress-capacity=<rate>` (`1g`, `940m`, `500mbit`; bits per second, exact). Enforced whenever any member is active. `off` disables Part B. The default is `auto`.
 2. **Link speed with a margin.** Under `auto`, `K_link = 0.95 x speed` where speed is `/sys/class/net/<interface>/speed` on Linux. The file is absent or `-1` for virtual, wireless and macOS interfaces. Then there is **no link bound**: this is a normal case (hypervisor NICs), and the ceiling is learned only.
-3. **Learned from the aggregate.** The group takes a window `W = 100 ms` (events carry their own times, so a simulation drives it). From the members' sample-packet counters it forms the aggregate sent rate `A`, the decided count `N`, the lost count `L`, the loss `lambda = L/N`, and the weighted channel floor `lambda0 = sum(N_i x floor_i) / N`, where `floor_i` is each member's erasure after Part A. The group's excess loss is `lambda - lambda0`.
+3. **Learned from the aggregate.** The group takes a window `W = 100 ms` (events carry their own times, so a simulation drives it). From the members' sample-packet counters each window gives the aggregate sent rate `a_w` and the loss `l_w` of the packets decided in it, kept while at least 2 members are active and the window decided at least 500 packets. The group keeps the last 40 windows.
 
-   **A learned `K` can only fall through the learn-down rule.** The conditions below are the only way it falls, and they all require loss that a member has found to rise with its own rate. A gateway whose members see random loss alone can therefore never be throttled: their `delta` is about zero, none is flagged, and `K` stays what it was (none, or the link's).
+   **The experiment is the aggregate's own variation.** Members' probe cycles are not aligned, so `a_w` moves from window to window with no one choosing it. If the egress drops past its capacity, `l_w` rises with `a_w`; if the channel erases at random, it does not. The group fits `l_w` on `a_w / mean(a) - 1` by least squares. The loss is **rate-correlated** when at least 20 windows are in the fit, their rates spread over at least 3 % of their mean, and the slope is at least 0.1 (ten percent more offered, a point more lost) and at least 4 standard errors, the error taken from the fit's residual and floored at binomial. At the egress itself this is the measurement that matters, and it is made on a thousand packets per window where one member's own up phase against its siblings' is not: with two members at 1.3 times the egress, a member's up-versus-cruise contrast was swamped by its sibling's phases (per-epoch loss spread of 0.12 against an effect of 0.05), and it flagged only now and then.
 
-   **Learn down** when all hold: at least 2 members are active, at least one active member is `flagged` by Part A, `N >= 500`, and `lambda - lambda0 > 0.02 + 3 sqrt(lambda0 (1 - lambda0)/N)`. Then, with `q = (lambda - lambda0)/(1 - lambda0)` the fraction the egress dropped of what reached it, the aggregate that fitted is `A (1 - q)`:
+   **A learned `K` can only fall through the learn-down rule.** It requires the fit above, so a gateway whose members see random loss alone can never be throttled: the slope is about zero, and `K` stays what it was (none, or the link's).
+
+   **Learn down** when the loss is rate-correlated and at least 2 members are active. The ceiling becomes what the egress delivered of the windows in the fit:
 
    ```
-   K <- min(K, A (1 - q))              hold 2 s (+ up to 1 s jitter), as inflightBound
+   K <- min(K, mean(a) (1 - loss))     hold 2 s (+ up to 1 s jitter), as inflightBound
    ```
 
-   Requiring a flag is what keeps this from throttling a gateway whose members each see random loss: the group never learns from loss alone. It iterates. Once the members are throttled their lower-class floors fall, `lambda0` falls and the next window's `q` is larger, so `K` converges on the real capacity from above in a few windows.
+   When the channel past the egress erases nothing this is its capacity; when it erases `e` it is `(1 - e)` of it, a lower bound that a probe then raises. The fit is emptied by a cut and the next windows (three, or three round trips) are not judged: what is lost then was sent before the cut. The rule therefore iterates from above, each cut using the windows the previous shares produced.
 
-   **Probe up** while `K` binds (some member is capped by its share) and the last window had no excess loss: `K <- 1.05 K` once per second after the hold, never above the link bound. A probe that brings excess loss is cut back by the rule above to what fitted. This is `inflight_hi`'s growth and BBR's ProbeBW applied to the aggregate; random loss does not disturb it, because the probe's own experiment (rate up, loss unchanged) leaves `q = 0`.
+
+   **Probe up** while `K` binds (some member is capped by its share) and the loss is not rate-correlated: `K <- 1.05 K` once per second after the hold, never above the link bound. A probe that brings excess loss is cut back by the rule above to what fitted. This is `inflight_hi`'s growth and BBR's ProbeBW applied to the aggregate; random loss does not disturb it, because the probe's own experiment (rate up, loss unchanged) leaves `q = 0`.
 
 `K` persists for the life of the process, as the capacity of the host's egress is a property of the host.
 
@@ -165,7 +168,7 @@ Both apply after the delay bound and the `inflightBound`; the tightest wins. The
 All new tests fail before the change and pass after it (the report states which).
 
 1. **Unit, Part A** (`internal/congestion/loss_correlation_test.go`): independent loss at 3 %, 20 % and 42 % and a Gilbert burst model, each under the real gain cycle, leaves the compensation within 5 % of the existing law's erasure and flags in under 2 % of looks; loss `max(0, 1 - C/S)` is flagged within 8 cycles and the compensation falls to the lower-class floor; fewer than 6 `up` epochs, or too few packets per epoch, never flags; the Schmitt trigger does not flap.
-2. **Unit, Part B** (`internal/congestion/egress_limit_test.go`): water-filling (max-min, work conservation); no effect under the ceiling; a member below its share is uncapped; one active member is unaffected without a configured ceiling; learn-down needs a flag and two members; random loss alone never learns; probe-up recovers a stale low `K`; link-speed parsing, including `-1` and absence.
+2. **Unit, Part B** (`internal/congestion/egress_limit_test.go`): water-filling (max-min, work conservation); no effect under the ceiling; a member below its share is uncapped; one active member is unaffected without a configured ceiling; learn-down needs rate-correlated aggregate loss and two active members; random loss alone never learns; a policed egress is learned to within 15 %; probe-up recovers a stale low `K`; link-speed parsing, including `-1` and absence.
 3. **Deterministic pathsim, `internal/pep`**: two loaded leaves and a light control leaf (300 KB every 0.5 s) through one shared 1 Gbit/s limiter that drops with no standing queue (`PolicerRefillPeriod`), the DC leg (53 ms), ABBAAB against the legacy arm. The control leaf's p50 is within 1.10x legacy's (plus the existing `dcLatencySlack`), the loaded leaves' aggregate is at least legacy's, and the link drop rate falls. The same test on the unmodified main is expected to fail the first bound; the numbers before and after are recorded in the PR.
 4. **Policed regression** (`TestDCPolicedLeafGoodputAndLatency`): one leaf behind a 100 Mbit/s policer, with and without 5 % channel loss, against legacy: goodput at least 0.90x and a fetch beside the download at most 1.10x legacy's at the median (plus the emulator slack), because Part A withholds compensation for policer loss. Goodput and latency before and after are recorded in the PR.
 5. **Regressions**, run on the bed host: `TestSharedBottleneckQueuePressure` and the CUBIC bed; `TestDCControlLeafBesideLoadedDownloads`; `TestGatewayFirstFlightBesideBulkDownloads`; `TestBlackhole*`; M5 and W10; `TestDCMultiLeaf*`; the congestion package, `go vet`, and the full suite.
@@ -176,7 +179,7 @@ All new tests fail before the change and pass after it (the report states which)
 | Risk | Handling |
 | --- | --- |
 | The learned ceiling is too low after a transient brownout and starves a path that has recovered | Probe-up 5 % per second after a hold; a gateway that must not learn can set `--egress-capacity` or `off` |
-| Part A power is too small on short, low-rate paths | It then does nothing (today's behaviour); B's learning also waits for a flag, so it too does nothing. No path gets worse. |
+| Part A power is too small on short, low-rate paths | It then does nothing (today's behaviour). B's learning does not depend on it: it fits the aggregate's own loss against its own rate, which has many more packets per observation. No path gets worse. |
 | A gateway with several interfaces mapped to one port by a bridge or a bond | Link speed is then the bond's or unreadable; configure the ceiling |
 | The flag arrives late on a very short DC round trip | The 5 ms epoch floor and the 100 ms window bound reaction to a few hundred milliseconds |
 | Groups and the light leaf: a burst of the light leaf lands on a full port | 3 % headroom, and the light leaf is never capped while its demand is below the water level |

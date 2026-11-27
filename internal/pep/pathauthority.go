@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,14 +59,14 @@ func newClientPathPrincipal() string {
 // pointing the connection's readers (follow) at its model. It is called
 // only on the connection's run loop.
 func pathRekey(principal func() string, current string, initial quiccongestion.ByteCount, follow func(next string)) func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
-	return pathRekeyIn(principal, current, initial, false, func(next, _, _ string) { follow(next) })
+	return pathRekeyIn(principal, current, initial, false, nil, func(next, _, _ string) { follow(next) })
 }
 
 // pathRekeyIn is pathRekey for an authority that may sit in a hierarchical
 // profile's tree (§11.3): the new key's controller is created with its
 // knowledge view, and follow also learns the new key's egress and address
 // part, from which the readers' view is rebuilt.
-func pathRekeyIn(principal func() string, current string, initial quiccongestion.ByteCount, hierarchical bool, follow func(next, egress, addrs string)) func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
+func pathRekeyIn(principal func() string, current string, initial quiccongestion.ByteCount, hierarchical bool, egressPolicy *EgressCapacity, follow func(next, egress, addrs string)) func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
 	return func(_, newLocal, _, newRemote net.Addr) *wancongestion.PathController {
 		egress, nextAddrs := resolvePath(newLocal, newRemote)
 		nextWho := principal()
@@ -78,6 +79,7 @@ func pathRekeyIn(principal func() string, current string, initial quiccongestion
 		// and its model, and the readers must follow the model the
 		// controller reports to.
 		c := pathAuthorities.controllerIn(nextWho, nextAddrs, initial, treePosition(hierarchical, egress, nextAddrs))
+		joinEgress(c, nextWho, egress, egressPolicy)
 		follow(next, egress, nextAddrs)
 		return c
 	}
@@ -157,6 +159,7 @@ func (r *pathAuthorityRegistry) controllerIn(principal, key string, initialPacke
 		r.swept = now
 		for k, c := range r.controllers {
 			if idle, ok := c.IdleSince(); ok && now.Sub(idle) > pathKnowledgeLifetime {
+				c.JoinEgress(nil)
 				delete(r.controllers, k)
 				// The principal's model goes with its controller: a
 				// principal that does not return would otherwise keep it
@@ -173,6 +176,7 @@ func (r *pathAuthorityRegistry) controllerIn(principal, key string, initialPacke
 			return c
 		}
 		// Expired, whenever the last sweep ran: the path starts cold.
+		c.JoinEgress(nil)
 		delete(r.controllers, name)
 		pathmodel.Forget(name)
 	}
@@ -185,10 +189,12 @@ func (r *pathAuthorityRegistry) controllerIn(principal, key string, initialPacke
 // path.
 func (r *pathAuthorityRegistry) forget() {
 	r.mu.Lock()
-	for k := range r.controllers {
+	for k, c := range r.controllers {
+		c.JoinEgress(nil)
 		pathmodel.Forget(k)
 	}
 	clear(r.controllers)
+	egressGroups.forget()
 	r.mu.Unlock()
 }
 
@@ -209,12 +215,13 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal func(
 	initial := conn.InitialPacketSize()
 	position := treePosition(cfg.hierarchicalPath, egress, addrs)
 	controller := pathAuthorities.controllerIn(who, addrs, initial, position)
+	joinEgress(controller, who, egress, cfg.egress)
 	// The connection's FEC and probe readers read the model the law reports
 	// to: the principal's, through the tree's knowledge under a hierarchical
 	// profile.
 	readers := pathModelOfKey(conn, current)
 	readers.setKnowledge(knowledgeAt(current, position))
-	rekey := pathRekeyIn(principal, current, initial, cfg.hierarchicalPath, func(next, egress, addrs string) {
+	rekey := pathRekeyIn(principal, current, initial, cfg.hierarchicalPath, cfg.egress, func(next, egress, addrs string) {
 		rekeyPathModel(conn, next)
 		pathModelOf(conn).setKnowledge(knowledgeAt(next, treePosition(cfg.hierarchicalPath, egress, addrs)))
 	})
@@ -237,6 +244,17 @@ func attachPathController(conn *quic.Conn, cfg congestionConfig, principal func(
 	markClassScheduled(conn)
 	conn.SetCongestionControl(attachment)
 	return attachment
+}
+
+// joinEgress seats a gateway's controller in the joint limit of the interface
+// it sends out of (egress.go). A client's controllers, whose principal is not
+// a gateway's, never join, and neither does any when the gateway has no
+// --egress-capacity policy (a client).
+func joinEgress(c *wancongestion.PathController, principal, egressHost string, policy *EgressCapacity) {
+	if policy == nil || !strings.HasPrefix(principal, "principal:") {
+		return
+	}
+	c.JoinEgress(egressGroups.group(egressHost, *policy))
 }
 
 // knowledgeAt is the readers' knowledge view of the path named name at a

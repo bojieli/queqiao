@@ -103,6 +103,11 @@ type PathController struct {
 	// unpublished says the estimator observed fates since its figures were
 	// last published.
 	unpublished bool
+	// egress is the controller's seat in its gateway's joint egress limit
+	// (docs/DESIGN-EGRESS-JOINT-LIMIT.md §3), nil when it has none.
+	// appLimitedTotal is the unused-opportunity time, cumulative.
+	egress          *EgressMember
+	appLimitedTotal time.Duration
 	// flightGauge mirrors flight for telemetry readers.
 	flightGauge atomic.Int64
 	// datagrams is the loss estimator over datagram-bearing samples only,
@@ -148,6 +153,10 @@ type fateRecord struct {
 	fate fate
 	// datagram says the packet carried a DATAGRAM frame.
 	datagram bool
+	// epoch and class are the law's rate epoch the packet was sent in
+	// (rateCorrelation).
+	epoch uint64
+	class lossClass
 }
 
 type heldLoss struct {
@@ -266,6 +275,7 @@ func (c *PathController) accrue(now monotime.Time) {
 		}
 		if now.After(start) {
 			c.unusedTime += now.Sub(start)
+			c.appLimitedTotal += now.Sub(start)
 		}
 	}
 	if now.After(c.accruedAt) {
@@ -316,6 +326,32 @@ func (c *PathController) Attach(rekey func(oldLocal, newLocal, oldRemote, newRem
 	return a
 }
 
+// JoinEgress seats the controller in g, the joint limit of the interface it
+// sends out of, or takes it out of every group when g is nil. A gateway's
+// controllers join; a client's never do.
+func (c *PathController) JoinEgress(g *EgressLimit) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.egress != nil && (g == nil || c.egress.g != g) {
+		c.egress.Leave()
+		c.egress = nil
+		c.law.egress.Store(nil)
+	}
+	if g != nil && c.egress == nil {
+		c.egress = g.Join()
+		c.law.egress.Store(c.egress)
+	}
+}
+
+// reportEgress publishes the law's figures to the group, which ticks when a
+// window has passed.
+func (c *PathController) reportEgress(now monotime.Time) {
+	if c.egress == nil {
+		return
+	}
+	c.egress.report(now, uint64(max(c.law.uncappedBandwidth(), 0)), c.law.inner.minRoundTrip(), c.appLimitedTotal)
+}
+
 // Attachments is the number of attachments currently attached.
 func (c *PathController) Attachments() int { return int(c.attached.Load()) }
 
@@ -349,6 +385,10 @@ func (c *PathController) Telemetry() ControllerTelemetry {
 	t.Authority = c.id
 	// The counted flight, not the sampler's last view of it.
 	t.BytesInFlight = uint64(max(c.flightGauge.Load(), 0))
+	if m := c.law.egress.Load(); m != nil {
+		t.EgressShare = m.Share()
+		t.EgressCeiling, _ = m.g.Ceiling()
+	}
 	return t
 }
 
@@ -531,9 +571,18 @@ func (c *PathController) advance(now monotime.Time) {
 		switch r.fate {
 		case fateDelivered:
 			c.law.estimator.ObserveOutcome(true)
+			c.law.corr.observe(r.epoch, r.class, r.sent, false)
+			if c.egress != nil {
+				c.egress.decided.Add(1)
+			}
 			c.unpublished = true
 		case fateLost:
 			c.law.estimator.ObserveOutcome(false)
+			c.law.corr.observe(r.epoch, r.class, r.sent, true)
+			if c.egress != nil {
+				c.egress.decided.Add(1)
+				c.egress.lost.Add(1)
+			}
 			c.unpublished = true
 		default:
 			c.law.estimator.Break()
@@ -1206,6 +1255,9 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 		}
 	}
 	c.law.recordInFlight(c.flight)
+	if c.egress != nil && s.AckEliciting {
+		c.egress.sent.Add(byteTotal(s.Bytes))
+	}
 	sample := !a.probing && s.Space == quiccongestion.SpaceApplication && s.AckEliciting && s.InFlightCounted &&
 		(s.Kind == quiccongestion.KindOrdinary || s.Kind == quiccongestion.KindPTOProbe)
 	switch {
@@ -1213,7 +1265,8 @@ func (c *PathController) sent(a *PathAttachment, s quiccongestion.SentPacket) []
 		pseq := c.nextPseq
 		c.nextPseq++
 		key := packetKey{space: s.Space, number: s.Number}
-		c.ring = append(c.ring, fateRecord{att: a, key: key, sent: now, datagram: s.HasDatagram})
+		epoch, class := c.law.sendEpoch(now)
+		c.ring = append(c.ring, fateRecord{att: a, key: key, sent: now, datagram: s.HasDatagram, epoch: epoch, class: class})
 		a.pkts[key] = sampleRef{pseq: pseq, bytes: s.Bytes}
 		c.stats.samples.Add(1)
 		// The sampler's pre-send flight is the path's before this packet.
@@ -1417,6 +1470,7 @@ func (c *PathController) ackEvent(a *PathAttachment, ev quiccongestion.AckEvent)
 		after := c.law.Telemetry()
 		a.bankCounters(&after, &before)
 	}
+	c.reportEgress(now)
 	var wakes []func()
 	if c.flight < before || c.law.GetCongestionWindow() > windowBefore {
 		wakes = c.collectBlocked(a, wakes)

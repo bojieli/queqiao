@@ -571,6 +571,9 @@ type runtimeOptions struct {
 	sched string
 	// congestionScope is the path controller switch (design §14 stage 6).
 	congestionScope string
+	// egressCapacity is a gateway's joint egress limit (docs/DESIGN-EGRESS-JOINT-LIMIT.md):
+	// auto, off, or a rate. It applies only under --congestion-scope=path.
+	egressCapacity string
 	// codedRetry is the coded-retry bundle (design §14 stage 4).
 	codedRetry string
 	// classifierMode is the flow-classifier bundle (workload model R1).
@@ -694,6 +697,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this gateway serves: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.BoolVar(&opts.allowPrivate, "allow-private-destinations", false, "allow private and link-local destinations")
 		fs.StringVar(&opts.outboundSOCKS5, "outbound-socks5", "", "optional loopback SOCKS5 upstream for destination traffic")
+		fs.StringVar(&opts.egressCapacity, "egress-capacity", "auto", "ceiling on what this gateway's path authorities send out of one network interface together, divided fairly among the active ones: auto (the interface's link speed with a margin where it can be read, else learned from the aggregate loss), off, or a rate such as 1g or 940m; applies only with --congestion-scope=path")
 		fs.StringVar(&opts.gatewayAdmission, "gateway-admission", string(pep.GatewayAdmissionLegacy), "what the session limit counts: legacy (every stream, with JOIN and PROBE still admitted when full) or owned (logical flows, charged at OPEN)")
 	}
 }
@@ -791,6 +795,15 @@ func validateRuntime(opts runtimeOptions, client bool) error {
 	}
 	if err := pep.ValidateCongestionScope(pep.CongestionScope(opts.congestionScope), pep.CCAPIVersion(opts.ccAPI), pep.SchedMode(opts.sched)); err != nil {
 		return err
+	}
+	if !client {
+		egress, err := pep.ParseEgressCapacity(opts.egressCapacity)
+		if err != nil {
+			return err
+		}
+		if err := pep.ValidateEgressCapacity(egress, pep.CongestionScope(opts.congestionScope)); err != nil {
+			return err
+		}
 	}
 	if err := pep.ValidateCodedRetry(pep.CodedRetryMode(opts.codedRetry), pep.CCAPIVersion(opts.ccAPI)); err != nil {
 		return fmt.Errorf("--coded-retry: %w", err)
@@ -998,6 +1011,10 @@ func runServer(args []string) (returnErr error) {
 	}
 	logger.Info("path profile selected", "profile", serverProfile.Name,
 		"level", string(serverProfile.Level), "evidence", serverProfile.Evidence)
+	egressCapacity, err := pep.ParseEgressCapacity(opts.egressCapacity)
+	if err != nil {
+		return err
+	}
 	server, err := pep.NewServer(pep.ServerConfig{
 		ListenAddr: opts.listen, Credentials: provider.ServerCredentials(), Enrollment: service,
 		ChunkSize:        opts.chunkSize,
@@ -1011,6 +1028,7 @@ func runServer(args []string) (returnErr error) {
 		CCAPI:               pep.CCAPIVersion(opts.ccAPI),
 		Sched:               pep.SchedMode(opts.sched),
 		CongestionScope:     pep.CongestionScope(opts.congestionScope),
+		EgressCapacity:      egressCapacity,
 		CodedRetry:          pep.CodedRetryMode(opts.codedRetry),
 		Recovery:            pep.RecoveryMode(opts.recovery),
 		CarrierShadow:       opts.carrierShadowConfig(),
