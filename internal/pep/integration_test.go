@@ -29,6 +29,14 @@ import (
 
 func testCertificate(t testing.TB) (identity.ServerCredentials, identity.ClientCredentials) {
 	t.Helper()
+	server, clients := testDeviceCertificates(t, 1)
+	return server, clients[0]
+}
+
+// testDeviceCertificates is testCertificate for a gateway with n clients: one
+// provider, n enrolled devices, each its own principal.
+func testDeviceCertificates(t testing.TB, n int) (identity.ServerCredentials, []identity.ClientCredentials) {
+	t.Helper()
 	now := time.Now()
 	provider, err := identity.InitProvider(t.TempDir()+"/provider", "test provider", "127.0.0.1:1", now)
 	if err != nil {
@@ -38,36 +46,39 @@ func testCertificate(t testing.TB) (identity.ServerCredentials, identity.ClientC
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, invitation, err := provider.CreateInvitation(account.ID, time.Hour, now)
-	if err != nil {
-		t.Fatal(err)
+	var clients []identity.ClientCredentials
+	for range n {
+		_, invitation, err := provider.CreateInvitation(account.ID, time.Hour, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, device, err := provider.Store.ConsumeInvite(invitation.Token, "test device", publicKey, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		certPEM, err := provider.IssueDevice(account.ID, device.ID, publicKey, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+		deviceCertificate, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, identity.ClientCredentials{
+			ProviderID: provider.Metadata.ProviderID, GatewayID: provider.Metadata.GatewayID,
+			Certificate: deviceCertificate, Root: provider.RootCert, RootPin: provider.Metadata.RootPin,
+		})
 	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, device, err := provider.Store.ConsumeInvite(invitation.Token, "test device", publicKey, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	certPEM, err := provider.IssueDevice(account.ID, device.ID, publicKey, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	deviceCertificate, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := identity.ClientCredentials{
-		ProviderID: provider.Metadata.ProviderID, GatewayID: provider.Metadata.GatewayID,
-		Certificate: deviceCertificate, Root: provider.RootCert, RootPin: provider.Metadata.RootPin,
-	}
-	return provider.ServerCredentials(), client
+	return provider.ServerCredentials(), clients
 }
 
 func discardDestination(listener net.Listener) {
