@@ -47,7 +47,9 @@ An epoch is a maximal run of consecutive *sample packets* of the path's send ord
 | `down` | mode ProbeBW and gain < 1 |
 | none | startup, drain, ProbeRTT: not used, as their rate moves for other reasons |
 
-Each fate record carries `(epoch id, class)`. The estimator already observes fates **in send order** (`PathController.advance`), so an epoch is complete exactly when the first record of a later epoch is observed. No lag constant is needed, and a loss declared late still counts for the epoch that sent it. An epoch with fewer than 20 decided packets is discarded. The statistic keeps the last 96 closed epochs, with each epoch's loss fraction `l_e = lost / decided`.
+Each fate record carries `(epoch id, class)`. The estimator already observes fates **in send order** (`PathController.advance`), so an epoch is complete exactly when the first record of a later epoch is observed. No lag constant is needed, and a loss declared late still counts for the epoch that sent it. An epoch with fewer than 20 decided packets is discarded.
+
+An epoch is also discarded when it is a round with no acknowledgements at all (every packet lost: a path that is away loses every rate class alike), and when it overlaps a detected outage (#264): on judging a silence an outage, `noteAnswered` drops every epoch sent from two smoothed round trips before the silence's first unanswered packet, so an outage that begins during an up epoch cannot flag a rate correlation. The statistic keeps the last 96 closed epochs, with each epoch's loss fraction `l_e = lost / decided`.
 
 ### 2.3 Statistic
 
@@ -60,7 +62,7 @@ se    = sqrt( var(U)/|U| + var(B)/|B| )          # per-epoch variance, so bursti
 var   = max(var_sample, p(1-p)/mean_n)            # floored at binomial, so 6 identical epochs do not give se = 0
 ```
 
-The loss is **rate-correlated** (`flagged`) when all hold: `|U| >= 6`, `|B| >= 12`, `delta >= 0.02` and `delta >= 3 se`. It stays flagged (a Schmitt trigger) until `delta < 0.01` or `delta < 1 se`, so the verdict does not flap as compensation is withdrawn and the gap closes.
+The loss is **rate-correlated** (`flagged`) when all hold: `|U| >= 6`, `|B| >= 12`, `delta >= 0.02` and `delta >= (3 + 6/|U|) se` (the allowance covers the heavy tail of a variance estimated from few up epochs: 4 se at six, 3.5 at twelve). It stays flagged (a Schmitt trigger) until `delta < 0.01` or `delta < 1 se`, so the verdict does not flap as compensation is withdrawn and the gap closes.
 
 Why this and not a regression on realised rate: the gain is the only rate variation the sender produces deliberately and independently of load, so the contrast is a designed experiment. It needs no model of the limiter, and it is a statement about *this sender's* rate, not the aggregate's. A siblings' probe adds variance to every epoch alike, because siblings' phases are not aligned with ours.
 
@@ -101,6 +103,8 @@ The *egress group* of a gateway is the set of its path controllers that send out
 1. **Configured.** `--egress-capacity=<rate>` (`1g`, `940m`, `500mbit`; bits per second, exact). Enforced whenever any member is active. `off` disables Part B. The default is `auto`.
 2. **Link speed with a margin.** Under `auto`, `K_link = 0.95 x speed` where speed is `/sys/class/net/<interface>/speed` on Linux. The file is absent or `-1` for virtual, wireless and macOS interfaces. Then there is **no link bound**: this is a normal case (hypervisor NICs), and the ceiling is learned only.
 3. **Learned from the aggregate.** The group takes a window `W = 100 ms` (events carry their own times, so a simulation drives it). From the members' sample-packet counters it forms the aggregate sent rate `A`, the decided count `N`, the lost count `L`, the loss `lambda = L/N`, and the weighted channel floor `lambda0 = sum(N_i x floor_i) / N`, where `floor_i` is each member's erasure after Part A. The group's excess loss is `lambda - lambda0`.
+
+   **A learned `K` can only fall through the learn-down rule.** The conditions below are the only way it falls, and they all require loss that a member has found to rise with its own rate. A gateway whose members see random loss alone can therefore never be throttled: their `delta` is about zero, none is flagged, and `K` stays what it was (none, or the link's).
 
    **Learn down** when all hold: at least 2 members are active, at least one active member is `flagged` by Part A, `N >= 500`, and `lambda - lambda0 > 0.02 + 3 sqrt(lambda0 (1 - lambda0)/N)`. Then, with `q = (lambda - lambda0)/(1 - lambda0)` the fraction the egress dropped of what reached it, the aggregate that fitted is `A (1 - q)`:
 
@@ -163,8 +167,9 @@ All new tests fail before the change and pass after it (the report states which)
 1. **Unit, Part A** (`internal/congestion/loss_correlation_test.go`): independent loss at 3 %, 20 % and 42 % and a Gilbert burst model, each under the real gain cycle, leaves the compensation within 5 % of the existing law's erasure and flags in under 2 % of looks; loss `max(0, 1 - C/S)` is flagged within 8 cycles and the compensation falls to the lower-class floor; fewer than 6 `up` epochs, or too few packets per epoch, never flags; the Schmitt trigger does not flap.
 2. **Unit, Part B** (`internal/congestion/egress_limit_test.go`): water-filling (max-min, work conservation); no effect under the ceiling; a member below its share is uncapped; one active member is unaffected without a configured ceiling; learn-down needs a flag and two members; random loss alone never learns; probe-up recovers a stale low `K`; link-speed parsing, including `-1` and absence.
 3. **Deterministic pathsim, `internal/pep`**: two loaded leaves and a light control leaf (300 KB every 0.5 s) through one shared 1 Gbit/s limiter that drops with no standing queue (`PolicerRefillPeriod`), the DC leg (53 ms), ABBAAB against the legacy arm. The control leaf's p50 is within 1.10x legacy's (plus the existing `dcLatencySlack`), the loaded leaves' aggregate is at least legacy's, and the link drop rate falls. The same test on the unmodified main is expected to fail the first bound; the numbers before and after are recorded in the PR.
-4. **Regressions**, run on the bed host: `TestSharedBottleneckQueuePressure` and the CUBIC bed; `TestDCControlLeafBesideLoadedDownloads`; `TestGatewayFirstFlightBesideBulkDownloads`; `TestBlackhole*`; M5 and W10; `TestDCMultiLeaf*`; the congestion package, `go vet`, and the full suite.
-5. **Live (not claimed here).** The stage-9 DC gate's control-leaf p50 contrast, rerun after merge.
+4. **Policed regression** (`TestDCPolicedLeafGoodputAndLatency`): one leaf behind a 100 Mbit/s policer, with and without 5 % channel loss, against legacy: goodput at least 0.90x and a fetch beside the download at most 1.10x legacy's at the median (plus the emulator slack), because Part A withholds compensation for policer loss. Goodput and latency before and after are recorded in the PR.
+5. **Regressions**, run on the bed host: `TestSharedBottleneckQueuePressure` and the CUBIC bed; `TestDCControlLeafBesideLoadedDownloads`; `TestGatewayFirstFlightBesideBulkDownloads`; `TestBlackhole*`; M5 and W10; `TestDCMultiLeaf*`; the congestion package, `go vet`, and the full suite.
+6. **Live (not claimed here).** The stage-9 DC gate's control-leaf p50 contrast, and a full impaired campaign (slow-lossy, blackhole, policed, idle-wake) before the flip, rerun after merge.
 
 ## 6. Risks
 
