@@ -203,7 +203,14 @@ class PooledCompletion(unittest.TestCase):
         # still leaves 149 attempts.
         self.assertEqual(st.events_decision([((0, 30), (0, 30))] * 5, v, n, ALPHA, final=True)[0], "pass")
         cut = [((0, 29), (0, 28))] + [((0, 30), (0, 30))] * 4
-        self.assertEqual(st.events_decision(cut, v, n, ALPHA, final=True)[0], "n/a")    # 149 / 148: main short
+        # 149 / 148: the candidate is what the rule tests, so its 149 attempts
+        # are the sample size that matters. Main's shorter count (it is the
+        # slower arm; trial windows cut its downloads) used to leave the rule
+        # unmeasured for good, which is how imp7's completion gate went
+        # unmeasured at 0/150 against 0/109.
+        self.assertEqual(st.events_decision(cut, v, n, ALPHA, final=True)[0], "pass")
+        thin = [((0, 2), (0, 30))] + [((0, 30), (0, 30))] * 4
+        self.assertEqual(st.events_decision(thin, v, n, ALPHA, final=True)[0], "n/a")   # 122 attempts: short
         cut6 = [((0, 27), (0, 28))] + [((0, 30), (0, 30))] * 5
         self.assertEqual(st.events_decision(cut6, v, n, ALPHA, final=True)[0], "pass")   # 177 / 178
 
