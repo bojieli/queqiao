@@ -55,6 +55,7 @@ MAIN = {
     "resume_upload_s": ([3.0, 4.5, 2.2, 5.1, 3.6, 4.0], "lower"),
     "ttft_clear_p99_s": ([2.0, 2.4, 1.9, 2.6, 2.2, 2.1], "lower"),
     "ttft_after_restore_s": ([3.0, 4.5, 2.2, 5.1, 3.6, 4.0], "lower"),
+    "credit_delay_clear_p95_s": ([0.30, 0.42, 0.28, 0.51, 0.36, 0.40], "lower"),
     "stalls_per_trial": ([36, 28, 40, 31, 25, 33], "lower"),
 }
 

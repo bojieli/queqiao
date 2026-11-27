@@ -343,6 +343,49 @@ def bg_transfers(trial, ph) -> Tuple[int, int]:
     return failed + stuck, len(tried) + stuck
 
 
+CREDIT_AFTER = 5.0          # seconds after an outage's end that count as its restore window
+
+
+def credit_windows(trial, ph) -> Dict[str, Any]:
+    """The trial's credit-delay histogram per window, pooled over its
+    endpoints, from the per-second samples (credit_ts records): each
+    interval's increments go to the window its end falls in -- "outage"
+    (within an outage), "after" (the CREDIT_AFTER s after one) or "clear".
+    A credit wait is counted when it ends, so one spanning an outage lands
+    at the restore. Times are each host's clock; the outages are the client
+    host's (hosts keep NTP time). None per window without samples."""
+    import generic_metrics as gm
+    ev = next((r for r in getattr(trial, "records", []) if r.get("_phase") == ph and r.get("kind") == "impair"
+               and not r.get("fail")), None)
+    outs = (ev or {}).get("outages") or []
+
+    def window(t):
+        for s, e in outs:
+            if s <= t <= e:
+                return "outage"
+            if e < t <= e + CREDIT_AFTER:
+                return "after"
+        return "clear"
+    hists: Dict[str, List[Any]] = {"clear": [], "outage": [], "after": []}
+    recs = [r for r in getattr(trial, "records", []) if r.get("_phase") == ph and r.get("kind") == "credit_ts"]
+    if not recs:
+        return {k: None for k in hists}
+    for r in recs:
+        smp = r.get("samples") or []
+        for (t0, h0), (t1, h1) in zip(smp, smp[1:]):
+            les = sorted(h1, key=lambda le: float("inf") if le == "+Inf" else float(le))
+            inc = [(float("inf") if le == "+Inf" else float(le), max(0.0, h1[le] - h0.get(le, 0.0))) for le in les]
+            hists[window(float(t1))].append(inc)
+    out: Dict[str, Any] = {}
+    for k, hs in hists.items():
+        if not hs:
+            # Samples, but none in this window: an empty histogram.
+            out[k] = [(le, 0.0) for le, _ in (hists["clear"] or hists["outage"] or hists["after"])[0]]
+            continue
+        out[k] = gm.pool(hs)
+    return out
+
+
 def fetch_attempts(trials, ph) -> Tuple[int, int]:
     """(failed, attempted) short downloads over the trials, pooled: a download
     the window's end cut was not a fair attempt and is left out."""
@@ -386,6 +429,9 @@ class Impaired(mn.Minimal):
     under its scenario; D (idle-wake-lossy) beside them."""
     name = "impaired"
     impairs = True
+    # Each endpoint's credit-delay histogram sampled about once a second
+    # through every trial (Campaign.start_credit_sampler).
+    credit_sampling = True
     # Wildcard rules that do not apply to a type: blackhole judges TTFT as
     # ttft_clear_p99_s and ttft_after_restore_s instead (#239).
     rule_exempt = {"blackhole": ("ttft_net_p99_s", "fetch_failures")}
@@ -396,7 +442,8 @@ class Impaired(mn.Minimal):
     generic = {t: ("stalls_per_trial",) for t in TRIAL_TYPES}
     report_only = ("completion", "goodput_bps", "ttft_net_p50_s", "ttft_all_p99_s", "echo_p50_s", "recover_8s_s", "recover_25s_s",
                    "reopen_ttfb_8s_s", "reopen_ttfb_25s_s", "inflight_ttfb_8s_s", "inflight_ttfb_25s_s",
-                   "inflight_ttfb_s", "bg_transfer_failures", "fetch_failures")
+                   "inflight_ttfb_s", "bg_transfer_failures", "fetch_failures",
+                   "credit_delay_outage_p95_s", "credit_delay_after_p95_s")
     # Measures compared only in the blocks where both arms have them (a flow
     # kind alive at an outage's start in both): the coverage rule asks for
     # two such blocks, not every block.
@@ -407,7 +454,9 @@ class Impaired(mn.Minimal):
         delay p95 is also a rule of every trial type ([secondary] bound)."""
         if mn.campaign_stage(plan) < 10:
             return dict(self.generic)
-        return {ph: ks + ("credit_delay_p95_s",) for ph, ks in self.generic.items()}
+        # Blackhole judges credit delay clear of its outages instead
+        # (credit_delay_clear_p95_s, from the per-second samples).
+        return {ph: ks + (() if ph == "blackhole" else ("credit_delay_p95_s",)) for ph, ks in self.generic.items()}
 
     def report_only_for(self, plan):
         return self.report_only + (("false_promotion_rate",) if mn.campaign_stage(plan) >= 10 else ())
@@ -417,7 +466,8 @@ class Impaired(mn.Minimal):
         # --carrier-shadow on every endpoint), never gated here.
         if mn.campaign_stage(plan) < 10:
             return {}
-        return {ph: ("false_promotion_rate",) for ph in self.generic}
+        return {ph: ("false_promotion_rate",) + (("credit_delay_p95_s",) if ph == "blackhole" else ())
+                for ph in self.generic}
 
     def read(self, cfg, p):
         cfg.scenario_udp_port = int(p.get("udp_port", "23487"))
@@ -536,6 +586,14 @@ class Impaired(mn.Minimal):
         # The generic secondaries' pooled evidence (credit delay histograms,
         # promotion counts), then this workload's own tails.
         out: Dict[str, Tuple[Optional[float], List[float]]] = dict(mn.Minimal.block_tails(self, trials, plan))
+        # Blackhole's credit delay clear of the outages, pooled over blocks
+        # when sparse.
+        bt = [t for t in trials if getattr(t, "trial", "") == "blackhole"]
+        if bt:
+            import generic_metrics as gm
+            h = gm.pool([credit_windows(t, "blackhole")["clear"] for t in bt])
+            if h is not None:
+                out["blackhole.credit_delay_clear_p95_s"] = (0.95, gm.Tail(h))
         for ph in TRIAL_TYPES:
             pt = [t for t in trials if getattr(t, "trial", "") == ph]
             if not pt:
@@ -665,6 +723,10 @@ class Impaired(mn.Minimal):
             bg = [bg_transfers(t, ph) for t in trials]
             m["bg_transfer_failures"] = (sum(f for f, _ in bg) / sum(n for _, n in bg)
                                          if sum(n for _, n in bg) else nan)
+            import generic_metrics as gm
+            for win in ("clear", "outage", "after"):
+                h = gm.pool([credit_windows(t, ph)[win] for t in trials])
+                m[f"credit_delay_{win}_p95_s"] = gm.quantile(0.95, h)
             ff, fn = fetch_attempts(trials, ph)
             bf, bn = sum(f for f, _ in bg), sum(n for _, n in bg)
             m["transfer_failures"] = (ff + bf) / (fn + bn) if fn + bn else nan

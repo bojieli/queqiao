@@ -523,7 +523,11 @@ class Stage10(unittest.TestCase):
         self.assertEqual(cfg.minimal_stage, 10)
         plan = {"config": {"minimal_stage": 10}}
         wl = cfg.wl
-        self.assertEqual(set(wl.generics(plan)["blackhole"]), {"stalls_per_trial", "credit_delay_p95_s"})
+        self.assertEqual(set(wl.generics(plan)["policed"]), {"stalls_per_trial", "credit_delay_p95_s"})
+        # Blackhole judges credit delay clear of its outages instead, and
+        # reports the whole-trial p95.
+        self.assertEqual(set(wl.generics(plan)["blackhole"]), {"stalls_per_trial"})
+        self.assertIn("credit_delay_p95_s", wl.reported(plan)["blackhole"])
         self.assertEqual(wl.reported(plan)["policed"], ("false_promotion_rate",))
         self.assertIn("false_promotion_rate", wl.report_only_for(plan))
         # Stage 7 (the default) is unchanged.

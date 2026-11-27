@@ -1283,6 +1283,7 @@ class Campaign:
         self.reserved: List[str] = []
         self.production_changed = False
         self.measures_path = None if dry else os.path.join(self.out, "measures.jsonl")
+        self.records_lock = threading.Lock()
         self.job_seq = 0
         self.blocks_run = 0
         self.units_run: List[List[Any]] = []
@@ -2210,6 +2211,8 @@ rm -f "$f"''', what=f"stop {tag}")
             parallel(lambda: self.scrape(arm, name + "-pre"), *[(lambda c=c: self.scrape_client(c, arm, name + "-pre"))
                                                                  for c in clients])
             samplers = self.start_host_cpu(name, path) if cfg.host_cpu else None
+            credit = (self.start_credit_sampler(name, arm, clients)
+                      if getattr(cfg.wl, "credit_sampling", False) else None)
             phases = cfg.wl.type_phases(cfg, path, trial)
             scenario = cfg.wl.impairment(cfg, trial) if self.impair else ""
             try:
@@ -2231,6 +2234,8 @@ rm -f "$f"''', what=f"stop {tag}")
             finally:
                 if samplers is not None:
                     self.stop_host_cpu(name, samplers)
+                if credit is not None:
+                    self.stop_credit_sampler(s, arm, trial, credit)
             parallel(lambda: self.scrape(arm, name + "-post"),
                      *[(lambda c=c: self.scrape_client(c, arm, name + "-post")) for c in clients])
             for c in clients:
@@ -2301,6 +2306,58 @@ rm -f "$f"''', what=f"stop {tag}")
             out[host] = (files, stop)
         parallel(*[(lambda host=host: go(host)) for host in hosts])
         return out
+
+    def start_credit_sampler(self, name: str, arm: Arm, clients: List[Client]) -> Dict[str, Any]:
+        """Sample each endpoint's credit-delay histogram (its /metrics on the
+        host's loopback) about once a second through the trial, detached like
+        the CPU sampler: the gateway's and each client's. Returns what
+        stop_credit_sampler needs."""
+        g = self.cfg.gateway
+        ends = [("gateway", g.host, g.metrics_port_base + arm.index)] + \
+               [(f"client-{c.name}", c.host, c.metrics_port_base + arm.index) for c in clients]
+        out: Dict[str, Any] = {}
+
+        def go(end, host, port):
+            stop = f"{self.w(host)}/run/stop-credit-{end}"
+            script = (NOW_SH + f"rm -f {stop}; while [ ! -e {stop} ]; do t=$(now); "
+                      f"curl -s --max-time 1 http://127.0.0.1:{port}/metrics 2>/dev/null | awk -v t=\"$t\" "
+                      "'/^queqiao_credit_delay_seconds_bucket/ {match($0, /le=\"[^\"]+\"/); "
+                      "le = substr($0, RSTART + 4, RLENGTH - 5); s[le] += $NF} "
+                      "END {for (k in s) printf \"C\\t%s\\t%s\\t%s\\n\", t, k, s[k]}'; sleep 1; done")
+            try:
+                files, _ = self.start_job(host, script, f"credit sampler {end} ({name})", self.SAMPLER_SSH_TRIES)
+            except Exception as e:  # missing evidence, not a dead campaign
+                files = None
+                self.log(f"credit sampler {end} failed to start: {e}")
+            out[end] = (host, files, stop)
+        parallel(*[(lambda e=e, h=h, p=p: go(e, h, p)) for e, h, p in ends])
+        return out
+
+    def stop_credit_sampler(self, slot: Slot, arm: Arm, trial: str, samplers: Dict[str, Any]) -> None:
+        """Stop the credit samplers and keep each endpoint's samples as one
+        measures.jsonl record: {"kind": "credit_ts", "end": ..., "samples":
+        [[t, {le: cumulative count}], ...]} (t on that host's clock)."""
+        def go(end, host, files, stop):
+            if files is None:
+                return
+            self.session(host, f"touch {stop}", f"stop the credit sampler {end}", self.SAMPLER_SSH_TRIES)
+            rc, text = self.wait_job(host, files, 60, f"credit sampler {end}", self.SAMPLER_SSH_TRIES)
+            if self.dry or rc == 255 or not self.measures_path:
+                return
+            by_t: Dict[str, Dict[str, float]] = {}
+            for line in (text or "").splitlines():
+                p_ = line.split("\t")
+                if len(p_) == 4 and p_[0] == "C":
+                    try:
+                        by_t.setdefault(p_[1], {})[p_[2]] = float(p_[3])
+                    except ValueError:
+                        continue
+            rec = {"kind": "credit_ts", "end": end, "samples": [[float(t), h] for t, h in sorted(by_t.items())],
+                   "_block": slot.block, "_path": slot.path, "_slot": slot.slot, "_arm": arm.name, "_phase": trial,
+                   "_client": slot.path, "_job": -1}
+            with self.records_lock, open(self.measures_path, "a") as f:
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        parallel(*[(lambda e=e, h=h, f=f, s_=s_: go(e, h, f, s_)) for e, (h, f, s_) in samplers.items()])
 
     def stop_host_cpu(self, name: str, samplers: Dict[str, Any]) -> None:
         """Stop the samplers and keep their samples as hostcpu/<name>-<host>.tsv.
