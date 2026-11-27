@@ -833,3 +833,73 @@ func TestNoBurstAllowanceKeepsTheShallowBucket(t *testing.T) {
 		t.Fatal("a shallow bucket passed a 100 packet burst without policing any of it")
 	}
 }
+
+// A blackholed TCP relay forwards nothing, in either direction and for a
+// connection opened into it, and delivers what it held, in order, when the
+// path returns.
+func TestTCPRelayBlackholeHoldsAndThenDelivers(t *testing.T) {
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			conn, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer conn.Close(); _, _ = io.Copy(conn, conn) }()
+		}
+	}()
+	relay, err := NewTCP("127.0.0.1:0", echo.Addr().String(), Config{OneWayDelay: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	roundTrip := func(conn net.Conn, msg string, within time.Duration) (string, error) {
+		if msg != "" {
+			if _, err := conn.Write([]byte(msg)); err != nil {
+				return "", err
+			}
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(within))
+		buf := make([]byte, 64)
+		n, err := conn.Read(buf)
+		return string(buf[:n]), err
+	}
+	old, err := net.Dial("tcp", relay.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	if got, err := roundTrip(old, "one", 2*time.Second); err != nil || got != "one" {
+		t.Fatalf("before the blackhole: %q, %v", got, err)
+	}
+
+	relay.SetBlackhole(true)
+	if got, err := roundTrip(old, "two", 300*time.Millisecond); err == nil {
+		t.Fatalf("a blackholed relay echoed %q", got)
+	}
+	fresh, err := net.Dial("tcp", relay.LocalAddr())
+	if err != nil {
+		t.Fatalf("the relay's own listener refused a connection during the blackhole: %v", err)
+	}
+	defer fresh.Close()
+	if got, err := roundTrip(fresh, "new", 300*time.Millisecond); err == nil {
+		t.Fatalf("a connection opened into the blackhole echoed %q", got)
+	}
+	if _, err := old.Write([]byte("three")); err != nil {
+		t.Fatal(err)
+	}
+
+	relay.SetBlackhole(false)
+	_ = old.SetReadDeadline(time.Now().Add(2 * time.Second))
+	held := make([]byte, len("twothree"))
+	if _, err := io.ReadFull(old, held); err != nil || string(held) != "twothree" {
+		t.Fatalf("after the restore the held bytes came back as %q, %v", held, err)
+	}
+	if got, err := roundTrip(fresh, "", 2*time.Second); err != nil || got != "new" {
+		t.Fatalf("after the restore the connection opened into the blackhole echoed %q, %v", got, err)
+	}
+}

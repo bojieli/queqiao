@@ -170,3 +170,27 @@ func TestTimeoutsAreToldFromRefusals(t *testing.T) {
 		t.Errorf("handshake wait on a 5 s path is %v, want the %v ceiling", got, quicHandshakeWaitMax)
 	}
 }
+
+// A TCP lane that is ready waits for QUIC before its JOIN only when the path
+// was away for TCP too, and never once the latest handoff start has come.
+func TestATCPHandoffYieldsOnlyAfterAnOutage(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	latest := now.Add(10 * time.Second)
+	wait := quicHandshakeWaitFor(360 * time.Millisecond)
+	for _, c := range []struct {
+		name     string
+		timedOut bool
+		dial     time.Duration
+		now      time.Time
+		want     bool
+	}{
+		{"UDP blocked: a prompt dial, nothing timed out", false, 800 * time.Millisecond, now, false},
+		{"a dial that spanned the outage", false, 9 * time.Second, now, true},
+		{"a prompt dial after an attempt that timed out", true, 800 * time.Millisecond, now, true},
+		{"at the latest handoff start", true, 9 * time.Second, latest, false},
+	} {
+		if got := tcpHandoffYields(c.timedOut, c.dial, wait, c.now, latest); got != c.want {
+			t.Errorf("%s: yields=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
