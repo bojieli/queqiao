@@ -118,6 +118,9 @@ SCENARIOS: Dict[str, Scenario] = {s.name: s for s in (
     Scenario("blackhole", *_same(Direction(75, 0, 20000)), outages=((30, 8), (70, 25)),
              summary="20 Mbit/s, +150 ms RTT, 100 % drop 8 s at 30 s and 25 s at 70 s"),
     # A 4 Mbit/s policer with a 12 KB bucket (8 packets), +150 ms RTT.
+    # DIAGNOSTIC ONLY (branch diag/credit-base): blackhole's base path, no outages.
+    Scenario("blackhole-base", *_same(Direction(75, 0, 20000)),
+             summary="DIAGNOSTIC: 20 Mbit/s, +150 ms RTT, no outages"),
     Scenario("policed", *_same(Direction(75)), police_kbit=4000, police_burst=12000,
              summary="4 Mbit/s token-bucket policer (12 KB burst), +150 ms RTT"),
     # D's idle-wake session: 2 % random loss per direction, +200 ms RTT.

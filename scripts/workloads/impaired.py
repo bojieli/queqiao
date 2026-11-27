@@ -51,7 +51,10 @@ def _sibling(mod: str, file: str):
 pa = _sibling("ab_workload_phase_a", "phase_a.py")
 mn = _sibling("ab_workload_minimal", "minimal.py")
 
-TRIAL_SECONDS = {"slow-lossy": 120, "blackhole": 120, "policed": 120}
+TRIAL_SECONDS = {"slow-lossy": 120, "blackhole": 120, "policed": 120,
+                 # DIAGNOSTIC ONLY (branch diag/credit-base, never merged):
+                 # blackhole's base path and workload without its outages.
+                 "blackhole-base": 120}
 TRIAL_TYPES = tuple(TRIAL_SECONDS)
 WAKE_SCENARIO = "idle-wake-lossy"
 LEAD = 5                    # the foreground starts this long after the download
@@ -488,15 +491,16 @@ class Impaired(mn.Minimal):
             jobs = [w.Job(c, "imp-fetch", 1),
                     w.Job(c, "wl-llm", 1, load=False, params=self.llm_swarm()),
                     w.Job(c, "wl-term", 1, load=False, params=self.term(secs - LEAD - 5, None))]
-            if t == "blackhole":
+            if t in ("blackhole", "blackhole-base"):
                 # Flows in flight across the outages (a download and a long
                 # upload, each with a progress timeline), probes for the
                 # recovery and for new connections, and the outages.
-                bg = {"io_timeout": BG_IO_TIMEOUT[t], "continue_after_failure": True}
+                bg = {"io_timeout": BG_IO_TIMEOUT["blackhole"], "continue_after_failure": True}
                 jobs += [w.Job(c, "wl-bgdown", 1, load=False, params=dict(bg, object_bytes=BG_DOWN_OBJECT)),
                          w.Job(c, "wl-bgup", 1, load=False, params=dict(bg, object_bytes=BG_UP_OBJECT)),
-                         w.Job(c, "imp-probe", 1, load=False),
-                         w.Job(c, "impair-outages", 1, params={"scenario": t})]
+                         w.Job(c, "imp-probe", 1, load=False)]
+                if t == "blackhole":
+                    jobs.append(w.Job(c, "impair-outages", 1, params={"scenario": t}))
             out.append(w.Phase(t, secs, jobs))
         return out
 
