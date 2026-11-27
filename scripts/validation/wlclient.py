@@ -132,6 +132,71 @@ def open_conn(args, timeout: float, deadline: float = None):
     return ss
 
 
+class SerialTLS:
+    """One TLS connection read by one thread while another writes to it.
+
+    An SSLSocket is not safe for that: OpenSSL forbids concurrent calls on one
+    connection, and Python does not serialise them. Measured on the campaign
+    hosts' Python 3.10-3.12 with OpenSSL 3.0, a reader thread in recv and a
+    writer in sendall right after a TLS 1.3 handshake return a spurious EOF,
+    "bad record mac", or crash the process. A live terminal session ended that
+    way while the arm under test still held the connection open. So every
+    TLS call here is made under one lock, non-blocking; the waits for the
+    socket to be ready happen outside it, so a blocked read never holds up a
+    write."""
+
+    def __init__(self, ss):
+        self.ss = ss
+        self.timeout = ss.gettimeout()
+        self.lock = threading.Lock()
+        ss.setblocking(False)
+
+    def settimeout(self, timeout) -> None:
+        self.timeout = timeout
+
+    def gettimeout(self):
+        return self.timeout
+
+    def _wait(self, read: bool, deadline) -> None:
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            raise socket.timeout("The read operation timed out" if read else "The write operation timed out")
+        r, w, _ = select.select([self.ss] if read else [], [] if read else [self.ss], [], left)
+        if not r and not w:
+            raise socket.timeout("The read operation timed out" if read else "The write operation timed out")
+
+    def _call(self, op, *a):
+        deadline = None if self.timeout is None else time.monotonic() + self.timeout
+        while True:
+            with self.lock:
+                try:
+                    return op(*a)
+                except ssl.SSLWantReadError:
+                    read = True
+                except ssl.SSLWantWriteError:
+                    read = False
+            self._wait(read, deadline)
+
+    def recv(self, n: int) -> bytes:
+        return self._call(self.ss.recv, n)
+
+    def sendall(self, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            view = view[self._call(self.ss.send, view):]
+
+    def version(self):
+        return self.ss.version()
+
+    def close(self) -> None:
+        self.ss.close()
+
+
+def serial(sock):
+    """sock, made safe for a reader thread and a writer at once."""
+    return SerialTLS(sock) if isinstance(sock, ssl.SSLSocket) else sock
+
+
 def stopped(args) -> bool:
     return bool(args.stop_file) and os.path.exists(args.stop_file)
 
@@ -313,7 +378,7 @@ def cmd_term(args) -> None:
     t0 = time.time()
     rec = {"kind": "term", "t0": round(t0, 3), "keys": [], "bursts": [], "fail": "", "canary": args.canary}
     try:
-        sock = open_conn(args, args.timeout)
+        sock = serial(open_conn(args, args.timeout))
         sock.settimeout(args.timeout)
     except (OSError, EOFError, ssl.SSLError) as e:
         rec["fail"] = f"{type(e).__name__}: {e}"[:200]
@@ -1069,7 +1134,7 @@ def cmd_wake(args) -> None:
                "t0": round(time.time(), 3), "fail": "", "pushes": [], "sends": [], "end": "", "end_at": None,
                "sync_done": None, "sync_seconds": None}
         try:
-            s = open_conn(args, 30)
+            s = serial(open_conn(args, 30))
             s.settimeout(None)
             c0 = time.monotonic()
             s.sendall(f"W {args.sync} {at:g} {mode} {args.follow}\n".encode())
