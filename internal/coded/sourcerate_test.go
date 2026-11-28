@@ -41,9 +41,9 @@ func TestASparseCodedLaneSizesItsWindowFromItsOwnSourceRate(t *testing.T) {
 		}
 		if sourceRate {
 			got := p.rate()
-			t.Logf("sparse lane sizes from %.0f B/s; the share is %.0f B/s", got, share)
-			if got <= 0 || got > share/100 {
-				t.Fatalf("a sparse coded lane sizes its window from %.0f B/s against a share of %.0f", got, share)
+			t.Logf("sparse lane sizes from %.0f B/s; the share is %.0f B/s, the cold-start prior %.0f", got, share, prior)
+			if got != prior {
+				t.Fatalf("a sparse coded lane sizes its window from %.0f B/s, want the cold-start prior %.0f, never a share", got, prior)
 			}
 		}
 		p.Close()

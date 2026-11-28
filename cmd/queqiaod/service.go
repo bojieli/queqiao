@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bojieli/queqiao/internal/pep"
 	"github.com/bojieli/queqiao/internal/profile"
 )
 
@@ -41,6 +42,10 @@ type serviceConfig struct {
 	metricsListen string
 	logLevel      string
 	pathProfile   string
+	// bundle is passed through as the client's --bundle when set; empty
+	// runs the default bundle. It exists so that the soak release's
+	// rollback (--bundle=legacy) can be installed as a service.
+	bundle string
 }
 
 // arguments returns everything after the binary. The supervisor-specific tail
@@ -57,6 +62,9 @@ func (c serviceConfig) arguments() []string {
 	args = append(args, "--local-address", c.localAddress)
 	if c.pathProfile != "" {
 		args = append(args, "--path-profile", c.pathProfile)
+	}
+	if c.bundle != "" {
+		args = append(args, "--bundle", c.bundle)
 	}
 	if c.metricsListen != "" {
 		args = append(args, "--metrics-listen", c.metricsListen)
@@ -198,6 +206,7 @@ func bindServiceFlags(fs *flag.FlagSet, c *serviceConfig) {
 	fs.StringVar(&c.metricsListen, "metrics-listen", "127.0.0.1:12090", "loopback metrics address, empty to disable")
 	fs.StringVar(&c.logLevel, "log-level", "info", "debug, info, warn, or error")
 	fs.StringVar(&c.pathProfile, "path-profile", "", "path profile the service runs, empty for the default. See docs/DEPLOYING-DC-PROFILE.md before choosing dc-long-haul")
+	fs.StringVar(&c.bundle, "bundle", "", "migration bundle the service runs, empty for the default (path-authority); legacy is the rollback of the release that made path-authority the default")
 	fs.StringVar(&c.label, "label", defaultServiceLabel, "macOS LaunchAgent label")
 	fs.StringVar(&c.unit, "service-name", defaultServiceUnit, "Linux systemd --user unit name")
 	fs.StringVar(&c.binary, "binary", "", "queqiaod path to run (default: this executable)")
@@ -209,6 +218,13 @@ func (c *serviceConfig) resolve() error {
 	}
 	if !serviceNamePattern.MatchString(c.unit) {
 		return fmt.Errorf("invalid --service-name %q; use letters, digits, dot, underscore, and dash", c.unit)
+	}
+	if c.bundle != "" {
+		name, err := pep.ParseBundleName(c.bundle)
+		if err != nil {
+			return fmt.Errorf("--bundle: %w", err)
+		}
+		c.bundle = string(name)
 	}
 	// Resolved here rather than at first start, so a misspelled profile is a
 	// failed install instead of a service that comes up carrying policy the

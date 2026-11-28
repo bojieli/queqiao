@@ -444,3 +444,93 @@ func ValidateRecovery(recovery RecoveryMode, scope CongestionScope, codedRetry C
 	}
 	return validateRecovery(&recovery, scope, codedRetry, topology, fanOut, gateway)
 }
+
+// BundleName names a whole migration bundle (design §14). Since stage 10 the
+// path-authority bundle is the default of both roles; the legacy bundle stays
+// selectable, as one switch, for the release that soaks the flip.
+type BundleName string
+
+const (
+	// BundlePathAuthority is the stage 1-8 bundle plus classifier=phased:
+	// cc-api=v2, sched=class, congestion=path, coded-retry=sticky,
+	// recovery=carrier, mem=owned and classifier=phased on both roles,
+	// gateway-admission=owned on a gateway and topology=single on a client.
+	// It is the default since stage 10.
+	BundlePathAuthority BundleName = "path-authority"
+	// BundleLegacy is every switch off: the behaviour before the migration.
+	// It is the rollback for the soak release and is deleted at stage 11.
+	BundleLegacy BundleName = "legacy"
+)
+
+// DefaultBundle is the bundle an endpoint runs when nothing selects another.
+const DefaultBundle = BundlePathAuthority
+
+// ParseBundleName accepts a bundle's name. The empty name is the default.
+func ParseBundleName(value string) (BundleName, error) {
+	switch BundleName(strings.ToLower(strings.TrimSpace(value))) {
+	case "":
+		return DefaultBundle, nil
+	case BundlePathAuthority:
+		return BundlePathAuthority, nil
+	case BundleLegacy:
+		return BundleLegacy, nil
+	}
+	return "", fmt.Errorf("unsupported bundle %q (want %s or %s)", value, BundlePathAuthority, BundleLegacy)
+}
+
+// BundleSwitches is the value of every migration switch in one bundle. A
+// gateway's Topology is empty; a client's GatewayAdmission is empty.
+type BundleSwitches struct {
+	CCAPI            CCAPIVersion
+	Sched            SchedMode
+	CongestionScope  CongestionScope
+	CodedRetry       CodedRetryMode
+	Memory           MemoryMode
+	Classifier       ClassifierMode
+	Recovery         RecoveryMode
+	Topology         Topology
+	GatewayAdmission GatewayAdmission
+}
+
+// SwitchesOf returns a named bundle's switches for a client (gateway false)
+// or a gateway (gateway true). Every switch is spelled out, so a caller that
+// applies them does not depend on what an empty value means.
+func SwitchesOf(name BundleName, gateway bool) (BundleSwitches, error) {
+	var s BundleSwitches
+	switch name {
+	case BundlePathAuthority:
+		s = BundleSwitches{
+			CCAPI: CCAPIV2, Sched: SchedClass, CongestionScope: CongestionScopePath,
+			CodedRetry: CodedRetrySticky, Memory: MemoryOwned, Classifier: ClassifierPhased,
+			Recovery: RecoveryCarrier, Topology: TopologySingle, GatewayAdmission: GatewayAdmissionOwned,
+		}
+	case BundleLegacy:
+		s = BundleSwitches{
+			CCAPI: CCAPIV1, Sched: SchedLegacy, CongestionScope: CongestionScopeConnection,
+			CodedRetry: CodedRetryLegacy, Memory: MemoryLegacy, Classifier: ClassifierLegacy,
+			Recovery: RecoveryFlow, Topology: TopologyIsolated, GatewayAdmission: GatewayAdmissionLegacy,
+		}
+	default:
+		return BundleSwitches{}, fmt.Errorf("unsupported bundle %q (want %s or %s)", name, BundlePathAuthority, BundleLegacy)
+	}
+	if gateway {
+		s.Topology = ""
+	} else {
+		s.GatewayAdmission = ""
+	}
+	return s, nil
+}
+
+// ApplyToClient sets every switch of a client configuration.
+func (s BundleSwitches) ApplyToClient(cfg *ClientConfig) {
+	cfg.CCAPI, cfg.Sched, cfg.CongestionScope = s.CCAPI, s.Sched, s.CongestionScope
+	cfg.CodedRetry, cfg.Memory, cfg.Classifier = s.CodedRetry, s.Memory, s.Classifier
+	cfg.Recovery, cfg.Topology = s.Recovery, s.Topology
+}
+
+// ApplyToServer sets every switch of a gateway configuration.
+func (s BundleSwitches) ApplyToServer(cfg *ServerConfig) {
+	cfg.CCAPI, cfg.Sched, cfg.CongestionScope = s.CCAPI, s.Sched, s.CongestionScope
+	cfg.CodedRetry, cfg.Memory, cfg.Classifier = s.CodedRetry, s.Memory, s.Classifier
+	cfg.Recovery, cfg.GatewayAdmission = s.Recovery, s.GatewayAdmission
+}

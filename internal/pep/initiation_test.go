@@ -92,9 +92,23 @@ func TestFlowInitiationCostsNoRoundTripsWhenTheConnectionIsWarm(t *testing.T) {
 	if testing.Short() {
 		t.Skip("brings up QUIC across an emulated 300 ms path")
 	}
+	testFlowInitiation(t, "")
+}
+
+// The same on the default bundle (stage 10): the path controller counts
+// packet outcomes rather than probe frames, and the prewarm must still end
+// once its echo is back rather than run out its budget.
+func TestFlowInitiationOnTheDefaultBundle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("brings up QUIC across an emulated 300 ms path")
+	}
+	testFlowInitiation(t, DefaultBundle)
+}
+
+func testFlowInitiation(t *testing.T, bundle BundleName) {
 	const oneWay = 150 * time.Millisecond
 	path := pathsim.Config{OneWayDelay: oneWay, Seed: 31}
-	socks, destination := codedPairWith(t, true, &path, echoDestination)
+	socks, destination := codedPairOnBundle(t, bundle, true, &path, echoDestination)
 
 	measure := func() time.Duration {
 		start := time.Now()

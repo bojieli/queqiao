@@ -24,6 +24,8 @@ __pycache__/
 *.local.json
 # Live validation campaigns name real hosts (docs/VALIDATING-A-BUNDLE.md).
 *.local.ini
+# Rollout notes that name real hosts (docs/ROLLOUT-v0.15.md).
+*.local.md
 /.env
 /.dev/
 

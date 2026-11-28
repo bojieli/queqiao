@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bojieli/queqiao/internal/metrics"
+	"github.com/bojieli/queqiao/internal/pep"
 )
 
 func parseRuntimeForTest(t *testing.T, client bool, args ...string) runtimeOptions {
@@ -22,6 +23,9 @@ func parseRuntimeForTest(t *testing.T, client bool, args ...string) runtimeOptio
 	var opts runtimeOptions
 	bindRuntimeFlags(fs, &opts, client)
 	if err := fs.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolveBundle(fs, &opts, client); err != nil {
 		t.Fatal(err)
 	}
 	if err := validateRuntime(opts, client); err != nil {
@@ -298,43 +302,195 @@ func TestWireVersionFlags(t *testing.T) {
 	}
 }
 
-func TestGatewayAdmissionIsValidatedAtStartup(t *testing.T) {
-	if opts := parseRuntimeForTest(t, false); effectiveGatewayAdmission(opts.gatewayAdmission) != "legacy" {
-		t.Fatalf("default gateway admission = %q, want legacy", opts.gatewayAdmission)
-	}
-	if opts := parseRuntimeForTest(t, false, "--gateway-admission", "owned"); opts.gatewayAdmission != "owned" {
-		t.Fatalf("gateway admission = %q, want owned", opts.gatewayAdmission)
-	}
+// parseRuntimeArgs parses, resolves the bundle and validates, as the client
+// and server commands do.
+func parseRuntimeArgs(client bool, args ...string) (runtimeOptions, error) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var opts runtimeOptions
-	bindRuntimeFlags(fs, &opts, false)
-	if err := fs.Parse([]string{"--gateway-admission", "shared"}); err != nil {
-		t.Fatal(err)
+	bindRuntimeFlags(fs, &opts, client)
+	if err := fs.Parse(args); err != nil {
+		return opts, err
 	}
-	if err := validateRuntime(opts, false); err == nil {
+	if err := resolveBundle(fs, &opts, client); err != nil {
+		return opts, err
+	}
+	return opts, validateRuntime(opts, client)
+}
+
+// legacy prefixes a command line with the legacy bundle, the base the
+// per-switch validation below was written against.
+func legacy(args ...string) []string {
+	return append([]string{"--bundle=legacy"}, args...)
+}
+
+// Since stage 10 (design §14) both roles default to the path-authority
+// bundle: the stage 1-8 switches plus classifier=phased, gateway-admission
+// owned on a gateway and topology=single on a client.
+func TestBothRolesDefaultToThePathAuthorityBundle(t *testing.T) {
+	for _, client := range []bool{true, false} {
+		opts := parseRuntimeForTest(t, client)
+		got := pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry),
+			pep.GatewayAdmission(opts.gatewayAdmission), pep.SchedMode(opts.sched), pep.ClassifierMode(opts.classifierMode),
+			pep.CongestionScope(opts.congestionScope), pep.Topology(opts.topology), pep.RecoveryMode(opts.recovery))
+		want := "cc-api=v2,sched=class,congestion=path,recovery=carrier,coded-retry=sticky,mem=owned,gateway-admission=owned,classifier=phased"
+		if client {
+			want = "cc-api=v2,sched=class,congestion=path,topology=single,recovery=carrier,coded-retry=sticky,mem=owned,classifier=phased"
+		}
+		if got != want || opts.bundle != "path-authority" {
+			t.Fatalf("client=%v default bundle %q (%s), want %q", client, got, opts.bundle, want)
+		}
+		// The default bundle is what the library calls it.
+		s, err := pep.SwitchesOf(pep.DefaultBundle, !client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opts.ccAPI != string(s.CCAPI) || opts.sched != string(s.Sched) || opts.congestionScope != string(s.CongestionScope) ||
+			opts.codedRetry != string(s.CodedRetry) || opts.memory != string(s.Memory) || opts.classifierMode != string(s.Classifier) ||
+			opts.recovery != string(s.Recovery) || opts.topology != string(s.Topology) || opts.gatewayAdmission != string(s.GatewayAdmission) {
+			t.Fatalf("client=%v flags %+v differ from the library's default bundle %+v", client, opts, s)
+		}
+	}
+}
+
+// --bundle=legacy is the rollback of the soak release: every switch off at
+// once, on both roles, with any switch given explicitly still winning and
+// the combination still validated.
+func TestLegacyBundleTurnsEverySwitchOff(t *testing.T) {
+	for _, client := range []bool{true, false} {
+		opts := parseRuntimeForTest(t, client, "--bundle=legacy")
+		got := pep.Bundle(pep.CCAPIVersion(opts.ccAPI), pep.MemoryMode(opts.memory), pep.CodedRetryMode(opts.codedRetry),
+			pep.GatewayAdmission(opts.gatewayAdmission), pep.SchedMode(opts.sched), pep.ClassifierMode(opts.classifierMode),
+			pep.CongestionScope(opts.congestionScope), pep.Topology(opts.topology), pep.RecoveryMode(opts.recovery))
+		if got != "legacy" {
+			t.Fatalf("client=%v --bundle=legacy runs %q", client, got)
+		}
+		if client && opts.topology != "isolated" || !client && opts.gatewayAdmission != "legacy" {
+			t.Fatalf("client=%v --bundle=legacy left topology %q admission %q", client, opts.topology, opts.gatewayAdmission)
+		}
+		// An explicit independent switch is kept.
+		if opts := parseRuntimeForTest(t, client, "--bundle=legacy", "--mem=owned"); opts.memory != "owned" || opts.ccAPI != "v1" {
+			t.Fatalf("client=%v explicit switch under legacy: mem %q cc-api %q", client, opts.memory, opts.ccAPI)
+		}
+		// The bundle name is case-insensitive; an unknown one is refused.
+		if opts := parseRuntimeForTest(t, client, "--bundle=LEGACY"); opts.ccAPI != "v1" {
+			t.Fatalf("client=%v --bundle=LEGACY: cc-api %q", client, opts.ccAPI)
+		}
+		for _, args := range [][]string{{"--bundle=v2"}, {"--bundle="}, {"--bundle=legacy", "--recovery=carrier"}} {
+			if _, err := parseRuntimeArgs(client, args...); err == nil && args[0] != "--bundle=" {
+				t.Errorf("client=%v %v accepted", client, args)
+			}
+		}
+		// An empty --bundle is the default.
+		if opts, err := parseRuntimeArgs(client, "--bundle="); err != nil || opts.ccAPI != "v2" {
+			t.Errorf("client=%v --bundle= : %v cc-api %q", client, err, opts.ccAPI)
+		}
+	}
+}
+
+// A fan-out was only ever an explicit option of topology=single; under the
+// default bundle it needs per-flow recovery back.
+func TestFanOutUnderTheDefaultBundleNeedsFlowRecovery(t *testing.T) {
+	if _, err := parseRuntimeArgs(true, "--topology-fanout=2"); err == nil || !strings.Contains(err.Error(), "--recovery=flow") {
+		t.Fatalf("fan-out on the default bundle: %v", err)
+	}
+	if opts, err := parseRuntimeArgs(true, "--topology-fanout=2", "--recovery=flow"); err != nil || opts.topologyFanOut != 2 {
+		t.Fatalf("fan-out with recovery=flow: %v", err)
+	}
+}
+
+// One switch can be rolled back on its own when nothing that depends on it
+// is on (design §14, "Rollback"); the validator refuses the rest.
+func TestSingleSwitchRollbackUnderTheDefaultBundle(t *testing.T) {
+	for _, client := range []bool{true, false} {
+		for _, args := range [][]string{
+			{"--recovery=flow"},
+			{"--mem=legacy"},
+			{"--classifier=legacy"},
+			{"--recovery=flow", "--coded-retry=legacy"},
+		} {
+			if _, err := parseRuntimeArgs(client, args...); err != nil {
+				t.Errorf("client=%v %v refused: %v", client, args, err)
+			}
+		}
+		for _, args := range [][]string{
+			{"--coded-retry=legacy"},          // recovery=carrier needs it
+			{"--congestion-scope=connection"}, // recovery=carrier needs it
+			{"--sched=legacy"},                // congestion=path needs it
+			{"--cc-api=v1"},                   // everything needs it
+		} {
+			if _, err := parseRuntimeArgs(client, args...); err == nil {
+				t.Errorf("client=%v %v accepted", client, args)
+			}
+		}
+	}
+	if _, err := parseRuntimeArgs(false, "--gateway-admission=legacy"); err != nil {
+		t.Errorf("gateway admission rollback refused: %v", err)
+	}
+	if _, err := parseRuntimeArgs(true, "--topology=isolated"); err == nil {
+		t.Error("topology=isolated accepted beside recovery=carrier")
+	}
+	if _, err := parseRuntimeArgs(true, "--topology=isolated", "--recovery=flow"); err != nil {
+		t.Errorf("topology rollback with recovery=flow refused: %v", err)
+	}
+}
+
+// A command line written for the old defaults names a setting only the
+// legacy bundle runs; start-up refuses it and says how to keep it.
+func TestLegacyOnlySettingsPointAtTheLegacyBundle(t *testing.T) {
+	for _, tc := range []struct {
+		client bool
+		args   []string
+	}{
+		{true, []string{"--congestion=reno"}},
+		{false, []string{"--congestion=bbr"}},
+		{false, []string{"--congestion=brutal", "--brutal-bytes-per-sec=1000000"}},
+		{true, []string{"--quic-pool=false"}},
+	} {
+		_, err := parseRuntimeArgs(tc.client, tc.args...)
+		if err == nil || !strings.Contains(err.Error(), "--bundle=legacy") {
+			t.Errorf("client=%v %v: %v, want a pointer at --bundle=legacy", tc.client, tc.args, err)
+		}
+		if _, err := parseRuntimeArgs(tc.client, legacy(tc.args...)...); err != nil {
+			t.Errorf("client=%v %v under the legacy bundle: %v", tc.client, tc.args, err)
+		}
+	}
+}
+
+func TestGatewayAdmissionIsValidatedAtStartup(t *testing.T) {
+	if opts := parseRuntimeForTest(t, false); opts.gatewayAdmission != "owned" {
+		t.Fatalf("default gateway admission = %q, want owned", opts.gatewayAdmission)
+	}
+	if opts := parseRuntimeForTest(t, false, legacy()...); effectiveGatewayAdmission(opts.gatewayAdmission) != "legacy" {
+		t.Fatalf("legacy-bundle gateway admission = %q, want legacy", opts.gatewayAdmission)
+	}
+	if opts := parseRuntimeForTest(t, false, legacy("--gateway-admission", "owned")...); opts.gatewayAdmission != "owned" {
+		t.Fatalf("gateway admission = %q, want owned", opts.gatewayAdmission)
+	}
+	if _, err := parseRuntimeArgs(false, "--gateway-admission", "shared"); err == nil {
 		t.Fatal("an unknown gateway admission was accepted")
 	}
 }
 
 // An unsupported bundle is refused by flag validation, before the process
-// logs its configuration or renews anything.
+// logs its configuration or renews anything. The combinations are spelled
+// on top of the legacy bundle, one switch at a time, as they were built.
 func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
 	for _, client := range []bool{true, false} {
-		if opts := parseRuntimeForTest(t, client, "--cc-api=v2"); opts.ccAPI != "v2" {
+		if opts := parseRuntimeForTest(t, client, legacy("--cc-api=v2")...); opts.ccAPI != "v2" {
 			t.Fatalf("cc-api=v2 not parsed: %q", opts.ccAPI)
 		}
-		if opts := parseRuntimeForTest(t, client, "--cc-api=v2", "--sched=class"); opts.sched != "class" {
+		if opts := parseRuntimeForTest(t, client, legacy("--cc-api=v2", "--sched=class")...); opts.sched != "class" {
 			t.Fatalf("sched=class not parsed: %q", opts.sched)
 		}
-		if opts := parseRuntimeForTest(t, client); opts.sched != "legacy" {
-			t.Fatalf("the default sched is %q, want legacy", opts.sched)
+		if opts := parseRuntimeForTest(t, client, legacy()...); opts.sched != "legacy" {
+			t.Fatalf("the legacy bundle's sched is %q, want legacy", opts.sched)
 		}
-		if opts := parseRuntimeForTest(t, client, "--cc-api=v2", "--sched=class", "--congestion-scope=path"); opts.congestionScope != "path" {
+		if opts := parseRuntimeForTest(t, client, legacy("--cc-api=v2", "--sched=class", "--congestion-scope=path")...); opts.congestionScope != "path" {
 			t.Fatalf("congestion-scope=path not parsed: %q", opts.congestionScope)
 		}
-		if opts := parseRuntimeForTest(t, client); opts.congestionScope != "connection" {
-			t.Fatalf("the default congestion scope is %q, want connection", opts.congestionScope)
+		if opts := parseRuntimeForTest(t, client, legacy()...); opts.congestionScope != "connection" {
+			t.Fatalf("the legacy bundle's congestion scope is %q, want connection", opts.congestionScope)
 		}
 		for _, args := range [][]string{
 			{"--cc-api=v3"},
@@ -354,14 +510,7 @@ func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
 			{"--classifier=phased", "--path-profile=dc-long-haul"},
 			{"--cc-api=v2", "--sched=class", "--congestion-scope=path", "--coded-retry=sticky", "--path-profile=dc-long-haul"},
 		} {
-			fs := flag.NewFlagSet("test", flag.ContinueOnError)
-			fs.SetOutput(io.Discard)
-			var opts runtimeOptions
-			bindRuntimeFlags(fs, &opts, client)
-			if err := fs.Parse(args); err != nil {
-				t.Fatal(err)
-			}
-			if err := validateRuntime(opts, client); err == nil {
+			if _, err := parseRuntimeArgs(client, legacy(args...)...); err == nil {
 				t.Errorf("client=%v %v accepted", client, args)
 			}
 		}
@@ -369,7 +518,9 @@ func TestRuntimeValidationRejectsAnUnsupportedBundle(t *testing.T) {
 }
 
 // dc-long-haul starts on its whole new-architecture bundle (design §11.3,
-// stage 9), with classifier=phased, on both roles.
+// stage 9), with classifier=phased, on both roles; since stage 10 that is
+// what it runs with no switch flags at all, and --bundle=legacy keeps the
+// bundle it ran before.
 func TestRuntimeValidationAcceptsTheDCBundle(t *testing.T) {
 	for _, client := range []bool{true, false} {
 		args := []string{"--path-profile=dc-long-haul", "--cc-api=v2", "--sched=class", "--congestion-scope=path",
@@ -379,38 +530,44 @@ func TestRuntimeValidationAcceptsTheDCBundle(t *testing.T) {
 		} else {
 			args = append(args, "--gateway-admission=owned")
 		}
-		fs := flag.NewFlagSet("test", flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		var opts runtimeOptions
-		bindRuntimeFlags(fs, &opts, client)
-		if err := fs.Parse(args); err != nil {
-			t.Fatal(err)
-		}
-		if err := validateRuntime(opts, client); err != nil {
+		if _, err := parseRuntimeArgs(client, args...); err != nil {
 			t.Errorf("client=%v %v refused: %v", client, args, err)
 		}
-		// Without carrier recovery it is a partial bundle.
-		fs = flag.NewFlagSet("test", flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		opts = runtimeOptions{}
-		bindRuntimeFlags(fs, &opts, client)
-		if err := fs.Parse(append(args, "--recovery=flow")); err != nil {
-			t.Fatal(err)
+		if _, err := parseRuntimeArgs(client, legacy(args...)...); err != nil {
+			t.Errorf("client=%v %v over the legacy bundle refused: %v", client, args, err)
 		}
-		if err := validateRuntime(opts, client); err == nil || !strings.Contains(err.Error(), "dc-long-haul") {
-			t.Errorf("client=%v partial DC bundle: got %v", client, err)
+		// No switch flags: the default bundle is the whole DC bundle.
+		if _, err := parseRuntimeArgs(client, "--path-profile=dc-long-haul"); err != nil {
+			t.Errorf("client=%v dc-long-haul on the default bundle refused: %v", client, err)
+		}
+		if opts, err := parseRuntimeArgs(client, "--path-profile=dc-long-haul", "--bundle=legacy"); err != nil || opts.classifierMode != "legacy" {
+			t.Errorf("client=%v dc-long-haul on the legacy bundle: %v (classifier %q)", client, err, opts.classifierMode)
+		}
+		// Without carrier recovery it is a partial bundle, explicit or by
+		// rolling back one switch from the default.
+		for _, partial := range [][]string{append(args, "--recovery=flow"), {"--path-profile=dc-long-haul", "--recovery=flow"}} {
+			if _, err := parseRuntimeArgs(client, partial...); err == nil || !strings.Contains(err.Error(), "dc-long-haul") {
+				t.Errorf("client=%v partial DC bundle %v: got %v", client, partial, err)
+			}
 		}
 	}
 }
 
 // The memory-ownership bundle (design §14 stage 3) is independent: either
-// value starts on either role, and any other spelling is refused at start-up.
+// value starts on either role and with either bundle, and any other spelling
+// is refused at start-up.
 func TestMemoryBundleIsValidatedAtStartup(t *testing.T) {
 	for _, client := range []bool{true, false} {
-		if opts := parseRuntimeForTest(t, client); opts.memory != "legacy" {
+		if opts := parseRuntimeForTest(t, client); opts.memory != "owned" {
 			t.Fatalf("default memory bundle = %q", opts.memory)
 		}
-		if opts := parseRuntimeForTest(t, client, "--mem", "owned"); opts.memory != "owned" {
+		if opts := parseRuntimeForTest(t, client, legacy()...); opts.memory != "legacy" {
+			t.Fatalf("legacy memory bundle = %q", opts.memory)
+		}
+		if opts := parseRuntimeForTest(t, client, legacy("--mem", "owned")...); opts.memory != "owned" {
+			t.Fatalf("memory bundle = %q", opts.memory)
+		}
+		if opts := parseRuntimeForTest(t, client, "--mem", "legacy"); opts.memory != "legacy" {
 			t.Fatalf("memory bundle = %q", opts.memory)
 		}
 		opts := parseRuntimeForTest(t, client)
@@ -425,25 +582,22 @@ func TestMemoryBundleIsValidatedAtStartup(t *testing.T) {
 // other spelling is refused at start-up.
 func TestCodedRetryBundleIsValidatedAtStartup(t *testing.T) {
 	for _, client := range []bool{true, false} {
-		if opts := parseRuntimeForTest(t, client); opts.codedRetry != "legacy" {
+		if opts := parseRuntimeForTest(t, client); opts.codedRetry != "sticky" {
 			t.Fatalf("default coded-retry bundle = %q", opts.codedRetry)
 		}
-		if opts := parseRuntimeForTest(t, client, "--cc-api=v2", "--coded-retry=sticky"); opts.codedRetry != "sticky" {
+		if opts := parseRuntimeForTest(t, client, legacy()...); opts.codedRetry != "legacy" {
+			t.Fatalf("legacy coded-retry bundle = %q", opts.codedRetry)
+		}
+		if opts := parseRuntimeForTest(t, client, legacy("--cc-api=v2", "--coded-retry=sticky")...); opts.codedRetry != "sticky" {
 			t.Fatalf("coded-retry bundle = %q", opts.codedRetry)
 		}
 		for _, args := range [][]string{
-			{"--coded-retry=sticky"},
-			{"--cc-api=v1", "--coded-retry=sticky"},
-			{"--cc-api=v2", "--coded-retry=eager"},
+			legacy("--coded-retry=sticky"),
+			legacy("--cc-api=v1", "--coded-retry=sticky"),
+			legacy("--cc-api=v2", "--coded-retry=eager"),
+			{"--coded-retry=eager"},
 		} {
-			fs := flag.NewFlagSet("test", flag.ContinueOnError)
-			fs.SetOutput(io.Discard)
-			var opts runtimeOptions
-			bindRuntimeFlags(fs, &opts, client)
-			if err := fs.Parse(args); err != nil {
-				t.Fatal(err)
-			}
-			if err := validateRuntime(opts, client); err == nil {
+			if _, err := parseRuntimeArgs(client, args...); err == nil {
 				t.Errorf("client=%v %v accepted", client, args)
 			}
 		}
@@ -461,36 +615,33 @@ func TestCarrierShadowFlags(t *testing.T) {
 		if cfg := opts.carrierShadowConfig(); !cfg.Enabled || cfg.SuspectPTOs != 3 || cfg.ReplacePTOs != 5 {
 			t.Fatalf("carrier shadow config = %+v", cfg)
 		}
-		parseRuntimeForTest(t, client, "--carrier-shadow", "--cc-api=v2", "--coded-retry=sticky")
+		parseRuntimeForTest(t, client, legacy("--carrier-shadow", "--cc-api=v2", "--coded-retry=sticky")...)
+		parseRuntimeForTest(t, client, legacy("--carrier-shadow")...)
 		for _, args := range [][]string{
 			{"--carrier-shadow", "--carrier-shadow-ks=4", "--carrier-shadow-kp=3"},
 			{"--carrier-shadow", "--carrier-shadow-kp=99"},
 			{"--carrier-shadow-ks=4294967297"},
 		} {
-			fs := flag.NewFlagSet("test", flag.ContinueOnError)
-			fs.SetOutput(io.Discard)
-			var opts runtimeOptions
-			bindRuntimeFlags(fs, &opts, client)
-			if err := fs.Parse(args); err != nil {
-				continue
-			}
-			if err := validateRuntime(opts, client); err == nil {
+			if _, err := parseRuntimeArgs(client, args...); err == nil {
 				t.Errorf("client=%v %v accepted", client, args)
 			}
 		}
 	}
 }
 
-// The recovery bundle (design §14 stage 8): off by default on both ends;
-// carrier needs the path controller and the sticky coded retry, and on a
-// client the single topology; its thresholds are validated.
+// The recovery bundle (design §14 stage 8): on by default on both ends
+// since stage 10; carrier needs the path controller and the sticky coded
+// retry, and on a client the single topology; its thresholds are validated.
 func TestRecoveryFlags(t *testing.T) {
 	full := []string{"--cc-api=v2", "--sched=class", "--congestion-scope=path", "--coded-retry=sticky", "--classifier=phased"}
 	for _, client := range []bool{true, false} {
-		if opts := parseRuntimeForTest(t, client); opts.recovery != "flow" {
+		if opts := parseRuntimeForTest(t, client); opts.recovery != "carrier" {
 			t.Fatalf("recovery %q by default (client=%v)", opts.recovery, client)
 		}
-		args := append([]string{}, full...)
+		if opts := parseRuntimeForTest(t, client, legacy()...); opts.recovery != "flow" {
+			t.Fatalf("recovery %q on the legacy bundle (client=%v)", opts.recovery, client)
+		}
+		args := legacy(full...)
 		if client {
 			args = append(args, "--topology=single")
 		}
@@ -499,25 +650,23 @@ func TestRecoveryFlags(t *testing.T) {
 		if cfg := opts.carrierRecoveryConfig(); cfg.SuspectPTOs != 3 || cfg.ReplacePTOs != 6 || cfg.DetectionSkew != 10*time.Second || cfg.HandoffBudget != 3*time.Second {
 			t.Fatalf("carrier recovery config = %+v", cfg)
 		}
+		// The thresholds apply to the default bundle without naming it.
+		if cfg := parseRuntimeForTest(t, client, "--recovery-ks=3", "--recovery-kp=6").carrierRecoveryConfig(); cfg.SuspectPTOs != 3 || cfg.ReplacePTOs != 6 {
+			t.Fatalf("carrier recovery config on the default bundle = %+v", cfg)
+		}
 		bad := [][]string{
-			{"--recovery=carrier"},
+			legacy("--recovery=carrier"),
 			{"--recovery=bogus"},
-			append(append([]string{}, full[:3]...), "--recovery=carrier"),
-			append(append([]string{}, full...), "--topology=single", "--recovery=carrier", "--recovery-ks=5", "--recovery-kp=2"),
-			append(append([]string{}, full...), "--topology=single", "--recovery=carrier", "--recovery-skew=40s", "--recovery-handoff-budget=10s"),
+			legacy(append(append([]string{}, full[:3]...), "--recovery=carrier")...),
+			legacy(append(append([]string{}, full...), "--topology=single", "--recovery=carrier", "--recovery-ks=5", "--recovery-kp=2")...),
+			legacy(append(append([]string{}, full...), "--topology=single", "--recovery=carrier", "--recovery-skew=40s", "--recovery-handoff-budget=10s")...),
+			{"--recovery-ks=5", "--recovery-kp=2"},
 		}
 		if client {
-			bad = append(bad, append(append([]string{}, full...), "--recovery=carrier"))
+			bad = append(bad, legacy(append(append([]string{}, full...), "--recovery=carrier")...))
 		}
 		for _, args := range bad {
-			fs := flag.NewFlagSet("test", flag.ContinueOnError)
-			fs.SetOutput(io.Discard)
-			var opts runtimeOptions
-			bindRuntimeFlags(fs, &opts, client)
-			if err := fs.Parse(args); err != nil {
-				continue
-			}
-			if err := validateRuntime(opts, client); err == nil {
+			if _, err := parseRuntimeArgs(client, args...); err == nil {
 				t.Errorf("client=%v %v accepted", client, args)
 			}
 		}
@@ -527,9 +676,12 @@ func TestRecoveryFlags(t *testing.T) {
 // The topology bundle (design §14 stage 7) is a client switch: single needs
 // the path controller and the pool, and a fan-out needs single.
 func TestTopologyIsValidatedAtStartup(t *testing.T) {
-	path := []string{"--cc-api=v2", "--sched=class", "--congestion-scope=path"}
-	if opts := parseRuntimeForTest(t, true); opts.topology != "isolated" || opts.topologyFanOut != 0 {
+	path := []string{"--bundle=legacy", "--cc-api=v2", "--sched=class", "--congestion-scope=path"}
+	if opts := parseRuntimeForTest(t, true); opts.topology != "single" || opts.topologyFanOut != 0 {
 		t.Fatalf("default topology %q fan-out %d", opts.topology, opts.topologyFanOut)
+	}
+	if opts := parseRuntimeForTest(t, true, legacy()...); opts.topology != "isolated" || opts.topologyFanOut != 0 {
+		t.Fatalf("legacy topology %q fan-out %d", opts.topology, opts.topologyFanOut)
 	}
 	if opts := parseRuntimeForTest(t, true, append(path, "--topology=single", "--classifier=phased")...); opts.topology != "single" {
 		t.Fatalf("topology=single not parsed: %q", opts.topology)
@@ -538,33 +690,23 @@ func TestTopologyIsValidatedAtStartup(t *testing.T) {
 		t.Fatalf("fan-out not parsed: %d", opts.topologyFanOut)
 	}
 	for _, args := range [][]string{
-		{"--topology=single"},
-		{"--cc-api=v2", "--sched=class", "--topology=single"},
+		legacy("--topology=single"),
+		legacy("--cc-api=v2", "--sched=class", "--topology=single"),
 		append(path, "--topology=single", "--quic-pool=false"),
 		append(path, "--topology=ring"),
 		append(path, "--topology="),
 		append(path, "--topology-fanout=2"),
 		append(path, "--topology=single", "--topology-fanout=10"),
 		append(path, "--topology=single", "--topology-fanout=-1"),
+		{"--topology=single", "--quic-pool=false"},
 	} {
-		fs := flag.NewFlagSet("test", flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		var opts runtimeOptions
-		bindRuntimeFlags(fs, &opts, true)
-		if err := fs.Parse(args); err != nil {
-			t.Fatal(err)
-		}
-		if err := validateRuntime(opts, true); err == nil {
+		if _, err := parseRuntimeArgs(true, args...); err == nil {
 			t.Errorf("%v accepted", args)
 		}
 	}
 	// A gateway has no topology flag: it never isolates, and it attaches an
 	// isolating client's connections to one controller either way.
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	var opts runtimeOptions
-	bindRuntimeFlags(fs, &opts, false)
-	if err := fs.Parse([]string{"--topology=single"}); err == nil {
+	if _, err := parseRuntimeArgs(false, "--topology=single"); err == nil {
 		t.Fatal("the gateway accepted --topology")
 	}
 }
@@ -580,16 +722,19 @@ func TestEgressCapacityIsAGatewayFlagUnderPathScope(t *testing.T) {
 		}
 	}
 	// A configured rate does nothing under connection scope, so it is refused
-	// rather than ignored; auto and off are inert there.
+	// rather than ignored; auto and off are inert there. The scope is named
+	// explicitly: these lines are parsed without the bundle resolution, and
+	// since stage 10 the flags' own defaults are the path-authority bundle.
 	for _, tc := range []struct {
 		args []string
 		ok   bool
 	}{
-		{[]string{"--egress-capacity=1g"}, false},
-		{[]string{"--egress-capacity=fast"}, false},
+		{[]string{"--egress-capacity=1g"}, true},
+		{[]string{"--egress-capacity=1g", "--congestion-scope=connection", "--recovery=flow"}, false},
+		{[]string{"--egress-capacity=fast", "--congestion-scope=connection", "--recovery=flow"}, false},
 		{append([]string{"--egress-capacity=fast"}, path...), false},
-		{[]string{"--egress-capacity=off"}, true},
-		{[]string{"--egress-capacity=auto"}, true},
+		{[]string{"--egress-capacity=off", "--congestion-scope=connection", "--recovery=flow"}, true},
+		{[]string{"--egress-capacity=auto", "--congestion-scope=connection", "--recovery=flow"}, true},
 	} {
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)
 		fs.SetOutput(io.Discard)

@@ -34,14 +34,31 @@ type workloadArm struct {
 	server func(*ServerConfig)
 }
 
-// legacyArm is every switch off: today's behaviour and the registered
-// control of the stage-10 gate. Each switch is set explicitly, so the control
-// stays the legacy bundle on a build whose defaults have flipped.
-var legacyArm = workloadArm{name: "legacy", client: applyLegacyBundleToClient, server: applyLegacyBundleToServer}
+// legacyArm is the legacy bundle: the registered control of the stage-10
+// gate. Each switch is set explicitly (pep.BundleLegacy), so the control
+// stays the legacy bundle now that the defaults have flipped.
+var legacyArm = bundleArm("legacy", BundleLegacy)
 
-// flipArm is the bundle the default flip ships, recovery=carrier included:
-// the one shared definition in flipbundle_test.go.
-var flipArm = workloadArm{name: "flip", client: applyFlipBundleToClient, server: applyFlipBundleToServer}
+// flipArm is the path-authority bundle, the default since stage 10: what the
+// default flip ships, recovery=carrier included. It is the named bundle
+// itself, so a switch added to the bundle is measured here without an edit.
+var flipArm = bundleArm("flip", BundlePathAuthority)
+
+// bundleArm is the arm that applies every switch of a named bundle.
+func bundleArm(name string, bundle BundleName) workloadArm {
+	switches := func(gateway bool) BundleSwitches {
+		s, err := SwitchesOf(bundle, gateway)
+		if err != nil {
+			panic(err)
+		}
+		return s
+	}
+	return workloadArm{
+		name:   name,
+		client: func(c *ClientConfig) { switches(false).ApplyToClient(c) },
+		server: func(s *ServerConfig) { switches(true).ApplyToServer(s) },
+	}
+}
 
 // workloadArms are the two arms, control first.
 func workloadArms() []workloadArm { return []workloadArm{legacyArm, flipArm} }

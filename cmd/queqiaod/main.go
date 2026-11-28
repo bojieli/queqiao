@@ -566,7 +566,11 @@ type runtimeOptions struct {
 	// silently replaced by the default.
 	resolvedProfile profile.Profile
 	congestion      string
-	ccAPI           string
+	// bundle is --bundle: the migration bundle whose switches every switch
+	// flag not given on the command line takes (design §14). Since stage 10
+	// the default is the path-authority bundle; legacy is the rollback.
+	bundle string
+	ccAPI  string
 	// sched is the class scheduler (design §14 stage 2).
 	sched string
 	// congestionScope is the path controller switch (design §14 stage 6).
@@ -628,6 +632,14 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		defaultListen, defaultMaxSessions = "127.0.0.1:12080", 2048
 	}
 	fs.StringVar(&opts.listen, "listen", defaultListen, "listen address")
+	// Every switch flag defaults to the default bundle's value for this
+	// role; --bundle moves the ones not given explicitly (resolveBundle).
+	clientSwitches, _ := pep.SwitchesOf(pep.DefaultBundle, false)
+	gatewaySwitches, _ := pep.SwitchesOf(pep.DefaultBundle, true)
+	defaultSwitches := clientSwitches
+	if !client {
+		defaultSwitches = gatewaySwitches
+	}
 	fs.IntVar(&opts.maxSessions, "max-sessions", defaultMaxSessions, "global concurrent-session limit")
 	fs.IntVar(&opts.chunkSize, "chunk-size", 32*1024, "stream data frame size")
 	fs.DurationVar(&opts.dialTimeout, "dial-timeout", 10*time.Second, "dial timeout")
@@ -643,20 +655,21 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 	fs.BoolVar(&opts.udpOnStream, "udp-on-stream", false, "carry UDP packets on streams instead of QUIC datagrams")
 	fs.IntVar(&opts.hopPortCount, "hop-port-count", 0, "number of UDP ports to listen on for port hopping (0/1 = disabled)")
 	fs.StringVar(&opts.congestion, "congestion", string(pep.CongestionErasure), "QUIC congestion controller")
-	fs.StringVar(&opts.ccAPI, "cc-api", string(pep.CCAPIV1), "how QUIC congestion controllers are driven: v1 (per-packet callbacks) or v2 (the path-authority controller API; requires --congestion=erasure)")
-	fs.StringVar(&opts.congestionScope, "congestion-scope", string(pep.CongestionScopeConnection), "what one QUIC congestion controller governs: connection (one per connection), or path (one controller per path and direction that every connection on the path attaches to; requires --cc-api=v2 and --sched=class)")
-	fs.StringVar(&opts.sched, "sched", string(pep.SchedLegacy), "packet scheduler: legacy, or class (CONTROL, INTERACTIVE and BULK arbitrated by weighted deficit round robin; requires --cc-api=v2)")
-	fs.StringVar(&opts.codedRetry, "coded-retry", string(pep.CodedRetryLegacy), "coded-retry bundle: legacy, or sticky (a coded chunk's deadline starts when its datagrams are registered, and its retry stays on the stream; requires --cc-api=v2)")
-	fs.StringVar(&opts.classifierMode, "classifier", string(pep.ClassifierLegacy), "flow-classifier bundle: legacy (BULK is permanent), or phased (lane choice keeps the sticky class; the DATA class, queue and coding follow what the flow does now, and small writes onto an empty queue go interactive and coded)")
+	fs.StringVar(&opts.bundle, "bundle", string(pep.DefaultBundle), "migration bundle the switch flags below default to: path-authority (the default since stage 10), or legacy (every switch off: the behaviour before the path-authority migration, kept for one release as the rollback). A switch flag given explicitly overrides its bundle value, and the result must still be a supported combination")
+	fs.StringVar(&opts.ccAPI, "cc-api", string(defaultSwitches.CCAPI), "how QUIC congestion controllers are driven: v1 (per-packet callbacks) or v2 (the path-authority controller API; requires --congestion=erasure)")
+	fs.StringVar(&opts.congestionScope, "congestion-scope", string(defaultSwitches.CongestionScope), "what one QUIC congestion controller governs: connection (one per connection), or path (one controller per path and direction that every connection on the path attaches to; requires --cc-api=v2 and --sched=class)")
+	fs.StringVar(&opts.sched, "sched", string(defaultSwitches.Sched), "packet scheduler: legacy, or class (CONTROL, INTERACTIVE and BULK arbitrated by weighted deficit round robin; requires --cc-api=v2)")
+	fs.StringVar(&opts.codedRetry, "coded-retry", string(defaultSwitches.CodedRetry), "coded-retry bundle: legacy, or sticky (a coded chunk's deadline starts when its datagrams are registered, and its retry stays on the stream; requires --cc-api=v2)")
+	fs.StringVar(&opts.classifierMode, "classifier", string(defaultSwitches.Classifier), "flow-classifier bundle: legacy (BULK is permanent), or phased (lane choice keeps the sticky class; the DATA class, queue and coding follow what the flow does now, and small writes onto an empty queue go interactive and coded)")
 	fs.BoolVar(&opts.carrierShadow, "carrier-shadow", false, "record the carrier state the path-authority design would assign to every QUIC connection, and the remedy it would take at every flow stall, beside today's recovery (observation only)")
 	fs.UintVar(&opts.carrierShadowKS, "carrier-shadow-ks", 0, "carrier-shadow k_s: probe timeouts without transport progress before a carrier is labelled suspect (0 = default)")
 	fs.UintVar(&opts.carrierShadowKP, "carrier-shadow-kp", 0, "carrier-shadow k_p: probe timeouts before a suspect carrier is labelled for replacement (0 = default)")
-	fs.StringVar(&opts.recovery, "recovery", string(pep.RecoveryFlow), "who owns QUIC recovery: flow (each flow rescues its own lanes, with per-flow dials), or carrier (the client's carrier manager replaces a carrier only on its transport evidence and rebinds failed streams on it; no per-flow rescue dials or lane demotion; requires --congestion-scope=path, --coded-retry=sticky and, on a client, --topology=single)")
+	fs.StringVar(&opts.recovery, "recovery", string(defaultSwitches.Recovery), "who owns QUIC recovery: flow (each flow rescues its own lanes, with per-flow dials), or carrier (the client's carrier manager replaces a carrier only on its transport evidence and rebinds failed streams on it; no per-flow rescue dials or lane demotion; requires --congestion-scope=path, --coded-retry=sticky and, on a client, --topology=single)")
 	fs.UintVar(&opts.recoveryKS, "recovery-ks", 0, "recovery=carrier k_s: probe timeouts without transport progress before a carrier is suspect and a standby is dialled (0 = provisional default)")
 	fs.UintVar(&opts.recoveryKP, "recovery-kp", 0, "recovery=carrier k_p: probe timeouts, without progress since suspect, before a verified standby is promoted (0 = provisional default)")
 	fs.DurationVar(&opts.recoverySkew, "recovery-skew", 0, "recovery=carrier S: how much later than the gateway the client may observe a lost binding (0 = 15s)")
 	fs.DurationVar(&opts.recoveryHandoffBudget, "recovery-handoff-budget", 0, "recovery=carrier J: time from starting a rebinding JOIN or TCP handoff to the gateway parsing it (0 = provisional 5s)")
-	fs.StringVar(&opts.memory, "mem", string(pep.MemoryLegacy), "memory-ownership bundle: legacy, or owned (fair shared send-memory grants and the credit-driven retention bound)")
+	fs.StringVar(&opts.memory, "mem", string(defaultSwitches.Memory), "memory-ownership bundle: legacy, or owned (fair shared send-memory grants and the credit-driven retention bound)")
 	fs.Uint64Var(&opts.brutalBytesPerSec, "brutal-bytes-per-sec", 0, "Brutal fixed byte rate")
 	fs.Uint64Var(&opts.adaptiveMinBytesSec, "adaptive-min-bytes-per-sec", 64*1024, "Adaptive minimum byte rate")
 	fs.Uint64Var(&opts.adaptiveMaxBytesSec, "adaptive-max-bytes-per-sec", 200*1024*1024, "Adaptive maximum byte rate")
@@ -675,7 +688,7 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.StringVar(&opts.localAddress, "local-address", "auto", "outer source: auto, IP, or if:NAME")
 		fs.IntVar(&opts.maxPendingOpens, "max-pending-opens", 256, "concurrent remote flow opens")
 		fs.BoolVar(&opts.quicPool, "quic-pool", true, "reuse a persistent QUIC connection")
-		fs.StringVar(&opts.topology, "topology", string(pep.TopologyIsolated), "placement of flows on QUIC connections: isolated (a bulk flow sharing the pooled connection moves to a connection of its own), or single (every flow is a stream on one connection per path; requires --congestion-scope=path and --quic-pool)")
+		fs.StringVar(&opts.topology, "topology", string(clientSwitches.Topology), "placement of flows on QUIC connections: isolated (a bulk flow sharing the pooled connection moves to a connection of its own), or single (every flow is a stream on one connection per path; requires --congestion-scope=path and --quic-pool)")
 		fs.IntVar(&opts.topologyFanOut, "topology-fanout", 0, "explicit fan-out under --topology=single: bulk flows that share the preferred connection may be placed on up to N-1 extra connections per path (0 or 1 = off); rescue dials and handover generations are not counted")
 		fs.StringVar(&opts.pathProfile, "path-profile", "", "deployment this client runs in: "+strings.Join(profile.Names(), ", ")+" (default is the supported access-link profile)")
 		fs.StringVar(&opts.flowMetadataSocket, "flow-metadata-socket", "", "local capture agent socket to ask what produced each flow, so its class is known before it carries anything; empty disables the lookup")
@@ -698,8 +711,78 @@ func bindRuntimeFlags(fs *flag.FlagSet, opts *runtimeOptions, client bool) {
 		fs.BoolVar(&opts.allowPrivate, "allow-private-destinations", false, "allow private and link-local destinations")
 		fs.StringVar(&opts.outboundSOCKS5, "outbound-socks5", "", "optional loopback SOCKS5 upstream for destination traffic")
 		fs.StringVar(&opts.egressCapacity, "egress-capacity", "auto", "ceiling on what this gateway's path authorities send out of one network interface together, divided fairly among the active ones: auto (the interface's link speed with a margin where it can be read, else learned from the aggregate loss), off, or a rate such as 1g or 940m; applies only with --congestion-scope=path")
-		fs.StringVar(&opts.gatewayAdmission, "gateway-admission", string(pep.GatewayAdmissionLegacy), "what the session limit counts: legacy (every stream, with JOIN and PROBE still admitted when full) or owned (logical flows, charged at OPEN)")
+		fs.StringVar(&opts.gatewayAdmission, "gateway-admission", string(gatewaySwitches.GatewayAdmission), "what the session limit counts: legacy (every stream, with JOIN and PROBE still admitted when full) or owned (logical flows, charged at OPEN)")
 	}
+}
+
+// bundleSwitchFlags maps each migration switch flag to where its value lives,
+// so that --bundle can move the ones the command line left alone.
+func bundleSwitchFlags(opts *runtimeOptions, s pep.BundleSwitches, client bool) map[string]struct {
+	target *string
+	value  string
+} {
+	type entry = struct {
+		target *string
+		value  string
+	}
+	m := map[string]entry{
+		"cc-api":           {&opts.ccAPI, string(s.CCAPI)},
+		"sched":            {&opts.sched, string(s.Sched)},
+		"congestion-scope": {&opts.congestionScope, string(s.CongestionScope)},
+		"coded-retry":      {&opts.codedRetry, string(s.CodedRetry)},
+		"mem":              {&opts.memory, string(s.Memory)},
+		"classifier":       {&opts.classifierMode, string(s.Classifier)},
+		"recovery":         {&opts.recovery, string(s.Recovery)},
+	}
+	if client {
+		m["topology"] = entry{&opts.topology, string(s.Topology)}
+	} else {
+		m["gateway-admission"] = entry{&opts.gatewayAdmission, string(s.GatewayAdmission)}
+	}
+	return m
+}
+
+// resolveBundle gives every switch flag the command line did not set the
+// value of the selected bundle (design §14, stage 10). Run it once, after
+// parsing and before validateRuntime. Under the default bundle it also
+// turns the refusals of a setting that only the legacy bundle supports into
+// a pointer at --bundle=legacy, since that bundle used to be the default and
+// a command line written for it is the likely cause.
+func resolveBundle(fs *flag.FlagSet, opts *runtimeOptions, client bool) error {
+	name, err := pep.ParseBundleName(opts.bundle)
+	if err != nil {
+		return fmt.Errorf("--bundle: %w", err)
+	}
+	opts.bundle = string(name)
+	switches, err := pep.SwitchesOf(name, !client)
+	if err != nil {
+		return fmt.Errorf("--bundle: %w", err)
+	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	explicitSwitch := false
+	for flagName, e := range bundleSwitchFlags(opts, switches, client) {
+		if set[flagName] {
+			explicitSwitch = true
+			continue
+		}
+		*e.target = e.value
+	}
+	if name != pep.BundlePathAuthority || explicitSwitch {
+		// An explicit switch is a deliberate combination; the validator
+		// judges it as given.
+		return nil
+	}
+	if opts.congestion != string(pep.CongestionErasure) {
+		return fmt.Errorf("--congestion=%s runs only on the legacy bundle; add --bundle=%s (the path-authority bundle, the default since stage 10, hosts --congestion=%s only)", opts.congestion, pep.BundleLegacy, pep.CongestionErasure)
+	}
+	if client && !opts.quicPool {
+		return fmt.Errorf("--quic-pool=false runs only on the legacy bundle; add --bundle=%s (the path-authority bundle, the default since stage 10, keeps every flow on one pooled connection per path)", pep.BundleLegacy)
+	}
+	if client && opts.topologyFanOut > 1 {
+		return errors.New("--topology-fanout is not supported with recovery=carrier, which the default path-authority bundle includes; a fan-out runs with --recovery=flow")
+	}
+	return nil
 }
 
 // resolveProfile parses the deployment profile once, so an unknown name is a
@@ -901,6 +984,9 @@ func runClient(args []string) (returnErr error) {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if err := resolveBundle(fs, &opts, true); err != nil {
+		return err
+	}
 	if opts.jsonLogs {
 		opts.logFormat = "json"
 	}
@@ -980,6 +1066,9 @@ func runServer(args []string) (returnErr error) {
 	var opts runtimeOptions
 	bindRuntimeFlags(fs, &opts, false)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := resolveBundle(fs, &opts, false); err != nil {
 		return err
 	}
 	if opts.jsonLogs {
@@ -1150,6 +1239,7 @@ func logRuntimeConfiguration(logger *slog.Logger, opts runtimeOptions, client bo
 		slog.String("listen", opts.listen),
 		slog.String("transport", opts.transport),
 		slog.String("congestion", opts.congestion),
+		slog.String("bundle_name", opts.bundle),
 		slog.String("cc_api", opts.ccAPI),
 		slog.String("sched", opts.sched),
 		slog.String("congestion_scope", opts.congestionScope),

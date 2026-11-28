@@ -429,6 +429,9 @@ type multipathFlow struct {
 	stallScan     time.Duration
 	stallGrace    time.Duration
 	progressGrace time.Duration // test override; production uses laneReplacementWait
+	// ackDataLane is the newest lane the peer has sent DATA on; see
+	// noteDataLane.
+	ackDataLane atomic.Pointer[mpLane]
 	// controlLaneShared reports whether another flow is currently using the
 	// pooled control connection that control, the flow's selected control
 	// lane, is on. Nil means "no", which is what a flow on a dedicated
@@ -1362,6 +1365,7 @@ func (f *multipathFlow) deliverInbound(lane *mpLane, frame protocol.Frame) bool 
 
 	if frame.Header.Type == protocol.TypeData {
 		lane.recv.Add(uint64(len(frame.Payload)))
+		f.noteDataLane(lane)
 	}
 	if frame.Header.Type == protocol.TypeOpenOK {
 		if err := f.acceptOpenConfirmation(frame); err != nil {
@@ -3043,6 +3047,24 @@ func (f *multipathFlow) writeControl(ctx context.Context, frame protocol.Frame, 
 	}
 }
 
+// noteDataLane remembers the newest lane the peer is sending DATA on, which
+// acknowledgements then prefer. A peer moves its data to a lane admitted later
+// only when it has stopped trusting the older one -- a stall rescue -- and on
+// wire 1 a rescue JOIN cannot say which lane it replaces, so without this the
+// acknowledgements kept going to the frozen lane the rescue routed around and
+// the sender, whose read-ahead waits for credit, stalled again every round.
+func (f *multipathFlow) noteDataLane(lane *mpLane) {
+	for {
+		cur := f.ackDataLane.Load()
+		if cur == lane || cur != nil && !cur.closed.Load() && !lane.admitted.After(cur.admitted) {
+			return
+		}
+		if f.ackDataLane.CompareAndSwap(cur, lane) {
+			return
+		}
+	}
+}
+
 func (f *multipathFlow) writeACK(ctx context.Context, sequence uint64, direction uint16, final bool) error {
 	return f.writeACKPreferred(ctx, sequence, direction, final, nil)
 }
@@ -3070,6 +3092,11 @@ func (f *multipathFlow) writeACKPreferred(ctx context.Context, sequence uint64, 
 	// full lane-replacement timeout when every current lane rejects one: the
 	// flow coordinator must observe the failure immediately so a replacement
 	// can be admitted and the latest ACK/FIN state replayed there.
+	if preferred == nil {
+		if data := f.ackDataLane.Load(); data != nil && !data.closed.Load() {
+			preferred = data
+		}
+	}
 	lanes := f.healthyLanes()
 	// A rescue must carry ACK state on the new lane, not enqueue it on the
 	// same old transport whose missing ACK prompted the rescue. Otherwise
