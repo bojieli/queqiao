@@ -30,6 +30,7 @@ jobs:
   # change is harmless.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       core: ${{ steps.pick.outputs.core }}
       mobile: ${{ steps.pick.outputs.mobile }}
@@ -104,6 +105,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -120,12 +122,15 @@ jobs:
     needs: changes
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
       - run: go vet ./...
+      - name: Workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
@@ -141,6 +146,7 @@ jobs:
   # seconds of one runner.
   changelog:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
@@ -198,6 +204,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -224,7 +231,7 @@ jobs:
   test:
     needs: changes
     if: needs.changes.outputs.core == 'true'
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -243,6 +250,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.harness == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'
@@ -253,7 +261,7 @@ jobs:
     # here too; the apps themselves (Android, iOS) are not.
     if: needs.changes.outputs.mobile == 'true' || needs.changes.outputs.core == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -286,7 +294,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.mobile == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -393,7 +401,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.mobile == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -508,7 +516,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.mobile == 'true'
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -563,6 +571,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
