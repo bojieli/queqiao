@@ -10,6 +10,14 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.15.1 - 2026-11-28
+
+### Fixed
+
+- The README's download links and version notes name this release. v0.15.0
+  was tagged without them and was never published; v0.15.1 is the same code
+  as v0.15.0 with that corrected and a shorter release workflow.
+
 ## v0.15.0 - 2026-11-28
 
 ### Added
