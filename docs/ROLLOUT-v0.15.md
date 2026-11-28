@@ -19,6 +19,13 @@ twice main's. The design's own rule says one failing gate blocks the flip, so
 that tail is the decision: fix it first, or ship with it as a known limitation
 and watch it.
 
+**Decision (2026-11-28).** The gate failed on three independent live campaigns
+(imp7 3.76 s vs 1.92 s, imp8 4.71 vs 2.29, imp9 4.70 vs 2.48). The owner waived
+it ("ship now") with #282 open as a known limitation. v0.15.0 is stage 10
+alone: the path-authority bundle is the default and `--bundle=legacy` stays as
+the flag-level rollback for the whole v0.15.x line. Stage 11 — deleting the
+legacy bundle — moves to v0.16, after the soak this release starts.
+
 ## Impaired-path A/B (imp7, 12 blocks, bj → HK relay → gateway)
 
 Arms: `main` at bb212411 (`--classifier=phased`), `final` at bb2124116 with
@@ -180,7 +187,7 @@ in a local, git-ignored file beside this one (`ROLLOUT-v0.15.local.md`).
 | Phase | Build | Rollback |
 | --- | --- | --- |
 | 1. Soak | `main` at the stage-10 merge, built by the release-candidate workflow (no published release) | `--bundle=legacy` on the host, or the previous binary |
-| 2. Release | v0.15.0, after stage 11 deletes the legacy code | the previous binary only (the soak build, or v0.14.0) |
+| 2. Release | v0.16.0, after stage 11 deletes the legacy code | the previous binary only (v0.15.x, or v0.14.0) |
 
 Phase 1 is the design's soak: the new defaults run in production while the
 legacy bundle is still one flag away. Phase 2 starts only after phase 1 has
