@@ -144,17 +144,27 @@ node and rule.
 ## Non-publishing release candidate
 
 Run `.github/workflows/release-candidate.yml` manually on the exact commit under
-review with a version such as `v0.1.0-rc.1`. It runs the full, fuzz,
-vulnerability, fallback, history-secret, and reproducibility gates. The
-portable Go suite runs natively on Linux, macOS, and Windows for amd64 and
-arm64. The high-erasure wall-clock emulator campaigns run on Linux and macOS,
-where the configured path timing is preserved; hosted Windows timers can
-stretch a configured 300 ms RTT into seconds and therefore do not provide
-valid path evidence. Windows still runs coded-path correctness, conformance,
-socket-error, and packaged-binary checks. The repository-wide race matrix is
-kept in the weekly and on-demand `deep.yml` campaign instead of blocking each
-release candidate for hours. Normal CI continues to race-test the mobile core,
-and the candidate fallback soak retains its targeted race repetitions. A
+review with a version such as `v0.1.0-rc.1`. It is kept short — every job is
+capped at 20 minutes and the whole run takes about half an hour — because it
+answers release questions only: the fuzz, vulnerability, fallback,
+history-secret and reproducibility gates, wire interoperability, and the
+packaged archives built, run, signed and attested.
+
+It no longer runs the full Go suite on six native runners. Those suites took 55
+to 72 minutes each on hosted runners, and what they found there was timing
+noise on two-core machines rather than release blockers. The suite still runs:
+on all six platforms in normal CI (`-short`, which the candidate requires on
+this exact commit), weekly and on demand in `deep.yml` (full, native and race),
+and **before tagging, on an idle many-core host**:
+
+```sh
+go test -p=1 -count=1 -timeout 120m ./...
+```
+
+Record that run with the release. A failure there is a release question in a
+way a timing miss on a loaded two-core runner is not.
+
+A
 separate six-native-runner gate executes each packaged
 archive. It also refuses to qualify a commit unless an exact-SHA push or manual
 run of the normal CI workflow succeeded, binding the Android, iOS, emulator,

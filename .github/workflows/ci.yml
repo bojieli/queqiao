@@ -13,6 +13,7 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -29,6 +30,7 @@ jobs:
   # change is harmless.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       core: ${{ steps.pick.outputs.core }}
       mobile: ${{ steps.pick.outputs.mobile }}
@@ -46,7 +48,12 @@ jobs:
         run: |
           set -uo pipefail
           base=""
-          if [ "$EVENT" = "pull_request" ]; then
+          # A tag is a release: it runs everything, because the release
+          # workflows take this run as the exact commit's CI evidence, and a
+          # changelog-only release commit would otherwise skip every job.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            :
+          elif [ "$EVENT" = "pull_request" ]; then
             base="$BASE_SHA"
           elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             base="$BEFORE"
@@ -85,10 +92,12 @@ jobs:
           else
             matrix='[{"runner":"ubuntu-24.04","os":"linux","arch":"amd64"},{"runner":"ubuntu-24.04-arm","os":"linux","arch":"arm64"},{"runner":"macos-15-intel","os":"darwin","arch":"amd64"},{"runner":"macos-15","os":"darwin","arch":"arm64"},{"runner":"windows-2025","os":"windows","arch":"amd64"},{"runner":"windows-11-arm","os":"windows","arch":"arm64"}]'
           fi
-          echo "core=$core" >> "$GITHUB_OUTPUT"
-          echo "mobile=$mobile" >> "$GITHUB_OUTPUT"
-          echo "harness=$harness" >> "$GITHUB_OUTPUT"
-          echo "test-matrix=$matrix" >> "$GITHUB_OUTPUT"
+          {
+            echo "core=$core"
+            echo "mobile=$mobile"
+            echo "harness=$harness"
+            echo "test-matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
 
   # The build matrix exists because it has already caught something: the
   # external-proxy harness used Setpgid, Getpgid and Kill directly and did not
@@ -98,6 +107,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -114,12 +124,15 @@ jobs:
     needs: changes
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
       - run: go vet ./...
+      - name: Workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
@@ -135,6 +148,7 @@ jobs:
   # seconds of one runner.
   changelog:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
@@ -192,6 +206,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -218,7 +233,7 @@ jobs:
   test:
     needs: changes
     if: needs.changes.outputs.core == 'true'
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -237,6 +252,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.harness == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'
@@ -247,7 +263,7 @@ jobs:
     # here too; the apps themselves (Android, iOS) are not.
     if: needs.changes.outputs.mobile == 'true' || needs.changes.outputs.core == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -280,7 +296,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.mobile == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -387,7 +403,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.mobile == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -502,7 +518,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.mobile == 'true'
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -557,6 +573,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7

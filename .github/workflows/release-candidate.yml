@@ -25,6 +25,7 @@ jobs:
   # merge commit while the API reports the pull-request head SHA.
   ci-evidence:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       actions: read
       contents: read
@@ -43,72 +44,12 @@ jobs:
           run_url=$(jq -r .html_url <<<"$run")
           echo "Exact-commit CI evidence: [$run_id]($run_url)" >> "$GITHUB_STEP_SUMMARY"
 
-  full:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 110
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version-file: go.mod
-      # Match the native/race jobs: CPU-bound FEC tests must not starve the
-      # wall-clock network emulators, including on Linux runners.
-      - run: go test -p=1 -timeout 90m ./...
-      - run: go vet ./...
-      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 -checks=all,-U1000 ./...
-      - name: Gosec reviewed baseline
-        run: |
-          set +e
-          go run github.com/securego/gosec/v2/cmd/gosec@v2.28.0 \
-            -fmt json -out gosec.json ./...
-          scanner_status=$?
-          set -e
-          test "$scanner_status" -eq 0 || test "$scanner_status" -eq 1
-          ./scripts/check_gosec.py gosec.json .
-      - name: Formatting
-        run: test -z "$(gofmt -l .)"
-      - name: Workflow syntax
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-      - name: Python helper tests
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
-  native-test:
-    timeout-minutes: 110
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {runner: ubuntu-24.04, os: linux, arch: amd64}
-          - {runner: ubuntu-24.04-arm, os: linux, arch: arm64}
-          - {runner: macos-15-intel, os: darwin, arch: amd64}
-          - {runner: macos-15, os: darwin, arch: arm64}
-          - {runner: windows-2025, os: windows, arch: amd64}
-          - {runner: windows-11-arm, os: windows, arch: arm64}
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version-file: go.mod
-      # -p=1 keeps CPU-bound erasure coding in another package from starving
-      # wall-clock network emulators. The high-erasure latency campaigns
-      # themselves run on Linux and macOS: hosted Windows timers stretched a
-      # configured 300 ms RTT as far as 3.8 s, changing the impairment rather
-      # than testing the one requested. Windows still runs every portable test,
-      # including coded-path correctness, and executes its packaged binary.
-      - name: Native tests
-        if: runner.os != 'macOS'
-        run: go test -p=1 -count=1 -timeout 90m ./...
-      # These three absolute-rate/queue/loss measurements require stable
-      # scheduling. Linux still gates all three at the original thresholds.
-      - name: Native macOS tests
-        if: runner.os == 'macOS'
-        run: go test -p=1 -count=1 -timeout 90m -skip "$MEASUREMENTS" ./...
-      - name: Record hosted macOS timing measurements
-        if: runner.os == 'macOS'
-        continue-on-error: true
-        run: go test -v -p=1 -count=1 -timeout 20m -run "$MEASUREMENTS" ./internal/pathsim ./internal/baseline ./internal/pep
-    env:
-      MEASUREMENTS: '^(TestTheEmulatorReproducesTheMeasuredPath|TestRawQUICSaturatesThePath|TestCase4APolicedPathIsStillUnbraked)$'
+  # The full and native test suites used to run here too: six serialized
+  # suites, 55-72 minutes each, the same long wall-clock tests deep.yml runs
+  # every week. They are not release questions. ci-evidence already requires
+  # this exact commit's normal CI (the suite on all six platforms); what this
+  # workflow adds is what only a release can check: the archives are built,
+  # run on their own platforms, signed, attested and scanned.
 
   vulnerability:
     runs-on: ubuntu-24.04
@@ -122,7 +63,7 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -148,7 +89,7 @@ jobs:
 
   fallback-soak:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -169,7 +110,7 @@ jobs:
   # actually deployed.
   wire-interop:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -211,7 +152,7 @@ jobs:
 
   package:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -319,7 +260,7 @@ jobs:
   macos-signing:
     needs: [package, native-smoke]
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 20
     environment: public-release
     permissions:
       contents: read
@@ -354,8 +295,9 @@ jobs:
 
   provenance:
     if: github.event.repository.visibility == 'public'
-    needs: [ci-evidence, full, native-test, vulnerability, fuzz, fallback-soak, history-secret-scan, package, native-smoke]
+    needs: [ci-evidence, vulnerability, fuzz, fallback-soak, history-secret-scan, package, native-smoke]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
       id-token: write
@@ -372,14 +314,13 @@ jobs:
 
   candidate-summary:
     if: always()
-    needs: [ci-evidence, full, native-test, vulnerability, fuzz, fallback-soak, wire-interop, history-secret-scan, package, native-smoke, macos-signing, provenance]
+    needs: [ci-evidence, vulnerability, fuzz, fallback-soak, wire-interop, history-secret-scan, package, native-smoke, macos-signing, provenance]
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Require every available gate
         env:
           CI_EVIDENCE: ${{ needs.ci-evidence.result }}
-          FULL: ${{ needs.full.result }}
-          NATIVE_TEST: ${{ needs.native-test.result }}
           VULN: ${{ needs.vulnerability.result }}
           FUZZ: ${{ needs.fuzz.result }}
           SOAK: ${{ needs.fallback-soak.result }}
@@ -393,7 +334,7 @@ jobs:
           CANDIDATE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          for result in "$CI_EVIDENCE" "$FULL" "$NATIVE_TEST" "$VULN" "$FUZZ" "$SOAK" "$WIRE_INTEROP" "$HISTORY" "$PACKAGE" "$NATIVE" "$MACOS_SIGNING"; do
+          for result in "$CI_EVIDENCE" "$VULN" "$FUZZ" "$SOAK" "$WIRE_INTEROP" "$HISTORY" "$PACKAGE" "$NATIVE" "$MACOS_SIGNING"; do
             test "$result" = success
           done
           if test "$VISIBILITY" = public; then
