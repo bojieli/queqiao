@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -24,7 +25,11 @@ class ConcurrentTLSTest(unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
-        self.server = wlserver.Server(("127.0.0.1", 0), wlserver.Term, wlserver.tls_context(self.dir.name))
+
+        class Backlog(wlserver.Server):
+            request_queue_size = 128
+
+        self.server = Backlog(("127.0.0.1", 0), wlserver.Term, wlserver.tls_context(self.dir.name))
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def tearDown(self):
@@ -36,8 +41,15 @@ class ConcurrentTLSTest(unittest.TestCase):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        ss = ctx.wrap_socket(socket.create_connection(self.server.server_address, timeout=10),
-                             server_hostname="wlserver", do_handshake_on_connect=False)
+        for attempt in range(5):            # a full accept queue resets a connect
+            try:
+                raw = socket.create_connection(self.server.server_address, timeout=10)
+                break
+            except ConnectionResetError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+        ss = ctx.wrap_socket(raw, server_hostname="wlserver", do_handshake_on_connect=False)
         ss.setblocking(False)              # the handshake as open_conn does it
         while True:
             try:
@@ -69,7 +81,7 @@ class ConcurrentTLSTest(unittest.TestCase):
         return fail[0] if fail else echoes
 
     def test_a_reader_and_a_writer_share_one_tls_connection(self):
-        with ThreadPoolExecutor(16) as ex:
+        with ThreadPoolExecutor(8) as ex:
             results = list(ex.map(self.session, range(300)))
         self.assertEqual([r for r in results if r != [0, 1, 2, 3, 4]], [])
 

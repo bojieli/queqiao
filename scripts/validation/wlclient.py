@@ -129,7 +129,7 @@ def open_conn(args, timeout: float, deadline: float = None):
             if not select.select([], [ss], [], _left(deadline))[1]:
                 raise socket.timeout("deadline")
     ss.settimeout(timeout)
-    return ss
+    return serial(ss)
 
 
 class SerialTLS:
@@ -193,7 +193,10 @@ class SerialTLS:
 
 
 def serial(sock):
-    """sock, made safe for a reader thread and a writer at once."""
+    """sock, made safe for a reader thread and a writer at once. Every
+    connection open_conn hands out goes through here, so a workload cannot
+    reach past it (the call and browse workloads read in a thread of their
+    own too)."""
     return SerialTLS(sock) if isinstance(sock, ssl.SSLSocket) else sock
 
 
@@ -378,7 +381,7 @@ def cmd_term(args) -> None:
     t0 = time.time()
     rec = {"kind": "term", "t0": round(t0, 3), "keys": [], "bursts": [], "fail": "", "canary": args.canary}
     try:
-        sock = serial(open_conn(args, args.timeout))
+        sock = open_conn(args, args.timeout)
         sock.settimeout(args.timeout)
     except (OSError, EOFError, ssl.SSLError) as e:
         rec["fail"] = f"{type(e).__name__}: {e}"[:200]
@@ -1134,7 +1137,7 @@ def cmd_wake(args) -> None:
                "t0": round(time.time(), 3), "fail": "", "pushes": [], "sends": [], "end": "", "end_at": None,
                "sync_done": None, "sync_seconds": None}
         try:
-            s = serial(open_conn(args, 30))
+            s = open_conn(args, 30)
             s.settimeout(None)
             c0 = time.monotonic()
             s.sendall(f"W {args.sync} {at:g} {mode} {args.follow}\n".encode())
