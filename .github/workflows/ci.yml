@@ -13,6 +13,7 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -46,7 +47,12 @@ jobs:
         run: |
           set -uo pipefail
           base=""
-          if [ "$EVENT" = "pull_request" ]; then
+          # A tag is a release: it runs everything, because the release
+          # workflows take this run as the exact commit's CI evidence, and a
+          # changelog-only release commit would otherwise skip every job.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            :
+          elif [ "$EVENT" = "pull_request" ]; then
             base="$BASE_SHA"
           elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             base="$BEFORE"
