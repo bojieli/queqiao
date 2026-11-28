@@ -10,6 +10,635 @@ also where every change merged since the newest release below is described. An
 entry written here conflicts with every other branch that wrote one; add a file
 to `changelog.d/` instead, as [`CONTRIBUTING.md`](CONTRIBUTING.md) describes.
 
+## v0.15.0 - 2026-11-28
+
+### Added
+
+- `--carrier-shadow` runs a carrier-liveness observer on clients and gateways
+  beside today's recovery, as groundwork for carrier-owned recovery in the
+  path-authority migration. For every QUIC connection that carries a flow it
+  labels the state the design would assign (active, suspect after
+  `--carrier-shadow-ks` probe timeouts without transport progress, replace after
+  `--carrier-shadow-kp`, dead on an idle timeout or transport error). For every
+  flow stall and lane failure it records that state, whether QUIC was still
+  acknowledging, and the remedy the design would take next to the one taken
+  today. Both endpoints also log when they first observed a flow's failure, when
+  the gateway's replacement grace started, and when a rescue JOIN arrived. The
+  records appear as `carrier shadow ...` log lines and
+  `queqiao_carrier_shadow_*` metrics, and `scripts/carrier_shadow_summary.py`
+  turns client and gateway logs into probe-timeout calibration tables, a stall
+  comparison and recovery-deadline distributions. It changes no decision; the
+  default is off.
+- `--cc-api=v2`, the first bundle of the path-authority migration, drives each
+  QUIC connection's erasure controller through the fork's new PathSender API
+  instead of quic-go's per-packet callbacks. It changes exactly three things.
+  QUIC ACK-only packets are no longer charged to the pacer, so a connection that
+  mostly receives no longer spends the budget its own flow acknowledgements need
+  on traffic its rate estimate never measured. A NAT rebinding or other
+  connection migration keeps the controller and what it has measured, where
+  quic-go replaced it with Reno. Acknowledgements, probe-timeout probes, the
+  keep-alive PING and path validation can still be sent while the connection is
+  window-blocked or paced. The default stays `v1`, which behaves as before.
+  `v2` requires `--congestion=erasure` and is refused with the `dc-long-haul`
+  profile.
+- `--classifier phased` lets a flow that has carried a bulk transfer behave as
+  an interactive one again, on clients and gateways. Under the default,
+  `--classifier legacy`, BULK is permanent: an SSH session after one large
+  output, a browser's HTTP/2 connection after a page, an LLM call on a reused
+  connection or with a large prompt, and a messaging connection after a photo
+  send every later small write as uncoded BULK data. Under `phased` the sticky
+  class still decides lane choice and bulk isolation, but the DATA class, lane
+  queue, interactive budget flag and coding follow what the flow does now: a
+  write of at most two packets onto an empty send queue is sent interactive and
+  coded, and the flow leaves BULK after two payload-carrying one-second windows
+  with no backlog and no high rate, re-entering it only after a backlog held for
+  a second (or four round trips). A backlogged transfer stays BULK throughout.
+  Each endpoint classifies the direction it sends, so the gateway must also run
+  `phased` for downstream data. `phased` is refused with the `dc-long-haul`
+  profile.
+- Every flow completion record now reports the DATA payload this endpoint sent
+  by class (new, interactive, bulk) and substrate (coded, stream), whether the
+  flow was ever BULK, and how often it left and re-entered BULK. The metrics
+  endpoint exports the same split per endpoint as
+  `queqiao_data_class_bytes_total{class,substrate}`, and class changes are
+  logged at debug level with the flow's age. These are what an evaluation reads
+  to see which bytes a classifier decision actually affected, such as the share
+  of an LLM response sent interactive.
+- `--coded-retry sticky` enables the coded-retry bundle of the path-authority
+  migration on clients and gateways; it requires `--cc-api v2`. A chunk sent on
+  coded datagrams is the code's to repair only until a deadline that now starts
+  when its last datagram is built into a packet, not when the chunk is queued,
+  so a chunk waiting behind the connection's datagram queue is no longer retried
+  early. A chunk whose deadline passes, whose datagram the connection discards,
+  or that the peer's ranges show missing is retried on the flow's existing
+  stream, and every later attempt of that chunk stays on the stream. A coded
+  tail lost on a healthy connection is therefore recovered without waiting for
+  the stall watchdog. The default, `--coded-retry legacy`, keeps today's
+  behaviour; any other value, or `sticky` without `--cc-api v2`, is refused at
+  start-up.
+- `--congestion-scope=path`, the sixth bundle of the path-authority migration,
+  gives each path and sending direction one congestion controller instead of
+  one per QUIC connection. Every connection on the path attaches to it and asks
+  it to admit each packet, so the rate, the window, the erasure estimate, the
+  minimum round trip and the choice of which class is served next are decided
+  once for the path. Nothing is divided between connections: there are no
+  shares, seeds or ramps, and a connection that joins, leaves or idles changes
+  nothing but the work offered. It works with isolation on, so a client's bulk
+  and rescue connections, and on a gateway every data connection of one
+  device, draw on the same budget. Packets that elicit no acknowledgement are
+  not charged, and the delivery sampler retires its state per packet, so
+  acknowledgements arriving out of order across connections no longer lose
+  delivered bytes. It requires `--cc-api=v2` and `--sched=class`; the default
+  stays `connection`, which behaves as before.
+- Every endpoint now exports sender-side credit delay as the
+  `queqiao_credit_delay_seconds` histogram on `/metrics`: the time from a
+  chunk's last byte being taken by the carrier to the flow acknowledgement
+  that covers it, minus the path's minimum round trip, on the sender's own
+  clock. It is passive and needs no flag. The validation harness reads it,
+  and the shadow false-promotion rate from the carrier-shadow counters, as
+  generic secondaries: gated in every trial type at stage 10 and reported at
+  stages 6 and 7. The carrier-shadow summary also prints the false-promotion
+  rate.
+- The stage 9 DC gate campaign now has an upload phase that can see the
+  `dc-long-haul` path tree's joint limit. Several leaves upload at once through
+  one multi-provider client process (`queqiaod client --providers`). Each
+  provider reaches the gateway through a relay on its own host, so each is its
+  own leaf, and the uploader's uplink is their shared ancestor. A light sibling
+  runs beside them. `dc_gate.py` judges the phase on the section 11.3 fairness
+  criteria, with its own bounds frozen in `dc_gate.ini` `[upload]`. It checks
+  that the uplink bound and that every leaf had its own relay. The design
+  document records the lead's decisions in #235 on fan-out, the authority key,
+  the initial pacing hint and the relay evidence.
+- `--path-profile dc-long-haul` can now run on the path-authority architecture:
+  `--cc-api=v2 --sched=class --congestion-scope=path --coded-retry=sticky
+  --recovery=carrier`, with `--topology=single` on the client, and optionally
+  `--classifier=phased`, `--mem=owned` and `--gateway-admission=owned`. Each
+  endpoint pair gets one path authority, and the profile's path tree is used
+  only as knowledge: a new destination starts from the erasure, burst and
+  round-trip figures its uplink has already measured, until it has measured
+  enough of its own, and no tree node caps or seeds a rate. The profile still
+  defaults to the legacy bundle, and start-up refuses any other combination of
+  these switches with it. The stage 9 DC gate's example campaigns now run this
+  bundle as their candidate, and `dc_gate.py` voids a campaign whose candidate
+  or legacy arm ran a different bundle.
+- Under `--congestion-scope=path`, a gateway's path authorities now share a
+  joint egress limit per network interface (`--egress-capacity`: `auto`, `off`,
+  or a rate). The ceiling is configured, or the interface's link speed with a
+  margin, or learned from the aggregate loss when authorities that see their
+  own loss rise with their own rate overload it together. It is divided
+  max-min among the active authorities, and has no effect while the aggregate
+  is under it or when only one authority is active. Each path authority also
+  stops compensating loss that rises with its own sending rate (up-phase loss
+  above cruise and down-phase loss), so a policed or overflowing shared point
+  is no longer read as channel erasure; independent channel loss is
+  compensated as before.
+- `--gateway-admission owned` makes a gateway's `--max-sessions` count flows
+  rather than streams: the ceiling is charged at OPEN on QUIC and TLS/TCP, a
+  JOIN counts against its flow's lane limit, a PROBE against a per-connection
+  allowance, and a refused OPEN is answered with the flow-limit code. A
+  RESERVE_CONTROL JOIN retires the lane that held the control role, and a UDP
+  association whose replacement arrives while it still runs hands over its relay
+  and its slots. The default, `legacy`, keeps the per-stream charge.
+- A regression test, `TestGatewayFirstFlightBesideBulkDownloads`, now guards the
+  gateway's send path: beside two loaded clients' downloads on one gateway, a
+  light client's 300 KB response must be on the path whole within 45 ms of its
+  first byte, before any acknowledgement of it can return, under the legacy and
+  the path-authority bundles. The live DC gate's slow control-leaf probes were
+  first read as a capped first flight; the gateway's snapshots show every chunk
+  issued and the whole response in flight, and the slow probes are the ones that
+  lost a packet and paid a round trip to repair it. A shared-bottleneck variant
+  only reports. The test bed gains a helper for one gateway with several
+  enrolled clients.
+- `--mem owned` enables the memory-ownership bundle of the path-authority
+  migration on clients and gateways, and `Session.SetMemoryBundle("owned")`
+  on mobile: the shared send budget grants one chunk per waiting flow in
+  arrival order instead of letting waiters race, a flow's retention bound is
+  tuned from its own validated flow credit instead of summing its lanes'
+  congestion windows, and bytes read but not yet dispatched (including a
+  queued end of stream) count as pending work for the no-progress budget. The
+  default, `--mem legacy`, keeps today's behaviour; any other value is refused
+  at start-up.
+- A deterministic test measures the keystroke echo tail behind a token-bucket
+  policer beside a bulk download -- the one place the live impaired campaign
+  measured the new bundle worse -- and reports both bundles' percentiles
+  (#282).
+- `--recovery=carrier` makes the client's carrier manager the single owner of
+  QUIC recovery (stage 8 of the path-authority design). A carrier is replaced
+  only on its own transport evidence: after `--recovery-ks` probe timeouts
+  without progress it takes no new flows and one standby is dialled and
+  verified; after `--recovery-kp` it is promoted and the old carrier drains.
+  A flow whose stream failed is rebound by one JOIN on the live carrier, and
+  missing flow credit on a live stream is waited out. Per-flow QUIC rescue
+  dials and lane demotion are off under the switch, the adaptive keep-alive
+  schedule is on, and each unbound flow has a binding deadline derived from
+  the gateway's grace (`--recovery-skew`, `--recovery-handoff-budget`). The
+  thresholds are provisional until the carrier-shadow calibration. The switch
+  requires `--congestion-scope=path` and `--coded-retry=sticky`, and on a
+  client `--topology=single`. Off by default.
+- `docs/ROLLOUT-v0.15.md`: what the path-authority flip measured on real
+  paths, the one place it is worse (interactive echo tails under a policer),
+  and the order to roll it out in, with what is checked and how to roll each
+  step back.
+- `--sched=class`, the second bundle of the path-authority migration, has each
+  QUIC connection's controller choose which class of work its next packet
+  serves, and the packet builder carry that choice out. Flow control frames
+  (OPEN, ACK, CLOSE and the rest) and QUIC's own window updates are CONTROL;
+  DATA of new and interactive flows and the datagram substrate are INTERACTIVE;
+  DATA of bulk flows is BULK. A weighted deficit round robin (4:2:1) serves
+  CONTROL first while its share is unused and gives every class at least its
+  weight under contention. When a flow's acknowledgement has to wait behind its
+  own DATA write, that flow's stream is boosted, so the bytes ahead of the
+  acknowledgement are served at CONTROL instead of queueing behind every other
+  bulk flow. It requires `--cc-api=v2`; the default stays `legacy`, which
+  behaves as before.
+- `--topology=single`, the seventh bundle of the path-authority migration,
+  keeps every flow of a client a stream on one QUIC connection per path. A bulk
+  flow no longer moves to a connection of its own when another flow shares the
+  pooled one; the path controller's class scheduler keeps control and
+  interactive work ahead of bulk on the one connection instead. Per-flow rescue
+  still dials, and a replacement connection is an attachment of the same path
+  controller. `--topology-fanout=N` is an explicit, off-by-default fan-out to at
+  most N connections per path for bulk flows. With fixed mobile receive
+  windows, the one connection's window grows by a stream window for each
+  secondary connection it no longer opens, so it holds as much in flight as the
+  isolated connections did. It requires `--congestion-scope=path` and
+  `--quic-pool`; the default stays `isolated`, which behaves as before.
+- The impaired-network campaign samples credit delay every second and judges
+  it clear of the blackhole outages, reporting the waits during and just after
+  them.
+- Live validation campaigns keep running their test jobs through a dropped
+  connection to a test host, and a block whose job host stays unreachable is set
+  aside for both arms instead of leaving the whole campaign without a verdict; a
+  job that hangs past its window or fails on a reachable host counts against the
+  arm. Campaigns spend less time between measurement windows (one shared ssh
+  connection per host, parallel restarts and scrapes, faster polling).
+- The path-authority gates now have a reproducible live harness.
+  `scripts/ab_campaign.py` runs interleaved A/B campaigns of builds and flag
+  bundles on temporary gateways and clients. It refuses to start beside a
+  production service and tears everything down. `scripts/ab_analyze.py`
+  applies the 0.90 block-contrast gate, and `scripts/dc_gate.py` judges the
+  `dc-long-haul` gate against frozen bounds. Workloads plug in by name:
+  besides bulk downloads they include LLM streaming calls, terminal
+  keystrokes with output bursts, and mixtures of the two with bulk traffic.
+  See docs/VALIDATING-A-BUNDLE.md.
+- Live validation campaigns can record each loaded host's CPU through every
+  trial and void blocks run under contention, and can read a production unit's
+  state for the safety snapshot through non-interactive sudo when the
+  campaign's own user cannot.
+- Live validation can measure reliability under slow, lossy and broken
+  networks: a campaign applies frozen impairment scenarios (slow and lossy, two
+  blackholes, a policer, idle wakes under loss) to its own test traffic only,
+  and judges the arms on flow completion, stalls, recovery after a blackhole,
+  LLM call failures and first-token time, keystroke echo and silent deaths.
+- The impaired-network campaign can gate the final bundle at stage 10, adding
+  sender-side credit delay to its rules.
+- The live validation harness has a minimal default profile, as the design
+  plans it: four trial types, each a block of its own taken in turn, that mix
+  bulk transfers, LLM streaming, terminal keystrokes, a video call over UDP, a
+  page load and idle connections that wake, plus the data-centre gate at its
+  minimal size. Each trial type stops on its own once it is decided, at levels
+  from an alpha-spending rule, and a pass carries forward to the default flip
+  unless a later stage changes what it exercises. Its dry run prints the
+  expected wall time, about 26 minutes per block and two and a half to three
+  hours per path.
+- Live validation campaigns can put a relay hop in front of the test
+  gateway, the way production clients reach theirs, with the relay started and
+  stopped by the campaign and its host checked and sampled like the others.
+- Live campaigns can reach a host through another ssh host, and upload binaries
+  compressed and checked, for a slow direct link.
+- Deterministic CI tests for the workloads the stage-10 gate moved out of live
+  runs (`docs/WORKLOAD-MODEL.md`): long-idle survival on an injected clock
+  (W9b), a tunnelled QUIC download and page load (W8), heavy UDP beside thin
+  UDP and coded chunks (M5), segment fetch (W10) and one-shot datagrams (W11).
+  Each runs the legacy bundle and the flip bundle through a real client and
+  gateway on the same seeded emulated path and applies the model's bounds.
+
+### Changed
+
+- The gateway and the client, desktop and mobile, now run the path-authority
+  bundle by default (stage 10 of the path-authority design): `--cc-api=v2`,
+  `--sched=class`, `--congestion-scope=path`, `--coded-retry=sticky`,
+  `--recovery=carrier`, `--mem=owned` and `--classifier=phased` on both roles,
+  `--gateway-admission=owned` on a gateway and `--topology=single` on a
+  client. `dc-long-haul` runs the same bundle. The wire does not change: an
+  upgraded gateway keeps serving wire-1 clients and clients on the legacy
+  bundle, so upgrade gateways first. The new `--bundle=legacy` turns every
+  switch off at once and is the rollback while the new defaults soak, until
+  the legacy code is deleted. A switch given explicitly still overrides
+  the bundle, and start-up refuses an unsupported combination.
+  `--congestion` other than `erasure` and a client's `--quic-pool=false` now
+  need `--bundle=legacy`, and start-up says so. `queqiaod service install`
+  takes `--bundle` to install a client service on the legacy bundle.
+- The impaired blackhole times the resumption of downloads and uploads
+  separately, only where both arms had that transfer in flight, and counts
+  background transfer failures, with background clients that outlast the
+  outages.
+- The impaired blackhole judges all its transfers as one failure rate and runs
+  up to 12 blocks, so its restore measures can be decided.
+- The impaired-network campaign judges failures as pooled rates over all
+  blocks, measures flow completion over eight short downloads per trial, and
+  times the first byte after each blackhole for new connections and for flows
+  in flight. Host CPU sampling survives a brief loss of the runner's link
+  without voiding the block, and logs can be fetched through another host.
+- The impaired-network campaign varies each trial's LLM start and outage
+  timing, and judges first-token time after a blackhole separately for calls
+  clear of the outage and for calls caught by it.
+- The impaired-network campaign judges flow completion as a pooled failure rate
+  over all blocks, so a candidate that completes every download is no longer
+  failed by a per-block test.
+- The deterministic workload tests (W8, W9b, W10, W11, M5) now run their flip
+  arm on the whole default-to-be bundle, `--recovery=carrier` included; the
+  arm had listed the stage 1-7 switches by hand. The full-suite workflows
+  allow `go test` 90 minutes, since `internal/pep` with two arms takes about
+  55 on a 32-core host.
+
+### Fixed
+
+- Under `--recovery=carrier`, connections left idle no longer die after a
+  stall on the path. A stall leaves round-trip samples of many seconds in an
+  idle carrier's estimate, and QUIC spaces its keep-alives and sets its idle
+  timeout by that estimate (1.5 and 3 probe timeouts): in a live idle-wake
+  session the client's keep-alives were 50 s apart and it noticed a dead
+  carrier 152 s after the gateway did, long after the gateway's 45 s grace for
+  the flows, so every idle connection ended. The carrier manager now keeps two
+  wall-clock bounds on a carrier with open flows. One that has heard nothing
+  for 7.5 s is probed, which keeps a NAT or relay mapping alive and gives the
+  estimate a fresh sample; one that has heard nothing for 15 s after its first
+  unanswered packet is treated as dead and replaced, as QUIC's own idle
+  timeout does when its estimate is sound. A healthy idle carrier is not
+  probed and sends what it sent before: one keep-alive every five seconds.
+  `queqiao_carrier_silent_deaths_total` counts the carriers ended this way.
+- Under `--recovery=carrier`, a client notices a path that comes back from a
+  blackhole within about a second. It sends a small probe exchange every
+  second under a verification grant while its carrier is suspect, or while an
+  ack-eliciting packet (a keep-alive PING counts) has gone unanswered, with
+  nothing heard, for a second beneath open flows. Before,
+  it waited for the next exponentially backed-off probe timeout, or, on a
+  carrier carrying mostly downloads, for the one keep-alive PING sent early in
+  the outage to come round again. While there is no carrier at all, it starts a
+  fresh replacement handshake every two seconds instead of leaving one
+  handshake waiting out its retransmission backoff. On an emulated 20 Mbit/s
+  path with +150 ms of round trip, traffic moved again on average 0.7 s
+  (worst 0.8 s) after an 8 s blackhole ended, against 3.2–3.5 s (worst 5.8 s)
+  before; a download alone resumed after 1.7–2.0 s (worst 2.1 s), against 5.1 s.
+- Under `--recovery=carrier`, a standby dial to a gateway with several
+  addresses races only as many address candidates as the device has free
+  connection slots, so on iOS it dials them one at a time instead of going
+  over the two-connection limit. The carrier manager's counters are exported
+  as Prometheus metrics: `queqiao_carrier_suspects_total`,
+  `queqiao_carrier_promotions_total`, `queqiao_carrier_standby_dials_total`,
+  `queqiao_carrier_standby_failures_total`,
+  `queqiao_carrier_replacement_dials_total`,
+  `queqiao_carrier_rebinds_total{carrier="same"|"new"}`,
+  `queqiao_carrier_binding_deadline_failures_total` and
+  `queqiao_carrier_tcp_handoffs_total`.
+- `--carrier-shadow` calibration data is more accurate. Probe-timeout episodes
+  are counted at the peak the transport reached, from counters the QUIC fork now
+  keeps as each episode ends, so short episodes and episodes acknowledged
+  between two samples are no longer undercounted. Carriers used only by UDP
+  associations are watched too. A client stall's legacy remedy is labelled as
+  a rescue request (`demote_and_request_rescue`) rather than a dial, and the
+  summary counts the dials that actually followed. Writing the outage record no
+  longer delays the gateway's replacement-grace timer. In the summary, skew is
+  measured from the first client observation of the matched incident, JOINs
+  started after an outage ended are not counted as transit, episodes still open
+  when the capture ends are reported as censored, and a later stall in a newer
+  transport epoch counts as progress.
+- `scripts/carrier_shadow_summary.py` handles four attribution edge cases
+  before stage-8 calibration. Outage starts that share a timestamp are taken
+  in `outage_id` order on both endpoints, so an asynchronously logged newer
+  start no longer closes the wrong outage. A state transition that names a
+  newer transport epoch now ends an earlier incident. An outage end whose
+  start is missing from the capture no longer closes an outage with a
+  different identifier. A reused process/carrier key with a lower epoch no
+  longer makes progress lookups quadratic.
+- `scripts/carrier_shadow_summary.py` ends a client incident when any flow
+  observes its carrier in a newer transport epoch, not only the flow itself.
+  It also recognizes an outage that ended in the millisecond it started:
+  outage records now carry an `outage_id` that their end record repeats.
+  Correlating stalls with later progress no longer rescans each carrier's
+  history per stall, so long captures of many flows on one pooled carrier
+  summarize in near-linear time.
+- Under `--recovery=carrier` with `--transport=auto`, flows in flight across
+  an outage are no longer handed to TCP as the path returns. A flow with no
+  QUIC carrier tries a TCP handoff once the fallback grace has passed and
+  retries it on a backoff; in an outage those attempts time out, because TCP
+  is down as well. When the path came back, the next retry and the QUIC
+  replacement came up within the same second or two, and a TCP JOIN that
+  landed first committed the flow to TCP for the rest of its life: on a live
+  path dropped for 25 s every flow in flight went to TCP 1.2 to 2.1 s after
+  the restore, and a long download then moved 14 s after it. Once a handoff
+  attempt has timed out, a retry now waits for a QUIC replacement that is
+  being dialled, for about one handshake and never past the latest handoff
+  start, and goes ahead only if QUIC does not come up. A network that blocks
+  UDP is unaffected: its first handoff succeeds, so nothing waits.
+- Under `--recovery=carrier` with `--transport=auto`, a flow is committed to
+  TCP only when its JOIN is sent, after a bounded wait for QUIC whenever the
+  path was away for TCP as well. The earlier fix held back a handoff retry
+  after one had timed out, but a handoff that began during the outage never
+  times out: its connection waits and completes the moment the path returns,
+  and its JOIN then committed the flow. The handoff now dials and
+  authenticates its TCP lane first; if an earlier attempt timed out, or the
+  dial took longer than a handshake should, it waits about one handshake (and
+  never past the latest handoff start) for a QUIC carrier, and if one becomes
+  eligible the lane is closed with no JOIN sent. On an emulated 20 Mbit/s,
+  360 ms path dropped for 8 s and for 25 s with TCP dropped too, both
+  downloads were handed to TCP in three trials of three before, and in none of
+  three after. With UDP alone blocked the handoff still comes 18.0 s after
+  the block.
+- Under `--cc-api=v2`, a reissued verification grant takes effect as soon as it
+  is bound, a replacement controller no longer inherits its predecessor's grant,
+  and a send pass that ends without a packet refreshes the connection's demand,
+  so a discarded datagram or a write that hit its limit no longer leaves a stale
+  class asserted until an unrelated event.
+- The flow classifier's recent-traffic window now ages by the time that has
+  actually passed. It used to roll over once however long a flow had been idle,
+  so the first write after any idle period still counted the burst before it as
+  recent. A response to a 120-128 KiB request, or the first message after a
+  quiet spell, could then make the flow BULK, and under the legacy classifier
+  BULK is permanent.
+- Under `--coded-retry=sticky`, receiver gap evidence is dated by when the
+  acknowledgement that advanced it arrived, not by when the scheduler's scan
+  ran, so an acknowledgement older than a coded packet can no longer cause a
+  premature stream retry. Every gap-driven retry now counts in
+  `queqiao_lane_reinjections_total`, including one that a late registration
+  or write report completes. A coded first attempt no longer looks up a
+  recovery deadline at dispatch that it would discard.
+- `--congestion-scope=path`: when a probe timeout demotes a connection and the
+  demotion publishes new loss figures, the pacing balance is settled at the
+  probe's own send time, so the interval up to the next event is no longer
+  credited twice.
+- `--congestion-scope=path`: a connection that moves to another path
+  controller after an uplink change takes no round-trip sample from packets
+  sent on the old uplink, and a probe sent before its next admission is
+  charged to the new path. A CONTROL claimant is judged with the control debt
+  it would be admitted on. Erasure figures released by a discard or a
+  disconnect are published at once, and the path controller no longer keeps
+  the path model's unused bandwidth-share history.
+- `--congestion-scope=path`: after a connection moves to another path
+  controller -- by migration or because its path changed before installation
+  -- round-trip samples count only for its own packets on the new path, for as
+  long as it stays there, and its old round trip does not seed the new
+  controller. Outcomes released when a connection is demoted for probe
+  timeouts are published at once, and releasing records without an outcome
+  publishes nothing.
+- The stage 9 DC gate now measures a leaf's capacity for its binding check as
+  the larger of the arms' median solo rates (`dc_gate.ini [validity]
+  binding_reference`, frozen), because capacity belongs to the path, and a
+  legacy arm that cannot fill a lone leaf made a binding ancestor look unbound.
+  W4's transactional requests run on absolute slots from the phase's barrier.
+  A request that has to wait for the previous one is late, and its latency is
+  measured from its slot. One slow request therefore counts against its arm
+  instead of shifting the leaf's later waves until the trial goes unmeasured.
+- The stage 9 DC gate can now judge a short path. A request wave counts as
+  concurrent when the leaves overlap for half of the shortest leaf's time in
+  the wave (at least 20 ms, at most 0.1 s), instead of a fixed 0.1 s that a
+  warm request across a 53 ms hop never lasts, so latency and spread were never
+  measured there. `[dc] calibrate_repeats` runs each leaf's solo several times
+  and takes the median, so one collapsed run cannot void the binding check, and
+  `calibrate_arms = all` records every arm's single-connection solo rate. The
+  report now prints the uplink binding ratio and a table of every solo run.
+- DC gate: a solo calibration's one-leaf check counts only leaves that
+  carried at least 1 % of the solo window's bytes, so a keepalive-sized flow
+  of another leaf (the uploader's single process keeps every provider's
+  carrier) no longer voids a campaign. A second leaf carrying real load
+  still voids it.
+- An "events" gate rule's minimum opportunity count is now judged on the
+  candidate arm. Sequential stopping lets the arms run a different number of
+  trials, and holding both to the minimum left rules like the completion
+  rate unmeasured for good whenever the slower arm fell short.
+- A gateway whose session limit was full no longer refuses the JOIN and PROBE
+  streams that recover the flows holding that limit (#170). Every slot used to
+  be taken before a stream's first frame was read, so when established flows
+  held them all, a flow that lost a lane could not rejoin and failed after its
+  replacement grace while still holding its slot. A stream that finds no free
+  slot is now read under a small separate bound, and a JOIN or PROBE for an
+  existing flow is admitted without one; a full QUIC connection limit admits one
+  standby connection beside a device's existing ones. New flows are refused as
+  before.
+- Validation harness: trial C's background window now ends with the call's
+  media, not after the reflector report has been fetched over the same path,
+  and the DC gate's request waves are scheduled from the shared barrier inside
+  the client, so start-up skew between leaf hosts no longer shifts them.
+- A client with a shared send budget (the iOS and Android profiles) no longer
+  lets idle application sockets hold that budget. Each flow used to reserve a
+  whole chunk before waiting to read from its application, so on iOS 192 idle
+  keep-alive connections held all 3 MiB and a request behind them was never
+  read, nor was an EOF on a later socket; nothing released them. A flow now
+  waits on its application with only a 1 KiB private buffer, reserves shared
+  memory once it has bytes in hand, and fills the rest of the chunk from what
+  the application has already written (#169).
+- A flow that ends at its own idle or lifetime limit now tells the other end
+  with a RESET, whichever end it is. A client's idle timeout used to reach the
+  gateway only as its streams closing, which the gateway took for a path
+  failure: the destination was held open for up to 45 seconds waiting for a
+  replacement lane, long after the application had seen the connection end.
+- Under `--mem=owned` a flow keeps its retention bound through a pause of its
+  application, for up to five minutes. The bound used to decay through every
+  idle round to the startup allowance, so a flow that sent a burst every few
+  seconds, such as a video player fetching segments, slow-started each burst
+  again; on an emulated long-haul path its slowest segments ran at three
+  quarters of the legacy bundle's throughput.
+- Under `--mem=owned`, the retention autotune samples the credit-round
+  duration once per round instead of at every read admission, dispatch and
+  completion, which walked the flow's lanes under their locks while the
+  scheduler mutex was held. The socket-based idle-reader test runs at an
+  eighth of the iOS budget, so it fits a 512-descriptor limit.
+- Under `--mem=owned`, a flow may send one path window unacknowledged from its
+  first byte, and again after an idle gap. Its retention bound used to start
+  at, and decay back to, the four-chunk startup allowance (128 KiB) and double
+  once per credit round, so every fresh or idle flow paid credit round trips to
+  send what its path could carry at once: an LLM agent's 132 KB prompt waited
+  one round trip, a 300 KB request two, and a 4 MiB upload spent most of its
+  life opening its own bound. The bound's floor is now the path's congestion
+  window (never more than the per-flow send limit); it reserves no memory,
+  since shared memory is taken only for bytes in hand. On an emulated
+  20 Mbit/s path with +150 ms of round trip a 132 KB prompt reached the server
+  in 0.05 s instead of 0.16 s; on an emulated 53 ms, 300 Mbit/s leg 4 MiB
+  uploads on fresh flows ran at 157 Mbit/s instead of 75, and a 355 KB request
+  beside a loaded upload took 0.13-0.19 s at the median instead of 0.32-0.36 s.
+- Under `--congestion-scope=path` with `--recovery=carrier`, a burst that
+  follows a pause no longer starts from a collapsed bandwidth estimate. An idle
+  carrier still carries the odd small frame, and the path's estimate ages out
+  after ten round trips. A lone small packet acknowledged during the pause then
+  read as a few hundred bytes a second and became the estimate, and the next
+  burst was paced from it. On an emulated 20 Mbit/s path with 120 ms of round
+  trip, a video player fetching a 1.5 MB segment every 4 s saw a segment take
+  2.4 to 4.8 s instead of 1 s in about two sessions out of five. An
+  application-limited sample now replaces an aged-out estimate only if it saw
+  more than a minimum window delivered.
+- Under `--congestion=path`, a path's bandwidth estimate no longer collapses to
+  a ProbeRTT trickle when it ages out. The estimate expires after ten minimum
+  round trips of wall time, which on a path with a standing queue is sooner
+  than ten rounds, so it expired in steady state, and expiry replaced every
+  sample in the filter with the one that happened to arrive. When that sample
+  came from ProbeRTT's four-packet window, a 20 Mbit/s path was estimated at
+  0.3 Mbit/s, and bandwidth probing took about twelve seconds to climb back.
+  Expiry now forgets only the samples that outlived the window and keeps the
+  younger ones. On an emulated 20 Mbit/s path with 150 ms of round trip and a
+  512 KiB queue, a bulk upload beside an interactive exchange held 18 Mbit/s
+  with prompt responses within 90 ms, where it had fallen to 8 Mbit/s with
+  responses of up to 1.0 s. The per-connection controllers are unchanged.
+- Under `--congestion=path`, a path that was carrying downloads now comes back
+  from an outage promptly. Three things held it back. A connection whose
+  packets had gone unanswered could send ordinary packets only while little
+  was outstanding, so one cut off mid-transfer could send none, and waited for
+  its own backed-off probe timeout: after an 8 s outage a gateway sent nothing
+  of its own for another 5.5 s. It now keeps an allowance of two packets per
+  round trip, so the first packet the returning path delivers prompts one that
+  can be acknowledged. The bandwidth estimate, which stands for ten round
+  trips, expired during the outage and was replaced by the first trickle
+  acknowledged; the outage no longer ages it, nor the minimum round trip. And
+  rounds in which nothing at all was acknowledged no longer count as
+  congestion or as channel erasure for the loss bound, which also does not sit
+  out a probe wait after the path returns. On an emulated 20 Mbit/s, 360 ms
+  path with two downloads, they were moving 1.3-1.5 s after an 8 s drop, where
+  they had taken 5.5-8 s, and carried about 20 MB in the next ten seconds,
+  where they had carried 0.4-10 MB. The per-connection controllers are
+  unchanged.
+- Under `--congestion=path`, an application-limited path, such as the uplink
+  beside a download, no longer takes a ProbeRTT every ten seconds. The ProbeRTT
+  held the path's window at four packets for a round trip and 200 ms, which
+  delayed every datagram and acknowledgement on it by up to about 350 ms: voice
+  packets sent beside a tunnelled download were late by that much, and the
+  download stalled while its acknowledgements waited. A path whose window or
+  pacer held it back since its minimum RTT was measured, as a bulk one does,
+  still takes its ProbeRTT.
+- Under `--congestion=path`, ProbeRTT now holds half a bandwidth-delay product
+  in flight, as BBRv2 and BBRv3 do, instead of four packets. At four packets
+  the path carried nothing for 200 ms and a round trip every time the minimum
+  round trip was re-measured, and everything on the path waited behind it. On
+  an emulated 20 Mbit/s, 120 ms path, a call's downlink audio beside a
+  tunnelled download waited up to 440 ms for about half a second at each
+  ProbeRTT, which put its 99th-percentile lateness at about 310 ms; it is now
+  about 80 ms, with a peak of about 145 ms, and late or lost audio fell from
+  1.3-1.7% of packets to 0-0.7%. Half a product is less than the pipe holds,
+  so the sender's own queue still drains and the round trip measured is the
+  path's. The per-connection controllers keep the four-packet window.
+- Under `--congestion=path`, a path's sender no longer holds a shared
+  bottleneck's queue full. The law keeps two bandwidth-delay products in
+  flight and its delay bound allows a round trip of twice the minimum, which
+  together are exactly the pipe and a one-product buffer, so at a shared link
+  the buffer stood full and overflowing; the overflow was then read as channel
+  erasure and compensated for by sending more. The law now bounds its flight
+  by loss the way BBRv2 does, with the erasure channel kept apart: the erasure
+  it compensates for is learned only from rounds with little queue, and loss
+  beyond that while a queue stands near full cuts the flight to 0.7, holds it
+  for two to three seconds and probes back up. Random loss, which is the same
+  at any queue depth, and a policer, which drops with no queue, do not trigger
+  it. On an emulated 300 Mbit/s, 53 ms link with a one-product buffer, two
+  such senders went from 16-24% of packets dropped and a queue pinned at 55 ms
+  to 0.1-0.2% and a median 26 ms, at a higher combined rate; against the
+  per-connection sender their share went from 77% to 47%; and a light leaf's
+  300 KB fetches beside three loaded leaves went from a median 991 ms to
+  148 ms. The per-connection controllers are unchanged.
+- On macOS, a QUIC dial with no local binding now listens on a socket of the
+  gateway's own address family rather than a dual-stack one. The kernel could
+  give the dual-stack socket a port that an IPv4 socket elsewhere on the host
+  already held, and that socket then received the gateway's answers, so the
+  handshake retransmitted into silence until the dial timed out. A TCP flow's
+  lane manager also no longer dials a replacement after the flow has ended,
+  which it could do when its timer fired as the flow's grace ran out; that dial
+  was missing from the flow's completion record.
+- `queqiaod relay run --idle-timeout` is now an idle timeout for TCP
+  connections, as it already was for UDP associations. It used to be an
+  absolute lifetime: every TLS/TCP lane or TCP handoff through a relay was cut
+  that long after it was accepted (two minutes by default) however busy it
+  was. A forwarded TCP connection is now closed only when no byte has crossed
+  it in either direction for the timeout.
+- `--sched=class` no longer blocks MTU discovery when the scheduler grants
+  exactly the packet size it is asked for: while a probe is due, admission is
+  requested at the probe's size, falling back to an ordinary packet if refused.
+  Under class permits, a not-yet-due ACK is no longer spent on an ACK-only
+  packet for a datagram that cannot fit beside it, a small leftover budget is
+  offered to a bounded number of streams, and draining control retransmissions
+  behind an oversized frame takes one pass per packet instead of quadratic
+  copying.
+- A small write that reached an empty send queue is recovered in half a
+  round trip instead of two when a shaper drops it, so a keystroke's echo no
+  longer waits about 500 ms behind a bulk transfer on a policer (its median
+  is unchanged). Chunks with data behind them keep the longer deadline.
+- A campaign reports a start that leaves no pid file at the start, with the
+  command's own output, and retries it once after a dropped session, instead
+  of the next wait reporting "no pid file"; the wait now gives the pid file
+  a few seconds to appear before calling a start failed.
+- Under `--topology=single` with an explicit `--topology-fanout`, a bulk flow
+  moves to a fan-out connection only when another flow shares its own pooled
+  connection. A flow still draining on the previous connection after a handover
+  no longer makes a lone bulk flow on the replacement spend a handshake and the
+  fan-out slot.
+- With `--topology=single --topology-fanout`, a flow that already has a
+  fan-out lane now judges whether its control lane is shared on that lane's
+  own pooled generation, as opening a fan-out lane already did. After a
+  handover, a flow draining on the old generation no longer sends a lone bulk
+  flow's chunks from its warm control lane to its fan-out lane. Isolation
+  keeps the client-wide count.
+- On macOS, the gateway's direct UDP relay now uses one socket per address
+  family instead of one dual-stack socket: an IPv4 socket opened with the
+  relay, and an IPv6 socket opened on the first IPv6 destination. A
+  dual-stack socket there could be given a port that an IPv4 socket elsewhere
+  on the host already held, and that socket then received the destination's
+  replies. Other platforms keep the single dual-stack socket. On every
+  platform, the socket to an upstream SOCKS5 relay takes the upstream's
+  address family.
+- A live campaign with several candidates decides each one on its own, a broken
+  keystroke session counts against its arm, and a trial type is not judged on a
+  rule written for measures it does not have.
+- A live campaign's report explains how to read each rule's contrast, no
+  longer shows an undecided rule as failed while the campaign is still
+  running, and keeps a side session's missing logs from withholding the main
+  verdict.
+- On Windows the QUIC stack now reads the performance counter instead of Go's
+  clock, which advances once per clock interrupt there (15.6 ms by default).
+  At that granularity the path controller, the default since this release,
+  measured a short path's round trips as zero or one whole step and dropped
+  nearly every delivery-rate sample: on loopback and LAN paths it settled at a
+  few packets per step and a transfer stalled.
+- The validation workload client no longer reads and writes one TLS connection
+  from two threads at once. Python's ssl module does not serialise those calls,
+  and the terminal and idle-wake workloads could end a session with a spurious
+  EOF (or "bad record mac") that the arm under test never caused.
+
 ## v0.14.0 - 2026-11-24
 
 ### Added
